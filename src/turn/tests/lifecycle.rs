@@ -558,3 +558,78 @@ async fn test_an_answer_turn_failing_before_it_saves_the_answer_keeps_its_error(
     wait_until("the answer turn ends", || !turn_running(conversation_id)).await;
     assert!(last_turn_error(conversation_id).is_some(), "the answer turn's error isn't kept");
 }
+
+/// SME-219: the user's Stop on a conversation already deleted (and
+/// forgotten) leaves no turn state. Today it made the entry, paused, and
+/// nothing forgot it again.
+#[sqlx::test]
+async fn test_a_stop_for_a_deleted_conversation_leaves_no_turn_state(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+    delete_as_the_api_does(&pool, conversation_id).await;
+
+    stop_conversation(&pool, conversation_id).await;
+
+    assert!(!has_turn_state(conversation_id), "the Stop left turn state");
+    assert!(!is_paused(conversation_id));
+}
+
+/// SME-219: an error shown outside a turn ("Work on a repo" that couldn't
+/// start the sandbox) on a conversation already deleted leaves no turn
+/// state, and no kept error.
+#[sqlx::test]
+async fn test_an_error_shown_for_a_deleted_conversation_leaves_no_turn_state(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+    delete_as_the_api_does(&pool, conversation_id).await;
+
+    show_error_outside_turn(&pool, conversation_id, "\"Work on a repo\" failed.".to_string()).await;
+
+    assert!(!has_turn_state(conversation_id), "the error left turn state");
+    assert_eq!(last_turn_error(conversation_id), None);
+}
+
+/// SME-219: a Stop on an id that was never a conversation leaves no turn
+/// state either.
+#[sqlx::test]
+async fn test_a_stop_for_an_unknown_conversation_leaves_no_turn_state(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let base = db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let never_created = base + 1_000_000;
+
+    stop_conversation(&pool, never_created).await;
+
+    assert!(!has_turn_state(never_created), "the Stop left turn state");
+}
+
+/// SME-219 guard: a Stop on a live conversation with no turn state yet
+/// (no turn ever run) still pauses it, so a command finishing right after
+/// doesn't wake the model; its delete then leaves nothing.
+#[sqlx::test]
+async fn test_a_stop_for_a_live_idle_conversation_still_pauses_it(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+
+    stop_conversation(&pool, conversation_id).await;
+
+    assert!(is_paused(conversation_id), "the Stop didn't pause a live conversation");
+    delete_as_the_api_does(&pool, conversation_id).await;
+}
+
+/// SME-219 guard: an error shown outside a turn on a live conversation is
+/// kept for a tab that reloads.
+#[sqlx::test]
+async fn test_a_shown_error_on_a_live_conversation_is_kept(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+    let message = "\"Work on a repo\" failed. Couldn't start the sandbox.".to_string();
+
+    show_error_outside_turn(&pool, conversation_id, message.clone()).await;
+
+    assert_eq!(last_turn_error(conversation_id), Some(message));
+    delete_as_the_api_does(&pool, conversation_id).await;
+}
