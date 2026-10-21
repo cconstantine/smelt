@@ -51,7 +51,9 @@ pub async fn delete_conversation(id: i64) -> ServerFnResult<()> {
 #[cfg(feature = "server")]
 async fn delete_and_forget(pool: &PgPool, id: i64) -> Result<(), String> {
     let pool = pool.clone();
-    tokio::spawn(async move {
+    // In the request's span, so its teardown is the request's child, as
+    // `start_turn`'s turn is (SME-137, SME-262 review 1).
+    tokio::spawn(tracing::Instrument::in_current_span(async move {
         // Its turns first, so nothing is still making a pod (SME-51 B5).
         stop_turn_now(id);
         let _ = crate::browsing::close_session(id).await;
@@ -75,7 +77,7 @@ async fn delete_and_forget(pool: &PgPool, id: i64) -> Result<(), String> {
         // After the delete, so a listener refetching sees the pod rows gone.
         crate::events::publish_app(crate::events::AppEvent::PodsChanged);
         Ok(())
-    })
+    }))
     .await
     .map_err(|e| format!("The delete didn't finish: {e}"))?
 }
@@ -560,5 +562,26 @@ mod tests {
         })
         .await;
         eventually("the turn state is forgotten", || async move { !crate::turn::has_turn_state(id) }).await;
+    }
+
+    /// SME-262 review 1: the delete's task runs in its request's span, so
+    /// its teardown is the request's child in a trace, as before the task.
+    /// (No test manager: teardown stops at `get()`, inside its span.)
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+    async fn test_a_deletes_teardown_is_a_child_of_its_request(pool: PgPool) {
+        let _race = git::test_support::ONE_AT_A_TIME.lock().await;
+        let _turns = crate::providers::test_support::lock_turn_tests();
+        db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+        let id = db::create_conversation(&pool).await.expect("conversation").id;
+
+        // The span is made inside the capture, which only then listens.
+        let (deleted, spans) = crate::telemetry::capture_spans(async {
+            crate::telemetry::in_span(tracing::info_span!("request"), delete_and_forget(&pool, id)).await
+        })
+        .await;
+        deleted.expect("delete");
+        let request = spans.iter().find(|span| span.name == "request").expect("the request's span");
+        let teardown = spans.iter().find(|span| span.name == "teardown_conversation").expect("teardown's span");
+        assert_eq!(teardown.parent_span_id, request.span_context.span_id(), "{spans:?}");
     }
 }
