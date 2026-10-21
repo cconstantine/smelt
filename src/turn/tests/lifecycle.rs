@@ -388,11 +388,16 @@ async fn test_a_notice_after_a_delete_leaves_no_turn_state(pool: PgPool) {
 
     let woken = db::create_conversation(&pool).await.expect("create conversation").id;
     delete_as_the_api_does(&pool, woken).await;
+    // The delete took the wake's pending work with it, so the wake isn't
+    // counted (SME-218).
     let woke = wake_conversation(&pool, woken).await;
-    assert!(
-        woke.as_ref().is_ok_and(Vec::is_empty) || woke.as_ref().is_err_and(|e| e.to_string().contains("not found")),
-        "{woke:?}"
-    );
+    assert!(woke.as_ref().is_ok_and(Vec::is_empty), "{woke:?}");
+    // A counted wake still can be (the delete landing after
+    // `wake_has_work`, or the check failing): `wake_conversation`'s own
+    // steps, after its check passed.
+    let turn = TurnInFlight::start_unless_paused(woken).expect("not paused");
+    let result = run_turn_bounded(&pool, turn, None, MAX_TURNS, None, false).await;
+    assert!(result.as_ref().is_err_and(|e| e.to_string().contains("not found")), "{result:?}");
     assert!(!has_turn_state(woken), "a wake left turn state");
 
     let sent = db::create_conversation(&pool).await.expect("create conversation").id;
