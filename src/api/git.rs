@@ -115,9 +115,23 @@ async fn attach_and_answer(
     branch: String,
     dir: String,
 ) -> Result<RepoSummary, String> {
+    let (_attaching, answered) = spawn_attach(pool, id, url, branch, dir);
+    read_attach_answer(answered).await
+}
+
+/// Starts the attach's task: the handle to it (for a test to wait on),
+/// and the channel its start is handed back on.
+#[cfg(feature = "server")]
+fn spawn_attach(
+    pool: &sqlx::PgPool,
+    id: i64,
+    url: String,
+    branch: String,
+    dir: String,
+) -> (tokio::task::JoinHandle<()>, tokio::sync::oneshot::Receiver<AttachAnswer>) {
     let pool = pool.clone();
     let (answer, answered) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
+    let attaching = tokio::spawn(async move {
         let branch = Some(branch.trim()).filter(|b| !b.is_empty());
         let dir = Some(dir.trim()).filter(|d| !d.is_empty());
         let (shown, pending) = match git::start_attach(&pool, id, url.trim(), branch, dir).await {
@@ -139,6 +153,13 @@ async fn attach_and_answer(
             report_attach_failure(&pool, id, nothing_to_clone, &e).await;
         }
     });
+    (attaching, answered)
+}
+
+/// The request's side of the hand-back: reads the attach's start and
+/// says it did.
+#[cfg(feature = "server")]
+async fn read_attach_answer(answered: tokio::sync::oneshot::Receiver<AttachAnswer>) -> Result<RepoSummary, String> {
     let (started, ack) = answered
         .await
         .map_err(|_| "\"Work on a repo\" stopped before it answered.".to_string())?;
@@ -331,7 +352,8 @@ mod tests {
     /// load is held at its card's insert, holding the remote's trust
     /// lock; A's "Work on a repo" waits for it, and its request is dropped
     /// there. The attach still trusts the remote, drops B's card and
-    /// tells B.
+    /// tells B. The test waits for the attach's sandbox step to finish
+    /// too, so none of it runs on after the test (review 1, finding 4).
     #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
     async fn test_work_on_a_repo_whose_request_is_dropped_still_drops_the_cards_and_tells_the_models(pool: sqlx::PgPool) {
         let _race = git::test_support::ONE_AT_A_TIME.lock().await;
@@ -351,10 +373,8 @@ mod tests {
             async move { git::request_or_load(&pool, b, &repo_b, "AGENTS.md", &git::test_support::file("b")).await }
         });
         assert!(git::test_support::waiters_or_finished(&pool, 1, &load).await, "the load never reached its card");
-        let request = tokio::spawn({
-            let pool = pool.clone();
-            async move { attach_and_answer(&pool, a, "https://github.com/o/r".into(), String::new(), String::new()).await }
-        });
+        let (attaching, answered) = spawn_attach(&pool, a, "https://github.com/o/r".into(), String::new(), String::new());
+        let request = tokio::spawn(read_attach_answer(answered));
         assert!(
             git::test_support::waiters_or_finished(&pool, 2, &request).await,
             "the attach never waited for the load"
@@ -374,6 +394,11 @@ mod tests {
         })
         .await;
         eventually("B's model is told", || told(p, b, "load_instructions again")).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), attaching)
+            .await
+            .expect("the attach's sandbox step finishes")
+            .expect("the attach's task");
+        assert_eq!(crate::turn::last_turn_error(a), None, "A's sandbox step failed");
         crate::turn::forget_conversation_lock(a);
         crate::turn::forget_conversation_lock(b);
     }
