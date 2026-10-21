@@ -462,7 +462,8 @@ async fn compact(
     };
 
     let mut discard_deltas = |_: &str| {};
-    let recorder = CallRecorder::new(pool, conversation_id, turn_model, db::ModelCallKind::Compaction);
+    let recorder =
+        CallRecorder::new(pool, conversation_id, turn_model, db::ModelCallKind::Compaction, &summarization_request);
     let turn = anthropic::stream::stream_anthropic_message_metered(
         &turn_model.endpoint,
         &summarization_request,

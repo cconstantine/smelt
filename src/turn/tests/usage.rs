@@ -300,3 +300,42 @@ async fn test_a_stopped_turns_late_record_doesnt_overwrite_the_next_turns_usage(
     );
     resume_turns(conversation.id);
 }
+
+/// A stopped or failed call's input falls back to the request's estimate
+/// only when `message_start` reported no input at all, as LiteLLM's does,
+/// whose real counts come only at the end (code review 1).
+#[test]
+fn test_an_unfinished_calls_input_is_estimated_only_when_none_was_reported() {
+    let usage = |input, write, read| anthropic::TokenUsage {
+        input_tokens: input,
+        output_tokens: 7,
+        cache_creation_input_tokens: write,
+        cache_read_input_tokens: read,
+    };
+    assert_eq!(with_estimated_input(usage(0, 0, 0), 3000), usage(3000, 0, 0));
+    assert_eq!(with_estimated_input(usage(12, 0, 0), 3000), usage(12, 0, 0));
+    assert_eq!(with_estimated_input(usage(0, 0, 900), 3000), usage(0, 0, 900), "fully cached");
+    assert_eq!(with_estimated_input(usage(0, 40, 0), 3000), usage(0, 40, 0), "all written to the cache");
+}
+
+/// A LiteLLM call stopped mid-stream: its `message_start` says 0 input,
+/// so its row has the request's estimate instead.
+#[sqlx::test]
+async fn test_a_call_stopped_after_a_zero_message_start_records_the_requests_estimate(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation_with_id(&pool, 9178000009).await.expect("conversation");
+    let text = "a".repeat(400);
+    start_prefix_then_hanging_mock_upstream(&pool, message_start(0, 0) + &text_delta(&text)).await;
+
+    let turn = spawn_turn(&pool, conversation.id);
+    wait_for_reply_of(conversation.id, 400).await;
+    stop_and_wait(conversation.id, turn).await;
+
+    let found = wait_for_rows(&pool, 1).await;
+    assert_eq!(found.len(), 1, "{found:?}");
+    let (_, _, input, cache_read, output) = found[0].clone();
+    // The system prompt and tool definitions alone are thousands of tokens.
+    assert!(input > 1000, "input {input} isn't the request's estimate");
+    assert_eq!((cache_read, output), (0, 100));
+    resume_turns(conversation.id);
+}

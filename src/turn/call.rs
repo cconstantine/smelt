@@ -62,7 +62,7 @@ pub(super) async fn call_model(
             conversation_id,
             crate::events::ConversationEvent::ReplyReset {},
         );
-        let recorder = CallRecorder::new(pool, conversation_id, turn_model, db::ModelCallKind::Turn);
+        let recorder = CallRecorder::new(pool, conversation_id, turn_model, db::ModelCallKind::Turn, request);
         match anthropic::stream::stream_anthropic_message_metered(
             &turn_model.endpoint,
             request,
@@ -110,6 +110,7 @@ pub(super) struct CallRecorder {
     price_catalog_provider: Option<String>,
     kind: db::ModelCallKind,
     meter: anthropic::stream::UsageMeter,
+    estimated_input: i64,
     armed: bool,
 }
 
@@ -120,6 +121,7 @@ impl CallRecorder {
         conversation_id: i64,
         turn_model: &crate::providers::TurnModel,
         kind: db::ModelCallKind,
+        request: &anthropic::CreateMessageRequest,
     ) -> Self {
         Self {
             pool: pool.clone(),
@@ -129,6 +131,7 @@ impl CallRecorder {
             price_catalog_provider: turn_model.price_catalog_provider.clone(),
             kind,
             meter: anthropic::stream::UsageMeter::default(),
+            estimated_input: i64::try_from(estimate_request_tokens(request)).unwrap_or(i64::MAX),
             armed: true,
         }
     }
@@ -206,6 +209,24 @@ impl CallRecorder {
     }
 }
 
+/// An unfinished call's `usage`, with `estimated_input` (the request's
+/// size, `estimate_request_tokens`) as its input when `message_start`
+/// reported no input at all (code review 1). LiteLLM's always says 0,
+/// its real counts coming only in the final `message_delta`, so a call of
+/// it stopped mid-stream would otherwise be counted with no input. Any
+/// reported count, a cached one included, stands.
+#[cfg(feature = "server")]
+pub(super) fn with_estimated_input(usage: anthropic::TokenUsage, estimated_input: i64) -> anthropic::TokenUsage {
+    let reported_none = usage.input_tokens == 0
+        && usage.cache_creation_input_tokens == 0
+        && usage.cache_read_input_tokens == 0;
+    if reported_none {
+        anthropic::TokenUsage { input_tokens: estimated_input, ..usage }
+    } else {
+        usage
+    }
+}
+
 /// Marks a finished call's record no longer current when `finish`'s
 /// future ends or is dropped.
 #[cfg(feature = "server")]
@@ -227,6 +248,7 @@ impl Drop for CallRecorder {
         let Some(usage) = self.meter.known() else {
             return;
         };
+        let usage = with_estimated_input(usage, self.estimated_input);
         let conversation_id = self.conversation_id;
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             tracing::warn!(conversation_id, "no runtime to record an unfinished model call on");
