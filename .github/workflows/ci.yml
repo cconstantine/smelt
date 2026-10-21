@@ -143,12 +143,17 @@ jobs:
         run: |
           curl -fsSLo kubectl-diag "https://dl.k8s.io/release/v1.34.0/bin/linux/amd64/kubectl"
           chmod +x kubectl-diag
-          echo "--- pods (smelt-park) ---"
-          docker compose run --rm smelt ./kubectl-diag get pods -n smelt-park -o wide || true
+          # smelt-park-test, not smelt-park: this step follows the test run,
+          # which is built under cfg(test), where sandbox::NAMESPACE is
+          # smelt-park-test (src/sandbox/mod.rs) — the dev namespace holds
+          # nothing these tests made (SME-186, B43). The `park` service
+          # account can list pods and events in it (k8s/smelt-park-rbac.yaml).
+          echo "--- pods (smelt-park-test) ---"
+          docker compose run --rm smelt ./kubectl-diag get pods -n smelt-park-test -o wide || true
           echo "--- pod descriptions ---"
-          docker compose run --rm smelt ./kubectl-diag describe pods -n smelt-park || true
+          docker compose run --rm smelt ./kubectl-diag describe pods -n smelt-park-test || true
           echo "--- events, most recent first ---"
-          docker compose run --rm smelt ./kubectl-diag get events -n smelt-park --sort-by=.lastTimestamp || true
+          docker compose run --rm smelt ./kubectl-diag get events -n smelt-park-test --sort-by=.lastTimestamp || true
           echo "--- node describe (capacity/allocatable/conditions; may 403, RBAC has no nodes access) ---"
           docker compose run --rm smelt ./kubectl-diag describe nodes || true
           rm -f kubectl-diag
@@ -210,12 +215,14 @@ jobs:
         run: |
           curl -fsSLo kubectl-diag "https://dl.k8s.io/release/v1.34.0/bin/linux/amd64/kubectl"
           chmod +x kubectl-diag
-          echo "--- pods (smelt-park) ---"
-          docker compose run --rm smelt ./kubectl-diag get pods -n smelt-park -o wide || true
+          # The browser tests serve the app in-process (src/browser_tests/harness.rs)
+          # under cfg(test), so their pods are in smelt-park-test (SME-186, B43).
+          echo "--- pods (smelt-park-test) ---"
+          docker compose run --rm smelt ./kubectl-diag get pods -n smelt-park-test -o wide || true
           echo "--- pod descriptions ---"
-          docker compose run --rm smelt ./kubectl-diag describe pods -n smelt-park || true
+          docker compose run --rm smelt ./kubectl-diag describe pods -n smelt-park-test || true
           echo "--- events, most recent first ---"
-          docker compose run --rm smelt ./kubectl-diag get events -n smelt-park --sort-by=.lastTimestamp || true
+          docker compose run --rm smelt ./kubectl-diag get events -n smelt-park-test --sort-by=.lastTimestamp || true
           rm -f kubectl-diag
 
       - name: Tear down

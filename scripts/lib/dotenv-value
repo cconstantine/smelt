@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+r"""dotenv-value FILE NAME — print NAME's value in FILE the way dotenvy would.
+
+A port of dotenvy 0.15.7's iter.rs (QuotedLines::next, eval_end_state) and
+parse.rs (LineParser's parse_line/parse_key/expect_equal/skip_whitespace,
+parse_value, apply_substitution), which is what smelt itself runs over its
+.env: `dotenvy::dotenv()` at src/main.rs:84. check-server and browser-tier
+read .env through this instead of `sed`, so they agree with the server they
+are starting (SME-186, B40). Run isolated: `python3 -I dotenv-value FILE NAME`.
+
+The rules it reproduces, each of which a line-based reader gets wrong:
+
+  * the first line setting a key wins, and a line that fails to parse stops
+    the load there, so keys after it are never read and those before are kept;
+  * `export KEY=` is a prefix, and `export=` is a key named `export`;
+    whitespace is allowed around `=`;
+  * '...' is literal; "..." and unquoted values honour the escapes \\ ' " $
+    space and \n, and substitute $NAME and ${NAME} — the environment's value
+    first, then an earlier line's, then empty;
+  * an unquoted value ends at whitespace, after which only a `#` comment may
+    follow (`KEY=` and `KEY= # c` read empty); only a quote left open spans
+    lines — a line ending in `\` or in whitespace still ends its entry, and
+    the fixture named trailing-backslash-joins records dotenvy's answer;
+  * lines split on `\n` only: a lone CR, `\v` or `\f` is content, not a line
+    ending. An entry's own terminator — a `\n` and a `\r` right before it —
+    comes off, and nothing inside it does, so a CRLF inside a quoted value
+    stays `\r\n` as it is in the crate; a leading BOM is skipped (as
+    `load()`, smelt's path, does); and lines decode as they are read, so
+    keys before a line that is not valid UTF-8 keep their values.
+
+NAME's own value in the environment is NOT consulted: each caller settles
+that precedence for itself (check-server's effective_value and browser-tier
+both prefer the environment). Names *inside* a value do consult it, the way
+apply_substitution does.
+
+Exit status is 0 whether or not anything was found — an empty stdout means
+"this file gives NAME no value", which is what the callers treat as unset —
+so a reader failure can't abort a script mid-flight. A line that fails to
+parse says which line on stderr and stops there, printing no value.
+"""
+
+import os
+import sys
+
+COMPLETE, ESCAPE, STRONG_OPEN, STRONG_OPEN_ESCAPE, WEAK_OPEN, WEAK_OPEN_ESCAPE, \
+    COMMENT, WHITESPACE = range(8)
+
+# What dotenvy's parse_value accepts after a backslash.
+ESCAPES = ("\\", "'", '"', "$", " ")
+
+
+class StopLoad(Exception):
+    """Loading stops here: this line fails to parse (dotenvy's Iter::next,
+    which returns the Err and so ends the iteration)."""
+
+    def __init__(self, line_no, reason):
+        super().__init__(reason)
+        self.line_no = line_no
+        self.reason = reason
+
+
+def _key_start(c):
+    return bool(c) and c.isascii() and (c.isalpha() or c == "_")
+
+
+def _key_char(c):
+    return c.isascii() and (c.isalnum() or c in "_.")
+
+
+def _eval_end_state(state, chunk):
+    """iter.rs's eval_end_state: how a chunk leaves the quote/escape state,
+    and where a comment starts. Returns (pos, state)."""
+    pos = 0
+    for pos, c in enumerate(chunk):
+        if state == WHITESPACE:
+            if c == "#":
+                return (pos, COMMENT)
+            state = {"\\": ESCAPE, '"': WEAK_OPEN, "'": STRONG_OPEN}.get(c, COMPLETE)
+        elif state == ESCAPE:
+            state = COMPLETE
+        elif state == COMPLETE:
+            if c.isspace() and c not in "\n\r":
+                state = WHITESPACE
+            else:
+                state = {"\\": ESCAPE, '"': WEAK_OPEN, "'": STRONG_OPEN}.get(c, COMPLETE)
+        elif state == WEAK_OPEN:
+            state = {"\\": WEAK_OPEN_ESCAPE, '"': COMPLETE}.get(c, WEAK_OPEN)
+        elif state == WEAK_OPEN_ESCAPE:
+            state = WEAK_OPEN
+        elif state == STRONG_OPEN:
+            state = {"\\": STRONG_OPEN_ESCAPE, "'": COMPLETE}.get(c, STRONG_OPEN)
+        elif state == STRONG_OPEN_ESCAPE:
+            state = STRONG_OPEN
+        else:  # COMMENT: dotenvy returns as soon as it reaches one
+            raise AssertionError("should have returned early")
+    return (pos, state)
+
+
+class QuotedLines:
+    r"""iter.rs's QuotedLines: one parseable entry per next(), quotes and all.
+
+    Lines are what dotenvy's reader sees, and it splits them on `\n` only:
+    a lone CR, `\v` or `\f` is content, not a line ending (Python's
+    splitlines cuts on those; dotenvy does not — SME-186 review 1). An
+    entry whose quote never closes takes the lines after it, bytes and all,
+    so a CRLF inside a quoted value stays `\r\n` as it does for the crate;
+    the entry's own final terminator — a `\n`, and a `\r` before it — is
+    what comes off. Each line decodes as it is read, so keys before a line
+    that is not valid UTF-8 keep their values, as they do for dotenvy's
+    line-by-line reading. `line_no` is where the current entry started.
+    """
+
+    def __init__(self, data):
+        parts = data.split(b"\n")
+        lines = [p + b"\n" for p in parts[:-1]]
+        if parts[-1]:
+            lines.append(parts[-1])
+        self.lines = iter(lines)
+        self.read = 0
+        self.line_no = 0
+
+    def __next__(self):
+        buf = ""
+        state = COMPLETE
+        while True:
+            at = len(buf)
+            if at == 0:
+                self.line_no = self.read + 1
+            try:
+                raw = next(self.lines)
+            except StopIteration:
+                if state == COMPLETE:
+                    raise
+                raise StopLoad(self.line_no, "the file ends inside a quoted value")
+            try:
+                line = raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise StopLoad(self.read + 1,
+                               "the line is not valid UTF-8 (%s)" % exc.reason)
+            self.read += 1
+            buf += line
+            # As dotenvy: the accumulated entry, not the new line — so a `#`
+            # line can't masquerade as one while a quote is still open.
+            if buf.lstrip().startswith("#"):
+                return ""
+            pos, state = _eval_end_state(state, line)
+            if state == COMPLETE:
+                if buf.endswith("\n"):
+                    buf = buf[:-1]
+                    if buf.endswith("\r"):
+                        buf = buf[:-1]
+                return buf
+            if state == COMMENT:
+                return buf[:at + pos]
+
+
+def _substitute(name, substitutions, env):
+    """parse.rs's apply_substitution: the environment's value first, then an
+    earlier line's, then empty."""
+    if name in env:
+        return env[name]
+    return substitutions.get(name) or ""
+
+
+def parse_value(text, substitutions, env):
+    """parse.rs's parse_value, state for state. Raises ValueError on a line
+    it can't finish."""
+    output = []
+    strong_quote = False
+    weak_quote = False
+    escaped = False
+    expecting_end = False
+    in_name = False
+    in_block = False
+    name = []
+
+    def close_name():
+        nonlocal in_name, in_block, name
+        output.append(_substitute("".join(name), substitutions, env))
+        in_name = False
+        in_block = False
+        name = []
+
+    for index, c in enumerate(text):
+        if expecting_end:
+            # The value ended at whitespace: only a comment may follow it.
+            if c in " \t":
+                continue
+            if c == "#":
+                break
+            raise ValueError("%s:%d" % (text, index))
+        if escaped:
+            if c in ESCAPES:
+                output.append(c)
+            elif c == "n":
+                output.append("\n")
+            else:
+                raise ValueError("%s:%d" % (text, index))
+            escaped = False
+        elif strong_quote:
+            if c == "'":
+                strong_quote = False
+            else:
+                output.append(c)
+        elif in_name:
+            if c.isalnum():
+                name.append(c)
+            elif in_block:
+                if c == "}":
+                    close_name()
+                else:
+                    name.append(c)
+            elif c == "{" and not name:
+                in_block = True
+            else:
+                close_name()
+                if c == "$":
+                    in_name = True
+                else:
+                    output.append(c)
+        elif c == "$":
+            in_name = True
+        elif weak_quote:
+            if c == '"':
+                weak_quote = False
+            elif c == "\\":
+                escaped = True
+            else:
+                output.append(c)
+        elif c == "'":
+            strong_quote = True
+        elif c == '"':
+            weak_quote = True
+        elif c == "\\":
+            escaped = True
+        elif c in " \t":
+            expecting_end = True
+        else:
+            output.append(c)
+
+    if in_block or strong_quote or weak_quote:
+        raise ValueError("%s:%d" % (text, max(len(text) - 1, 0)))
+    if in_name:
+        close_name()
+    return "".join(output)
+
+
+class Entry:
+    """parse.rs's LineParser over one entry."""
+
+    def __init__(self, text, substitutions, env):
+        self.original = text
+        self.text = text.rstrip()
+        self.pos = 0
+        self.sub = substitutions
+        self.env = env
+
+    def _fail(self):
+        raise ValueError("%s:%d" % (self.original, self.pos))
+
+    def skip_whitespace(self):
+        stripped = self.text.lstrip()
+        self.pos += len(self.text) - len(stripped)
+        self.text = stripped
+
+    def expect_equal(self):
+        if not self.text.startswith("="):
+            self._fail()
+        self.text = self.text[1:]
+        self.pos += 1
+
+    def parse_key(self):
+        if not _key_start(self.text[:1]):
+            self._fail()
+        index = len(self.text)
+        for i, c in enumerate(self.text):
+            if not _key_char(c):
+                index = i
+                break
+        key = self.text[:index]
+        self.pos += index
+        self.text = self.text[index:]
+        return key
+
+    def parse(self):
+        """The entry's (key, value), or None for a blank or comment line."""
+        self.skip_whitespace()
+        if not self.text or self.text.startswith("#"):
+            return None
+        key = self.parse_key()
+        self.skip_whitespace()
+        # `export` is an optional prefix — or, with an `=` after it, a key.
+        if key == "export":
+            try:
+                self.expect_equal()
+            except ValueError:
+                key = self.parse_key()
+                self.skip_whitespace()
+                self.expect_equal()
+        else:
+            self.expect_equal()
+        self.skip_whitespace()
+        if not self.text or self.text.startswith("#"):
+            self.sub[key] = None
+            return (key, "")
+        value = parse_value(self.text, self.sub, self.env)
+        self.sub[key] = value
+        return (key, value)
+
+
+def load(path, env):
+    """The file's (key, value) pairs in order. Raises StopLoad at the first
+    entry that fails to parse, as dotenvy's iteration ends there."""
+    with open(path, "rb") as handle:
+        data = handle.read()
+    # iter.rs's remove_bom, which load() — smelt's path — does before iterating.
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    substitutions = {}
+    entries = QuotedLines(data)
+    while True:
+        try:
+            entry = next(entries)
+        except StopIteration:
+            return
+        try:
+            pair = Entry(entry, substitutions, env).parse()
+        except ValueError as exc:
+            # exc is "<the failing text>:<offset>", the text the line held
+            # itself — and a line that fails to parse is exactly where a
+            # secret sits unquoted, an unquoted DATABASE_URL with a bad
+            # escape in its password being the everyday case. This reason
+            # reaches a terminal and any log beside it, so it names the
+            # offset only, never the text (SME-186 review 1, finding 3).
+            raise StopLoad(entries.line_no,
+                           "invalid format at index %s" % str(exc).rsplit(":", 1)[-1])
+        if pair is not None:
+            yield pair
+
+
+def main(argv):
+    if len(argv) != 3:
+        sys.stderr.write("usage: dotenv-value FILE NAME\n")
+        return 2
+    path, name = argv[1], argv[2]
+    value = None
+    try:
+        for key, found in load(path, os.environ):
+            # dotenvy's Iter::load: the first line setting a key wins.
+            if key == name:
+                value = found
+                break
+    except FileNotFoundError:
+        return 0
+    except IsADirectoryError:
+        sys.stderr.write("dotenv-value: %s is a directory\n" % path)
+        return 0
+    except OSError as exc:
+        sys.stderr.write("dotenv-value: %s: %s\n" % (path, exc.strerror))
+        return 0
+    except StopLoad as stop:
+        sys.stderr.write(
+            "dotenv-value: %s line %d: %s: stopping there, as dotenvy does, "
+            "so keys after it are not read\n" % (path, stop.line_no, stop.reason)
+        )
+        return 0
+    if value is not None:
+        sys.stdout.write(value + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
