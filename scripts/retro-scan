@@ -9,16 +9,18 @@ command that exited non-zero, and long gaps. The Facilitator then reads
 those stretches.
 
   scripts/retro-scan --base https://smelt.example --since 2026-10-18
-  scripts/retro-scan --since 2026-10-18 --claude-session ~/.claude/projects/<p>/<id>.jsonl
+  scripts/retro-scan --since 2026-10-18 --claude-session ~/.claude/projects/<p>/<id>.jsonl --claude-session ~/.claude/projects/<p>/<id>/
   scripts/retro-scan --self-test
 
 --base lists every smelt conversation updated since --since (smelt's own
 server functions, GET /api/conversations and /messages). --claude-session
-adds a Claude Code session's transcript (the orchestrating session's own
-record); it may be given more than once.
+adds Claude Code transcripts: a session's own JSONL, or a directory, which
+means every *.jsonl under it changed since --since (a session's folder holds
+its sub-agents' transcripts in subagents/). It may be given more than once.
 """
 import argparse
 import json
+import pathlib
 import re
 import sys
 import urllib.request
@@ -85,8 +87,10 @@ def smelt_hotspots(messages):
 
 
 def claude_hotspots(lines):
-    """The same for a Claude Code session's JSONL: the human's own messages and interrupts."""
-    out = []
+    """The same for a Claude Code transcript (a session's or a sub-agent's JSONL):
+    the human's own messages and interrupts (in a sub-agent's, the first is its
+    brief), and tool results marked as errors (a failed command among them)."""
+    out, seen_brief = [], False
     for n, line in enumerate(lines, 1):
         try:
             entry = json.loads(line)
@@ -94,18 +98,44 @@ def claude_hotspots(lines):
             continue
         if entry.get("type") != "user" or entry.get("isMeta"):
             continue
+        stamp = entry.get("timestamp")
+        t = when(stamp) if stamp else None
         content = (entry.get("message") or {}).get("content")
-        texts = [content] if isinstance(content, str) else [
-            b.get("text", "") for b in content or [] if isinstance(b, dict) and b.get("type") == "text"]
-        for text in texts:
-            text = text.strip()
+        items = [{"type": "text", "text": content}] if isinstance(content, str) else [
+            b for b in content or [] if isinstance(b, dict)]
+        for b in items:
+            if b.get("type") == "tool_result":
+                if b.get("is_error"):
+                    c = b.get("content")
+                    text = c if isinstance(c, str) else " ".join(
+                        x.get("text", "") for x in c or [] if isinstance(x, dict))
+                    code = re.match(r"\s*Exit code (-?\d+)", text)
+                    out.append((n, t, f"exit {code.group(1)}" if code else "tool-error", one_line(text)))
+                continue
+            if b.get("type") != "text":
+                continue
+            text = b.get("text", "").strip()
             if not text or text.startswith("<"):  # harness-injected context, not the human
                 continue
-            stamp = entry.get("timestamp")
-            t = when(stamp) if stamp else None
-            kind = "stop" if text.startswith("[Request interrupted") else "user"
+            if text.startswith("[Request interrupted"):
+                kind = "stop"
+            elif not seen_brief:
+                kind = "brief"
+            else:
+                kind = "user"
+            seen_brief = True
             out.append((n, t, kind, one_line(text)))
     return out
+
+
+def transcripts(path, since):
+    """A JSONL file, or every *.jsonl under a directory (a session's folder holds
+    its sub-agents' transcripts in subagents/) changed since `since`."""
+    path = pathlib.Path(path).expanduser()
+    if path.is_file():
+        return [path]
+    return sorted(f for f in path.rglob("*.jsonl")
+                  if datetime.fromtimestamp(f.stat().st_mtime) >= since)
 
 
 def report(title, header, spots):
@@ -150,13 +180,18 @@ def self_test():
     jsonl = [
         json.dumps({"type": "user", "timestamp": "2026-10-18T10:00:00Z", "message": {"content": "do the thing"}}),
         json.dumps({"type": "user", "message": {"content": [{"type": "tool_result", "content": "x"}]}}),
+        json.dumps({"type": "user", "message": {"content": [
+            {"type": "tool_result", "is_error": True, "content": "Exit code 2\nboom"}]}}),
+        json.dumps({"type": "user", "message": {"content": [
+            {"type": "tool_result", "is_error": True, "content": [{"type": "text", "text": "File not found"}]}]}}),
+        json.dumps({"type": "user", "message": {"content": "use B"}}),
         json.dumps({"type": "user", "message": {"content": "<system-reminder>ctx</system-reminder>"}}),
         json.dumps({"type": "user", "message": {"content": [{"type": "text", "text": "[Request interrupted by user]"}]}}),
         json.dumps({"type": "assistant", "message": {"content": "hi"}}),
         "not json",
     ]
     kinds = [k for _, _, k, _ in claude_hotspots(jsonl)]
-    assert kinds == ["user", "stop"], kinds
+    assert kinds == ["brief", "exit 2", "tool-error", "user", "stop"], kinds
     print("retro-scan self-test: ok")
 
 
@@ -164,7 +199,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--base", help="the smelt deployment whose conversations to scan")
     p.add_argument("--since", help="the last retrospective's date (ISO 8601)")
-    p.add_argument("--claude-session", action="append", default=[], help="a Claude Code session JSONL to scan")
+    p.add_argument("--claude-session", action="append", default=[], help="a Claude Code transcript JSONL, or a directory of them")
     p.add_argument("--self-test", action="store_true")
     a = p.parse_args()
     if a.self_test:
@@ -179,10 +214,11 @@ def main():
             msgs = [m for m in get(a.base, f"/api/conversations/{c['id']}/messages") if when(m["created_at"]) >= since]
             span = f"{c['created_at'][:16]} → {c['updated_at'][:16]}, {len(msgs)} messages in the window"
             report(f"Conversation {c['id']}: {one_line(c['title'])}", span, smelt_hotspots(msgs))
-    for path in a.claude_session:
-        with open(path, encoding="utf-8") as f:
-            spots = [s for s in claude_hotspots(f) if s[1] is None or s[1] >= since]
-        report(f"Claude Code session {path}", "(line numbers, not message ids)", spots)
+    for given in a.claude_session:
+        for path in transcripts(given, since):
+            with open(path, encoding="utf-8") as f:
+                spots = [s for s in claude_hotspots(f) if s[1] is None or s[1] >= since]
+            report(f"Claude Code transcript {path}", "(line numbers, not message ids)", spots)
 
 
 if __name__ == "__main__":

@@ -32,7 +32,7 @@ On each pass over the project's tickets in Linear, it first rebuilds who owns wh
 
 It comments on the ticket, `Project Manager: moved to Up Next because …`, naming the runners-up. It tells the user in its next report, so they can swap the pick before the plan is approved. The user's own moves always take precedence: a ticket they put in Up Next means the Backlog isn't read.
 
-**Retrospectives.** On each pass it checks the "Next retrospective" ticket against the trigger in [Retrospective](../process/close-out.md#retrospective), whichever project it's working. When one holds, it moves the ticket to Up Next and starts a [Facilitator](facilitator.md) as a fresh Claude Code sub-agent with only the brief that persona names (the date range, the smelt address and its own sessions' transcript paths), and passes its report to the user unedited.
+**Retrospectives.** On each pass it checks the "Next retrospective" ticket against the trigger in [Retrospective](../process/close-out.md#retrospective), whichever project it's working. When one holds, it moves the ticket to Up Next and starts a [Facilitator](facilitator.md) as a fresh Claude Code sub-agent with only the brief that persona names (the date range, the smelt address, and its own sessions' transcripts and folders, which hold their sub-agents' transcripts), and passes its report to the user unedited.
 
 **When a bug bash or design review is due** (see [Bug bash](../process/sweeps.md#bug-bash-every-few-projects) and [Design review](../process/sweeps.md#design-review-every-few-projects-alternating-with-bug-bashes)), it says so in its report. It doesn't start one: a sweep is a project of its own, and the user directs the Project Manager to it.
 
