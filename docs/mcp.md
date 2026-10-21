@@ -2,7 +2,7 @@
 
 smelt is an MCP client (SME-15): the model can use tools from externally hosted MCP servers, configured on the `/mcp-servers` page. [`rmcp`](https://crates.io/crates/rmcp), the official Rust MCP SDK, owns the protocol (JSON-RPC, Streamable HTTP, sessions, notifications) and the OAuth client. smelt's side is:
 
-- `src/mcp.rs`: the connection registry, tool naming, calling a tool and turning its result into a `ToolResult` string.
+- `src/mcp/`: the connection registry (`mod.rs`), tool naming and the model's tool list (`tools.rs`), calling a tool and turning its result into a `ToolResult` string (`call.rs`), and an OAuth server's shared `AuthClient` and sign-in check (`oauth_client.rs`).
 - `src/mcp_oauth.rs`: OAuth wiring around `rmcp::transport::auth` (SME-16).
 - `src/api/mcp.rs`: the `/mcp-servers` pages' server functions (listed in [api.md](api.md#current-endpoints)).
 
