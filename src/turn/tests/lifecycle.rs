@@ -284,9 +284,10 @@ async fn fail_a_users_turn(pool: &PgPool, conversation_id: i64) {
 
 /// B30, interleaving: a wake (a command finished during the user's
 /// turn) is counted and queued while the user's turn runs, and that
-/// turn then fails; the wake finds nothing to do. The user's error must
-/// be kept: today the wake took a newer turn generation when it was
-/// counted, so the failure kept nothing.
+/// turn then drains the command and fails; the wake finds nothing to do.
+/// The user's error must be kept: today the wake took a newer turn
+/// generation when it was counted, so the failure kept nothing. The
+/// command is what gets the wake counted at all (SME-218).
 #[sqlx::test]
 async fn test_a_wake_queued_behind_a_failing_turn_keeps_its_error(pool: PgPool) {
     let _guard = lock_turn_tests();
@@ -300,6 +301,7 @@ async fn test_a_wake_queued_behind_a_failing_turn_keeps_its_error(pool: PgPool) 
         .await
         .expect("the user's turn saves its message")
         .expect("hook");
+    unnotified_finished_command(&pool, conversation_id, "cmd-b30").await;
     let wake = tokio::spawn({
         let pool = pool.clone();
         async move { wake_conversation(&pool, conversation_id).await }
