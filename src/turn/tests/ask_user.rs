@@ -84,7 +84,7 @@ fn message_after_call(request: &serde_json::Value, tool_use_id: &str) -> serde_j
     messages[call + 1].clone()
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_ask_user_ends_the_turn_and_waits(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_300).await.expect("conversation");
@@ -106,7 +106,7 @@ async fn test_ask_user_ends_the_turn_and_waits(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_ask_user_with_another_tool_saves_its_result_and_waits(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_301).await.expect("conversation");
@@ -133,7 +133,7 @@ async fn test_ask_user_with_another_tool_saves_its_result_and_waits(pool: PgPool
     assert!(pending_question(&pool, conversation.id).await.expect("read").is_some());
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_bad_or_second_ask_user_is_an_error_result(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_302).await.expect("conversation");
@@ -169,7 +169,7 @@ async fn test_a_bad_or_second_ask_user_is_an_error_result(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_notice_while_a_question_waits_is_saved_without_calling_the_model(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_303).await.expect("conversation");
@@ -186,7 +186,7 @@ async fn test_a_notice_while_a_question_waits_is_saved_without_calling_the_model
     assert!(pending_question(&pool, conversation.id).await.expect("read").is_some(), "still waiting");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_answering_sends_the_result_right_after_the_call(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_304).await.expect("conversation");
@@ -210,7 +210,7 @@ async fn test_answering_sends_the_result_right_after_the_call(pool: PgPool) {
     assert_eq!(db::get_pending_question(&pool, conversation.id).await.expect("read"), None);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_message_instead_of_an_answer_dismisses_the_question(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_305).await.expect("conversation");
@@ -230,7 +230,7 @@ async fn test_a_message_instead_of_an_answer_dismisses_the_question(pool: PgPool
     assert_eq!(db::get_pending_question(&pool, conversation.id).await.expect("read"), None);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_question_takes_one_valid_answer(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_306).await.expect("conversation");
@@ -261,7 +261,7 @@ async fn test_a_question_takes_one_valid_answer(pool: PgPool) {
 /// saved its own message is running (a notice's turn, paused here right
 /// after its save) is taken by that turn before it calls the model, not
 /// left behind with the call answered "unfinished".
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_answer_landing_mid_turn_is_taken_before_the_model_call(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_307).await.expect("conversation");
@@ -291,7 +291,7 @@ async fn test_an_answer_landing_mid_turn_is_taken_before_the_model_call(pool: Pg
 /// Code review 2: the question is recorded before the reply's other
 /// tools run, so a Stop (or restart) while they run leaves it on its card
 /// rather than losing it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_question_is_recorded_before_the_replys_other_tools_run(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_308).await.expect("conversation");
@@ -394,7 +394,7 @@ fn tool_result(tool_use_id: &str, content: &str) -> anthropic::ContentBlock {
 /// queued behind another turn: the message still dismisses the question,
 /// as it does when it runs, and the model later gets one result for the
 /// call, the user's text right after it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_written_answer_caught_queued_by_a_stop_dismisses_the_question(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_312).await.expect("conversation");
@@ -437,7 +437,7 @@ async fn test_a_written_answer_caught_queued_by_a_stop_dismisses_the_question(po
 
 /// A notice a Stop catches queued isn't the user's reply: the question
 /// still waits, and the notice is saved as it is.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_notice_caught_queued_by_a_stop_leaves_the_question_waiting(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_310).await.expect("conversation");
@@ -462,7 +462,7 @@ async fn test_a_notice_caught_queued_by_a_stop_leaves_the_question_waiting(pool:
 
 /// An answer recorded from the card before the Stop goes first in the
 /// stopped message, as it would in a turn that ran.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_answer_recorded_before_the_stop_goes_with_the_stopped_message(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_311).await.expect("conversation");

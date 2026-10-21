@@ -258,7 +258,7 @@ async fn test_a_conversation_stream_relays_turns_changed() {
 /// A subscription belongs to its connection: once the response is
 /// dropped (the tab closed or reloaded), nothing should still be
 /// listening on the conversation's channel.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_dropped_event_subscription_stops_listening(pool: PgPool) {
     // An id no other test's conversation has: subscriptions are counted
     // per id across the process, and every test database counts from 1

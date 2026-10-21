@@ -83,7 +83,7 @@ fn spawn_decide(
 /// B32. Interleaving: Trust on a card is held at its load while Decline
 /// answers the same card (another tab). The card is answered once:
 /// Trust stands and Decline is refused.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_trust_and_decline_on_one_card_settle_once(pool: PgPool) {
     let _turn = ONE_AT_A_TIME.lock().await;
     let conversation = db::create_conversation(&pool).await.expect("conversation");
@@ -112,7 +112,7 @@ async fn test_trust_and_decline_on_one_card_settle_once(pool: PgPool) {
 /// Interleaving: Trust on conversation A's card is held at its load
 /// while Decline answers conversation B's card for the same remote.
 /// Trust settles the remote, and B's card went with it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_trust_and_decline_on_two_conversations_cards_settle_once(pool: PgPool) {
     let _turn = ONE_AT_A_TIME.lock().await;
     let a = db::create_conversation(&pool).await.expect("conversation A");
@@ -149,7 +149,7 @@ async fn test_trust_and_decline_on_two_conversations_cards_settle_once(pool: PgP
 /// remote undecided) is held at its card's insert while Decline answers
 /// conversation A's card for the same remote. The Decline drops B's
 /// card and tells B, rather than leave it asking about a declined remote.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_card_asked_for_while_a_decline_waits_is_dropped_by_it(pool: PgPool) {
     let _turn = ONE_AT_A_TIME.lock().await;
     let a = db::create_conversation(&pool).await.expect("conversation A");
@@ -215,7 +215,7 @@ fn spawn_delete(pool: &PgPool, conversation_id: i64) -> tokio::task::JoinHandle<
 /// The delete's cascade takes B's loaded file and then its card; a
 /// Decline that dropped B's card before unloading took them the other
 /// way round, and Postgres aborted one of the two as a deadlock.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_decline_and_a_conversation_delete_dont_deadlock(pool: PgPool) {
     let _turn = ONE_AT_A_TIME.lock().await;
     let (a, card_a, b, repo_b) = a_card_and_b(&pool).await;
@@ -241,7 +241,7 @@ async fn test_a_decline_and_a_conversation_delete_dont_deadlock(pool: PgPool) {
 /// (a card about the remote) is held at its cascade into B's card while
 /// Decline answers A's card and has listed B's card among the others.
 /// A conversation deleted meanwhile is skipped, not a failed decision.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_conversation_deleted_while_a_decline_drops_its_card_doesnt_fail_it(pool: PgPool) {
     let _turn = ONE_AT_A_TIME.lock().await;
     let (a, card_a, b, repo_b) = a_card_and_b(&pool).await;
@@ -266,7 +266,7 @@ async fn test_a_conversation_deleted_while_a_decline_drops_its_card_doesnt_fail_
 /// deleted. Trust took its card before its load's foreign key took a
 /// share lock on A's row, and the delete takes A's row before its card,
 /// so the two deadlocked. Trust now locks A's row first.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_trust_and_a_delete_of_its_own_conversation_dont_deadlock(pool: PgPool) {
     let _turn = ONE_AT_A_TIME.lock().await;
     let (a, card_a, _, _) = a_card_and_b(&pool).await;
@@ -328,7 +328,7 @@ async fn decline_while_deleting(pool: &PgPool, a: i64, card_a: &TrustRequest, b:
 /// the second's. B's delete cascades into them in that physical order
 /// and is held at the second card while Decline answers A's card, which
 /// drops B's cards in id order.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_decline_and_a_delete_of_a_conversation_with_two_cards_dont_deadlock(pool: PgPool) {
     let _turn = ONE_AT_A_TIME.lock().await;
     let (a, card_a, b, repo_b) = a_card_and_b(&pool).await;
@@ -349,7 +349,7 @@ async fn test_a_decline_and_a_delete_of_a_conversation_with_two_cards_dont_deadl
 /// files loaded from the remote, the first loaded again so its row
 /// moved. B's delete is held at the second while Decline answers A's
 /// card and unloads both through the index.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_decline_and_a_delete_of_a_conversation_with_two_loaded_files_dont_deadlock(pool: PgPool) {
     let _turn = ONE_AT_A_TIME.lock().await;
     let (a, card_a, b, repo_b) = a_card_and_b(&pool).await;

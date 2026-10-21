@@ -59,7 +59,7 @@ async fn connected(server_id: i64) -> bool {
 /// The bug as reported: a connect a turn started before a URL edit
 /// finished after it and was kept, so every later turn used the old
 /// server's tools until a restart.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_connect_finishing_after_a_url_edit_is_not_kept(pool: sqlx::PgPool) {
     let (a, b) = (gated_http::spawn("tool_a").await, gated_http::spawn("tool_b").await);
     let config = create_static_server(&pool, &a.url).await;
@@ -82,7 +82,7 @@ async fn test_a_connect_finishing_after_a_url_edit_is_not_kept(pool: sqlx::PgPoo
 
 /// The same with only the headers changed: the next connect sends the
 /// new header.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_connect_finishing_after_a_header_edit_is_not_kept(pool: sqlx::PgPool) {
     let a = gated_http::spawn("tool_a").await;
     let created = create_static_server(&pool, &a.url).await;
@@ -111,7 +111,7 @@ async fn test_a_connect_finishing_after_a_header_edit_is_not_kept(pool: sqlx::Pg
 
 /// A server deleted while a connect to it was in flight stays gone, and
 /// a tool call for it never reaches the old server.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_connect_finishing_after_a_delete_is_not_kept(pool: sqlx::PgPool) {
     let a = gated_http::spawn("tool_a").await;
     let config = create_static_server(&pool, &a.url).await;
@@ -140,7 +140,7 @@ async fn test_a_connect_finishing_after_a_delete_is_not_kept(pool: sqlx::PgPool)
 /// A connect to the old URL that fails after an edit isn't the new
 /// server failing: the next turn tries the new URL rather than skipping
 /// the server for `RETRY_AFTER_FAILURE`.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_connect_failing_after_an_edit_is_not_recorded_as_a_failure(pool: sqlx::PgPool) {
     let (a, b) = (gated_http::spawn("tool_a").await, gated_http::spawn("tool_b").await);
     let config = create_static_server(&pool, &a.url).await;
@@ -164,7 +164,7 @@ async fn test_a_connect_failing_after_an_edit_is_not_recorded_as_a_failure(pool:
 /// A caller holding the config it read before an edit (a status check,
 /// or a caller queued behind the interrupted connect) connects to the
 /// row as it is now, not to its copy.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_caller_holding_the_config_from_before_an_edit_connects_to_the_new_one(pool: sqlx::PgPool) {
     let (a, b) = (gated_http::spawn("tool_a").await, gated_http::spawn("tool_b").await);
     let config = create_static_server(&pool, &a.url).await;
@@ -180,7 +180,7 @@ async fn test_a_caller_holding_the_config_from_before_an_edit_connects_to_the_ne
 
 /// A `tools/list_changed` re-list on a connection that was evicted and
 /// replaced meanwhile wrote the old server's tools onto the new one.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_relist_finishing_after_an_evict_does_not_overwrite_the_new_connection(pool: sqlx::PgPool) {
     let (a, b) = (gated_http::spawn("tool_a").await, gated_http::spawn("tool_b").await);
     let config = create_static_server(&pool, &a.url).await;
@@ -210,7 +210,7 @@ async fn test_a_relist_finishing_after_an_evict_does_not_overwrite_the_new_conne
 /// Guards the check against refusing too much: a connect no evict of
 /// its own server interrupted is kept (another server's evict doesn't
 /// count), and after an interrupted one, the next connect is kept.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_connect_the_evict_did_not_interrupt_is_kept(pool: sqlx::PgPool) {
     let a = gated_http::spawn("tool_a").await;
     let config = create_static_server(&pool, &a.url).await;

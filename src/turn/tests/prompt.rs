@@ -100,7 +100,7 @@ fn test_system_prompt_leaves_out_empty_volume_and_mcp_lines() {
     assert!(!environment.contains("MCP servers"), "got: {environment}");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_prompt_environment_reads_volumes_and_mcp_servers(pool: PgPool) {
     db::create_sandbox_volume(&pool, "cargo-cache", "/home/sandbox/.cargo")
         .await
@@ -149,7 +149,7 @@ async fn test_prompt_environment_reads_volumes_and_mcp_servers(pool: PgPool) {
 
 /// Every turn's request carries the system prompt built from that
 /// turn's environment.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_run_turn_sends_the_system_prompt(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -175,7 +175,7 @@ async fn test_run_turn_sends_the_system_prompt(pool: PgPool) {
 
 /// Compaction's summarization call keeps its own prompt; only the real
 /// turn after it gets the agent's system prompt.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_compaction_keeps_its_own_system_prompt(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -226,7 +226,7 @@ async fn test_compaction_keeps_its_own_system_prompt(pool: PgPool) {
 
 /// On a provider with prompt caching on, the turn's request carries both
 /// cache markers; compaction's one-off summarization call carries neither.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_caching_provider_marks_turn_requests_but_not_compaction(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -284,7 +284,7 @@ async fn test_a_caching_provider_marks_turn_requests_but_not_compaction(pool: Pg
 }
 
 /// The detail view shows exactly the system prompt a turn sends.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_context_detail_shows_the_system_prompt_a_turn_sends(pool: PgPool) {
     let conversation = db::create_conversation(&pool)
         .await
@@ -298,7 +298,7 @@ async fn test_context_detail_shows_the_system_prompt_a_turn_sends(pool: PgPool) 
 }
 
 /// The detail view lists the loaded AGENTS.md files on their own.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_context_detail_lists_loaded_instructions(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let repo = db::create_conversation_repo(&pool, conversation.id, "git@github.com:o/r.git", "github.com/o/r", None, "r")

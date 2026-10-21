@@ -104,7 +104,7 @@ async fn remove_pre_fix_objects(client: &kube::Client, [claim, pod, server, gone
 /// dev database) labels its conversation's claim, pod and server pod as
 /// its own at startup, so its watch, sweep and teardown see them again; a
 /// claim of a conversation it no longer has is left as it was.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_owning_database_adopts_its_unlabelled_objects(pool: PgPool) {
     let client = test_client().await;
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -128,7 +128,7 @@ async fn test_the_owning_database_adopts_its_unlabelled_objects(pool: PgPool) {
 
 /// SME-115: a database that didn't make them (a scratch one) adopts
 /// nothing, even for a conversation id it happens to have too.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_scratch_database_adopts_nothing(pool: PgPool) {
     let client = test_client().await;
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -220,7 +220,7 @@ async fn test_the_owner_tears_down_a_conversation_adoption_missed() {
 /// for the database that owns it, instead of closing the record and
 /// leaving the pod running (every later start of the conversation would
 /// then wait on it and time out).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_owner_terminates_a_pod_adoption_missed(pool: PgPool) {
     let client = test_client().await;
     let pods = pods_api(&client);
@@ -263,7 +263,7 @@ async fn pod_kept(client: &kube::Client, name: &str) -> bool {
 /// The database that owns such objects still stops it, tears it down with
 /// its conversation, and adopts it at startup while its record is live:
 /// the record names it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_owner_handles_a_pod_with_no_labels_named_by_its_record(pool: PgPool) {
     let client = test_client().await;
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -359,7 +359,7 @@ async fn test_the_wait_for_old_pods_ignores_another_databases() {
 /// database's claims (A, the dev server's) or one from before the fix.
 /// Before the fix it deleted all three. Runs the sweep for real in the
 /// shared test namespace: it can't reach another test's claims either.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_sweep_deletes_only_its_own_databases_orphans(pool: PgPool) {
     let client = test_client().await;
     let ours = db::smelt_instance(&pool).await.expect("instance").id;

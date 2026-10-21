@@ -37,7 +37,7 @@ async fn own_sandbox(pool: &PgPool) -> kube::Client {
 
 /// SME-134: the harness sweeps the namespace of old leftovers once per
 /// process, however many tests start.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_own_sandbox_sweeps_once_per_process(pool: PgPool) {
     own_sandbox(&pool).await;
     own_sandbox(&pool).await;
@@ -159,7 +159,7 @@ async fn kept_objects(pool: &PgPool, client: &kube::Client) -> Vec<String> {
 /// its own task (here by the time limit) leaves nothing behind. Teardown
 /// waits the start out and keeps its lock, so nothing the start makes
 /// outlives the deletes.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_teardown_waits_out_a_pod_start_the_scenario_left_running(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     let conversation = db::create_conversation(&pool).await.expect("create conversation");

@@ -1,6 +1,6 @@
 use super::*;
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_replies_resolve_their_own_requests_in_any_order(pool: PgPool) {
     let (_, pod_id) = pod_row(&pool).await;
     let mut agent = fake_agent(pod_id, current(), Duration::ZERO).await;
@@ -27,7 +27,7 @@ async fn test_replies_resolve_their_own_requests_in_any_order(pool: PgPool) {
 
 /// The agent's own reason reaches the model, for a terminal action too,
 /// instead of "no such terminal".
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_agent_refusal_of_create_terminal_reaches_the_model_verbatim(pool: PgPool) {
     let (conversation_id, pod_id) = pod_row(&pool).await;
     let mut agent = fake_agent(pod_id, current(), Duration::ZERO).await;
@@ -50,7 +50,7 @@ async fn test_an_agent_refusal_of_create_terminal_reaches_the_model_verbatim(poo
 
 /// A reply that comes after its request timed out answers nothing, and
 /// the next request still gets its own.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_request_times_out_and_its_late_reply_answers_nothing(pool: PgPool) {
     let (_, pod_id) = pod_row(&pool).await;
     let mut agent = fake_agent(pod_id, current(), Duration::ZERO).await;
@@ -75,7 +75,7 @@ async fn test_a_request_times_out_and_its_late_reply_answers_nothing(pool: PgPoo
 
 /// Waiters learn at once that the connection dropped, instead of
 /// sitting out the whole timeout.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_dropped_connection_fails_waiting_requests_at_once(pool: PgPool) {
     let (_, pod_id) = pod_row(&pool).await;
     let mut agent = fake_agent(pod_id, current(), Duration::ZERO).await;
@@ -95,7 +95,7 @@ async fn test_a_dropped_connection_fails_waiting_requests_at_once(pool: PgPool) 
 }
 
 /// Protocol errors with a request id fail that request at once.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_protocol_error_fails_its_request_at_once(pool: PgPool) {
     let (_, pod_id) = pod_row(&pool).await;
     let mut agent = fake_agent(pod_id, current(), Duration::ZERO).await;
@@ -117,7 +117,7 @@ async fn test_a_protocol_error_fails_its_request_at_once(pool: PgPool) {
 
 /// An event from a newer agent that smelt doesn't know is skipped, and
 /// the connection carries on.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_unknown_event_is_ignored(pool: PgPool) {
     let (_, pod_id) = pod_row(&pool).await;
     let mut agent = fake_agent(pod_id, current(), Duration::ZERO).await;
@@ -134,7 +134,7 @@ async fn test_an_unknown_event_is_ignored(pool: PgPool) {
 }
 
 /// Two callers that need the agent at once share one connection.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_two_callers_connecting_at_once_make_one_connection(pool: PgPool) {
     let (_, pod_id) = pod_row(&pool).await;
     let agent = fake_agent(pod_id, current(), Duration::from_millis(300)).await;
@@ -146,7 +146,7 @@ async fn test_two_callers_connecting_at_once_make_one_connection(pool: PgPool) {
 
 /// A pod torn down while its connection was being made keeps no
 /// connection: nothing registered, and the socket closed.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_teardown_during_a_connect_leaves_no_connection(pool: PgPool) {
     let (_, pod_id) = pod_row(&pool).await;
     let mut agent = fake_agent(pod_id, current(), Duration::from_millis(500)).await;

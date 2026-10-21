@@ -245,7 +245,7 @@ async fn stored_credentials(pool: &PgPool, server_id: i64) -> Option<serde_json:
         .map(|json| json.0)
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_callback_carrying_the_advertised_issuer_saves_credentials(pool: PgPool) {
     let base_url = spawn_mock_oauth_server(MockMetadata::Issuer {
         iss_supported: true,
@@ -270,7 +270,7 @@ async fn test_a_callback_carrying_the_advertised_issuer_saves_credentials(pool: 
 /// B4 (SME-122): an authorization server whose metadata names a
 /// `javascript:` authorization endpoint gets no URL handed to the
 /// browser, and leaves no attempt pending.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_javascript_authorization_endpoint_is_refused(pool: PgPool) {
     let base_url = spawn_mock_oauth_server(MockMetadata::JavascriptEndpoint).await;
     let config = create_oauth_server(&pool, &base_url).await;
@@ -326,7 +326,7 @@ async fn assert_attempt_cleared(server_id: i64, state: &str, base_url: &str) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_callback_without_the_advertised_issuer_is_rejected(pool: PgPool) {
     let base_url = spawn_mock_oauth_server(MockMetadata::Issuer {
         iss_supported: true,
@@ -347,7 +347,7 @@ async fn test_a_callback_without_the_advertised_issuer_is_rejected(pool: PgPool)
     assert_attempt_cleared(config.id, &state, &base_url).await;
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_callback_from_a_different_issuer_is_rejected(pool: PgPool) {
     let base_url = spawn_mock_oauth_server(MockMetadata::Issuer {
         iss_supported: true,
@@ -372,7 +372,7 @@ async fn test_a_callback_from_a_different_issuer_is_rejected(pool: PgPool) {
 }
 
 /// SEP-2468 only requires `iss` from a provider that advertises it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_callback_without_iss_succeeds_when_the_provider_does_not_advertise_it(
     pool: PgPool,
 ) {
@@ -402,7 +402,7 @@ fn error_callback(state: Option<&str>, iss: Option<&str>) -> CallbackParams {
     }
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_error_callback_from_the_advertised_issuer_shows_its_error_and_ends_the_attempt(
     pool: PgPool,
 ) {
@@ -427,7 +427,7 @@ async fn test_an_error_callback_from_the_advertised_issuer_shows_its_error_and_e
 /// An error callback with the attempt's state but an issuer smelt can't
 /// verify shows `UNVERIFIED_ERROR`, not the provider's text, and still ends
 /// the attempt: only the provider's redirect can carry the state.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_error_callback_with_the_state_but_an_unverified_issuer_hides_its_text(
     pool: PgPool,
 ) {
@@ -455,7 +455,7 @@ async fn test_an_error_callback_with_the_state_but_an_unverified_issuer_hides_it
 /// SME-177 B23: an error callback without the attempt's state shows
 /// `UNVERIFIED_ERROR` and leaves the attempt pending, so the user's own
 /// callback still completes it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_error_callback_without_the_state_hides_its_text_and_keeps_the_attempt(
     pool: PgPool,
 ) {
@@ -483,7 +483,7 @@ async fn test_an_error_callback_without_the_state_hides_its_text_and_keeps_the_a
     }
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_error_callback_with_no_pending_attempt_hides_its_text(pool: PgPool) {
     let base_url = spawn_mock_oauth_server(MockMetadata::None).await;
     let config = create_oauth_server(&pool, &base_url).await;
@@ -497,7 +497,7 @@ async fn test_an_error_callback_with_no_pending_attempt_hides_its_text(pool: PgP
 
 /// SEP-2468 only requires `iss` from a provider that advertises it, on
 /// error callbacks as on code callbacks.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_error_callback_without_iss_shows_its_error_when_the_provider_does_not_advertise_it(
     pool: PgPool,
 ) {
@@ -521,7 +521,7 @@ async fn test_an_error_callback_without_iss_shows_its_error_when_the_provider_do
 
 /// RFC 8414 §3.3: metadata must name the server it was fetched from.
 /// `rmcp` enforces this; the test checks it still does through `start`.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_start_refuses_metadata_naming_a_different_issuer(pool: PgPool) {
     let base_url = spawn_mock_oauth_server(MockMetadata::WrongIssuer).await;
     let config = create_oauth_server(&pool, &base_url).await;
@@ -540,7 +540,7 @@ async fn test_start_refuses_metadata_naming_a_different_issuer(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_start_and_handle_callback_persists_credentials_and_a_later_fetch_refreshes(
     pool: PgPool,
 ) {
@@ -605,7 +605,7 @@ async fn test_start_and_handle_callback_persists_credentials_and_a_later_fetch_r
     assert_eq!(token, "refreshed-access-token");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_handle_callback_without_a_pending_attempt_is_a_clear_error(pool: PgPool) {
     let _ = pool;
     let result = handle_callback(999_999, "some-code", "some-state", None).await;
@@ -618,7 +618,7 @@ async fn test_handle_callback_without_a_pending_attempt_is_a_clear_error(pool: P
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_disconnect_clears_stored_credentials(pool: PgPool) {
     let base_url = spawn_mock_oauth_server(MockMetadata::None).await;
     let created = db::create_mcp_server_config(
@@ -660,7 +660,7 @@ async fn change_url(pool: &PgPool, config: &McpServerConfig, name: &str, url: &s
 
 /// A URL edit after Connect: the token issued for the old address isn't
 /// saved onto the new one, and the error says why.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_callback_after_a_url_edit_saves_nothing(pool: PgPool) {
     let base_url = spawn_mock_oauth_server(MockMetadata::None).await;
     let config = create_oauth_server(&pool, &base_url).await;
@@ -681,7 +681,7 @@ async fn test_a_callback_after_a_url_edit_saves_nothing(pool: PgPool) {
 /// The interleaving that dropping `PENDING` on an edit can't cover: the
 /// callback has already taken its attempt and is waiting on the
 /// provider's token endpoint when the URL changes.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_url_edit_during_the_code_exchange_saves_nothing(pool: PgPool) {
     let gate = Arc::new(TokenGate::default());
     let base_url = spawn_gated_mock_oauth_server(MockMetadata::None, Some(gate.clone())).await;
@@ -721,7 +721,7 @@ async fn test_a_url_edit_during_the_code_exchange_saves_nothing(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_callback_after_the_server_is_deleted_saves_nothing(pool: PgPool) {
     let base_url = spawn_mock_oauth_server(MockMetadata::None).await;
     let config = create_oauth_server(&pool, &base_url).await;
@@ -746,7 +746,7 @@ async fn test_a_callback_after_the_server_is_deleted_saves_nothing(pool: PgPool)
 
 /// The guard is on the URL alone: a rename, or an edit that puts the URL
 /// back, leaves the sign-in valid for the address the row now has.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_callback_after_edits_that_leave_the_url_as_it_was_saves(pool: PgPool) {
     let base_url = spawn_mock_oauth_server(MockMetadata::None).await;
     for case in ["a rename", "a URL changed and changed back"] {
@@ -775,7 +775,7 @@ async fn test_a_callback_after_edits_that_leave_the_url_as_it_was_saves(pool: Pg
 /// connection, or a call still holding its client after `evict`); it
 /// reads the store on every request, so once the row holds Y's grant it
 /// must not hand that grant out for X.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_connection_manager_for_an_old_url_does_not_use_the_new_urls_grant(pool: PgPool) {
     let base_url = spawn_mock_oauth_server(MockMetadata::None).await;
     let config = create_oauth_server(&pool, &base_url).await;
@@ -816,7 +816,7 @@ async fn test_a_connection_manager_for_an_old_url_does_not_use_the_new_urls_gran
 /// SME-177 B24: rmcp clears a connection's store when the provider's
 /// issuer changed since its load (`initialize_from_store`). A grant saved
 /// after that load (a Reconnect) is not the one it judged, and stays.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_connection_stores_clear_leaves_a_grant_saved_after_its_load(pool: PgPool) {
     let base_url = spawn_mock_oauth_server(MockMetadata::None).await;
     let config = create_oauth_server(&pool, &base_url).await;

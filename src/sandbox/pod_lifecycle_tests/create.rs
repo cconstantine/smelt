@@ -5,7 +5,7 @@ use super::*;
 /// instead of waiting out the running timeout. A hand-built pod
 /// with the sandbox's pull policy and an image no one built; its deadline
 /// bounds its life if the test is killed before teardown.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_pod_whose_image_is_missing_fails_fast_saying_how_to_build_it(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
@@ -62,7 +62,7 @@ async fn test_a_pod_whose_image_is_missing_fails_fast_saying_how_to_build_it(poo
 /// SME-33, SME-32: `create_pod` gives the pod its conversation's own
 /// Docker data claim (so its images outlive the pod) and `/workspace`
 /// claim, and `teardown_conversation` deletes both with the pod.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_pod_mounts_the_conversations_docker_and_workspace_claims(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
@@ -116,7 +116,7 @@ async fn test_create_pod_mounts_the_conversations_docker_and_workspace_claims(po
 /// SME-51 B7: a `create_pod` whose caller goes away (a Stop drops the turn
 /// mid-call) still finishes: the pod gets its git setup and is announced
 /// Running, rather than being left at whatever step it had reached.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_pod_finishes_when_its_caller_goes_away(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
@@ -150,7 +150,7 @@ const VOLUME_MOUNT_SESSION_LABEL: &str = "volume-mount";
 /// SME-17 phase 4: `create_volume`/`delete_volume` manage a real claim
 /// alongside the `sandbox_volumes` row, and the volume mounted into a real
 /// pod is writable and readable.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_volumes_are_backed_by_claims_and_mounted_into_pods(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     // Earlier runs' volume-mount pods, found by prefix since each name
@@ -219,7 +219,7 @@ async fn test_volumes_are_backed_by_claims_and_mounted_into_pods(pool: PgPool) {
 /// live: the next call to it gets `AgentUnreachable`, and the same crash
 /// cleanup a failed connect runs closes its terminals and the pod's record,
 /// so the conversation has no live pod left.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_pod_deleted_behind_smelts_back_is_cleaned_up_on_next_use(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
@@ -250,7 +250,7 @@ async fn test_a_pod_deleted_behind_smelts_back_is_cleaned_up_on_next_use(pool: P
 /// `forget_connection`; the pod is left alone) shows its terminal
 /// connected again once `try_reconnect` runs, without waiting for some
 /// other tool call.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_try_reconnect_restores_a_lost_connection_to_a_healthy_pod(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {

@@ -1,6 +1,6 @@
 use super::*;
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_sandbox_volume_round_trips_name_and_mount_path(pool: PgPool) {
     let created = create_sandbox_volume(&pool, "ssh-key", "/home/sandbox/.ssh")
         .await
@@ -15,7 +15,7 @@ async fn test_create_sandbox_volume_round_trips_name_and_mount_path(pool: PgPool
     assert_eq!(fetched, created);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_get_sandbox_volume_returns_none_for_unknown_id(pool: PgPool) {
     let result = get_sandbox_volume(&pool, 999_999)
         .await
@@ -23,7 +23,7 @@ async fn test_get_sandbox_volume_returns_none_for_unknown_id(pool: PgPool) {
     assert!(result.is_none());
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_list_sandbox_volumes_orders_by_name(pool: PgPool) {
     create_sandbox_volume(&pool, "zzz-cache", "/data/cache")
         .await
@@ -39,7 +39,7 @@ async fn test_list_sandbox_volumes_orders_by_name(pool: PgPool) {
     assert_eq!(names, vec!["aaa-ssh", "zzz-cache"]);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_delete_sandbox_volume_actually_removes_it(pool: PgPool) {
     let created = create_sandbox_volume(&pool, "build-cache", "/data/cache")
         .await

@@ -2,7 +2,7 @@ use super::*;
 
 /// Mechanical CRUD, mirroring the MCP server table's: a characterization
 /// round trip rather than test-first.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_inference_provider_round_trip_keeps_the_secret_unless_replaced(pool: PgPool) {
     let created = test_provider(&pool, "anthropic").await;
     assert_eq!(list_inference_providers(&pool).await.expect("list"), vec![created.clone()]);
@@ -37,7 +37,7 @@ async fn test_inference_provider_round_trip_keeps_the_secret_unless_replaced(poo
 /// SME-111 review 2: what a llama.cpp server said about itself goes
 /// when the provider points at another address or becomes another
 /// kind, so a turn never sends settings for the old server's template.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_providers_server_caps_go_when_its_address_or_kind_changes(pool: PgPool) {
     let caps = serde_json::json!({"template_caps": {"supports_reasoning_effort": true}});
     let p = create_inference_provider(&pool, "llama", "llama_cpp", "http://one", "bearer", "k", false, None, true, None)
@@ -67,7 +67,7 @@ async fn test_a_providers_server_caps_go_when_its_address_or_kind_changes(pool: 
 /// SME-162 review 2: a server's `/props` is kept only while the provider
 /// still points at that server: one read before an address change is
 /// dropped, not stored for the new address.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_server_caps_are_kept_only_for_the_server_they_came_from(pool: PgPool) {
     let caps = serde_json::json!({"total_slots": 4});
     let p = create_inference_provider(&pool, "llama", "llama_cpp", "http://one", "bearer", "k", false, None, true, Some(0))
@@ -89,7 +89,7 @@ async fn test_server_caps_are_kept_only_for_the_server_they_came_from(pool: PgPo
     assert!(written.updated_at > stored.updated_at, "a new version");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_providers_debug_hides_its_secret(pool: PgPool) {
     let provider = test_provider(&pool, "p").await;
     let shown = format!("{provider:?}");
@@ -97,7 +97,7 @@ async fn test_a_providers_debug_hides_its_secret(pool: PgPool) {
     assert!(shown.contains("anthropic"), "{shown}");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_deleting_a_provider_clears_the_default_and_conversations_using_it(pool: PgPool) {
     let doomed = test_provider(&pool, "doomed").await;
     let kept = test_provider(&pool, "kept").await;
@@ -118,7 +118,7 @@ async fn test_deleting_a_provider_clears_the_default_and_conversations_using_it(
     assert!(!delete_inference_provider(&pool, doomed.id).await.expect("delete again"));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_deleting_a_provider_keeps_another_providers_default(pool: PgPool) {
     let doomed = test_provider(&pool, "doomed").await;
     let kept = test_provider(&pool, "kept").await;
@@ -129,7 +129,7 @@ async fn test_deleting_a_provider_keeps_another_providers_default(pool: PgPool) 
     assert_eq!(get_default_model(&pool).await.expect("default"), Some((kept.id, "m2".to_string())));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_setting_a_conversations_model_leaves_the_switch_point_to_its_next_turn(pool: PgPool) {
     let provider = test_provider(&pool, "p").await;
     let conversation = create_conversation(&pool).await.expect("conversation");
@@ -152,7 +152,7 @@ async fn test_setting_a_conversations_model_leaves_the_switch_point_to_its_next_
 
 /// SME-72 review: the switch point is where a turn starts on a
 /// different backend than the last turn, recorded under the turn lock.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_turn_on_a_different_backend_records_the_switch_point(pool: PgPool) {
     let conversation = create_conversation(&pool).await.expect("conversation");
     let text = [ContentBlock::Text { text: "hi".to_string() }];
@@ -172,7 +172,7 @@ async fn test_a_turn_on_a_different_backend_records_the_switch_point(pool: PgPoo
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_setting_a_deleted_providers_model_is_refused(pool: PgPool) {
     let provider = test_provider(&pool, "p").await;
     let conversation = create_conversation(&pool).await.expect("conversation");
@@ -182,7 +182,7 @@ async fn test_setting_a_deleted_providers_model_is_refused(pool: PgPool) {
     assert!(set_default_model(&pool, provider.id, "m1").await.is_err());
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_conversation_adopts_the_default_only_when_it_has_no_model(pool: PgPool) {
     let provider = test_provider(&pool, "p").await;
     let conversation = create_conversation(&pool).await.expect("conversation");
@@ -205,7 +205,7 @@ async fn test_a_conversation_adopts_the_default_only_when_it_has_no_model(pool: 
 
 /// SME-72 review 2: Ollama reports a window from `/api/ps` only while
 /// the model is loaded; asking again when it isn't keeps what it said.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_report_without_a_window_keeps_the_last_one(pool: PgPool) {
     let provider = test_provider(&pool, "p").await;
     set_provider_model_reported(&pool, provider.id, "m", Some(8192), Some(true), Some(true), Some(4096), None).await.expect("loaded");
@@ -215,7 +215,7 @@ async fn test_a_report_without_a_window_keeps_the_last_one(pool: PgPool) {
     assert_eq!(row.reported_max_output, Some(4096), "kept like the window (SME-111)");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_model_overrides_and_reported_details_leave_each_other_alone(pool: PgPool) {
     let provider = test_provider(&pool, "p").await;
     set_provider_model_reported(&pool, provider.id, "m", Some(4096), Some(false), Some(true), Some(1024), None).await.expect("reported");
@@ -247,7 +247,7 @@ async fn test_model_overrides_and_reported_details_leave_each_other_alone(pool: 
 /// SME-162: a provider's max concurrent requests is kept as set: none
 /// (no limit), `0` (the count its server reports) or a count; an update
 /// sets it outright, and a negative count is refused.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_providers_max_concurrent_requests_is_kept_as_set(pool: PgPool) {
     let unset = test_provider(&pool, "unset").await;
     assert_eq!(unset.max_concurrent_requests, None, "no limit unless set");

@@ -151,7 +151,7 @@ fn test_automatic_takes_the_servers_slot_count_once_it_has_one() {
 
 /// Deleting a provider forgets its pool, which would otherwise stay
 /// until a restart.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_deleting_a_provider_forgets_its_slots(pool: PgPool) {
     // An id of its own, as above.
     sqlx::query("ALTER TABLE inference_providers ALTER COLUMN id RESTART WITH 9162000006")
@@ -174,7 +174,7 @@ async fn test_deleting_a_provider_forgets_its_slots(pool: PgPool) {
 /// SME-162 review 1: saving a new limit sets the provider's pool at
 /// once, not at the next endpoint build, so a turn already running takes
 /// it from its next model call.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_saving_a_limit_sets_the_providers_pool_at_once(pool: PgPool) {
     sqlx::query("ALTER TABLE inference_providers ALTER COLUMN id RESTART WITH 9162000007")
         .execute(&pool)
@@ -195,7 +195,7 @@ async fn test_saving_a_limit_sets_the_providers_pool_at_once(pool: PgPool) {
 /// SME-162 review 2: a save always makes a newer version than the last,
 /// even when the clock has stepped back (here, a row stamped a day
 /// ahead), so the saved limit isn't ignored as older.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_save_after_a_clock_step_back_still_sets_the_limit(pool: PgPool) {
     sqlx::query("ALTER TABLE inference_providers ALTER COLUMN id RESTART WITH 9162000010")
         .execute(&pool)

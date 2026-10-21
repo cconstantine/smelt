@@ -26,7 +26,7 @@ async fn sh(client: &kube::Client, pod: i64, script: &str) {
 /// SME-32: `/workspace` is the conversation's own. The next pod has the
 /// checkouts, their uncommitted work, the repo list and the instructions
 /// loaded from them.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_conversations_workspace_outlives_its_pod(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
@@ -90,7 +90,7 @@ async fn test_a_conversations_workspace_outlives_its_pod(pool: PgPool) {
 /// SME-32, SME-49: "work on a repo" and the model's `clone_repo`, on a
 /// conversation with no sandbox, each start one. The repo is recorded
 /// first, so a turn started while the sandbox starts waits for the clone.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_attach_repo_and_clone_repo_start_a_sandbox_when_there_is_none(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     // Three pod starts, one after another.
@@ -148,7 +148,7 @@ async fn test_attach_repo_and_clone_repo_start_a_sandbox_when_there_is_none(pool
 /// retried asks for what's asked now, a directory holding work is never
 /// replaced, an empty repo clones, and asking again returns the same
 /// checkout.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_clone_repo_checks_out_loads_instructions_and_retries_safely(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {

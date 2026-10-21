@@ -83,7 +83,7 @@ fn error_callback_with_marker(state: Option<&str>, iss: Option<&str>) -> Callbac
     }
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_verified_error_callbacks_text_stays_out_of_the_redirect(pool: PgPool) {
     let base_url = spawn_mock_oauth_server(MockMetadata::Issuer {
         iss_supported: true,
@@ -103,7 +103,7 @@ async fn test_a_verified_error_callbacks_text_stays_out_of_the_redirect(pool: Pg
     assert_eq!(take_callback_error(config.id), None, "it shows once");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_forged_error_callback_keeps_only_the_unverified_error(pool: PgPool) {
     let base_url = spawn_mock_oauth_server(MockMetadata::None).await;
     let config = create_oauth_server(&pool, &base_url).await;
@@ -119,7 +119,7 @@ async fn test_a_forged_error_callback_keeps_only_the_unverified_error(pool: PgPo
 }
 
 /// SME-166's refusal reaches the page through the same slot.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_callback_after_a_url_edit_keeps_the_address_changed_error(pool: PgPool) {
     let base_url = spawn_mock_oauth_server(MockMetadata::None).await;
     let config = create_oauth_server(&pool, &base_url).await;
@@ -135,7 +135,7 @@ async fn test_a_callback_after_a_url_edit_keeps_the_address_changed_error(pool: 
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_successful_callback_clears_an_earlier_error(pool: PgPool) {
     let base_url = spawn_mock_oauth_server(MockMetadata::None).await;
     let config = create_oauth_server(&pool, &base_url).await;
@@ -153,7 +153,7 @@ async fn test_a_successful_callback_clears_an_earlier_error(pool: PgPool) {
 /// doesn't replace an unexpired error from one that did, so a forged
 /// callback can't swap the real error out before the page takes it. It
 /// still writes over an unmatched error, and into an expired slot.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_forged_callback_does_not_replace_a_real_callback_error(pool: PgPool) {
     let base_url = spawn_mock_oauth_server(MockMetadata::Issuer {
         iss_supported: true,

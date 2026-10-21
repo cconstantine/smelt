@@ -2,7 +2,7 @@ use super::*;
 
 /// SME-51 B7: one live pod per conversation is the database's rule,
 /// not only a check `create_pod` makes before inserting.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_conversation_cant_have_two_live_pods(pool: PgPool) {
     let conversation = create_conversation(&pool).await.expect("conversation");
     let first = create_sandbox_pod(&pool, conversation.id).await.expect("first pod");
@@ -17,7 +17,7 @@ async fn test_a_conversation_cant_have_two_live_pods(pool: PgPool) {
 
 /// SME-41 D11: the default title is now sentence case; a conversation
 /// still carrying the old "New Conversation" gets auto-titled too.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_old_style_default_title_is_still_replaced(pool: PgPool) {
     assert_eq!(DEFAULT_TITLE, "New conversation");
     let conversation = create_conversation(&pool).await.expect("create conversation");
@@ -38,7 +38,7 @@ async fn test_an_old_style_default_title_is_still_replaced(pool: PgPool) {
     assert_eq!(titled.title, "fix the build");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_and_list_conversations_round_trip(pool: PgPool) {
     let created = create_conversation(&pool)
         .await
@@ -52,7 +52,7 @@ async fn test_create_and_list_conversations_round_trip(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_get_conversation_usage_returns_none_when_never_set(pool: PgPool) {
     let conversation = create_conversation(&pool)
         .await
@@ -65,7 +65,7 @@ async fn test_get_conversation_usage_returns_none_when_never_set(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_upsert_conversation_usage_round_trips_and_overwrites(pool: PgPool) {
     let conversation = create_conversation(&pool)
         .await
@@ -105,7 +105,7 @@ async fn test_upsert_conversation_usage_round_trips_and_overwrites(pool: PgPool)
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_get_conversation_todos_is_empty_when_never_written(pool: PgPool) {
     let conversation = create_conversation(&pool)
         .await
@@ -118,7 +118,7 @@ async fn test_get_conversation_todos_is_empty_when_never_written(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_set_conversation_todos_round_trips_and_overwrites(pool: PgPool) {
     use crate::anthropic::tools::{TodoItem, TodoStatus};
 
@@ -162,7 +162,7 @@ async fn test_set_conversation_todos_round_trips_and_overwrites(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_message_round_trips_and_lists_in_order(pool: PgPool) {
     let conversation = create_conversation(&pool)
         .await
@@ -198,7 +198,7 @@ async fn test_create_message_round_trips_and_lists_in_order(pool: PgPool) {
     assert_eq!(messages[1].role, "assistant");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_message_stores_content_as_json_blocks(pool: PgPool) {
     let conversation = create_conversation(&pool)
         .await
@@ -225,7 +225,7 @@ async fn test_create_message_stores_content_as_json_blocks(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_first_user_message_auto_titles_conversation(pool: PgPool) {
     let conversation = create_conversation(&pool)
         .await
@@ -249,7 +249,7 @@ async fn test_first_user_message_auto_titles_conversation(pool: PgPool) {
     assert_eq!(updated.title, "What's the weather like today?");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_second_message_does_not_overwrite_title(pool: PgPool) {
     let conversation = create_conversation(&pool)
         .await
@@ -293,7 +293,7 @@ async fn test_second_message_does_not_overwrite_title(pool: PgPool) {
     assert_eq!(updated.title, "first message");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_delete_conversation_removes_it_from_list(pool: PgPool) {
     let conversation = create_conversation(&pool)
         .await
@@ -309,7 +309,7 @@ async fn test_delete_conversation_removes_it_from_list(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_delete_conversation_cascades_to_messages(pool: PgPool) {
     let conversation = create_conversation(&pool)
         .await
@@ -338,7 +338,7 @@ async fn test_delete_conversation_cascades_to_messages(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_delete_nonexistent_conversation_is_a_no_op(pool: PgPool) {
     delete_conversation(&pool, -1)
         .await

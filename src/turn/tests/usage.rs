@@ -105,7 +105,7 @@ fn spawn_turn(pool: &PgPool, conversation_id: i64) -> tokio::task::JoinHandle<Tu
 /// A Stop mid-stream records what the call used: `message_start`'s input
 /// and cache counts, and its output estimated from what streamed (400
 /// bytes, 100 tokens). It isn't the conversation's last-known usage.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_call_stopped_mid_stream_is_recorded_with_what_it_used(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9178000001).await.expect("conversation");
@@ -126,7 +126,7 @@ async fn test_a_call_stopped_mid_stream_is_recorded_with_what_it_used(pool: PgPo
 
 /// A Stop after the reply is saved and before its usage is recorded
 /// records the call's full usage, but not as the last-known usage.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_call_stopped_after_its_reply_is_saved_is_recorded(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9178000002).await.expect("conversation");
@@ -151,7 +151,7 @@ async fn test_a_call_stopped_after_its_reply_is_saved_is_recorded(pool: PgPool) 
 /// A Stop while a finished call is being recorded doesn't record it
 /// twice: the record goes on. Its turn gone, it isn't the last-known
 /// usage (code review 1).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stop_while_a_call_is_recorded_records_it_once(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9178000003).await.expect("conversation");
@@ -176,7 +176,7 @@ async fn test_a_stop_while_a_call_is_recorded_records_it_once(pool: PgPool) {
 
 /// A stream that fails after `message_start` (an `error` event) records
 /// what the call used before it failed.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_call_failing_mid_stream_is_recorded(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9178000004).await.expect("conversation");
@@ -193,7 +193,7 @@ async fn test_a_call_failing_mid_stream_is_recorded(pool: PgPool) {
 
 /// Ollama's flat 500 before anything streams leaves no row of its own:
 /// nothing is known of it. The retry that succeeds is the one row.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_retried_call_that_streamed_nothing_leaves_no_row(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9178000005).await.expect("conversation");
@@ -207,7 +207,7 @@ async fn test_a_retried_call_that_streamed_nothing_leaves_no_row(pool: PgPool) {
 }
 
 /// A compaction's call stopped mid-stream is recorded as one.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_compaction_stopped_mid_stream_is_recorded(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9178000006).await.expect("conversation");
@@ -247,7 +247,7 @@ async fn test_a_compaction_stopped_mid_stream_is_recorded(pool: PgPool) {
 
 /// A conversation deleted mid-call: the call stopped after the delete is
 /// still recorded, with no conversation.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_call_on_a_conversation_deleted_mid_turn_is_kept(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9178000007).await.expect("conversation");
@@ -268,7 +268,7 @@ async fn test_a_call_on_a_conversation_deleted_mid_turn_is_kept(pool: PgPool) {
 /// A Stop while a finished call is recorded cuts the record loose: it
 /// can commit after the next turn's. Being no longer the turn's, it
 /// doesn't overwrite the next turn's last-known usage (code review 1).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stopped_turns_late_record_doesnt_overwrite_the_next_turns_usage(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9178000008).await.expect("conversation");
@@ -320,7 +320,7 @@ fn test_an_unfinished_calls_input_is_estimated_only_when_none_was_reported() {
 
 /// A LiteLLM call stopped mid-stream: its `message_start` says 0 input,
 /// so its row has the request's estimate instead.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_call_stopped_after_a_zero_message_start_records_the_requests_estimate(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9178000009).await.expect("conversation");

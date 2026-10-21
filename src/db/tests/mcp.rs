@@ -1,6 +1,6 @@
 use super::*;
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_list_get_delete_mcp_server_config_round_trip(pool: PgPool) {
     let headers = HashMap::from([("Authorization".to_string(), "Bearer secret".to_string())]);
     let created = create_mcp_server_config(
@@ -37,7 +37,7 @@ async fn test_create_list_get_delete_mcp_server_config_round_trip(pool: PgPool) 
     assert!(after_delete.is_none(), "row should be gone after delete");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_update_mcp_server_config_renames_without_touching_headers(pool: PgPool) {
     let original_headers = HashMap::from([(
         "Authorization".to_string(),
@@ -76,7 +76,7 @@ async fn test_update_mcp_server_config_renames_without_touching_headers(pool: Pg
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_get_mcp_server_config_by_name_round_trips(pool: PgPool) {
     let headers = HashMap::new();
     let created = create_mcp_server_config(
@@ -103,7 +103,7 @@ async fn test_get_mcp_server_config_by_name_round_trips(pool: PgPool) {
     assert!(missing.is_none());
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_update_mcp_server_config_upserts_headers_without_touching_others(pool: PgPool) {
     let original = HashMap::from([
         ("Authorization".to_string(), "Bearer old".to_string()),
@@ -149,7 +149,7 @@ async fn test_update_mcp_server_config_upserts_headers_without_touching_others(p
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_update_mcp_server_config_removes_named_headers(pool: PgPool) {
     let original = HashMap::from([
         ("Authorization".to_string(), "Bearer old".to_string()),
@@ -187,7 +187,7 @@ async fn test_update_mcp_server_config_removes_named_headers(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_update_mcp_server_config_upsert_wins_over_remove_for_the_same_name(pool: PgPool) {
     let original = HashMap::from([("Authorization".to_string(), "Bearer old".to_string())]);
     let created = create_mcp_server_config(
@@ -223,7 +223,7 @@ async fn test_update_mcp_server_config_upsert_wins_over_remove_for_the_same_name
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_update_mcp_server_config_returns_none_for_unknown_id(pool: PgPool) {
     let result = update_mcp_server_config(
         &pool,
@@ -239,7 +239,7 @@ async fn test_update_mcp_server_config_returns_none_for_unknown_id(pool: PgPool)
     assert!(result.is_none());
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_ensure_mcp_server_inserts_a_missing_server_once(pool: PgPool) {
     let inserted = ensure_mcp_server(&pool, "exa", "https://mcp.example.com/mcp")
         .await
@@ -258,7 +258,7 @@ async fn test_ensure_mcp_server_inserts_a_missing_server_once(pool: PgPool) {
     assert!(configs[0].extra_headers.0.is_empty());
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_ensure_mcp_server_leaves_an_edited_entry_alone(pool: PgPool) {
     let headers = HashMap::from([("x-api-key".to_string(), "my-key".to_string())]);
     let existing = create_mcp_server_config(
@@ -287,7 +287,7 @@ async fn test_ensure_mcp_server_leaves_an_edited_entry_alone(pool: PgPool) {
     assert_eq!(after.updated_at, existing.updated_at);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_mcp_server_config_defaults_auth_mode_to_static_headers(pool: PgPool) {
     let created = create_mcp_server_config(
         &pool,
@@ -304,7 +304,7 @@ async fn test_create_mcp_server_config_defaults_auth_mode_to_static_headers(pool
     assert!(created.oauth_credentials.is_none());
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_mcp_server_config_stores_a_preregistered_oauth_client(pool: PgPool) {
     let created = create_mcp_server_config(
         &pool,
@@ -321,7 +321,7 @@ async fn test_create_mcp_server_config_stores_a_preregistered_oauth_client(pool:
     assert_eq!(created.oauth_client_secret.as_deref(), Some("secret-456"));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_mcp_server_config_oauth_mode_round_trips(pool: PgPool) {
     let created = create_mcp_server_config(
         &pool,
@@ -337,7 +337,7 @@ async fn test_create_mcp_server_config_oauth_mode_round_trips(pool: PgPool) {
     assert_eq!(created.auth_mode, "oauth");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_set_mcp_server_oauth_credentials_round_trips(pool: PgPool) {
     let created = create_mcp_server_config(
         &pool,
@@ -376,7 +376,7 @@ async fn test_set_mcp_server_oauth_credentials_round_trips(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_update_mcp_server_config_clears_oauth_credentials_when_url_changes(pool: PgPool) {
     let created = create_mcp_server_config(
         &pool,
@@ -418,7 +418,7 @@ async fn test_update_mcp_server_config_clears_oauth_credentials_when_url_changes
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_update_mcp_server_config_keeps_oauth_credentials_when_url_is_unchanged(
     pool: PgPool,
 ) {
@@ -461,7 +461,7 @@ async fn test_update_mcp_server_config_keeps_oauth_credentials_when_url_is_uncha
 /// SME-166: a sign-in's grant is saved only while the row still has the
 /// URL the sign-in started for, so a token issued for one address never
 /// lands on another after an edit, or on a deleted server.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_save_mcp_server_sign_in_saves_only_onto_the_url_it_started_for(pool: PgPool) {
     let created = create_mcp_server_config(
         &pool,
@@ -521,7 +521,7 @@ async fn test_save_mcp_server_sign_in_saves_only_onto_the_url_it_started_for(poo
 /// a rename reads the row at X; another edit (to Y) and a sign-in's save
 /// for Y commit; then the rename writes X back. Deciding from its read,
 /// the rename kept Y's grant on X.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_edit_racing_a_url_change_still_clears_the_grant(pool: PgPool) {
     let created = create_mcp_server_config(
         &pool,
@@ -594,7 +594,7 @@ async fn test_an_edit_racing_a_url_change_still_clears_the_grant(pool: PgPool) {
 
 /// SME-166 review 2: a refresh is saved only while the row still has the
 /// URL the refreshing connection was built for, as well as the client.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_refresh_is_saved_only_onto_the_url_its_connection_was_built_for(pool: PgPool) {
     let created = create_mcp_server_config(
         &pool,
@@ -641,7 +641,7 @@ async fn test_a_refresh_is_saved_only_onto_the_url_its_connection_was_built_for(
 /// A Reconnect with a pre-registered client (GitHub) keeps the client id,
 /// so a client-id match alone let the old grant's refresh overwrite the
 /// new grant.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_refresh_is_saved_only_over_the_grant_it_refreshed(pool: PgPool) {
     let created = create_mcp_server_config(
         &pool,
@@ -701,7 +701,7 @@ async fn stored_grant(pool: &PgPool, id: i64) -> Option<serde_json::Value> {
 /// X; a Reconnect's save of W (same client) is uncommitted when the
 /// refresh's `UPDATE` runs, so Postgres makes it wait, then re-checks its
 /// `WHERE` against the committed W.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_refresh_racing_a_reconnect_keeps_the_new_grant(pool: PgPool) {
     let created = create_mcp_server_config(
         &pool,

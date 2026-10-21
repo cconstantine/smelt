@@ -25,7 +25,7 @@ async fn pod_is_up(client: &kube::Client, pod_id: i64) -> bool {
 /// alone. Before the fix the reconnect found no agent, took the starting
 /// pod for dead and closed its record, and the start went on to make a pod
 /// that nothing would ever delete.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_page_load_while_the_pod_starts_leaves_the_start_alone(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
@@ -53,7 +53,7 @@ async fn test_a_page_load_while_the_pod_starts_leaves_the_start_alone(pool: PgPo
 /// B1 (SME-122): a pod whose record is closed while it starts (the
 /// sandbox panel's Stop) doesn't outlive its start: the start says it was
 /// stopped and deletes the pod it made.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_pod_stopped_while_it_starts_is_not_left_running(pool: PgPool) {
     stop_while_starting(pool, false).await;
 }
@@ -61,7 +61,7 @@ async fn test_a_pod_stopped_while_it_starts_is_not_left_running(pool: PgPool) {
 /// B1 (SME-122): a Stop once Kubernetes has the starting pod deletes it,
 /// and the start, waiting for it to run, says it was stopped rather than
 /// failing with Kubernetes' own 404 (as the bug bash saw in the UI).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_pod_stopped_once_kubernetes_has_it_says_it_was_stopped(pool: PgPool) {
     stop_while_starting(pool, true).await;
 }

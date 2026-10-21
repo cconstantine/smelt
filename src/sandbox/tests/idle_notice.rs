@@ -75,7 +75,7 @@ async fn idle_conversation(pool: &sqlx::PgPool, command_ids: &[&str]) -> i64 {
     conversation.id
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_idle_watch_pass_wakes_only_the_conversations_with_due_commands(pool: sqlx::PgPool) {
     let _guard = crate::providers::test_support::lock_turn_tests();
     // Wakes publish on the conversation id's channel, and the drain saves
@@ -120,7 +120,7 @@ async fn notices(pool: &sqlx::PgPool, conversation_id: i64, want: usize) -> Vec<
     panic!("only {want} idle notices had arrived");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_idle_watch_wake_saves_the_notices_and_repeats_the_interval(pool: sqlx::PgPool) {
     let _guard = crate::providers::test_support::lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -162,7 +162,7 @@ async fn test_the_idle_watch_wake_saves_the_notices_and_repeats_the_interval(poo
 /// user's next message drains it with that moment's numbers, which
 /// `turn::tests::wake::test_a_stopped_conversation_holds_the_idle_notice_for_the_next_message`
 /// pins.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stopped_conversation_is_left_out_of_the_idle_pass(pool: sqlx::PgPool) {
     let _guard = crate::providers::test_support::lock_turn_tests();
     // A conversation this test pauses, so an id no other run's conversation

@@ -206,7 +206,7 @@ fn test_a_remembered_exit_reason_explains_only_the_restart_after_it() {
 /// DB-only: the notice lands in the pod's conversation, saying what
 /// was lost and what wasn't. The wake after it fails at once: the test
 /// database has no model provider.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_report_docker_restart_tells_the_pods_conversation(pool: PgPool) {
     // The wake after the notice touches process-wide turn state keyed
     // by conversation id, as the chat tests' turns do.

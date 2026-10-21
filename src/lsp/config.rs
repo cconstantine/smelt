@@ -90,7 +90,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
     async fn test_saving_checks_the_config_and_names_a_clash(pool: PgPool) {
         let created = save(&pool, None, &pyright()).await.expect("create");
         assert_eq!(created.config, pyright());

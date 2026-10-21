@@ -7,7 +7,7 @@ fn cut_off_reply_body(text: &str) -> String {
 /// SME-111: a reply that hits its `max_tokens` is kept, followed by a
 /// notice every tab gets live, naming the limit and what bound it; a
 /// reply that finishes gets none.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_cut_off_reply_is_followed_by_a_notice(pool: PgPool) {
     use crate::api::chat::{ReplyLimit, cut_off_notice};
     let _guard = lock_turn_tests();
@@ -84,7 +84,7 @@ fn sent_messages(requests: &std::sync::Mutex<Vec<serde_json::Value>>, n: usize) 
 
 /// B3 (SME-122): an empty reply isn't saved: the API refuses an empty
 /// assistant message once it isn't the last, so every later turn failed.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_empty_reply_is_not_saved_and_the_next_turn_works(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
@@ -133,7 +133,7 @@ fn test_history_leaves_out_an_empty_or_blank_reply() {
 
 /// B3 (SME-122): a reply the provider refused partway keeps its text and
 /// is followed by a notice saying so, not saved as if it had finished.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_refused_reply_keeps_its_text_and_says_it_was_refused(pool: PgPool) {
     use crate::api::chat::refusal_notice;
     let _guard = lock_turn_tests();
@@ -153,7 +153,7 @@ async fn test_a_refused_reply_keeps_its_text_and_says_it_was_refused(pool: PgPoo
 /// call (its input may be cut short), as a cut-off does, instead of
 /// failing the turn on the half-written input; with nothing else in the
 /// reply, only the notice is saved.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_reply_refused_in_a_call_drops_the_call(pool: PgPool) {
     use crate::api::chat::refusal_notice;
     let _guard = lock_turn_tests();
@@ -203,7 +203,7 @@ fn only_text(message: &crate::models::Message) -> String {
 /// keeps its text and gets the notice naming the call, which never runs;
 /// its usage is recorded, and the next request sends the reply, the
 /// notice and the next message, and is accepted.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_reply_cut_off_in_a_call_keeps_its_text_and_names_the_call(pool: PgPool) {
     use crate::api::chat::{ReplyLimit, cut_off_notice};
     let _guard = lock_turn_tests();
@@ -242,7 +242,7 @@ async fn test_a_reply_cut_off_in_a_call_keeps_its_text_and_names_the_call(pool: 
 
 /// SME-126: complete calls before the cut one are kept, not run, and
 /// each gets a saved "not run" result, sent right after the call.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_whole_calls_before_a_cut_one_are_kept_with_a_not_run_result(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
@@ -279,7 +279,7 @@ async fn test_whole_calls_before_a_cut_one_are_kept_with_a_not_run_result(pool: 
 /// results right after the reply is saved, so a failure after that (here
 /// recording the call's usage) doesn't leave them to be answered as
 /// stopped mid-run, which they weren't.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_not_run_results_are_saved_before_anything_that_can_fail(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
@@ -308,7 +308,7 @@ async fn test_not_run_results_are_saved_before_anything_that_can_fail(pool: PgPo
 /// SME-126: a reply that is nothing but the cut call saves no assistant
 /// message (the API refuses an empty one); the notice follows the
 /// user's message alone.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_reply_that_is_only_the_cut_call_saves_just_the_notice(pool: PgPool) {
     use crate::api::chat::{ReplyLimit, cut_off_notice};
     let _guard = lock_turn_tests();
@@ -326,7 +326,7 @@ async fn test_a_reply_that_is_only_the_cut_call_saves_just_the_notice(pool: PgPo
 /// SME-111 review 2: a reply bound by an Anthropic model's own reported
 /// cap, which "Max reply tokens" can't raise, says it's the model's own
 /// maximum rather than telling the user to raise the setting.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_reply_at_the_models_own_cap_doesnt_say_raise_it(pool: PgPool) {
     use crate::api::chat::{ReplyLimit, parse_cut_off_notice};
     let _guard = lock_turn_tests();
@@ -352,7 +352,7 @@ async fn test_a_reply_at_the_models_own_cap_doesnt_say_raise_it(pool: PgPool) {
 /// SME-111 review 1: a reply the context window stopped
 /// (`model_context_window_exceeded`, Claude 4.5+) is cut off too, and the
 /// notice says the conversation ran out of room, whatever bound the budget.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_reply_the_window_stopped_gets_a_room_left_notice(pool: PgPool) {
     use crate::api::chat::{ReplyLimit, parse_cut_off_notice};
     let _guard = lock_turn_tests();
@@ -381,7 +381,7 @@ async fn test_a_reply_the_window_stopped_gets_a_room_left_notice(pool: PgPool) {
 /// SME-111 review 1: a llama.cpp reply budget too small to think in
 /// (4,096 or less) turns thinking off, said plainly, instead of sending a
 /// reasoning budget of 0 while thinking is on.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_reply_budget_too_small_to_think_in_turns_thinking_off(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -406,7 +406,7 @@ async fn test_a_reply_budget_too_small_to_think_in_turns_thinking_off(pool: PgPo
 
 /// A model on an Anthropic provider that nothing sized keeps the reply
 /// budget every turn had: a Claude model refuses one above its own cap.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_unsized_anthropic_models_reply_budget_stays_as_it_was(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)

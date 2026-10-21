@@ -30,7 +30,7 @@ fn captured_logs() -> &'static Arc<StdMutex<Vec<u8>>> {
 /// The agent's protocol error quotes serde's message, which can quote
 /// the request it couldn't read (a `write_file`'s content). smelt logs
 /// that it happened, not the text.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_protocol_error_is_not_logged_verbatim(pool: PgPool) {
     let logs = captured_logs();
     let (_, pod_id) = pod_row(&pool).await;
@@ -57,7 +57,7 @@ async fn test_a_protocol_error_is_not_logged_verbatim(pool: PgPool) {
 
 /// A teardown whose delete fails leaves the pod running and listed as
 /// live, so it must stay usable: a later connect registers.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_failed_teardown_leaves_the_pod_usable(pool: PgPool) {
     let (_, pod_id) = pod_row(&pool).await;
     let _agent = fake_agent(pod_id, current(), Duration::ZERO).await;
@@ -76,7 +76,7 @@ async fn test_a_failed_teardown_leaves_the_pod_usable(pool: PgPool) {
 /// A connection whose socket closed before `connect_with_retry` got to
 /// register it isn't registered: its reader has already given up on it,
 /// and nothing would ever replace it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_connection_that_already_ended_is_not_registered(pool: PgPool) {
     let (_, pod_id) = pod_row(&pool).await;
     let mut agent = fake_agent(pod_id, current(), Duration::ZERO).await;
@@ -98,7 +98,7 @@ async fn test_a_connection_that_already_ended_is_not_registered(pool: PgPool) {
 }
 
 /// A page load doesn't wait behind a connect that's already under way.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_try_reconnect_does_not_wait_for_a_connect_in_progress(pool: PgPool) {
     let (_, pod_id) = pod_row(&pool).await;
     let _agent = fake_agent(pod_id, current(), Duration::from_secs(2)).await;
@@ -116,7 +116,7 @@ async fn test_try_reconnect_does_not_wait_for_a_connect_in_progress(pool: PgPool
 /// Review 2: the Sandboxes page's refresh (`try_reconnect`) reads an
 /// unknown image again too, so the page doesn't say "restart" where only
 /// a rebuild helps; it still never dials the refused agent again.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_page_refresh_reads_an_unknown_image_again(pool: PgPool) {
     let (_, pod_id) = pod_row(&pool).await;
     let v0_line = r#"{"id":"cmd-1","terminal_id":"3","stream":"stdout","seq":1,"data":"hi"}"#;
@@ -133,7 +133,7 @@ async fn test_a_page_refresh_reads_an_unknown_image_again(pool: PgPool) {
 
 /// Review 2: a pod torn down while its refused agent's image is read
 /// isn't remembered as outdated afterwards (nothing would ever clear it).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_pod_torn_down_during_the_image_read_isnt_remembered(pool: PgPool) {
     let (_, pod_id) = pod_row(&pool).await;
     let (reading, release) = (Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
@@ -224,7 +224,7 @@ async fn command_updates(
 /// the previous command and then show this one running for good. The
 /// start is published before the send, so no scheduling between the send
 /// and the publish can put the finish first.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_command_is_announced_before_its_finish(pool: PgPool) {
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let (conversation_id, pod_id) = pod_row(&pool).await;
@@ -254,7 +254,7 @@ async fn test_a_command_is_announced_before_its_finish(pool: PgPool) {
 /// SME-144: a send that fails marks the command lost and says so to open
 /// tabs, after announcing it, so the panel shows `lost` live rather than
 /// the previous command's status.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_failed_send_announces_the_command_lost(pool: PgPool) {
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let (conversation_id, pod_id) = pod_row(&pool).await;
@@ -276,7 +276,7 @@ async fn test_a_failed_send_announces_the_command_lost(pool: PgPool) {
 /// SME-144 review 1: when the send fails and marking the row lost fails
 /// too, the row still says running (and the terminal stays busy), so open
 /// tabs aren't told `lost`: a reload would show running again.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_lost_mark_that_fails_announces_nothing(pool: PgPool) {
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let (conversation_id, pod_id) = pod_row(&pool).await;

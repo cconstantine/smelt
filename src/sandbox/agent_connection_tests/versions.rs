@@ -3,7 +3,7 @@ use super::*;
 /// An agent from before the protocol was versioned: its first message
 /// isn't a hello. The pod is outdated for good, without a retry or crash
 /// cleanup, and the next call fails without dialling.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_protocol_0_agent_is_outdated_for_good(pool: PgPool) {
     let (_, pod_id) = pod_row(&pool).await;
     let v0_line = r#"{"id":"cmd-1","terminal_id":"3","stream":"stdout","seq":1,"data":"hi"}"#;
@@ -21,7 +21,7 @@ async fn test_a_protocol_0_agent_is_outdated_for_good(pool: PgPool) {
     assert_eq!(agent.dials.load(Ordering::SeqCst), 1, "the second call dialled again");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_agent_on_another_major_is_outdated(pool: PgPool) {
     let (_, pod_id) = pod_row(&pool).await;
     let next_major = ProtocolVersion { major: PROTOCOL_VERSION.major + 1, minor: 0 };
@@ -34,7 +34,7 @@ async fn test_an_agent_on_another_major_is_outdated(pool: PgPool) {
 /// SME-121: a refused pod that runs another image than a new pod would
 /// (an older build, or `:latest`) is told to recreate, which gets it a
 /// newer agent.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_refused_pod_on_an_older_image_is_told_to_recreate(pool: PgPool) {
     let (_, pod_id) = pod_row(&pool).await;
     let older = "docker.io/library/smelt-sandbox:src-0000000000000000";
@@ -58,7 +58,7 @@ async fn test_a_refused_pod_on_an_older_image_is_told_to_recreate(pool: PgPool) 
 /// can't be fixed by recreating it, so the error says not to retry and to
 /// have the image rebuilt, now and on every later call; `/pods` says the
 /// image needs rebuilding, then a restart.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_refused_pod_on_the_image_a_new_pod_gets_says_to_rebuild_it(pool: PgPool) {
     let (_, pod_id) = pod_row(&pool).await;
     let image = default_sandbox_image();
@@ -86,7 +86,7 @@ async fn test_a_refused_pod_on_the_image_a_new_pod_gets_says_to_rebuild_it(pool:
 
 /// SME-121: when the pod's image can't be read, the error keeps the
 /// recreate advice and adds what to do if a new pod is refused too.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_refused_pod_whose_image_is_unknown_hedges_its_advice(pool: PgPool) {
     let (_, pod_id) = pod_row(&pool).await;
     let next_major = ProtocolVersion { major: PROTOCOL_VERSION.major + 1, minor: 0 };
@@ -102,7 +102,7 @@ async fn test_a_refused_pod_whose_image_is_unknown_hedges_its_advice(pool: PgPoo
 /// Review 1: an image read that failed isn't remembered as the answer:
 /// the next call reads it again (without dialling the agent again), and
 /// gives the advice that image calls for.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_image_that_couldnt_be_read_is_read_again_next_time(pool: PgPool) {
     let (_, pod_id) = pod_row(&pool).await;
     let v0_line = r#"{"id":"cmd-1","terminal_id":"3","stream":"stdout","seq":1,"data":"hi"}"#;
@@ -144,7 +144,7 @@ fn test_judge_image_takes_short_and_full_names_of_one_image_as_the_same() {
 
 /// Silence could be an old agent with nothing to say, or a slow link, so
 /// it fails this attempt but isn't remembered.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_agent_that_says_nothing_is_outdated_but_not_for_good(pool: PgPool) {
     let (_, pod_id) = pod_row(&pool).await;
     let agent = fake_agent(pod_id, Greeting::Nothing, Duration::ZERO).await;
@@ -156,7 +156,7 @@ async fn test_an_agent_that_says_nothing_is_outdated_but_not_for_good(pool: PgPo
 
 /// Any minor of smelt's major connects; a feature from a later minor
 /// fails alone, asking for a restart.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_another_minor_connects_and_gates_only_newer_features(pool: PgPool) {
     let (_, pod_id) = pod_row(&pool).await;
     let older = ProtocolVersion { major: PROTOCOL_VERSION.major, minor: 3 };
@@ -170,7 +170,7 @@ async fn test_another_minor_connects_and_gates_only_newer_features(pool: PgPool)
 }
 
 /// The Sandboxes page and `list_pods` say what each pod's agent speaks.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_agent_status_follows_what_the_agent_said(pool: PgPool) {
     let (_, unconnected) = pod_row(&pool).await;
     let _a = fake_agent(unconnected, current(), Duration::ZERO).await;

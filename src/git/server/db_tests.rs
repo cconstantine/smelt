@@ -1,6 +1,6 @@
 use super::*;
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_key_stores_it_and_returns_only_the_public_half(pool: PgPool) {
     let created = create_key(&pool, "github").await.expect("create key");
     assert_eq!(created.name, "github");
@@ -14,7 +14,7 @@ async fn test_create_key_stores_it_and_returns_only_the_public_half(pool: PgPool
     assert_eq!(list_keys(&pool).await.expect("list keys"), vec![created]);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_key_refuses_an_unsafe_name(pool: PgPool) {
     let unsafe_name = create_key(&pool, "../x").await.expect_err("unsafe");
     assert!(unsafe_name.contains("letters"), "{unsafe_name}");
@@ -24,7 +24,7 @@ async fn test_create_key_refuses_an_unsafe_name(pool: PgPool) {
 /// One key at a time, for now: with several, the host picks the
 /// first it knows, which breaks per-repo deploy keys (SME-32 code
 /// review 3).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_only_one_key_at_a_time(pool: PgPool) {
     let first = create_key(&pool, "github").await.expect("first");
     let generated = create_key(&pool, "another").await.expect_err("a second key");
@@ -41,7 +41,7 @@ async fn test_only_one_key_at_a_time(pool: PgPool) {
     create_key(&pool, "replacement").await.expect("a key again once there's none");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_import_key_stores_the_derived_public_half(pool: PgPool) {
     let pair = generate_key("elsewhere");
     let imported = import_key_named(&pool, "laptop", &pair.private_key)
@@ -53,7 +53,7 @@ async fn test_import_key_stores_the_derived_public_half(pool: PgPool) {
     assert!(refused.contains("private key"), "{refused}");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_clone_repo_refuses_before_recording_anything(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let bad_url = clone_repo(&pool, conversation.id, "not a url", None, None)
@@ -79,7 +79,7 @@ fn test_checkout_dirs_are_one_plain_name() {
     }
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_wait_for_clones_waits_for_a_clone_to_finish(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     // Nothing cloning: no wait.
@@ -125,7 +125,7 @@ pub(super) async fn only_repo(pool: &PgPool, conversation_id: i64) -> RepoSummar
     repos.remove(0)
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_trusted_repos_agents_md_loads_at_once(pool: PgPool) {
     db::set_repo_trust(&pool, "github.com/o/r", true).await.expect("trust");
     let conversation = db::create_conversation(&pool).await.expect("conversation");
@@ -142,7 +142,7 @@ async fn test_a_trusted_repos_agents_md_loads_at_once(pool: PgPool) {
     assert_eq!(only_repo(&pool, conversation.id).await.loaded_instructions, vec!["web/AGENTS.md".to_string()]);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_unknown_repo_asks_the_user_with_the_exact_file(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let repo = cloned_repo(&pool, conversation.id).await;
@@ -157,7 +157,7 @@ async fn test_an_unknown_repo_asks_the_user_with_the_exact_file(pool: PgPool) {
     assert_eq!(summary.trust_requests[0].content, "Run make test.\n");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_declined_repos_agents_md_is_refused(pool: PgPool) {
     db::set_repo_trust(&pool, "github.com/o/r", false).await.expect("decline");
     let conversation = db::create_conversation(&pool).await.expect("conversation");
@@ -170,7 +170,7 @@ async fn test_a_declined_repos_agents_md_is_refused(pool: PgPool) {
     assert!(summary.trust_requests.is_empty() && summary.loaded_instructions.is_empty());
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_trust_loads_exactly_the_file_the_card_showed(pool: PgPool) {
     let first = db::create_conversation(&pool).await.expect("conversation");
     let second = db::create_conversation(&pool).await.expect("conversation");
@@ -203,7 +203,7 @@ async fn test_trust_loads_exactly_the_file_the_card_showed(pool: PgPool) {
 /// The file changed (the model asked again) while the card was
 /// open: Trust on what the user read doesn't load the newer copy
 /// (SME-32 code review 5, finding 1).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_trust_refuses_a_file_that_changed_since_it_was_shown(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let repo = cloned_repo(&pool, conversation.id).await;
@@ -227,7 +227,7 @@ async fn test_trust_refuses_a_file_that_changed_since_it_was_shown(pool: PgPool)
 /// Deciding on one card drops the same conversation's other
 /// requests for that repo; the model is told which (SME-32 code
 /// review 5, finding 2).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_model_hears_about_its_other_requests_for_the_repo(pool: PgPool) {
     for trusted in [true, false] {
         let conversation = db::create_conversation(&pool).await.expect("conversation");
@@ -252,7 +252,7 @@ async fn test_the_model_hears_about_its_other_requests_for_the_repo(pool: PgPool
 /// The decision is recorded at once, and the notices are the
 /// caller's to deliver: a turn running in the conversation doesn't
 /// hold up the user's click (SME-32 code review 6, finding 3).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_deciding_doesnt_wait_for_a_running_turn(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let repo = cloned_repo(&pool, conversation.id).await;
@@ -276,7 +276,7 @@ async fn test_deciding_doesnt_wait_for_a_running_turn(pool: PgPool) {
 /// The Clone button's request only records: the sandbox and the
 /// clone run after it, so a closed tab can't cut them off (SME-32
 /// code review 8, finding 1).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_starting_work_on_a_repo_records_it_without_touching_a_pod(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let (shown, pending, _) = start_attach(&pool, conversation.id, "git@github.com:o/r.git", None, None)
@@ -293,7 +293,7 @@ async fn test_starting_work_on_a_repo_records_it_without_touching_a_pod(pool: Pg
 /// 10, finding 2): a failed clone's directory can be taken over by
 /// a corrected URL, and a directory can be named for a second
 /// checkout.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_work_on_a_repo_can_correct_a_url_or_name_a_directory(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let typo = db::create_conversation_repo(&pool, conversation.id, "git@github.com:me/app.git", "github.com/me/app", None, "app")
@@ -317,7 +317,7 @@ async fn test_work_on_a_repo_can_correct_a_url_or_name_a_directory(pool: PgPool)
     assert_eq!(list_repos(&pool, conversation.id).await.expect("list").len(), 2);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_work_on_a_repo_trusts_an_existing_checkout(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     cloned_repo(&pool, conversation.id).await;
@@ -334,7 +334,7 @@ async fn test_work_on_a_repo_trusts_an_existing_checkout(pool: PgPool) {
 /// loading again once it's trusted, or "Work on a repo") leaves no
 /// card behind, and every waiting model hears (SME-32 code review
 /// 9, finding 1).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_trust_given_elsewhere_settles_waiting_requests(pool: PgPool) {
     let waiting = db::create_conversation(&pool).await.expect("conversation");
     let repo = cloned_repo(&pool, waiting.id).await;
@@ -367,7 +367,7 @@ async fn test_trust_given_elsewhere_settles_waiting_requests(pool: PgPool) {
 /// Declining unloads what was loaded from that remote before, in
 /// every conversation, so no instructions from an untrusted repo
 /// stay in a system prompt (SME-32 code review 9, finding 2).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_declining_unloads_what_was_loaded_before(pool: PgPool) {
     db::set_repo_trust(&pool, "github.com/o/r", true).await.expect("trust");
     let earlier = db::create_conversation(&pool).await.expect("conversation");
@@ -388,7 +388,7 @@ async fn test_declining_unloads_what_was_loaded_before(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_declining_loads_nothing_and_later_loads_are_refused(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let repo = cloned_repo(&pool, conversation.id).await;
@@ -401,7 +401,7 @@ async fn test_declining_loads_nothing_and_later_loads_are_refused(pool: PgPool) 
     assert!(request_or_load(&pool, conversation.id, &repo, "AGENTS.md", &file("x")).await.is_err());
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_request_is_decided_only_from_its_own_conversation(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let elsewhere = db::create_conversation(&pool).await.expect("conversation");
@@ -412,7 +412,7 @@ async fn test_a_request_is_decided_only_from_its_own_conversation(pool: PgPool) 
     assert_eq!(db::get_repo_trust(&pool, "github.com/o/r").await.expect("get"), None);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_clone_dropped_midway_is_marked_interrupted(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let repo = db::create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")
@@ -440,7 +440,7 @@ async fn test_a_clone_dropped_midway_is_marked_interrupted(pool: PgPool) {
     assert!(wait_for_clones(&pool, conversation.id, std::time::Duration::from_millis(100)).await);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stop_after_the_clone_is_recorded_doesnt_mark_it_interrupted(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let repo = db::create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")
@@ -461,7 +461,7 @@ async fn test_a_stop_after_the_clone_is_recorded_doesnt_mark_it_interrupted(pool
 /// A turn stopped just after the clone was recorded ready, before
 /// its guard was disarmed: the guard's "interrupted" doesn't undo
 /// it (SME-86).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_guard_firing_after_ready_leaves_the_clone_ready(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let repo = db::create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")
@@ -479,7 +479,7 @@ async fn test_a_guard_firing_after_ready_leaves_the_clone_ready(pool: PgPool) {
 
 /// A replaced attempt whose clone (or pod start) fails is told it
 /// was superseded, not that the repo failed (SME-86 code review).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_superseded_attempt_that_fails_is_told_so(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let stale = db::create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")
@@ -497,7 +497,7 @@ async fn test_a_superseded_attempt_that_fails_is_told_so(pool: PgPool) {
 
 /// A retry that loses the race to another retry of the same failed
 /// clone is refused, saying why (SME-86).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_retry_racing_another_is_refused(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let repo = db::create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")
@@ -520,7 +520,7 @@ async fn test_a_retry_racing_another_is_refused(pool: PgPool) {
 /// Two fresh clones into the same directory at once (\"Work on a
 /// repo\" while the model clones it): the second gets the first's
 /// checkout, not a database error (SME-86 code review 2).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_fresh_clone_that_lost_the_race_gets_the_winners_checkout(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let url = "git@github.com:o/r.git";
@@ -539,7 +539,7 @@ async fn test_a_fresh_clone_that_lost_the_race_gets_the_winners_checkout(pool: P
 /// A request whose retry lost the race gets the other request's
 /// checkout when it's the same repo and branch, cloning or done, and
 /// the usual refusal otherwise (SME-86 code review).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_retry_that_lost_the_race_gets_the_winners_checkout(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let url = "git@github.com:o/r.git";
@@ -564,7 +564,7 @@ async fn test_a_retry_that_lost_the_race_gets_the_winners_checkout(pool: PgPool)
 
 /// An attempt that a retry has replaced can't record its clone as
 /// the repo's, and says so (SME-86).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_superseded_attempt_doesnt_record_its_clone(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let stale = db::create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")
@@ -589,7 +589,7 @@ async fn test_a_superseded_attempt_doesnt_record_its_clone(pool: PgPool) {
 /// A repo is ready only once its AGENTS.md files are listed, so a
 /// turn that waited for the clone sees them (SME-32 code review 10,
 /// finding 3).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_repo_is_ready_with_its_agents_files_already_listed(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let cloned = ClonedRepo { commit: Some("abc".to_string()), branch: "main".to_string() };
@@ -612,12 +612,12 @@ async fn test_a_repo_is_ready_with_its_agents_files_already_listed(pool: PgPool)
 /// No key and no identity: a new pod is left alone (SME-32 code
 /// review 8, finding 2). Pod 999999 doesn't exist, and this test
 /// process has no cluster: any attempt to write would fail.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_new_pod_gets_nothing_when_there_is_nothing_to_install(pool: PgPool) {
     install_into_new_pod(&pool, 999_999).await.expect("nothing to do");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_delete_key_and_save_identity(pool: PgPool) {
     let key = create_key(&pool, "gone").await.expect("create");
     delete_key(&pool, key.id).await.expect("delete");

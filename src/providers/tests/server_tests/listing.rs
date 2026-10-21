@@ -30,7 +30,7 @@ async fn mock_ollama() -> String {
     format!("http://{addr}")
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_ollama_providers_models_come_with_their_details(pool: PgPool) {
     let base = mock_ollama().await;
     let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false, None, true, None)
@@ -60,7 +60,7 @@ async fn test_an_ollama_providers_models_come_with_their_details(pool: PgPool) {
 
 /// SME-72 review: the picker's list doesn't ask an Ollama server
 /// about every model each time it opens; it uses what's stored.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_quick_listing_skips_the_per_model_questions(pool: PgPool) {
     let base = mock_ollama().await;
     let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false, None, true, None)
@@ -74,7 +74,7 @@ async fn test_a_quick_listing_skips_the_per_model_questions(pool: PgPool) {
 }
 
 /// SME-72 review: adding a model by id keeps any settings it has.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_adding_a_model_by_id_keeps_its_settings(pool: PgPool) {
     let p = provider(&pool, "p", "api_key").await;
     set_model_settings(&pool, p.id, "llama3", settings(Some(false), Some(32_768), None)).await.expect("set");
@@ -92,7 +92,7 @@ async fn test_adding_a_model_by_id_keeps_its_settings(pool: PgPool) {
 
 /// SME-72 review 2: a model the provider stopped listing goes away,
 /// unless it was added by hand or has settings of the user's.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_model_the_provider_dropped_isnt_shown(pool: PgPool) {
     let base = mock_ollama().await;
     let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false, None, true, None)
@@ -111,7 +111,7 @@ async fn test_a_model_the_provider_dropped_isnt_shown(pool: PgPool) {
 
 /// SME-72 review 2: `/api/ps` is one server-wide list, fetched once
 /// per page, not once per model.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_ollamas_loaded_models_are_fetched_once(pool: PgPool) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -150,7 +150,7 @@ async fn test_ollamas_loaded_models_are_fetched_once(pool: PgPool) {
 
 /// SME-111: Anthropic's listing's `max_tokens` is kept as the
 /// model's reported cap, and a turn on it is capped by it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_anthropic_models_reported_cap_is_kept_and_used(pool: PgPool) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -171,7 +171,7 @@ async fn test_an_anthropic_models_reported_cap_is_kept_and_used(pool: PgPool) {
     assert_eq!(resolve_turn_model(&pool, conversation.id).await.expect("resolves").output_cap, Some(64_000));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_unreachable_providers_models_still_list_what_is_stored(pool: PgPool) {
     let p = db::create_inference_provider(&pool, "gone", "anthropic", "http://127.0.0.1:1", "api_key", "k", false, None, true, None)
         .await
@@ -183,7 +183,7 @@ async fn test_an_unreachable_providers_models_still_list_what_is_stored(pool: Pg
     assert_eq!(listing.models[0].id, "claude-opus-5");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_default_is_checked_and_announced(pool: PgPool) {
     let p = provider(&pool, "p", "api_key").await;
     let mut app_events = crate::events::subscribe_app();
@@ -199,7 +199,7 @@ async fn test_the_default_is_checked_and_announced(pool: PgPool) {
     assert_eq!(default_model(&pool).await.expect("read"), None);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_setting_a_model_checks_it_and_tells_the_tabs(pool: PgPool) {
     let conversation = db::create_conversation_with_id(&pool, 9_172_000_002).await.expect("conversation");
     let p = provider(&pool, "p", "api_key").await;

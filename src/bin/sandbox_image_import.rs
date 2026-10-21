@@ -528,6 +528,7 @@ async fn check(pods: &Api<Pod>, loader: &str, wanted: &[String]) -> Result<(), B
 
 #[cfg(test)]
 #[path = "../test_lock.rs"]
+#[allow(dead_code, reason = "shared with the smelt binary's tests; this one uses only require()")]
 mod test_lock;
 
 #[cfg(test)]

@@ -34,7 +34,7 @@ fn todoread_call_body() -> String {
 
 /// A turn is one `turn` span, with its model calls and tool calls under it,
 /// all in one trace.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_turns_model_and_tool_calls_are_children_of_its_span(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
@@ -64,7 +64,7 @@ async fn test_a_turns_model_and_tool_calls_are_children_of_its_span(pool: PgPool
     assert!(!format!("{spans:?}").contains("hello"), "no message text in a span");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_turn_whose_model_call_fails_is_a_failed_span(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
@@ -77,7 +77,7 @@ async fn test_a_turn_whose_model_call_fails_is_a_failed_span(pool: PgPool) {
     assert!(description.contains("error parsing tool call"), "{description}");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stopped_turn_says_so_without_failing_its_span(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
@@ -106,7 +106,7 @@ async fn test_a_stopped_turn_says_so_without_failing_its_span(pool: PgPool) {
 
 /// The user's turn runs in the background, as a child of the request that
 /// sent it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_sent_turn_is_a_child_of_the_request_that_sent_it(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
@@ -136,7 +136,7 @@ async fn test_a_sent_turn_is_a_child_of_the_request_that_sent_it(pool: PgPool) {
     assert_eq!(turn.parent_span_id, request.span_context.span_id());
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_compaction_is_a_span_with_its_model_call_under_it(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");

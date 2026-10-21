@@ -14,6 +14,8 @@
 //! Compiled only into test builds: the smelt binary's tests and the two
 //! helper binaries' (`#[path]`), which have real-cluster tests of their own.
 
+use sqlx::migrate::Migrator;
+
 /// The variable `scripts/with-cluster-lock` sets to the lock file's path
 /// for the command it runs, once the lock is held.
 const HELD: &str = "SMELT_CLUSTER_LOCK_HELD";
@@ -42,6 +44,36 @@ pub(crate) fn require() {
         panic!("{why}");
     }
 }
+
+/// A migrator that refuses the test before sqlx connects, unless the lock
+/// is held. Every `#[sqlx::test]` names one of the two statics below
+/// (`migrator = "crate::test_lock::MIGRATOR"`): sqlx's macro expands that to
+/// `args.migrator(&<path>)` ahead of `run_test`, which is where it creates
+/// the test database (sqlx-macros-core 0.8.6, `test_attr.rs`), and the
+/// reference coerces to `&Migrator` through this `Deref`. A `Deref` with a
+/// side effect, on purpose: it's the one hook sqlx runs first.
+/// `src/repo_lints/cluster_lock.rs` fails the gate on an attribute that
+/// names neither.
+pub(crate) struct Locked(&'static Migrator);
+
+impl std::ops::Deref for Locked {
+    type Target = Migrator;
+
+    fn deref(&self) -> &Migrator {
+        require();
+        self.0
+    }
+}
+
+static MIGRATIONS: Migrator = sqlx::migrate!();
+/// No migrations: `Migrator::DEFAULT` is the empty list sqlx's own
+/// `migrate!()` builds on. For a test that migrates by hand.
+static NONE: Migrator = Migrator::DEFAULT;
+
+/// The repo's migrations, applied once the lock is known to be held.
+pub(crate) static MIGRATOR: Locked = Locked(&MIGRATIONS);
+/// No migrations (the old `migrations = false`), under the same check.
+pub(crate) static NO_MIGRATIONS: Locked = Locked(&NONE);
 
 #[cfg(test)]
 mod tests {

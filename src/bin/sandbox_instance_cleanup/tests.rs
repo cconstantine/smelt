@@ -205,7 +205,7 @@ async fn connection(pool: &PgPool) -> PgConnection {
 
 /// A migrated database gives its instance: a UUID, owning nothing from
 /// before SME-115.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_migrated_database_reads_its_instance(pool: PgPool) {
     let mut conn = connection(&pool).await;
     match read_instance(&mut conn).await.expect("the instance") {
@@ -228,7 +228,7 @@ async fn test_a_migrated_database_reads_its_instance(pool: PgPool) {
 
 /// A database without `smelt_instance` was never migrated: nothing can
 /// carry its instance, so the cleanup succeeds deleting nothing.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_database_without_smelt_instance_reads_as_never_migrated(pool: PgPool) {
     sqlx::query("DROP TABLE smelt_instance")
         .execute(&pool)
@@ -242,7 +242,7 @@ async fn test_a_database_without_smelt_instance_reads_as_never_migrated(pool: Pg
 }
 
 /// A database that isn't there reads as absent, not as a failure.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_missing_database_reads_as_absent(pool: PgPool) {
     let mut options: PgConnectOptions = pool.connect_options().as_ref().clone();
     options = options.database(&format!("smelt_instance_cleanup_missing_{}", unique()));
@@ -254,7 +254,7 @@ async fn test_a_missing_database_reads_as_absent(pool: PgPool) {
 
 /// Guard 5 counts every other connection to the database, and never this
 /// one's own.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_other_connections_counts_every_other_connection(pool: PgPool) {
     let database = pool
         .connect_options()

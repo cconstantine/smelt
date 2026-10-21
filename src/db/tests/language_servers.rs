@@ -2,7 +2,7 @@ use super::*;
 
 /// SME-35: a language server's settings go in and come back whole,
 /// and a second server can't take a name that's in use.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_language_servers_round_trip(pool: PgPool) {
     let mut config = crate::models::LanguageServerConfig {
         name: "pyright".to_string(),

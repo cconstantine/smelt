@@ -468,7 +468,7 @@ pub(super) mod log_tests {
 
     /// The sweep always says what it did, even when it found nothing, and
     /// names each claim it deleted with its uid.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
     async fn test_the_claim_sweep_logs_a_summary_and_each_claim_it_deletes(pool: PgPool) {
         let client = test_client().await;
         let ours = db::smelt_instance(&pool).await.expect("instance").id;
@@ -594,7 +594,7 @@ pub(super) mod log_tests {
     }
 
     /// Stopping a pod logs its delete with its uid.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
     async fn test_a_terminated_pods_delete_is_logged(pool: PgPool) {
         let client = test_client().await;
         db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");

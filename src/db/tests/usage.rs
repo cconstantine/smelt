@@ -2,7 +2,7 @@ use super::*;
 
 /// Mechanical CRUD: a characterization round trip rather than
 /// test-first (SME-106).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_model_calls_add_up_and_only_a_turns_call_is_the_last_known_usage(pool: PgPool) {
     let conversation = create_conversation(&pool).await.expect("conversation");
     let other = create_conversation(&pool).await.expect("another conversation");
@@ -71,7 +71,7 @@ async fn test_model_calls_add_up_and_only_a_turns_call_is_the_last_known_usage(p
     assert_eq!(get_conversation_spend(&pool, other.id).await.expect("spend").calls, 1);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_model_spend_sums_each_providers_model_over_the_period(pool: PgPool) {
     let conversation = create_conversation(&pool).await.expect("conversation");
     let kept = test_provider(&pool, "kept").await;
@@ -120,7 +120,7 @@ async fn test_model_spend_sums_each_providers_model_over_the_period(pool: PgPool
 /// B50 (SME-122): deleting a conversation keeps its calls in the spend
 /// it was billed for, with no conversation; the conversation's own
 /// spend goes with it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_deleted_conversations_calls_stay_in_the_spend(pool: PgPool) {
     let conversation = create_conversation(&pool).await.expect("conversation");
     let provider = test_provider(&pool, "p").await;
@@ -155,7 +155,7 @@ async fn test_a_deleted_conversations_calls_stay_in_the_spend(pool: PgPool) {
 /// A turn reads its provider when it starts; the user may delete the
 /// provider before the reply finishes. The call is still recorded, with
 /// no provider, as rows the deletion itself nulls (code review 1).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_call_on_a_provider_deleted_mid_turn_is_recorded_without_it(pool: PgPool) {
     let conversation = create_conversation(&pool).await.expect("conversation");
     let provider = test_provider(&pool, "gone").await;
@@ -190,7 +190,7 @@ async fn test_a_call_on_a_provider_deleted_mid_turn_is_recorded_without_it(pool:
 /// the record waits for it and then sees no provider, rather than taking
 /// the id and failing the foreign key once the delete commits (code
 /// review 2).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_call_recorded_while_its_provider_is_being_deleted_is_recorded_without_it(pool: PgPool) {
     let conversation = create_conversation(&pool).await.expect("conversation");
     let provider = test_provider(&pool, "going").await;
@@ -274,7 +274,7 @@ async fn conversation_of_the_only_call(pool: &PgPool) -> Option<i64> {
 
 /// SME-178 B25: a call that ends after its conversation was deleted is
 /// still recorded, with no conversation, and no context usage for it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_call_whose_conversation_is_gone_is_recorded_without_it(pool: PgPool) {
     let conversation = create_conversation(&pool).await.expect("conversation");
     let provider = test_provider(&pool, "p").await;
@@ -298,7 +298,7 @@ async fn test_a_call_whose_conversation_is_gone_is_recorded_without_it(pool: PgP
 /// The same with the conversation's delete still uncommitted: the
 /// record waits for it, then sees no conversation, rather than taking
 /// the id and failing the foreign key once the delete commits.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_call_recorded_while_its_conversation_is_being_deleted_is_recorded_without_it(pool: PgPool) {
     let conversation = create_conversation(&pool).await.expect("conversation");
     let provider = test_provider(&pool, "p").await;
@@ -343,7 +343,7 @@ async fn test_a_call_recorded_while_its_conversation_is_being_deleted_is_recorde
 
 /// A call that didn't finish (stopped, failed) is counted, but isn't the
 /// conversation's last-known usage: its reply may not be in the history.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_unfinished_turn_call_is_counted_but_isnt_the_last_known_usage(pool: PgPool) {
     let conversation = create_conversation(&pool).await.expect("conversation");
     let provider = test_provider(&pool, "p").await;
@@ -385,7 +385,7 @@ async fn wait_for_a_lock_waiter(pool: &PgPool, what: &str) {
 /// A finished call whose turn is no longer current (stopped while its
 /// record was on its way) is counted, but isn't the conversation's
 /// last-known usage: a newer turn's may already be (code review 1).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_call_no_longer_current_is_counted_but_isnt_the_last_known_usage(pool: PgPool) {
     let conversation = create_conversation(&pool).await.expect("conversation");
     let provider = test_provider(&pool, "p").await;
@@ -426,7 +426,7 @@ async fn finish_the_older_record(mut older: sqlx::Transaction<'static, sqlx::Pos
 /// A record that checked its turn was current, and then lost a race to
 /// the next turn's, still commits first: the next turn's record waits
 /// for the conversation's row and writes after it (code review 1).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_newer_record_waits_for_an_older_one_and_its_usage_stands(pool: PgPool) {
     let conversation = create_conversation(&pool).await.expect("conversation");
     let provider = test_provider(&pool, "p").await;
@@ -450,7 +450,7 @@ async fn test_a_newer_record_waits_for_an_older_one_and_its_usage_stands(pool: P
 
 /// The same for a compaction's clear: it waits for the older record,
 /// so the usage of the history it summarized doesn't come back.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_clear_waits_for_an_older_record_and_leaves_no_usage(pool: PgPool) {
     let conversation = create_conversation(&pool).await.expect("conversation");
     let older = an_older_record(&pool, conversation.id).await;

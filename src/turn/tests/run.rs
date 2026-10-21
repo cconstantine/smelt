@@ -1,6 +1,6 @@
 use super::*;
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_run_turn_for_a_missing_conversation_says_so(pool: PgPool) {
     let _guard = lock_turn_tests();
     start_mock_upstream(&pool, vec![String::new()]).await;
@@ -14,7 +14,7 @@ async fn test_run_turn_for_a_missing_conversation_says_so(pool: PgPool) {
 
 /// With no model to run on the turn can't run, but what the user
 /// typed is still theirs: it shouldn't vanish on the next reload.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_run_turn_without_a_model_still_saves_the_message(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -31,7 +31,7 @@ async fn test_run_turn_without_a_model_still_saves_the_message(pool: PgPool) {
     assert_eq!(saved[0].role, "user");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_run_turn_persists_user_and_assistant_messages_for_text_only_reply(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -89,7 +89,7 @@ async fn test_run_turn_persists_user_and_assistant_messages_for_text_only_reply(
 /// mock upstream that fails the *first* request with Ollama's exact
 /// error shape, `run_turn` should retry without thinking and still
 /// complete — not surface the 500 to the caller.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_run_turn_retries_without_thinking_after_ollama_tool_call_corruption(
     pool: PgPool,
 ) {
@@ -143,7 +143,7 @@ async fn test_run_turn_retries_without_thinking_after_ollama_tool_call_corruptio
 /// doc comment) — this fails *twice*, past the thinking-drop, and
 /// relies on `TOOL_CALL_PARSE_RETRIES` allowing one further plain
 /// regeneration to still recover.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_run_turn_recovers_after_two_ollama_tool_call_failures(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -192,7 +192,7 @@ async fn test_run_turn_recovers_after_two_ollama_tool_call_failures(pool: PgPool
 /// Once `TOOL_CALL_PARSE_RETRIES` is exhausted, `run_turn` gives up and
 /// surfaces the error rather than retrying forever against a call the
 /// model is reliably bad at.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_run_turn_gives_up_after_exhausting_tool_call_parse_retries(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
