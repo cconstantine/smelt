@@ -115,9 +115,9 @@ Three things trip a conversation sandbox's stack (SME-257's retrospective, propo
 - **Building the sandbox image needs memory.** The build runs in the pod's
   Docker sidecar, whose limit is `SANDBOX_DOCKER_MEMORY_LIMIT` (8 Gi by
   default) unless `create_pod`'s `docker_memory_limit` raises it, up to the
-  namespace's `LimitRange` ceiling. SME-226's build was OOM-killed at 24 Gi
-  and went through at 48 Gi, and the kill showed in the build log as an apt or
-  network error, not as memory. Create the pod with
+  namespace's `LimitRange` ceiling. One of SME-226's builds went through at 24 Gi;
+  another was OOM-killed twice before 48 Gi let it through, and each kill showed
+  in the build log as an apt or network error, not as memory. Create the pod with
   `docker_memory_limit: "48Gi"` when it will build the image.
 - **Rebuild the sandbox image after a merge that changes the agent's
   sources** (a merge of `origin/main` into the branch included), before the
@@ -131,7 +131,8 @@ Three things trip a conversation sandbox's stack (SME-257's retrospective, propo
 
   ```bash
   docker compose down
-  docker volume rm smelt_k3s-data smelt_k3s-config  # <project>_…: `docker volume ls` names them
+  p=${COMPOSE_PROJECT_NAME:-$(basename "$PWD")}  # compose's project name: the clone's directory
+  docker volume rm "${p}_k3s-data" "${p}_k3s-config"
   docker compose up -d postgres docker k3s
   docker compose run --rm k3s-bootstrap
   ```
