@@ -211,3 +211,18 @@ running_pgid() {
     group_is_our_server "$pgid" || return 1
     echo "$pgid"
 }
+
+# The DATABASE_URL the group $1 was started with, read from its own environment
+# (/proc/<pid>/environ, NUL-separated): what the running server was actually
+# given, which is the only record of which database it serves — the scratch file
+# records what the last scratch run created, so a dev start over a leftover
+# leaves it naming a database the running server never opened (SME-226 question
+# 1). Empty, and status 0, when the process, the file or the variable isn't
+# there — a server that takes its URL from .env rather than its environment, or
+# a group leader that has died while its children live — and a caller then says
+# nothing rather than guessing. Reads /proc; prints nothing itself, and callers
+# print a database's name only, never the URL, which can carry credentials.
+server_database_url() { # pgid
+    { tr '\0' '\n' <"/proc/$1/environ" 2>/dev/null || true; } |
+        sed -n 's/^DATABASE_URL=//p' | head -n 1
+}

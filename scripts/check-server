@@ -6,7 +6,8 @@
 #
 #   scripts/check-server start [REF] [-- KEY=VALUE ...]   build and serve REF (default: HEAD)
 #   scripts/check-server stop                             stop it, and everything it started
-#   scripts/check-server status
+#   scripts/check-server status                           say what's running, and which
+#                                                         database it serves (SME-226)
 #
 # stop's exit status says which of three things happened. 0: it stopped the
 # server, or there was nothing to stop. 1: a scratch cleanup didn't finish,
@@ -18,8 +19,10 @@
 #
 # KEY=VALUE pairs override the environment for this server only, e.g.
 # `-- SANDBOX_MEMORY_LIMIT=2Gi`. They win over .env, which never overrides a
-# variable that's already set. (To make compaction happen quickly, set a
-# small context window on the model's row at /providers.)
+# variable that's already set. One is refused: `-- DATABASE_URL=` without
+# CHECK_DEV_DB=1, since it would replace the scratch database this serves by
+# default (SME-226). (To make compaction happen quickly, set a small context
+# window on the model's row at /providers.)
 #
 # A REF from before SME-115's fix (6c9f03c) is refused outright, whatever
 # database it would serve (SME-186 B39): such a smelt sweeps the shared
@@ -46,12 +49,30 @@
 #                   On timeout it exits 1, naming the holder and the `stop`
 #                   that would free the port, having checked nothing out and
 #                   created, written or signalled nothing (SME-186 B48).
-#   CHECK_SCRATCH_DB=1  serve from a database of its own, created on start
-#                   (smelt migrates it) and dropped on stop, instead of the dev
-#                   database. For when the dev database has migrations from
-#                   another branch, which stop smelt starting: on SME-65 every
-#                   page was a 500 because SME-35's branch had applied one.
-#                   Nothing from the dev database is copied into it.
+#   CHECK_DEV_DB=1  serve the dev database (DATABASE_URL as it is) instead of a
+#                   scratch one, saying so on start: the branch's migrations are
+#                   applied to it, which is what SME-175's hand-run start did by
+#                   accident. Both database flags accept exactly 1 — any other
+#                   value, `0` included, is refused with exit 2 before anything
+#                   is locked, checked out, created or signalled, since a silent
+#                   `0` is exactly how that start served the dev database — and
+#                   asking for both at once is refused with exit 1 (SME-226).
+#   CHECK_SCRATCH_DB=1  serve from a database of the worktree's own, created on
+#                   start (smelt migrates it) and dropped on stop. That is the
+#                   default since SME-226, so this setting says what happens
+#                   anyway and is accepted for the docs, saved runbooks and
+#                   Feature-checklist rows that have set it all along. It is
+#                   here for when the dev database has migrations from another
+#                   branch, which stop smelt starting: on SME-65 every page was
+#                   a 500 because SME-35's branch had applied one. Nothing from
+#                   the dev database is copied into it.
+#
+#                   The dev URL is $DATABASE_URL, else the check worktree's
+#                   .env, else this checkout's (SME-226: a fresh worktree has no
+#                   .env of its own until start copies it there, and the scratch
+#                   URL is built before that); the scratch URL is that one with
+#                   its database renamed smelt_scratch_<the worktree's name>.
+#                   Neither is ever printed, only the scratch database's name.
 #
 #                   stop deletes that database's own sandbox objects first
 #                   (SME-129): every pod and claim its server made carries
@@ -124,13 +145,21 @@ scratch_db_file() { echo "$worktree/.check-server.scratch-db"; }
 # to the same cluster (SME-129). Empty means the inherited environment.
 kubeconfig_file() { echo "$worktree/.check-server.kubeconfig"; }
 
-# The dev DATABASE_URL: the environment's, else the check worktree's .env read
-# as dotenvy reads it (SME-186 B40 — the server itself gets its URL through
-# dotenvy, so the two have to read the line the same way).
+# The dev DATABASE_URL: the environment's, else the check worktree's .env, else
+# this checkout's, each read as dotenvy reads it (SME-186 B40 — the server
+# itself gets its URL through dotenvy, so the two have to read the line the same
+# way). This checkout's own .env is the last of the three (SME-226): a fresh
+# check worktree has none, and start copies this file into it only *after* the
+# scratch URL is built, so without this fallback the default start — which
+# builds a scratch database — fails in every new worktree. It is exactly the
+# file that copy makes, for the same server, and the value is never printed.
 dev_database_url() {
     local url=${DATABASE_URL:-}
     if [ -z "$url" ] && [ -f "$worktree/.env" ]; then
         url=$(env_file_value DATABASE_URL)
+    fi
+    if [ -z "$url" ] && [ -f "$repo/.env" ]; then
+        url=$(repo_env_file_value DATABASE_URL)
     fi
     echo "$url"
 }
@@ -142,19 +171,60 @@ db_name() {
     echo "${url##*/}"
 }
 
-# The dev DATABASE_URL (the environment's, else the worktree's .env) with the
-# database renamed after the worktree: a fixed name, so a leftover from a
-# failed run is easy to find and the next run reuses it.
+# The scratch database's name: the dev URL's database renamed after the
+# worktree. A fixed name, so a leftover from a failed run is easy to find and
+# the next run reuses it. It needs nothing *of* that URL (SME-226), which is
+# what lets the scratch lock be taken before a DATABASE_URL is resolved at all.
+scratch_db_name() {
+    echo "smelt_scratch_$(basename "$worktree" | tr -c 'a-zA-Z0-9\n' '_')"
+}
+
+# The dev DATABASE_URL with its database renamed after the worktree; the name is
+# scratch_db_name's, so the two can never disagree about what the scratch
+# database is called.
 scratch_db_url() {
     local url
     url=$(dev_database_url)
-    [ -n "$url" ] || { echo "CHECK_SCRATCH_DB needs DATABASE_URL (environment or .env)" >&2; return 1; }
+    [ -n "$url" ] || { echo "a scratch database needs DATABASE_URL (environment, .env or the repo's .env)" >&2; return 1; }
+    # A raw tab, CR or LF is stripped by a driver's URL parser before it reads the
+    # query, so one hides a `dbname=` from the guards below (SME-226 review 2,
+    # finding 1; see url_has_tab_or_newline). Refused rather than stripped first:
+    # no real database URL has one in it, and guessing which reading to believe is
+    # how the drop ends up naming another database.
+    if url_has_tab_or_newline "$url"; then
+        echo "the dev DATABASE_URL contains a raw tab, CR or LF, which a driver strips before reading its query, where it can hide a dbname=: remove the character from the URL, or say CHECK_DEV_DB=1 to serve that URL as it is" >&2
+        return 1
+    fi
     local query=""
-    case "$url" in *\?*) query="?${url#*\?}"; url=${url%%\?*} ;; esac
-    local name
-    name=smelt_scratch_$(basename "$worktree" | tr -c 'a-zA-Z0-9\n' '_')
-    echo "${url%/*}/$name$query"
+    case "$url" in
+        *\?*) query="?${url#*\?}"; url=${url%%\?*} ;;
+    esac
+    # A query that names a database fights the renamed path segment over which
+    # database the driver opens, and which of the two wins was never measured
+    # (SME-226), so it is refused rather than guessed at: a scratch URL is only
+    # worth having if it says this worktree's database and no other. Before this
+    # `?dbname=other` rode along, and the recorded `sqlx database drop` and
+    # `create` asked for that other one by name.
+    # Which key is compared is the *decoded* one (SME-226 review 1, finding 2):
+    # a driver decodes a query key before matching it against the names it knows,
+    # so `?db%6Eame=other` says `dbname=other` to it exactly as the plain spelling
+    # does. The literal `?dbname=` match this guard had let that one through, and
+    # the two sqlx calls below asked for that other database by name.
+    if query_names_dbname "$query"; then
+        echo "the dev DATABASE_URL's query sets dbname=, which would override the scratch database's name: remove it from the URL, or say CHECK_DEV_DB=1 to serve that URL as it is" >&2
+        return 1
+    fi
+    echo "${url%/*}/$(scratch_db_name)$query"
 }
+
+# Which database this start serves (SME-226): a scratch database of the
+# worktree's own, unless the caller opted into the dev one with CHECK_DEV_DB=1.
+# CHECK_SCRATCH_DB=1 names this default and stays accepted, so the docs, saved
+# runbooks and Feature-checklist rows that set it keep working; the two flags
+# together were refused at the top of start, so whatever isn't CHECK_DEV_DB=1 is
+# scratch. Before this ticket the default was the dev database, and any value of
+# CHECK_SCRATCH_DB but `1` — `0` among them — served it in silence.
+serves_scratch_db() { [ "${CHECK_DEV_DB:-}" != 1 ]; }
 
 # The lock ordering a start and a stop of the same scratch database
 # (SME-129): keyed by the database's name, so it works before the check
@@ -205,10 +275,11 @@ drop_scratch_db() {
     echo "dropped the scratch database"
 }
 
-# The settings and /proc helpers, in their own files because this one is at
+# The settings, /proc and URL helpers, in their own files because this one is at
 # the size ceiling (SME-186 review 1, finding 4): sourced here, never run.
 . "$repo/scripts/lib/check-server-config.sh"
 . "$repo/scripts/lib/check-server-proc.sh"
+. "$repo/scripts/lib/check-server-url.sh"
 
 # Cleans up the scratch database's objects and drops it, then empties the
 # KUBECONFIG file. Everything is kept when the cleanup can't finish, so a
@@ -298,6 +369,32 @@ start() {
         echo "CHECK_PORT_WAIT must be a number of seconds to wait for a port another check server holds (0 gives up at once): '$port_wait'" >&2
         exit 2
     fi
+    # Which database was asked for, validated as early as the port and for the
+    # same reason (SME-226): before anything is locked, checked out, created or
+    # signalled. Each flag accepts exactly 1, and empty counts as unset, the
+    # script's convention for RUST_LOG. Until now any value of CHECK_SCRATCH_DB
+    # but `1` — `0` among them — meant the dev database as silently as `true`
+    # did, which is how SME-175's hand-run start ended up serving it.
+    local setting
+    for setting in CHECK_DEV_DB CHECK_SCRATCH_DB; do
+        local setting_value=${!setting-}
+        case "$setting_value" in
+            "" | 1) ;;
+            *)
+                echo "$setting must be 1, or left unset: '$setting_value'" >&2
+                exit 2
+                ;;
+        esac
+    done
+    # And the two of them together is a refusal, not a bad value (exit 1, like
+    # the refusals below): one asks for the dev database, the other for a
+    # scratch one of this worktree's own. It sits here too rather than at the
+    # database itself, so a refused pair locks, checks out, creates and
+    # signals nothing.
+    if [ "${CHECK_DEV_DB:-}" = 1 ] && [ "${CHECK_SCRATCH_DB:-}" = 1 ]; then
+        echo "CHECK_DEV_DB=1 and CHECK_SCRATCH_DB=1 disagree about which database to serve: set one of them, not both" >&2
+        exit 1
+    fi
     local ref=HEAD
     if [ $# -gt 0 ] && [ "$1" != "--" ]; then
         ref=$1
@@ -327,20 +424,41 @@ start() {
         echo "$ref ($commit) is refused: it predates SME-115's fix, so its server sweeps every sandbox claim that isn't in the database it serves, deleting the conversations of every other server's. Merge origin/main into it, or serve a ref from 6c9f03c on" >&2
         exit 1
     fi
+    # An explicit `-- DATABASE_URL=` is the one way to name another database on
+    # the command line, and it used to win by being appended after the scratch
+    # URL (SME-186 B39: that is how a pre-SME-115 ref walked past the refusal).
+    # Under the default it would silently serve whatever database it names, which
+    # is SME-175's harm one step removed, so it is refused — and behind SME-115's
+    # refusal above, which is about the ref and outranks it: a pre-fix ref is
+    # refused because of the ref, whatever database it was headed for.
+    # CHECK_DEV_DB=1 is how to mean it, and still works in one step.
+    if serves_scratch_db && override_value DATABASE_URL >/dev/null 2>&1; then
+        echo "an explicit -- DATABASE_URL= is refused: it would replace the scratch database this serves by default. To serve the database you name, say CHECK_DEV_DB=1 as well" >&2
+        exit 1
+    fi
     # The scratch lock, after the refusals (a refused start never waits) and
     # before the "already running" check, held until this start writes its
     # pid file: a stop of the same database waits for it, so it can't take
     # its no-server branch and drop a database a starting server is about to
-    # use (SME-129). A start that has to wait says so.
-    local db_url
-    if [ "${CHECK_SCRATCH_DB:-}" = 1 ]; then
-        db_url=$(scratch_db_url)
-        take_scratch_lock "$(db_name "$db_url")"
+    # use (SME-129). A start that has to wait says so. Keyed by the scratch
+    # database's *name*, which the worktree alone decides, rather than by a
+    # resolved URL (SME-226): a start with nothing to resolve a DATABASE_URL
+    # from still reaches the checks below, so a server already running is
+    # reported as that and not as a URL error. The URL itself is resolved
+    # after them, still before anything is checked out, created or written.
+    if serves_scratch_db; then
+        take_scratch_lock "$(scratch_db_name)"
     fi
+    # (What a dev start prints about itself is down with the rest, just before the
+    # server begins — every refusal is still ahead of it here. Review 1, finding 3.)
 
     if running_pgid >/dev/null; then
         echo "a check server is already running; scripts/check-server stop first" >&2
         exit 1
+    fi
+    local db_url=""
+    if serves_scratch_db; then
+        db_url=$(scratch_db_url)
     fi
     # The port, after the refusals (a refused start never waits) and before
     # anything is checked out, created or started (a waiting start has
@@ -422,7 +540,7 @@ start() {
         fi
         exit 1
     fi
-    if [ "${CHECK_SCRATCH_DB:-}" = 1 ]; then
+    if serves_scratch_db; then
         # A leftover scratch database's objects are cleaned up before it is
         # dropped and made again (SME-129): dropping it strands every pod and
         # claim its server labelled, since nothing else names its instance.
@@ -457,6 +575,17 @@ start() {
         # Before the caller's overrides, so an explicit DATABASE_URL still wins.
         overrides=("DATABASE_URL=$db_url" "${overrides[@]}")
         echo "serving from scratch database ${db_url##*/}"
+    else
+        # Said out loud because it's the harm this opt-in is here to make a
+        # conscious choice (SME-226): SME-175's hand-run start did it by
+        # accident, applying a branch's migrations to the dev database. It is
+        # said here, beside the scratch database's own line and just before the
+        # server starts, rather than where the flag is read: every refusal — a
+        # server already running, a port another check server holds or something
+        # else listens on, an image the cluster hasn't got — is behind this point,
+        # and a start that went on to refuse had told the reader it was about to
+        # migrate the dev database (SME-226 review 1, finding 3).
+        echo "serving the DEV database; the branch's migrations will be applied to it"
     fi
 
     # smelt logs errors only unless RUST_LOG says otherwise, which left
@@ -503,7 +632,7 @@ start() {
     # The pid file is written, so a stop may take over from here: this start
     # lets go of the scratch lock before it waits for the server to answer,
     # which can take minutes (SME-129).
-    if [ "${CHECK_SCRATCH_DB:-}" = 1 ]; then
+    if serves_scratch_db; then
         exec 9>&-
     fi
     echo "building $(git -C "$worktree" log --oneline -1) (log: $(log_file))"
@@ -555,7 +684,22 @@ case "${1:-}" in
     stop) stop ;;
     status)
         if pgid=$(running_pgid); then
-            echo "running (process group $pgid) at http://localhost:$port/, $(git -C "$worktree" log --oneline -1) (log: $(log_file))"
+            # Which database this server serves, from the server's own
+            # environment: the scratch file records the last scratch run, not
+            # what the running server opened, so only the running process knows
+            # (SME-226 question 1). A database's name only, never the URL, which
+            # can carry credentials; and nothing at all when the server wasn't
+            # given one in its environment.
+            db_note=""
+            server_url=$(server_database_url "$pgid")
+            if [ -n "$server_url" ]; then
+                if [ "$(db_name "$server_url")" = "$(scratch_db_name)" ]; then
+                    db_note=" serving scratch database $(db_name "$server_url"),"
+                else
+                    db_note=" serving the dev database $(db_name "$server_url"),"
+                fi
+            fi
+            echo "running (process group $pgid)$db_note at http://localhost:$port/, $(git -C "$worktree" log --oneline -1) (log: $(log_file))"
         else
             echo "not running (log: $(log_file))"
         fi

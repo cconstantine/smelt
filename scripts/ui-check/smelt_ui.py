@@ -1,7 +1,7 @@
 """Helpers for hands-on checks of smelt through its web UI, with Playwright.
 
 Written for bug bashes (SME-51): drive the real app, with a real model, the
-way a user would. Run a check server first (`scripts/check-server start`),
+way a user would. Run a check server first (`CHECK_SCRATCH_DB=1 scripts/check-server start`),
 then a short script of your own:
 
     /opt/playwright-venv/bin/python my_check.py

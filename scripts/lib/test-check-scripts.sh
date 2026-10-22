@@ -1,5 +1,6 @@
-# Shared by scripts/test-check-server, test-cluster-lock and
-# test-gate-scripts (SME-163; they were one script, test-check-scripts):
+# Shared by scripts/test-check-server, test-check-server-scratch,
+# test-check-server-guards, test-cluster-lock and test-gate-scripts
+# (SME-163; they were one script, test-check-scripts):
 # the stubs and helpers their cases use. Sourced, never run. Each script
 # keeps its files, the stubs and the locks under its own
 # target/<script name>/, so no two share a lock. Needs no cluster or
@@ -267,6 +268,12 @@ check_server() {
         "${extra_env[@]}" scripts/check-server "$@" 2>&1
 }
 scratch_url=postgres://u@localhost/smelt_scratch_worktree
+# The same environment as check_server(), spelled out as an `env` command so a
+# case can run it under `timeout` or `flock`, which take a command and not a
+# shell function. CHECK_WORKTREE is left to the case, which usually names a
+# second worktree.
+cs_env=(env -u SANDBOX_IMAGE -u RUST_LOG -u NO_COLOR PATH="$dir/bin:$PATH" SANDBOX_IMAGE_IMPORT="$dir/bin/import"
+    SANDBOX_INSTANCE_CLEANUP="$dir/bin/cleanup" DATABASE_URL=postgres://u@localhost/smelt_dev CHECK_PORT="$port")
 
 
 # Ends a script: its failures, or that every case passed.

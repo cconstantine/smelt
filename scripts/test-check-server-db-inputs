@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# The check-server inputs that name a database of their own (SME-226): an
+# explicit `-- DATABASE_URL=`, and a dev URL whose query sets `dbname=`. Moved
+# out of scripts/test-check-server-guards, which had crossed the size ceiling;
+# the cases are unchanged apart from this header and the source line. The stubs
+# and helpers are in scripts/lib/test-check-scripts.sh.
+#
+#   scripts/test-check-server-db-inputs
+. "$(dirname "$0")/lib/test-check-scripts.sh"
+
+# The port lock the refusals must never take.
+port_lock=$SMELT_LOCK_DIR/smelt-check-server-$port.lock
+
+# Whatever an earlier, failed run left running.
+check_server stop >/dev/null
+: >"$SQLX_CALLS"
+: >"$pid_file"
+: >"$scratch_file"
+
+# G9 (SME-226): the two inputs that name a database of their own. An explicit
+# `-- DATABASE_URL=` used to win over the scratch URL by being appended after it
+# — the walk-past SME-186 B39 is about — and under the new default it would
+# silently serve whatever database it names, so it is refused unless
+# CHECK_DEV_DB=1 says the caller means the database it names. And a dev URL whose
+# query sets `dbname=` would fight the renamed path segment over which database a
+# scratch server gets; which of the two a driver prefers was never measured, so
+# it is refused rather than guessed at. Both exit 1 (a refusal, not a bad value),
+# touching nothing.
+check_server stop >/dev/null
+: >"$SQLX_CALLS"
+: >"$pid_file"
+: >"$scratch_file"
+out=$(check_server start HEAD -- DATABASE_URL=postgres://u@localhost/another)
+rc=$?
+[ "$rc" = 1 ] || fail "G9 (an explicit -- DATABASE_URL=): start exited $rc, not 1: $out"
+grep -qF "DATABASE_URL" <<<"$out" || fail "G9 (an explicit -- DATABASE_URL=): the refusal doesn't name DATABASE_URL: $out"
+grep -qF "CHECK_DEV_DB" <<<"$out" || fail "G9 (an explicit -- DATABASE_URL=): the refusal doesn't say how to mean it (CHECK_DEV_DB=1): $out"
+grep -q "check server up" <<<"$out" && fail "G9 (an explicit -- DATABASE_URL=): start came up anyway: $out"
+[ -s "$SQLX_CALLS" ] && fail "G9 (an explicit -- DATABASE_URL=): the refused start called sqlx: $(cat "$SQLX_CALLS")"
+[ -s "$pid_file" ] && fail "G9 (an explicit -- DATABASE_URL=): the refused start wrote a pid file: '$(cat "$pid_file")'"
+[ -s "$scratch_file" ] && fail "G9 (an explicit -- DATABASE_URL=): the refused start wrote a scratch file: '$(cat "$scratch_file")'"
+flock -n "$port_lock" true || fail "G9 (an explicit -- DATABASE_URL=): the refused start took the port lock"
+check_server stop >/dev/null
+# With CHECK_DEV_DB=1 the same override is the one-step way to serve another
+# database, exactly as it was before: up, no scratch record, nothing to drop.
+: >"$SQLX_CALLS"
+: >"$pid_file"
+: >"$scratch_file"
+extra_env=(CHECK_DEV_DB=1)
+if ! out=$(check_server start HEAD -- DATABASE_URL=postgres://u@localhost/another); then
+    fail "G9 (CHECK_DEV_DB=1 with -- DATABASE_URL=): start: $out"
+fi
+extra_env=()
+grep -q "check server up" <<<"$out" || fail "G9 (CHECK_DEV_DB=1 with -- DATABASE_URL=): didn't come up: $out"
+[ -s "$scratch_file" ] && fail "G9 (CHECK_DEV_DB=1 with -- DATABASE_URL=): wrote a scratch record: '$(cat "$scratch_file")'"
+: >"$SQLX_CALLS"
+check_server stop >/dev/null
+[ -s "$SQLX_CALLS" ] && fail "G9 (CHECK_DEV_DB=1 with -- DATABASE_URL=): its stop called sqlx: $(cat "$SQLX_CALLS")"
+
+dbname_url='postgres://u@localhost/smelt_dev?dbname=another'
+check_server stop >/dev/null
+: >"$SQLX_CALLS"
+: >"$pid_file"
+: >"$scratch_file"
+extra_env=("DATABASE_URL=$dbname_url")
+out=$(check_server start HEAD)
+rc=$?
+extra_env=()
+[ "$rc" = 1 ] || fail "G9 (a dev URL whose query sets dbname=): start exited $rc, not 1: $out"
+grep -qF "dbname" <<<"$out" || fail "G9 (a dev URL whose query sets dbname=): the refusal doesn't name dbname: $out"
+grep -q "check server up" <<<"$out" && fail "G9 (a dev URL whose query sets dbname=): start came up anyway: $out"
+[ -s "$SQLX_CALLS" ] && fail "G9 (a dev URL whose query sets dbname=): the refused start called sqlx: $(cat "$SQLX_CALLS")"
+[ -s "$pid_file" ] && fail "G9 (a dev URL whose query sets dbname=): the refused start wrote a pid file: '$(cat "$pid_file")'"
+[ -s "$scratch_file" ] && fail "G9 (a dev URL whose query sets dbname=): the refused start wrote a scratch file: '$(cat "$scratch_file")'"
+flock -n "$port_lock" true || fail "G9 (a dev URL whose query sets dbname=): the refused start took the port lock"
+# On the dev path there is no scratch name to override, so the same URL is the
+# caller's own business and start serves it.
+check_server stop >/dev/null
+: >"$SQLX_CALLS"
+: >"$pid_file"
+: >"$scratch_file"
+extra_env=(CHECK_DEV_DB=1 "DATABASE_URL=$dbname_url")
+if ! out=$(check_server start HEAD); then
+    fail "G9 (dbname= with CHECK_DEV_DB=1): start: $out"
+fi
+extra_env=()
+grep -q "check server up" <<<"$out" || fail "G9 (dbname= with CHECK_DEV_DB=1): didn't come up: $out"
+[ -s "$scratch_file" ] && fail "G9 (dbname= with CHECK_DEV_DB=1): wrote a scratch record: '$(cat "$scratch_file")'"
+check_server stop >/dev/null
+
+# G9b (SME-226 review 1, finding 2): the guard compares the *decoded* key. A
+# driver decodes a query key before matching it, so `?db%6Eame=another` names a
+# database exactly as `?dbname=another` does — and the literal `?dbname=` match
+# let it through, so the recorded `sqlx database drop` and `create` asked for
+# that other database by name. Every spelling of the key that decodes to
+# `dbname` is refused the same way, wherever it sits in the query.
+for enc in 'db%6Eame' 'db%6eame' '%64bname' '%64%62%6e%61%6d%65'; do
+    check_server stop >/dev/null
+    : >"$SQLX_CALLS"
+    : >"$pid_file"
+    : >"$scratch_file"
+    extra_env=("DATABASE_URL=postgres://u@localhost/smelt_dev?sslmode=disable&${enc}=another")
+    out=$(check_server start HEAD)
+    rc=$?
+    extra_env=()
+    [ "$rc" = 1 ] || fail "G9b (?${enc}=): start exited $rc, not 1: $out"
+    grep -qF "dbname" <<<"$out" || fail "G9b (?${enc}=): the refusal doesn't name dbname: $out"
+    grep -q "check server up" <<<"$out" && fail "G9b (?${enc}=): start came up anyway: $out"
+    [ -s "$SQLX_CALLS" ] && fail "G9b (?${enc}=): the refused start called sqlx: $(cat "$SQLX_CALLS")"
+    [ -s "$pid_file" ] && fail "G9b (?${enc}=): the refused start wrote a pid file: '$(cat "$pid_file")'"
+    [ -s "$scratch_file" ] && fail "G9b (?${enc}=): the refused start wrote a scratch file: '$(cat "$scratch_file")'"
+    flock -n "$port_lock" true || fail "G9b (?${enc}=): the refused start took the port lock"
+done
+check_server stop >/dev/null
+# And a query that names no database stays nobody's business: the keys beside
+# `dbname` are not what this guard is for, so the same URL with an ordinary key
+# still gets its database renamed, query kept.
+check_server stop >/dev/null
+: >"$SQLX_CALLS"
+: >"$pid_file"
+: >"$scratch_file"
+extra_env=("DATABASE_URL=postgres://u@localhost/smelt_dev?sslmode=disable&name=another")
+if ! out=$(check_server start HEAD); then
+    fail "G9b (a query that sets no dbname): start: $out"
+fi
+extra_env=()
+grep -qx "database create --database-url postgres://u@localhost/smelt_scratch_worktree?sslmode=disable&name=another" \
+    "$SQLX_CALLS" ||
+    fail "G9b (a query that sets no dbname): the scratch URL isn't the dev one with its database renamed and its query kept: $(cat "$SQLX_CALLS")"
+check_server stop >/dev/null
+
+
+# G9c (SME-226 review 2, finding 1): a raw tab, CR or LF hides `dbname` from the
+# guard. The URL parser the driver reads with (the `url` crate, behind sqlx's
+# `url.query_pairs()`) removes every ASCII tab, CR and LF from its input before
+# parsing, so `?db<TAB>name=` is the key `dbname` to it while this script reads
+# `db<TAB>name`, and a newline ends the query before the pair that follows it —
+# `IFS='&' read` stops at the first newline, so `?a=1<LF>&dbname=` reads as the
+# one pair `a=1`. Such a URL reaches `sqlx database drop -y`, which then asks for
+# the database the hidden key names, exactly as the plain spelling does. The
+# characters arrive from a `.env` (a literal tab inside double quotes, a
+# multi-line single-quoted value), not only from a command line. So a dev URL
+# carrying one is refused before the scratch name is built: which of the two
+# readings to believe isn't a thing worth guessing at.
+refused_ws_url() { # name url
+    local name=$1 url=$2 out rc
+    check_server stop >/dev/null
+    : >"$SQLX_CALLS"
+    : >"$pid_file"
+    : >"$scratch_file"
+    extra_env=("DATABASE_URL=$url")
+    out=$(check_server start HEAD)
+    rc=$?
+    extra_env=()
+    [ "$rc" = 1 ] || fail "$name: start exited $rc, not 1: $out"
+    grep -qF "dbname" <<<"$out" || fail "$name: the refusal doesn't name dbname: $out"
+    grep -qF "tab, CR or LF" <<<"$out" ||
+        fail "$name: the refusal doesn't say which characters it is refusing: $out"
+    grep -qF "CHECK_DEV_DB" <<<"$out" ||
+        fail "$name: the refusal doesn't say how to serve that URL (CHECK_DEV_DB=1): $out"
+    grep -q "check server up" <<<"$out" && fail "$name: start came up anyway: $out"
+    [ -s "$SQLX_CALLS" ] && fail "$name: the refused start called sqlx: $(cat "$SQLX_CALLS")"
+    [ -s "$pid_file" ] && fail "$name: the refused start wrote a pid file: '$(cat "$pid_file")'"
+    [ -s "$scratch_file" ] && fail "$name: the refused start wrote a scratch file: '$(cat "$scratch_file")'"
+    flock -n "$port_lock" true || fail "$name: the refused start took the port lock"
+}
+for ws_name in tab CR LF; do
+    case $ws_name in
+        tab) ws=$'\t' ;;
+        CR) ws=$'\r' ;;
+        LF) ws=$'\n' ;;
+    esac
+    # The character inside the key: `dbname` to the driver, `db<ws>name` here.
+    refused_ws_url "G9c (a dev URL with a $ws_name in the key)" \
+        "postgres://u@localhost/smelt_dev?db${ws}name=another"
+    # The character before the pair: the driver sees both pairs, this script only
+    # the first, because the character ends the line `read` takes.
+    refused_ws_url "G9c (a dev URL with a $ws_name before the dbname pair)" \
+        "postgres://u@localhost/smelt_dev?a=1${ws}&dbname=another"
+done
+check_server stop >/dev/null
+
+finish
