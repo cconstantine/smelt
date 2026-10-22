@@ -86,6 +86,11 @@ grep -qx "database create --database-url $scratch_url" "$SQLX_CALLS" || fail "th
 grep -qF "serving from scratch database" <<<"$out" || fail "the default start didn't say which database it serves: $out"
 grep -qF "serving the DEV database" <<<"$out" && fail "the default start said it serves the DEV database: $out"
 case "$(check_server status)" in running*) ;; *) fail "status after the default start: $(check_server status)" ;; esac
+# …and says which database it serves (SME-226): the running server's own, not
+# whatever the scratch file happens to record.
+out=$(check_server status)
+grep -qF "serving scratch database smelt_scratch_worktree," <<<"$out" ||
+    fail "status doesn't say which scratch database the default start serves: $out"
 
 # stop: the group gone, the database dropped, both files kept and empty.
 : >"$SQLX_CALLS"
@@ -115,6 +120,10 @@ if ! out=$(CHECK_DEV_DB=1 check_server start HEAD); then
 fi
 grep -qF "serving the DEV database; the branch's migrations will be applied to it" <<<"$out" ||
     fail "CHECK_DEV_DB=1 didn't say it serves the dev database: $out"
+# And status says it too, from the running server's own environment (SME-226).
+out=$(check_server status)
+grep -qF "serving the dev database smelt_dev," <<<"$out" ||
+    fail "status doesn't say the CHECK_DEV_DB=1 server serves the dev database: $out"
 [ -s "$scratch_file" ] && fail "CHECK_DEV_DB=1 left '$(cat "$scratch_file")' to drop"
 : >"$SQLX_CALLS"
 check_server stop >/dev/null

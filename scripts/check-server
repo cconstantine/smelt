@@ -6,7 +6,8 @@
 #
 #   scripts/check-server start [REF] [-- KEY=VALUE ...]   build and serve REF (default: HEAD)
 #   scripts/check-server stop                             stop it, and everything it started
-#   scripts/check-server status
+#   scripts/check-server status                           say what's running, and which
+#                                                         database it serves (SME-226)
 #
 # stop's exit status says which of three things happened. 0: it stopped the
 # server, or there was nothing to stop. 1: a scratch cleanup didn't finish,
@@ -660,7 +661,22 @@ case "${1:-}" in
     stop) stop ;;
     status)
         if pgid=$(running_pgid); then
-            echo "running (process group $pgid) at http://localhost:$port/, $(git -C "$worktree" log --oneline -1) (log: $(log_file))"
+            # Which database this server serves, from the server's own
+            # environment: the scratch file records the last scratch run, not
+            # what the running server opened, so only the running process knows
+            # (SME-226 question 1). A database's name only, never the URL, which
+            # can carry credentials; and nothing at all when the server wasn't
+            # given one in its environment.
+            db_note=""
+            server_url=$(server_database_url "$pgid")
+            if [ -n "$server_url" ]; then
+                if [ "$(db_name "$server_url")" = "$(scratch_db_name)" ]; then
+                    db_note=" serving scratch database $(db_name "$server_url"),"
+                else
+                    db_note=" serving the dev database $(db_name "$server_url"),"
+                fi
+            fi
+            echo "running (process group $pgid)$db_note at http://localhost:$port/, $(git -C "$worktree" log --oneline -1) (log: $(log_file))"
         else
             echo "not running (log: $(log_file))"
         fi
