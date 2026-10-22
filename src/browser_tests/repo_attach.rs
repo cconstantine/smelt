@@ -5,37 +5,17 @@
 //! `api::git::tests::test_work_on_a_repo_that_fails_after_trusting_still_tells_the_models`
 //! does: an uncommitted repo row from another remote holds the
 //! conversation's directory, the attach trusts its remote and then waits on
-//! that row, and committing the row makes it fail with "already used by".
+//! that row, and committing the row makes it fail with "already used by"
+//! (`git::test_support::hold_directory`).
 
 use super::*;
-
-/// The attach's directory, held by another remote's uncommitted repo row in
-/// `conversation`. Dropped without a commit (a failed scenario), it rolls
-/// back.
-async fn hold_the_directory<'a>(
-    pool: &'a sqlx::PgPool,
-    conversation: i64,
-    dir: &str,
-) -> sqlx::Transaction<'a, sqlx::Postgres> {
-    let mut holding = pool.begin().await.expect("begin the holding transaction");
-    sqlx::query(
-        "INSERT INTO conversation_repos (conversation_id, url, remote_key, dir, status)
-         VALUES ($1, $2, $3, $4, 'cloning')",
-    )
-    .bind(conversation)
-    .bind(format!("https://github.com/x/{dir}"))
-    .bind(format!("github.com/x/{dir}"))
-    .bind(dir)
-    .execute(&mut *holding)
-    .await
-    .expect("hold the directory, uncommitted");
-    holding
-}
+use crate::git::test_support::{HeldDirectory, blocked_by, hold_directory};
 
 /// Types `https://github.com/o/{dir}` into the open conversation's "Work on
 /// a repo", clicks Clone, and waits until the attach waits on the held
-/// directory.
-async fn clone_into_the_held_directory(page: &chromiumoxide::Page, pool: &sqlx::PgPool, dir: &str) {
+/// directory: on `held`'s own lock, not any in the shared database (code
+/// review 1).
+async fn clone_into_the_held_directory(page: &chromiumoxide::Page, pool: &sqlx::PgPool, held: &HeldDirectory, dir: &str) {
     let url = format!("https://github.com/o/{dir}");
     let field = wait_for_element(page, "#repo-attach-url", Duration::from_secs(10)).await;
     field.focus().await.expect("focus the repo URL");
@@ -49,17 +29,18 @@ async fn clone_into_the_held_directory(page: &chromiumoxide::Page, pool: &sqlx::
     assert_eq!(typed, url, "the repo URL field should hold what was typed");
     click_when_present(page, ".repo-attach button[type=submit]", Duration::from_secs(5)).await;
     assert!(
-        wait_until(|| async { crate::git::test_support::lock_waiters(pool).await >= 1 }, Duration::from_secs(15)).await,
+        wait_until(|| async { blocked_by(pool, held.pid).await >= 1 }, Duration::from_secs(15)).await,
         "the attach never waited on the held directory"
     );
 }
 
-/// Commits the held row and waits until nothing waits on a lock any more:
-/// the attach has failed with "already used by".
-async fn release(holding: sqlx::Transaction<'_, sqlx::Postgres>, pool: &sqlx::PgPool) {
-    holding.commit().await.expect("commit the other remote's repo");
+/// Commits the held row and waits until nothing waits on it any more: the
+/// attach has failed with "already used by".
+async fn release(held: HeldDirectory, pool: &sqlx::PgPool) {
+    let pid = held.pid;
+    held.commit().await;
     assert!(
-        wait_until(|| async { crate::git::test_support::lock_waiters(pool).await == 0 }, Duration::from_secs(15)).await,
+        wait_until(|| async { blocked_by(pool, pid).await == 0 }, Duration::from_secs(15)).await,
         "the attach still waits after the hold was committed"
     );
 }
@@ -93,8 +74,8 @@ pub(super) async fn scenario_attach_error_outlives_a_switch(t: &Scenario<'_>) {
     let page = t.tab(t.url(&format!("conversation/{}", a.id))).await;
     wait_for_live_client(&page, a.id).await;
     let dir = unique_id("sme263");
-    let holding = hold_the_directory(t.pool, a.id, &dir).await;
-    clone_into_the_held_directory(&page, t.pool, &dir).await;
+    let held = hold_directory(t.pool, a.id, &dir).await;
+    clone_into_the_held_directory(&page, t.pool, &held, &dir).await;
 
     switch_to(&page, b.id).await;
     switch_to(&page, a.id).await;
@@ -106,7 +87,7 @@ pub(super) async fn scenario_attach_error_outlives_a_switch(t: &Scenario<'_>) {
     );
 
     switch_to(&page, b.id).await;
-    release(holding, t.pool).await;
+    release(held, t.pool).await;
     switch_to(&page, a.id).await;
     assert!(
         wait_for_text(&page, "already used by", Duration::from_secs(10)).await,
@@ -136,15 +117,15 @@ pub(super) async fn scenario_attach_error_after_the_first_message(t: &Scenario<'
     let page = t.tab(t.url(&format!("conversation/{}", c.id))).await;
     wait_for_live_client(&page, c.id).await;
     let dir = unique_id("sme263-first");
-    let holding = hold_the_directory(t.pool, c.id, &dir).await;
-    clone_into_the_held_directory(&page, t.pool, &dir).await;
+    let held = hold_directory(t.pool, c.id, &dir).await;
+    clone_into_the_held_directory(&page, t.pool, &held, &dir).await;
 
     send_from(&page, "first message while cloning").await;
     assert!(
         wait_for_count(&page, ".conversation-empty", 0, Duration::from_secs(10)).await,
         "the first message should take the start screen down"
     );
-    release(holding, t.pool).await;
+    release(held, t.pool).await;
     assert!(
         wait_until(
             || async { page.evaluate(ATTACH_LINE).await.ok().and_then(|v| v.into_value::<bool>().ok()).unwrap_or(false) },
