@@ -20,7 +20,7 @@ A child agent is a conversation (the project's scope item 1): its own transcript
 | `created_at`, `state_changed_at` | |
 
 - **`agent_messages`**, the queue (SME-236 for reports, SME-238 for the rest): `id` (identity), `to_conversation_id` (FK cascade), `from_conversation_id` (FK `SET NULL`, so a deleted sender's message still arrives), `from_label` (`agent #12 (smelt:developer)` or `your parent`, kept for that case), `kind` (`message`, `report`, `notice`), `body`, `created_at`, `delivered_at`, `delivered_message_id` (FK → `messages` `SET NULL`). A partial index on `(to_conversation_id, id) WHERE delivered_at IS NULL`.
-- **`pending_questions.asked_of`** `TEXT NOT NULL DEFAULT 'user'`, `CHECK`ed `user`/`parent` (SME-238): a child's question to its parent uses `ask_user`'s own row and answer path (SME-34).
+- **`pending_questions.asked_of`** `TEXT NOT NULL DEFAULT 'user'`, `CHECK`ed `user`/`parent` (SME-238): a child's question to its parent uses `ask_user`'s own row and answer path (SME-34). Every reader that means "the user is asked" filters on `asked_of = 'user'`: the sidebar's waiting list (`db::list_waiting_conversations`, `/api/questions/waiting`) and the chat's question card (`/api/conversations/{id}/question`), or a child asking its parent would show as waiting for the user.
 - **`conversations.paused_at`** `TIMESTAMP NULL` (SME-238): the pause after a Stop, stored (see [Restarts](#restarts)).
 
 The `agents` row is separate from `conversations` so the user's own conversations carry none of it; `parent_id` is on `conversations` because the cascade has to be.
