@@ -18,8 +18,10 @@
 #
 # KEY=VALUE pairs override the environment for this server only, e.g.
 # `-- SANDBOX_MEMORY_LIMIT=2Gi`. They win over .env, which never overrides a
-# variable that's already set. (To make compaction happen quickly, set a
-# small context window on the model's row at /providers.)
+# variable that's already set. One is refused: `-- DATABASE_URL=` without
+# CHECK_DEV_DB=1, since it would replace the scratch database this serves by
+# default (SME-226). (To make compaction happen quickly, set a small context
+# window on the model's row at /providers.)
 #
 # A REF from before SME-115's fix (6c9f03c) is refused outright, whatever
 # database it would serve (SME-186 B39): such a smelt sweeps the shared
@@ -185,6 +187,18 @@ scratch_db_url() {
     [ -n "$url" ] || { echo "a scratch database needs DATABASE_URL (environment, .env or the repo's .env)" >&2; return 1; }
     local query=""
     case "$url" in *\?*) query="?${url#*\?}"; url=${url%%\?*} ;; esac
+    # A query that names a database fights the renamed path segment over which
+    # database the driver opens, and which of the two wins was never measured
+    # (SME-226), so it is refused rather than guessed at: a scratch URL is only
+    # worth having if it says this worktree's database and no other. Before this
+    # `?dbname=other` rode along, and the recorded `sqlx database drop` and
+    # `create` asked for that other one by name.
+    case "$query" in
+        *[\?\&]dbname=*)
+            echo "the dev DATABASE_URL's query sets dbname=, which would override the scratch database's name: remove it from the URL, or say CHECK_DEV_DB=1 to serve that URL as it is" >&2
+            return 1
+            ;;
+    esac
     echo "${url%/*}/$(scratch_db_name)$query"
 }
 
@@ -392,6 +406,18 @@ start() {
     # with VersionMissing on a database holding migrations the ref doesn't.
     if ! git -C "$repo" merge-base --is-ancestor 6c9f03c "$commit" 2>/dev/null; then
         echo "$ref ($commit) is refused: it predates SME-115's fix, so its server sweeps every sandbox claim that isn't in the database it serves, deleting the conversations of every other server's. Merge origin/main into it, or serve a ref from 6c9f03c on" >&2
+        exit 1
+    fi
+    # An explicit `-- DATABASE_URL=` is the one way to name another database on
+    # the command line, and it used to win by being appended after the scratch
+    # URL (SME-186 B39: that is how a pre-SME-115 ref walked past the refusal).
+    # Under the default it would silently serve whatever database it names, which
+    # is SME-175's harm one step removed, so it is refused — and behind SME-115's
+    # refusal above, which is about the ref and outranks it: a pre-fix ref is
+    # refused because of the ref, whatever database it was headed for.
+    # CHECK_DEV_DB=1 is how to mean it, and still works in one step.
+    if serves_scratch_db && override_value DATABASE_URL >/dev/null 2>&1; then
+        echo "an explicit -- DATABASE_URL= is refused: it would replace the scratch database this serves by default. To serve the database you name, say CHECK_DEV_DB=1 as well" >&2
         exit 1
     fi
     # The scratch lock, after the refusals (a refused start never waits) and

@@ -568,4 +568,75 @@ flock -n "$port_lock" true || fail "G8 (both flags): the refused pair took the p
 # answer), so the docs and runbooks that set it keep working.
 check_server stop >/dev/null
 
+# G9 (SME-226): the two inputs that name a database of their own. An explicit
+# `-- DATABASE_URL=` used to win over the scratch URL by being appended after it
+# — the walk-past SME-186 B39 is about — and under the new default it would
+# silently serve whatever database it names, so it is refused unless
+# CHECK_DEV_DB=1 says the caller means the database it names. And a dev URL whose
+# query sets `dbname=` would fight the renamed path segment over which database a
+# scratch server gets; which of the two a driver prefers was never measured, so
+# it is refused rather than guessed at. Both exit 1 (a refusal, not a bad value),
+# touching nothing.
+check_server stop >/dev/null
+: >"$SQLX_CALLS"
+: >"$pid_file"
+: >"$scratch_file"
+out=$(check_server start HEAD -- DATABASE_URL=postgres://u@localhost/another)
+rc=$?
+[ "$rc" = 1 ] || fail "G9 (an explicit -- DATABASE_URL=): start exited $rc, not 1: $out"
+grep -qF "DATABASE_URL" <<<"$out" || fail "G9 (an explicit -- DATABASE_URL=): the refusal doesn't name DATABASE_URL: $out"
+grep -qF "CHECK_DEV_DB" <<<"$out" || fail "G9 (an explicit -- DATABASE_URL=): the refusal doesn't say how to mean it (CHECK_DEV_DB=1): $out"
+grep -q "check server up" <<<"$out" && fail "G9 (an explicit -- DATABASE_URL=): start came up anyway: $out"
+[ -s "$SQLX_CALLS" ] && fail "G9 (an explicit -- DATABASE_URL=): the refused start called sqlx: $(cat "$SQLX_CALLS")"
+[ -s "$pid_file" ] && fail "G9 (an explicit -- DATABASE_URL=): the refused start wrote a pid file: '$(cat "$pid_file")'"
+[ -s "$scratch_file" ] && fail "G9 (an explicit -- DATABASE_URL=): the refused start wrote a scratch file: '$(cat "$scratch_file")'"
+flock -n "$port_lock" true || fail "G9 (an explicit -- DATABASE_URL=): the refused start took the port lock"
+check_server stop >/dev/null
+# With CHECK_DEV_DB=1 the same override is the one-step way to serve another
+# database, exactly as it was before: up, no scratch record, nothing to drop.
+: >"$SQLX_CALLS"
+: >"$pid_file"
+: >"$scratch_file"
+extra_env=(CHECK_DEV_DB=1)
+if ! out=$(check_server start HEAD -- DATABASE_URL=postgres://u@localhost/another); then
+    fail "G9 (CHECK_DEV_DB=1 with -- DATABASE_URL=): start: $out"
+fi
+extra_env=()
+grep -q "check server up" <<<"$out" || fail "G9 (CHECK_DEV_DB=1 with -- DATABASE_URL=): didn't come up: $out"
+[ -s "$scratch_file" ] && fail "G9 (CHECK_DEV_DB=1 with -- DATABASE_URL=): wrote a scratch record: '$(cat "$scratch_file")'"
+: >"$SQLX_CALLS"
+check_server stop >/dev/null
+[ -s "$SQLX_CALLS" ] && fail "G9 (CHECK_DEV_DB=1 with -- DATABASE_URL=): its stop called sqlx: $(cat "$SQLX_CALLS")"
+
+dbname_url='postgres://u@localhost/smelt_dev?dbname=another'
+check_server stop >/dev/null
+: >"$SQLX_CALLS"
+: >"$pid_file"
+: >"$scratch_file"
+extra_env=("DATABASE_URL=$dbname_url")
+out=$(check_server start HEAD)
+rc=$?
+extra_env=()
+[ "$rc" = 1 ] || fail "G9 (a dev URL whose query sets dbname=): start exited $rc, not 1: $out"
+grep -qF "dbname" <<<"$out" || fail "G9 (a dev URL whose query sets dbname=): the refusal doesn't name dbname: $out"
+grep -q "check server up" <<<"$out" && fail "G9 (a dev URL whose query sets dbname=): start came up anyway: $out"
+[ -s "$SQLX_CALLS" ] && fail "G9 (a dev URL whose query sets dbname=): the refused start called sqlx: $(cat "$SQLX_CALLS")"
+[ -s "$pid_file" ] && fail "G9 (a dev URL whose query sets dbname=): the refused start wrote a pid file: '$(cat "$pid_file")'"
+[ -s "$scratch_file" ] && fail "G9 (a dev URL whose query sets dbname=): the refused start wrote a scratch file: '$(cat "$scratch_file")'"
+flock -n "$port_lock" true || fail "G9 (a dev URL whose query sets dbname=): the refused start took the port lock"
+# On the dev path there is no scratch name to override, so the same URL is the
+# caller's own business and start serves it.
+check_server stop >/dev/null
+: >"$SQLX_CALLS"
+: >"$pid_file"
+: >"$scratch_file"
+extra_env=(CHECK_DEV_DB=1 "DATABASE_URL=$dbname_url")
+if ! out=$(check_server start HEAD); then
+    fail "G9 (dbname= with CHECK_DEV_DB=1): start: $out"
+fi
+extra_env=()
+grep -q "check server up" <<<"$out" || fail "G9 (dbname= with CHECK_DEV_DB=1): didn't come up: $out"
+[ -s "$scratch_file" ] && fail "G9 (dbname= with CHECK_DEV_DB=1): wrote a scratch record: '$(cat "$scratch_file")'"
+check_server stop >/dev/null
+
 finish
