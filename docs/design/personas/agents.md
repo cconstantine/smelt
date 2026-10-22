@@ -80,7 +80,7 @@ Stored: only `agents.state`, the lifecycle (`starting`, `active`, `finished`, `s
 | finished | `state = 'finished'` |
 | idle | otherwise (between turns, maybe waiting on a command) |
 
-**Every writer of `state`:** `finish` (`active` → `finished`); `stop_agent` (the subtree → `stopped`); the drain delivering a parent's message to a `finished` child (→ `active`, in the drain's transaction); the user's own send or answer in the child (`finished` or `stopped` → `active`, in `start_turn`'s admission). Each is one `UPDATE … WHERE state = <expected>`, so two writers can't both act on one state: a `finish` racing a `stop_agent` leaves whichever committed second refused, and `stop_agent` wins over a later `finish` because `finish` checks `state = 'active'`.
+**Every writer of `state`:** the start (`starting` → `active`, or → `finished` when it fails); `finish` (`active` → `finished`); `stop_agent` (the subtree → `stopped`); the drain delivering a parent's message to a `finished` child (→ `active`, in the drain's transaction); the user's own send or answer in the child (`finished` or `stopped` → `active`, in `start_turn`'s admission). Each is one `UPDATE … WHERE state = <expected>`, so two writers can't both act on one state: a `finish` racing a `stop_agent` leaves whichever committed second refused, and `stop_agent` wins over a later `finish` because `finish` checks `state = 'active'`.
 
 ## Stop, `stop_agent` and the user
 
