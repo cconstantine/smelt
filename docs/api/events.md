@@ -50,7 +50,7 @@ pub struct BrowsingState { session_open: bool, url: Option<String> }
 `subscribe_conversation_events` is the conversation's `ServerEvents` stream. It isn't scoped to one request: a browser tab opens it once per viewed conversation and keeps it open for as long as that conversation is selected, forwarding whatever `events::subscribe(id)` yields. A conversation's channel exists only while something subscribes: the first subscriber makes it, the last one's `Subscription` removes it, and `publish` with nobody subscribed drops the event without making one. A conversation that doesn't exist is refused (checked again once subscribed), so a tab still reconnecting to a deleted one makes nothing (SME-91):
 
 ```rust
-// src/events.rs
+// src/events/mod.rs
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum ConversationEvent {
@@ -109,7 +109,7 @@ The model can ask the user one to four questions (`ask_user`: each a question, a
 
 ## App-wide events and pods
 
-`subscribe_app_events` is the stream of `AppEvent` (`src/events.rs`), for views that span conversations. Both events carry nothing; listeners refetch:
+`subscribe_app_events` is the stream of `AppEvent` (`src/events/mod.rs`), for views that span conversations. Both events carry nothing; listeners refetch:
 - **`PodsChanged`**, published when a pod is created (`create_pod`), goes away (`force_terminate_pod`: a model's terminate, a user's stop, a crash), or is torn down with its conversation (`delete_conversation`).
 - **`TurnsChanged`**, published when a conversation goes from idle to busy or back (`TurnInFlight`). Listeners refetch `get_busy_conversations`: every conversation with a turn running or queued.
 - **`QuestionsChanged`**, published when a conversation starts or stops waiting on an answer to the model's question. Listeners refetch `get_waiting_conversations`, for the sidebar's waiting mark.
