@@ -97,6 +97,7 @@ fn repo_in(dir: &str) -> db::ConversationRepo {
         updated_at: chrono::DateTime::from_timestamp(0, 0).expect("epoch").naive_utc(),
         agents_files: vec![],
         attempt: 1,
+        persona_files: vec![],
     }
 }
 

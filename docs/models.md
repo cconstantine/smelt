@@ -88,5 +88,5 @@ Model providers' wire types (`ProviderSummary`, `ProviderInput`, `ProviderKind`,
 
 `models.rs` isn't the only home for these:
 
-- Server-only row types live in `db.rs` (`SandboxPod`, `SandboxTerminal`, `TerminalCommand`, `SandboxVolume`, `McpServerConfig`, `ConversationRepo`, `LoadedInstruction`, `SshKey`, ...), deriving `FromRow` ungated since `db` is only compiled with the `server` feature.
+- Server-only row types live in `db.rs` (`SandboxPod`, `SandboxTerminal`, `TerminalCommand`, `SandboxVolume`, `McpServerConfig`, `ConversationRepo`, `LoadedInstruction`, `SshKey`, ...), deriving `FromRow` ungated since `db` is only compiled with the `server` feature. `ConversationRepo.persona_files` (SME-235) holds the checkout's persona files' paths, relative to it, recorded at clone like `agents_files`; nothing from inside the files is stored.
 - Shared wire types live next to the code they belong to: `anthropic::types` (`ContentBlock`, `TokenUsage`, `AnthropicMessage`, ...), `events.rs` (`ConversationEvent`, `AppEvent`, `SandboxPreview`) and `git.rs` (`RepoSummary`, `SshKeySummary`, `GitIdentity`, ...).

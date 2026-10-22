@@ -157,7 +157,7 @@ async fn test_only_the_current_attempt_finishes_a_clone(pool: PgPool) {
     assert_eq!(status(pool.clone()).await, ("cloning".to_string(), 1));
 
     // Attempt 1 finishes; its guard's late "failed" changes nothing.
-    assert!(set_repo_ready(&pool, repo.id, 1, "main", None, &[], None).await.expect("ready"));
+    assert!(set_repo_ready(&pool, repo.id, 1, "main", None, &[], &[], None).await.expect("ready"));
     assert!(!set_repo_failed(&pool, repo.id, 1, "interrupted").await.expect("late failed"));
     assert_eq!(status(pool.clone()).await, ("ready".to_string(), 1));
     // A ready clone isn't retried either.
@@ -175,10 +175,10 @@ async fn test_only_the_current_attempt_finishes_a_clone(pool: PgPool) {
         .expect("it was failed");
     assert_eq!((retried.status.as_str(), retried.attempt), ("cloning", 2));
     assert!(!set_repo_failed(&pool, failed.id, 1, "interrupted").await.expect("stale failed"));
-    assert!(!set_repo_ready(&pool, failed.id, 1, "main", None, &[], None).await.expect("stale ready"));
+    assert!(!set_repo_ready(&pool, failed.id, 1, "main", None, &[], &[], None).await.expect("stale ready"));
     let row = get_conversation_repo(&pool, failed.id).await.expect("get").expect("exists");
     assert_eq!((row.status.as_str(), row.attempt), ("cloning", 2));
-    assert!(set_repo_ready(&pool, failed.id, 2, "main", None, &[], None).await.expect("ready"));
+    assert!(set_repo_ready(&pool, failed.id, 2, "main", None, &[], &[], None).await.expect("ready"));
     let row = get_conversation_repo(&pool, failed.id).await.expect("get").expect("exists");
     assert_eq!(row.status, "ready");
 }
@@ -197,4 +197,38 @@ async fn test_two_retries_of_a_failed_clone_one_wins(pool: PgPool) {
     );
     let won = [a.expect("retry a"), b.expect("retry b")].into_iter().flatten().count();
     assert_eq!(won, 1, "exactly one retry runs");
+}
+
+/// SME-235: a finished clone records its persona files with its
+/// AGENTS.md files, in the one update, and a retry starts them empty.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_clone_records_its_persona_files_and_a_retry_clears_them(pool: PgPool) {
+    let conversation = create_conversation(&pool).await.expect("conversation");
+    let repo = create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")
+        .await
+        .expect("create repo");
+    assert!(repo.persona_files.is_empty(), "{repo:?}");
+    let agents = vec!["AGENTS.md".to_string()];
+    let personas = vec![".agents/personas/developer.md".to_string(), ".agents/personas/reviewer.md".to_string()];
+    assert!(set_repo_ready(&pool, repo.id, 1, "main", None, &agents, &personas, None).await.expect("ready"));
+    let row = get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
+    assert_eq!((row.agents_files, row.persona_files), (agents, personas.clone()));
+
+    // A failed row still holding some (written by hand: no path leaves
+    // one there today) is retried with none.
+    let failed = create_conversation_repo(&pool, conversation.id, "u", "k", None, "f")
+        .await
+        .expect("create repo");
+    assert!(set_repo_failed(&pool, failed.id, 1, "fatal: nope").await.expect("fail"));
+    sqlx::query("UPDATE conversation_repos SET persona_files = $2 WHERE id = $1")
+        .bind(failed.id)
+        .bind(&personas)
+        .execute(&pool)
+        .await
+        .expect("set persona files");
+    let retried = retry_repo_clone(&pool, failed.id, "u", "k", None)
+        .await
+        .expect("retry")
+        .expect("it was failed");
+    assert!(retried.persona_files.is_empty(), "{retried:?}");
 }
