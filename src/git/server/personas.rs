@@ -12,26 +12,36 @@ pub const PERSONAS_DIR: &str = ".agents/personas/";
 /// How many persona files of one checkout are recorded, as for AGENTS.md.
 const MAX_PERSONA_FILES: usize = 50;
 
+/// The persona files a checkout's listing found, and how many other files
+/// directly in `.agents/personas/` weren't taken (a name no persona can
+/// have, or past the first 50), so a listing can say so.
+#[derive(Debug, PartialEq)]
+pub struct PersonaPaths {
+    pub files: Vec<String>,
+    pub unread: usize,
+}
+
 /// The persona files among `git ls-files -z` output: the files directly
 /// in `.agents/personas/` named as a persona's can be (`<name>.md`),
 /// sorted, at most 50. Git's pathspec `*` matches `/` too, so a file in a
 /// subdirectory comes through the listing and is dropped here.
-pub(super) fn persona_paths(listed: &str) -> Vec<String> {
-    let mut files: Vec<String> = listed
+pub(super) fn persona_paths(listed: &str) -> PersonaPaths {
+    let direct: Vec<&str> = listed
         .split('\0')
-        .filter(|path| {
-            path.strip_prefix(PERSONAS_DIR)
-                .is_some_and(|name| !name.contains('/') && crate::personas::is_persona_file_name(name))
-        })
-        .map(str::to_string)
+        .filter_map(|path| path.strip_prefix(PERSONAS_DIR).filter(|name| !name.is_empty() && !name.contains('/')).map(|_| path))
+        .collect();
+    let mut files: Vec<String> = direct
+        .iter()
+        .filter(|path| path.strip_prefix(PERSONAS_DIR).is_some_and(crate::personas::is_persona_file_name))
+        .map(|path| path.to_string())
         .collect();
     files.sort();
     files.truncate(MAX_PERSONA_FILES);
-    files
+    PersonaPaths { unread: direct.len() - files.len(), files }
 }
 
 /// The checkout's tracked persona files, relative to it.
-pub async fn list_persona_files(shell: &sandbox::PodShell, dir: &str) -> Result<Vec<String>, String> {
+pub async fn list_persona_files(shell: &sandbox::PodShell, dir: &str) -> Result<PersonaPaths, String> {
     let path = format!("{}/{dir}", crate::sandbox::WORKSPACE_DIR);
     let pathspec = format!("{PERSONAS_DIR}*.md");
     let listed = shell
@@ -72,12 +82,19 @@ pub(crate) struct PersonaFile {
     pub parsed: Result<crate::personas::Persona, String>,
 }
 
+/// A checkout's persona files as read, and how many other files in the
+/// directory weren't read (`PersonaPaths::unread`).
+pub(crate) struct CheckoutPersonas {
+    pub files: Vec<PersonaFile>,
+    pub unread: usize,
+}
+
 /// What `list_personas` read from one repo's checkout, before the trust
 /// gate: `None` unless the repo is ready; an error when it couldn't be
 /// listed.
 pub(crate) struct RepoPersonas {
     pub repo: db::ConversationRepo,
-    pub read: Option<Result<Vec<PersonaFile>, String>>,
+    pub read: Option<Result<CheckoutPersonas, String>>,
 }
 
 /// What the model is told when the conversation has no repos.
@@ -119,8 +136,8 @@ async fn read_repo_personas(
     pool: &PgPool,
     shell: &sandbox::PodShell,
     repo: &db::ConversationRepo,
-) -> Result<Vec<PersonaFile>, String> {
-    let paths = list_persona_files(shell, &repo.dir).await?;
+) -> Result<CheckoutPersonas, String> {
+    let PersonaPaths { files: paths, unread } = list_persona_files(shell, &repo.dir).await?;
     if let Err(e) = db::set_repo_persona_files(pool, repo.id, repo.attempt, &paths).await {
         tracing::warn!(repo_id = repo.id, error = %e, "couldn't re-record persona files");
     }
@@ -136,7 +153,7 @@ async fn read_repo_personas(
         };
         files.push(PersonaFile { path, parsed });
     }
-    Ok(files)
+    Ok(CheckoutPersonas { files, unread })
 }
 
 /// Whether the user trusts `remote_key`: `None` when they haven't
@@ -193,13 +210,25 @@ pub(crate) async fn gated_listing(pool: &PgPool, reads: Vec<RepoPersonas>) -> Re
         };
         match remote_trust(pool, &repo.remote_key).await? {
             Some(true) => match read {
-                Ok(files) if files.is_empty() => {
-                    entry["note"] = Value::String(format!("It has no persona files ({PERSONAS_DIR}*.md)."));
-                }
-                Ok(files) => {
-                    let personas: Vec<Value> = files.into_iter().map(|f| persona_entry(&repo.dir, f)).collect();
-                    any_persona |= personas.iter().any(|p| p.get("persona").is_some());
-                    entry["personas"] = Value::Array(personas);
+                Ok(CheckoutPersonas { files, unread }) => {
+                    let mut notes = Vec::new();
+                    if files.is_empty() {
+                        notes.push(format!("It has no persona files ({PERSONAS_DIR}*.md)."));
+                    } else {
+                        let personas: Vec<Value> = files.into_iter().map(|f| persona_entry(&repo.dir, f)).collect();
+                        any_persona |= personas.iter().any(|p| p.get("persona").is_some());
+                        entry["personas"] = Value::Array(personas);
+                    }
+                    if unread > 0 {
+                        notes.push(format!(
+                            "{unread} other files in {PERSONAS_DIR} weren't read: a persona file is named <name>.md, \
+                             the name 1 to 64 of a-z, 0-9 and - (not starting or ending with -), and at most \
+                             {MAX_PERSONA_FILES} are read."
+                        ));
+                    }
+                    if !notes.is_empty() {
+                        entry["note"] = Value::String(notes.join(" "));
+                    }
                 }
                 Err(e) => entry["error"] = Value::String(format!("Couldn't list its persona files: {e}")),
             },

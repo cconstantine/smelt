@@ -563,7 +563,7 @@ async fn clone_repo_row(
                 e.to_string()
             });
             // What list_personas shows once the user trusts the repo.
-            let personas = list_persona_files(&shell, &repo.dir).await.inspect_err(|e| {
+            let personas = list_persona_files(&shell, &repo.dir).await.map(|p| p.files).inspect_err(|e| {
                 tracing::warn!(repo = %crate::telemetry::scrub_urls(&repo.url), error = %e, "couldn't list persona files");
             });
             record_cloned(pool, repo, &cloned, files, personas, guard).await
