@@ -16,7 +16,7 @@ A child agent is a conversation (the project's scope item 1): its own transcript
 | `brief` | The brief, as `start_agent` got it (also the child's first message) |
 | `persona_name`, `persona_path`, `persona_commit`, `persona_body`, `persona_settings` (JSONB) | The persona snapshot, all null without one ([persona-files.md](persona-files.md#read-from-the-childs-own-checkout)) |
 | `rule_chain` (JSONB), `credentials` (`TEXT[]`) | The effective rules and credentials ([tool-rules.md](tool-rules.md#narrowing-a-child-never-gets-more-than-its-parent)), fixed at start |
-| `state` | `active`, `finished` or `stopped`, `CHECK`ed; the only stored part of the status ([Statuses](#statuses)) |
+| `state` | `starting`, `active`, `finished` or `stopped`, `CHECK`ed; the only stored part of the status ([Statuses](#statuses)) |
 | `created_at`, `state_changed_at` | |
 
 - **`agent_messages`**, the queue (SME-236 for reports, SME-238 for the rest): `id` (identity), `to_conversation_id` (FK cascade), `from_conversation_id` (FK `SET NULL`, so a deleted sender's message still arrives), `from_label` (`agent #12 (smelt:developer)` or `your parent`, kept for that case), `kind` (`message`, `report`, `notice`), `body`, `created_at`, `delivered_at`, `delivered_message_id` (FK → `messages` `SET NULL`). A partial index on `(to_conversation_id, id) WHERE delivered_at IS NULL`.
@@ -63,10 +63,13 @@ The drain, `drain_agent_messages`, runs beside the two command drains in `run_tu
 
 ## Statuses
 
-Stored: only `agents.state`, the lifecycle (`active`, `finished`, `stopped`). Everything else is derived from where it already lives, so a status can't disagree with its source:
+Stored: only `agents.state`, the lifecycle (`starting`, `active`, `finished`, `stopped`).
+
+**`starting`** lasts from the child's row until its start is done: clone, AGENTS.md, persona snapshot and, for a child without `git-ssh`, the key removed. While it holds, no turn is admitted: the user's send in the child is refused ("this agent is still starting"), and a wake or a delivered notice is a no-op, so no command of the model's runs before the start is done. The start ends by setting `active` and admitting the brief's turn, or, failing, as [Deleting](#deleting) and the failed-start rule below say. Everything else is derived from where it already lives, so a status can't disagree with its source:
 
 | Status (first that holds) | From |
 | -- | -- |
+| starting | `state = 'starting'` |
 | stopped | `state = 'stopped'` |
 | running | a turn in flight (`turn::turn_running`, in memory) |
 | waiting for the user | an unanswered `pending_questions` row with `asked_of = 'user'`, or an `instruction_requests` card |
