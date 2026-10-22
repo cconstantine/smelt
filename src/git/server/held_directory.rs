@@ -11,7 +11,8 @@
 use super::*;
 use std::time::{Duration, Instant};
 
-/// `dir` in `conversation`, held by another remote's uncommitted repo row.
+/// `dir` in `conversation`, held by another remote's uncommitted repo row
+/// until it's committed or dropped.
 pub(crate) struct HeldDirectory {
     holding: Option<sqlx::Transaction<'static, sqlx::Postgres>>,
     /// The holding session's backend pid, for [`blocked_by`].
@@ -24,6 +25,25 @@ impl HeldDirectory {
     pub(crate) async fn commit(mut self) {
         if let Some(holding) = self.holding.take() {
             holding.commit().await.expect("commit the other remote's repo");
+        }
+    }
+}
+
+/// A hold dropped without [`HeldDirectory::commit`] (a scenario that failed
+/// or ran out of time) commits too, rather than rolling back: rolled back,
+/// it let the waiting attach go on to start a real sandbox and clone from
+/// GitHub (code review 1). Committed, the attach fails fast with "already
+/// used by", as when the scenario releases it.
+impl Drop for HeldDirectory {
+    fn drop(&mut self) {
+        if let Some(holding) = self.holding.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(async move {
+                if let Err(e) = holding.commit().await {
+                    eprintln!("a dropped directory hold didn't commit: {e}");
+                }
+            });
         }
     }
 }
@@ -114,5 +134,30 @@ mod tests {
         other.commit().await;
         conflicts(mine, "the insert at the held directory").await;
         conflicts(unrelated, "the unrelated insert").await;
+    }
+
+    /// SME-263 code review 1: a scenario that fails or times out drops its
+    /// hold. Rolled back, it let the waiting attach go on to start a real
+    /// sandbox and clone from GitHub; committed, the attach fails fast with
+    /// "already used by", as it does when the scenario releases it.
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+    async fn test_a_hold_dropped_without_its_commit_still_commits(pool: PgPool) {
+        let conversation = db::create_conversation(&pool).await.expect("conversation").id;
+        drop(hold_directory(&pool, conversation, "dropped").await);
+        let deadline = Instant::now() + LIMIT;
+        loop {
+            let held: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM conversation_repos WHERE conversation_id = $1 AND dir = 'dropped'",
+            )
+            .bind(conversation)
+            .fetch_one(&pool)
+            .await
+            .expect("count the held row");
+            if held == 1 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the dropped hold rolled back instead of committing");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }
