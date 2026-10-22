@@ -12,8 +12,9 @@ use super::*;
 /// (a streamed delta, say) re-renders only what reads that field.
 ///
 /// What isn't here outlives a switch on purpose: the message box's draft,
-/// the turn errors (kept by conversation), the model picker's state, the
-/// time zone, and the transcript's own scroll bookkeeping.
+/// the turn errors (kept by conversation), "Work on a repo"'s clone in
+/// flight and its error (by conversation, SME-263), the model picker's
+/// state, the time zone, and the transcript's own scroll bookkeeping.
 #[derive(Store, Default)]
 pub(super) struct ConversationState {
     /// The conversation this state is about: set by the switch's reset,
@@ -46,13 +47,11 @@ pub(super) struct ConversationState {
     pub(super) todos: Vec<TodoItem>,
     /// The question this conversation waits on, for its card (SME-34).
     pub(super) pending_question: Option<PendingQuestion>,
-    /// "Work on a repo" in a new conversation: the form, a clone in flight,
-    /// and its error.
+    /// "Work on a repo" in a new conversation: the form. A clone in flight
+    /// and its error are `RepoAttaches`', which outlive a switch.
     pub(super) repo_url: String,
     pub(super) repo_branch: String,
     pub(super) repo_dir: String,
-    pub(super) repo_attaching: bool,
-    pub(super) repo_attach_error: Option<String>,
     /// The last Trust / Don't trust / Reload failure.
     pub(super) repo_action_error: Option<String>,
     /// The conversation's git repos (SME-32), from `ReposUpdate`.

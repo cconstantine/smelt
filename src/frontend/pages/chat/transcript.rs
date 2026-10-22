@@ -329,6 +329,7 @@ pub(super) fn Transcript(
     mut input: Signal<String>,
     on_attach: EventHandler<()>,
     stream_errors: Signal<super::state::ChatErrors>,
+    attaches: Signal<RepoAttaches>,
     scroll: StickyBottom,
     mut pointer_over_transcript: Signal<bool>,
     mut media_loaded: Signal<u64>,
@@ -450,7 +451,9 @@ pub(super) fn Transcript(
                     h2 { "What should smelt work on?" }
                     p { "It works in a sandbox of its own: it writes and runs code, uses a terminal, reads the web, and shows you each step." }
                     RepoAttach {
+                        selected,
                         state,
+                        attaches,
                         on_attach,
                     }
                     div { class: "example-asks",

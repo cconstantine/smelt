@@ -21,7 +21,7 @@ pub(crate) static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::co
 
 /// Sessions in this test's database waiting on a lock (a row lock or
 /// the remote's advisory lock).
-async fn lock_waiters(pool: &PgPool) -> i64 {
+pub(crate) async fn lock_waiters(pool: &PgPool) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM pg_stat_activity
           WHERE datname = current_database() AND wait_event_type = 'Lock'",

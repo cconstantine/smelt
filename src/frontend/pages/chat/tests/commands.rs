@@ -178,8 +178,6 @@ fn test_conversation_state_starts_empty() {
         repo_url,
         repo_branch,
         repo_dir,
-        repo_attaching,
-        repo_attach_error,
         repo_action_error,
         repos,
         sandbox_pods,
@@ -211,8 +209,6 @@ fn test_conversation_state_starts_empty() {
     assert!(repo_url.is_empty(), "repo_url");
     assert!(repo_branch.is_empty(), "repo_branch");
     assert!(repo_dir.is_empty(), "repo_dir");
-    assert!(!repo_attaching, "repo_attaching");
-    assert!(repo_attach_error.is_none(), "repo_attach_error");
     assert!(repo_action_error.is_none(), "repo_action_error");
     assert!(repos.is_empty(), "repos");
     assert!(sandbox_pods.is_empty(), "sandbox_pods");
@@ -231,4 +227,63 @@ fn test_conversation_state_starts_empty() {
     assert!(!context_detail_open, "context_detail_open");
     assert!(!layout_snap_pending, "layout_snap_pending");
     assert!(live.is_none(), "live");
+}
+
+/// SME-263: an attach's error is kept for its conversation (a switch
+/// doesn't touch the store), and the next Clone there clears it.
+#[test]
+fn test_an_attach_error_outlives_a_switch_and_goes_on_the_next_clone() {
+    let mut attaches = RepoAttaches::default();
+    assert!(attaches.start(1), "the first Clone starts");
+    assert!(attaches.attaching(1), "in flight");
+    attaches.finish(1, Err("x is already used by y".to_string()));
+    assert!(!attaches.attaching(1), "answered");
+    assert_eq!(attaches.error(1), Some("x is already used by y"));
+    assert!(attaches.start(1), "Clone again");
+    assert_eq!(attaches.error(1), None, "the next Clone clears the error");
+    attaches.finish(1, Ok(()));
+    assert_eq!(attaches.error(1), None, "a clone that worked leaves no error");
+    assert!(!attaches.attaching(1), "answered");
+}
+
+/// SME-263: one clone in flight per conversation; another conversation's
+/// is its own.
+#[test]
+fn test_a_second_clone_while_one_is_in_flight_is_refused() {
+    let mut attaches = RepoAttaches::default();
+    assert!(attaches.start(1), "the first Clone starts");
+    assert!(!attaches.start(1), "a second while the first is in flight is refused");
+    assert!(attaches.start(2), "another conversation's Clone starts");
+    assert!(attaches.attaching(1) && attaches.attaching(2), "both in flight");
+}
+
+/// SME-263: a send clears the conversation's kept error, but a clone in
+/// flight runs on and its answer is still kept.
+#[test]
+fn test_a_send_clears_the_error_but_not_a_clone_in_flight() {
+    let mut attaches = RepoAttaches::default();
+    attaches.start(1);
+    attaches.finish(1, Err("first".to_string()));
+    attaches.clear_error(1);
+    assert_eq!(attaches.error(1), None, "a send clears the kept error");
+    attaches.start(1);
+    attaches.clear_error(1);
+    assert!(attaches.attaching(1), "a send leaves a clone in flight");
+    attaches.finish(1, Err("second".to_string()));
+    assert_eq!(attaches.error(1), Some("second"), "its answer is still kept");
+}
+
+/// SME-263: one conversation's answer leaves another's entry alone.
+#[test]
+fn test_finish_on_another_conversation_leaves_this_one() {
+    let mut attaches = RepoAttaches::default();
+    attaches.start(1);
+    attaches.finish(1, Err("one's".to_string()));
+    attaches.start(2);
+    attaches.finish(2, Ok(()));
+    attaches.start(3);
+    attaches.clear_error(2);
+    assert_eq!(attaches.error(1), Some("one's"), "1's error stays");
+    assert!(attaches.attaching(3), "3 is still in flight");
+    assert!(!attaches.attaching(1), "1 isn't");
 }

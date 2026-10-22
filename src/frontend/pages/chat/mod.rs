@@ -190,6 +190,9 @@ fn ChatPanel(
     // The error line, by conversation: a turn's (`TurnError`) or one only
     // this tab saw (a send or Stop the server refused); see `ChatErrors`.
     let stream_errors: Signal<ChatErrors> = use_signal(ChatErrors::default);
+    // "Work on a repo"'s clone in flight and its error, by conversation
+    // (SME-263); see `RepoAttaches`.
+    let attaches: Signal<RepoAttaches> = use_signal(RepoAttaches::default);
     // Bumped when the conversation's model or the providers change, so the
     // model picker refetches (SME-72).
     let model_changed = use_signal(|| 0u64);
@@ -201,7 +204,7 @@ fn ChatPanel(
     let stop = stop_action(selected, stream_errors);
     let input = use_signal(String::new);
     let next_temp_id = use_signal(|| -1i64);
-    let mut attach_repo_now = attach_action(selected, state);
+    let mut attach_repo_now = attach_action(selected, state, attaches);
     let mut request_pod_stop = pod_stop_action(selected, state);
     // The live frame's width as shown; it scales to fit the panel, and
     // clicks on it are scaled back up to the page's own pixels.
@@ -257,7 +260,7 @@ fn ChatPanel(
     );
     #[cfg(feature = "web")]
     use_browser_frames(selected, state);
-    let mut send = send_action(selected, state, input, next_temp_id, model_ready, stream_errors, conversations_changed);
+    let mut send = send_action(selected, state, input, next_temp_id, model_ready, stream_errors, conversations_changed, attaches);
     use_transcript_follow(state, transcript_scroll, pointer_over_transcript, media_loaded);
 
     rsx! {
@@ -308,6 +311,7 @@ fn ChatPanel(
                             input,
                             on_attach: move |_| attach_repo_now(),
                             stream_errors,
+                            attaches,
                             scroll: transcript_scroll,
                             pointer_over_transcript,
                             media_loaded,
