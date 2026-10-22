@@ -83,7 +83,7 @@ Stored: only `agents.state`, the lifecycle (`starting`, `active`, `finished`, `s
 | finished | `state = 'finished'` |
 | idle | otherwise (between turns, maybe waiting on a command) |
 
-**Every writer of `state`:** the start (`starting` → `active`, or → `failed`); `finish` (`active` → `finished`); `stop_agent` (the subtree → `stopped`); the drain delivering a parent's message to a `finished` child (→ `active`, in the drain's transaction); the user's own send or answer in the child (`finished` or `stopped` → `active`, in `start_turn`'s admission). Each is one `UPDATE … WHERE state = <expected>`, so two writers can't both act on one state: a `finish` racing a `stop_agent` leaves whichever committed second refused, and `stop_agent` wins over a later `finish` because `finish` checks `state = 'active'`.
+**Every writer of `state`:** the start (`starting` → `active`, or → `failed`); `finish` (`active` → `finished`); `stop_agent` (the subtree → `stopped`); `message_agent` to a `finished` recipient, from its parent or from one of its own children (→ `active`, in `message_agent`'s own transaction, under the root's lock and the limit; the drain writes no state); the user's own send or answer in the child (`finished` or `stopped` → `active`, in `start_turn`'s admission). Each is one `UPDATE … WHERE state = <expected>`, so two writers can't both act on one state: a `finish` racing a `stop_agent` leaves whichever committed second refused, and `stop_agent` wins over a later `finish` because `finish` checks `state = 'active'`.
 
 ## Stop, `stop_agent` and the user
 
@@ -127,7 +127,7 @@ For a conversation in a group. "Queued" is an `agent_messages` row; "wake" is `N
 
 | Limit | Counted | Checked | Over it |
 | -- | -- | -- | -- |
-| Agents at once | The group's live agents (`agents.root_id = root AND state IN ('starting', 'active')`): live work, not model calls | In `start_agent`'s transaction, and in every other move to `active` (a parent's message to a `finished` child), each locking the root's `conversations` row (`FOR UPDATE`) before counting, so two can't both pass | Refused with a tool error naming the limit (`start_agent`, or `message_agent` to a `finished` child); no waiting inside a tool call. The user's own send in a child always goes through: the user can exceed it |
+| Agents at once | The group's live agents (`agents.root_id = root AND state IN ('starting', 'active')`): live work, not model calls | In `start_agent`'s transaction, and in every other move to `active` (`message_agent` to a `finished` recipient, which makes the move itself), each locking the root's `conversations` row (`FOR UPDATE`) before counting, so two can't both pass | Refused with a tool error naming the limit (`start_agent`, or `message_agent` to a `finished` recipient); no waiting inside a tool call. The user's own send in a child always goes through: the user can exceed it |
 | Nesting depth | `agents.depth` | When the tool list is built (not offered at the limit) and in `start_agent` | Not offered; a call is refused |
 | Budget | The group's spend: `model_call_usage.cost_usd` summed by a new `model_call_usage.group_root_id` (no FK, so a deleted child's spend still counts; `conversation_id` is `SET NULL` on delete) | Before each model call of a group member, under its turn lock | No call; every member's turn is stopped and paused, the root marked `budget_stopped_at`, each told why; the user lifts it on the root |
 
