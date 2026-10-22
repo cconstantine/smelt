@@ -1,5 +1,6 @@
 //! SME-263: a "Work on a repo" error the tab's request read is kept for its
-//! conversation, through a switch. Each scenario forces a late failure
+//! conversation, through a switch and once the first message hides the
+//! form. Each scenario forces a late failure
 //! with no server hook, the way
 //! `api::git::tests::test_work_on_a_repo_that_fails_after_trusting_still_tells_the_models`
 //! does: an uncommitted repo row from another remote holds the
@@ -120,4 +121,48 @@ pub(super) async fn scenario_attach_error_outlives_a_switch(t: &Scenario<'_>) {
     assert!(in_the_form, "the error should show in A's \"Work on a repo\" form");
     let (label, disabled) = clone_button(&page).await;
     assert!(label == "Clone" && !disabled, "once it failed, Clone is offered again: {label:?}, disabled {disabled}");
+}
+
+/// Whether a `p.error` line in the transcript says the attach failed.
+const ATTACH_LINE: &str = "Array.from(document.querySelectorAll('.messages p.error')).some(p => p.innerText.includes('\"Work on a repo\" failed.') && p.innerText.includes('already used by'))";
+
+/// SME-263 (Q2): Clone in C, then send the first message while the attach
+/// waits: the start screen and its form go. The attach's error, arriving
+/// afterwards, shows as a line under the transcript; the next send clears
+/// it. Before the fix it was written to the form's state with nothing to
+/// render it.
+pub(super) async fn scenario_attach_error_after_the_first_message(t: &Scenario<'_>) {
+    let c = t.conversation().await;
+    let page = t.tab(t.url(&format!("conversation/{}", c.id))).await;
+    wait_for_live_client(&page, c.id).await;
+    let dir = unique_id("sme263-first");
+    let holding = hold_the_directory(t.pool, c.id, &dir).await;
+    clone_into_the_held_directory(&page, t.pool, &dir).await;
+
+    send_from(&page, "first message while cloning").await;
+    assert!(
+        wait_for_count(&page, ".conversation-empty", 0, Duration::from_secs(10)).await,
+        "the first message should take the start screen down"
+    );
+    release(holding, t.pool).await;
+    assert!(
+        wait_until(
+            || async { page.evaluate(ATTACH_LINE).await.ok().and_then(|v| v.into_value::<bool>().ok()).unwrap_or(false) },
+            Duration::from_secs(10),
+        )
+        .await,
+        "the attach's error should show as a line under the transcript"
+    );
+
+    assert!(t.mock.wait_until_idle(Duration::from_secs(20)).await, "the first reply never finished upstream");
+    assert!(wait_for_text(&page, "zebra24", Duration::from_secs(10)).await, "the first reply should show");
+    send_from(&page, "second message").await;
+    assert!(
+        wait_until(
+            || async { page.evaluate(ATTACH_LINE).await.ok().and_then(|v| v.into_value::<bool>().ok()) == Some(false) },
+            Duration::from_secs(10),
+        )
+        .await,
+        "the next send should clear the attach's line"
+    );
 }

@@ -473,6 +473,19 @@ pub(super) fn Transcript(
                 WorkingLine { state }
             }
             ModelNotes { selected, state, stream_errors }
+            // A "Work on a repo" error once its form is gone: the first
+            // message took the start screen down while the clone waited
+            // (SME-263). In the same words as the server's own fallback.
+            // Only under a message, so a switch's load (no messages yet,
+            // the start screen down a moment) doesn't flash it over the
+            // form that's about to show it, and not on a deleted
+            // conversation's page, which says it's gone.
+            if !messages.read().is_empty() && !conversation_missing() {
+                ErrorText {
+                    message: selected()
+                        .and_then(|id| attaches.read().error(id).map(|err| format!("\"Work on a repo\" failed. {err}"))),
+                }
+            }
             TrustCards { selected, state }
             // The model's question, waiting on the user (SME-34).
             if let (Some(id), Some(question)) = (selected(), pending_question()) {
