@@ -16,7 +16,7 @@ A child agent is a conversation (the project's scope item 1): its own transcript
 | `brief` | The brief, as `start_agent` got it (also the child's first message) |
 | `persona_name`, `persona_path`, `persona_commit`, `persona_body`, `persona_settings` (JSONB) | The persona snapshot, all null without one ([persona-files.md](persona-files.md#read-from-the-childs-own-checkout)) |
 | `rule_chain` (JSONB), `credentials` (`TEXT[]`) | The effective rules and credentials ([tool-rules.md](tool-rules.md#narrowing-a-child-never-gets-more-than-its-parent)), fixed at start |
-| `state` | `starting`, `active`, `finished` or `stopped`, `CHECK`ed; the only stored part of the status ([Statuses](#statuses)) |
+| `state` | `starting`, `active`, `finished`, `stopped` or `failed`, `CHECK`ed; the only stored part of the status ([Statuses](#statuses)) |
 | `created_at`, `state_changed_at` | |
 
 - **`agent_messages`**, the queue (SME-236 for reports, SME-238 for the rest): `id` (identity), `to_conversation_id` (FK cascade), `from_conversation_id` (FK `SET NULL`, so a deleted sender's message still arrives), `from_label` (`agent #12 (smelt:developer)` or `your parent`, kept for that case), `kind` (`message`, `report`, `notice`), `body`, `created_at`, `delivered_at`, `delivered_message_id` (FK → `messages` `SET NULL`). A partial index on `(to_conversation_id, id) WHERE delivered_at IS NULL`.
@@ -60,19 +60,22 @@ The drain, `drain_agent_messages`, runs beside the two command drains in `run_tu
 
 **A child that stops without finishing** would leave its parent waiting for good. So when a child's last turn ends and the child is `active`, with no question waiting, no terminal command running, no `active` agent of its own (a parent waiting on its agents ends its turn too) and no Stop, smelt queues a notice to the parent: `agent #12's turn ended without a report; its last message: <first 500 characters>`. A command finishing just after the check wakes the child again, which is fine: the notice says the turn ended, not that the work did.
 
-**A start that fails** (the clone fails, the persona is missing at the child's ref or doesn't parse, the user Forgets the remote mid-start) ends the child `finished`, with the error queued to the parent as its report, and deletes any trust card its AGENTS.md load left in it, so a failed child neither holds a slot of "agents at once" nor shows as waiting for the user.
+**A start that fails** (the clone fails, the persona is missing at the child's ref or doesn't parse, the remote is no longer trusted, smelt restarts mid-start) ends the child **`failed`**, a terminal state: the error is queued to the parent as its report, any trust card its AGENTS.md load left in it is deleted, and nothing makes it `active` again (`message_agent` refuses it, and the user's send in it is refused with "this agent's start failed; start a new one"). So a failed child holds no slot of "agents at once", doesn't show as waiting for the user, and, without a persona snapshot, never runs a turn under rules it doesn't have.
+
+**The key leaves on every exit from the start.** For a child without `git-ssh`, removing the key is the first step after the clone, whatever the clone's outcome, and runs again on every way out of `starting`: success, failure, and a state update refused because `stop_agent` or a delete landed first. The startup sweep covers a start cut off by a restart ([Restarts](#restarts)).
 
 **Asking and waiting:** `ask_parent(question)` records a `pending_questions` row with `asked_of = 'parent'` and queues the question to the parent as a `message`; the child's turn ends waiting, as with `ask_user`. The parent's next `message_agent(to: <child>)` is saved as the answer on that row (`answer`, the card's path) and wakes the child, whose turn takes it as the call's result (`take_answer_or_wait`). The user writing in the child instead takes the question with `NOT_ANSWERED`, as today; a later reply from the parent then arrives as a plain message.
 
 ## Statuses
 
-Stored: only `agents.state`, the lifecycle (`starting`, `active`, `finished`, `stopped`).
+Stored: only `agents.state`, the lifecycle (`starting`, `active`, `finished`, `stopped`, `failed`).
 
 **`starting`** lasts from the child's row until its start is done: clone, AGENTS.md, persona snapshot and, for a child without `git-ssh`, the key removed. While it holds, no turn is admitted: the user's send in the child is refused ("this agent is still starting"), and a wake or a delivered notice is a no-op, so no command of the model's runs before the start is done. The start ends by setting `active` and admitting the brief's turn, or, failing, as [Deleting](#deleting) and the failed-start rule below say. Everything else is derived from where it already lives, so a status can't disagree with its source:
 
 | Status (first that holds) | From |
 | -- | -- |
 | starting | `state = 'starting'` |
+| failed | `state = 'failed'` |
 | stopped | `state = 'stopped'` |
 | running | a turn in flight (`turn::turn_running`, in memory) |
 | waiting for the user | an unanswered `pending_questions` row with `asked_of = 'user'`, or an `instruction_requests` card |
@@ -80,7 +83,7 @@ Stored: only `agents.state`, the lifecycle (`starting`, `active`, `finished`, `s
 | finished | `state = 'finished'` |
 | idle | otherwise (between turns, maybe waiting on a command) |
 
-**Every writer of `state`:** the start (`starting` → `active`, or → `finished` when it fails); `finish` (`active` → `finished`); `stop_agent` (the subtree → `stopped`); the drain delivering a parent's message to a `finished` child (→ `active`, in the drain's transaction); the user's own send or answer in the child (`finished` or `stopped` → `active`, in `start_turn`'s admission). Each is one `UPDATE … WHERE state = <expected>`, so two writers can't both act on one state: a `finish` racing a `stop_agent` leaves whichever committed second refused, and `stop_agent` wins over a later `finish` because `finish` checks `state = 'active'`.
+**Every writer of `state`:** the start (`starting` → `active`, or → `failed`); `finish` (`active` → `finished`); `stop_agent` (the subtree → `stopped`); the drain delivering a parent's message to a `finished` child (→ `active`, in the drain's transaction); the user's own send or answer in the child (`finished` or `stopped` → `active`, in `start_turn`'s admission). Each is one `UPDATE … WHERE state = <expected>`, so two writers can't both act on one state: a `finish` racing a `stop_agent` leaves whichever committed second refused, and `stop_agent` wins over a later `finish` because `finish` checks `state = 'active'`.
 
 ## Stop, `stop_agent` and the user
 
