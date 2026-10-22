@@ -14,6 +14,10 @@
 # inline) — same category as .env, never committed. See docs/setup.md.
 .kubeconfig.yaml
 
+# scripts/pm-wait-for-board's Linear API key (the user's, read-only), at the
+# main checkout's root so a reboot keeps it.
+/.linear-api-key
+
 # Downloaded by scripts/browser-check/setup.sh — a headless Chrome binary
 # and its shared libraries, never committed. See docs/testing.md.
 /.browser-check-cache/
