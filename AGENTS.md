@@ -16,6 +16,7 @@ A single-user, 100%-Rust AI chat agent talking to Claude. Dioxus fullstack (SSR 
 | Where tests live, database and sandbox tests, running them, the browser tier | [docs/testing.md](docs/testing.md) |
 | The development process: plan, TDD, rules, done, close-out (an index of its parts) | [docs/development-process.md](docs/development-process.md) |
 | Personas (Project Manager, Architect, Planner, Developer, Code Reviewer, Integrator, Facilitator) and the ticket workflow they run | [docs/personas/README.md](docs/personas/README.md) |
+| The design for personas in smelt itself: persona files, tool rules, child agents, messages, volumes | [docs/design/personas/index.md](docs/design/personas/index.md) |
 
 ## Project tracking
 
