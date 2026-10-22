@@ -28,6 +28,8 @@ mod mcp;
 mod mcp_oauth;
 mod models;
 #[cfg(feature = "server")]
+mod personas;
+#[cfg(feature = "server")]
 mod preview;
 #[cfg(feature = "server")]
 mod pricing;

@@ -232,3 +232,22 @@ async fn test_a_clone_records_its_persona_files_and_a_retry_clears_them(pool: Pg
         .expect("it was failed");
     assert!(retried.persona_files.is_empty(), "{retried:?}");
 }
+
+/// SME-235: `list_personas` re-records what the checkout has now, but
+/// only on a ready row of the attempt it read.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_persona_files_are_re_recorded_only_on_the_ready_attempt_read(pool: PgPool) {
+    let conversation = create_conversation(&pool).await.expect("conversation");
+    let repo = create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")
+        .await
+        .expect("create repo");
+    let files = vec![".agents/personas/reviewer.md".to_string()];
+    assert!(!set_repo_persona_files(&pool, repo.id, 1, &files).await.expect("cloning"), "a clone still running");
+    assert!(set_repo_ready(&pool, repo.id, 1, "main", None, &[], &[], None).await.expect("ready"));
+    assert!(!set_repo_persona_files(&pool, repo.id, 2, &files).await.expect("stale"), "another attempt");
+    let row = get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
+    assert!(row.persona_files.is_empty(), "{row:?}");
+    assert!(set_repo_persona_files(&pool, repo.id, 1, &files).await.expect("ready"));
+    let row = get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
+    assert_eq!(row.persona_files, files);
+}

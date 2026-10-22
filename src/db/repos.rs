@@ -437,6 +437,22 @@ pub async fn set_repo_ready(
     Ok(result.rows_affected() > 0)
 }
 
+/// Re-records a checkout's persona files from what `list_personas` read
+/// in it (SME-235): only on a ready row of the attempt it read, so it never
+/// writes over a newer clone's. False when it wrote nothing.
+pub async fn set_repo_persona_files(pool: &PgPool, id: i64, attempt: i32, files: &[String]) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE conversation_repos SET persona_files = $3, updated_at = now()
+          WHERE id = $1 AND attempt = $2 AND status = 'ready'",
+    )
+    .bind(id)
+    .bind(attempt)
+    .bind(files)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// At startup: a clone still marked cloning was cut off by the restart.
 /// Returns how many there were.
 pub async fn fail_unfinished_clones(pool: &PgPool, error: &str) -> Result<u64, sqlx::Error> {

@@ -1,4 +1,4 @@
-//! Repos cloned into the sandbox, and their AGENTS.md.
+//! Repos cloned into the sandbox, their AGENTS.md and their personas.
 
 use serde_json::Value;
 use sqlx::PgPool;
@@ -52,6 +52,21 @@ pub(super) fn tools() -> Vec<Tool> {
             },
             run: run!(|c| load_instructions_tool(c.pool, c.conversation_id, c.input)),
         },
+        Tool {
+            def: ToolDefinition {
+                name: "list_personas".to_string(),
+                description: "List the personas in this conversation's repos: each repo's \
+                               .agents/personas/*.md files, read from its checkout now. A \
+                               persona is named <repo dir>:<name> (smelt:developer), with its \
+                               description; a file that doesn't parse is listed with its error. \
+                               Only a repo the user trusts shows its personas; for one they \
+                               haven't decided about, it says how they can be asked. Nothing \
+                               can be started with a persona yet."
+                    .to_string(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            },
+            run: run!(|c| crate::git::list_personas(c.pool, c.conversation_id)),
+        },
     ]
 }
 
@@ -61,22 +76,36 @@ async fn clone_repo_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> 
     let branch = optional("branch");
     let dir = optional("dir");
     let repo = crate::git::clone_repo(pool, conversation_id, &url, branch.as_deref(), dir.as_deref()).await?;
-    Ok(clone_result_for_model(repo))
+    let persona_files = crate::git::repo_persona_files(pool, repo.id).await;
+    Ok(clone_result_for_model(repo, &persona_files))
 }
 
 /// What the model is told about a clone: the repo summary without the
-/// trust card's preview. An AGENTS.md the user hasn't trusted must not
-/// reach the model's context, which is the point of asking.
-pub(super) fn clone_result_for_model(mut repo: crate::git::RepoSummary) -> String {
+/// trust card's preview, and its persona files' names. An AGENTS.md the
+/// user hasn't trusted must not reach the model's context, which is the
+/// point of asking; nor may a persona file's content.
+pub(super) fn clone_result_for_model(mut repo: crate::git::RepoSummary, persona_files: &[String]) -> String {
     repo.trust_requests.clear();
     let mut told = serde_json::to_value(&repo).unwrap_or_default();
+    let mut notes = Vec::new();
     if !repo.agents_files.is_empty() {
-        told["note"] = Value::String(format!(
+        notes.push(format!(
             "This repo has AGENTS.md files (agents_files, relative to {}). Load the ones for \
              the code you'll work on with load_instructions: the top-level one, and the \
              nearest one to the files you change.",
             repo.path
         ));
+    }
+    if !persona_files.is_empty() {
+        told["persona_files"] = serde_json::json!(persona_files);
+        notes.push(
+            "It has persona files (persona_files, relative to it): list_personas shows them once \
+             the user trusts the repo."
+                .to_string(),
+        );
+    }
+    if !notes.is_empty() {
+        told["note"] = Value::String(notes.join(" "));
     }
     told.to_string()
 }
