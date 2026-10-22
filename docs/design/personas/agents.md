@@ -71,7 +71,7 @@ The drain, `drain_agent_messages`, runs beside the two command drains in `run_tu
 
 Stored: only `agents.state`, the lifecycle (`starting`, `active`, `finished`, `stopped`, `failed`).
 
-**`starting`** lasts from the child's row until its start is done: clone, AGENTS.md, persona snapshot and, for a child without `git-ssh`, the key removed. While it holds, no turn is admitted: the user's send in the child is refused ("this agent is still starting"), and a wake or a delivered notice is a no-op, so no command of the model's runs before the start is done. The start ends by setting `active` and admitting the brief's turn, or, failing, as [Deleting](#deleting) and the failed-start rule below say. Everything else is derived from where it already lives, so a status can't disagree with its source:
+**`starting`** lasts from the child's row until its start is done: clone, AGENTS.md, persona snapshot and, for a child without `git-ssh`, the key removed. While it holds, no turn is admitted: the user's send in the child is refused ("this agent is still starting"), and a wake or a delivered notice is a no-op, so no command of the model's runs before the start is done. The start ends by setting `active` and admitting the brief's turn, or ends `failed` as the failed-start rule above says ([How a child's report and messages reach a conversation](#how-a-childs-report-and-messages-reach-a-conversation)). Everything else is derived from where it already lives, so a status can't disagree with its source:
 
 | Status (first that holds) | From |
 | -- | -- |
