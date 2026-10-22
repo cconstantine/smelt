@@ -59,6 +59,8 @@ The drain, `drain_agent_messages`, runs beside the two command drains in `run_tu
 
 **A child that stops without finishing** would leave its parent waiting for good. So when a child's last turn ends and the child is `active`, with no question waiting, no terminal command running, no `active` agent of its own (a parent waiting on its agents ends its turn too) and no Stop, smelt queues a notice to the parent: `agent #12's turn ended without a report; its last message: <first 500 characters>`. A command finishing just after the check wakes the child again, which is fine: the notice says the turn ended, not that the work did.
 
+**A start that fails** (the clone fails, the persona is missing at the child's ref or doesn't parse, the user Forgets the remote mid-start) ends the child `finished`, with the error queued to the parent as its report, and deletes any trust card its AGENTS.md load left in it, so a failed child neither holds a slot of "agents at once" nor shows as waiting for the user.
+
 **Asking and waiting:** `ask_parent(question)` records a `pending_questions` row with `asked_of = 'parent'` and queues the question to the parent as a `message`; the child's turn ends waiting, as with `ask_user`. The parent's next `message_agent(to: <child>)` is saved as the answer on that row (`answer`, the card's path) and wakes the child, whose turn takes it as the call's result (`take_answer_or_wait`). The user writing in the child instead takes the question with `NOT_ANSWERED`, as today; a later reply from the parent then arrives as a plain message.
 
 ## Statuses

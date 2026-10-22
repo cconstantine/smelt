@@ -30,7 +30,7 @@ Trust is per remote, not per conversation: `repo_trust` is keyed by `remote_key`
 
 `start_agent` with `repo` requires `repo_trust.trusted = true` for that checkout's `remote_key`, read under `db::lock_remote_trust` in the same transaction that records the child's `conversation_repos` row (as `cloning`), as `request_or_load` does (SME-181). A remote the user hasn't decided about, or declined, is refused: "the user hasn't trusted this repo; load its AGENTS.md with `load_instructions` so they're asked". The child can only name a repo its parent has checked out, so it can't reach a remote the parent couldn't.
 
-Before its first turn, smelt loads the child's top-level `AGENTS.md`, if the checkout has one, through `request_or_load`, which finds the remote trusted and loads it. Should the user Forget the remote on the Git page between the start and the clone, the load becomes a card in the child (waiting for the user) and the persona read fails, so the start fails and the parent is told. The child's first turn waits for its clone (not `run_turn_steps`'s 120-second `CLONE_WAIT`): the persona has to be read first.
+Before its first turn, smelt loads the child's top-level `AGENTS.md`, if the checkout has one, through `request_or_load`, which finds the remote trusted and loads it. Should the user Forget the remote on the Git page between the start and the clone, the persona read fails, so the start fails: the child ends `finished`, the card its AGENTS.md load made is deleted, and the parent is told ([agents.md](agents.md#how-a-childs-report-and-messages-reach-a-conversation)). The child's first turn waits for its clone (not `run_turn_steps`'s 120-second `CLONE_WAIT`): the persona has to be read first.
 
 ## Volumes
 
