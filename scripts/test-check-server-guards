@@ -514,4 +514,56 @@ leaked=$("$dir/check-dir-local.sh" "$PWD" "$worktree")
 [ -z "$leaked" ] ||
     fail "G7: browser_check_cache left its loop variable behind in its caller: $leaked"
 
+# G8 (SME-226): the two database settings accept exactly 1, and asking for both
+# databases at once is refused. Until now any value of CHECK_SCRATCH_DB but `1`
+# — `0` among them — meant the dev database as silently as `true` did, which is
+# how SME-175's hand-run start ended up serving it. A bad value exits 2 where
+# CHECK_PORT and CHECK_PORT_WAIT do, before anything is locked, checked out,
+# created or signalled; the two flags together is a refusal, so exit 1.
+refused_database_flag() { # name want setting value
+    local name=$1 want=$2 setting=$3 value=$4 out rc
+    check_server stop >/dev/null
+    : >"$SQLX_CALLS"
+    : >"$pid_file"
+    : >"$scratch_file"
+    extra_env=("$setting=$value")
+    out=$(check_server start HEAD)
+    rc=$?
+    extra_env=()
+    [ "$rc" = "$want" ] || fail "$name: start with $setting='$value' exited $rc, not $want: $out"
+    grep -qF "$setting" <<<"$out" || fail "$name: the refusal doesn't name $setting: $out"
+    grep -q "check server up" <<<"$out" && fail "$name: start came up anyway: $out"
+    [ -s "$SQLX_CALLS" ] && fail "$name: a refused start called sqlx: $(cat "$SQLX_CALLS")"
+    [ -s "$pid_file" ] && fail "$name: a refused start wrote a pid file: '$(cat "$pid_file")'"
+    [ -s "$scratch_file" ] && fail "$name: a refused start wrote a scratch file: '$(cat "$scratch_file")'"
+    flock -n "$port_lock" true || fail "$name: a refused start took the port lock"
+}
+for setting in CHECK_DEV_DB CHECK_SCRATCH_DB; do
+    for value in 0 2 true "1 "; do
+        refused_database_flag "G8 ($setting='$value')" 2 "$setting" "$value"
+    done
+done
+
+# Both at once: one asks for the dev database, the other for the scratch one
+# that is the default, so they disagree — a refusal (1), not a bad value (2),
+# and it names both.
+check_server stop >/dev/null
+: >"$SQLX_CALLS"
+: >"$pid_file"
+: >"$scratch_file"
+extra_env=(CHECK_DEV_DB=1 CHECK_SCRATCH_DB=1)
+out=$(check_server start HEAD)
+rc=$?
+extra_env=()
+[ "$rc" = 1 ] || fail "G8 (both flags): start exited $rc, not 1: $out"
+grep -qF "CHECK_DEV_DB" <<<"$out" || fail "G8 (both flags): the refusal doesn't name CHECK_DEV_DB: $out"
+grep -qF "CHECK_SCRATCH_DB" <<<"$out" || fail "G8 (both flags): the refusal doesn't name CHECK_SCRATCH_DB: $out"
+[ -s "$SQLX_CALLS" ] && fail "G8 (both flags): the refused pair called sqlx: $(cat "$SQLX_CALLS")"
+[ -s "$pid_file" ] && fail "G8 (both flags): the refused pair wrote a pid file: '$(cat "$pid_file")'"
+[ -s "$scratch_file" ] && fail "G8 (both flags): the refused pair wrote a scratch file: '$(cat "$scratch_file")'"
+flock -n "$port_lock" true || fail "G8 (both flags): the refused pair took the port lock"
+# The old flag alone is still accepted: it is the default now (question 2's
+# answer), so the docs and runbooks that set it keep working.
+check_server stop >/dev/null
+
 finish

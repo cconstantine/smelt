@@ -46,6 +46,14 @@
 #                   On timeout it exits 1, naming the holder and the `stop`
 #                   that would free the port, having checked nothing out and
 #                   created, written or signalled nothing (SME-186 B48).
+#   CHECK_DEV_DB=1  serve the dev database (DATABASE_URL as it is), saying so on
+#                   start: the branch's migrations are applied to it, which is
+#                   what SME-175's hand-run start did by accident. Both database
+#                   flags accept exactly 1 — any other value, `0` included, is
+#                   refused with exit 2 before anything is locked, checked out,
+#                   created or signalled, since a silent `0` is exactly how that
+#                   start served the dev database — and asking for both at once
+#                   is refused with exit 1 (SME-226).
 #   CHECK_SCRATCH_DB=1  serve from a database of its own, created on start
 #                   (smelt migrates it) and dropped on stop, instead of the dev
 #                   database. For when the dev database has migrations from
@@ -298,6 +306,32 @@ start() {
         echo "CHECK_PORT_WAIT must be a number of seconds to wait for a port another check server holds (0 gives up at once): '$port_wait'" >&2
         exit 2
     fi
+    # Which database was asked for, validated as early as the port and for the
+    # same reason (SME-226): before anything is locked, checked out, created or
+    # signalled. Each flag accepts exactly 1, and empty counts as unset, the
+    # script's convention for RUST_LOG. Until now any value of CHECK_SCRATCH_DB
+    # but `1` — `0` among them — meant the dev database as silently as `true`
+    # did, which is how SME-175's hand-run start ended up serving it.
+    local setting
+    for setting in CHECK_DEV_DB CHECK_SCRATCH_DB; do
+        local setting_value=${!setting-}
+        case "$setting_value" in
+            "" | 1) ;;
+            *)
+                echo "$setting must be 1, or left unset: '$setting_value'" >&2
+                exit 2
+                ;;
+        esac
+    done
+    # And the two of them together is a refusal, not a bad value (exit 1, like
+    # the refusals below): one asks for the dev database, the other for a
+    # scratch one of this worktree's own. It sits here too rather than at the
+    # database itself, so a refused pair locks, checks out, creates and
+    # signals nothing.
+    if [ "${CHECK_DEV_DB:-}" = 1 ] && [ "${CHECK_SCRATCH_DB:-}" = 1 ]; then
+        echo "CHECK_DEV_DB=1 and CHECK_SCRATCH_DB=1 disagree about which database to serve: set one of them, not both" >&2
+        exit 1
+    fi
     local ref=HEAD
     if [ $# -gt 0 ] && [ "$1" != "--" ]; then
         ref=$1
@@ -336,6 +370,11 @@ start() {
     if [ "${CHECK_SCRATCH_DB:-}" = 1 ]; then
         db_url=$(scratch_db_url)
         take_scratch_lock "$(db_name "$db_url")"
+    elif [ "${CHECK_DEV_DB:-}" = 1 ]; then
+        # Said out loud because it's the harm this opt-in is here to make a
+        # conscious choice (SME-226): SME-175's hand-run start did it by
+        # accident, applying a branch's migrations to the dev database.
+        echo "serving the DEV database; the branch's migrations will be applied to it"
     fi
 
     if running_pgid >/dev/null; then

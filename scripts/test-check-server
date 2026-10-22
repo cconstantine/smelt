@@ -88,6 +88,20 @@ for file in "$pid_file" "$scratch_file"; do
 done
 case "$(check_server status)" in "not running"*) ;; *) false ;; esac || fail "status after stop: $(check_server status)"
 
+# CHECK_DEV_DB=1 says what it serves (SME-226): the branch's migrations go to
+# the dev database, which is what SME-175's hand-run start did by accident. It
+# serves the dev database as a plain start does — no scratch file written, and
+# nothing for stop to drop.
+if ! out=$(CHECK_DEV_DB=1 check_server start HEAD); then
+    fail "start with CHECK_DEV_DB=1: $out"
+fi
+grep -qF "serving the DEV database; the branch's migrations will be applied to it" <<<"$out" ||
+    fail "CHECK_DEV_DB=1 didn't say it serves the dev database: $out"
+[ -s "$scratch_file" ] && fail "CHECK_DEV_DB=1 left '$(cat "$scratch_file")' to drop"
+: >"$SQLX_CALLS"
+check_server stop >/dev/null
+[ -s "$SQLX_CALLS" ] && fail "stop after CHECK_DEV_DB=1 called sqlx: $(cat "$SQLX_CALLS")"
+
 # stop again: nothing running, nothing to drop.
 : >"$SQLX_CALLS"
 out=$(check_server stop)
