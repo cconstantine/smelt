@@ -404,8 +404,10 @@ async fn test_sandbox_commands_run_as_non_root_with_sudo_available() {
 
     // The everyday tools are already there: a first coding task used
     // to fail with `python3: command not found` and spend a minute
-    // installing it (SME-41 D10).
-    for tool in ["python3", "git", "curl"] {
+    // installing it (SME-41 D10). ps and pgrep (procps) too: the
+    // check-server script tests use them, and without them dozens of
+    // cases failed as if the code were wrong (SME-267).
+    for tool in ["python3", "git", "curl", "ps", "pgrep"] {
         let found = sandbox
             .exec(&["sh", "-c", &format!("command -v {tool}")])
             .await
