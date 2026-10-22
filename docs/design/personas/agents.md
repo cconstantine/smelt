@@ -116,7 +116,7 @@ For a conversation in a group. "Queued" is an `agent_messages` row; "wake" is `N
 
 | Limit | Counted | Checked | Over it |
 | -- | -- | -- | -- |
-| Agents at once | The group's `active` agents (`agents.root_id = root AND state = 'active'`): live work, not model calls | In `start_agent`'s transaction, which locks the root's `conversations` row (`FOR UPDATE`) before counting, so two starts can't both pass | Refused with a tool error naming the limit; no waiting inside a tool call |
+| Agents at once | The group's `active` agents (`agents.root_id = root AND state = 'active'`): live work, not model calls | In `start_agent`'s transaction, and in every other move to `active` (a parent's message to a `finished` child), each locking the root's `conversations` row (`FOR UPDATE`) before counting, so two can't both pass | Refused with a tool error naming the limit (`start_agent`, or `message_agent` to a `finished` child); no waiting inside a tool call. The user's own send in a child always goes through: the user can exceed it |
 | Nesting depth | `agents.depth` | When the tool list is built (not offered at the limit) and in `start_agent` | Not offered; a call is refused |
 | Budget | The group's spend: `model_call_usage.cost_usd` summed by a new `model_call_usage.group_root_id` (no FK, so a deleted child's spend still counts; `conversation_id` is `SET NULL` on delete) | Before each model call of a group member, under its turn lock | No call; every member's turn is stopped and paused, the root marked `budget_stopped_at`, each told why; the user lifts it on the root |
 
