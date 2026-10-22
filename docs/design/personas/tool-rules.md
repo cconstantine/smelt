@@ -27,7 +27,7 @@ Each native tool's class sits beside its definition in the registry (`Tool { def
 | `clone_repo` | read-only | Fetches into its own `/workspace`. Pushing needs the credential, not this tool. |
 | `load_instructions`, `list_personas` | read-only | Reads its own checkout; may ask the user to trust a repo, which is the user's decision. |
 | `webfetch`, `sandbox_preview_url` | read-only | A `GET` in a browser, or a link to its own pod's server. |
-| `http_request` | by its `method`: `GET`, `HEAD`, `OPTIONS` read-only; `DELETE` destructive; any other writing | The one native tool whose class depends on its input; see [Offered and called](#offered-and-called). |
+| `http_request` | by its `method`, parsed by the same function that sends it (`parse_method`, `src/http_request.rs`, which uppercases first, so `delete` is `DELETE`; absent is `GET`): `GET`, `HEAD`, `OPTIONS` read-only; `DELETE` destructive; any other writing | The one native tool whose class depends on its input; see [Offered and called](#offered-and-called). |
 | `open_browser_session`, `close_browser_session`, `browser_navigate`, `browser_back`, `browser_read` | read-only | Reading pages. |
 | `browser_click`, `browser_fill` | writing | Can submit a form on any site. A persona that only drives its own preview allows them by name. |
 | `lsp_servers`, `start_language_server`, `lsp` | read-only | A language server for its own checkout. |
