@@ -15,6 +15,8 @@ Every module, its feature gate and what it does, in two tables:
 - [Modules: the app, chat, models and turns](architecture/modules-core.md)
 - [Modules: the sandbox, browsing and the binaries](architecture/modules-sandbox.md)
 
+The design for personas and child agents (persona files, tool rules, agent messages, child checkouts and volumes), which the "Personas and sub-agents" tickets build: [design/personas/index.md](design/personas/index.md).
+
 ## Live channels
 
 Each SSE/broadcast-shaped stream answers a different question:
