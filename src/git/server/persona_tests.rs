@@ -202,6 +202,8 @@ async fn test_a_listing_says_why_a_trusted_repo_has_no_personas(pool: PgPool) {
     let empty = ready_repo(&pool, conversation.id, "empty", true).await;
     let crowded = ready_repo(&pool, conversation.id, "crowded", true).await;
     db::set_repo_trust(&pool, "github.com/o/crowded", true).await.expect("trust");
+    let one_more = ready_repo(&pool, conversation.id, "one-more", true).await;
+    db::set_repo_trust(&pool, "github.com/o/one-more", true).await.expect("trust");
     db::set_repo_trust(&pool, "github.com/o/a", true).await.expect("trust");
     db::set_repo_trust(&pool, "github.com/o/empty", true).await.expect("trust");
     let told = gated_listing(
@@ -210,6 +212,7 @@ async fn test_a_listing_says_why_a_trusted_repo_has_no_personas(pool: PgPool) {
             RepoPersonas { repo: a, read: Some(Err("git exited 128".to_string())) },
             RepoPersonas { repo: empty, read: Some(Ok(CheckoutPersonas { files: vec![], unread: 0 })) },
             RepoPersonas { repo: crowded, read: Some(Ok(CheckoutPersonas { files: vec![], unread: 2 })) },
+            RepoPersonas { repo: one_more, read: Some(Ok(CheckoutPersonas { files: vec![], unread: 1 })) },
         ],
     )
     .await
@@ -218,6 +221,9 @@ async fn test_a_listing_says_why_a_trusted_repo_has_no_personas(pool: PgPool) {
     assert!(repo_entry(&listing, "/workspace/a")["error"].as_str().expect("error").contains("git exited 128"), "{told}");
     assert!(repo_entry(&listing, "/workspace/empty")["note"].as_str().expect("note").contains(".agents/personas/"), "{told}");
     let crowded = repo_entry(&listing, "/workspace/crowded")["note"].as_str().expect("note").to_string();
-    assert!(crowded.contains("2 other files") && crowded.contains("at most 50"), "{told}");
+    assert!(crowded.contains("2 other .md files there weren't") && crowded.contains("at most 50"), "{told}");
+    // Review 2: one file is one file.
+    let one_more = repo_entry(&listing, "/workspace/one-more")["note"].as_str().expect("note").to_string();
+    assert!(one_more.contains("1 other .md file there wasn't"), "{told}");
     assert!(listing.get("note").is_none(), "no persona listed, so no note about using one: {told}");
 }

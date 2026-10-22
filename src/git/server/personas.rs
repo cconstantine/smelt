@@ -220,8 +220,9 @@ pub(crate) async fn gated_listing(pool: &PgPool, reads: Vec<RepoPersonas>) -> Re
                         entry["personas"] = Value::Array(personas);
                     }
                     if unread > 0 {
+                        let files = if unread == 1 { "file there wasn't" } else { "files there weren't" };
                         notes.push(format!(
-                            "{unread} other files in {PERSONAS_DIR} weren't read: a persona file is named <name>.md, \
+                            "{unread} other .md {files} read from {PERSONAS_DIR}: a persona file is named <name>.md, \
                              the name 1 to 64 of a-z, 0-9 and - (not starting or ending with -), and at most \
                              {MAX_PERSONA_FILES} are read."
                         ));
