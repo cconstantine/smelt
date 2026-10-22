@@ -103,6 +103,7 @@ Turn state is in memory (`src/turn/state.rs`), and a restart loses every turn in
 
 - **The pause is stored** (`conversations.paused_at`), set by Stop and cleared by the user's send or answer, where `paused` is set and cleared today. The in-memory flag was harmless while nothing woke a conversation on its own after a restart; the startup sweep below does.
 - **A startup sweep** wakes (`Notice::Wake`) every conversation with an undelivered `agent_messages` row that isn't paused and isn't `stopped`.
+- **A start cut off by a restart** (a child still `starting`: its start ran in a task the restart killed) is ended by the same sweep as a failed start: the key removed from its pod if the pod is live, any card deleted, `failed`, and `smelt restarted during the start` queued to the parent.
 - **A child cut off mid-turn** (`active`, its last message a `user` message: a tool result or a notice with no reply after it) gets a notice of its own, `smelt restarted during your turn; carry on`, and a wake, so a group doesn't stall on a restart. A user's own conversation is left as today.
 
 ## State × event
@@ -111,6 +112,7 @@ For a conversation in a group. "Queued" is an `agent_messages` row; "wake" is `N
 
 | State ↓ / event → | Message from parent or child | Child's report or notice (this is the parent) | User's Stop on this | User's Stop on its parent | `stop_agent` on this | User writes in this | smelt restarts | Its parent deleted | This deleted | Waiting for a provider slot |
 | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |
+| starting | queued, delivered once `active` | queued, wakes | refused ("still starting") | nothing | stopped; the start ends and removes the key | refused ("still starting") | the sweep fails the start | deleted with it | parent told | — |
 | idle | queued, wakes, runs a turn | queued, wakes | paused; parent told | nothing | stopped, subtree too | turn runs | sweep wakes it if queued | deleted with it | parent told | — |
 | running | taken at the next iteration | taken at the next iteration | turn ends, paused; parent told | nothing | turn ends, stopped | queued behind the turn (turn lock) | turn lost; restart notice and wake | deleted, turn ended | turn ended, rows gone | the call waits; status running |
 | paused (Stop) | queued, no wake | queued, no wake | stays paused | nothing | stopped | pause ends, turn runs and drains | stays paused (stored) | deleted with it | parent told | — |
