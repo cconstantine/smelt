@@ -65,7 +65,7 @@ smelt:
 ```
 
 - **`class`** is the ceiling: `all` allows every class, `no-destructive` read-only and writing, `read-only` read-only. The user's two named classes are `read-only` and `no-destructive`.
-- **`allow` and `deny`** are lists of tool patterns. A smelt tool is named as the model sees it (`write_file`). An MCP tool is `<server>/<tool>`, by the server's configured name (`mcp_servers.name`) and the tool's own name: `github/merge_pull_request`, not `mcp__github__merge_pull_request`. `*` matches any run of characters other than `/`. `<server>/*` is the whole server.
+- **`allow` and `deny`** are lists of tool patterns. A smelt tool is named as the model sees it (`write_file`). An MCP tool is `<server>/<tool>`, by the server's configured name (`mcp_servers.name`) and the tool's own name: `github/merge_pull_request`, not `mcp__github__merge_pull_request`. `*` matches any run of characters other than `/`, in a tool's name only: a pattern's server is always named (`*/get_*` is an error), so a server rule can't be undercut by a pattern that names no server. `<server>/*` is the whole server.
 - An unknown class, an empty pattern, a pattern with more than one `/`, or a name in both `allow` and `deny` is an error naming the file. A server that isn't configured in this deployment is not an error (another deployment may have it); `list_personas` and `start_agent` report the rules that match no configured server, so a typo shows.
 
 **How specific a pattern is**, most specific first:
