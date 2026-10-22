@@ -179,8 +179,9 @@ type AttachAnswer = (Result<RepoSummary, String>, tokio::sync::oneshot::Sender<(
 /// is shown in the conversation instead, as a failure after the answer is
 /// (SME-91); a conversation deleted meanwhile is left with no turn state
 /// (SME-219). "Read" means read by the server function, not seen by the
-/// user: a tab that switched conversations while the attach waited reads
-/// the failure and drops it (SME-224 review 2).
+/// user: the tab keeps a failure it read for its conversation, through a
+/// switch and once the first message hides the form (SME-263), but a
+/// response lost after the read shows nowhere (SME-224 review 2).
 #[cfg(feature = "server")]
 async fn hand_back_attach(
     pool: &sqlx::PgPool,

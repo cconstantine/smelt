@@ -284,3 +284,22 @@ fn test_the_start_screen_stays_down_while_an_error_shows_for_the_conversation() 
         "a failed send's error line didn't keep the start screen down"
     );
 }
+
+/// SME-263 code review 1: a failed first send withdraws the message and
+/// keeps the start screen down under its error line, so a "Work on a repo"
+/// error landing then had neither the form nor a message to show under.
+#[test]
+fn test_an_attach_error_shows_under_a_failed_first_sends_error_line() {
+    assert!(
+        shows_attach_error_line(true, false, true),
+        "a late attach error after a failed first send showed nowhere"
+    );
+}
+
+#[test]
+fn test_an_attach_error_line_shows_under_a_message_but_not_on_a_switchs_load() {
+    assert!(shows_attach_error_line(false, false, false), "under a message");
+    assert!(!shows_attach_error_line(true, false, false), "a switch's load: the form is about to show it");
+    assert!(!shows_attach_error_line(false, true, false), "a deleted conversation");
+    assert!(!shows_attach_error_line(true, true, true), "a deleted conversation with an error line");
+}
