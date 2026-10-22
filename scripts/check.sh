@@ -64,7 +64,7 @@ lint_output=$(scripts/lint-expects 2>&1) || {
 # a minute together, and none of them needs a cluster or a database.
 echo "== script tests"
 if [ -z "${SMELT_SKIP_SCRIPT_TESTS:-}" ]; then
-    for t in test-start-dockerd test-cluster-doctor test-ci-web-bundle test-check-server test-check-server-scratch test-check-server-guards test-dotenv-value test-cluster-lock test-gate-scripts test-retro-scan; do
+    for t in test-start-dockerd test-cluster-doctor test-ci-web-bundle test-check-server test-check-server-scratch test-check-server-guards test-check-server-db-inputs test-dotenv-value test-cluster-lock test-gate-scripts test-retro-scan; do
         echo "-- scripts/$t"
         "scripts/$t" || {
             echo "scripts/$t failed"
