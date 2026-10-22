@@ -110,6 +110,35 @@ less, since it reaches neither the database nor a cluster. A daemon that
 refuses privileged containers can't bring up the `k3s` and `docker` sidecars,
 and then the cluster-backed tests fall to CI. What this seat is, in practice — one clone, the sequential gate, what is and isn't installed, how the run ends — is the "Working from a conversation sandbox" section of [the persona rules](personas/rules.md). This deployment's daemon allows privileged containers, so the real gate runs in a conversation sandbox and not only in CI.
 
+Three things trip a conversation sandbox's stack (SME-257's retrospective, proposal 2):
+
+- **Building the sandbox image needs memory.** The build runs in the pod's
+  Docker sidecar, whose limit is `SANDBOX_DOCKER_MEMORY_LIMIT` (8 Gi by
+  default) unless `create_pod`'s `docker_memory_limit` raises it, up to the
+  namespace's `LimitRange` ceiling. One of SME-226's builds went through at 24 Gi;
+  another was OOM-killed twice before 48 Gi let it through, and each kill showed
+  in the build log as an apt or network error, not as memory. Create the pod with
+  `docker_memory_limit: "48Gi"` when it will build the image.
+- **Rebuild the sandbox image after a merge that changes the agent's
+  sources** (a merge of `origin/main` into the branch included), before the
+  next gate: the gate's pods run the image named after the sources
+  (`scripts/sandbox-image-ref`), and until it is built `scripts/check.sh`
+  stops at `scripts/cluster-doctor`, naming the missing image.
+- **`k3s` won't start again after its container is recreated** when the node
+  IP stored in its volume no longer matches the new container's: it exits
+  quietly, and its log ends with `failed to find interface with specified
+  node ip`. Drop the cluster's state and bootstrap it again:
+
+  ```bash
+  docker compose down
+  p=${COMPOSE_PROJECT_NAME:-$(basename "$PWD")}  # compose's project name: the clone's directory
+  docker volume rm "${p}_k3s-data" "${p}_k3s-config"
+  docker compose up -d postgres docker k3s
+  docker compose run --rm k3s-bootstrap
+  ```
+
+  The cluster then starts empty, so build the sandbox image again too.
+
 Helper scripts: `scripts/check.sh` (the checks every commit must pass: both
 builds with no warnings, plus the server tests), `scripts/check-server`
 (`dx serve` from a separate worktree, for hands-on checks), and
