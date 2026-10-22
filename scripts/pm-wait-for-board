@@ -28,7 +28,8 @@ most one extra wake. A ticket that leaves and comes back between two polls,
 or while no run is going, is missed: no poll saw it leave.
 
 The API key is a Linear personal API key (read-only is enough), read from
-~/.config/smelt/linear-api-key, or the file $SMELT_LINEAR_KEY_FILE names. The
+.linear-api-key at the root of the main checkout (gitignored; one key for
+every worktree), or the file $SMELT_LINEAR_KEY_FILE names. The
 file must not be readable by group or others (chmod 600). The key is never
 printed.
 
@@ -48,6 +49,7 @@ import io
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -77,9 +79,19 @@ query Board($project: String!, $after: String) {
 
 
 def key_path():
-    return os.environ.get(
-        "SMELT_LINEAR_KEY_FILE", os.path.expanduser("~/.config/smelt/linear-api-key")
-    )
+    """$SMELT_LINEAR_KEY_FILE, or .linear-api-key at the root of the main
+    checkout (gitignored). The main checkout, not this worktree's: one key
+    serves every worktree, and it lives in the repo's directory, which a
+    reboot keeps (the home directory isn't kept)."""
+    if "SMELT_LINEAR_KEY_FILE" in os.environ:
+        return os.environ["SMELT_LINEAR_KEY_FILE"]
+    here = os.path.dirname(os.path.abspath(__file__))
+    common = subprocess.run(
+        ["git", "-C", here, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    root = os.path.dirname(common) if common else os.path.dirname(here)
+    return os.path.join(root, ".linear-api-key")
 
 
 def state_path():
