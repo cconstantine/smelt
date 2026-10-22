@@ -9,9 +9,10 @@ FROM debian:trixie-slim
 
 # The everyday tools most coding tasks reach for first. Without them a
 # first task started by failing and installing them (SME-41 D10);
-# anything else is still one `sudo apt-get install` away.
+# anything else is still one `sudo apt-get install` away. procps gives
+# ps and pgrep, which scripts/check-server and its tests use (SME-267).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        sudo ca-certificates curl git openssh-client python3 \
+        sudo ca-certificates curl git openssh-client procps python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Git over SSH (SME-32). smelt writes the user's keys, an SSH config
