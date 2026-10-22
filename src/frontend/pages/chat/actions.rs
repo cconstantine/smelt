@@ -27,38 +27,36 @@ pub(super) fn stop_action(selected: Memo<Option<i64>>, stream_errors: Signal<Cha
 /// Clones the repo typed into a new conversation's "Work on a repo".
 /// Here, not in `RepoAttach`: the form goes as soon as the first message
 /// shows, which would drop a clone request still in flight with its
-/// reset and its error (SME-57 code review).
-pub(super) fn attach_action(selected: Memo<Option<i64>>, state: Store<ConversationState>) -> impl FnMut() + 'static {
+/// reset and its error (SME-57 code review). The answer is kept for its
+/// conversation whichever one is open by then (SME-263): the request read
+/// it, so the server shows it nowhere else.
+pub(super) fn attach_action(
+    selected: Memo<Option<i64>>,
+    state: Store<ConversationState>,
+    attaches: Signal<RepoAttaches>,
+) -> impl FnMut() + 'static {
     let mut repo_url = state.repo_url();
     let mut repo_branch = state.repo_branch();
     let mut repo_dir = state.repo_dir();
-    let mut repo_attaching = state.repo_attaching();
-    let mut repo_attach_error = state.repo_attach_error();
+    let mut attaches = attaches;
     move || {
         let Some(id) = selected() else { return };
-        if repo_attaching() {
+        if !attaches.write().start(id) {
             return;
         }
         let url = repo_url();
         let branch = repo_branch();
         let dir = repo_dir();
-        repo_attaching.set(true);
-        repo_attach_error.set(None);
         spawn(async move {
             let result = attach_repo(id, url, branch, dir).await;
-            // The user may have moved on to another conversation.
-            if selected() != Some(id) {
-                return;
+            // The form's fields are the open conversation's: after a switch
+            // they're another's, and the switch already emptied `id`'s.
+            if result.is_ok() && selected() == Some(id) {
+                repo_url.set(String::new());
+                repo_branch.set(String::new());
+                repo_dir.set(String::new());
             }
-            match result {
-                Ok(_) => {
-                    repo_url.set(String::new());
-                    repo_branch.set(String::new());
-                    repo_dir.set(String::new());
-                }
-                Err(e) => repo_attach_error.set(Some(server_error_message(&e))),
-            }
-            repo_attaching.set(false);
+            attaches.write().finish(id, result.map(|_| ()).map_err(|e| server_error_message(&e)));
         });
     }
 }
@@ -133,11 +131,13 @@ pub(super) fn send_action(
     model_ready: Signal<bool>,
     stream_errors: Signal<ChatErrors>,
     conversations_changed: Signal<u64>,
+    attaches: Signal<RepoAttaches>,
 ) -> impl FnMut() + 'static {
     let mut messages = state.messages();
     let mut input = input;
     let mut next_temp_id = next_temp_id;
     let mut stream_errors = stream_errors;
+    let mut attaches = attaches;
     let mut conversations_changed = conversations_changed;
     move || {
         let Some(id) = selected() else { return };
@@ -166,6 +166,9 @@ pub(super) fn send_action(
         // turn. Keyed by `id`: the viewer may switch away meanwhile.
         spawn(async move {
             stream_errors.write().clear(id);
+            // A kept "Work on a repo" error goes too: the user has moved
+            // on from the form (SME-263). A clone in flight runs on.
+            attaches.write().clear_error(id);
             if let Err(e) = send_message(id, content.clone()).await {
                 // Not sent (SME-185 B36): the copy goes, so a resend shows
                 // the message once, and its text goes back in the box if

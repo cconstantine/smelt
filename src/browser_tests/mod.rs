@@ -258,6 +258,8 @@ async fn test_end_to_end_browser_scenarios() {
     // that passing every step, so 30s can fail a working run and have it read
     // as an infrastructure failure (code review 2).
     run_scenario(&t, only, r, k, "switch_shows_no_start_screen", 60, Box::pin(scenario_switch_shows_no_start_screen(&t))).await;
+    run_scenario(&t, only, r, k, "attach_error_outlives_a_switch", 60, Box::pin(scenario_attach_error_outlives_a_switch(&t))).await;
+    run_scenario(&t, only, r, k, "attach_error_after_the_first_message", 60, Box::pin(scenario_attach_error_after_the_first_message(&t))).await;
 
     let mut failures: Vec<String> = results
         .iter()
@@ -311,6 +313,7 @@ mod long_replies;
 mod notices;
 mod keyboard_and_errors;
 mod links_and_commands;
+mod repo_attach;
 
 use harness::*;
 use basics::*;
@@ -326,3 +329,4 @@ use long_replies::*;
 use notices::*;
 use keyboard_and_errors::*;
 use links_and_commands::*;
+use repo_attach::*;

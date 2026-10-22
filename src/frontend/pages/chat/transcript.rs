@@ -316,6 +316,17 @@ pub(super) fn shows_start_screen(
         && matches!(loaded, Some((id, Ok(list))) if Some(*id) == selected && list.is_empty())
 }
 
+/// Whether the transcript shows a "Work on a repo" error under itself, once
+/// the start screen's form, which shows it otherwise, is down (SME-263):
+/// under a message, or under the conversation's error line when a failed
+/// first send left it with no messages (code review 1). Not on a switch's
+/// load (no messages and no error line, the start screen down a moment),
+/// so it doesn't flash over the form about to show it, and not on a deleted
+/// conversation's page, which says it's gone.
+pub(super) fn shows_attach_error_line(no_messages: bool, missing: bool, error_showing: bool) -> bool {
+    (!no_messages || error_showing) && !missing
+}
+
 /// The transcript: the conversation's messages, a new conversation's
 /// first steps, the reply as it streams, the working line, errors, trust
 /// cards and the model's waiting question. Scrolling it keeps the panel's stick-to-bottom and
@@ -329,6 +340,7 @@ pub(super) fn Transcript(
     mut input: Signal<String>,
     on_attach: EventHandler<()>,
     stream_errors: Signal<super::state::ChatErrors>,
+    attaches: Signal<RepoAttaches>,
     scroll: StickyBottom,
     mut pointer_over_transcript: Signal<bool>,
     mut media_loaded: Signal<u64>,
@@ -450,7 +462,9 @@ pub(super) fn Transcript(
                     h2 { "What should smelt work on?" }
                     p { "It works in a sandbox of its own: it writes and runs code, uses a terminal, reads the web, and shows you each step." }
                     RepoAttach {
+                        selected,
                         state,
+                        attaches,
                         on_attach,
                     }
                     div { class: "example-asks",
@@ -470,6 +484,19 @@ pub(super) fn Transcript(
                 WorkingLine { state }
             }
             ModelNotes { selected, state, stream_errors }
+            // A "Work on a repo" error once its form is gone: the first
+            // message took the start screen down while the clone waited
+            // (SME-263). In the same words as the server's own fallback.
+            if shows_attach_error_line(
+                messages.read().is_empty(),
+                conversation_missing(),
+                selected().is_some_and(|id| stream_errors.read().lines.contains_key(&id)),
+            ) {
+                ErrorText {
+                    message: selected()
+                        .and_then(|id| attaches.read().error(id).map(|err| format!("\"Work on a repo\" failed. {err}"))),
+                }
+            }
             TrustCards { selected, state }
             // The model's question, waiting on the user (SME-34).
             if let (Some(id), Some(question)) = (selected(), pending_question()) {
