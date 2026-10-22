@@ -1,6 +1,7 @@
 -- SME-235: a checkout's persona files, recorded at clone as `agents_files`
--- is: the tracked Markdown files directly in `.agents/personas/`, relative
--- to the checkout, sorted. Paths only: nothing from inside the files is
+-- is: the tracked files directly in `.agents/personas/` named as a persona's
+-- can be (`<name>.md`, name 1-64 of a-z, 0-9 and -), relative to the
+-- checkout, sorted. Paths only: nothing from inside the files is
 -- stored, so an untrusted repo's content never reaches a model-visible row.
 -- `list_personas` re-records it from the checkout on each call. Existing
 -- rows start empty: the migration can't look in the pods, so a repo cloned

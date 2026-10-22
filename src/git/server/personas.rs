@@ -12,16 +12,16 @@ pub const PERSONAS_DIR: &str = ".agents/personas/";
 /// How many persona files of one checkout are recorded, as for AGENTS.md.
 const MAX_PERSONA_FILES: usize = 50;
 
-/// The persona files among `git ls-files -z` output: the `.md` files
-/// directly in `.agents/personas/`, sorted, at most 50. Git's pathspec
-/// `*` matches `/` too, so a file in a subdirectory comes through the
-/// listing and is dropped here.
+/// The persona files among `git ls-files -z` output: the files directly
+/// in `.agents/personas/` named as a persona's can be (`<name>.md`),
+/// sorted, at most 50. Git's pathspec `*` matches `/` too, so a file in a
+/// subdirectory comes through the listing and is dropped here.
 pub(super) fn persona_paths(listed: &str) -> Vec<String> {
     let mut files: Vec<String> = listed
         .split('\0')
         .filter(|path| {
             path.strip_prefix(PERSONAS_DIR)
-                .is_some_and(|name| !name.contains('/') && name.ends_with(".md") && name != ".md")
+                .is_some_and(|name| !name.contains('/') && crate::personas::is_persona_file_name(name))
         })
         .map(str::to_string)
         .collect();

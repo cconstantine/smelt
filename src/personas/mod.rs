@@ -57,6 +57,14 @@ fn valid_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
+/// Whether a file in `.agents/personas/` named `file_name` could hold a
+/// persona: `<name>.md` with a valid name, since `name` must equal it.
+/// Others are never recorded, so a file name's text (which an untrusted
+/// repo chooses) reaches the system prompt only in this shape.
+pub fn is_persona_file_name(file_name: &str) -> bool {
+    file_name.strip_suffix(".md").is_some_and(valid_name)
+}
+
 /// serde's error, at the file's line: the frontmatter starts on the
 /// file's line 2. Its own " at line L column C" is dropped, as it counts
 /// from the frontmatter.

@@ -21,8 +21,9 @@ pub struct ConversationRepo {
     pub agents_files: Vec<String>,
     /// Which attempt at the clone is current; a retry increments it.
     pub attempt: i32,
-    /// The checkout's persona files (SME-235): the tracked `.md` files
-    /// directly in `.agents/personas/`, relative to it, sorted. Paths only.
+    /// The checkout's persona files (SME-235): the tracked files directly
+    /// in `.agents/personas/` named `<name>.md` with a valid persona name,
+    /// relative to it, sorted. Paths only.
     pub persona_files: Vec<String>,
 }
 
