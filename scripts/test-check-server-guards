@@ -639,4 +639,45 @@ grep -q "check server up" <<<"$out" || fail "G9 (dbname= with CHECK_DEV_DB=1): d
 [ -s "$scratch_file" ] && fail "G9 (dbname= with CHECK_DEV_DB=1): wrote a scratch record: '$(cat "$scratch_file")'"
 check_server stop >/dev/null
 
+# G9b (SME-226 review 1, finding 2): the guard compares the *decoded* key. A
+# driver decodes a query key before matching it, so `?db%6Eame=another` names a
+# database exactly as `?dbname=another` does — and the literal `?dbname=` match
+# let it through, so the recorded `sqlx database drop` and `create` asked for
+# that other database by name. Every spelling of the key that decodes to
+# `dbname` is refused the same way, wherever it sits in the query.
+for enc in 'db%6Eame' 'db%6eame' '%64bname' '%64%62%6e%61%6d%65'; do
+    check_server stop >/dev/null
+    : >"$SQLX_CALLS"
+    : >"$pid_file"
+    : >"$scratch_file"
+    extra_env=("DATABASE_URL=postgres://u@localhost/smelt_dev?sslmode=disable&${enc}=another")
+    out=$(check_server start HEAD)
+    rc=$?
+    extra_env=()
+    [ "$rc" = 1 ] || fail "G9b (?${enc}=): start exited $rc, not 1: $out"
+    grep -qF "dbname" <<<"$out" || fail "G9b (?${enc}=): the refusal doesn't name dbname: $out"
+    grep -q "check server up" <<<"$out" && fail "G9b (?${enc}=): start came up anyway: $out"
+    [ -s "$SQLX_CALLS" ] && fail "G9b (?${enc}=): the refused start called sqlx: $(cat "$SQLX_CALLS")"
+    [ -s "$pid_file" ] && fail "G9b (?${enc}=): the refused start wrote a pid file: '$(cat "$pid_file")'"
+    [ -s "$scratch_file" ] && fail "G9b (?${enc}=): the refused start wrote a scratch file: '$(cat "$scratch_file")'"
+    flock -n "$port_lock" true || fail "G9b (?${enc}=): the refused start took the port lock"
+done
+check_server stop >/dev/null
+# And a query that names no database stays nobody's business: the keys beside
+# `dbname` are not what this guard is for, so the same URL with an ordinary key
+# still gets its database renamed, query kept.
+check_server stop >/dev/null
+: >"$SQLX_CALLS"
+: >"$pid_file"
+: >"$scratch_file"
+extra_env=("DATABASE_URL=postgres://u@localhost/smelt_dev?sslmode=disable&name=another")
+if ! out=$(check_server start HEAD); then
+    fail "G9b (a query that sets no dbname): start: $out"
+fi
+extra_env=()
+grep -qx "database create --database-url postgres://u@localhost/smelt_scratch_worktree?sslmode=disable&name=another" \
+    "$SQLX_CALLS" ||
+    fail "G9b (a query that sets no dbname): the scratch URL isn't the dev one with its database renamed and its query kept: $(cat "$SQLX_CALLS")"
+check_server stop >/dev/null
+
 finish

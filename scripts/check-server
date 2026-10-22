@@ -194,12 +194,15 @@ scratch_db_url() {
     # worth having if it says this worktree's database and no other. Before this
     # `?dbname=other` rode along, and the recorded `sqlx database drop` and
     # `create` asked for that other one by name.
-    case "$query" in
-        *[\?\&]dbname=*)
-            echo "the dev DATABASE_URL's query sets dbname=, which would override the scratch database's name: remove it from the URL, or say CHECK_DEV_DB=1 to serve that URL as it is" >&2
-            return 1
-            ;;
-    esac
+    # Which key is compared is the *decoded* one (SME-226 review 1, finding 2):
+    # a driver decodes a query key before matching it against the names it knows,
+    # so `?db%6Eame=other` says `dbname=other` to it exactly as the plain spelling
+    # does. The literal `?dbname=` match this guard had let that one through, and
+    # the two sqlx calls below asked for that other database by name.
+    if query_names_dbname "$query"; then
+        echo "the dev DATABASE_URL's query sets dbname=, which would override the scratch database's name: remove it from the URL, or say CHECK_DEV_DB=1 to serve that URL as it is" >&2
+        return 1
+    fi
     echo "${url%/*}/$(scratch_db_name)$query"
 }
 
@@ -261,10 +264,11 @@ drop_scratch_db() {
     echo "dropped the scratch database"
 }
 
-# The settings and /proc helpers, in their own files because this one is at
+# The settings, /proc and URL helpers, in their own files because this one is at
 # the size ceiling (SME-186 review 1, finding 4): sourced here, never run.
 . "$repo/scripts/lib/check-server-config.sh"
 . "$repo/scripts/lib/check-server-proc.sh"
+. "$repo/scripts/lib/check-server-url.sh"
 
 # Cleans up the scratch database's objects and drops it, then empties the
 # KUBECONFIG file. Everything is kept when the cleanup can't finish, so a
