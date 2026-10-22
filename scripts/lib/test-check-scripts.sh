@@ -14,6 +14,17 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# ps and pgrep (Debian's procps) are used by the cases and by check-server
+# itself; without them dozens of cases fail as if the code were wrong
+# (SME-267). Each is checked on its own: `command -v ps pgrep` succeeds
+# when either one is found.
+for tool in ps pgrep; do
+    command -v "$tool" >/dev/null || {
+        echo "$(basename "$0") needs ps and pgrep, and $tool is missing (Debian: sudo apt-get install procps)" >&2
+        exit 1
+    }
+done
+
 failures=0
 fail() {
     echo "FAIL: $*" >&2
