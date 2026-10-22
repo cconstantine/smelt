@@ -129,6 +129,23 @@ grep -qF "serving the dev database smelt_dev," <<<"$out" ||
 check_server stop >/dev/null
 [ -s "$SQLX_CALLS" ] && fail "stop after CHECK_DEV_DB=1 called sqlx: $(cat "$SQLX_CALLS")"
 
+# A CHECK_DEV_DB=1 start that goes on to be refused says nothing about the dev
+# database (SME-226 review 1, finding 3): the notice printed before the
+# already-running check, the port checks and the image check, so a start that
+# refused anyway had told the reader the branch's migrations would be applied
+# to the dev database, when nothing had been checked out, created or started.
+# It is said when the start goes ahead, where the scratch one says its piece.
+if ! out=$(check_server start HEAD); then
+    fail "start before a refused CHECK_DEV_DB=1 start: $out"
+fi
+out=$(CHECK_DEV_DB=1 check_server start HEAD)
+rc=$?
+[ "$rc" = 1 ] || fail "a CHECK_DEV_DB=1 start while a server runs exited $rc, not 1: $out"
+grep -q "already running" <<<"$out" || fail "the second start isn't the already-running refusal: $out"
+grep -qF "serving the DEV database" <<<"$out" &&
+    fail "a refused CHECK_DEV_DB=1 start said it serves the DEV database: $out"
+check_server stop >/dev/null
+
 # A CHECK_DEV_DB=1 start following a scratch run: the record is the scratch
 # file, not the running server's kind (SME-226) — which is also why `status`
 # can't tell the two kinds of server apart from it. The dev start leaves the
@@ -481,6 +498,28 @@ for bad in "0$port" abc 0 70000 "$port "; do
     [ -s "$pid_file" ] && fail "CHECK_PORT='$bad': start wrote a pid file"
     "${cs_env[@]}" CHECK_WORKTREE="$worktree" scripts/check-server stop >/dev/null 2>&1
 done
+
+# 12d. A CHECK_DEV_DB=1 start refused by a port something else listens on
+# says nothing about the dev database either (SME-226 review 1, finding 3):
+# the port is refused before anything is checked out, created or started, so
+# the notice belongs after it and not before.
+fport=$(free_port)
+if start_foreign 127.0.0.1 "$fport"; then
+    : >"$SQLX_CALLS"
+    : >"$pid_file"
+    extra_env=(CHECK_DEV_DB=1 CHECK_PORT="$fport")
+    out=$(check_server start HEAD)
+    rc=$?
+    extra_env=()
+    [ "$rc" = 1 ] || fail "a CHECK_DEV_DB=1 start on a taken port exited $rc, not 1: $out"
+    grep -qw "pid $foreign_pid" <<<"$out" || fail "12d: the refusal doesn't name the listener's pid $foreign_pid: $out"
+    grep -qF "serving the DEV database" <<<"$out" &&
+        fail "12d: a start refused for its port said it serves the DEV database: $out"
+    [ -s "$SQLX_CALLS" ] && fail "12d: the refused start called sqlx: $(cat "$SQLX_CALLS")"
+    stop_foreign "$foreign_pid"
+else
+    fail "12d: the foreign listener never listened"
+fi
 
 # 13. The same for a listener on IPv6's loopback only, which curl tries
 # first for localhost and which dx's IPv4 bind doesn't collide with.

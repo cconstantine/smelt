@@ -437,12 +437,9 @@ start() {
     # after them, still before anything is checked out, created or written.
     if serves_scratch_db; then
         take_scratch_lock "$(scratch_db_name)"
-    else
-        # Said out loud because it's the harm this opt-in is here to make a
-        # conscious choice (SME-226): SME-175's hand-run start did it by
-        # accident, applying a branch's migrations to the dev database.
-        echo "serving the DEV database; the branch's migrations will be applied to it"
     fi
+    # (What a dev start prints about itself is down with the rest, just before the
+    # server begins — every refusal is still ahead of it here. Review 1, finding 3.)
 
     if running_pgid >/dev/null; then
         echo "a check server is already running; scripts/check-server stop first" >&2
@@ -567,6 +564,17 @@ start() {
         # Before the caller's overrides, so an explicit DATABASE_URL still wins.
         overrides=("DATABASE_URL=$db_url" "${overrides[@]}")
         echo "serving from scratch database ${db_url##*/}"
+    else
+        # Said out loud because it's the harm this opt-in is here to make a
+        # conscious choice (SME-226): SME-175's hand-run start did it by
+        # accident, applying a branch's migrations to the dev database. It is
+        # said here, beside the scratch database's own line and just before the
+        # server starts, rather than where the flag is read: every refusal — a
+        # server already running, a port another check server holds or something
+        # else listens on, an image the cluster hasn't got — is behind this point,
+        # and a start that went on to refuse had told the reader it was about to
+        # migrate the dev database (SME-226 review 1, finding 3).
+        echo "serving the DEV database; the branch's migrations will be applied to it"
     fi
 
     # smelt logs errors only unless RUST_LOG says otherwise, which left
