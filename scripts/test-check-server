@@ -2,8 +2,10 @@
 # scripts/check-server (SME-107, SME-115, SME-117, SME-129, SME-100):
 # its state files, emptied rather than removed, an empty one meaning
 # "not running" or "no scratch database"; the log settings its server
-# gets; that it takes no cluster lock; its port and scratch locks. The
-# stubs and helpers are in scripts/lib/test-check-scripts.sh.
+# gets; that it takes no cluster lock; its port lock. The scratch
+# database's cleanup and the scratch lock are in
+# scripts/test-check-server-scratch (SME-226). The stubs and helpers are
+# in scripts/lib/test-check-scripts.sh.
 #
 #   scripts/test-check-server
 . "$(dirname "$0")/lib/test-check-scripts.sh"
@@ -195,10 +197,6 @@ check_server stop >/dev/null
 out=$(check_server status)
 grep -qF "$log_file" <<<"$out" || fail "status when stopped doesn't name the log: $out"
 
-
-cs_env=(env -u SANDBOX_IMAGE -u RUST_LOG -u NO_COLOR PATH="$dir/bin:$PATH" SANDBOX_IMAGE_IMPORT="$dir/bin/import"
-    SANDBOX_INSTANCE_CLEANUP="$dir/bin/cleanup" DATABASE_URL=postgres://u@localhost/smelt_dev CHECK_PORT="$port")
-
 # 10. check-server takes no cluster lock, and the server it starts never
 # holds it, even when start runs under an old outer flock (SME-100).
 check_server start HEAD >/dev/null || fail "start for the cluster-lock case"
@@ -259,133 +257,6 @@ check_server stop >/dev/null
 # The usage text is the whole header.
 header_end=$(awk '/^set -euo pipefail/ { print prev; exit } { prev = $0 }' scripts/check-server | sed 's/^# \{0,1\}//')
 [ "$(scripts/check-server 2>&1 | tail -n 1)" = "$header_end" ] || fail "check-server's usage stops before the header's last line: $header_end"
-
-# The scratch cleanup (SME-129). stop runs the tool on the scratch database's
-# URL before it drops it — the database's own `smelt_instance` row is the last
-# record of the instance its server labelled its pods and claims with — and
-# drops it only once the tool succeeded; a failure keeps the database for a
-# later stop; a start over a leftover cleans it up before recreating it; and
-# the tool gets the KUBECONFIG the server was started with.
-: >"$ORDER"
-: >"$CLEANUP_CALLS"
-extra_env=(KUBECONFIG=/the/servers/cluster)
-if ! out=$(CHECK_SCRATCH_DB=1 check_server start HEAD); then
-    fail "start for the cleanup cases: $out"
-fi
-extra_env=()
-cleanup_line="cleanup --database-url $scratch_url --dev-database-url postgres://u@localhost/smelt_dev"
-stop_order="$cleanup_line
-sqlx database drop -y --database-url $scratch_url"
-[ "$(head -n 1 "$ORDER")" = "$cleanup_line" ] ||
-    fail "start dropped the leftover before cleaning it: $(cat "$ORDER")"
-grep -qF "KUBECONFIG=/the/servers/cluster" "$CLEANUP_CALLS" ||
-    fail "the cleanup didn't get the server's KUBECONFIG: $(cat "$CLEANUP_CALLS")"
-
-# stop a running server: the cleanup first, then the drop.
-: >"$ORDER"
-out=$(check_server stop)
-[ "$(cat "$ORDER")" = "$stop_order" ] || fail "stop's cleanup then drop: $(cat "$ORDER")"
-
-# A cleanup that fails keeps the database and its file, and stop exits 1.
-dead=$(bash -c 'echo $$')
-echo "$dead" >"$pid_file"
-echo "$scratch_url" >"$scratch_file"
-: >"$ORDER"
-extra_env=(CLEANUP_FAIL=1)
-out=$(check_server stop)
-rc=$?
-extra_env=()
-[ "$rc" = 1 ] || fail "stop with a failed cleanup exited $rc: $out"
-grep -q "weren't all deleted" <<<"$out" || fail "a failed cleanup's message: $out"
-[ "$(cat "$scratch_file" 2>/dev/null)" = "$scratch_url" ] || fail "a failed cleanup emptied the scratch file"
-grep -q "^sqlx " "$ORDER" && fail "a failed cleanup dropped the database: $(cat "$ORDER")"
-
-# The retry cleans up, drops, and empties the files.
-: >"$ORDER"
-check_server stop >/dev/null || fail "stop after a failed cleanup"
-[ "$(cat "$ORDER")" = "$stop_order" ] || fail "the retry's cleanup then drop: $(cat "$ORDER")"
-[ -e "$scratch_file" ] && [ ! -s "$scratch_file" ] || fail "the retry left the scratch file: $(cat "$scratch_file")"
-
-# A stop with no server running (crashed, killed) cleans up before dropping
-# too.
-echo "$dead" >"$pid_file"
-echo "$scratch_url" >"$scratch_file"
-: >"$ORDER"
-check_server stop >/dev/null
-[ "$(cat "$ORDER")" = "$stop_order" ] || fail "the no-server cleanup then drop: $(cat "$ORDER")"
-
-# The recorded KUBECONFIG wins over the environment at stop time: the tool
-# must talk to the cluster the server used, not whatever is set now.
-extra_env=(KUBECONFIG=/the/servers/cluster)
-CHECK_SCRATCH_DB=1 check_server start HEAD >/dev/null || fail "start for the KUBECONFIG case"
-extra_env=(KUBECONFIG=/another/cluster)
-: >"$CLEANUP_CALLS"
-check_server stop >/dev/null
-extra_env=()
-grep -q "^KUBECONFIG=/the/servers/cluster " "$CLEANUP_CALLS" ||
-    fail "stop's cleanup didn't use the recorded KUBECONFIG: $(cat "$CLEANUP_CALLS")"
-grep -q "KUBECONFIG=/another/cluster" "$CLEANUP_CALLS" &&
-    fail "stop's cleanup used the environment's KUBECONFIG: $(cat "$CLEANUP_CALLS")"
-
-# A stop in a check worktree where no scratch start ever wrote the KUBECONFIG
-# file (a plain start, a scratch start that failed before it, or none at all)
-# succeeds (SME-129 review): it once exited 1 on the missing file, so the
-# documented "until stop succeeds" retry never ended.
-out=$("${cs_env[@]}" CHECK_WORKTREE="$dir/never-started" scripts/check-server stop 2>&1)
-rc=$?
-[ "$rc" = 0 ] || fail "stop with no KUBECONFIG file exited $rc: $out"
-
-# A start over a recorded leftover cleans it up, and drops it, with the URL
-# and KUBECONFIG it was recorded with, not this start's (SME-129 review): on
-# another cluster the tool finds nothing and succeeds, and a database under
-# another URL is reported missing, so either way the leftover's objects were
-# stranded silently. A failed cleanup changes neither file and drops nothing.
-leftover_url=postgres://u@oldhost/smelt_scratch_worktree
-echo "$leftover_url" >"$scratch_file"
-echo /the/leftovers/cluster >"$kubeconfig_file"
-: >"$CLEANUP_CALLS"
-: >"$ORDER"
-extra_env=(KUBECONFIG=/a/new/cluster CLEANUP_FAIL=1)
-out=$(CHECK_SCRATCH_DB=1 check_server start HEAD) && fail "start over a leftover whose cleanup failed started: $out"
-extra_env=()
-[ "$(head -n 1 "$CLEANUP_CALLS")" = "KUBECONFIG=/the/leftovers/cluster --database-url $leftover_url --dev-database-url postgres://u@localhost/smelt_dev" ] ||
-    fail "start cleaned the leftover with what it wasn't recorded with: $(cat "$CLEANUP_CALLS")"
-[ "$(cat "$scratch_file")" = "$leftover_url" ] || fail "a failed leftover cleanup changed the scratch file: $(cat "$scratch_file")"
-[ "$(cat "$kubeconfig_file")" = /the/leftovers/cluster ] || fail "a failed leftover cleanup changed the KUBECONFIG file: $(cat "$kubeconfig_file")"
-grep -q "^sqlx " "$ORDER" && fail "a failed leftover cleanup dropped a database: $(cat "$ORDER")"
-: >"$CLEANUP_CALLS"
-: >"$ORDER"
-extra_env=(KUBECONFIG=/a/new/cluster)
-CHECK_SCRATCH_DB=1 check_server start HEAD >/dev/null || fail "start over a leftover"
-extra_env=()
-[ "$(head -n 1 "$CLEANUP_CALLS")" = "KUBECONFIG=/the/leftovers/cluster --database-url $leftover_url --dev-database-url postgres://u@localhost/smelt_dev" ] ||
-    fail "start cleaned the leftover with what it wasn't recorded with: $(cat "$CLEANUP_CALLS")"
-grep -qx "sqlx database drop -y --database-url $leftover_url" "$ORDER" || fail "start didn't drop the recorded leftover: $(cat "$ORDER")"
-[ "$(cat "$scratch_file")" = "$scratch_url" ] || fail "start over a leftover recorded '$(cat "$scratch_file")'"
-[ "$(cat "$kubeconfig_file")" = /a/new/cluster ] || fail "start over a leftover recorded KUBECONFIG '$(cat "$kubeconfig_file")'"
-check_server stop >/dev/null || fail "stop after the leftover case"
-
-# The scratch lock: a stop holds it through its cleanup, so a start of the
-# same database waits for it and says so.
-scratch_lock=$SMELT_LOCK_DIR/smelt-check-scratch-smelt_scratch_worktree.lock
-scratch_is_free() { flock -n "$scratch_lock" true; }
-CHECK_SCRATCH_DB=1 check_server start HEAD >/dev/null || fail "start for the scratch lock"
-extra_env=(CLEANUP_SLEEP=3)
-check_server stop >/dev/null 2>&1 &
-stopper=$!
-extra_env=()
-held=""
-for _ in $(seq 1 100); do
-    scratch_is_free || { held=1; break; }
-    sleep 0.1
-done
-[ -n "$held" ] || fail "the stop's cleanup never took the scratch lock"
-out=$(timeout 2 "${cs_env[@]}" CHECK_WORKTREE="$worktree" CHECK_SCRATCH_DB=1 scripts/check-server start HEAD 2>&1)
-rc=$?
-[ "$rc" = 124 ] || fail "a start didn't wait for the scratch lock (exit $rc): $out"
-grep -qF "waiting for the scratch lock" <<<"$out" || fail "the waiting start's line: $out"
-wait "$stopper" || fail "the stop holding the scratch lock failed"
-scratch_is_free || fail "the scratch lock is still held after the stop ended"
 
 # SME-175: listeners that aren't the check server's. Each is a python HTTP
 # server answering 200, in a process group of its own, which this script
