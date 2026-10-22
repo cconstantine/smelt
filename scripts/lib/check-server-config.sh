@@ -22,6 +22,19 @@ env_file_value() {
     python3 -I "$repo/scripts/lib/dotenv-value" "$worktree/.env" "$1"
 }
 
+# NAME's value in this checkout's own .env, read exactly the same way.
+# check-server falls back to it for the database URL: a fresh check worktree has
+# no .env yet — the copy into it happens later than the first read — so without
+# this a scratch database, the default since SME-226, couldn't be built there.
+# It is the same file that copy makes, and the value is never printed.
+repo_env_file_value() {
+    command -v python3 >/dev/null 2>&1 || {
+        echo "reading $repo/.env needs python3 (scripts/lib/dotenv-value)" >&2
+        return 1
+    }
+    python3 -I "$repo/scripts/lib/dotenv-value" "$repo/.env" "$1"
+}
+
 # The value of the last `-- NAME=` override given to start (in start's
 # `overrides`), which may be empty; fails when there is none.
 override_value() {

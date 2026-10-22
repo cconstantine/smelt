@@ -41,8 +41,8 @@ grep -q "SME-115" <<<"$out" || fail "the partway refusal doesn't name SME-115: $
 [ -s "$SQLX_CALLS" ] && fail "a refused partway start called sqlx: $(cat "$SQLX_CALLS")"
 [ -s "$scratch_file" ] && fail "a refused partway start wrote a scratch file: '$(cat "$scratch_file")'"
 
-# start with a scratch database, for a ref with the fix: both state files
-# written.
+# start with CHECK_SCRATCH_DB=1 — the default since SME-226, and still accepted
+# as saying it — for a ref with the fix: both state files written.
 if ! out=$(CHECK_SCRATCH_DB=1 check_server start HEAD); then
     fail "start: $out"
 fi
@@ -50,6 +50,7 @@ pgid=$(cat "$pid_file" 2>/dev/null)
 [ -n "$pgid" ] && group_is_live "$pgid" || fail "after start, the pid file names no live group: '$pgid'"
 [ "$(cat "$scratch_file" 2>/dev/null)" = "$scratch_url" ] || fail "after start, the scratch file holds '$(cat "$scratch_file" 2>/dev/null)'"
 grep -qx "database create --database-url $scratch_url" "$SQLX_CALLS" || fail "start didn't create the scratch database: $(cat "$SQLX_CALLS")"
+grep -qF "serving from scratch database" <<<"$out" || fail "start didn't say which scratch database it serves: $out"
 case "$(check_server status)" in running*) ;; *) fail "status after start: $(check_server status)" ;; esac
 
 # stop: the group gone, the database dropped, both files kept and empty.
@@ -65,20 +66,32 @@ for file in "$pid_file" "$scratch_file"; do
     fi
 done
 
-# start without a scratch database: the pid file written, no scratch file.
+# The default start serves a scratch database of the worktree's own (SME-226):
+# what CHECK_SCRATCH_DB=1 used to ask for is what happens with no flag at all.
+# This case was "start without a scratch database: the pid file written, no
+# scratch file"; those assertions move to the CHECK_DEV_DB=1 case below, which
+# is what asks for the dev database now.
+: >"$CLEANUP_CALLS"
+: >"$SQLX_CALLS"
+: >"$pid_file"
+: >"$scratch_file"
 if ! out=$(check_server start HEAD); then
-    fail "start: $out"
+    fail "the default start: $out"
 fi
 pgid=$(cat "$pid_file" 2>/dev/null)
-[ -n "$pgid" ] && group_is_live "$pgid" || fail "after start, the pid file names no live group: '$pgid'"
-[ -s "$scratch_file" ] && fail "a start without CHECK_SCRATCH_DB left '$(cat "$scratch_file")' to drop"
-case "$(check_server status)" in running*) ;; *) fail "status after start: $(check_server status)" ;; esac
+[ -n "$pgid" ] && group_is_live "$pgid" || fail "after the default start, the pid file names no live group: '$pgid'"
+[ "$(cat "$scratch_file" 2>/dev/null)" = "$scratch_url" ] || fail "after the default start, the scratch file holds '$(cat "$scratch_file" 2>/dev/null)'"
+grep -qx "database create --database-url $scratch_url" "$SQLX_CALLS" || fail "the default start didn't create the scratch database: $(cat "$SQLX_CALLS")"
+[ -s "$CLEANUP_CALLS" ] || fail "the default start didn't clean the scratch database's sandbox objects: $(cat "$CLEANUP_CALLS")"
+grep -qF "serving from scratch database" <<<"$out" || fail "the default start didn't say which database it serves: $out"
+grep -qF "serving the DEV database" <<<"$out" && fail "the default start said it serves the DEV database: $out"
+case "$(check_server status)" in running*) ;; *) fail "status after the default start: $(check_server status)" ;; esac
 
-# stop: the group gone, nothing to drop, both files kept and empty.
+# stop: the group gone, the database dropped, both files kept and empty.
 : >"$SQLX_CALLS"
 out=$(check_server stop)
 [ -n "$pgid" ] && group_is_live "$pgid" && fail "after stop, group $pgid is still running"
-[ -s "$SQLX_CALLS" ] && fail "stop with no scratch database called sqlx: $(cat "$SQLX_CALLS")"
+grep -qx "database drop -y --database-url $scratch_url" "$SQLX_CALLS" || fail "stop didn't drop the scratch database: $(cat "$SQLX_CALLS")"
 for file in "$pid_file" "$scratch_file"; do
     if [ ! -e "$file" ]; then
         fail "stop removed $(basename "$file")"
@@ -87,6 +100,11 @@ for file in "$pid_file" "$scratch_file"; do
     fi
 done
 case "$(check_server status)" in "not running"*) ;; *) false ;; esac || fail "status after stop: $(check_server status)"
+
+# CHECK_SCRATCH_DB=1 asks for the default, so it changes nothing: the case at the
+# top of this script is this one with the flag on, asserting the same scratch
+# file and sqlx calls. The flag stays accepted so the docs, saved runbooks and
+# Feature-checklist rows that set it keep working (SME-226 question 2).
 
 # CHECK_DEV_DB=1 says what it serves (SME-226): the branch's migrations go to
 # the dev database, which is what SME-175's hand-run start did by accident. It
@@ -101,6 +119,23 @@ grep -qF "serving the DEV database; the branch's migrations will be applied to i
 : >"$SQLX_CALLS"
 check_server stop >/dev/null
 [ -s "$SQLX_CALLS" ] && fail "stop after CHECK_DEV_DB=1 called sqlx: $(cat "$SQLX_CALLS")"
+
+# A CHECK_DEV_DB=1 start following a scratch run: the record is the scratch
+# file, not the running server's kind (SME-226) — which is also why `status`
+# can't tell the two kinds of server apart from it. The dev start leaves the
+# earlier run's record alone and calls no sqlx; the stop that follows drops the
+# scratch database that record names, this worktree's leftover to clear.
+echo "$scratch_url" >"$scratch_file"
+: >"$SQLX_CALLS"
+if ! out=$(CHECK_DEV_DB=1 check_server start HEAD); then
+    fail "start with CHECK_DEV_DB=1 over a scratch leftover: $out"
+fi
+[ "$(cat "$scratch_file")" = "$scratch_url" ] || fail "the dev start changed the scratch record to '$(cat "$scratch_file")'"
+[ -s "$SQLX_CALLS" ] && fail "a CHECK_DEV_DB=1 start touched a database: $(cat "$SQLX_CALLS")"
+: >"$SQLX_CALLS"
+check_server stop >/dev/null
+grep -qx "database drop -y --database-url $scratch_url" "$SQLX_CALLS" || fail "the stop after a CHECK_DEV_DB=1 start didn't drop the scratch database the earlier run recorded: $(cat "$SQLX_CALLS")"
+[ -e "$scratch_file" ] && [ ! -s "$scratch_file" ] || fail "that stop left the scratch record as '$(cat "$scratch_file" 2>/dev/null)'"
 
 # stop again: nothing running, nothing to drop.
 : >"$SQLX_CALLS"
@@ -124,6 +159,76 @@ if ! out=$(check_server start HEAD); then
     fail "start over a dead pid: $out"
 fi
 check_server stop >/dev/null
+
+# Where the scratch URL's base comes from, now that every default start needs
+# one (SME-226): $DATABASE_URL, else the check worktree's .env, else this
+# checkout's own. A fresh check worktree has none, and start copies one in only
+# after the scratch URL is built, so that third source is what makes a first
+# start work in a new worktree. These cases run from a clone of this repo with
+# this working tree's scripts copied over its own — the clone is of HEAD, and the
+# gate runs against the working tree — so its .env is its own to write and the
+# real checkout is never touched. It's a full checkout, because start's image
+# check reads this repo's sources.
+repo_clone=$dir/repo-env
+wt_repo=$dir/wtrepoenv
+[ -d "$repo_clone/.git" ] || git clone -q --shared "$PWD" "$repo_clone" || exit 1
+# A working tree of its own, since start's image check reads this repo's sources
+# through cluster-doctor (an earlier run may have made the clone without one),
+# and --force because the copy over the top below is a change of ours.
+git -C "$repo_clone" checkout -q --force --detach HEAD || exit 1
+cp -a "$PWD/scripts/." "$repo_clone/scripts/"
+# With DATABASE_URL unexported and both .env files emptied (what an earlier run
+# left, kept and emptied rather than removed), only the repo's own .env can
+# answer.
+no_url_env=(env -u DATABASE_URL -u SANDBOX_IMAGE -u RUST_LOG -u NO_COLOR PATH="$dir/bin:$PATH"
+    SANDBOX_IMAGE_IMPORT="$dir/bin/import" SANDBOX_INSTANCE_CLEANUP="$dir/bin/cleanup" CHECK_PORT="$port")
+repo_url=postgres://repouser@localhost/smelt_repodev
+repo_scratch_url=postgres://repouser@localhost/smelt_scratch_wtrepoenv
+
+# Nothing exported, the repo's .env holding DATABASE_URL, a worktree with no
+# value of its own: the start succeeds, and its scratch database is that
+# server's, named after the worktree.
+"${no_url_env[@]}" CHECK_WORKTREE="$wt_repo" "$repo_clone/scripts/check-server" stop >/dev/null 2>&1
+printf 'DATABASE_URL=%s\n' "$repo_url" >"$repo_clone/.env"
+mkdir -p "$wt_repo"
+: >"$wt_repo/.env"
+: >"$SQLX_CALLS"
+if ! out=$("${no_url_env[@]}" CHECK_WORKTREE="$wt_repo" "$repo_clone/scripts/check-server" start HEAD 2>&1); then
+    fail "a default start in a fresh worktree with only the repo's .env: $out"
+fi
+[ "$(cat "$wt_repo/.check-server.scratch-db" 2>/dev/null)" = "$repo_scratch_url" ] ||
+    fail "the repo's .env didn't reach the scratch database: '$(cat "$wt_repo/.check-server.scratch-db" 2>/dev/null)', not '$repo_scratch_url'"
+grep -qx "database create --database-url $repo_scratch_url" "$SQLX_CALLS" || fail "that start didn't create the scratch database the repo's .env implies: $(cat "$SQLX_CALLS")"
+"${no_url_env[@]}" CHECK_WORKTREE="$wt_repo" "$repo_clone/scripts/check-server" stop >/dev/null 2>&1
+grep -qx "database drop -y --database-url $repo_scratch_url" "$SQLX_CALLS" || fail "stop didn't drop the scratch database made from the repo's .env: $(cat "$SQLX_CALLS")"
+
+# Nothing anywhere to resolve a URL from: refused, and the message names the
+# three places it looked.
+echo "# no DATABASE_URL in this file" >"$repo_clone/.env"
+: >"$wt_repo/.env"
+: >"$wt_repo/.check-server.pid"
+: >"$wt_repo/.check-server.scratch-db"
+: >"$SQLX_CALLS"
+out=$("${no_url_env[@]}" CHECK_WORKTREE="$wt_repo" "$repo_clone/scripts/check-server" start HEAD 2>&1)
+rc=$?
+[ "$rc" = 1 ] || fail "a start with no DATABASE_URL anywhere exited $rc: $out"
+grep -qF "DATABASE_URL (environment, .env or the repo's .env)" <<<"$out" || fail "that refusal doesn't name the three places it looked: $out"
+[ -s "$wt_repo/.check-server.pid" ] && fail "a start that couldn't resolve a URL wrote a pid file"
+[ -s "$wt_repo/.check-server.scratch-db" ] && fail "a start that couldn't resolve a URL wrote a scratch record"
+[ -s "$SQLX_CALLS" ] && fail "a start that couldn't resolve a URL called sqlx: $(cat "$SQLX_CALLS")"
+
+# And a server already running is still reported as *that*, not as the URL
+# error: the scratch lock is keyed by the database's name, which the worktree
+# decides on its own, so the URL is resolved only after the running check.
+if ! out=$("${no_url_env[@]}" DATABASE_URL="$repo_url" CHECK_WORKTREE="$wt_repo" "$repo_clone/scripts/check-server" start HEAD 2>&1); then
+    fail "the already-running case's first start, with DATABASE_URL exported: $out"
+fi
+out=$("${no_url_env[@]}" CHECK_WORKTREE="$wt_repo" "$repo_clone/scripts/check-server" start HEAD 2>&1)
+rc=$?
+[ "$rc" = 1 ] || fail "a second start with no DATABASE_URL exited $rc: $out"
+grep -q "already running" <<<"$out" || fail "a second start with no DATABASE_URL didn't report the running server: $out"
+grep -qF "needs DATABASE_URL" <<<"$out" && fail "the URL error came before the already-running one: $out"
+"${no_url_env[@]}" CHECK_WORKTREE="$wt_repo" "$repo_clone/scripts/check-server" stop >/dev/null 2>&1
 
 # The log level and colour the server gets (SME-117). Each case starts a
 # check server with extra_env and the given start arguments, then compares

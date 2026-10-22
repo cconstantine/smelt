@@ -4,8 +4,9 @@
 # whatever database it would get, that the wait for the port lock is bounded
 # and names the server that holds it, that a pid file only ever claims a group
 # that looks like this worktree's server, and that the default check worktree
-# belongs to this checkout alone. The stubs and helpers are in
-# scripts/lib/test-check-scripts.sh.
+# belongs to this checkout alone. G8 (SME-226) covers the two database settings:
+# each accepts exactly 1, and they refuse each other. The stubs and helpers are
+# in scripts/lib/test-check-scripts.sh.
 #
 #   scripts/test-check-server-guards
 . "$(dirname "$0")/lib/test-check-scripts.sh"
@@ -18,7 +19,8 @@ check_server stop >/dev/null
 
 # G1 (SME-186 B39): a ref from before 6c9f03c, where SME-115's fix is
 # complete, is refused whatever database it would be served on. The refusal
-# was tied to CHECK_SCRATCH_DB=1, so any of these could be started on another
+# used to be conditional on serving a scratch database (`CHECK_SCRATCH_DB=1`,
+# the default since SME-226), so any of these could be started on another
 # database — `-- DATABASE_URL=…`, or one inherited from the environment — and
 # that server's startup sweep deletes every conversation's sandbox claim that
 # isn't in the database it serves: the harm the refusal exists to stop. Such a

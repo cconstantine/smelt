@@ -46,20 +46,30 @@
 #                   On timeout it exits 1, naming the holder and the `stop`
 #                   that would free the port, having checked nothing out and
 #                   created, written or signalled nothing (SME-186 B48).
-#   CHECK_DEV_DB=1  serve the dev database (DATABASE_URL as it is), saying so on
-#                   start: the branch's migrations are applied to it, which is
-#                   what SME-175's hand-run start did by accident. Both database
-#                   flags accept exactly 1 — any other value, `0` included, is
-#                   refused with exit 2 before anything is locked, checked out,
-#                   created or signalled, since a silent `0` is exactly how that
-#                   start served the dev database — and asking for both at once
-#                   is refused with exit 1 (SME-226).
-#   CHECK_SCRATCH_DB=1  serve from a database of its own, created on start
-#                   (smelt migrates it) and dropped on stop, instead of the dev
-#                   database. For when the dev database has migrations from
-#                   another branch, which stop smelt starting: on SME-65 every
-#                   page was a 500 because SME-35's branch had applied one.
-#                   Nothing from the dev database is copied into it.
+#   CHECK_DEV_DB=1  serve the dev database (DATABASE_URL as it is) instead of a
+#                   scratch one, saying so on start: the branch's migrations are
+#                   applied to it, which is what SME-175's hand-run start did by
+#                   accident. Both database flags accept exactly 1 — any other
+#                   value, `0` included, is refused with exit 2 before anything
+#                   is locked, checked out, created or signalled, since a silent
+#                   `0` is exactly how that start served the dev database — and
+#                   asking for both at once is refused with exit 1 (SME-226).
+#   CHECK_SCRATCH_DB=1  serve from a database of the worktree's own, created on
+#                   start (smelt migrates it) and dropped on stop. That is the
+#                   default since SME-226, so this setting says what happens
+#                   anyway and is accepted for the docs, saved runbooks and
+#                   Feature-checklist rows that have set it all along. It is
+#                   here for when the dev database has migrations from another
+#                   branch, which stop smelt starting: on SME-65 every page was
+#                   a 500 because SME-35's branch had applied one. Nothing from
+#                   the dev database is copied into it.
+#
+#                   The dev URL is $DATABASE_URL, else the check worktree's
+#                   .env, else this checkout's (SME-226: a fresh worktree has no
+#                   .env of its own until start copies it there, and the scratch
+#                   URL is built before that); the scratch URL is that one with
+#                   its database renamed smelt_scratch_<the worktree's name>.
+#                   Neither is ever printed, only the scratch database's name.
 #
 #                   stop deletes that database's own sandbox objects first
 #                   (SME-129): every pod and claim its server made carries
@@ -132,13 +142,21 @@ scratch_db_file() { echo "$worktree/.check-server.scratch-db"; }
 # to the same cluster (SME-129). Empty means the inherited environment.
 kubeconfig_file() { echo "$worktree/.check-server.kubeconfig"; }
 
-# The dev DATABASE_URL: the environment's, else the check worktree's .env read
-# as dotenvy reads it (SME-186 B40 — the server itself gets its URL through
-# dotenvy, so the two have to read the line the same way).
+# The dev DATABASE_URL: the environment's, else the check worktree's .env, else
+# this checkout's, each read as dotenvy reads it (SME-186 B40 — the server
+# itself gets its URL through dotenvy, so the two have to read the line the same
+# way). This checkout's own .env is the last of the three (SME-226): a fresh
+# check worktree has none, and start copies this file into it only *after* the
+# scratch URL is built, so without this fallback the default start — which
+# builds a scratch database — fails in every new worktree. It is exactly the
+# file that copy makes, for the same server, and the value is never printed.
 dev_database_url() {
     local url=${DATABASE_URL:-}
     if [ -z "$url" ] && [ -f "$worktree/.env" ]; then
         url=$(env_file_value DATABASE_URL)
+    fi
+    if [ -z "$url" ] && [ -f "$repo/.env" ]; then
+        url=$(repo_env_file_value DATABASE_URL)
     fi
     echo "$url"
 }
@@ -150,19 +168,34 @@ db_name() {
     echo "${url##*/}"
 }
 
-# The dev DATABASE_URL (the environment's, else the worktree's .env) with the
-# database renamed after the worktree: a fixed name, so a leftover from a
-# failed run is easy to find and the next run reuses it.
+# The scratch database's name: the dev URL's database renamed after the
+# worktree. A fixed name, so a leftover from a failed run is easy to find and
+# the next run reuses it. It needs nothing *of* that URL (SME-226), which is
+# what lets the scratch lock be taken before a DATABASE_URL is resolved at all.
+scratch_db_name() {
+    echo "smelt_scratch_$(basename "$worktree" | tr -c 'a-zA-Z0-9\n' '_')"
+}
+
+# The dev DATABASE_URL with its database renamed after the worktree; the name is
+# scratch_db_name's, so the two can never disagree about what the scratch
+# database is called.
 scratch_db_url() {
     local url
     url=$(dev_database_url)
-    [ -n "$url" ] || { echo "CHECK_SCRATCH_DB needs DATABASE_URL (environment or .env)" >&2; return 1; }
+    [ -n "$url" ] || { echo "a scratch database needs DATABASE_URL (environment, .env or the repo's .env)" >&2; return 1; }
     local query=""
     case "$url" in *\?*) query="?${url#*\?}"; url=${url%%\?*} ;; esac
-    local name
-    name=smelt_scratch_$(basename "$worktree" | tr -c 'a-zA-Z0-9\n' '_')
-    echo "${url%/*}/$name$query"
+    echo "${url%/*}/$(scratch_db_name)$query"
 }
+
+# Which database this start serves (SME-226): a scratch database of the
+# worktree's own, unless the caller opted into the dev one with CHECK_DEV_DB=1.
+# CHECK_SCRATCH_DB=1 names this default and stays accepted, so the docs, saved
+# runbooks and Feature-checklist rows that set it keep working; the two flags
+# together were refused at the top of start, so whatever isn't CHECK_DEV_DB=1 is
+# scratch. Before this ticket the default was the dev database, and any value of
+# CHECK_SCRATCH_DB but `1` — `0` among them — served it in silence.
+serves_scratch_db() { [ "${CHECK_DEV_DB:-}" != 1 ]; }
 
 # The lock ordering a start and a stop of the same scratch database
 # (SME-129): keyed by the database's name, so it works before the check
@@ -365,12 +398,15 @@ start() {
     # before the "already running" check, held until this start writes its
     # pid file: a stop of the same database waits for it, so it can't take
     # its no-server branch and drop a database a starting server is about to
-    # use (SME-129). A start that has to wait says so.
-    local db_url
-    if [ "${CHECK_SCRATCH_DB:-}" = 1 ]; then
-        db_url=$(scratch_db_url)
-        take_scratch_lock "$(db_name "$db_url")"
-    elif [ "${CHECK_DEV_DB:-}" = 1 ]; then
+    # use (SME-129). A start that has to wait says so. Keyed by the scratch
+    # database's *name*, which the worktree alone decides, rather than by a
+    # resolved URL (SME-226): a start with nothing to resolve a DATABASE_URL
+    # from still reaches the checks below, so a server already running is
+    # reported as that and not as a URL error. The URL itself is resolved
+    # after them, still before anything is checked out, created or written.
+    if serves_scratch_db; then
+        take_scratch_lock "$(scratch_db_name)"
+    else
         # Said out loud because it's the harm this opt-in is here to make a
         # conscious choice (SME-226): SME-175's hand-run start did it by
         # accident, applying a branch's migrations to the dev database.
@@ -380,6 +416,10 @@ start() {
     if running_pgid >/dev/null; then
         echo "a check server is already running; scripts/check-server stop first" >&2
         exit 1
+    fi
+    local db_url=""
+    if serves_scratch_db; then
+        db_url=$(scratch_db_url)
     fi
     # The port, after the refusals (a refused start never waits) and before
     # anything is checked out, created or started (a waiting start has
@@ -461,7 +501,7 @@ start() {
         fi
         exit 1
     fi
-    if [ "${CHECK_SCRATCH_DB:-}" = 1 ]; then
+    if serves_scratch_db; then
         # A leftover scratch database's objects are cleaned up before it is
         # dropped and made again (SME-129): dropping it strands every pod and
         # claim its server labelled, since nothing else names its instance.
@@ -542,7 +582,7 @@ start() {
     # The pid file is written, so a stop may take over from here: this start
     # lets go of the scratch lock before it waits for the server to answer,
     # which can take minutes (SME-129).
-    if [ "${CHECK_SCRATCH_DB:-}" = 1 ]; then
+    if serves_scratch_db; then
         exec 9>&-
     fi
     echo "building $(git -C "$worktree" log --oneline -1) (log: $(log_file))"
