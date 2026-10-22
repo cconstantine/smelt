@@ -36,7 +36,7 @@ Before its first turn, smelt loads the child's top-level `AGENTS.md`, if the che
 
 ### The volume tools
 
-- **`create_volume(name, mount_path)`**: a claim owned by this conversation, mounted at `mount_path` in its own pod. `name` is 1–64 letters, digits, `-` and `_` (global volumes' names have no rule; a model-written one gets one), unique per owner. `mount_path` validated like a global volume's (`validate_mount_path`, `~` expanded), and refused at or under `/workspace`, at a global volume's path, or at another of this conversation's mounts.
+- **`create_volume(name, mount_path)`**: a claim owned by this conversation, mounted at `mount_path` in its own pod. `name` is 1–64 letters, digits, `-` and `_` (global volumes' names have no rule; a model-written one gets one), unique per owner. `mount_path` validated like a global volume's (`validate_mount_path`, `~` expanded), and refused at or under `/workspace`, at or under `/etc/smelt` (`POD_GIT_DIR`: the key would be written onto the volume and passed on with it), at or under a system directory (`/etc`, `/usr`, `/bin`, `/lib`, `/proc`, `/sys`, `/dev`, `/var/lib/docker`), at a global volume's path, or at another of this conversation's mounts. Credential narrowing can't stop a parent copying a file it can read onto a volume it passes; a parent without `git-ssh` has no key to copy.
 - **`delete_volume(name)`**: one this conversation created. Refused while an `active` agent other than this conversation mounts it (stop or finish it first).
 - The model sees its mounted volumes in the system prompt's Environment section, as global volumes are listed today (`turn::system_prompt`), each with whether it owns it.
 
