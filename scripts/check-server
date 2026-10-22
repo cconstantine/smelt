@@ -186,8 +186,19 @@ scratch_db_url() {
     local url
     url=$(dev_database_url)
     [ -n "$url" ] || { echo "a scratch database needs DATABASE_URL (environment, .env or the repo's .env)" >&2; return 1; }
+    # A raw tab, CR or LF is stripped by a driver's URL parser before it reads the
+    # query, so one hides a `dbname=` from the guards below (SME-226 review 2,
+    # finding 1; see url_has_tab_or_newline). Refused rather than stripped first:
+    # no real database URL has one in it, and guessing which reading to believe is
+    # how the drop ends up naming another database.
+    if url_has_tab_or_newline "$url"; then
+        echo "the dev DATABASE_URL contains a raw tab, CR or LF, which a driver strips before reading its query, where it can hide a dbname=: remove the character from the URL, or say CHECK_DEV_DB=1 to serve that URL as it is" >&2
+        return 1
+    fi
     local query=""
-    case "$url" in *\?*) query="?${url#*\?}"; url=${url%%\?*} ;; esac
+    case "$url" in
+        *\?*) query="?${url#*\?}"; url=${url%%\?*} ;;
+    esac
     # A query that names a database fights the renamed path segment over which
     # database the driver opens, and which of the two wins was never measured
     # (SME-226), so it is refused rather than guessed at: a scratch URL is only

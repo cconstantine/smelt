@@ -130,4 +130,54 @@ grep -qx "database create --database-url postgres://u@localhost/smelt_scratch_wo
 check_server stop >/dev/null
 
 
+# G9c (SME-226 review 2, finding 1): a raw tab, CR or LF hides `dbname` from the
+# guard. The URL parser the driver reads with (the `url` crate, behind sqlx's
+# `url.query_pairs()`) removes every ASCII tab, CR and LF from its input before
+# parsing, so `?db<TAB>name=` is the key `dbname` to it while this script reads
+# `db<TAB>name`, and a newline ends the query before the pair that follows it —
+# `IFS='&' read` stops at the first newline, so `?a=1<LF>&dbname=` reads as the
+# one pair `a=1`. Such a URL reaches `sqlx database drop -y`, which then asks for
+# the database the hidden key names, exactly as the plain spelling does. The
+# characters arrive from a `.env` (a literal tab inside double quotes, a
+# multi-line single-quoted value), not only from a command line. So a dev URL
+# carrying one is refused before the scratch name is built: which of the two
+# readings to believe isn't a thing worth guessing at.
+refused_ws_url() { # name url
+    local name=$1 url=$2 out rc
+    check_server stop >/dev/null
+    : >"$SQLX_CALLS"
+    : >"$pid_file"
+    : >"$scratch_file"
+    extra_env=("DATABASE_URL=$url")
+    out=$(check_server start HEAD)
+    rc=$?
+    extra_env=()
+    [ "$rc" = 1 ] || fail "$name: start exited $rc, not 1: $out"
+    grep -qF "dbname" <<<"$out" || fail "$name: the refusal doesn't name dbname: $out"
+    grep -qF "tab, CR or LF" <<<"$out" ||
+        fail "$name: the refusal doesn't say which characters it is refusing: $out"
+    grep -qF "CHECK_DEV_DB" <<<"$out" ||
+        fail "$name: the refusal doesn't say how to serve that URL (CHECK_DEV_DB=1): $out"
+    grep -q "check server up" <<<"$out" && fail "$name: start came up anyway: $out"
+    [ -s "$SQLX_CALLS" ] && fail "$name: the refused start called sqlx: $(cat "$SQLX_CALLS")"
+    [ -s "$pid_file" ] && fail "$name: the refused start wrote a pid file: '$(cat "$pid_file")'"
+    [ -s "$scratch_file" ] && fail "$name: the refused start wrote a scratch file: '$(cat "$scratch_file")'"
+    flock -n "$port_lock" true || fail "$name: the refused start took the port lock"
+}
+for ws_name in tab CR LF; do
+    case $ws_name in
+        tab) ws=$'\t' ;;
+        CR) ws=$'\r' ;;
+        LF) ws=$'\n' ;;
+    esac
+    # The character inside the key: `dbname` to the driver, `db<ws>name` here.
+    refused_ws_url "G9c (a dev URL with a $ws_name in the key)" \
+        "postgres://u@localhost/smelt_dev?db${ws}name=another"
+    # The character before the pair: the driver sees both pairs, this script only
+    # the first, because the character ends the line `read` takes.
+    refused_ws_url "G9c (a dev URL with a $ws_name before the dbname pair)" \
+        "postgres://u@localhost/smelt_dev?a=1${ws}&dbname=another"
+done
+check_server stop >/dev/null
+
 finish
