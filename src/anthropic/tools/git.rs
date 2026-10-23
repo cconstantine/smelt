@@ -76,10 +76,13 @@ async fn clone_repo_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> 
     let branch = optional("branch");
     let dir = optional("dir");
     // SME-275: a failed clone's error is git's output, which the remote
-    // can write into; its line breakers and bidi controls go escaped.
+    // can write into; its line breakers and bidi controls go escaped, and
+    // it goes as a JSON string, so a newline the remote sent (git prefixes
+    // only some of its lines with `remote: `) can't start a line of the
+    // tool result (review 1).
     let repo = crate::git::clone_repo(pool, conversation_id, &url, branch.as_deref(), dir.as_deref())
         .await
-        .map_err(|e| crate::git::plain_multiline_text(&e))?;
+        .map_err(|e| serde_json::json!({"error": crate::git::plain_multiline_text(&e)}).to_string())?;
     let persona_files = crate::git::repo_persona_files(pool, repo.id).await;
     Ok(clone_result_for_model(repo, &persona_files))
 }
