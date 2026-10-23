@@ -27,6 +27,16 @@ fn test_clone_result_doesnt_show_a_branch_name_that_breaks_a_line() {
     assert_eq!(parsed["branch"], Value::Null, "{told}");
     assert!(parsed["note"].as_str().is_some_and(|n| n.contains("control characters")), "{told}");
 
+    // A bidi control too, and the note joins the AGENTS.md one (review 1).
+    let mut repo = ready_repo("a\u{202e}b");
+    repo.agents_files = vec!["AGENTS.md".to_string()];
+    let told = clone_result_for_model(repo, &[]);
+    assert!(!told.contains('\u{202e}'), "{told}");
+    let parsed: Value = serde_json::from_str(&told).expect("JSON");
+    assert_eq!(parsed["branch"], Value::Null, "{told}");
+    let note = parsed["note"].as_str().unwrap_or_default();
+    assert!(note.contains("control characters") && note.contains("load_instructions"), "{told}");
+
     let told = clone_result_for_model(ready_repo("main"), &[]);
     let parsed: Value = serde_json::from_str(&told).expect("JSON");
     assert_eq!(parsed["branch"], "main", "{told}");
