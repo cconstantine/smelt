@@ -211,17 +211,23 @@ pub async fn ask_parent(
 }
 
 /// Queues `body`, a notice from smelt, to every agent a restart cut off
-/// mid-turn: `active`, not paused or being deleted, its last message the
-/// user side's (a turn's own message, a tool result or a notice, with no
-/// reply after it), not waiting on a question, and not already holding
-/// this notice undelivered (two restarts in a row tell it once). A user's
-/// own conversation is left alone. Returns who was told.
+/// mid-turn: `active`, not paused or being deleted, not waiting on a
+/// question, its last message a turn's with no reply after it (a tool
+/// result, or a delivered report, message or notice from the queue), and
+/// not already holding this notice undelivered (two restarts in a row tell
+/// it once). A notice saved without waking it (the user stopping its pod)
+/// isn't a turn (review 1, finding 2), nor is a user's own conversation.
+/// Returns who was told.
 pub async fn queue_restart_notices(pool: &PgPool, body: &str) -> Result<Vec<i64>, sqlx::Error> {
     sqlx::query_scalar::<_, i64>(
         "INSERT INTO agent_messages (to_conversation_id, from_label, kind, body)
          SELECT c.id, 'smelt', $2, $1 FROM conversations c JOIN agents a ON a.conversation_id = c.id
          WHERE a.state = $3 AND c.paused_at IS NULL AND c.deleting_at IS NULL
-           AND (SELECT m.role FROM messages m WHERE m.conversation_id = c.id ORDER BY m.id DESC LIMIT 1) = 'user'
+           AND EXISTS (SELECT 1 FROM messages last
+                       WHERE last.id = (SELECT max(m.id) FROM messages m WHERE m.conversation_id = c.id)
+                         AND last.role = 'user'
+                         AND (last.content LIKE '%\"type\":\"tool_result\"%'
+                              OR EXISTS (SELECT 1 FROM agent_messages d WHERE d.delivered_message_id = last.id)))
            AND NOT EXISTS (SELECT 1 FROM pending_questions q WHERE q.conversation_id = c.id AND q.answer IS NULL)
            AND NOT EXISTS (SELECT 1 FROM agent_messages m WHERE m.to_conversation_id = c.id
                            AND m.delivered_at IS NULL AND m.kind = $2 AND m.body = $1)

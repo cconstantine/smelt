@@ -45,18 +45,32 @@ async fn test_a_child_cut_off_mid_turn_gets_the_restart_notice_and_carries_on(po
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let child = active_child(&pool, root).await;
     cut_off_turn(&pool, child).await;
+    // Cut off right after its turn read a message from its parent.
+    let reading = active_child(&pool, root).await;
+    say(&pool, reading, "user", vec![ContentBlock::Text { text: "Work.".to_string() }]).await;
+    say(&pool, reading, "assistant", vec![ContentBlock::Text { text: "Done.".to_string() }]).await;
+    db::message_agent(&pool, root, db::Recipient::Child(reading), "your parent", "One more thing.").await.expect("queue it");
+    let row = db::undelivered_agent_messages(&pool, reading).await.expect("rows").remove(0);
+    let text = vec![ContentBlock::Text { text: "Message from your parent:\n\nOne more thing.".to_string() }];
+    db::deliver_agent_message(&pool, &row, &text).await.expect("deliver it").expect("delivered");
 
-    restart(&pool, &[root, child]).await;
-    let calls = requests_for(&requests, Some(child));
-    assert_eq!(calls.len(), 1, "the child wasn't woken");
-    let messages = calls[0]["messages"].as_array().expect("messages");
-    let last = messages.last().expect("a message").to_string();
-    assert!(last.contains(NOTICE), "{last}");
-    eventually("every turn is over", || async { !crate::turn::turn_running(root) && !crate::turn::turn_running(child) }).await;
+    restart(&pool, &[root, child, reading]).await;
+    for id in [child, reading] {
+        let calls = requests_for(&requests, Some(id));
+        assert_eq!(calls.len(), 1, "#{id} wasn't woken");
+        let messages = calls[0]["messages"].as_array().expect("messages");
+        let last = messages.last().expect("a message").to_string();
+        assert!(last.contains(NOTICE), "{last}");
+    }
+    eventually("every turn is over", || async {
+        !crate::turn::turn_running(root) && !crate::turn::turn_running(child) && !crate::turn::turn_running(reading)
+    })
+    .await;
 }
 
 /// Not for a root, a paused child, a child waiting for its parent, a
-/// finished or stopped one, nor one whose last message is the model's.
+/// finished or stopped one, one whose last message is the model's, nor
+/// one whose last message is a notice saved while it was idle.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_restart_notice_is_only_for_an_active_child_cut_off_mid_turn(pool: PgPool) {
     let requests = setup(&pool, vec![text_reply("Carrying on.")]).await;
@@ -87,8 +101,14 @@ async fn test_the_restart_notice_is_only_for_an_active_child_cut_off_mid_turn(po
     let replied = active_child(&pool, root).await;
     say(&pool, replied, "user", vec![ContentBlock::Text { text: "Work.".to_string() }]).await;
     say(&pool, replied, "assistant", vec![ContentBlock::Text { text: "Done.".to_string() }]).await;
+    // Review 1, finding 2: idle, then a notice saved without waking it
+    // (the user stopping its pod): not a turn cut off.
+    let saved = active_child(&pool, root).await;
+    say(&pool, saved, "user", vec![ContentBlock::Text { text: "Work.".to_string() }]).await;
+    say(&pool, saved, "assistant", vec![ContentBlock::Text { text: "Done.".to_string() }]).await;
+    say(&pool, saved, "user", vec![ContentBlock::Text { text: "The user stopped your sandbox.".to_string() }]).await;
 
-    let ids = [root, paused, asking, finished, stopped, replied];
+    let ids = [root, paused, asking, finished, stopped, replied, saved];
     restart(&pool, &ids).await;
     for id in ids {
         assert_eq!(restart_notices(&pool, id).await, 0, "#{id} was told");
