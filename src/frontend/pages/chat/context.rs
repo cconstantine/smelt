@@ -1,6 +1,7 @@
 //! The context usage meter and its detail dialog.
 
 use super::*;
+use super::shown_text::{hidden_text_notice, shown_pre};
 
 /// Where a loaded `AGENTS.md` came from, for the context detail view.
 pub(super) fn instructions_source(doc: &crate::git::ProjectInstructions) -> String {
@@ -230,6 +231,97 @@ mod detail_body_tests {
     }
 }
 
+/// SME-277's SSR tests of the loaded-file, System prompt and Tools panes:
+/// the same rule the trust card uses, one notice per pane that hides
+/// something, and no raw invisible character anywhere in the html. The
+/// existing `detail_body_tests` above stay green unedited: the loading
+/// and failed states render no file content at all.
+#[cfg(all(test, feature = "server"))]
+mod detail_shown_tests {
+    use super::*;
+    use crate::anthropic::ToolDefinition;
+    use crate::git::ProjectInstructions;
+
+    fn snapshot(content: &str, system: Option<&str>, tools: Vec<ToolDefinition>) -> ContextDetailSnapshot {
+        ContextDetailSnapshot {
+            system: system.map(|s| s.to_string()),
+            instructions: vec![ProjectInstructions {
+                repo_url: "file:///tmp/v.git".to_string(),
+                path: "/workspace/v/AGENTS.md".to_string(),
+                commit: None,
+                content: content.to_string(),
+                file_bytes: content.len() as u64,
+                truncated: false,
+            }],
+            tools,
+            message_count: 0,
+            usage: None,
+            context_window: 200_000,
+            spend: Default::default(),
+            prices_as_of: None,
+        }
+    }
+
+    /// The pane pair: the file's U+200B and the same character inside the
+    /// System prompt (which embeds the file). Today both reach the html
+    /// raw; each pane must show its escape with its own notice, and no
+    /// raw character anywhere.
+    #[test]
+    fn test_the_file_and_system_prompt_panes_escape_hidden_characters_with_notices() {
+        let snap = snapshot("Be kind.\u{200b}", Some("… instructions: Be kind.\u{200b} …"), vec![]);
+        let html = dioxus::ssr::render_element(render_context_detail_body(Some(&Ok(snap))));
+        assert_eq!(html.matches("\\u{200b}").count(), 2, "{html}");
+        assert_eq!(html.matches("1 character here").count(), 2, "{html}");
+        assert!(!html.contains('\u{200b}'), "raw U+200B in the html: {html}");
+    }
+
+    /// The Tools panes (the user's Q3 answer): a connected server's tool
+    /// description and input schema, escaped with one count for the tool
+    /// — 1 in the description, 2 in the schema text.
+    #[test]
+    fn test_the_tools_panes_escape_hidden_characters_with_one_notice() {
+        let tools = vec![ToolDefinition {
+            name: "example".to_string(),
+            description: "does things\u{200b}".to_string(),
+            input_schema: serde_json::json!({"a\u{200b}b": "t\u{200b}ext"}),
+        }];
+        let snap = snapshot("plain file", Some("plain prompt"), tools);
+        let html = dioxus::ssr::render_element(render_context_detail_body(Some(&Ok(snap))));
+        assert!(html.contains("3 characters here"), "{html}");
+        assert!(html.contains("\\u{200b}"), "{html}");
+        assert!(!html.contains('\u{200b}'), "raw U+200B in the html: {html}");
+    }
+
+    /// Review 1, finding 1 (SME-277): the tool's *name* is the same
+    /// server-written text in the same pane, and it reached the html raw
+    /// while its description and schema were escaped either side of it.
+    /// Q3's answer was "escape the Tools panes"; a name is part of one.
+    #[test]
+    fn test_a_tools_name_with_a_hidden_character_is_escaped_too() {
+        let tools = vec![ToolDefinition {
+            name: "mcp__serv\u{200b}er__echo".to_string(),
+            description: "plain".to_string(),
+            input_schema: serde_json::json!({"a": "b"}),
+        }];
+        let snap = snapshot("plain file", Some("plain prompt"), tools);
+        let html = dioxus::ssr::render_element(render_context_detail_body(Some(&Ok(snap))));
+        assert!(!html.contains('\u{200b}'), "raw U+200B in the tool name: {html}");
+        assert!(html.contains("\\u{200b}"), "{html}");
+        assert!(html.contains("1 character here"), "{html}");
+    }
+
+    /// The no-regression cell for the context view: nothing hidden, no
+    /// notice anywhere, text exactly as today.
+    #[test]
+    fn test_the_context_view_shows_no_notice_for_a_file_with_nothing_hidden() {
+        let snap = snapshot("Be kind.\n日本 é", Some("You are smelt."), vec![]);
+        let html = dioxus::ssr::render_element(render_context_detail_body(Some(&Ok(snap))));
+        assert!(!html.contains("render as nothing"), "{html}");
+        assert!(html.contains("Be kind.\n日本 é"), "{html}");
+        assert!(html.contains("You are smelt."), "{html}");
+    }
+}
+
 #[cfg(test)]
 mod context_usage_tests {
     use super::*;
@@ -324,6 +416,23 @@ mod context_usage_tests {
     }
 }
 
+/// One notice per tool (the user's answer to SME-277's Q3): the name, the
+/// description and the schema are all text the connected server writes, so
+/// all three are escaped by the same rule as the panes around them, and the
+/// count covers the three together. Review round 1, finding 1: the name was
+/// the one left raw, reaching the html while the other two were escaped on
+/// either side of it.
+fn tool_notice(tool: &crate::anthropic::ToolDefinition) -> Element {
+    let hidden = crate::git::hidden_characters(&tool.name)
+        + crate::git::hidden_characters(&tool.description)
+        + crate::git::hidden_characters(&tool.input_schema.to_string());
+    if hidden > 0 {
+        hidden_text_notice(hidden)
+    } else {
+        rsx! {}
+    }
+}
+
 /// The context dialog's body: "Loading…" until its fetch lands, then the
 /// snapshot, or why it couldn't load (SME-185 B37: a failed fetch used to
 /// leave "Loading…" for good). A plain function, so a test can render it.
@@ -348,7 +457,7 @@ pub(super) fn render_context_detail_body(detail: Option<&Result<ContextDetailSna
                             code { "{doc.path}" }
                             span { class: "muted", " {instructions_source(doc)}" }
                         }
-                        pre { class: "context-detail-prompt", "{doc.content}" }
+                        {shown_pre(&doc.content, Some("context-detail-prompt"))}
                     }
                 }
             }
@@ -356,7 +465,7 @@ pub(super) fn render_context_detail_body(detail: Option<&Result<ContextDetailSna
             if let Some(system) = &detail.system {
                 // Its own line breaks and headings, not one
                 // run-together paragraph (SME-41 D7).
-                pre { class: "context-detail-prompt", "{system}" }
+                {shown_pre(system, Some("context-detail-prompt"))}
             } else {
                 p { class: "muted", "None set." }
             }
@@ -390,9 +499,10 @@ pub(super) fn render_context_detail_body(detail: Option<&Result<ContextDetailSna
             h4 { "Tools ({detail.tools.len()})" }
             for tool in &detail.tools {
                 div { class: "context-detail-tool",
-                    strong { "{tool.name}" }
-                    p { "{tool.description}" }
-                    pre { "{tool.input_schema}" }
+                    strong { "{crate::git::plain_multiline_text(&tool.name)}" }
+                    {tool_notice(tool)}
+                    p { "{crate::git::plain_multiline_text(&tool.description)}" }
+                    pre { "{crate::git::plain_multiline_text(&tool.input_schema.to_string())}" }
                 }
             }
         },

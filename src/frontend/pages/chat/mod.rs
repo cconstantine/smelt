@@ -63,6 +63,7 @@ mod panels;
 mod live;
 mod question_card;
 mod repo_attach;
+mod shown_text;
 mod sidebar;
 mod state;
 mod sticky;

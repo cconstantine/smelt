@@ -1,6 +1,8 @@
 //! The trust card a repo's AGENTS.md waits on (SME-32).
 
 use super::*;
+use super::shown_text::shown_pre;
+use crate::git::TrustRequest;
 
 /// One card per AGENTS.md waiting for the user's trust, and the last
 /// Trust / Don't trust failure.
@@ -37,10 +39,7 @@ pub(super) fn TrustCards(
                 p { class: "muted",
                     "The model wants to load this AGENTS.md as instructions it follows on every turn. Trust loads exactly the file below, and later ones from this repo load without asking. Only trust repos whose instructions you're happy for the model to follow."
                 }
-                details { class: "trust-card-preview", open: true,
-                    summary { "{request.path}" }
-                    pre { "{request.content}" }
-                }
+                {render_trust_card_preview(&request)}
                 div { class: "trust-card-buttons",
                     button {
                         class: "trust-card-trust",
@@ -66,5 +65,60 @@ pub(super) fn TrustCards(
             }
         }
         ErrorText { message: repo_action_error() }
+    }
+}
+
+/// The card's preview (SME-277): the file escaped for the reader, with the
+/// count notice above it when needed, under the unchanged `<summary>` — a
+/// path is `plain_path_text`-checked server-side (SME-271), so it cannot
+/// need escaping here. The question line and both buttons stay in
+/// `TrustCards`: the decision goes by `request.hash`, the sha256 of the
+/// raw content (`git/server/instructions.rs`), never by this showing.
+fn render_trust_card_preview(request: &TrustRequest) -> Element {
+    rsx! {
+        details { class: "trust-card-preview", open: true,
+            summary { "{request.path}" }
+            {shown_pre(&request.content, None)}
+        }
+    }
+}
+
+/// SME-277's SSR tests of the card's preview: smuggled tag characters
+/// show escaped with their count and never raw, and the `<summary>`
+/// keeps the plain path. What Trust loads is pinned by `request.hash`,
+/// sent by the buttons in `TrustCards` above, not by this preview; that
+/// flow stays covered server-side by `git::server::trust_race_tests`.
+#[cfg(all(test, feature = "server"))]
+mod preview_tests {
+    use super::*;
+
+    fn card(content: &str) -> String {
+        let request = TrustRequest {
+            id: 7,
+            path: "/workspace/v/AGENTS.md".to_string(),
+            content: content.to_string(),
+            hash: "0".repeat(64),
+        };
+        dioxus::ssr::render_element(render_trust_card_preview(&request))
+    }
+
+    #[test]
+    fn test_the_card_shows_hidden_characters_escaped_with_their_count() {
+        let html = card("trust me\u{200b}\u{e006f}\u{e0062}\u{e0065}\u{e0079}");
+        assert!(html.contains("\\u{200b}"), "{html}");
+        assert!(html.contains("\\u{e006f}"), "{html}");
+        assert!(html.contains("5 characters"), "{html}");
+        for c in "\u{200b}\u{e006f}\u{e0062}\u{e0065}\u{e0079}".chars() {
+            assert!(!html.contains(c), "raw U+{:X} in the card's html", c as u32);
+        }
+        assert!(html.contains("/workspace/v/AGENTS.md"), "{html}");
+        assert!(html.contains("trust-card-preview"), "{html}");
+    }
+
+    #[test]
+    fn test_the_card_with_nothing_hidden_shows_its_text_exactly() {
+        let html = card("# House rules\nBe kind.\n日本 é\n");
+        assert!(!html.contains("muted"), "{html}");
+        assert!(html.contains("Be kind."), "{html}");
     }
 }

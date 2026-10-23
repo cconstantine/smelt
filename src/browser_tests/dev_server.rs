@@ -272,6 +272,75 @@ pub(super) async fn scenario_agents_md_trust(t: &Scenario<'_>) {
         crate::git::project_instructions(pool, trusting.id).await.expect("loaded")[0].content,
         "Browser tier rule: always run the linter.\n"
     );
+
+    // SME-277: an AGENTS.md that hides text, through the real flow rather
+    // than a seed — the model clones a repo whose file hides characters and
+    // asks to load it, so the card's row comes from `clone_repo` and
+    // `load_instructions` themselves. The card then shows the escapes and
+    // the count in the live DOM, and Trust still loads the file exactly as
+    // it is, invisible characters and all.
+    let hiding = t.conversation().await;
+    sandbox::create_pod(pool, hiding.id, Default::default()).await.expect("create_pod");
+    let terminal = sandbox::create_terminal(pool, hiding.id).await.expect("create_terminal");
+    // Python's own escapes, so the shell command carries only ASCII: three
+    // zero-width-ish characters, a bidi isolate pair around "re order" (a
+    // reader sees "re order" in the wrong order without the fix) and a BOM.
+    let make_hiding_repo = r##"git init --bare --initial-branch=main -q /tmp/v.git && git clone -q file:///tmp/v.git /tmp/w && cd /tmp/w && python3 -c 'open("AGENTS.md","w").write("# House rules\nBe kind.\u200b\u206e\u2066re order\u200b\nRead every file.\ufeff\n")' && git add AGENTS.md && git -c user.email=smelt@test -c user.name=smelt commit -qm rules && git push -q origin main"##;
+    anthropic::tools::execute(
+        pool,
+        hiding.id,
+        &unique_id("make"),
+        "run_terminal_command",
+        &serde_json::json!({"terminal_id": terminal, "command": make_hiding_repo}),
+    )
+    .await
+    .expect("make the hiding repo");
+    // `run_terminal_command` only *starts* those git commands: the tier has
+    // to wait for the finish before the clone, or it races — a half-made
+    // origin clones empty, and the load says "there's no file". The second
+    // run of this scenario proved it.
+    wait_command_finished(pool, terminal).await;
+    anthropic::tools::execute(
+        pool,
+        hiding.id,
+        &unique_id("clone"),
+        "clone_repo",
+        &serde_json::json!({"url": "file:///tmp/v.git"}),
+    )
+    .await
+    .expect("clone the hiding repo");
+    anthropic::tools::execute(
+        pool,
+        hiding.id,
+        &unique_id("load"),
+        "load_instructions",
+        &serde_json::json!({"path": "/workspace/v/AGENTS.md"}),
+    )
+    .await
+    .expect("ask to load the hiding AGENTS.md");
+    let hidden_page = t.tab(t.url(&format!("conversation/{}", hiding.id))).await;
+    assert!(
+        wait_for_text(&hidden_page, "\\u{200b}", Duration::from_secs(10)).await,
+        "the card should show the zero-width space escaped as \\u{{…}} text"
+    );
+    assert!(
+        wait_for_text(&hidden_page, "\\u{feff}", Duration::from_secs(10)).await,
+        "the card should show the BOM escaped too"
+    );
+    assert!(
+        wait_for_text(&hidden_page, "5 characters here render as nothing", Duration::from_secs(10)).await,
+        "the card should name the count of characters it had to escape"
+    );
+    click_when_present(&hidden_page, ".trust-card-trust", Duration::from_secs(5)).await;
+    assert!(
+        wait_for_count(&hidden_page, ".trust-card", 0, Duration::from_secs(10)).await,
+        "trusting should take the hidden-characters card away too, live"
+    );
+    assert_eq!(
+        crate::git::project_instructions(pool, hiding.id).await.expect("loaded")[0].content,
+        "# House rules\nBe kind.\u{200b}\u{206e}\u{2066}re order\u{200b}\nRead every file.\u{feff}\n",
+        "Trust loads the raw file, not the escaped showing"
+    );
 }
 
 /// SME-34: the model's question waits on a card. It shows in every tab and
