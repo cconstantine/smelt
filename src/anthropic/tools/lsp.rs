@@ -3,7 +3,7 @@
 use serde_json::Value;
 use sqlx::PgPool;
 
-use super::Tool;
+use super::{Class, Tool};
 use super::server::required_str;
 use crate::sandbox;
 use crate::anthropic::ToolDefinition;
@@ -20,6 +20,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     .to_string(),
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| lsp_servers_tool(c.pool, c.conversation_id)),
         },
         Tool {
@@ -38,6 +39,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     "required": ["name"]
                 }),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| start_language_server_tool(c.pool, c.conversation_id, c.input)),
         },
         Tool {
@@ -64,6 +66,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     "required": ["operation"]
                 }),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| lsp_tool(c.pool, c.conversation_id, c.input)),
         },
     ]

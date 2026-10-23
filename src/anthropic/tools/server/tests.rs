@@ -688,7 +688,7 @@ async fn test_unknown_tool_name_errors() {
 /// `#[sqlx::test]` pool (unlike `test_pool()`'s lazy fake one)
 /// since this path genuinely queries the database, unlike
 /// `add`/`count`. Covers the "config was deleted out from under a
-/// stale tool name" case `call_mcp_tool`'s doc comment describes —
+/// stale tool name" case `resolve`'s doc comment describes —
 /// a plain tool error, not a panic.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_execute_routes_mcp_prefixed_names_and_errors_clearly_on_unknown_server(
