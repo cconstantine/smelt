@@ -17,6 +17,12 @@ mod tests;
 mod trust_race_tests;
 
 #[cfg(test)]
+mod persona_tests;
+
+#[cfg(test)]
+mod instructions_tests;
+
+#[cfg(test)]
 mod held_directory;
 
 /// The race tests' holds and fixtures, for the trust server functions'
@@ -35,10 +41,12 @@ mod keys;
 mod instructions;
 mod repos;
 mod clone;
+mod personas;
 mod trust;
 
 pub use keys::*;
 pub use instructions::*;
 pub use repos::*;
 pub use clone::*;
+pub use personas::*;
 pub use trust::*;

@@ -1,0 +1,20 @@
+# CI's additions to docker-compose.yml, used through COMPOSE_FILE (see the
+# "Build caches" step in workflows/ci.yml): cargo's downloaded crates and the
+# target dir come from the runner's own cache volume, so every
+# `docker compose run` gets them without a -v of its own and they outlive
+# both the container and the job. /usr/local/cargo is the image's CARGO_HOME
+# (the rust base image's), not ~/.cargo.
+#
+# The `docker` service's storage is kept too, so the sandbox image build
+# reuses its layers and docker:29-dind isn't pulled again; with the
+# docker-data volume, `down -v` threw both away every run. k3s keeps a
+# volume, so each run still starts with an empty cluster.
+services:
+  docker:
+    volumes:
+      - ${CI_DOCKER_DATA:?}:/var/lib/docker
+  smelt:
+    volumes:
+      - ${CI_CARGO_HOME:?}/registry:/usr/local/cargo/registry
+      - ${CI_CARGO_HOME:?}/git:/usr/local/cargo/git
+      - ${CI_CARGO_TARGET:?}:/app/target

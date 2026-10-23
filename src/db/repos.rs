@@ -21,6 +21,10 @@ pub struct ConversationRepo {
     pub agents_files: Vec<String>,
     /// Which attempt at the clone is current; a retry increments it.
     pub attempt: i32,
+    /// The checkout's persona files (SME-235): the tracked files directly
+    /// in `.agents/personas/` named `<name>.md` with a valid persona name,
+    /// relative to it, sorted. Paths only.
+    pub persona_files: Vec<String>,
 }
 
 /// Sets a checkout's AGENTS.md files, for tests; a clone records them
@@ -369,7 +373,7 @@ pub async fn retry_repo_clone(
     sqlx::query_as::<_, ConversationRepo>(
         "UPDATE conversation_repos
             SET url = $2, remote_key = $3, branch = $4, status = 'cloning', error = NULL,
-                agents_files = '{}', attempt = attempt + 1, updated_at = now()
+                agents_files = '{}', persona_files = '{}', attempt = attempt + 1, updated_at = now()
           WHERE id = $1 AND status = 'failed'
       RETURNING *",
     )
@@ -402,9 +406,9 @@ pub async fn set_repo_cloned(
     Ok(())
 }
 
-/// A clone that finished, with the AGENTS.md files it has (or why they
-/// couldn't be listed) recorded in the same update, so nothing sees it
-/// ready without them. Only `attempt`, still cloning, can finish it
+/// A clone that finished, with the AGENTS.md and persona files it has (or
+/// why they couldn't be listed) recorded in the same update, so nothing
+/// sees it ready without them. Only `attempt`, still cloning, can finish it
 /// (SME-86); false when it's no longer the current attempt.
 pub async fn set_repo_ready(
     pool: &PgPool,
@@ -413,12 +417,13 @@ pub async fn set_repo_ready(
     checked_out_branch: &str,
     commit_sha: Option<&str>,
     agents_files: &[String],
+    persona_files: &[String],
     error: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE conversation_repos
             SET status = 'ready', error = $4, checked_out_branch = $2, commit_sha = $3,
-                agents_files = $5, updated_at = now()
+                agents_files = $5, persona_files = $7, updated_at = now()
           WHERE id = $1 AND status = 'cloning' AND attempt = $6",
     )
     .bind(id)
@@ -427,6 +432,23 @@ pub async fn set_repo_ready(
     .bind(error)
     .bind(agents_files)
     .bind(attempt)
+    .bind(persona_files)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Re-records a checkout's persona files from what `list_personas` read
+/// in it (SME-235): only on a ready row of the attempt it read, so it never
+/// writes over a newer clone's. False when it wrote nothing.
+pub async fn set_repo_persona_files(pool: &PgPool, id: i64, attempt: i32, files: &[String]) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE conversation_repos SET persona_files = $3, updated_at = now()
+          WHERE id = $1 AND attempt = $2 AND status = 'ready'",
+    )
+    .bind(id)
+    .bind(attempt)
+    .bind(files)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)

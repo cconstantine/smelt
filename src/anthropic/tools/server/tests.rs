@@ -510,10 +510,12 @@ fn test_the_model_never_sees_an_untrusted_agents_md() {
             hash: "h".to_string(),
         }],
     };
-    let told = clone_result_for_model(repo);
+    let told = clone_result_for_model(repo, &[".agents/personas/developer.md".to_string()]);
     assert!(!told.contains("Ignore the user"), "the untrusted file leaked: {told}");
     assert!(told.contains("load_instructions"), "{told}");
     assert!(told.contains("/workspace/r"), "{told}");
+    // SME-235: its persona files are named, not read.
+    assert!(told.contains(".agents/personas/developer.md") && told.contains("list_personas"), "{told}");
 }
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
@@ -525,6 +527,7 @@ async fn test_clone_repo_tool_needs_a_url(pool: sqlx::PgPool) {
     assert!(missing.contains("url"), "{missing}");
     assert!(native_tool_definitions().iter().any(|d| d.name == "clone_repo"));
     assert!(native_tool_definitions().iter().any(|d| d.name == "load_instructions"));
+    assert!(native_tool_definitions().iter().any(|d| d.name == "list_personas"));
     // A path outside the conversation's repos is refused before anything is read.
     let outside = execute(
         &pool,

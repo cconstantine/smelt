@@ -5,6 +5,18 @@ name: CI
 # browser tier — reusing the same docker-compose.yml stack local dev already
 # depends on, so there's one environment definition to keep working, not two.
 # See SME-14 for the design.
+#
+# Two jobs, side by side on ARC runners of their own (homelab's arc/main.tf):
+# `server` runs the server-feature suite and the quick checks, `browser` the
+# browser tier. Each starts its own stack (.github/actions/start-stack), as
+# both suites want a test cluster to themselves, and keeps its own build
+# caches on its runner.
+#
+# A pull request from a fork runs on GitHub's ubuntu-latest instead: this
+# repo is public, and the ARC runners are privileged Docker on homelab whose
+# caches later runs build on, so code nobody here has reviewed doesn't run
+# there. Without the runner's cache volume (CI_CACHE_DIR) the caches start
+# empty in the checkout, so those runs build everything from scratch.
 
 on:
   pull_request:
@@ -20,80 +32,15 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  server:
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || 'arc-runner-smelt-amd64' }}
     timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Compute UID/GID for docker compose build
-        # docker-compose.yml's `smelt` service builds its dev-user with
-        # these, defaulting to 1000/1000 — match them to the runner's real
-        # user so files the container writes into the bind-mounted repo
-        # (target/, Cargo.lock changes) aren't owned by a mismatched uid.
-        run: |
-          echo "UID=$(id -u)" >> "$GITHUB_ENV"
-          echo "GID=$(id -g)" >> "$GITHUB_ENV"
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: .ci-cargo-cache
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-registry-${{ runner.os }}-
-
-      - name: Ensure cargo registry cache dir exists with correct ownership
-        # On a cache miss, actions/cache leaves .ci-cargo-cache absent; a
-        # plain `docker -v` bind mount then auto-creates it as root, which
-        # the container's non-root `dev` user can't write into. Creating it
-        # here as the runner user (matching UID/GID set above) avoids that.
-        run: mkdir -p .ci-cargo-cache
-
-      - name: Cache cargo build output
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: cargo-target-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-target-${{ runner.os }}-
-
-      - name: Build dev image
-        run: docker compose build smelt
-
-      - name: Start service dependencies (postgres, docker-in-docker, k3s)
-        run: docker compose up -d postgres docker k3s
-
-      - name: Bootstrap k3s (applies RBAC, writes kubeconfig for sandbox tests)
-        run: docker compose up --exit-code-from k3s-bootstrap k3s-bootstrap
-
-      # Every `docker compose run` below mounts .ci-cargo-cache over the
-      # container's cargo registry dir so downloaded crate sources survive
-      # across steps (each `run` is a fresh container) and across CI runs
-      # (via the actions/cache step above) — target/ already persists via
-      # docker-compose.yml's `.:/app` bind mount, no extra mount needed.
-      #
-      # The sandbox image is delivered with no registry involved (`ctr
-      # images import` straight into this runner's own k3s node — see
-      # SME-17) rather than
-      # pulled, so every sandbox test that creates a pod fails outright
-      # (`ImagePullBackOff`) unless this has run first — a fresh runner's
-      # k3s always starts with nothing imported. Needs `docker`/`k3s`/
-      # `k3s-bootstrap` already up, which the two steps above this one
-      # provide.
-      # The image is named after this commit's agent sources
-      # (scripts/sandbox-image-ref, SME-102), and the test steps below run
-      # their pods from it through SANDBOX_IMAGE, as scripts/check.sh does
-      # locally. `:latest` isn't imported: nothing here uses it.
-      - name: Sandbox image for this commit
-        run: echo "SANDBOX_IMAGE=$(scripts/sandbox-image-ref)" >> "$GITHUB_ENV"
-
-      - name: Build and deliver the sandbox image
-        run: |
-          docker compose run --rm \
-            -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
-            smelt scripts/build-sandbox-image.sh
+      - name: Start the compose stack
+        uses: ./.github/actions/start-stack
 
       # The sandbox tests create real pods against the compose-provided k3s
       # cluster. Two of them (test_dropping_without_delete_still_cleans_up_via_drain_task,
@@ -126,7 +73,6 @@ jobs:
             -e SANDBOX_MEMORY_LIMIT=128Mi \
             -e SANDBOX_DOCKER_MEMORY_LIMIT=256Mi \
             -e SANDBOX_IMAGE \
-            -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt scripts/with-cluster-lock cargo test --features server
 
       - name: Dump sandbox pod diagnostics on failure
@@ -161,19 +107,30 @@ jobs:
       - name: cargo check (wasm target)
         run: |
           docker compose run --rm \
-            -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt cargo check --no-default-features --features web --target wasm32-unknown-unknown
 
       - name: No expect() or unwrap() in production code without a reason (SME-95, SME-119)
         run: |
           docker compose run --rm \
-            -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt scripts/lint-expects
+
+      - name: Stop the compose stack
+        if: always()
+        uses: ./.github/actions/stop-stack
+
+  browser:
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || 'arc-runner-smelt-amd64-browser' }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start the compose stack
+        uses: ./.github/actions/start-stack
 
       - name: Browser test setup (chrome-headless-shell)
         run: |
           docker compose run --rm \
-            -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt scripts/browser-check/setup.sh
 
       # dx's server half sometimes hangs after the client bundle (all this
@@ -191,15 +148,15 @@ jobs:
         run: |
           attempt=1
           until docker compose run --rm \
-              -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
               smelt scripts/ci-web-bundle; do
             if [ "$attempt" -ge 2 ]; then exit 1; fi
             echo "::warning::attempt $attempt of dx build --platform web failed; retrying once (SME-189)"
             attempt=$((attempt + 1))
           done
 
-      # Also creates a real sandbox pod (see src/browser_tests/) — same
-      # reasoning as the step above, the cluster lock included.
+      # Also creates a real sandbox pod (see src/browser_tests/) — the
+      # server job's notes on the test pods' limits and the cluster lock
+      # apply here too.
       - name: Browser tests (src/browser_tests/)
         run: |
           docker compose run --rm \
@@ -207,7 +164,6 @@ jobs:
             -e SANDBOX_MEMORY_LIMIT=128Mi \
             -e SANDBOX_DOCKER_MEMORY_LIMIT=256Mi \
             -e SANDBOX_IMAGE \
-            -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt scripts/with-cluster-lock cargo test --features "server browser-test" -- --ignored --test-threads=1
 
       - name: Dump sandbox pod diagnostics on failure (browser tests)
@@ -225,6 +181,6 @@ jobs:
           docker compose run --rm smelt ./kubectl-diag get events -n smelt-park-test --sort-by=.lastTimestamp || true
           rm -f kubectl-diag
 
-      - name: Tear down
+      - name: Stop the compose stack
         if: always()
-        run: docker compose down -v
+        uses: ./.github/actions/stop-stack

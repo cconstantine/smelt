@@ -97,6 +97,7 @@ fn repo_in(dir: &str) -> db::ConversationRepo {
         updated_at: chrono::DateTime::from_timestamp(0, 0).expect("epoch").naive_utc(),
         agents_files: vec![],
         attempt: 1,
+        persona_files: vec![],
     }
 }
 
@@ -118,6 +119,20 @@ fn test_an_agents_md_path_resolves_to_its_repo() {
     ] {
         assert!(resolve_instructions_path(&repos, bad).is_err(), "{bad}");
     }
+    // A path that can break or reorder a line is refused before any read
+    // or trust request, so no trust card shows it, and the refusal quotes
+    // it (SME-271); a non-ASCII one still resolves.
+    for bad in [
+        "/workspace/smelt/x\n- y/AGENTS.md",
+        "/workspace/smelt/a\u{2028}b/AGENTS.md",
+        "/workspace/smelt/a\u{202e}b/AGENTS.md",
+    ] {
+        let refused = resolve_instructions_path(&repos, bad).expect_err(bad);
+        assert!(refused.contains("control characters"), "{refused}");
+        assert!(!refused.contains(['\n', '\u{2028}', '\u{202e}']), "quoted: {refused}");
+    }
+    let (_, rel) = resolve_instructions_path(&repos, "/workspace/smelt/é/AGENTS.md").expect("non-ASCII");
+    assert_eq!(rel, "é/AGENTS.md");
 }
 
 /// "Cut" is about the file's size, not its decoded length, which

@@ -224,6 +224,9 @@ pub(crate) struct PromptEnvironment {
     pub repos: Vec<crate::git::RepoSummary>,
     /// Their loaded `AGENTS.md` files.
     pub instructions: Vec<crate::git::ProjectInstructions>,
+    /// Each repo's recorded persona files, by repo id (SME-235): names
+    /// only, listed whether or not the repo is trusted.
+    pub persona_files: std::collections::BTreeMap<i64, Vec<String>>,
 }
 
 /// The system prompt sent with every turn: the base prompt, then an
@@ -251,30 +254,49 @@ pub(crate) fn system_prompt(env: &PromptEnvironment) -> String {
         prompt.push_str("- Repositories:\n");
         for repo in &env.repos {
             let state = match repo.status {
-                crate::git::RepoStatus::Ready => repo.branch.clone().unwrap_or_default(),
+                // SME-272: the branch is the remote owner's choice.
+                crate::git::RepoStatus::Ready => match repo.branch.as_deref() {
+                    Some(b) if !crate::git::plain_path_text(b) => {
+                        "a branch whose name holds control characters".to_string()
+                    }
+                    b => b.unwrap_or_default().to_string(),
+                },
                 crate::git::RepoStatus::Cloning => "still cloning".to_string(),
                 crate::git::RepoStatus::Failed => "clone failed".to_string(),
             };
             prompt.push_str(&format!("  - {}: {} ({state})", repo.path, repo.url));
-            if !repo.agents_files.is_empty() {
-                let files: Vec<String> = repo
-                    .agents_files
-                    .iter()
-                    .map(|f| {
-                        if repo.loaded_instructions.contains(f) {
-                            format!("{f} (loaded)")
-                        } else {
-                            f.clone()
-                        }
-                    })
-                    .collect();
-                prompt.push_str(&format!("; AGENTS.md files: {}", files.join(", ")));
+            prompt.push_str(&agents_files_clause(repo));
+            if let Some(personas) = env.persona_files.get(&repo.id).filter(|p| !p.is_empty()) {
+                prompt.push_str(&format!("; persona files: {}", personas.join(", ")));
             }
             prompt.push('\n');
         }
     }
     prompt.push_str(&crate::git::render_project_instructions(&env.instructions));
     prompt
+}
+
+/// A repo's AGENTS.md files on its Repositories line ("; AGENTS.md
+/// files: …"), marking the loaded ones; empty when it has none. A path
+/// recorded before SME-271 that isn't `plain_path_text` (a newline, line
+/// separator or bidi control in it) is only counted, never shown.
+fn agents_files_clause(repo: &crate::git::RepoSummary) -> String {
+    let (shown, hidden): (Vec<&String>, Vec<&String>) =
+        repo.agents_files.iter().partition(|f| crate::git::plain_path_text(f));
+    let mut clause = String::new();
+    if !shown.is_empty() {
+        let files: Vec<String> = shown
+            .into_iter()
+            .map(|f| if repo.loaded_instructions.contains(f) { format!("{f} (loaded)") } else { f.clone() })
+            .collect();
+        clause.push_str(&format!("; AGENTS.md files: {}", files.join(", ")));
+    }
+    match hidden.len() {
+        0 => {}
+        1 => clause.push_str("; 1 AGENTS.md file not shown (a control character in its path)"),
+        n => clause.push_str(&format!("; {n} AGENTS.md files not shown (control characters in their paths)")),
+    }
+    clause
 }
 
 /// Gathers this turn's `PromptEnvironment`. A database read that fails
@@ -295,6 +317,12 @@ pub(crate) async fn prompt_environment(
         .unwrap_or_else(|e| {
             tracing::warn!(error = %e, "couldn't read project instructions for the system prompt");
             Vec::new()
+        });
+    let persona_files = crate::git::persona_files_by_repo(pool, conversation_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "couldn't read persona files for the system prompt");
+            Default::default()
         });
     let volumes = match db::list_sandbox_volumes(pool).await {
         Ok(volumes) => volumes.into_iter().map(|v| (v.name, v.mount_path)).collect(),
@@ -317,5 +345,6 @@ pub(crate) async fn prompt_environment(
         mcp_servers,
         repos,
         instructions,
+        persona_files,
     }
 }

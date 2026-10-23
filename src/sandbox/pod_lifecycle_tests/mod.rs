@@ -280,6 +280,7 @@ async fn message_arrives(pool: &PgPool, conversation_id: i64, needle: &str, with
 mod crashes;
 mod create;
 mod repos;
+mod personas;
 mod commands_and_files;
 mod pods_and_terminals;
 mod starting;
