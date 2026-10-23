@@ -199,3 +199,30 @@ async fn test_a_wake_or_notice_to_a_starting_child_runs_no_turn(pool: PgPool) {
     assert!(texts.contains(&"Notice: early".to_string()), "{texts:?}");
     eventually("its turn is over", || async { !crate::turn::turn_running(child) }).await;
 }
+
+/// Review 1, finding 1: a stopped or failed child runs no turn for a wake
+/// or a delivered notice, even with its pause lost (a restart): only the
+/// user writing in it brings a stopped one back.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_stopped_or_failed_child_runs_no_turn_for_a_wake_or_notice(pool: PgPool) {
+    let requests = setup(&pool, vec![text_reply("ok")]).await;
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    let stopped = settled_child(&pool, root, "One.").await;
+    let failed = settled_child(&pool, root, "Two.").await;
+    eventually("the parent's turns are over", || async { !crate::turn::turn_running(root) }).await;
+    stop(&pool, root, stopped).await.expect("stop it");
+    set_state(&pool, failed, db::AGENT_FAILED).await;
+    let calls = || requests_for(&requests, Some(stopped)).len() + requests_for(&requests, Some(failed)).len();
+    let before = calls();
+    for child in [stopped, failed] {
+        // What a restart forgets: the Stop's pause.
+        crate::turn::forget_conversation_lock(child);
+        db::queue_notice(&pool, child, root, "smelt", "a command finished").await.expect("queue a notice");
+        crate::turn::notify(&pool, child, vec![crate::turn::Notice::Wake, crate::turn::Notice::Deliver("Docker restarted.".to_string())])
+            .await
+            .expect("the notices are handled");
+        let texts: Vec<String> = transcript(&pool, child).await.into_iter().map(|(_, text)| text).collect();
+        assert!(texts.contains(&"Docker restarted.".to_string()), "the notice is saved: {texts:?}");
+    }
+    assert_eq!(calls(), before, "no model call for a stopped or failed child");
+}

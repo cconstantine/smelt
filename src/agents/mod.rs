@@ -145,11 +145,13 @@ pub(crate) async fn admit_user_turn(pool: &PgPool, conversation_id: i64) -> Resu
 
 /// Whether a wake or a delivered notice may run a turn in `conversation_id`
 /// now: not while it's a child still starting (its start's own wake comes
-/// once it's `active`). A failed read lets it in, so a notice is never
-/// dropped.
+/// once it's `active`), nor one stopped or failed, whose pause a restart
+/// may have lost (review 1): a notice to it is only saved, and only the
+/// user writing in a stopped one brings it back (`admit_user_turn`). A
+/// failed read lets it in, so a notice is never dropped.
 pub(crate) async fn admits_notices(pool: &PgPool, conversation_id: i64) -> bool {
     match db::agent_state(pool, conversation_id).await {
-        Ok(state) => state.as_deref() != Some(db::AGENT_STARTING),
+        Ok(state) => !matches!(state.as_deref(), Some(db::AGENT_STARTING | db::AGENT_STOPPED | db::AGENT_FAILED)),
         Err(e) => {
             tracing::warn!(conversation_id, error = %e, "couldn't read an agent's state before a wake");
             true

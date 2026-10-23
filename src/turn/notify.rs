@@ -42,8 +42,8 @@ pub(super) async fn save_notice_between_turns(
 /// next message. Call it from a spawned task: it waits for a running turn.
 #[cfg(feature = "server")]
 pub(super) async fn deliver_notice(pool: &PgPool, conversation_id: i64, text: String) {
-    // A child still starting is only told (SME-236): its first turn,
-    // once it's active, reads it.
+    // A child still starting, stopped or failed is only told (SME-236):
+    // its next turn, if it has one, reads it.
     if !crate::agents::admits_notices(pool, conversation_id).await {
         if let Err(e) = save_notice_between_turns(pool, conversation_id, text).await {
             tracing::warn!(conversation_id, error = %e, "couldn't save a notice");
@@ -114,8 +114,8 @@ pub(super) async fn wake_conversation(
         // reports the failure if it persists.
         Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't check a wake for pending work"),
     }
-    // A child still starting takes no turn (SME-236): the start wakes it
-    // once it's active, and that turn drains what's pending.
+    // A child still starting, stopped or failed takes no turn (SME-236):
+    // the start wakes one once it's active, the user's send a stopped one.
     if !crate::agents::admits_notices(pool, conversation_id).await {
         return Ok(Vec::new());
     }

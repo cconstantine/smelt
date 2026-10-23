@@ -30,7 +30,7 @@ A spawned task (`agents::run_start`) per child, holding `StartExit`, whose clean
 
 A step that fails ends the start through `fail_start`: the child `failed`, the error queued to the parent as its report and saved in the child's own transcript. Nothing makes a failed child `active` again.
 
-No turn runs in a child while it's `starting`: the user's send or answer is refused ("This agent is still starting."), a wake is a no-op and a delivered notice is only saved (`admits_notices`). The user's send or answer in a `finished` or `stopped` child that had started makes it `active` (`admit_user_turn`); one in a `failed` child, or one stopped during its start, is refused.
+No turn runs in a child while it's `starting`: the user's send or answer is refused ("This agent is still starting."), a wake is a no-op and a delivered notice is only saved (`admits_notices`). A `stopped` or `failed` child is treated the same way for wakes and notices, so it stays quiet even after a restart loses the Stop's pause (review 1). The user's send or answer in a `finished` or `stopped` child that had started makes it `active` (`admit_user_turn`); one in a `failed` child, or one stopped during its start, is refused.
 
 ## The queue
 
