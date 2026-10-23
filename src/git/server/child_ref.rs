@@ -60,31 +60,36 @@ pub fn requested_branch(target: &CloneTarget) -> Option<String> {
 /// untracked file is no reason to refuse: the child doesn't get it either way.
 pub async fn parent_commit(shell: &sandbox::PodShell, dir: &str) -> Result<(String, String), String> {
     let path = format!("{}/{dir}", crate::sandbox::WORKSPACE_DIR);
+    // The upstream must be a branch on `origin`, the remote the child
+    // clones (review 1): one on another remote, or a local branch, would be
+    // checked against a ref this fetch doesn't update.
     let script = r#"cd "$1" || exit 1
         GIT_TERMINAL_PROMPT=0 timeout 60 git -c core.sshCommand='ssh -o BatchMode=yes' fetch --quiet origin || exit 10
         b=$(git symbolic-ref --short -q HEAD) || exit 11
         echo "$b"
         u=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null) || exit 12
         echo "$u"
+        m=$(git config "branch.$b.merge") || exit 12
+        echo "${m#refs/heads/}"
+        [ "$(git config "branch.$b.remote")" = origin ] && [ "$m" != "${m#refs/heads/}" ] || exit 15
         git merge-base --is-ancestor HEAD '@{u}' || { git rev-list --count '@{u}..HEAD'; exit 13; }
         [ -z "$(git status --porcelain --untracked-files=no)" ] || exit 14
         git rev-parse HEAD"#;
     let ran = shell.run(&["sh", "-c", script, "sh", &path], None).await.map_err(|e| e.to_string())?;
     let lines: Vec<&str> = ran.stdout.lines().collect();
     let line = |i: usize| lines.get(i).copied().unwrap_or("").trim().to_string();
-    let (branch, upstream) = (line(0), line(1));
+    let (branch, upstream, name) = (line(0), line(1), line(2));
     let or_ref = "or pass ref to start the agent on a branch, tag or commit of the remote";
     match ran.exit_code {
-        0 => {
-            // `origin/feature` -> `feature`: the branch the child's is named for.
-            let name = upstream.split_once('/').map_or(upstream.as_str(), |(_, name)| name).to_string();
-            Ok((line(2), name))
-        }
+        0 => Ok((line(3), name)),
         10 => Err(format!("couldn't fetch {path}'s remote to check your commit is on it: {}", ran.stderr.trim())),
         11 => Err(format!("{path} is on a detached HEAD: check out a branch, commit and push, {or_ref}")),
         12 => Err(format!("{path}'s branch {branch} has no upstream: push it (git push -u origin {branch}), {or_ref}")),
-        13 => Err(format!("{path} has {} commits not on {upstream}: push them, {or_ref}", line(2))),
+        13 => Err(format!("{path} has {} commits not on {upstream}: push them, {or_ref}", line(3))),
         14 => Err(format!("{path} has uncommitted changes to tracked files: commit and push them, {or_ref}")),
+        15 => Err(format!(
+            "{path}'s branch {branch} tracks {upstream}, not a branch on origin: push it (git push -u origin {branch}), {or_ref}"
+        )),
         code => Err(format!("couldn't read {path}'s commit (exit code {code}): {}", ran.stderr.trim())),
     }
 }

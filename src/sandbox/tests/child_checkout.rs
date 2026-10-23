@@ -123,6 +123,19 @@ async fn test_parent_commit_needs_a_pushed_clean_branch() {
         let refused = crate::git::parent_commit(&shell, "no-upstream").await.expect_err("no upstream");
         assert!(refused.starts_with("/workspace/no-upstream's branch local has no upstream: push it (git push -u origin local)"), "{refused}");
 
+        // Review 1, finding 5: an upstream that isn't a branch on origin (a
+        // local one here) is refused, not checked against a stale ref; and
+        // an upstream whose name holds a slash keeps it.
+        parent_checkout(&sandbox, &shell, "local-upstream", "git checkout -q -b work --track main; c unpushed").await;
+        let refused = crate::git::parent_commit(&shell, "local-upstream").await.expect_err("a local upstream");
+        assert!(
+            refused.starts_with("/workspace/local-upstream's branch work tracks main, not a branch on origin"),
+            "{refused}"
+        );
+        parent_checkout(&sandbox, &shell, "slashed", "git push -q origin HEAD:refs/heads/feat/x; git fetch -q origin; git checkout -q -b mine --track origin/feat/x").await;
+        let (_, upstream) = crate::git::parent_commit(&shell, "slashed").await.expect("a pushed branch");
+        assert_eq!(upstream, "feat/x");
+
         parent_checkout(&sandbox, &shell, "ahead", "c mine; c mine-too").await;
         let refused = crate::git::parent_commit(&shell, "ahead").await.expect_err("ahead");
         assert!(refused.starts_with("/workspace/ahead has 2 commits not on origin/main: push them"), "{refused}");
