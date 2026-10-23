@@ -149,11 +149,15 @@ pub async fn project_instructions(
 
 /// Which of `repos` an `AGENTS.md` path is in, and the path relative to
 /// it: an absolute path under one of the conversation's checkouts,
-/// named `AGENTS.md`, with no `.` or `..` components.
+/// named `AGENTS.md`, with no `.` or `..` components, and
+/// `plain_path_text` (SME-271): the trust card shows it to the user.
 pub fn resolve_instructions_path<'a>(
     repos: &'a [db::ConversationRepo],
     path: &str,
 ) -> Result<(&'a db::ConversationRepo, String), String> {
+    if !plain_path_text(path) {
+        return Err(format!("{path:?} isn't a plain path: it holds control characters."));
+    }
     let not_in = || {
         format!(
             "{path} isn't in any of this conversation's repos: give the full path of an \
