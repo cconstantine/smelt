@@ -330,3 +330,21 @@ async fn test_a_cut_off_reply_with_markup_gets_only_the_cut_off_notice(pool: PgP
     assert!(notice.starts_with(crate::api::chat::CUT_OFF_NOTICE_START), "{notice}");
     assert_eq!(requests.lock().expect("the request log").len(), 1);
 }
+
+/// Review 1, finding 1: a provider that parses a call but leaves its
+/// markup in the text too gets no correction for that call: it ran, and
+/// telling the model it didn't would have it make the call again.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_markup_for_a_call_the_reply_also_made_gets_no_correction(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let markup = "<tool_call>\n<function=todoread>\n</function>\n</tool_call>";
+    let both = text_blocks_body(&[Block::Text(markup), Block::Todoread("toolu_both")], "tool_use");
+    let requests = start_recording_mock_upstream(&pool, vec![both, text_reply_body("Done.")]).await;
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("the turn succeeds");
+
+    assert_eq!(roles(&saved), ["user", "assistant", "user", "assistant"], "{saved:?}");
+    assert_eq!(notices(&saved), 0, "{saved:?}");
+    assert_eq!(requests.lock().expect("the request log").len(), 2);
+}

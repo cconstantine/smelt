@@ -301,7 +301,19 @@ pub(super) async fn after_reply(
         }
         streak.corrections = 0;
         streak.nudged = false;
-        let calls = text_calls(turn);
+        // Markup for a call the reply also made is a provider leaving the
+        // parsed call in the text too: it ran, and a correction would have
+        // the model make it again (review 1).
+        let made: Vec<&str> = turn
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                anthropic::ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let calls: Vec<_> =
+            text_calls(turn).into_iter().filter(|c| !c.name.as_deref().is_some_and(|n| made.contains(&n))).collect();
         let correction = (!calls.is_empty()).then(|| crate::text_calls::text_call_notice(&calls, offered));
         return Ok(NextStep::RunTools(correction));
     }
