@@ -30,7 +30,7 @@ pub(super) async fn build_request(
         )),
         messages: history,
         stream: true,
-        tools: anthropic::tools::tool_definitions(pool).await,
+        tools: anthropic::tools::tool_definitions(pool, conversation_id).await,
         // Set below, with the reply budget it's a share of.
         thinking: None,
         prompt_caching: turn_model.prompt_caching,

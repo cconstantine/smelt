@@ -606,8 +606,8 @@ const IDLE_NOTICE_DUE: &str = "tc.status = 'running' AND tc.idle_notice_secs > 0
         >= make_interval(secs => tc.idle_notice_secs)";
 
 /// Whether a wake of `conversation_id` has anything to act on: an ended
-/// command's notice, a due idle notice, or an answered question no turn has
-/// taken — exactly what its turn's first step drains or takes (SME-218). A
+/// command's notice, a due idle notice, an answered question no turn has
+/// taken, or an agent's report or notice not yet delivered (SME-236) — exactly what its turn's first step drains or takes (SME-218). A
 /// question still waiting is no work: that turn would stop at it. Read
 /// before the wake is counted, so one with nothing to do tells no tab a turn
 /// started; the drain under the turn lock still decides what's saved.
@@ -615,7 +615,8 @@ pub async fn wake_has_work(pool: &PgPool, conversation_id: i64) -> Result<bool, 
     sqlx::query_scalar::<_, bool>(&format!(
         "SELECT EXISTS (SELECT 1 FROM terminal_commands tc WHERE tc.conversation_id = $1 AND {UNNOTIFIED_END}) \
              OR EXISTS (SELECT 1 FROM terminal_commands tc WHERE tc.conversation_id = $1 AND {IDLE_NOTICE_DUE}) \
-             OR EXISTS (SELECT 1 FROM pending_questions WHERE conversation_id = $1 AND answer IS NOT NULL)"
+             OR EXISTS (SELECT 1 FROM pending_questions WHERE conversation_id = $1 AND answer IS NOT NULL) \
+             OR EXISTS (SELECT 1 FROM agent_messages WHERE to_conversation_id = $1 AND delivered_at IS NULL)"
     ))
     .bind(conversation_id)
     .fetch_one(pool)

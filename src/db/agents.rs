@@ -1,0 +1,245 @@
+//! Child agents' rows (SME-236): a child's `agents` row and the
+//! `agent_messages` queue that carries reports and notices to a
+//! conversation. The lifecycle around them is `crate::agents`.
+//!
+//! Lock order, in every transaction here: the remote's trust lock, if any;
+//! then `conversations` rows in ascending id (`lock_conversations`); then
+//! everything else. A parent's id is always smaller than its children's.
+
+use super::*;
+
+/// `agents.state`: the start is running; no turn is admitted.
+pub const AGENT_STARTING: &str = "starting";
+/// `agents.state`: started, working or between turns.
+pub const AGENT_ACTIVE: &str = "active";
+/// `agents.state`: `stop_agent` or a delete stopped it.
+pub const AGENT_STOPPED: &str = "stopped";
+
+/// `agent_messages.kind`: a child's report to its parent.
+pub const KIND_REPORT: &str = "report";
+/// `agent_messages.kind`: a notice from smelt.
+pub const KIND_NOTICE: &str = "notice";
+
+/// One queued report or notice, as the drain reads it.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct AgentMessage {
+    pub id: i64,
+    pub to_conversation_id: i64,
+    pub from_label: String,
+    pub kind: String,
+    pub body: String,
+}
+
+/// A row lock on a `conversations` row.
+#[derive(Clone, Copy, Debug)]
+pub enum RowLock {
+    KeyShare,
+    NoKeyUpdate,
+}
+
+impl RowLock {
+    fn sql(self) -> &'static str {
+        match self {
+            RowLock::KeyShare => "SELECT id FROM conversations WHERE id = $1 FOR KEY SHARE",
+            RowLock::NoKeyUpdate => "SELECT id FROM conversations WHERE id = $1 FOR NO KEY UPDATE",
+        }
+    }
+}
+
+/// Locks `conversations` rows in ascending id, each in its own mode, the
+/// order every transaction here takes them in. Returns whether every row
+/// still exists.
+pub async fn lock_conversations(
+    conn: &mut sqlx::PgConnection,
+    rows: &[(i64, RowLock)],
+) -> Result<bool, sqlx::Error> {
+    let mut rows = rows.to_vec();
+    rows.sort_by_key(|(id, _)| *id);
+    let mut all = true;
+    for (id, lock) in rows {
+        all &= sqlx::query(lock.sql()).bind(id).fetch_optional(&mut *conn).await?.is_some();
+    }
+    Ok(all)
+}
+
+/// The conversation's parent, `None` for the user's own conversations
+/// and for one that doesn't exist.
+pub async fn conversation_parent(pool: &PgPool, id: i64) -> Result<Option<i64>, sqlx::Error> {
+    Ok(sqlx::query_scalar::<_, Option<i64>>("SELECT parent_id FROM conversations WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .flatten())
+}
+
+/// The agent's `state`, `None` for a conversation that isn't an agent.
+pub async fn agent_state(pool: &PgPool, id: i64) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>("SELECT state FROM agents WHERE conversation_id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// What `start_agent` records for a new child.
+pub struct NewChild<'a> {
+    pub caller: i64,
+    pub brief: &'a str,
+    pub persona_name: Option<&'a str>,
+    /// The parent's resolved model, the child's until its persona says otherwise.
+    pub model: Option<(i64, String)>,
+}
+
+/// `create_child`'s outcome.
+#[derive(Debug, PartialEq)]
+pub enum CreateChild {
+    Created(i64),
+    /// The caller can't start an agent now, and why.
+    Refused(String),
+}
+
+/// `start_agent`'s transaction: the caller's row locked (the lock a
+/// delete takes, so a delete and a start exclude each other), the checks
+/// that it may start an agent, then the child's conversation, its
+/// `agents` row (`starting`) and the brief as its first message.
+pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChild, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let caller = sqlx::query_scalar::<_, Option<NaiveDateTime>>(
+        "SELECT deleting_at FROM conversations WHERE id = $1 FOR NO KEY UPDATE",
+    )
+    .bind(new.caller)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let refused = match caller {
+        None => Some("this conversation no longer exists".to_string()),
+        Some(Some(_)) => Some("this conversation is being deleted".to_string()),
+        Some(None) => match sqlx::query_scalar::<_, String>("SELECT state FROM agents WHERE conversation_id = $1")
+            .bind(new.caller)
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            Some(state) if state == AGENT_STOPPED => Some("you were stopped, so you can't start an agent".to_string()),
+            Some(_) => Some(crate::agents::ROOT_ONLY.to_string()),
+            None => None,
+        },
+    };
+    if let Some(why) = refused {
+        return Ok(CreateChild::Refused(why));
+    }
+    let (provider_id, model) = new.model.clone().unzip();
+    let child = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO conversations (title, parent_id, provider_id, model) VALUES ($1, $2, $3, $4) RETURNING id",
+    )
+    .bind(super::conversations::DEFAULT_TITLE)
+    .bind(new.caller)
+    .bind(provider_id)
+    .bind(model)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO agents (conversation_id, root_id, depth, brief, persona_name, state)
+         VALUES ($1, $2, 1, $3, $4, $5)",
+    )
+    .bind(child)
+    .bind(new.caller)
+    .bind(new.brief)
+    .bind(new.persona_name)
+    .bind(AGENT_STARTING)
+    .execute(&mut *tx)
+    .await?;
+    let brief = [ContentBlock::Text { text: new.brief.to_string() }];
+    super::conversations::create_message_on(&mut tx, child, "user", &brief).await?;
+    tx.commit().await?;
+    Ok(CreateChild::Created(child))
+}
+
+/// Queues a report or notice to `to`, on the caller's transaction.
+pub async fn queue_agent_message(
+    conn: &mut sqlx::PgConnection,
+    to: i64,
+    from: Option<i64>,
+    from_label: &str,
+    kind: &str,
+    body: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO agent_messages (to_conversation_id, from_conversation_id, from_label, kind, body)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(to)
+    .bind(from)
+    .bind(from_label)
+    .bind(kind)
+    .bind(body)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// The start's done step: the child `active` and started, and the notice
+/// that gives its first turn something to drain, in one transaction.
+/// `false` when the child is no longer `starting` (stopped or deleted
+/// meanwhile): nothing is written.
+pub async fn complete_start(pool: &PgPool, child: i64, parent: i64, notice: &str) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    if !lock_conversations(&mut tx, &[(parent, RowLock::KeyShare), (child, RowLock::NoKeyUpdate)]).await? {
+        return Ok(false);
+    }
+    let updated = sqlx::query(
+        "UPDATE agents SET state = $2, started_at = now(), state_changed_at = now()
+         WHERE conversation_id = $1 AND state = $3",
+    )
+    .bind(child)
+    .bind(AGENT_ACTIVE)
+    .bind(AGENT_STARTING)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if updated == 0 {
+        return Ok(false);
+    }
+    queue_agent_message(&mut tx, child, None, "smelt", KIND_NOTICE, notice).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Every undelivered report or notice to `to`, oldest first.
+pub async fn undelivered_agent_messages(pool: &PgPool, to: i64) -> Result<Vec<AgentMessage>, sqlx::Error> {
+    sqlx::query_as::<_, AgentMessage>(
+        "SELECT id, to_conversation_id, from_label, kind, body FROM agent_messages
+         WHERE to_conversation_id = $1 AND delivered_at IS NULL ORDER BY id",
+    )
+    .bind(to)
+    .fetch_all(pool)
+    .await
+}
+
+/// Delivers one queued row: its `user` message saved, and the row marked
+/// delivered and linked to it, in one transaction, so a stop between the
+/// two can't save it twice. `None` when another drain delivered it first
+/// or the recipient is gone.
+pub async fn deliver_agent_message(
+    pool: &PgPool,
+    row: &AgentMessage,
+    content: &[ContentBlock],
+) -> Result<Option<Message>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    if !lock_conversations(&mut tx, &[(row.to_conversation_id, RowLock::NoKeyUpdate)]).await? {
+        return Ok(None);
+    }
+    let marked = sqlx::query("UPDATE agent_messages SET delivered_at = now() WHERE id = $1 AND delivered_at IS NULL")
+        .bind(row.id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if marked == 0 {
+        return Ok(None);
+    }
+    let saved = super::conversations::create_message_on(&mut tx, row.to_conversation_id, "user", content).await?;
+    sqlx::query("UPDATE agent_messages SET delivered_message_id = $2 WHERE id = $1")
+        .bind(row.id)
+        .bind(saved.id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Some(saved))
+}

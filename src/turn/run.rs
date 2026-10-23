@@ -344,6 +344,9 @@ pub(crate) async fn start_turn(pool: PgPool, id: i64, content: String) -> Server
     // stop, and its generation is taken at once, not only when the turn
     // starts: it may queue behind another, and a turn already running
     // mustn't keep its error over this one.
+    // A child agent still starting takes no turn (SME-236); checked
+    // before the turn is counted.
+    crate::agents::admit_user_turn(&pool, id).await.map_err(ServerFnError::new)?;
     let (in_flight, generation) = TurnInFlight::start_by_user(id);
     let new_message = anthropic::AnthropicMessage {
         role: "user".to_string(),
@@ -470,6 +473,8 @@ fn run_turn_steps<'a: 'b, 'b>(
             // visibility the finish notices above have.
             drain_idle_command_notices(pool, conversation_id, &mut pending_new_content, &mut persisted)
                 .await?;
+            // Reports and notices from agents (SME-236), likewise.
+            drain_agent_messages(pool, conversation_id, &mut pending_new_content, &mut persisted).await?;
 
             // The model's `ask_user` (SME-34): an answer recorded since
             // this turn saved its own message is taken now, so the model

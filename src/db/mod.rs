@@ -62,6 +62,7 @@ pub fn get() -> &'static PgPool {
         .expect("Database not initialized. Call db::init() first.")
 }
 
+mod agents;
 mod conversations;
 mod usage;
 mod questions;
@@ -73,6 +74,7 @@ mod mcp;
 mod language_servers;
 mod providers;
 
+pub use agents::*;
 pub use conversations::*;
 pub use usage::*;
 pub use questions::*;

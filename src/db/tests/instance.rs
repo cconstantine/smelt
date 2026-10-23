@@ -23,7 +23,12 @@ async fn test_a_database_with_conversations_before_the_migration_owns_unlabelled
     };
     assert!(before.iter().count() < all.iter().count(), "the instance migration is in the set");
     before.run(&pool).await.expect("migrate up to the instance migration");
-    create_conversation(&pool).await.expect("a conversation from before the fix");
+    // A plain row: `create_conversation` reads back today's columns, which
+    // the schema doesn't have yet.
+    sqlx::query("INSERT INTO conversations (title) VALUES ('before the fix')")
+        .execute(&pool)
+        .await
+        .expect("a conversation from before the fix");
     all.run(&pool).await.expect("the rest of the migrations");
 
     let instance = smelt_instance(&pool).await.expect("the instance row");

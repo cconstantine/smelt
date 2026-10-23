@@ -351,7 +351,7 @@ pub async fn get_context_detail(id: i64) -> ServerFnResult<ContextDetailSnapshot
 /// `get_context_detail`'s body, taking the pool so tests can call it.
 #[cfg(feature = "server")]
 pub(crate) async fn context_detail(pool: &PgPool, id: i64) -> ServerFnResult<ContextDetailSnapshot> {
-    let tools = anthropic::tools::tool_definitions(pool).await;
+    let tools = anthropic::tools::tool_definitions(pool, id).await;
     let message_count = db::list_messages(pool, id)
         .await
         .map_err(ServerFnError::new)?

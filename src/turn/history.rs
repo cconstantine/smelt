@@ -227,6 +227,16 @@ pub(crate) struct PromptEnvironment {
     /// Each repo's recorded persona files, by repo id (SME-235): names
     /// only, listed whether or not the repo is trusted.
     pub persona_files: std::collections::BTreeMap<i64, Vec<String>>,
+    /// Set when the conversation is a child agent (SME-236).
+    pub agent: Option<AgentPrompt>,
+}
+
+/// What a child agent's system prompt says about it (SME-236).
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AgentPrompt {
+    pub id: i64,
+    pub parent_id: i64,
 }
 
 /// The system prompt sent with every turn: the base prompt, then an
@@ -238,6 +248,13 @@ pub(crate) fn system_prompt(env: &PromptEnvironment) -> String {
     prompt.push_str("\n# Environment\n\n");
     prompt.push_str(&format!("- Today's date: {}\n", env.date.format("%Y-%m-%d")));
     prompt.push_str(&format!("- Model: {}\n", env.model));
+    if let Some(agent) = &env.agent {
+        prompt.push_str(&format!(
+            "- You are agent #{}, started by conversation #{} (your parent) with the brief that \
+             starts this conversation. The user can also write to you.\n",
+            agent.id, agent.parent_id
+        ));
+    }
     if !env.volumes.is_empty() {
         prompt.push_str("- Volumes (their contents survive the pod ending):\n");
         for (name, path) in &env.volumes {
@@ -338,6 +355,13 @@ pub(crate) async fn prompt_environment(
             Vec::new()
         }
     };
+    let agent = match agent_prompt(pool, conversation_id).await {
+        Ok(agent) => agent,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't read the agent's row for the system prompt");
+            None
+        }
+    };
     PromptEnvironment {
         date: chrono::Utc::now().date_naive(),
         model: model.to_string(),
@@ -346,5 +370,14 @@ pub(crate) async fn prompt_environment(
         repos,
         instructions,
         persona_files,
+        agent,
     }
+}
+
+/// The agent part of the prompt, `None` for a conversation without a parent.
+#[cfg(feature = "server")]
+async fn agent_prompt(pool: &PgPool, conversation_id: i64) -> Result<Option<AgentPrompt>, sqlx::Error> {
+    Ok(db::conversation_parent(pool, conversation_id)
+        .await?
+        .map(|parent_id| AgentPrompt { id: conversation_id, parent_id }))
 }

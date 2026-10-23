@@ -232,6 +232,45 @@ pub(super) async fn drain_idle_command_notices(
     Ok(())
 }
 
+/// Drains the reports and notices queued to `conversation_id`
+/// (`agent_messages`, SME-236), in the order they were queued: each saved
+/// as one `user` message naming its sender and marked delivered, in one
+/// transaction per row, so a stop between rows leaves the rest queued and
+/// none saved twice. Run with the command drains, at every iteration, so
+/// a busy recipient takes them between a tool result and its next call.
+#[cfg(feature = "server")]
+pub(super) async fn drain_agent_messages(
+    pool: &PgPool,
+    conversation_id: i64,
+    pending_new_content: &mut Vec<anthropic::ContentBlock>,
+    persisted: &mut Vec<Message>,
+) -> ServerFnResult<()> {
+    for row in db::undelivered_agent_messages(pool, conversation_id)
+        .await
+        .map_err(ServerFnError::new)?
+    {
+        let content = vec![anthropic::ContentBlock::Text { text: agent_message_text(&row) }];
+        let Some(saved) = db::deliver_agent_message(pool, &row, &content)
+            .await
+            .map_err(ServerFnError::new)?
+        else {
+            continue;
+        };
+        pending_new_content.extend(content);
+        record_saved(conversation_id, persisted, saved);
+    }
+    Ok(())
+}
+
+/// A queued row as its recipient reads it: a report names its sender.
+fn agent_message_text(row: &db::AgentMessage) -> String {
+    if row.kind == db::KIND_REPORT {
+        format!("Report from {}:\n\n{}", row.from_label, row.body)
+    } else {
+        format!("Notice: {}", row.body)
+    }
+}
+
 /// A duration in seconds, said in words: "45 seconds", "5 minutes",
 /// "2 hours 5 minutes", "3 days 4 hours" (SME-79). The two biggest units that
 /// fit, rounded down — a notice never overstates how long a command has been
