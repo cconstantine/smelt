@@ -6,6 +6,9 @@ use super::*;
 /// What a start cut off by a restart says.
 pub(crate) const RESTARTED: &str = "smelt restarted during the start";
 
+/// The notice to a child whose turn a restart cut off (SME-238).
+pub(crate) const RESTARTED_MID_TURN: &str = "smelt restarted during your turn; carry on";
+
 /// Fails every child still `starting` (its start ran in a task the restart
 /// ended), as `fail_start` does, and cleans up after it as a start's exit
 /// would; then wakes every conversation with an undelivered report or
@@ -23,6 +26,7 @@ pub(crate) async fn startup_sweep(pool: &PgPool) -> Vec<tokio::task::JoinHandle<
         }
         Err(e) => tracing::warn!(error = %e, "couldn't list the agents a restart cut off"),
     }
+    notify_cut_off_turns(pool).await;
     match db::conversations_with_queued_messages(pool).await {
         Ok(ids) => {
             for id in ids {
@@ -32,4 +36,14 @@ pub(crate) async fn startup_sweep(pool: &PgPool) -> Vec<tokio::task::JoinHandle<
         Err(e) => tracing::warn!(error = %e, "couldn't list conversations with queued agent messages"),
     }
     wakes
+}
+
+/// Queues `RESTARTED_MID_TURN` to every child a restart cut off mid-turn,
+/// for the wakes after it to deliver (SME-238). Run by the startup sweep.
+pub(crate) async fn notify_cut_off_turns(pool: &PgPool) {
+    match db::queue_restart_notices(pool, RESTARTED_MID_TURN).await {
+        Ok(told) if !told.is_empty() => tracing::info!(agents = ?told, "told agents a restart cut off their turn"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "couldn't tell the agents a restart cut off their turn"),
+    }
 }

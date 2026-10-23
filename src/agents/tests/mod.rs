@@ -15,6 +15,7 @@ mod messages;
 mod pause;
 mod persona;
 mod reports;
+mod restart;
 pub(super) mod repo;
 mod start;
 mod stop;
