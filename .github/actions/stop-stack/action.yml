@@ -1,0 +1,17 @@
+name: Stop the compose stack
+description: >
+  Tears down what start-stack started, pruning the kept docker storage first.
+  Use with `if: always()`.
+runs:
+  using: composite
+  steps:
+    - name: Tear down
+      # The `docker` service's storage outlives the run (see "Build
+      # caches"), so drop images and build cache over a week old first:
+      # each change to the agent's sources builds a sandbox image of its
+      # own. At worst a run a week later rebuilds or re-pulls them.
+      shell: bash
+      run: |
+        docker compose exec -T docker sh -c \
+          'docker image prune -af --filter until=168h && docker builder prune -af --filter until=168h' || true
+        docker compose down -v
