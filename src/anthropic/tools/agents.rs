@@ -1,6 +1,6 @@
 //! Child agents (SME-236): `start_agent`, offered to a conversation without
-//! a parent, and `finish`, offered to an agent. The lifecycle behind them
-//! is `crate::agents`.
+//! a parent, `list_agents`, offered to every conversation, and `finish`,
+//! offered to an agent. The lifecycle behind them is `crate::agents`.
 
 use super::{Offer, Registered, Tool};
 use crate::anthropic::ToolDefinition;
@@ -30,6 +30,21 @@ pub(super) fn tools() -> Vec<Registered> {
                     }),
                 },
                 run: run!(|c| crate::agents::start_agent(c.pool, c.conversation_id, c.input)),
+            },
+        },
+        Registered {
+            offer: Offer::All,
+            tool: Tool {
+                def: ToolDefinition {
+                    name: "list_agents".to_string(),
+                    description: "List the agents you started (never anyone else's), newest first: \
+                                  id, title, persona, status (starting, running, waiting for the user, \
+                                  idle, finished, stopped or failed), when it started, its last \
+                                  message, and how many agents it started itself."
+                        .to_string(),
+                    input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                },
+                run: run!(|c| crate::agents::list_agents(c.pool, c.conversation_id)),
             },
         },
         Registered {

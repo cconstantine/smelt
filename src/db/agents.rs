@@ -16,6 +16,8 @@ pub const AGENT_ACTIVE: &str = "active";
 pub const AGENT_FINISHED: &str = "finished";
 /// `agents.state`: `stop_agent` or a delete stopped it.
 pub const AGENT_STOPPED: &str = "stopped";
+/// `agents.state`: its start failed; terminal.
+pub const AGENT_FAILED: &str = "failed";
 
 /// `agent_messages.kind`: a child's report to its parent.
 pub const KIND_REPORT: &str = "report";
@@ -249,6 +251,38 @@ pub async fn finish_agent(pool: &PgPool, child: i64, label: &str, report: &str) 
     queue_agent_message(&mut tx, parent, Some(child), label, KIND_REPORT, report).await?;
     tx.commit().await?;
     Ok(Finish::Queued { parent })
+}
+
+/// One of a conversation's children, as `list_agents` shows it.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct ChildAgent {
+    pub id: i64,
+    pub title: String,
+    pub persona_path: Option<String>,
+    pub state: String,
+    pub created_at: NaiveDateTime,
+    pub last_message_at: Option<NaiveDateTime>,
+    /// How many agents it has started itself.
+    pub agents_started: i64,
+    /// A question to the user is unanswered, or an AGENTS.md trust card waits.
+    pub waiting_for_user: bool,
+}
+
+/// `parent`'s own children, newest first: never anyone else's.
+pub async fn list_child_agents(pool: &PgPool, parent: i64) -> Result<Vec<ChildAgent>, sqlx::Error> {
+    sqlx::query_as::<_, ChildAgent>(
+        "SELECT c.id, c.title, a.persona_path, a.state, a.created_at,
+                (SELECT max(m.created_at) FROM messages m WHERE m.conversation_id = c.id) AS last_message_at,
+                (SELECT count(*) FROM conversations g WHERE g.parent_id = c.id) AS agents_started,
+                (EXISTS (SELECT 1 FROM pending_questions q WHERE q.conversation_id = c.id AND q.answer IS NULL)
+                 OR EXISTS (SELECT 1 FROM instruction_requests r WHERE r.conversation_id = c.id)) AS waiting_for_user
+         FROM conversations c JOIN agents a ON a.conversation_id = c.id
+         WHERE c.parent_id = $1
+         ORDER BY c.id DESC",
+    )
+    .bind(parent)
+    .fetch_all(pool)
+    .await
 }
 
 /// Every undelivered report or notice to `to`, oldest first.

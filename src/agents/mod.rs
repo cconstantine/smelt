@@ -31,6 +31,53 @@ pub(crate) const FINISH: &str = "finish";
 /// Why a child can't call `start_agent` (depth 1, until SME-245's limits).
 pub(crate) const ROOT_ONLY: &str = "start_agent is only for a conversation without a parent";
 
+/// A persona as `<dir>:<name>`, from its path in the child's checkout
+/// (`/workspace/<dir>/.agents/personas/<name>.md`).
+pub(crate) fn persona_label(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("/workspace/")?;
+    let (dir, file) = rest.split_once("/.agents/personas/")?;
+    let name = file.strip_suffix(".md")?;
+    Some(format!("{dir}:{name}"))
+}
+
+/// An agent's status, first that holds: its stored lifecycle when that
+/// ends it or hasn't begun, a turn in flight, a question or card waiting
+/// on the user, finished, else idle (agents.md, "Statuses", without
+/// SME-238's "waiting for its parent").
+pub(crate) fn status(state: &str, running: bool, waiting_for_user: bool) -> &'static str {
+    match state {
+        db::AGENT_STARTING => "starting",
+        db::AGENT_FAILED => "failed",
+        db::AGENT_STOPPED => "stopped",
+        _ if running => "running",
+        _ if waiting_for_user => "waiting for the user",
+        db::AGENT_FINISHED => "finished",
+        _ => "idle",
+    }
+}
+
+/// `list_agents`' run: the caller's own children, newest first.
+pub(crate) async fn list_agents(pool: &PgPool, caller: i64) -> Result<String, String> {
+    let children = db::list_child_agents(pool, caller)
+        .await
+        .map_err(|e| format!("couldn't list your agents: {e}"))?;
+    let agents: Vec<serde_json::Value> = children
+        .iter()
+        .map(|child| {
+            serde_json::json!({
+                "id": child.id,
+                "title": child.title,
+                "persona": child.persona_path.as_deref().and_then(persona_label),
+                "status": status(&child.state, crate::turn::turn_running(child.id), child.waiting_for_user),
+                "created_at": child.created_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                "last_message_at": child.last_message_at.map(|at| at.format("%Y-%m-%d %H:%M:%S UTC").to_string()),
+                "agents_started": child.agents_started,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({"agents": agents}).to_string())
+}
+
 /// How an agent is named to its parent: `agent #12`, or with its persona,
 /// `agent #12 (smelt:developer)`.
 pub(crate) fn label(conversation_id: i64, persona: Option<&str>) -> String {
