@@ -142,15 +142,27 @@ async fn test_two_reports_at_once_arrive_in_one_parent_turn_in_order(pool: PgPoo
     })
     .await;
     eventually("the parent's turns are over", || async { !crate::turn::turn_running(root) }).await;
-    let (low, high) = (first.min(second), first.max(second));
+    // In the order they were queued: the two children race to finish, so
+    // that's not always their ids' order (CI on the PR's first push).
+    let queued: Vec<i64> = sqlx::query_scalar(
+        "SELECT from_conversation_id FROM agent_messages WHERE to_conversation_id = $1 ORDER BY id",
+    )
+    .bind(root)
+    .fetch_all(&pool)
+    .await
+    .expect("the queued reports");
+    let mut both = vec![first, second];
+    both.sort();
+    let mut sorted = queued.clone();
+    sorted.sort();
+    assert_eq!(sorted, both, "one report from each");
     assert_eq!(
         transcript(&pool, root).await,
         vec![
-            ("user".to_string(), format!("Report from agent #{first}:\n\nReport of {first}.")),
-            ("user".to_string(), format!("Report from agent #{second}:\n\nReport of {second}.")),
+            ("user".to_string(), format!("Report from agent #{}:\n\nReport of {}.", queued[0], queued[0])),
+            ("user".to_string(), format!("Report from agent #{}:\n\nReport of {}.", queued[1], queued[1])),
             ("assistant".to_string(), "Both in.".to_string()),
-        ],
-        "agents #{low} and #{high}"
+        ]
     );
     assert_eq!(requests_for(&requests, None).len(), 1, "one model call for both");
 }
