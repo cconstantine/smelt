@@ -136,8 +136,11 @@ fn test_pool() -> sqlx::PgPool {
         .expect("lazy pool construction never fails")
 }
 
-/// A call's class is on its `tool` span, and nothing of its input is:
-/// this `DELETE` fails on its URL before anything is sent.
+/// A call's class is on its `tool` span, and no attribute holds its
+/// input (the method shows only as the class it gives). The span's error
+/// status is the tool's own message, which may quote a URL as before
+/// (scrubbed, SME-137). This `DELETE` fails on its URL before anything is
+/// sent.
 #[tokio::test]
 async fn test_a_calls_class_is_on_its_tool_span() {
     let input = serde_json::json!({"url": "not a SECRET-URL", "method": "DELETE"});
