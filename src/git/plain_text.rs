@@ -71,3 +71,56 @@ pub fn plain_multiline_text(text: &str) -> String {
     }
     out
 }
+
+/// How many characters of `text` `plain_multiline_text` escapes — the ones
+/// a reader can't see (SME-277): the default-ignorables, the control
+/// characters, and the ones that reorder the text around them. `text` with
+/// nothing to escape counts 0 and escapes to itself. The filter is the
+/// escape's own condition, so count and showing cannot drift apart.
+pub fn hidden_characters(text: &str) -> usize {
+    text.chars().filter(|c| not_plain(*c) && *c != '\n' && *c != '\t').count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T1 (SME-277): one character from each class — a zero-width space, a
+    /// tag character, a soft hyphen, a BOM, a bidi override, `ESC`, `DEL`
+    /// and `CR` — counts 1 each, and the escape shows each as its
+    /// `\u{…}`.
+    #[test]
+    fn test_hidden_characters_counts_every_class_the_escape_shows() {
+        for c in ['\u{200b}', '\u{e0041}', '\u{ad}', '\u{feff}', '\u{202e}', '\u{1b}', '\u{7f}', '\r'] {
+            assert_eq!(hidden_characters(&format!("a{c}b")), 1, "U+{:X}", c as u32);
+            assert_eq!(plain_multiline_text(&format!("a{c}b")), format!("a\\u{{{}}}b", escape_unicode_of(c)), "U+{:X}", c as u32);
+        }
+    }
+
+    /// T1: text a reader sees whole — newlines and tabs (kept by the
+    /// escape), letters, non-ASCII letters and an emoji — counts 0 and
+    /// escapes to itself.
+    #[test]
+    fn test_hidden_characters_is_zero_for_text_that_shows_whole() {
+        for text in ["\n\t", "", "plain", "é 日本 🎨", "\\u{200b}"] {
+            assert_eq!(hidden_characters(text), 0, "{text:?}");
+            assert_eq!(plain_multiline_text(text), text, "{text:?}");
+        }
+    }
+
+    /// T1: the escape is ASCII, so escaped text has nothing left to count
+    /// or escape — escaping twice changes nothing.
+    #[test]
+    fn test_escaped_text_has_nothing_left_hidden() {
+        let hidden = "a\u{200b}\u{e006f}\u{ad}\u{202e}\u{1b}\r\n\tb";
+        let once = plain_multiline_text(hidden);
+        assert!(hidden_characters(hidden) > 0);
+        assert_eq!(hidden_characters(&once), 0);
+        assert_eq!(plain_multiline_text(&once), once);
+    }
+
+    fn escape_unicode_of(c: char) -> String {
+        let e = c.escape_unicode().to_string();
+        e[3..e.len() - 1].to_string() // \u{1b} -> 1b
+    }
+}
