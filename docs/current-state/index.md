@@ -7,6 +7,7 @@ one first; the sections are:
 
 * [features.md](features.md) — what the app and the agent do, feature by feature
 * [agents.md](agents.md) — child agents: what a conversation's model hands off, and how it hears back
+* [bug-bashes.md](bug-bashes.md) — what each bug bash swept and fixed
 * [architecture.md](architecture.md) — how the code is laid out, short version;
   [docs/architecture.md](../architecture.md) is the full picture
 
