@@ -7,10 +7,11 @@ pub const INSTRUCTIONS_MAX_BYTES: usize = 32 * 1024;
 /// How many `AGENTS.md` files of one checkout are recorded.
 const MAX_AGENTS_FILES: usize = 50;
 
-/// Whether `text` (a repo's path) can go on a line of the system prompt
-/// as it is: no control character (C0, DEL, C1), line or paragraph
-/// separator, or bidi control, any of which can break a line or reorder
-/// its text (SME-271). Non-ASCII letters are plain.
+/// Whether `text` (a repo's path, or its branch name since SME-272) can
+/// go on a line of the system prompt as it is: no control character (C0,
+/// DEL, C1), line or paragraph separator, or bidi control, any of which
+/// can break a line or reorder its text (SME-271). Non-ASCII letters are
+/// plain.
 pub fn plain_path_text(text: &str) -> bool {
     !text.chars().any(|c| {
         c.is_control()

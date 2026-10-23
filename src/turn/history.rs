@@ -254,7 +254,13 @@ pub(crate) fn system_prompt(env: &PromptEnvironment) -> String {
         prompt.push_str("- Repositories:\n");
         for repo in &env.repos {
             let state = match repo.status {
-                crate::git::RepoStatus::Ready => repo.branch.clone().unwrap_or_default(),
+                // SME-272: the branch is the remote owner's choice.
+                crate::git::RepoStatus::Ready => match repo.branch.as_deref() {
+                    Some(b) if !crate::git::plain_path_text(b) => {
+                        "a branch whose name holds control characters".to_string()
+                    }
+                    b => b.unwrap_or_default().to_string(),
+                },
                 crate::git::RepoStatus::Cloning => "still cloning".to_string(),
                 crate::git::RepoStatus::Failed => "clone failed".to_string(),
             };
