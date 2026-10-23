@@ -277,8 +277,9 @@ pub(super) enum NextStep {
 /// reply cut off or refused already has its notice and ends as before. A
 /// reply that makes real calls and writes one as text too gets its
 /// correction after the real calls' results (`NextStep::RunTools`). A
-/// reply with no text and no call (thinking only, or empty) gets one nudge
-/// to carry on; a second ends the turn, as a model that meant to stop.
+/// reply with no text and no call (thinking only, or empty) gets a nudge
+/// to carry on; another before a real call ends the turn, as a model that
+/// meant to stop. A nudge, like a real call, resets the correction count.
 #[cfg(feature = "server")]
 pub(super) async fn after_reply(
     pool: &PgPool,

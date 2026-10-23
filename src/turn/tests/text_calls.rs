@@ -303,8 +303,8 @@ async fn test_a_reply_with_no_text_and_no_call_gets_one_nudge(pool: PgPool) {
     assert_eq!(requests.lock().expect("the request log").len(), 2);
 }
 
-/// A8: the nudge is once a turn, not once in a row: a real call between
-/// two empty replies doesn't earn a second.
+/// A8: a real call between two empty replies resets the nudge: the
+/// second empty reply is nudged too (review 1 corrected this comment).
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_nudge_resets_after_a_real_call(pool: PgPool) {
     let _guard = lock_turn_tests();
