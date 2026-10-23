@@ -37,6 +37,12 @@ const TEXT_CALL_NOTICE_END: &str = " Make the call as a tool call, not as text i
 /// A text-call notice's sentence for a call whose name couldn't be read.
 const UNREADABLE: &str = "One call's tool name couldn't be read";
 
+/// Saved after a reply with no text and no tool call (thinking only, or
+/// empty), once a turn: the model carries on rather than the turn ending
+/// silently.
+pub const EMPTY_REPLY_NOTICE: &str =
+    "Your last reply had no text and no tool call. Carry on: make the tool call you need, or answer.";
+
 /// How many corrections in a row a turn sends before the next reply with a
 /// call written as text ends it with an error.
 #[cfg(feature = "server")]

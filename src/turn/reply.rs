@@ -249,11 +249,13 @@ fn is_question(name: &str) -> bool {
 
 /// A turn's run of replies that wrote a tool call as text (SME-286), kept
 /// in memory for one turn: corrections sent in a row, with no real call
-/// between them.
+/// between them, and whether a reply with no text and no call has been
+/// nudged since the last real call.
 #[cfg(feature = "server")]
 #[derive(Default)]
 pub(super) struct TextCallStreak {
     corrections: usize,
+    nudged: bool,
 }
 
 /// What the turn does after a reply: runs its calls (and then saves the
@@ -274,7 +276,9 @@ pub(super) enum NextStep {
 /// saved (the model reads it next turn) and the turn fails, naming it. A
 /// reply cut off or refused already has its notice and ends as before. A
 /// reply that makes real calls and writes one as text too gets its
-/// correction after the real calls' results (`NextStep::RunTools`).
+/// correction after the real calls' results (`NextStep::RunTools`). A
+/// reply with no text and no call (thinking only, or empty) gets one nudge
+/// to carry on; a second ends the turn, as a model that meant to stop.
 #[cfg(feature = "server")]
 pub(super) async fn after_reply(
     pool: &PgPool,
@@ -296,13 +300,22 @@ pub(super) async fn after_reply(
             return Ok(NextStep::End);
         }
         streak.corrections = 0;
+        streak.nudged = false;
         let calls = text_calls(turn);
         let correction = (!calls.is_empty()).then(|| crate::text_calls::text_call_notice(&calls, offered));
         return Ok(NextStep::RunTools(correction));
     }
     let calls = text_calls(turn);
     if calls.is_empty() {
-        return Ok(NextStep::End);
+        let has_text = turn.content.iter().any(|b| matches!(b, anthropic::ContentBlock::Text { text } if !text.trim().is_empty()));
+        if has_text || streak.nudged {
+            return Ok(NextStep::End);
+        }
+        streak.corrections = 0;
+        streak.nudged = true;
+        let nudge = crate::text_calls::EMPTY_REPLY_NOTICE.to_string();
+        save_notice(pool, conversation_id, nudge, persisted, pending_new_content).await?;
+        return Ok(NextStep::CallAgain);
     }
     let notice = crate::text_calls::text_call_notice(&calls, offered);
     save_notice(pool, conversation_id, notice, persisted, pending_new_content).await?;

@@ -392,6 +392,9 @@ pub(in crate::frontend::pages::chat) fn system_notice(text: &str, commands: &Has
         let call = cut_call.map(|name| format!(" in the middle of a `{name}` call, which didn't run")).unwrap_or_default();
         return Some(format!("The model's provider stopped this reply (a refusal){call}."));
     }
+    if text == crate::text_calls::EMPTY_REPLY_NOTICE {
+        return Some("The model's reply was empty; smelt asked it to carry on.".to_string());
+    }
     // A tool call the model wrote as text, and smelt's correction (SME-286).
     if let Some(calls) = crate::text_calls::parse_text_call_notice(text) {
         let names: Vec<String> = calls

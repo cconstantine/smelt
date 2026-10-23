@@ -269,3 +269,64 @@ async fn test_tool_use_with_no_calls_is_the_end_of_the_reply(pool: PgPool) {
     let all = db::list_messages(&pool, conversation.id).await.expect("list messages");
     assert!(all.iter().all(|m| m.content != "[]"), "no empty message is saved: {all:?}");
 }
+
+/// A8: a reply with no text and no call (thinking only, as after the
+/// evidence's compaction, or empty) gets one nudge, and the model carries
+/// on; a second such reply ends the turn, as a model that meant to stop.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_reply_with_no_text_and_no_call_gets_one_nudge(pool: PgPool) {
+    use crate::text_calls::EMPTY_REPLY_NOTICE;
+    let _guard = lock_turn_tests();
+    let thinking = || text_blocks_body(&[Block::Thinking("The context was compacted.")], "end_turn");
+    let nudges = |saved: &[crate::models::Message]| saved.iter().filter(|m| notice_text(m).as_deref() == Some(EMPTY_REPLY_NOTICE)).count();
+
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![thinking(), text_reply_body("Done.")]).await;
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("the turn succeeds");
+    assert_eq!(roles(&saved), ["user", "assistant", "user", "assistant"], "{saved:?}");
+    assert_eq!(notice_text(&saved[2]).as_deref(), Some(EMPTY_REPLY_NOTICE));
+    assert_eq!(requests.lock().expect("the request log").len(), 2);
+    assert_eq!(last_sent(&requests, 1), ("user".to_string(), EMPTY_REPLY_NOTICE.to_string()));
+
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![thinking(), thinking(), text_reply_body("Never sent.")]).await;
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("a second empty reply ends the turn, not as an error");
+    assert_eq!(nudges(&saved), 1, "{saved:?}");
+    assert_eq!(requests.lock().expect("the request log").len(), 2);
+
+    // An empty reply isn't saved (B3), but is nudged all the same.
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![text_blocks_body(&[], "end_turn"), text_reply_body("Done.")]).await;
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("the turn succeeds");
+    assert_eq!(roles(&saved), ["user", "user", "assistant"], "{saved:?}");
+    assert_eq!(nudges(&saved), 1);
+    assert_eq!(requests.lock().expect("the request log").len(), 2);
+}
+
+/// A8: the nudge is once a turn, not once in a row: a real call between
+/// two empty replies doesn't earn a second.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_nudge_resets_after_a_real_call(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let thinking = || text_blocks_body(&[Block::Thinking("Hmm.")], "end_turn");
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let bodies = vec![thinking(), call_reply("toolu_between"), thinking(), text_reply_body("Done.")];
+    let requests = start_recording_mock_upstream(&pool, bodies).await;
+    run_turn(&pool, conversation.id, hello()).await.expect("the turn succeeds");
+    assert_eq!(requests.lock().expect("the request log").len(), 4, "a real call resets the nudge");
+}
+
+/// A9: a reply cut off at its budget with a call written in its text gets
+/// only the cut-off notice, and the turn ends as before.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_cut_off_reply_with_markup_gets_only_the_cut_off_notice(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let body = text_blocks_body(&[Block::Text(EVIDENCE)], "max_tokens");
+    let requests = start_recording_mock_upstream(&pool, vec![body, text_reply_body("Again?")]).await;
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("the turn succeeds");
+    assert_eq!(roles(&saved), ["user", "assistant", "user"], "{saved:?}");
+    let notice = notice_text(&saved[2]).expect("one text block");
+    assert!(notice.starts_with(crate::api::chat::CUT_OFF_NOTICE_START), "{notice}");
+    assert_eq!(requests.lock().expect("the request log").len(), 1);
+}

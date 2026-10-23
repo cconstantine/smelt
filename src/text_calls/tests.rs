@@ -207,6 +207,7 @@ fn test_other_text_is_not_a_text_call_notice() {
     for text in [
         "",
         "hello",
+        EMPTY_REPLY_NOTICE,
         TEXT_CALL_NOTICE_START,
         crate::api::chat::STOP_NOTICE,
         &format!("{TEXT_CALL_NOTICE_START} `a b` is offered."),

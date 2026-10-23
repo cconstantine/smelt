@@ -61,6 +61,16 @@ fn test_a_text_call_notice_names_the_calls() {
     );
 }
 
+/// SME-286: the nudge after a reply with no text and no call reads as a
+/// notice line.
+#[test]
+fn test_the_empty_reply_nudge_reads_as_a_notice() {
+    assert_eq!(
+        system_notice(crate::text_calls::EMPTY_REPLY_NOTICE, &HashMap::new()).as_deref(),
+        Some("The model's reply was empty; smelt asked it to carry on.")
+    );
+}
+
 /// B3 (SME-122): a refusal notice reads as one in the chat, naming a
 /// dropped call, and round-trips.
 #[test]
