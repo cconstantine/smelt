@@ -7,6 +7,15 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The plain-text rule (SME-276): which characters can break, reorder or
+/// hide text, and the escaping that shows them. Moved here verbatim from
+/// `git/server/instructions.rs`, and ungated with SME-277's first
+/// frontend call: the server applies it before text reaches the model,
+/// and the chat frontend applies it when showing a user a file they're
+/// being asked to read — one rule, one copy, both sides of the boundary.
+mod plain_text;
+pub use plain_text::*;
+
 /// A stored SSH key as the settings page and the model see it: never the
 /// private half.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

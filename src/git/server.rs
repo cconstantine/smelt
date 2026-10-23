@@ -52,3 +52,4 @@ pub use child_ref::*;
 pub use clone::*;
 pub use personas::*;
 pub use trust::*;
+pub use super::plain_text::*;
