@@ -365,7 +365,11 @@ pub(crate) async fn start_turn(pool: PgPool, id: i64, content: String) -> Server
     // A child agent still starting takes no turn (SME-236); checked
     // before the turn is counted.
     crate::agents::admit_user_turn(&pool, id).await.map_err(ServerFnError::new)?;
+    #[cfg(test)]
+    crate::agents::test_hooks::reach(crate::agents::test_hooks::AFTER_USER_ADMITTED, id).await;
     let (in_flight, generation) = TurnInFlight::start_by_user(id);
+    // A parent's stop between the admission and the count (SME-236).
+    crate::agents::confirm_user_turn(&pool, id).await.map_err(ServerFnError::new)?;
     let new_message = anthropic::AnthropicMessage {
         role: "user".to_string(),
         content: vec![anthropic::ContentBlock::Text { text: content }],

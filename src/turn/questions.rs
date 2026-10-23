@@ -152,6 +152,8 @@ pub(crate) async fn answer_question(
     // Admitted before this returns, so a Stop sent after it ends the
     // answer's turn (SME-216).
     let (in_flight, generation) = TurnInFlight::start_by_user(conversation_id);
+    // A parent's stop between the admission and the count (SME-236).
+    crate::agents::confirm_user_turn(&pool, conversation_id).await.map_err(ServerFnError::new)?;
     tokio::spawn(async move {
         if let Err(e) = run_turn_bounded(&pool, in_flight, None, MAX_TURNS, Some(generation), false).await {
             let message = e.message();

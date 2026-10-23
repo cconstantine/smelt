@@ -226,3 +226,33 @@ async fn test_a_stopped_or_failed_child_runs_no_turn_for_a_wake_or_notice(pool: 
     }
     assert_eq!(calls(), before, "no model call for a stopped or failed child");
 }
+
+/// Review 1, finding 3: the parent's `stop_agent` lands after the user's
+/// send made the child active and before the send's turn is counted, so
+/// its stop finds no turn to end. The send is refused, and no turn runs.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_stop_between_the_users_admission_and_its_turn_refuses_the_send(pool: PgPool) {
+    let requests = setup(&pool, vec![text_reply("ok")]).await;
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    let child = settled_child(&pool, root, "Work.").await;
+    eventually("the parent's turns are over", || async { !crate::turn::turn_running(root) }).await;
+    set_state(&pool, child, db::AGENT_FINISHED).await;
+    let before = requests_for(&requests, Some(child)).len();
+
+    let (reached, release) = test_hooks::pause(test_hooks::AFTER_USER_ADMITTED, child);
+    let send = tokio::spawn({
+        let pool = pool.clone();
+        async move { crate::turn::start_turn(pool, child, "Carry on.".to_string()).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), reached).await.expect("the send runs").expect("paused");
+    assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_ACTIVE), "the send made it active");
+    stop(&pool, root, child).await.expect("the parent stops it");
+    release.send(()).expect("release the send");
+    let sent = tokio::time::timeout(Duration::from_secs(10), send).await.expect("the send ends").expect("joined");
+    let error = sent.expect_err("refused: its parent stopped it");
+    assert!(crate::api::chat::chat_error_text(&error).contains("stopped"), "{error:?}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!crate::turn::turn_running(child));
+    assert_eq!(requests_for(&requests, Some(child)).len(), before, "no turn ran");
+    assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_STOPPED));
+}

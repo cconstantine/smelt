@@ -78,6 +78,9 @@ pub fn last_turns_checked(id: i64) -> usize {
     LAST_TURNS_CHECKED.lock().unwrap_or_else(|e| e.into_inner()).get(&id).copied().unwrap_or(0)
 }
 
+/// The user's send in conversation `id`, admitted and not yet counted.
+pub const AFTER_USER_ADMITTED: &str = "after_user_admitted";
+
 /// The delete of conversation `id`, after its subtree is marked.
 pub const DELETE_MARKED: &str = "delete_marked";
 

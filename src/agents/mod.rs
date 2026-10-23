@@ -110,8 +110,8 @@ pub(crate) fn label(conversation_id: i64, persona: Option<&str>) -> String {
 /// checked before the turn is counted: a conversation that isn't an agent
 /// always may; a child still starting, or whose start failed or was
 /// stopped, may not. A `finished` or `stopped` child is made `active`
-/// again; a `stop_agent` committing after that stops the turn this admits
-/// (`stop_conversation` after the update, SME-216's order).
+/// again. The caller then counts the turn and calls `confirm_user_turn`,
+/// so a `stop_agent` landing between this and the count is seen.
 pub(crate) async fn admit_user_turn(pool: &PgPool, conversation_id: i64) -> Result<(), String> {
     let state = db::agent_state(pool, conversation_id)
         .await
@@ -139,6 +139,24 @@ pub(crate) async fn admit_user_turn(pool: &PgPool, conversation_id: i64) -> Resu
                 Some(db::AGENT_FAILED) => Err("This agent's start failed; start a new one.".to_string()),
                 _ => Ok(()),
             }
+        }
+    }
+}
+
+/// After `admit_user_turn` and the turn's count: refused if a `stop_agent`
+/// (or a delete) landed in between, whose `stop_conversation` then found no
+/// turn to end (review 1). One landing after this read stops the counted
+/// turn itself (SME-216's order). A failed read lets the turn go on.
+pub(crate) async fn confirm_user_turn(pool: &PgPool, conversation_id: i64) -> Result<(), String> {
+    match db::agent_state(pool, conversation_id).await {
+        Ok(Some(state)) if state == db::AGENT_STOPPED => Err("This agent was stopped by its parent.".to_string()),
+        Ok(Some(state)) if state == db::AGENT_FAILED || state == db::AGENT_STARTING => {
+            Err(format!("This agent can't take a message now (it's {state})."))
+        }
+        Ok(_) => Ok(()),
+        Err(e) => {
+            tracing::warn!(conversation_id, error = %e, "couldn't read an agent's state after admitting the user's turn");
+            Ok(())
         }
     }
 }
