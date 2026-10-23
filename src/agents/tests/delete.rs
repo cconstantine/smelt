@@ -170,3 +170,22 @@ async fn test_the_parents_delete_holding_its_rows_then_a_finish(pool: PgPool) {
     let refused = finished.expect_err("refused: the agent is gone");
     assert!(!refused.contains("deadlock"), "{refused}");
 }
+
+/// Review 1, finding 2: two deletes of one child that both got past their
+/// mark (two tabs, a double confirm): the second finds it gone and succeeds
+/// without a notice, rather than failing on the notice's foreign key.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_second_delete_of_a_deleted_child_succeeds_quietly(pool: PgPool) {
+    setup(&pool, vec![text_reply("ok")]).await;
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    let child = sqlx::query_scalar::<_, i64>("INSERT INTO conversations (title, parent_id) VALUES ('c', $1) RETURNING id")
+        .bind(root)
+        .fetch_one(&pool)
+        .await
+        .expect("a child");
+    let first = db::mark_subtree_deleting(&pool, child).await.expect("mark").expect("there");
+    let second = db::mark_subtree_deleting(&pool, child).await.expect("mark").expect("there");
+    db::delete_subtree_rows(&pool, child, &first, "agent").await.expect("the first delete");
+    db::delete_subtree_rows(&pool, child, &second, "agent").await.expect("the second delete finds nothing to do");
+    assert_eq!(queued_to(&pool, root).await, vec!["the user deleted agent".to_string()], "one notice");
+}

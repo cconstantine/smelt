@@ -79,6 +79,15 @@ pub async fn delete_subtree_rows(
         locks.push((parent, RowLock::KeyShare));
     }
     lock_conversations(&mut tx, &locks).await?;
+    // Another delete of it committed first (two tabs, a double confirm):
+    // nothing is left to delete or tell (review 1).
+    if !sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM conversations WHERE id = $1)")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?
+    {
+        return Ok(());
+    }
     #[cfg(test)]
     crate::agents::test_hooks::reach(crate::agents::test_hooks::DELETE_LOCKED, id).await;
     if let Some(parent) = deleting.parent
