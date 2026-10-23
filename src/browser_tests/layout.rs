@@ -400,3 +400,76 @@ pub(super) async fn scenario_phone_width(t: &Scenario<'_>) {
     }
     assert!(list_shown, "the button should open the conversation list");
 }
+
+/// Scenario 18: a conversation created in one tab shows up in another tab's
+/// sidebar without a reload, and a deleted one goes away. `/` with nothing
+/// selected used to hold no connection at all, so it was the one list a
+/// Home tab fetched only on load (SME-269).
+pub(super) async fn scenario_conversations_appear_live(t: &Scenario<'_>) {
+    let pool = t.pool;
+    // A row to start from, so a new one is added to a list rather than
+    // ending the "No conversations yet" state — and so this scenario says
+    // something when run alone.
+    let seeded = t.conversation().await;
+    seed_user_message(pool, seeded.id, "a row to start from").await;
+    let listening = t.tab(t.url("")).await;
+    wait_for_element(&listening, "[data-app-live]", Duration::from_secs(15)).await;
+    let creator = t.tab(t.url("")).await;
+    wait_for_element(&creator, "[data-app-live]", Duration::from_secs(15)).await;
+
+    let before = list_requests(&listening).await;
+    click_when_present(&creator, ".new-conversation", Duration::from_secs(10)).await;
+    // The app opens what it made, so its id is in the creator's URL.
+    // Registered for the run's cleanup as soon as it's known: the click
+    // above has already put it in the database.
+    let id = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let path: String = creator
+                .evaluate("location.pathname")
+                .await
+                .expect("read the location")
+                .into_value()
+                .expect("a string");
+            if let Some(id) = path.strip_prefix("/conversation/").and_then(|rest| rest.parse::<i64>().ok()) {
+                break id;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "New conversation never opened a conversation: the tab sits at {path}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    t.created.lock().expect("the conversation list lock").push(id);
+    let row = format!(".conversation-item[data-conversation-id=\"{id}\"]");
+
+    // About a second on a quiet machine. The wait is long because these runs
+    // share the pod with the build, and a limit that fails a working run reads
+    // as infrastructure rather than as this scenario's finding.
+    assert!(
+        wait_for_count(&listening, &row, 1, Duration::from_secs(30)).await,
+        "a conversation made in another tab should appear in the listening tab's sidebar without a reload"
+    );
+    assert!(
+        list_requests(&listening).await > before,
+        "the listening tab should have refetched the list to get the new row"
+    );
+
+    // And the same the other way: delete it here, and the tab that made it —
+    // which has it open, so it listens through that conversation's stream —
+    // loses the row without a reload either.
+    let delete = format!("{row} .delete-conversation");
+    click_when_present(&listening, &delete, Duration::from_secs(10)).await;
+    let confirm = format!("{row} .delete-conversation.confirm");
+    wait_for_element(&listening, &confirm, Duration::from_secs(5)).await;
+    click_when_present(&listening, &confirm, Duration::from_secs(5)).await;
+    assert!(
+        wait_for_count(&listening, &row, 0, Duration::from_secs(10)).await,
+        "the tab that deleted the conversation should drop its row"
+    );
+    assert!(
+        wait_for_count(&creator, &row, 0, Duration::from_secs(10)).await,
+        "the tab that made the conversation should lose its row without a reload"
+    );
+}
