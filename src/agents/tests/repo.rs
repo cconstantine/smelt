@@ -17,9 +17,20 @@ pub(super) struct FakeCheckout {
     /// Held here until notified, when set.
     pub hold_clone: Option<Arc<tokio::sync::Notify>>,
     pub targets: Mutex<Vec<CloneTarget>>,
+    /// What `parent_commit` answers; refused when unset.
+    pub parent: Option<Result<(String, String), String>>,
 }
 
 impl ChildCheckout for FakeCheckout {
+    fn parent_commit<'a>(
+        &'a self,
+        _pool: &'a PgPool,
+        _parent: i64,
+        _dir: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(String, String), String>> + Send + 'a>> {
+        Box::pin(async move { self.parent.clone().unwrap_or_else(|| Err("this fake has no parent commit".to_string())) })
+    }
+
     fn clone_repo<'a>(
         &'a self,
         pool: &'a PgPool,
@@ -37,7 +48,10 @@ impl ChildCheckout for FakeCheckout {
                 return Err(error.clone());
             }
             let agents_files: Vec<String> = self.agents_md.iter().map(|_| "AGENTS.md".to_string()).collect();
-            let CloneTarget::Ref(branch) = target;
+            let branch = match target {
+                CloneTarget::Ref(r) => r,
+                CloneTarget::Commit { branch, .. } => branch,
+            };
             db::set_repo_ready(pool, repo.id, repo.attempt, branch, Some(COMMIT), &agents_files, &[], None)
                 .await
                 .expect("make the repo ready");
@@ -228,5 +242,39 @@ async fn test_repo_must_be_a_ready_checkout_and_ref_must_be_plain(pool: PgPool) 
     }
     let refused = start_on(&pool, root, serde_json::json!({"brief": "x", "ref": "main"})).await.expect_err("refused");
     assert_eq!(refused, "ref needs repo: the checkout whose remote it's on");
+    assert_eq!(children(&pool, root).await, 0);
+}
+
+/// Without a ref, the child gets its parent's exact commit, on a branch of
+/// its upstream's name.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_without_a_ref_the_child_gets_its_parents_commit(pool: PgPool) {
+    setup(&pool, vec![text_reply("ok")]).await;
+    let sha = "abc1230000000000000000000000000000000002".to_string();
+    let fake = Arc::new(FakeCheckout { parent: Some(Ok((sha.clone(), "feature".to_string()))), ..Default::default() });
+    let root = root_with_checkout(&pool, Some(true), fake.clone()).await;
+    let result = start_on(&pool, root, serde_json::json!({"brief": "Fix it.", "repo": "/workspace/app"}))
+        .await
+        .expect("started");
+    let child = child_of(&pool, root, &result).await;
+    assert!(result.contains(&format!("at your commit {sha} (branch feature)")), "{result}");
+    eventually("the child goes active", || async { state(&pool, child).await.as_deref() == Some(db::AGENT_ACTIVE) }).await;
+    assert_eq!(*fake.targets.lock().expect("targets"), vec![CloneTarget::Commit { sha, branch: "feature".to_string() }]);
+    assert_eq!(child_repo(&pool, child).await.branch.as_deref(), Some("feature"));
+    eventually("every turn is over", || async { !crate::turn::turn_running(child) && !crate::turn::turn_running(root) }).await;
+}
+
+/// A parent whose commit can't be shared is refused before anything is
+/// written, with what to do.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_parent_commit_that_cant_be_shared_is_refused(pool: PgPool) {
+    setup(&pool, vec![text_reply("ok")]).await;
+    let why = "/workspace/app has 2 commits not on origin/main: push them, or pass ref".to_string();
+    let fake = Arc::new(FakeCheckout { parent: Some(Err(why.clone())), ..Default::default() });
+    let root = root_with_checkout(&pool, Some(true), fake).await;
+    let refused = start_on(&pool, root, serde_json::json!({"brief": "Fix it.", "repo": "/workspace/app"}))
+        .await
+        .expect_err("refused");
+    assert_eq!(refused, why);
     assert_eq!(children(&pool, root).await, 0);
 }

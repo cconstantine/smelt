@@ -64,9 +64,18 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
         None => None,
         Some(path) => {
             let parent_repo = parent_checkout(pool, caller, path).await?;
-            let git_ref = git_ref.ok_or("give ref: the branch, tag or commit of the repo to check out")?;
-            crate::git::validate_ref(git_ref)?;
-            Some((parent_repo, crate::git::CloneTarget::Ref(git_ref.to_string())))
+            let target = match git_ref {
+                Some(git_ref) => {
+                    crate::git::validate_ref(git_ref)?;
+                    crate::git::CloneTarget::Ref(git_ref.to_string())
+                }
+                // The parent's exact commit, which must be on its upstream.
+                None => {
+                    let (sha, branch) = checkout_for(caller).parent_commit(pool, caller, &parent_repo.dir).await?;
+                    crate::git::CloneTarget::Commit { sha, branch }
+                }
+            };
+            Some((parent_repo, target))
         }
     };
     // The parent's model, resolved now: the child runs on it.
@@ -96,6 +105,9 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
     crate::events::publish_app(crate::events::AppEvent::ConversationsChanged);
     let on = match &repo {
         Some((parent_repo, crate::git::CloneTarget::Ref(r))) => format!(" on {} at {r}", parent_repo.url),
+        Some((parent_repo, crate::git::CloneTarget::Commit { sha, branch })) => {
+            format!(" on {} at your commit {sha} (branch {branch})", parent_repo.url)
+        }
         None => String::new(),
     };
     let request = StartRequest { repo: child_repo.zip(repo.map(|(_, target)| target)) };

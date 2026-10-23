@@ -82,3 +82,63 @@ async fn test_checkout_ref_takes_a_branch_a_tag_and_commits() {
     manager.delete(sandbox).await.expect("delete pod");
     checks.expect("checks finished within the timeout");
 }
+
+/// A parent's checkout of /tmp/origin.git at /workspace/<dir>, on `main`
+/// tracking origin's, after `script` runs in it.
+async fn parent_checkout(sandbox: &Sandbox, shell: &crate::sandbox::PodShell, dir: &'static str, script: &str) {
+    crate::git::clone_into_pod(shell, ORIGIN, None, dir).await.expect("clone");
+    let path = format!("/workspace/{dir}");
+    let full = format!("set -e; cd \"$1\"; c() {{ git -c user.name=t -c user.email=t@t commit -q --allow-empty -m \"$1\"; }}\n{script}");
+    let ran = sandbox.exec(&["sh", "-c", &full, "sh", &path]).await.expect("exec setup");
+    assert_eq!(ran.exit_code, 0, "{dir}: {}{}", ran.stdout, ran.stderr);
+}
+
+/// The parent's commit: given when it's on its upstream and clean (an
+/// untracked file aside), refused with what to do otherwise; and a child
+/// checked out at it is on a branch of the upstream's name.
+#[tokio::test]
+async fn test_parent_commit_needs_a_pushed_clean_branch() {
+    let client = test_client().await;
+    let manager = SandboxManager::new(client.clone());
+    let sandbox = manager.create(&unique_session_id("parent-commit"), "256Mi", &[]).await.expect("create pod");
+    let shell = sandbox.shell();
+
+    let checks = tokio::time::timeout(Duration::from_secs(120), async {
+        let made = make_origin(&sandbox).await;
+        let (c2, feature) = (&made[1], &made[3]);
+
+        // Behind its upstream (reset to c2, origin/main at c3), with an
+        // untracked file: its own commit, upstream `main`.
+        parent_checkout(&sandbox, &shell, "behind", "git reset -q --hard HEAD~1; touch untracked.txt").await;
+        assert_eq!(crate::git::parent_commit(&shell, "behind").await, Ok((c2.clone(), "main".to_string())));
+
+        parent_checkout(&sandbox, &shell, "on-feature", "git checkout -q feature").await;
+        assert_eq!(crate::git::parent_commit(&shell, "on-feature").await, Ok((feature.clone(), "feature".to_string())));
+
+        parent_checkout(&sandbox, &shell, "detached", "git checkout -q --detach HEAD").await;
+        let refused = crate::git::parent_commit(&shell, "detached").await.expect_err("detached");
+        assert!(refused.starts_with("/workspace/detached is on a detached HEAD"), "{refused}");
+
+        parent_checkout(&sandbox, &shell, "no-upstream", "git checkout -q -b local").await;
+        let refused = crate::git::parent_commit(&shell, "no-upstream").await.expect_err("no upstream");
+        assert!(refused.starts_with("/workspace/no-upstream's branch local has no upstream: push it (git push -u origin local)"), "{refused}");
+
+        parent_checkout(&sandbox, &shell, "ahead", "c mine; c mine-too").await;
+        let refused = crate::git::parent_commit(&shell, "ahead").await.expect_err("ahead");
+        assert!(refused.starts_with("/workspace/ahead has 2 commits not on origin/main: push them"), "{refused}");
+
+        parent_checkout(&sandbox, &shell, "dirty", "echo x > tracked.txt; git add tracked.txt; c add; git push -q origin HEAD:main; echo y > tracked.txt").await;
+        let refused = crate::git::parent_commit(&shell, "dirty").await.expect_err("dirty");
+        assert!(refused.starts_with("/workspace/dirty has uncommitted changes to tracked files"), "{refused}");
+
+        // A child at the parent's commit: on `main`, at c2, tracking origin's.
+        crate::git::clone_into_pod(&shell, ORIGIN, None, "child").await.expect("clone");
+        let target = CloneTarget::Commit { sha: c2.clone(), branch: "main".to_string() };
+        crate::git::checkout_ref(&shell, "child", ORIGIN, &target).await.expect("check out the parent's commit");
+        assert_eq!(head_of(&sandbox, "child").await, (c2.clone(), "main".to_string(), "origin/main".to_string()));
+    })
+    .await;
+
+    manager.delete(sandbox).await.expect("delete pod");
+    checks.expect("checks finished within the timeout");
+}

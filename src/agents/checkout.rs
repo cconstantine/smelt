@@ -14,6 +14,11 @@ type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// The pod work of a child's start.
 pub(crate) trait ChildCheckout: Send + Sync {
+    /// The commit the parent's checkout `dir` is on, and its upstream
+    /// branch's name: refused unless the commit is on that upstream (after
+    /// a fetch) with no uncommitted changes to tracked files.
+    fn parent_commit<'a>(&'a self, pool: &'a PgPool, parent: i64, dir: &'a str) -> Boxed<'a, Result<(String, String), String>>;
+
     /// Clones `repo` (the child's, recorded `cloning`) at `target` and
     /// records it ready, with its AGENTS.md and persona files.
     fn clone_repo<'a>(
@@ -39,6 +44,15 @@ pub(crate) trait ChildCheckout: Send + Sync {
 pub(crate) struct PodCheckout;
 
 impl ChildCheckout for PodCheckout {
+    fn parent_commit<'a>(&'a self, pool: &'a PgPool, parent: i64, dir: &'a str) -> Boxed<'a, Result<(String, String), String>> {
+        Box::pin(async move {
+            let shell = crate::sandbox::PodShell::for_conversation(pool, parent)
+                .await
+                .map_err(|e| format!("couldn't reach your sandbox to read your checkout's commit: {e}"))?;
+            crate::git::parent_commit(&shell, dir).await
+        })
+    }
+
     fn clone_repo<'a>(
         &'a self,
         pool: &'a PgPool,

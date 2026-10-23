@@ -7,6 +7,9 @@ use super::*;
 /// What a child's clone checks out after cloning the default branch.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CloneTarget {
+    /// The parent's exact commit, on a branch named as the parent's
+    /// upstream branch, tracking it when the remote still has it.
+    Commit { sha: String, branch: String },
     /// A branch, tag or commit on the remote, as `start_agent` was given it.
     Ref(String),
 }
@@ -43,8 +46,46 @@ fn is_hex_id(r: &str) -> bool {
 /// The branch a ref asks for, for the child's repo row: none for a commit id.
 pub fn requested_branch(target: &CloneTarget) -> Option<String> {
     match target {
+        CloneTarget::Commit { branch, .. } => Some(branch.clone()),
         CloneTarget::Ref(r) if is_hex_id(r) => None,
         CloneTarget::Ref(r) => Some(r.clone()),
+    }
+}
+
+/// The commit the checkout `/workspace/<dir>` is on and its upstream
+/// branch's name (without the remote): what a child started without a ref
+/// is cloned at. Fetches first, under `timeout`, and refuses a detached
+/// HEAD, a branch with no upstream, commits not on the upstream and
+/// uncommitted changes to tracked files, each saying what to do. An
+/// untracked file is no reason to refuse: the child doesn't get it either way.
+pub async fn parent_commit(shell: &sandbox::PodShell, dir: &str) -> Result<(String, String), String> {
+    let path = format!("{}/{dir}", crate::sandbox::WORKSPACE_DIR);
+    let script = r#"cd "$1" || exit 1
+        GIT_TERMINAL_PROMPT=0 timeout 60 git -c core.sshCommand='ssh -o BatchMode=yes' fetch --quiet origin || exit 10
+        b=$(git symbolic-ref --short -q HEAD) || exit 11
+        echo "$b"
+        u=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null) || exit 12
+        echo "$u"
+        git merge-base --is-ancestor HEAD '@{u}' || { git rev-list --count '@{u}..HEAD'; exit 13; }
+        [ -z "$(git status --porcelain --untracked-files=no)" ] || exit 14
+        git rev-parse HEAD"#;
+    let ran = shell.run(&["sh", "-c", script, "sh", &path], None).await.map_err(|e| e.to_string())?;
+    let lines: Vec<&str> = ran.stdout.lines().collect();
+    let line = |i: usize| lines.get(i).copied().unwrap_or("").trim().to_string();
+    let (branch, upstream) = (line(0), line(1));
+    let or_ref = "or pass ref to start the agent on a branch, tag or commit of the remote";
+    match ran.exit_code {
+        0 => {
+            // `origin/feature` -> `feature`: the branch the child's is named for.
+            let name = upstream.split_once('/').map_or(upstream.as_str(), |(_, name)| name).to_string();
+            Ok((line(2), name))
+        }
+        10 => Err(format!("couldn't fetch {path}'s remote to check your commit is on it: {}", ran.stderr.trim())),
+        11 => Err(format!("{path} is on a detached HEAD: check out a branch, commit and push, {or_ref}")),
+        12 => Err(format!("{path}'s branch {branch} has no upstream: push it (git push -u origin {branch}), {or_ref}")),
+        13 => Err(format!("{path} has {} commits not on {upstream}: push them, {or_ref}", line(2))),
+        14 => Err(format!("{path} has uncommitted changes to tracked files: commit and push them, {or_ref}")),
+        code => Err(format!("couldn't read {path}'s commit (exit code {code}): {}", ran.stderr.trim())),
     }
 }
 
@@ -61,6 +102,15 @@ pub async fn checkout_ref(shell: &sandbox::PodShell, dir: &str, url: &str, targe
     let fetch = "fetch_id() { git cat-file -e \"$1^{commit}\" 2>/dev/null || \
                  GIT_TERMINAL_PROMPT=0 timeout 120 git -c core.sshCommand='ssh -o BatchMode=yes' fetch --quiet origin \"$1\"; }";
     let (script, args): (String, Vec<&str>) = match target {
+        CloneTarget::Commit { sha, branch } => (
+            format!(
+                "set -e; cd \"$1\"; {fetch}
+                 fetch_id \"$2\"
+                 git checkout -q -B \"$3\" \"$2\"
+                 git branch -q --set-upstream-to=\"origin/$3\" \"$3\" 2>/dev/null || true"
+            ),
+            vec![sha.as_str(), branch.as_str()],
+        ),
         CloneTarget::Ref(r) => (
             format!(
                 "cd \"$1\" || exit 1; r=\"$2\"; {fetch}
@@ -84,11 +134,13 @@ pub async fn checkout_ref(shell: &sandbox::PodShell, dir: &str, url: &str, targe
         0 => Ok(()),
         NO_SUCH_REF => Err(match target {
             CloneTarget::Ref(r) => format!("no branch, tag or commit `{r}` on {url}"),
+            CloneTarget::Commit { sha, .. } => format!("no commit {sha} on {url}"),
         }),
         code => Err(format!(
             "couldn't check out {} in {path} (exit code {code}): {}",
             match target {
                 CloneTarget::Ref(r) => r.as_str(),
+                CloneTarget::Commit { sha, .. } => sha.as_str(),
             },
             format!("{}{}", ran.stdout, ran.stderr).trim()
         )),

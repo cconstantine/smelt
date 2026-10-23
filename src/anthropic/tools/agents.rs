@@ -31,7 +31,7 @@ pub(super) fn tools() -> Vec<Registered> {
                             },
                             "ref": {
                                 "type": "string",
-                                "description": "the branch, tag or commit of repo's remote to check out"
+                                "description": "the branch, tag or commit of repo's remote to check out; without it, the commit your checkout is on, which must be pushed and clean"
                             }
                         },
                         "required": ["brief"]
