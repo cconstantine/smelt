@@ -10,14 +10,20 @@ const MAX_AGENTS_FILES: usize = 50;
 /// Whether `text` (a repo's path, or its branch name since SME-272) can
 /// go on a line of the system prompt as it is: no control character (C0,
 /// DEL, C1), line or paragraph separator, or bidi control, any of which
-/// can break a line or reorder its text (SME-271). Non-ASCII letters are
-/// plain.
+/// can break a line or reorder its text (SME-271), and no character that
+/// renders as nothing (SME-276). Non-ASCII letters are plain.
 pub fn plain_path_text(text: &str) -> bool {
-    !text.chars().any(breaks_a_line)
+    !text.chars().any(not_plain)
+}
+
+/// What `plain_path_text` refuses and `plain_multiline_text` escapes: a
+/// character that can break or reorder a line, or one that hides text.
+fn not_plain(c: char) -> bool {
+    breaks_a_line(c) || hides_text(c)
 }
 
 /// A control character (C0, DEL, C1), line or paragraph separator, or
-/// bidi control: what `plain_path_text` refuses.
+/// bidi control.
 fn breaks_a_line(c: char) -> bool {
     c.is_control()
         || matches!(
@@ -26,16 +32,47 @@ fn breaks_a_line(c: char) -> bool {
         )
 }
 
+/// Unicode's `Default_Ignorable_Code_Point` (DerivedCoreProperties
+/// 18.0.0), the characters that render as nothing by default (SME-276):
+/// a person reading the text can't see them, while the model reads them,
+/// so tag characters (U+E0000–E007F) can carry hidden ASCII and variation
+/// selectors hidden bytes. Zero-width spaces and joiners, the soft
+/// hyphen, the BOM, Hangul fillers and the reserved ignorables too. It
+/// overlaps `breaks_a_line` on the bidi controls.
+fn hides_text(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00ad}'
+            | '\u{034f}'
+            | '\u{061c}'
+            | '\u{115f}'..='\u{1160}'
+            | '\u{17b4}'..='\u{17b5}'
+            | '\u{180b}'..='\u{180f}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{3164}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{feff}'
+            | '\u{ffa0}'
+            | '\u{fff0}'..='\u{fff8}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0000}'..='\u{e0fff}'
+    )
+}
+
 /// `text` (a failed clone's error, which the remote can write into)
 /// made safe to show the model (SME-275): every character
 /// `plain_path_text` refuses, except the newlines and tabs git's own
-/// messages use, is written as its `\u{…}` escape. The escape is ASCII,
-/// shows the model what was there, and leaves already-escaped text as it
-/// is, so escaping twice changes nothing.
+/// messages use, is written as its `\u{…}` escape, the ones that render
+/// as nothing included (SME-276). The escape is ASCII, shows the model
+/// what was there, and leaves already-escaped text as it is, so escaping
+/// twice changes nothing.
 pub fn plain_multiline_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if breaks_a_line(c) && c != '\n' && c != '\t' {
+        if not_plain(c) && c != '\n' && c != '\t' {
             out.extend(c.escape_unicode());
         } else {
             out.push(c);
@@ -179,7 +216,11 @@ pub fn resolve_instructions_path<'a>(
     path: &str,
 ) -> Result<(&'a db::ConversationRepo, String), String> {
     if !plain_path_text(path) {
-        return Err(format!("{path:?} isn't a plain path: it holds control characters."));
+        // Debug quotes it and escapes newlines and tabs, but leaves
+        // characters Rust counts as printable raw (the Hangul fillers):
+        // escape those too (SME-276 review 1).
+        let quoted = plain_multiline_text(&format!("{path:?}"));
+        return Err(format!("{quoted} isn't a plain path: it holds control characters."));
     }
     let not_in = || {
         format!(
