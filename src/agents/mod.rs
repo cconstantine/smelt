@@ -143,6 +143,15 @@ pub(crate) async fn admit_user_turn(pool: &PgPool, conversation_id: i64) -> Resu
     }
 }
 
+/// The user's turn, once it holds the turn lock: an agent that finished
+/// while the turn waited behind its last one is `active` again, so the
+/// work the user asked for can be reported too (review 2).
+pub(crate) async fn resume_finished(pool: &PgPool, conversation_id: i64) {
+    if let Err(e) = db::reactivate_finished(pool, conversation_id).await {
+        tracing::warn!(conversation_id, error = %e, "couldn't make a finished agent active for the user's turn");
+    }
+}
+
 /// After `admit_user_turn` and the turn's count: refused if a `stop_agent`
 /// (or a delete) landed in between, whose `stop_conversation` then found no
 /// turn to end (review 1). One landing after this read stops the counted

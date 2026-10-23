@@ -133,6 +133,8 @@ pub(super) fn run_turn_bounded<'a>(
                 new_message,
                 max_turns,
                 from_user,
+                // Only the user's sends and answers keep their error.
+                keep_error.is_some(),
                 place,
                 in_flight.stop(),
                 &mut generation,
@@ -200,6 +202,7 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
     new_message: Option<anthropic::AnthropicMessage>,
     max_turns: usize,
     from_user: bool,
+    users_turn: bool,
     place: Option<TurnPlace>,
     stop: &'b mut tokio::sync::watch::Receiver<u64>,
     generation: &'b mut Option<u64>,
@@ -243,6 +246,12 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
         };
         if new_message.is_some() {
             *generation = take_turn_generation(conversation_id, &lock);
+        }
+        // The user's turn in an agent that finished while this queued
+        // behind its last turn makes it active again, so it can report
+        // again (SME-236 review 2). A parent's stop isn't undone.
+        if users_turn {
+            crate::agents::resume_finished(pool, conversation_id).await;
         }
         // Checked after the generation is taken, both under the lock: a
         // delete landing before the check is seen here, and one landing

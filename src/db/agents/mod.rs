@@ -254,6 +254,20 @@ pub async fn reactivate_agent(pool: &PgPool, id: i64) -> Result<bool, sqlx::Erro
         > 0)
 }
 
+/// The user's turn, holding the turn lock, in an agent that `finish`ed
+/// while it waited: `active` again. Only `finished`: a stop wins.
+pub async fn reactivate_finished(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE agents SET state = $2, state_changed_at = now() WHERE conversation_id = $1 AND state = $3",
+    )
+    .bind(id)
+    .bind(AGENT_ACTIVE)
+    .bind(AGENT_FINISHED)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Queues a notice from smelt to `to` about agent `from` (`from_label`),
 /// in a transaction of its own: one that reports no state change.
 pub async fn queue_notice(pool: &PgPool, to: i64, from: i64, from_label: &str, body: &str) -> Result<(), sqlx::Error> {

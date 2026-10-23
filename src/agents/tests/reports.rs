@@ -186,3 +186,57 @@ async fn test_finish_twice_is_refused_the_second_time(pool: PgPool) {
     assert_eq!(reports, 1);
     eventually("the parent's turns are over", || async { !crate::turn::turn_running(root) && !crate::turn::turn_running(child) }).await;
 }
+
+/// Review 2, finding 1: the user writes to a working child; its running
+/// turn finishes; the user's turn, queued behind it, does more work and
+/// finishes again. Its second report reaches the parent too: the user's
+/// turn makes the child active again once it holds the turn lock.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_users_message_queued_behind_a_finish_can_finish_again(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let child_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let gate = gate.clone();
+        let child_calls = child_calls.clone();
+        mock_with(&pool, move |request| {
+            if agent_of(request).is_none() {
+                return Box::pin(async { text_reply("Noted.") });
+            }
+            let gate = gate.clone();
+            match child_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => Box::pin(async move {
+                    gate.notified().await;
+                    tool_call_reply("finish", serde_json::json!({"report": "First."}))
+                }),
+                1 => Box::pin(async { tool_call_reply("finish", serde_json::json!({"report": "Second."})) }),
+                _ => Box::pin(async { text_reply("ok") }),
+            }
+        })
+        .await;
+    }
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    let child = start_child(&pool, root, "Work.").await;
+    eventually("the child's first call is held", || async {
+        child_calls.load(std::sync::atomic::Ordering::SeqCst) == 1
+    })
+    .await;
+    crate::turn::start_turn(pool.clone(), child, "Also do this.".to_string()).await.expect("the send is admitted");
+    gate.notify_one();
+
+    eventually("both of the child's calls ran", || async {
+        child_calls.load(std::sync::atomic::Ordering::SeqCst) >= 2 && !crate::turn::turn_running(child)
+    })
+    .await;
+    eventually("both reports are queued", || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1 AND kind = 'report'")
+            .bind(root)
+            .fetch_one(&pool)
+            .await
+            .expect("count")
+            == 2
+    })
+    .await;
+    assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_FINISHED));
+    eventually("every turn is over", || async { !crate::turn::turn_running(root) }).await;
+}
