@@ -103,3 +103,30 @@ async fn test_the_conversation_tree_has_each_agents_state_persona_and_waits(pool
     assert_eq!(carded.state.as_deref(), Some(AGENT_FINISHED));
     assert_eq!((carded.parent_id, carded.waiting_for_user, carded.waiting_for_parent), (Some(asks_user), true, false));
 }
+
+/// SME-246: the banner's list is every agent under a conversation, at any
+/// depth, waiting for the user (a question or a card), and never one that
+/// only asked its parent, nor one under another conversation.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_agents_waiting_under_finds_every_depth_and_only_the_users_waits(pool: PgPool) {
+    let root = test_conversation(&pool).await.id;
+    let child = agent(&pool, root, AGENT_ACTIVE, None).await;
+    let grandchild = agent(&pool, child, AGENT_ACTIVE, None).await;
+    let asks_parent = agent(&pool, root, AGENT_ACTIVE, None).await;
+    let elsewhere = test_conversation(&pool).await.id;
+    let not_mine = agent(&pool, elsewhere, AGENT_ACTIVE, None).await;
+    question(&pool, root, ASKED_OF_USER).await;
+    question(&pool, child, ASKED_OF_USER).await;
+    trust_card(&pool, grandchild).await;
+    question(&pool, asks_parent, ASKED_OF_PARENT).await;
+    question(&pool, not_mine, ASKED_OF_USER).await;
+
+    let titles = |id: i64| format!("agent of {id}");
+    assert_eq!(
+        agents_waiting_under(&pool, root).await.expect("waiting"),
+        vec![(child, titles(root)), (grandchild, titles(child))],
+        "the root's own question isn't an agent's"
+    );
+    assert_eq!(agents_waiting_under(&pool, child).await.expect("waiting"), vec![(grandchild, titles(child))]);
+    assert!(agents_waiting_under(&pool, grandchild).await.expect("waiting").is_empty());
+}

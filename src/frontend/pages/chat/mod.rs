@@ -55,6 +55,7 @@ use crate::frontend::Route;
 use crate::models::Message;
 
 mod actions;
+mod agents_waiting;
 mod composer;
 mod context;
 mod follow;
@@ -72,6 +73,7 @@ mod transcript;
 mod trust_card;
 
 use actions::*;
+use agents_waiting::*;
 use composer::*;
 use context::*;
 use follow::*;
@@ -299,6 +301,7 @@ fn ChatPanel(
                         }
                     }
                     div { class: "chat-main",
+                        AgentsWaitingBanner { selected, conversations_changed, questions_changed }
                         ContextUsage {
                             selected,
                             state,

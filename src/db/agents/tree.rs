@@ -38,3 +38,22 @@ pub async fn conversation_tree(pool: &PgPool) -> Result<Vec<TreeRow>, sqlx::Erro
     .fetch_all(pool)
     .await
 }
+
+/// The conversations under `id`, at any depth, that wait for the user,
+/// by id: `(id, title)`.
+pub async fn agents_waiting_under(pool: &PgPool, id: i64) -> Result<Vec<(i64, String)>, sqlx::Error> {
+    sqlx::query_as::<_, (i64, String)>(&format!(
+        "WITH RECURSIVE under(id) AS (
+             SELECT id FROM conversations WHERE parent_id = $1
+             UNION
+             SELECT g.id FROM conversations g JOIN under u ON g.parent_id = u.id
+         )
+         SELECT c.id, c.title FROM conversations c JOIN under u ON u.id = c.id
+         WHERE {}
+         ORDER BY c.id",
+        super::WAITS_FOR_USER
+    ))
+    .bind(id)
+    .fetch_all(pool)
+    .await
+}

@@ -30,6 +30,13 @@ pub struct ConversationNode {
     pub waiting_for_user: bool,
 }
 
+/// One agent under a conversation that waits for the user, for its banner.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentWaiting {
+    pub id: i64,
+    pub title: String,
+}
+
 /// A conversation just made, before the next fetch brings its node: the
 /// user's own, so no persona or status, and nothing running or waiting.
 impl From<crate::models::Conversation> for ConversationNode {
@@ -59,6 +66,16 @@ pub async fn get_conversation_tree() -> ServerFnResult<Vec<ConversationNode>> {
         .map_err(ServerFnError::new)?;
     let running: std::collections::HashSet<i64> = crate::turn::busy_conversations().into_iter().collect();
     Ok(rows.into_iter().map(|row| node(row, &running)).collect())
+}
+
+/// The agents under conversation `id`, at any depth, waiting for the user
+/// (a question or a trust card; never a question to their parent).
+#[get("/api/conversations/{id}/agents-waiting")]
+pub async fn get_agents_waiting(id: i64) -> ServerFnResult<Vec<AgentWaiting>> {
+    let waiting = crate::db::agents_waiting_under(crate::db::get(), id)
+        .await
+        .map_err(ServerFnError::new)?;
+    Ok(waiting.into_iter().map(|(id, title)| AgentWaiting { id, title }).collect())
 }
 
 /// A tree row as the sidebar shows it, `running` being the conversations
