@@ -348,3 +348,22 @@ async fn test_markup_for_a_call_the_reply_also_made_gets_no_correction(pool: PgP
     assert_eq!(notices(&saved), 0, "{saved:?}");
     assert_eq!(requests.lock().expect("the request log").len(), 2);
 }
+
+/// Review 2, finding 3: a provider that leaves a parsed call's markup in
+/// the text in a form with no name to read (Mistral's JSON list) gets no
+/// correction either, when the reply made real calls: the markup is the
+/// calls that ran.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_unnamed_markup_beside_real_calls_gets_no_correction(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let markup = "[TOOL_CALLS][{\"name\": \"todoread\", \"arguments\": {}}]";
+    let both = text_blocks_body(&[Block::Text(markup), Block::Todoread("toolu_both")], "tool_use");
+    let requests = start_recording_mock_upstream(&pool, vec![both, text_reply_body("Done.")]).await;
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("the turn succeeds");
+
+    assert_eq!(roles(&saved), ["user", "assistant", "user", "assistant"], "{saved:?}");
+    assert_eq!(notices(&saved), 0, "{saved:?}");
+    assert_eq!(requests.lock().expect("the request log").len(), 2);
+}

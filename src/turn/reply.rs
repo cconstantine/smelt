@@ -304,7 +304,9 @@ pub(super) async fn after_reply(
         streak.nudged = false;
         // Markup for a call the reply also made is a provider leaving the
         // parsed call in the text too: it ran, and a correction would have
-        // the model make it again (review 1).
+        // the model make it again (review 1). Matched by name; markup with
+        // no name to read (Mistral's JSON list) is taken for the calls made
+        // too (review 2).
         let made: Vec<&str> = turn
             .content
             .iter()
@@ -314,7 +316,7 @@ pub(super) async fn after_reply(
             })
             .collect();
         let calls: Vec<_> =
-            text_calls(turn).into_iter().filter(|c| !c.name.as_deref().is_some_and(|n| made.contains(&n))).collect();
+            text_calls(turn).into_iter().filter(|c| c.name.as_deref().is_some_and(|n| !made.contains(&n))).collect();
         let correction = (!calls.is_empty()).then(|| crate::text_calls::text_call_notice(&calls, offered));
         return Ok(NextStep::RunTools(correction));
     }
