@@ -228,13 +228,17 @@ printf 'DATABASE_URL=%s\n' "$repo_url" >"$repo_clone/.env"
 if [ ! -d "$wt_repo/.git" ]; then
     { [ -d "$wt_repo" ] && git -C "$wt_repo" init -q; } ||
         git clone -q --shared --no-checkout "$repo_clone" "$wt_repo" || exit 1
-    echo "$repo_clone/.git/objects" >"$wt_repo/.git/objects/info/alternates"
     git -C "$wt_repo" fetch -q "$repo_clone" HEAD || exit 1
     # On a fresh clone this is its own HEAD already; on a migrated directory
     # it's the only name the fetched commit has, and it makes the detach
     # below one that HEAD can name.
     git -C "$wt_repo" checkout -q --force --detach FETCH_HEAD || exit 1
 fi
+# Rewritten every run, not only at creation: the objects live in repo_clone,
+# whose path differs between the host that runs this suite directly and the
+# container that runs it in the gate (/app), and a dangling alternate fails
+# every object read (the trap SME-251 records for the other fixture clones).
+echo "$repo_clone/.git/objects" >"$wt_repo/.git/objects/info/alternates"
 git -C "$wt_repo" checkout -q --force --detach HEAD || exit 1
 : >"$wt_repo/.env"
 : >"$SQLX_CALLS"
