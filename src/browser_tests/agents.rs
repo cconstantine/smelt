@@ -213,7 +213,17 @@ pub(super) async fn scenario_agent_tree(t: &Scenario<'_>) {
         wait_for_count(&page, ".agents-waiting-banner .agents-waiting-link", 2, Duration::from_secs(10)).await,
         "the banner didn't gain the developer agent"
     );
-    // The banner's link opens the waiting agent.
+    // The banner's link opens the waiting agent, and its row shows, marked
+    // open, though its grandparent was folded (review 1, finding 3).
+    let caret = format!(".conversation-item[data-conversation-id='{}'] .tree-caret", root.id);
+    click_when_present(&page, &caret, Duration::from_secs(5)).await;
+    wait_for_tree(&page, &ids, &[row(root.id, 0, "", "?2")], "folded before the link").await;
     click_when_present(&page, &format!(".agents-waiting-link[href$='/conversation/{grandchild}']"), Duration::from_secs(5)).await;
     wait_for_live_client(&page, grandchild).await;
+    wait_for_element(
+        &page,
+        &format!(".conversation-item.active[data-conversation-id='{grandchild}']"),
+        Duration::from_secs(10),
+    )
+    .await;
 }

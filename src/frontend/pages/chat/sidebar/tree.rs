@@ -56,6 +56,25 @@ pub(super) fn build_tree(nodes: &[ConversationNode], collapsed: &HashSet<i64>) -
     rows
 }
 
+/// Unfolds every ancestor of the `open` conversation, so its row shows
+/// wherever it was opened from (SME-246 review 1: a banner link to an agent
+/// inside a folded parent left no row marked open). Whether it unfolded
+/// anything.
+pub(super) fn unfold_to(collapsed: &mut HashSet<i64>, nodes: &[ConversationNode], open: Option<i64>) -> bool {
+    let parents: HashMap<i64, Option<i64>> = nodes.iter().map(|n| (n.id, n.parent_id)).collect();
+    let mut unfolded = false;
+    let mut seen = HashSet::new();
+    let mut at = open.and_then(|id| parents.get(&id).copied().flatten());
+    while let Some(id) = at {
+        if !seen.insert(id) {
+            break;
+        }
+        unfolded |= collapsed.remove(&id);
+        at = parents.get(&id).copied().flatten();
+    }
+    unfolded
+}
+
 fn push_subtree(
     node: &ConversationNode,
     depth: usize,
@@ -187,6 +206,21 @@ mod tests {
         let indents: Vec<usize> = rows.iter().map(TreeRow::indent).collect();
         assert_eq!(indents, vec![0, 1, 2, 3, 3, 3]);
         assert_eq!(rows[5].depth, 5);
+    }
+
+    #[test]
+    fn test_opening_an_agent_unfolds_every_folded_ancestor_and_nothing_else() {
+        let list = vec![node(1, None), node(2, Some(1)), node(3, Some(2)), node(4, None), node(5, Some(4))];
+        let mut collapsed = HashSet::from([1, 2, 4]);
+        assert!(unfold_to(&mut collapsed, &list, Some(3)));
+        assert_eq!(collapsed, HashSet::from([4]), "only the open one's ancestors unfold");
+        assert_eq!(build_tree(&list, &collapsed).iter().map(|r| r.node.id).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        assert!(!unfold_to(&mut collapsed, &list, Some(3)), "nothing left to unfold");
+        assert!(!unfold_to(&mut collapsed, &list, Some(4)), "a folded root's own row is shown already");
+        assert!(!unfold_to(&mut collapsed, &list, None));
+        assert!(!unfold_to(&mut collapsed, &list, Some(99)), "an id the list doesn't have");
+        let cycle = vec![node(1, Some(2)), node(2, Some(1))];
+        assert!(unfold_to(&mut HashSet::from([1, 2]), &cycle, Some(1)), "a malformed cycle ends");
     }
 
     #[test]

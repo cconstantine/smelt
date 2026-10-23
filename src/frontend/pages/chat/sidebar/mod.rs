@@ -7,7 +7,7 @@ use crate::api::agents::{ConversationNode, get_conversation_tree};
 
 mod tree;
 
-use tree::{TreeRow, build_tree};
+use tree::{TreeRow, build_tree, unfold_to};
 
 /// How long ago a conversation was last active, as the sidebar shows it:
 /// one unit, `now`, `5m`, `3h`, `2d`, `3w` (SME-41 D8).
@@ -79,6 +79,17 @@ pub(super) fn ConversationSidebar(
                 gloo_timers::future::TimeoutFuture::new(60_000).await;
             }
         });
+    });
+
+    // The open conversation's row always shows: opening an agent inside a
+    // folded parent (its banner link, a URL) unfolds the parents above it.
+    use_effect(move || {
+        let open = selected();
+        let nodes = conversations();
+        let mut folded = collapsed.peek().clone();
+        if unfold_to(&mut folded, &nodes, open) {
+            collapsed.set(folded);
+        }
     });
 
     use_effect(move || {
