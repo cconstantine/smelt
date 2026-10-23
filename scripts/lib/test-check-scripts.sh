@@ -293,8 +293,22 @@ cs_env=(env -u SANDBOX_IMAGE -u RUST_LOG -u NO_COLOR PATH="$dir/bin:$PATH" SANDB
     SANDBOX_INSTANCE_CLEANUP="$dir/bin/cleanup" DATABASE_URL=postgres://u@localhost/smelt_dev CHECK_PORT="$port")
 
 
+# The checkout this suite runs in: finish() fails if anything in the run
+# moved its HEAD. A fixture that isn't a working tree of its own lets
+# check-server's `git -C "$worktree" checkout --detach` walk up and detach
+# the checkout under test (SME-265); the recorded ref, not just its commit,
+# so a detach that lands on the same sha still fails.
+head_before=$(git rev-parse HEAD)
+head_ref_before=$(git symbolic-ref -q HEAD || echo DETACHED)
+
 # Ends a script: its failures, or that every case passed.
 finish() {
+    local head_now ref_now
+    head_now=$(git rev-parse HEAD)
+    ref_now=$(git symbolic-ref -q HEAD || echo DETACHED)
+    if [ "$head_now" != "$head_before" ] || [ "$ref_now" != "$head_ref_before" ]; then
+        fail "the suite moved this checkout's HEAD: '$head_ref_before $head_before' → '$ref_now $head_now'"
+    fi
     if [ "$failures" -gt 0 ]; then
         echo "$failures failure(s)"
         exit 1

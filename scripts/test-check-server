@@ -218,7 +218,24 @@ repo_scratch_url=postgres://repouser@localhost/smelt_scratch_wtrepoenv
 # server's, named after the worktree.
 "${no_url_env[@]}" CHECK_WORKTREE="$wt_repo" "$repo_clone/scripts/check-server" stop >/dev/null 2>&1
 printf 'DATABASE_URL=%s\n' "$repo_url" >"$repo_clone/.env"
-mkdir -p "$wt_repo"
+# A working tree of its own (SME-265): pointed at a plain directory, start's
+# `git -C "$worktree" checkout --detach` walks up out of it and detaches the
+# checkout running the suite. A fresh clone of repo_clone resolves the served
+# commits through repo_clone's own objects; one an earlier run made is kept,
+# and the detach below moves it like start would. A directory an earlier,
+# pre-fix run left is migrated in place, keeping the emptied state files the
+# cases below expect.
+if [ ! -d "$wt_repo/.git" ]; then
+    { [ -d "$wt_repo" ] && git -C "$wt_repo" init -q; } ||
+        git clone -q --shared --no-checkout "$repo_clone" "$wt_repo" || exit 1
+    echo "$repo_clone/.git/objects" >"$wt_repo/.git/objects/info/alternates"
+    git -C "$wt_repo" fetch -q "$repo_clone" HEAD || exit 1
+    # On a fresh clone this is its own HEAD already; on a migrated directory
+    # it's the only name the fetched commit has, and it makes the detach
+    # below one that HEAD can name.
+    git -C "$wt_repo" checkout -q --force --detach FETCH_HEAD || exit 1
+fi
+git -C "$wt_repo" checkout -q --force --detach HEAD || exit 1
 : >"$wt_repo/.env"
 : >"$SQLX_CALLS"
 if ! out=$("${no_url_env[@]}" CHECK_WORKTREE="$wt_repo" "$repo_clone/scripts/check-server" start HEAD 2>&1); then
