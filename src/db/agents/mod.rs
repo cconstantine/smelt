@@ -8,8 +8,10 @@
 
 use super::*;
 
+mod delete;
 mod start;
 
+pub use delete::*;
 pub use start::*;
 
 /// `agents.state`: the start is running; no turn is admitted.
@@ -43,6 +45,7 @@ pub struct AgentMessage {
 pub enum RowLock {
     KeyShare,
     NoKeyUpdate,
+    Update,
 }
 
 impl RowLock {
@@ -50,6 +53,7 @@ impl RowLock {
         match self {
             RowLock::KeyShare => "SELECT id FROM conversations WHERE id = $1 FOR KEY SHARE",
             RowLock::NoKeyUpdate => "SELECT id FROM conversations WHERE id = $1 FOR NO KEY UPDATE",
+            RowLock::Update => "SELECT id FROM conversations WHERE id = $1 FOR UPDATE",
         }
     }
 }
@@ -146,6 +150,8 @@ pub async fn finish_agent(pool: &PgPool, child: i64, label: &str, report: &str) 
     .execute(&mut *tx)
     .await?
     .rows_affected();
+    #[cfg(test)]
+    crate::agents::test_hooks::reach(crate::agents::test_hooks::FINISH_UPDATED, child).await;
     if finished == 0 {
         let state = sqlx::query_scalar::<_, String>("SELECT state FROM agents WHERE conversation_id = $1")
             .bind(child)

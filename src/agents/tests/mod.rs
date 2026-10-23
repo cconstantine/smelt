@@ -7,6 +7,7 @@ use crate::anthropic::ContentBlock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod delete;
 mod ended;
 mod list;
 mod persona;

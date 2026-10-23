@@ -63,26 +63,10 @@ async fn delete_and_forget(pool: &PgPool, id: i64) -> Result<(), String> {
     // In the request's span, so its teardown is the request's child, as
     // `start_turn`'s turn is (SME-137, SME-262 review 1).
     tokio::spawn(tracing::Instrument::in_current_span(async move {
-        // Its turns first, so nothing is still making a pod (SME-51 B5).
-        stop_turn_now(id);
-        let _ = crate::browsing::close_session(id).await;
-        // Read before the delete cascades them away: teardown deletes the pods
-        // they name too, labelled or not (SME-88). Best-effort, like teardown.
-        let pod_ids: Vec<i64> = match db::list_sandbox_pods(&pool, id).await {
-            Ok(rows) => rows.into_iter().map(|row| row.id).collect(),
-            Err(e) => {
-                tracing::warn!(conversation_id = id, error = %e, "couldn't list a conversation's pods before deleting it");
-                Vec::new()
-            }
-        };
-        db::delete_conversation(&pool, id).await.map_err(|e| e.to_string())?;
-        // After the delete: a pod started meanwhile is found by its label, and
-        // one still starting sees the conversation gone (`create_pod`).
-        // Best-effort, unconditional (unlike terminate_pod, which the model
-        // calls and which is guarded).
-        crate::sandbox::teardown_conversation(&pool, id, &pod_ids).await;
-        crate::events::forget(id);
-        forget_conversation_lock(id);
+        // The whole subtree: its agents go with it (SME-236). Teardown is
+        // best-effort and unconditional (unlike terminate_pod, which the
+        // model calls and which is guarded).
+        crate::agents::delete_subtree(&pool, id).await?;
         // After the delete, so a listener refetching sees the pod rows gone.
         crate::events::publish_app(crate::events::AppEvent::PodsChanged);
         // Also after it, so a tab's sidebar drops the row (SME-269).

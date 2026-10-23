@@ -14,12 +14,14 @@ use sqlx::PgPool;
 use crate::db;
 
 mod checkout;
+mod delete;
 mod persona;
 mod queue;
 mod start;
 mod sweep;
 
 pub(crate) use checkout::*;
+pub(crate) use delete::*;
 pub(crate) use queue::*;
 pub(crate) use start::*;
 pub(crate) use sweep::*;

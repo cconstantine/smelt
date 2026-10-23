@@ -77,3 +77,37 @@ impl Drop for Checked {
 pub fn last_turns_checked(id: i64) -> usize {
     LAST_TURNS_CHECKED.lock().unwrap_or_else(|e| e.into_inner()).get(&id).copied().unwrap_or(0)
 }
+
+/// The delete of conversation `id`, after its subtree is marked.
+pub const DELETE_MARKED: &str = "delete_marked";
+
+/// The delete of conversation `id`, holding its rows' locks, before it
+/// writes.
+pub const DELETE_LOCKED: &str = "delete_locked";
+
+/// `finish` by child `id`, after its state's update and before its report.
+pub const FINISH_UPDATED: &str = "finish_updated";
+
+static FAIL_DELETES: LazyLock<Mutex<std::collections::HashSet<i64>>> = LazyLock::new(Default::default);
+
+/// Makes the next delete of `id` fail after queuing its notice.
+pub fn fail_next_delete(id: i64) {
+    FAIL_DELETES.lock().unwrap_or_else(|e| e.into_inner()).insert(id);
+}
+
+/// Whether a test asked the delete of `id` to fail after its notice.
+pub fn fail_delete_after_notice(id: i64) -> bool {
+    FAIL_DELETES.lock().unwrap_or_else(|e| e.into_inner()).remove(&id)
+}
+
+static TORN_DOWN: LazyLock<Mutex<HashMap<i64, Vec<i64>>>> = LazyLock::new(Default::default);
+
+/// Records a delete's teardown of conversation `id` and its pods.
+pub fn torn_down(id: i64, pod_ids: &[i64]) {
+    TORN_DOWN.lock().unwrap_or_else(|e| e.into_inner()).insert(id, pod_ids.to_vec());
+}
+
+/// The pods a delete tore down for conversation `id`, if it did.
+pub fn teardown_of(id: i64) -> Option<Vec<i64>> {
+    TORN_DOWN.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned()
+}
