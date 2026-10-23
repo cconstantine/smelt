@@ -211,8 +211,9 @@ pub async fn ask_parent(
 }
 
 /// Queues `body`, a notice from smelt, to every agent a restart cut off
-/// mid-turn: `active`, not paused or being deleted, not waiting on a
-/// question, its last message a turn's with no reply after it (a tool
+/// mid-turn: `active`, not paused or being deleted, with no question open
+/// or answered and untaken (it waits, or the sweep wakes it for the answer;
+/// review 2), its last message a turn's with no reply after it (a tool
 /// result, or a delivered report, message or notice from the queue), and
 /// not already holding this notice undelivered (two restarts in a row tell
 /// it once). A notice saved without waking it (the user stopping its pod)
@@ -228,7 +229,7 @@ pub async fn queue_restart_notices(pool: &PgPool, body: &str) -> Result<Vec<i64>
                          AND last.role = 'user'
                          AND (last.content LIKE '%\"type\":\"tool_result\"%'
                               OR EXISTS (SELECT 1 FROM agent_messages d WHERE d.delivered_message_id = last.id)))
-           AND NOT EXISTS (SELECT 1 FROM pending_questions q WHERE q.conversation_id = c.id AND q.answer IS NULL)
+           AND NOT EXISTS (SELECT 1 FROM pending_questions q WHERE q.conversation_id = c.id)
            AND NOT EXISTS (SELECT 1 FROM agent_messages m WHERE m.to_conversation_id = c.id
                            AND m.delivered_at IS NULL AND m.kind = $2 AND m.body = $1)
          ORDER BY c.id

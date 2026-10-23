@@ -108,12 +108,33 @@ async fn test_the_restart_notice_is_only_for_an_active_child_cut_off_mid_turn(po
     say(&pool, saved, "assistant", vec![ContentBlock::Text { text: "Done.".to_string() }]).await;
     say(&pool, saved, "user", vec![ContentBlock::Text { text: "The user stopped your sandbox.".to_string() }]).await;
 
-    let ids = [root, paused, asking, finished, stopped, replied, saved];
+    // Review 2, finding 2: it asked its parent, read a plain message the
+    // parent sent before reading the question, and the answer was then
+    // recorded: it waits to take the answer, it wasn't cut off.
+    let answered = active_child(&pool, root).await;
+    cut_off_turn(&pool, answered).await;
+    db::message_agent(&pool, root, db::Recipient::Child(answered), "your parent", "Early.").await.expect("queue it");
+    let row = db::undelivered_agent_messages(&pool, answered).await.expect("rows").remove(0);
+    let text = vec![ContentBlock::Text { text: "Message from your parent:\n\nEarly.".to_string() }];
+    db::deliver_agent_message(&pool, &row, &text).await.expect("deliver it").expect("delivered");
+    sqlx::query(
+        "INSERT INTO pending_questions (conversation_id, tool_use_id, questions, asked_of, answer)
+         VALUES ($1, 'toolu_p', '[]', 'parent', '[{\"selected\": [], \"other\": \"a.txt\"}]')",
+    )
+    .bind(answered)
+    .execute(&pool)
+    .await
+    .expect("an answered question for its parent");
+
+    let ids = [root, paused, asking, finished, stopped, replied, saved, answered];
     restart(&pool, &ids).await;
     for id in ids {
         assert_eq!(restart_notices(&pool, id).await, 0, "#{id} was told");
     }
-    assert_eq!(requests.lock().expect("log").len(), 0, "something was woken");
+    // The answered child is woken for its answer; nobody else is.
+    for id in [None, Some(paused), Some(asking), Some(finished), Some(stopped), Some(replied), Some(saved)] {
+        assert_eq!(requests_for(&requests, id).len(), 0, "{id:?} was woken");
+    }
     for id in ids {
         crate::turn::forget_conversation_lock(id);
     }
