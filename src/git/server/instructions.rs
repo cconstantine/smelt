@@ -4,9 +4,49 @@ use super::*;
 /// `project_doc_max_bytes` default.
 pub const INSTRUCTIONS_MAX_BYTES: usize = 32 * 1024;
 
+/// How many `AGENTS.md` files of one checkout are recorded.
+const MAX_AGENTS_FILES: usize = 50;
+
+/// Whether `text` (a repo's path) can go on a line of the system prompt
+/// as it is: no control character (C0, DEL, C1), line or paragraph
+/// separator, or bidi control, any of which can break a line or reorder
+/// its text (SME-271). Non-ASCII letters are plain.
+pub fn plain_path_text(text: &str) -> bool {
+    !text.chars().any(|c| {
+        c.is_control()
+            || matches!(
+                c,
+                '\u{2028}' | '\u{2029}' | '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+            )
+    })
+}
+
+/// The `AGENTS.md` files a checkout's listing found, and how many it left
+/// out because their paths aren't `plain_path_text`.
+#[derive(Debug, PartialEq)]
+pub struct AgentsPaths {
+    pub files: Vec<String>,
+    pub left_out: usize,
+}
+
+/// The `AGENTS.md` files among `git ls-files -z` output: the plain paths,
+/// top-level first, at most 50. A path left out isn't counted toward the
+/// 50, so it can't crowd out a real one; the cap's own drops aren't
+/// counted as left out.
+pub(super) fn agents_paths(listed: &str) -> AgentsPaths {
+    let (mut files, junk): (Vec<String>, Vec<String>) = listed
+        .split('\0')
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .partition(|path| plain_path_text(path));
+    files.sort_by_key(|f| (f.matches('/').count(), f.clone()));
+    files.truncate(MAX_AGENTS_FILES);
+    AgentsPaths { files, left_out: junk.len() }
+}
+
 /// The checkout's tracked `AGENTS.md` files, relative to it, top-level
-/// first (at most 50).
-pub async fn list_agents_files(shell: &sandbox::PodShell, dir: &str) -> Result<Vec<String>, String> {
+/// first (at most 50), leaving out paths that aren't plain text.
+pub async fn list_agents_files(shell: &sandbox::PodShell, dir: &str) -> Result<AgentsPaths, String> {
     let path = format!("{}/{dir}", crate::sandbox::WORKSPACE_DIR);
     let listed = shell
         .run(
@@ -20,10 +60,7 @@ pub async fn list_agents_files(shell: &sandbox::PodShell, dir: &str) -> Result<V
     if listed.exit_code != 0 {
         return Err(format!("couldn't list {path}'s AGENTS.md files: {}", listed.stderr.trim()));
     }
-    let mut files: Vec<String> = listed.stdout.split('\0').filter(|l| !l.is_empty()).map(str::to_string).collect();
-    files.sort_by_key(|f| (f.matches('/').count(), f.clone()));
-    files.truncate(50);
-    Ok(files)
+    Ok(agents_paths(&listed.stdout))
 }
 
 /// Reads a file in the pod for loading: the first
@@ -112,11 +149,15 @@ pub async fn project_instructions(
 
 /// Which of `repos` an `AGENTS.md` path is in, and the path relative to
 /// it: an absolute path under one of the conversation's checkouts,
-/// named `AGENTS.md`, with no `.` or `..` components.
+/// named `AGENTS.md`, with no `.` or `..` components, and
+/// `plain_path_text` (SME-271): the trust card shows it to the user.
 pub fn resolve_instructions_path<'a>(
     repos: &'a [db::ConversationRepo],
     path: &str,
 ) -> Result<(&'a db::ConversationRepo, String), String> {
+    if !plain_path_text(path) {
+        return Err(format!("{path:?} isn't a plain path: it holds control characters."));
+    }
     let not_in = || {
         format!(
             "{path} isn't in any of this conversation's repos: give the full path of an \

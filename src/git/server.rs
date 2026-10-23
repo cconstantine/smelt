@@ -20,6 +20,9 @@ mod trust_race_tests;
 mod persona_tests;
 
 #[cfg(test)]
+mod instructions_tests;
+
+#[cfg(test)]
 mod held_directory;
 
 /// The race tests' holds and fixtures, for the trust server functions'

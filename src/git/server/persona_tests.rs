@@ -55,7 +55,7 @@ async fn test_a_finished_clone_records_its_persona_files(pool: PgPool) {
 
     let listed = db::create_conversation_repo(&pool, conversation.id, "u", "k", None, "listed").await.expect("repo");
     let guard = CloneGuard::new(&pool, &listed, conversation.id);
-    record_cloned(&pool, &listed, &cloned, Ok(vec!["AGENTS.md".to_string()]), Ok(personas.clone()), guard)
+    record_cloned(&pool, &listed, &cloned, Ok(AgentsPaths { files: vec!["AGENTS.md".to_string()], left_out: 0 }), Ok(personas.clone()), guard)
         .await
         .expect("record");
     let row = db::get_conversation_repo(&pool, listed.id).await.expect("get").expect("exists");
@@ -64,7 +64,7 @@ async fn test_a_finished_clone_records_its_persona_files(pool: PgPool) {
 
     let unlisted = db::create_conversation_repo(&pool, conversation.id, "u", "k", None, "unlisted").await.expect("repo");
     let guard = CloneGuard::new(&pool, &unlisted, conversation.id);
-    record_cloned(&pool, &unlisted, &cloned, Ok(vec![]), Err("exec failed".to_string()), guard)
+    record_cloned(&pool, &unlisted, &cloned, Ok(AgentsPaths { files: vec![], left_out: 0 }), Err("exec failed".to_string()), guard)
         .await
         .expect("record");
     let row = db::get_conversation_repo(&pool, unlisted.id).await.expect("get").expect("exists");

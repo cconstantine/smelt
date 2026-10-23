@@ -1,5 +1,10 @@
 use super::*;
 
+/// A listing that found no AGENTS.md files.
+fn no_agents() -> AgentsPaths {
+    AgentsPaths { files: vec![], left_out: 0 }
+}
+
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_key_stores_it_and_returns_only_the_public_half(pool: PgPool) {
     let created = create_key(&pool, "github").await.expect("create key");
@@ -451,7 +456,7 @@ async fn test_a_stop_after_the_clone_is_recorded_doesnt_mark_it_interrupted(pool
         commit: Some("abc".to_string()),
         branch: "main".to_string(),
     };
-    record_cloned(&pool, &repo, &cloned, Ok(vec![]), Ok(vec![]), guard).await.expect("record");
+    record_cloned(&pool, &repo, &cloned, Ok(no_agents()), Ok(vec![]), guard).await.expect("record");
     // What follows is cut off here.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let row = db::get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
@@ -577,7 +582,7 @@ async fn test_a_superseded_attempt_doesnt_record_its_clone(pool: PgPool) {
         .expect("it was failed");
     let cloned = ClonedRepo { commit: Some("abc".to_string()), branch: "main".to_string() };
     let guard = CloneGuard::new(&pool, &stale, conversation.id);
-    let refused = record_cloned(&pool, &stale, &cloned, Ok(vec![]), Ok(vec![]), guard)
+    let refused = record_cloned(&pool, &stale, &cloned, Ok(no_agents()), Ok(vec![]), guard)
         .await
         .expect_err("superseded");
     assert!(refused.contains("superseded"), "{refused}");
@@ -597,7 +602,7 @@ async fn test_a_repo_is_ready_with_its_agents_files_already_listed(pool: PgPool)
     let listed = db::create_conversation_repo(&pool, conversation.id, "u", "k", None, "listed").await.expect("repo");
     let guard = CloneGuard::new(&pool, &listed, conversation.id);
     let files = vec!["AGENTS.md".to_string(), "api/AGENTS.md".to_string()];
-    record_cloned(&pool, &listed, &cloned, Ok(files.clone()), Ok(vec![]), guard).await.expect("record");
+    record_cloned(&pool, &listed, &cloned, Ok(AgentsPaths { files: files.clone(), left_out: 0 }), Ok(vec![]), guard).await.expect("record");
     let row = db::get_conversation_repo(&pool, listed.id).await.expect("get").expect("exists");
     assert_eq!((row.status.as_str(), row.error.as_deref(), row.agents_files), ("ready", None, files));
 
