@@ -258,4 +258,4 @@ mod wire_tests;
 #[cfg(feature = "server")]
 pub use server::{Subscription, forget, publish, publish_app, subscribe, subscribe_app};
 #[cfg(all(feature = "server", test))]
-pub use server::{has_channel, subscriber_count};
+pub use server::{AppRecording, has_channel, subscriber_count};

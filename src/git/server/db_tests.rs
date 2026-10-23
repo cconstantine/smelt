@@ -648,18 +648,7 @@ async fn test_delete_key_and_save_identity(pool: PgPool) {
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_publishing_a_conversations_repos_announces_its_waits(pool: PgPool) {
     let id = db::create_conversation(&pool).await.expect("conversation").id;
-    let mut app = crate::events::subscribe_app();
+    let recording = crate::events::AppRecording::start();
     publish_repos(&pool, id).await;
-    let heard = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            match app.recv().await {
-                Ok(crate::events::AppEvent::QuestionsChanged) => return true,
-                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(_) => return false,
-            }
-        }
-    })
-    .await
-    .unwrap_or(false);
-    assert!(heard, "publishing the repos announced no change to what waits");
+    assert_eq!(recording.events(), vec![crate::events::AppEvent::QuestionsChanged]);
 }
