@@ -73,6 +73,11 @@ pub(super) fn record_saved(conversation_id: i64, persisted: &mut Vec<Message>, s
             messages: vec![saved.clone()],
         },
     );
+    // Every saved message bumps the conversation's `updated_at`, and the first
+    // one gives it its title, so the sidebar's list order and titles change
+    // with it (SME-269). A tab watching this conversation already refetches on
+    // `MessagesAppended`; this is for one holding no conversation stream.
+    crate::events::publish_app(crate::events::AppEvent::ConversationsChanged);
     persisted.push(saved);
 }
 
