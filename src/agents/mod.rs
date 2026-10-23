@@ -89,14 +89,52 @@ pub(crate) fn label(conversation_id: i64, persona: Option<&str>) -> String {
 
 /// Whether the user's send or answer may start a turn in `conversation_id`,
 /// checked before the turn is counted: a conversation that isn't an agent
-/// always may; a child still starting may not.
+/// always may; a child still starting, or whose start failed or was
+/// stopped, may not. A `finished` or `stopped` child is made `active`
+/// again; a `stop_agent` committing after that stops the turn this admits
+/// (`stop_conversation` after the update, SME-216's order).
 pub(crate) async fn admit_user_turn(pool: &PgPool, conversation_id: i64) -> Result<(), String> {
     let state = db::agent_state(pool, conversation_id)
         .await
         .map_err(|e| format!("couldn't read the agent's state: {e}"))?;
     match state.as_deref() {
+        None | Some(db::AGENT_ACTIVE) => Ok(()),
         Some(db::AGENT_STARTING) => Err("This agent is still starting.".to_string()),
-        _ => Ok(()),
+        Some(db::AGENT_FAILED) => Err("This agent's start failed; start a new one.".to_string()),
+        Some(_) => {
+            if db::reactivate_agent(pool, conversation_id)
+                .await
+                .map_err(|e| format!("couldn't make the agent active again: {e}"))?
+            {
+                return Ok(());
+            }
+            // Not finished or stopped after a start any more: read again.
+            match db::agent_state(pool, conversation_id)
+                .await
+                .map_err(|e| format!("couldn't read the agent's state: {e}"))?
+                .as_deref()
+            {
+                Some(db::AGENT_STOPPED) => {
+                    Err("This agent was stopped while it was starting; start a new one.".to_string())
+                }
+                Some(db::AGENT_FAILED) => Err("This agent's start failed; start a new one.".to_string()),
+                _ => Ok(()),
+            }
+        }
+    }
+}
+
+/// Whether a wake or a delivered notice may run a turn in `conversation_id`
+/// now: not while it's a child still starting (its start's own wake comes
+/// once it's `active`). A failed read lets it in, so a notice is never
+/// dropped.
+pub(crate) async fn admits_notices(pool: &PgPool, conversation_id: i64) -> bool {
+    match db::agent_state(pool, conversation_id).await {
+        Ok(state) => state.as_deref() != Some(db::AGENT_STARTING),
+        Err(e) => {
+            tracing::warn!(conversation_id, error = %e, "couldn't read an agent's state before a wake");
+            true
+        }
     }
 }
 

@@ -10,6 +10,7 @@ use std::time::Duration;
 mod list;
 mod reports;
 mod start;
+mod stop;
 mod tools;
 
 /// Ids clear of other tests', and a mock upstream answering every request

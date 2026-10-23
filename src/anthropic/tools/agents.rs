@@ -1,6 +1,6 @@
 //! Child agents (SME-236): `start_agent`, offered to a conversation without
-//! a parent, `list_agents`, offered to every conversation, and `finish`,
-//! offered to an agent. The lifecycle behind them is `crate::agents`.
+//! a parent, `list_agents` and `stop_agent`, offered to every conversation,
+//! and `finish`, offered to an agent. The lifecycle behind them is `crate::agents`.
 
 use super::{Offer, Registered, Tool};
 use crate::anthropic::ToolDefinition;
@@ -45,6 +45,25 @@ pub(super) fn tools() -> Vec<Registered> {
                     input_schema: serde_json::json!({"type": "object", "properties": {}}),
                 },
                 run: run!(|c| crate::agents::list_agents(c.pool, c.conversation_id)),
+            },
+        },
+        Registered {
+            offer: Offer::All,
+            tool: Tool {
+                def: ToolDefinition {
+                    name: "stop_agent".to_string(),
+                    description: "Stop one of the agents you started, and every agent under it: \
+                                  their turns end and they take no more work unless the user writes \
+                                  to them. Their sandboxes are left as they are. Only your own agents' \
+                                  ids (list_agents lists them)."
+                        .to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"id": {"type": "integer", "description": "the agent's id"}},
+                        "required": ["id"]
+                    }),
+                },
+                run: run!(|c| crate::agents::stop_agent(c.pool, c.conversation_id, c.input)),
             },
         },
         Registered {

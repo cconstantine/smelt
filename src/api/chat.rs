@@ -221,10 +221,11 @@ pub async fn get_turn_error(id: i64) -> ServerFnResult<Option<String>> {
 /// keeps finished commands and tasks from starting another until they
 /// write again. See `stop_turn_now`. A conversation that's gone, or never
 /// existed, is left with no turn state (`stop_conversation`, SME-219).
+/// A child agent still starting is refused, and stopping a working one
+/// tells its parent (`agents::user_stop`, SME-236).
 #[post("/api/conversations/{id}/stop")]
 pub async fn stop_turn(id: i64) -> ServerFnResult<()> {
-    stop_conversation(db::get(), id).await;
-    Ok(())
+    crate::agents::user_stop(db::get(), id).await.map_err(ServerFnError::new)
 }
 
 /// Whether a turn is running in this conversation, and how many whole

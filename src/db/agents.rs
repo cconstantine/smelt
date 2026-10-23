@@ -253,6 +253,103 @@ pub async fn finish_agent(pool: &PgPool, child: i64, label: &str, report: &str) 
     Ok(Finish::Queued { parent })
 }
 
+/// `stop_subtree`'s outcome.
+#[derive(Debug, PartialEq)]
+pub enum StopSubtree {
+    /// `id` isn't one of the caller's children.
+    NotYourChild,
+    /// It had already ended, in this state: nothing changed.
+    AlreadyEnded(String),
+    /// It and everything under it are stopped; these are their ids, `id` first.
+    Stopped(Vec<i64>),
+}
+
+/// The ids of `id` and every conversation under it, `id` first, then in
+/// ascending id.
+async fn subtree_ids(conn: &mut sqlx::PgConnection, id: i64) -> Result<Vec<i64>, sqlx::Error> {
+    let mut ids = sqlx::query_scalar::<_, i64>(
+        "WITH RECURSIVE sub(id) AS (
+             SELECT id FROM conversations WHERE id = $1
+             UNION ALL
+             SELECT c.id FROM conversations c JOIN sub ON c.parent_id = sub.id
+         )
+         SELECT id FROM sub WHERE id <> $1 ORDER BY id",
+    )
+    .bind(id)
+    .fetch_all(&mut *conn)
+    .await?;
+    ids.insert(0, id);
+    Ok(ids)
+}
+
+/// `stop_agent`'s transaction: `id`, one of `caller`'s children, and its
+/// whole subtree set `stopped`, the rows locked in ascending id first. The
+/// caller stops their turns after the commit (state first, SME-217's order).
+pub async fn stop_subtree(pool: &PgPool, caller: i64, id: i64) -> Result<StopSubtree, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let is_child = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM agents a JOIN conversations c ON c.id = a.conversation_id
+                        WHERE a.conversation_id = $1 AND c.parent_id = $2)",
+    )
+    .bind(id)
+    .bind(caller)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !is_child {
+        return Ok(StopSubtree::NotYourChild);
+    }
+    let subtree = subtree_ids(&mut tx, id).await?;
+    let locks: Vec<(i64, RowLock)> = subtree.iter().map(|id| (*id, RowLock::KeyShare)).collect();
+    lock_conversations(&mut tx, &locks).await?;
+    let state = sqlx::query_scalar::<_, String>("SELECT state FROM agents WHERE conversation_id = $1")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    match state.as_deref() {
+        None => return Ok(StopSubtree::NotYourChild),
+        Some(state @ (AGENT_STOPPED | AGENT_FAILED)) => return Ok(StopSubtree::AlreadyEnded(state.to_string())),
+        Some(_) => {}
+    }
+    sqlx::query(
+        "UPDATE agents SET state = $2, state_changed_at = now()
+         WHERE conversation_id = ANY($1) AND state IN ($3, $4, $5)",
+    )
+    .bind(&subtree)
+    .bind(AGENT_STOPPED)
+    .bind(AGENT_STARTING)
+    .bind(AGENT_ACTIVE)
+    .bind(AGENT_FINISHED)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(StopSubtree::Stopped(subtree))
+}
+
+/// The user's send or answer in a `finished` or `stopped` child that had
+/// started: it's `active` again. `false` when it isn't in either (a child
+/// stopped during its start never had `started_at`, so it stays stopped).
+pub async fn reactivate_agent(pool: &PgPool, id: i64) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query(
+        "UPDATE agents SET state = $2, state_changed_at = now()
+         WHERE conversation_id = $1 AND state IN ($3, $4) AND started_at IS NOT NULL",
+    )
+    .bind(id)
+    .bind(AGENT_ACTIVE)
+    .bind(AGENT_FINISHED)
+    .bind(AGENT_STOPPED)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
+/// Queues a notice from smelt to `to` about agent `from` (`from_label`),
+/// in a transaction of its own: one that reports no state change.
+pub async fn queue_notice(pool: &PgPool, to: i64, from: i64, from_label: &str, body: &str) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    queue_agent_message(&mut conn, to, Some(from), from_label, KIND_NOTICE, body).await
+}
+
 /// One of a conversation's children, as `list_agents` shows it.
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct ChildAgent {

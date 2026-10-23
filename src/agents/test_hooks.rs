@@ -33,3 +33,15 @@ pub async fn reach(hook: &'static str, id: i64) {
 
 /// The start of a child of parent `id`, before its done step.
 pub const BEFORE_START_DONE: &str = "before_start_done";
+
+static STARTS_ENDED: LazyLock<Mutex<std::collections::HashSet<i64>>> = LazyLock::new(Default::default);
+
+/// Records that child `id`'s start task has ended, however it ended.
+pub fn start_ended(id: i64) {
+    STARTS_ENDED.lock().unwrap_or_else(|e| e.into_inner()).insert(id);
+}
+
+/// Whether child `id`'s start task has ended.
+pub fn starts_ended(id: i64) -> bool {
+    STARTS_ENDED.lock().unwrap_or_else(|e| e.into_inner()).contains(&id)
+}

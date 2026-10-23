@@ -59,4 +59,6 @@ async fn run_start(pool: &PgPool, child: i64, parent: i64) {
         Ok(false) => tracing::info!(conversation_id = child, "the agent was stopped or deleted during its start"),
         Err(e) => tracing::warn!(conversation_id = child, error = %e, "couldn't complete an agent's start"),
     }
+    #[cfg(test)]
+    test_hooks::start_ended(child);
 }
