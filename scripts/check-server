@@ -42,7 +42,10 @@
 # Settings (environment):
 #   CHECK_WORKTREE  the worktree (default: ../smelt-check-<this checkout's
 #                   name>, or $TMPDIR/smelt-check-<name> when its parent isn't
-#                   writable — one per checkout, so two never share a server)
+#                   writable — one per checkout, so two never share a server).
+#                   An existing one must be the top level of a working tree of
+#                   its own: a plain directory is refused, since checking out
+#                   there would move the repository that contains it (SME-265).
 #   CHECK_PORT      the app's port (default: 8081; the dev server uses 8080)
 #   CHECK_PORT_WAIT how long start waits for a port another check server
 #                   holds, in seconds (default: 1800; 0 gives up at once).
@@ -357,6 +360,17 @@ start() {
         exit 1
     fi
     if [ -d "$worktree" ]; then
+        # The directory has to be the top level of a working tree of its own.
+        # Pointed at a plain directory (or a subdirectory of some repository),
+        # the checkout below walks up and detaches the repository that contains
+        # it (SME-265). --show-prefix is empty only at a working tree's own top
+        # level, and --show-toplevel would compare strings a symlinked parent
+        # defeats; a directory in no repository at all fails the rev-parse.
+        prefix=$(git -C "$worktree" rev-parse --show-prefix 2>/dev/null) || prefix=outside
+        if [ -n "$prefix" ]; then
+            echo "CHECK_WORKTREE=$worktree is not the top level of a git working tree of its own, so checking out there would move the repository that contains it: point CHECK_WORKTREE at a worktree of its own, or remove the directory and start will create one" >&2
+            exit 1
+        fi
         git -C "$worktree" checkout -q --detach "$commit"
     else
         git -C "$repo" worktree add -q --detach "$worktree" "$commit"
