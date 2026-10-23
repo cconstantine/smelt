@@ -103,7 +103,7 @@ Stored: only `agents.state`, the lifecycle (`starting`, `active`, `finished`, `s
 
 Turn state is in memory (`src/turn/state.rs`), and a restart loses every turn in flight and every pause. With agents waking each other, both matter:
 
-- **The pause is stored** (`conversations.paused_at`, SME-238; until it ships, the pause is in memory and the sweep below wakes a conversation the user had stopped if something is queued to it), set by Stop and cleared by the user's send or answer, where `paused` is set and cleared today. The in-memory flag was harmless while nothing woke a conversation on its own after a restart; the startup sweep below does.
+- **The pause is stored** (`conversations.paused_at`, SME-238), set by Stop and cleared by the user's send or answer, where `paused` is set and cleared. As built, the in-memory flag stays the live truth (it's decided with a turn's admission) and the column mirrors it, re-written until the two agree; startup restores it before anything can wake a conversation. The in-memory flag was harmless while nothing woke a conversation on its own after a restart; the startup sweep below does.
 - **A startup sweep** wakes (`Notice::Wake`) every conversation with an undelivered `agent_messages` row that isn't paused and isn't `stopped`.
 - **A start cut off by a restart** (a child still `starting`: its start ran in a task the restart killed) is ended by the same sweep as a failed start: the key removed from its pod if the pod is live, any card deleted, `failed`, and `smelt restarted during the start` queued to the parent.
 - **A child cut off mid-turn** (`active`, its last message a `user` message: a tool result or a notice with no reply after it) gets, from SME-238 (SME-236's sweep doesn't), a notice of its own, `smelt restarted during your turn; carry on`, and a wake, so a group doesn't stall on a restart. A user's own conversation is left as today.
@@ -122,6 +122,21 @@ For a conversation in a group. "Queued" is an `agent_messages` row; "wake" is `N
 | waiting for its parent | the parent's message answers the question and wakes it | as left | paused | nothing | stopped | takes the question (`NOT_ANSWERED`) | unchanged | deleted with it | parent told | — |
 | finished | `active`, wakes | queued, wakes | paused | nothing | stopped | `active`, turn runs | unchanged | deleted with it | parent told | — |
 | stopped | refused at `message_agent` | queued, no wake | stays | nothing | already | `active`, turn runs | unchanged | deleted with it | parent told | — |
+
+**As built (SME-238), beyond this design:** `message_agent` locks the recipient's `agents` row `FOR NO KEY UPDATE`, not `FOR SHARE`, since it may make a `finished` child `active` (two messages upgrading a shared lock would deadlock); the parent's queue gets a fourth `kind`, `question`, so it reads what it was asked; and `finish` is refused while a message or an answer is unread by the child, or a message sent during its last turn would wake a finished child that could no longer report. The table as built, its events those SME-238 owns (**bold** marks what it changed from SME-236):
+
+| State ↓ / event → | Message from parent or child | Child's question (this is the parent) | Parent's reply to a question | User's Stop on this | `stop_agent` on this | User writes in this | smelt restarts | `finish` |
+| -- | -- | -- | -- | -- | -- | -- | -- | -- |
+| starting | **queued**; the start's done step wakes it | — | — | refused | stopped | refused | sweep fails it; the queued row stays, never drained | — |
+| idle (active) | **queued, wakes, runs a turn** | **queued, wakes** | — | paused (**stored**); parent told | stopped (**stored pause**) | turn runs | **sweep wakes it if queued** | — |
+| running | **taken at the next iteration** | **taken at the next iteration** | — | turn ends, paused; parent told | turn ends, stopped | queued behind the turn | **turn lost; restart notice and wake** | **refused while a message or answer is queued**; else finished |
+| paused | **queued, no wake** (the paused finished child: **active, queued, no wake**) | **queued, no wake** | **recorded, no wake; the user's next message takes it first** | stays | stopped | pause ends (**stored**), turn drains | **stays paused (stored)** | — |
+| waiting for the user | **queued; the woken turn saves it and waits on** | as left | — | paused | stopped | takes the question | unchanged | — |
+| waiting for its parent | **the reply is the answer; wakes** | as left | **answer recorded, wakes, the turn takes it** | paused | stopped; the reply is **refused** | **takes it with `NOT_ANSWERED_BY_PARENT`; a later reply is a plain message** | **unchanged; an answer recorded before is woken by the sweep** | — |
+| finished | **active, queued, wakes** | — | — | paused | stopped | active, turn runs | unchanged | refused |
+| stopped | **refused** | **queued, no wake** | refused | stays | already | active (started) or refused (stopped while starting) | unchanged | refused |
+| failed | **refused** | — | — | — | already ended | refused | unchanged | — |
+| deleted | **refused** ("deleted") | rows cascade | refused | — | — | — | — | — |
 
 **Check-then-act, each named for SME-238's plan** (SME-34's lesson: the state can change between a check and the act): `message_agent`'s "is this my child, not stopped" check and its insert go in one transaction that locks the recipient's `agents` row (`FOR SHARE`), against `stop_agent`'s `UPDATE`; the drain marks a row delivered in the transaction that saves the message, so a Stop between them can't save it twice (SME-91); `stop_agent` updates the state before stopping turns, so a wake admitted between them is ended by the stop (SME-217's order); the "turn ended without a report" check reads state, question, commands and pause in one query after the last turn's `TurnInFlight` is dropped.
 
