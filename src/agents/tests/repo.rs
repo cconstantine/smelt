@@ -130,6 +130,9 @@ async fn test_an_undecided_or_declined_remote_is_refused_before_anything_is_writ
     let input = serde_json::json!({"brief": "Fix it.", "repo": "/workspace/app", "ref": "main"});
     let refused = start_on(&pool, undecided, input.clone()).await.expect_err("refused");
     assert!(refused.contains("hasn't decided whether to trust https://example.com/team/app.git"), "{refused}");
+    // Review 1, finding 6: a repo with no AGENTS.md has no card to ask with,
+    // so the refusal names the user's own way to trust it too.
+    assert!(refused.contains("\"Work on a repo\""), "{refused}");
     assert_eq!(children(&pool, undecided).await, 0);
 
     db::set_repo_trust(&pool, KEY, false).await.expect("decline");

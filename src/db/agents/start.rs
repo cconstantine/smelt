@@ -65,8 +65,9 @@ pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChi
                     Some(true) => None,
                     Some(false) => Some(format!("the user declined to trust {}, so no agent can work on it", repo.url)),
                     None => Some(format!(
-                        "the user hasn't decided whether to trust {}: load its AGENTS.md with \
-                         load_instructions so they're asked, then start the agent once they trust it",
+                        "the user hasn't decided whether to trust {}, so no agent can work on it yet: \
+                         ask them to trust it. They can open it with \"Work on a repo\", or, if it has an \
+                         AGENTS.md, load that with load_instructions so they're asked",
                         repo.url
                     )),
                 },
