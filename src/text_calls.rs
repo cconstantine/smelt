@@ -270,9 +270,10 @@ fn json_name(s: &str) -> Option<Option<String>> {
 
 /// `text` with its code blanked (spaces, newlines kept, same byte offsets):
 /// fenced blocks (an unclosed fence runs to the end), inline code spans
-/// (within a paragraph, so one can span a line break), lines indented 4 or
-/// more, blockquote lines, and reasoning leaked into the text between
-/// `<think>` and `</think>` (review 1).
+/// (within a paragraph, so one can span a line break; a whole tag call at a
+/// line's start ends the paragraph), lines indented 4 or more, blockquote
+/// lines, and reasoning leaked into the text between `<think>` and
+/// `</think>` (review 1).
 #[cfg(feature = "server")]
 fn mask_code(text: &str) -> String {
     let mut out = text.as_bytes().to_vec();
@@ -299,7 +300,10 @@ fn mask_code(text: &str) -> String {
         let indent: usize = line.chars().take_while(|c| *c == ' ' || *c == '\t').map(|c| if c == '\t' { 4 } else { 1 }).sum();
         let body = line.trim_start_matches([' ', '\t']);
         let run = |ch: char| body.chars().take_while(|c| *c == ch).count();
-        let plain = fence.is_none() && indent <= 3 && run('`') < 3 && run('~') < 3 && !body.starts_with('>') && !body.trim().is_empty();
+        // A complete call at a line's start ends the paragraph: a code span
+        // opened by a stray backtick before it can't run into it (review 2).
+        let call = fence.is_none() && indent <= 3 && complete_tag_call(&text[end - body.len()..]);
+        let plain = fence.is_none() && indent <= 3 && run('`') < 3 && run('~') < 3 && !body.starts_with('>') && !body.trim().is_empty() && !call;
         if !plain && let Some(para) = paragraph.take() {
             for (from, to) in code_spans(&text[para..start]) {
                 blank(para + from, para + to);
@@ -332,6 +336,19 @@ fn mask_code(text: &str) -> String {
     #[expect(clippy::expect_used, reason = "only whole characters were replaced, each byte with an ASCII space")]
     let masked = String::from_utf8(out).expect("only whole characters were replaced, with spaces");
     masked
+}
+
+/// Whether `s` starts with a call written with tags that is closed on a
+/// later line's start (`</tool_call>`, `</function>`, `</function_calls>`,
+/// `</invoke>`): a whole call, not a fragment quoted in prose.
+#[cfg(feature = "server")]
+fn complete_tag_call(s: &str) -> bool {
+    s.starts_with('<')
+        && tag_call(s).is_some()
+        && s.lines().skip(1).any(|l| {
+            let l = l.trim_start();
+            ["tool_call>", "function>", "function_calls>", "invoke>"].iter().any(|local| is_close(l, local))
+        })
 }
 
 /// The inline code spans in `text` (a paragraph), as byte ranges, backticks

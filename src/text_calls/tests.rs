@@ -256,3 +256,13 @@ fn test_a_cut_short_json_call_reads_no_name_from_later_text() {
     let cut = "<tool_call>\n{\"name\": \"get_time\", \"arguments\": {\"city\": \"XY";
     assert_eq!(one_name(cut).as_deref(), Some("get_time"));
 }
+
+/// Review 2, finding 1: an unmatched backtick in the prose before a call
+/// doesn't make a code span of the call's opening lines (its span closed
+/// on the first backtick in the call's body), so the call is still found.
+/// A complete call at a line's start ends the paragraph a span can cross.
+#[test]
+fn test_an_unmatched_backtick_before_a_call_does_not_hide_it() {
+    let text = "Posting the comment for `SME-246 now.\n<tool_call>\n<function=save_comment>\n<parameter=body>\nSee `scripts/check.sh` for details\n</parameter>\n</function>\n</tool_call>";
+    assert_eq!(one_name(text).as_deref(), Some("save_comment"));
+}
