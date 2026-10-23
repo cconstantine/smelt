@@ -50,7 +50,7 @@ pub struct BrowsingState { session_open: bool, url: Option<String> }
 `subscribe_conversation_events` is the conversation's `ServerEvents` stream. It isn't scoped to one request: a browser tab opens it once per viewed conversation and keeps it open for as long as that conversation is selected, forwarding whatever `events::subscribe(id)` yields. A conversation's channel exists only while something subscribes: the first subscriber makes it, the last one's `Subscription` removes it, and `publish` with nobody subscribed drops the event without making one. A conversation that doesn't exist is refused (checked again once subscribed), so a tab still reconnecting to a deleted one makes nothing (SME-91):
 
 ```rust
-// src/events.rs
+// src/events/mod.rs
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum ConversationEvent {
@@ -109,13 +109,14 @@ The model can ask the user one to four questions (`ask_user`: each a question, a
 
 ## App-wide events and pods
 
-`subscribe_app_events` is the stream of `AppEvent` (`src/events.rs`), for views that span conversations. Both events carry nothing; listeners refetch:
+`subscribe_app_events` is the stream of `AppEvent` (`src/events/mod.rs`), for views that span conversations. Both events carry nothing; listeners refetch:
 - **`PodsChanged`**, published when a pod is created (`create_pod`), goes away (`force_terminate_pod`: a model's terminate, a user's stop, a crash), or is torn down with its conversation (`delete_conversation`).
 - **`TurnsChanged`**, published when a conversation goes from idle to busy or back (`TurnInFlight`). Listeners refetch `get_busy_conversations`: every conversation with a turn running or queued.
 - **`QuestionsChanged`**, published when a conversation starts or stops waiting on an answer to the model's question. Listeners refetch `get_waiting_conversations`, for the sidebar's waiting mark.
 - **`ProvidersChanged`**, published when a model provider, a model's settings or the default model is added, changed or removed (SME-72). The model picker refetches.
+- **`ConversationsChanged`**, published when a conversation is created (`api::chat::create_conversation`), after each saved message — every one bumps `updated_at`, and the first gives it its title, so a row's place and name change with it (`turn::run.rs`'s `record_saved`, `turn::notify.rs`) — and after a delete (SME-269). The sidebar refetches its list.
 
-Only the `/pods` page subscribes to it directly; chat tabs get both relayed on their conversation stream (see above).
+The `/pods` page subscribes directly, and so does a chat sidebar with no conversation open (SME-269): `/` is the Chat page with nothing selected, and such a tab has no conversation stream to ride, so `frontend::pages::chat::live::use_sidebar_app_events` holds this one and cancels it the moment a conversation is selected — a tab holds exactly one always-open stream either way. Every other tab gets them relayed on its conversation stream (see above).
 
 `get_pods` returns a `PodOverview` for every live pod:
 - **From the database** (`db::list_live_pods`): its conversation, start time, and live terminal count.

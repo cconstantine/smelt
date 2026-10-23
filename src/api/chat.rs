@@ -21,9 +21,18 @@ pub async fn get_conversations() -> ServerFnResult<Vec<Conversation>> {
 
 #[post("/api/conversations")]
 pub async fn create_conversation() -> ServerFnResult<Conversation> {
-    db::create_conversation(db::get())
-        .await
-        .map_err(ServerFnError::new)
+    create_conversation_in(db::get()).await.map_err(ServerFnError::new)
+}
+
+/// The one writer of a new conversation row, then the app-wide announcement
+/// once that row exists: every open tab's sidebar refetches and finds it
+/// (SME-269). Takes the pool so a test can run it against a database of its
+/// own, as `delete_and_forget` does.
+#[cfg(feature = "server")]
+async fn create_conversation_in(pool: &PgPool) -> Result<Conversation, sqlx::Error> {
+    let created = db::create_conversation(pool).await?;
+    crate::events::publish_app(crate::events::AppEvent::ConversationsChanged);
+    Ok(created)
 }
 
 #[get("/api/conversations/{id}/messages")]
@@ -76,6 +85,8 @@ async fn delete_and_forget(pool: &PgPool, id: i64) -> Result<(), String> {
         forget_conversation_lock(id);
         // After the delete, so a listener refetching sees the pod rows gone.
         crate::events::publish_app(crate::events::AppEvent::PodsChanged);
+        // Also after it, so a tab's sidebar drops the row (SME-269).
+        crate::events::publish_app(crate::events::AppEvent::ConversationsChanged);
         Ok(())
     }))
     .await
@@ -413,18 +424,32 @@ pub(crate) async fn open_conversation_events(
 }
 
 /// Everything a tab watching `id` hears: that conversation's events, plus
-/// the app-wide `PodsChanged`, `TurnsChanged`, `QuestionsChanged` and `ProvidersChanged`, relayed as their
+/// the app-wide `PodsChanged`, `TurnsChanged`, `QuestionsChanged`,
+/// `ProvidersChanged` and `ConversationsChanged`, relayed as their
 /// `ConversationEvent` namesakes for the sidebar.
 /// Ends when the conversation's channel closes (it was deleted).
 #[cfg(feature = "server")]
 pub(crate) fn conversation_event_stream(
     id: i64,
 ) -> impl futures_util::Stream<Item = Result<events::ConversationEvent, axum::BoxError>> {
-    use tokio::sync::broadcast::error::RecvError;
-    // Both subscribed now, not on first poll, so nothing published in
+    // Both subscribed here, not on first poll, so nothing published in
     // between is missed.
-    let receivers = (events::subscribe(id), events::subscribe_app());
-    futures_util::stream::unfold(receivers, move |(mut conversation, mut app)| async move {
+    conversation_relay(id, events::subscribe(id), events::subscribe_app())
+}
+
+/// `conversation_event_stream` from channels already in hand, which is how
+/// a test gives it an app channel of its own: the app-wide bus carries every
+/// other test's events too, so what arrives on it isn't one test's to judge
+/// (SME-135, and the same reason `api::pods::app_events_response` takes its
+/// receiver).
+#[cfg(feature = "server")]
+pub(crate) fn conversation_relay(
+    id: i64,
+    conversation: events::Subscription,
+    app: tokio::sync::broadcast::Receiver<events::AppEvent>,
+) -> impl futures_util::Stream<Item = Result<events::ConversationEvent, axum::BoxError>> {
+    use tokio::sync::broadcast::error::RecvError;
+    futures_util::stream::unfold((conversation, app), move |(mut conversation, mut app)| async move {
         loop {
             tokio::select! {
                 received = conversation.recv() => match received {
@@ -454,6 +479,10 @@ pub(crate) fn conversation_event_stream(
                     }
                     Ok(events::AppEvent::QuestionsChanged) => {
                         let event = events::ConversationEvent::QuestionsChanged {};
+                        return Some((Ok(event), (conversation, app)));
+                    }
+                    Ok(events::AppEvent::ConversationsChanged) => {
+                        let event = events::ConversationEvent::ConversationsChanged {};
                         return Some((Ok(event), (conversation, app)));
                     }
                     // Only ever decoded, never published.
@@ -492,6 +521,77 @@ mod tests {
     fn spawn_delete(pool: &PgPool, id: i64) -> tokio::task::JoinHandle<Result<(), String>> {
         let pool = pool.clone();
         tokio::spawn(async move { delete_and_forget(&pool, id).await })
+    }
+
+    /// Whether a `ConversationsChanged` arrives within a few seconds,
+    /// skipping the app events other tests publish alongside (SME-135).
+    async fn received_list_change(
+        app: &mut tokio::sync::broadcast::Receiver<events::AppEvent>,
+    ) -> bool {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match app.recv().await {
+                    Ok(events::AppEvent::ConversationsChanged) => return true,
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// SME-269, the ticket's case: a conversation created here reaches every
+    /// open tab. `create_conversation_in` is the only writer of a new row, so
+    /// the announcement goes out once that row exists and a listener that
+    /// refetches on hearing it finds the row there.
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+    async fn test_creating_a_conversation_publishes_a_list_change(pool: PgPool) {
+        db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+        let mut app = events::subscribe_app();
+        let created = create_conversation_in(&pool).await.expect("create conversation");
+        assert!(received_list_change(&mut app).await, "creating a conversation announced nothing");
+        let listed = db::list_conversations(&pool).await.expect("list conversations");
+        assert!(listed.iter().any(|c| c.id == created.id), "the announced row isn't listed");
+    }
+
+    /// SME-269. The delete announces itself after the row is gone, as its
+    /// `PodsChanged` already does, so a tab that refetches sees the row
+    /// missing rather than still there.
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+    async fn test_deleting_a_conversation_publishes_a_list_change(pool: PgPool) {
+        db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+        // Teardown stops at `get()`: this delete touches no cluster.
+        crate::sandbox::test_support::use_unreachable_test_manager();
+        let id = db::create_conversation(&pool).await.expect("conversation").id;
+        let mut app = events::subscribe_app();
+        delete_and_forget(&pool, id).await.expect("delete conversation");
+        assert!(received_list_change(&mut app).await, "deleting a conversation announced nothing");
+        assert!(!db::conversation_exists(&pool, id).await.expect("exists"), "announced before it was deleted");
+    }
+
+    /// SME-269, the ticket's case for a tab that has a conversation open:
+    /// a conversation created, retitled or deleted elsewhere reaches it on
+    /// the stream it already holds. Built from an app channel of the test's
+    /// own — the app-wide bus carries every other test's events too, so a
+    /// first item here would be theirs to judge, not this test's (SME-135).
+    #[tokio::test]
+    async fn test_a_list_change_reaches_every_watched_conversation() {
+        use futures_util::StreamExt;
+        let conversation_id = 9_269_000_001;
+        let (app, app_rx) = tokio::sync::broadcast::channel(16);
+        let stream = conversation_relay(conversation_id, events::subscribe(conversation_id), app_rx);
+        futures_util::pin_mut!(stream);
+        app.send(events::AppEvent::ConversationsChanged).expect("publish");
+        let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("the relayed list change never arrived");
+        assert!(
+            matches!(event, Some(Ok(events::ConversationEvent::ConversationsChanged {}))),
+            "got {event:?}"
+        );
+        events::forget(conversation_id);
     }
 
     /// SME-262, the ticket's case. Interleaving: the delete commits, and

@@ -209,6 +209,11 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "reply_on_conversation_stream", 60, Box::pin(scenario_reply_on_conversation_stream(&t))).await;
     run_scenario(&t, only, r, k, "busy_session_layout", 120, Box::pin(scenario_busy_session_layout(&t))).await;
     run_scenario(&t, only, r, k, "sidebar", 30, Box::pin(scenario_sidebar(&t))).await;
+    // 90s, not 60: two Home tabs hydrate, then a 30s wait for the new row and
+    // 10s for each disappearance. All of them return early — the hop is about a
+    // second on a quiet pod — but a limit that fails a working run reads as
+    // infrastructure (the same reasoning as switch_shows_no_start_screen's).
+    run_scenario(&t, only, r, k, "conversations_appear_live", 90, Box::pin(scenario_conversations_appear_live(&t))).await;
     run_scenario(&t, only, r, k, "phone_width", 30, Box::pin(scenario_phone_width(&t))).await;
     run_scenario(&t, only, r, k, "not_found", 30, Box::pin(scenario_not_found(&t))).await;
     run_scenario(&t, only, r, k, "tool_rows", 30, Box::pin(scenario_tool_rows(&t))).await;

@@ -30,6 +30,8 @@ pub(super) async fn save_notice_between_turns(
             messages: vec![saved.clone()],
         },
     );
+    // A saved notice re-sorts the sidebar's row like any other message (SME-269).
+    crate::events::publish_app(crate::events::AppEvent::ConversationsChanged);
     Ok(saved)
 }
 

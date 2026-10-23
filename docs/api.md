@@ -140,7 +140,7 @@ In [api/events.md](api/events.md#the-browsing-panels-own-live-channel).
 | `get_pods` | `GET /api/pods` | every live pod with status, activity, limits and usage, see above |
 | `stop_pod` | `POST /api/pods/{pod_id}/stop` | the user stopping a pod, see above |
 | `get_live_pod_conversations` | `GET /api/pods/conversations` | conversations with a live pod, for the sidebar |
-| `subscribe_app_events` | `GET /api/app-events` | always-open app-wide stream (`AppEvent`), for the pods page |
+| `subscribe_app_events` | `GET /api/app-events` | always-open app-wide stream (`AppEvent`), for the pods page and for a chat tab with no conversation open (SME-269) |
 | `get_build_id` (`api::version`) | `GET /api/build-id` | the server's `SMELT_BUILD_ID`; a tab asks on every stream (re)connect and offers a reload when it isn't its own (see [architecture.md](architecture.md#live-channels)). The browser tier can override it (`test_override`, `browser-test` only) |
 | `list_conversation_repos` | `GET /api/conversations/{id}/repos` | the conversation's repos, for the sandbox panel, see `ReposUpdate` above |
 | `attach_repo` | `POST /api/conversations/{id}/repos` | "Work on a repo": trusts the remote (under its trust lock, dropping its cards, SME-224), starts the sandbox if needed and clones; runs on if the tab closes, and a failure no request read is shown in the conversation (SME-225; "read" by the server function: the tab keeps one it read for its conversation through a switch, SME-263, but a response lost after the read shows nowhere, SME-224 review 2); one failing after the trust committed still tells the models whose cards it dropped, and one from a deleted conversation trusts nothing (SME-224) |

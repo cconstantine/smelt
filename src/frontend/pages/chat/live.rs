@@ -258,6 +258,81 @@ pub(super) fn use_conversation_events(
     });
 }
 
+/// The sidebar's own live connection for when no conversation is open
+/// (SME-269). `/` is the Chat page with nothing selected, so
+/// `use_conversation_events` never runs and the list was the single fetch the
+/// page made on load: a conversation created, renamed or deleted in another
+/// window, or by a persona, showed up only after a reload.
+///
+/// This holds the one app-wide stream such a tab needs — the same counters
+/// `ChatPanel`'s stream feeds when a conversation *is* selected, so selecting
+/// one cancels this and the relay takes over, and a tab holds one always-open
+/// connection either way (browsers allow 6 per host across all tabs). It is
+/// `use_pods_changed`'s loop on `/pods`, widened to the four marks the sidebar
+/// draws.
+///
+/// `app_live` says the stream is up — `data-app-live` in the sidebar, what a
+/// browser scenario waits on to know the page is hydrated and listening.
+#[cfg(feature = "web")]
+pub(super) fn use_sidebar_app_events(
+    selected: Memo<Option<i64>>,
+    mut conversations_changed: Signal<u64>,
+    mut pods_changed: Signal<u64>,
+    mut turns_changed: Signal<u64>,
+    mut questions_changed: Signal<u64>,
+    mut app_live: Signal<bool>,
+) {
+    let mut task: Signal<Option<Task>> = use_signal(|| None);
+    use_effect(move || {
+        // A conversation's own stream relays all of this (SME-269), so a
+        // second connection would be one too many.
+        if selected().is_some() {
+            if let Some(task) = task.write().take() {
+                task.cancel();
+            }
+            app_live.set(false);
+            return;
+        }
+        // Already listening; the counters move without the effect re-running.
+        if task.peek().is_some() {
+            return;
+        }
+        task.set(Some(spawn(async move {
+            loop {
+                if let Ok(mut events) = crate::api::pods::subscribe_app_events().await {
+                    // One-shot reconciliation: `broadcast` has no replay, so
+                    // whatever changed while this was down is fetched now. Not
+                    // a poll — once per connection, as the conversation
+                    // stream's own pull is.
+                    *conversations_changed.write() += 1;
+                    *pods_changed.write() += 1;
+                    *turns_changed.write() += 1;
+                    *questions_changed.write() += 1;
+                    crate::frontend::check_build_id().await;
+                    app_live.set(true);
+                    while let Some(Ok(event)) = events.recv().await {
+                        match event {
+                            crate::events::AppEvent::ConversationsChanged => *conversations_changed.write() += 1,
+                            crate::events::AppEvent::PodsChanged => *pods_changed.write() += 1,
+                            crate::events::AppEvent::TurnsChanged => *turns_changed.write() += 1,
+                            crate::events::AppEvent::QuestionsChanged => *questions_changed.write() += 1,
+                            // The model picker's, and with no conversation
+                            // open there is no picker on screen.
+                            crate::events::AppEvent::ProvidersChanged => {}
+                            // A type this page's bundle predates (SME-43).
+                            crate::events::AppEvent::Unknown => *crate::frontend::STALE_BUNDLE.write() = true,
+                        }
+                    }
+                    // Down: the marks it shows are no longer current, and a
+                    // scenario mustn't read the stale attribute.
+                    app_live.set(false);
+                }
+                gloo_timers::future::TimeoutFuture::new(1500).await;
+            }
+        })));
+    });
+}
+
 /// A second, independent live subscription — the frame stream isn't
 /// part of `ConversationEvent` (see `events::ConversationEvent`'s own
 /// doc comment on why frames get a separate channel), and only needs

@@ -47,6 +47,7 @@ fn is_app_relay(event: &events::ConversationEvent) -> bool {
             | events::ConversationEvent::TurnsChanged {}
             | events::ConversationEvent::QuestionsChanged {}
             | events::ConversationEvent::ProvidersChanged {}
+            | events::ConversationEvent::ConversationsChanged {}
     )
 }
 
@@ -68,6 +69,54 @@ async fn next_skipping_other_app_relays(
     })
     .await
     .expect("the wanted event should arrive on the conversation stream")
+}
+
+/// SME-269: the message that lands is also the one that may name the
+/// conversation and move it to the top of the list, so a `ConversationsChanged`
+/// rides along with every `MessagesAppended`. Read the way a tab does, through
+/// `open_conversation_events`: it must reach the stream, not only the app-wide
+/// channel.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_saved_message_also_announces_a_list_change(pool: PgPool) {
+    use futures_util::StreamExt;
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation_id = db::create_conversation(&pool).await.expect("conversation").id;
+    let stream = open_conversation_events(&pool, conversation_id).await.expect("the conversation's stream");
+    futures_util::pin_mut!(stream);
+    let saved = db::create_message(
+        &pool,
+        conversation_id,
+        "user",
+        &[anthropic::ContentBlock::Text { text: "the first message".to_string() }],
+    )
+    .await
+    .expect("message");
+    let mut persisted = Vec::new();
+    record_saved(conversation_id, &mut persisted, saved.clone());
+
+    let mut saw_appended = false;
+    let mut saw_list_change = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !(saw_appended && saw_list_change) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "messages appended: {saw_appended}, list change: {saw_list_change}"
+        );
+        match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("the conversation's stream to answer")
+        {
+            Some(Ok(events::ConversationEvent::MessagesAppended { messages })) => {
+                assert_eq!(messages, vec![saved.clone()]);
+                saw_appended = true;
+            }
+            Some(Ok(events::ConversationEvent::ConversationsChanged {})) => saw_list_change = true,
+            // Another test's app event relayed onto this stream (SME-135).
+            Some(Ok(event)) if is_app_relay(&event) => continue,
+            other => panic!("the conversation's stream gave {other:?}"),
+        }
+    }
+    events::forget(conversation_id);
 }
 
 /// SME-51 B3: each delta says where it starts, measured against the

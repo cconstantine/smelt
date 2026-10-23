@@ -136,6 +136,21 @@ pub(super) fn ConversationSidebar(
         }
     };
 
+    // Whether the sidebar's live connection is up, for `data-app-live`: the
+    // app-wide stream while no conversation is open. With one selected, its
+    // stream relays the same events, so nothing listens here (SME-269).
+    #[allow(unused_mut)]
+    let mut app_live: Signal<bool> = use_signal(|| false);
+    #[cfg(feature = "web")]
+    use_sidebar_app_events(
+        selected,
+        conversations_changed,
+        pods_changed,
+        turns_changed,
+        questions_changed,
+        app_live,
+    );
+
     rsx! {
         aside { class: if open_on_phone() { "sidebar sidebar-open" } else { "sidebar" },
             // Phone only (see assets/css/01-base.css): the list folds behind this, so the
@@ -148,6 +163,10 @@ pub(super) fn ConversationSidebar(
                 if open_on_phone() { "Close" } else { "Conversations" }
             }
             div { class: "sidebar-body",
+            // Set once this tab's sidebar connection is up, so a browser
+            // test can tell a hydrated, listening page from a static
+            // server render (SME-269).
+            "data-app-live": app_live().then_some("true"),
             button { class: "new-conversation", onclick: move |e| { open_on_phone.set(false); new_conversation(e) }, "New conversation" }
             Link { to: Route::ProvidersRoute {}, class: "sandbox-volumes-link providers-link", "Model providers" }
             Link { to: Route::McpServersRoute {}, class: "mcp-servers-link", "MCP servers" }
