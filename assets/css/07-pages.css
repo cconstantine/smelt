@@ -689,6 +689,28 @@
     line-height: 1;
 }
 
+/* SME-246: how many agents under a row wait for the user, on the parent's
+   row folded or not, and how many conversations do, on the phone's folded
+   list's button. */
+.agents-waiting-count {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    height: 16px;
+    padding: 0 5px;
+    border: 1.5px solid var(--accent);
+    border-radius: 8px;
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1;
+}
+
+.sidebar-toggle .agents-waiting-count {
+    margin-left: 6px;
+    vertical-align: 1px;
+}
+
 /* SME-35: the language server page's catalog lookup. */
 .language-server-lookup-row {
   display: flex;

@@ -1,7 +1,13 @@
 //! The conversation list.
 
 use super::*;
+use std::collections::HashSet;
+
 use crate::api::agents::{ConversationNode, get_conversation_tree};
+
+mod tree;
+
+use tree::{TreeRow, build_tree};
 
 /// How long ago a conversation was last active, as the sidebar shows it:
 /// one unit, `now`, `5m`, `3h`, `2d`, `3w` (SME-41 D8).
@@ -51,6 +57,9 @@ pub(super) fn ConversationSidebar(
     let mut list_error: Signal<Option<String>> = use_signal(|| None);
     let mut action_error: Signal<Option<String>> = use_signal(|| None);
     let mut pending_delete: Signal<Option<i64>> = use_signal(|| None);
+    // The conversations whose agents are folded away, in this tab only: a
+    // reload shows every agent again (SME-246).
+    let mut collapsed: Signal<HashSet<i64>> = use_signal(HashSet::new);
     // Whether the conversation list is open on a phone, where it folds
     // behind a button (SME-41 D4). Ignored at wider widths.
     let mut open_on_phone = use_signal(|| false);
@@ -154,6 +163,11 @@ pub(super) fn ConversationSidebar(
                 aria_expanded: "{open_on_phone()}",
                 onclick: move |_| open_on_phone.toggle(),
                 if open_on_phone() { "Close" } else { "Conversations" }
+                // The folded list still says something waits for the user.
+                {waiting_count(waiting_total(&conversations()), |n| match n {
+                    1 => "1 conversation is waiting for you".to_string(),
+                    n => format!("{n} conversations are waiting for you"),
+                })}
             }
             div { class: "sidebar-body",
             // Set once this tab's sidebar connection is up, so a browser
@@ -175,60 +189,162 @@ pub(super) fn ConversationSidebar(
                 p { class: "muted", "No conversations yet" }
             } else {
                 div { class: "conversation-list",
-                    for conversation in conversations() {
-                        div {
-                            key: "{conversation.id}",
-                            "data-conversation-id": "{conversation.id}",
-                            class: if selected() == Some(conversation.id) { "conversation-item active" } else { "conversation-item" },
-                            onclick: move |_| open_conversation(conversation.id),
-                            // The title is the row's link and tab stop, which
-                            // Enter or Space opens (SME-58). Not the whole
-                            // row: its Delete would be inside the link, read
-                            // as part of its name and, by some screen
-                            // readers, not reachable at all.
-                            span {
-                                class: "conversation-title",
-                                tabindex: "0",
-                                role: "link",
-                                aria_current: if selected() == Some(conversation.id) { Some("page") } else { None },
-                                onkeydown: move |evt: Event<KeyboardData>| {
-                                    let opens = match evt.key() {
-                                        keyboard_types::Key::Enter => true,
-                                        keyboard_types::Key::Character(c) => c == " ",
-                                        _ => false,
-                                    };
-                                    if opens {
-                                        // Space would scroll the list too.
-                                        evt.prevent_default();
-                                        open_conversation(conversation.id);
-                                    }
-                                },
-                                "{conversation.title}"
-                            }
-                            if conversation.busy {
-                                span { class: "conversation-busy", title: "Working" }
-                            }
-                            if conversation.waiting_for_user {
-                                span { class: "conversation-waiting", title: "Waiting for your answer", "?" }
-                            }
-                            if has_live_pod(conversation.id) {
-                                span { class: "live-pod-dot", title: "sandbox pod running" }
-                            }
-                            if let Some(now) = now_utc() {
-                                span { class: "conversation-age", {short_age((now - conversation.updated_at).num_seconds())} }
-                            }
-                            super::TwoStepButton {
-                                armed: pending_delete() == Some(conversation.id),
-                                class: "delete-conversation",
-                                idle: "Delete",
-                                confirm: delete_confirm_label(&conversations(), conversation.id),
-                                on_arm: move |_| request_delete(conversation.id),
-                                on_confirm: move |_| request_delete(conversation.id),
-                            }
+                    for row in build_tree(&conversations(), &collapsed()) {
+                        ConversationRow {
+                            key: "{row.node.id}",
+                            active: selected() == Some(row.node.id),
+                            live_pod: has_live_pod(row.node.id),
+                            age: now_utc().map(|now| short_age((now - row.node.updated_at).num_seconds())),
+                            armed: pending_delete() == Some(row.node.id),
+                            confirm: delete_confirm_label(&conversations(), row.node.id),
+                            on_open: move |id| open_conversation(id),
+                            on_delete: move |id| request_delete(id),
+                            on_toggle: move |id| {
+                                let mut folded = collapsed.write();
+                                if !folded.remove(&id) {
+                                    folded.insert(id);
+                                }
+                            },
+                            row,
                         }
                     }
                 }
             }
+            }
+        }
+    }
+}
+
+/// One row of the list: a conversation, indented under its parent, with
+/// its marks and, for an agent, its persona and status (SME-246).
+#[component]
+fn ConversationRow(
+    row: TreeRow,
+    active: bool,
+    live_pod: bool,
+    age: Option<String>,
+    armed: bool,
+    confirm: String,
+    on_open: EventHandler<i64>,
+    on_delete: EventHandler<i64>,
+    on_toggle: EventHandler<i64>,
+) -> Element {
+    let id = row.node.id;
+    let class = match (active, row.node.status.is_some()) {
+        (true, true) => "conversation-item conversation-agent active",
+        (true, false) => "conversation-item active",
+        (false, true) => "conversation-item conversation-agent",
+        (false, false) => "conversation-item",
+    };
+    rsx! {
+        div {
+            "data-conversation-id": "{id}",
+            "data-depth": "{row.depth}",
+            class,
+            style: "--depth: {row.indent()}",
+            onclick: move |_| on_open.call(id),
+            if row.has_children {
+                button {
+                    class: "tree-caret",
+                    r#type: "button",
+                    aria_expanded: "{!row.collapsed}",
+                    aria_label: if row.collapsed { "Show its agents" } else { "Hide its agents" },
+                    title: if row.collapsed { "Show its agents" } else { "Hide its agents" },
+                    onclick: move |evt: Event<MouseData>| {
+                        // Folding isn't opening the conversation.
+                        evt.stop_propagation();
+                        on_toggle.call(id);
+                    },
+                    if row.collapsed { "\u{25b8}" } else { "\u{25be}" }
+                }
+            } else if row.depth > 0 {
+                // The caret's room, so an agent's title lines up with its
+                // siblings' that have agents of their own.
+                span { class: "tree-caret-spacer" }
+            }
+            // The title is the row's link and tab stop, which Enter or
+            // Space opens (SME-58). Not the whole row: its Delete would be
+            // inside the link, read as part of its name and, by some screen
+            // readers, not reachable at all.
+            span {
+                class: "conversation-title",
+                tabindex: "0",
+                role: "link",
+                aria_current: if active { Some("page") } else { None },
+                onkeydown: move |evt: Event<KeyboardData>| {
+                    let opens = match evt.key() {
+                        keyboard_types::Key::Enter => true,
+                        keyboard_types::Key::Character(c) => c == " ",
+                        _ => false,
+                    };
+                    if opens {
+                        // Space would scroll the list too.
+                        evt.prevent_default();
+                        on_open.call(id);
+                    }
+                },
+                "{row.node.title}"
+            }
+            if row.node.busy {
+                span { class: "conversation-busy", title: "Working" }
+            }
+            if row.node.waiting_for_user {
+                span { class: "conversation-waiting", title: "Waiting for your answer", "?" }
+            }
+            {waiting_count(row.waiting_under, |n| match n {
+                1 => "1 agent under it is waiting for you".to_string(),
+                n => format!("{n} agents under it are waiting for you"),
+            })}
+            if live_pod {
+                span { class: "live-pod-dot", title: "sandbox pod running" }
+            }
+            if let Some(age) = age {
+                span { class: "conversation-age", "{age}" }
+            }
+            super::TwoStepButton {
+                armed,
+                class: "delete-conversation",
+                idle: "Delete",
+                confirm,
+                on_arm: move |_| on_delete.call(id),
+                on_confirm: move |_| on_delete.call(id),
+            }
+            {agent_meta(&row.node)}
+        }
+    }
+}
+
+/// How many conversations in the list wait for the user.
+fn waiting_total(conversations: &[ConversationNode]) -> usize {
+    conversations.iter().filter(|c| c.waiting_for_user).count()
+}
+
+/// The mark that finds a waiting agent from further up: on a parent's row
+/// (its agents, at any depth, folded or not) and on the phone's folded
+/// list, `label` saying what the count is. Nothing when none waits.
+fn waiting_count(count: usize, label: impl Fn(usize) -> String) -> Element {
+    if count == 0 {
+        return rsx! {};
+    }
+    let label = label(count);
+    rsx! {
+        span { class: "agents-waiting-count", title: "{label}", aria_label: "{label}", "?{count}" }
+    }
+}
+
+/// An agent's second line: its status, then its persona, which gives way
+/// first on a narrow row. Nothing for the user's own conversations.
+fn agent_meta(node: &ConversationNode) -> Element {
+    let Some(status) = node.status.as_deref() else {
+        return rsx! {};
+    };
+    let status_class = format!("agent-status status-{}", status.replace(' ', "-"));
+    rsx! {
+        div { class: "conversation-agent-meta",
+            span { class: status_class, "{status}" }
+            if let Some(persona) = node.persona.as_deref() {
+                span { class: "agent-meta-sep", aria_hidden: "true", " \u{b7} " }
+                span { class: "agent-persona", "{persona}" }
             }
         }
     }
@@ -259,6 +375,51 @@ mod tests {
     fn conversation(id: i64, parent_id: Option<i64>) -> ConversationNode {
         let at = chrono::NaiveDateTime::default();
         ConversationNode::from(crate::models::Conversation { id, title: format!("c{id}"), created_at: at, updated_at: at, parent_id })
+    }
+
+    fn agent(id: i64, parent_id: i64, persona: Option<&str>, status: &str) -> ConversationNode {
+        let mut node = conversation(id, Some(parent_id));
+        node.persona = persona.map(str::to_string);
+        node.status = Some(status.to_string());
+        node
+    }
+
+    #[test]
+    fn test_an_agents_meta_line_shows_its_status_then_its_persona() {
+        let html = dioxus::ssr::render_element(agent_meta(&agent(2, 1, Some("smelt:developer"), "waiting for the user")));
+        assert!(html.contains(r#"class="conversation-agent-meta""#), "{html}");
+        assert!(html.contains(">smelt:developer<"), "{html}");
+        assert!(html.contains(r#"class="agent-status status-waiting-for-the-user">waiting for the user<"#), "{html}");
+        assert!(html.find("waiting for the user") < html.find("smelt:developer"), "the status comes first: {html}");
+    }
+
+    #[test]
+    fn test_an_agent_without_a_persona_shows_its_status_alone() {
+        let html = dioxus::ssr::render_element(agent_meta(&agent(2, 1, None, "idle")));
+        assert!(html.contains(">idle<"), "{html}");
+        assert!(!html.contains("agent-persona") && !html.contains("agent-meta-sep"), "{html}");
+    }
+
+    #[test]
+    fn test_the_users_own_conversation_has_no_meta_line() {
+        assert_eq!(dioxus::ssr::render_element(agent_meta(&conversation(1, None))), "");
+    }
+
+    #[test]
+    fn test_the_waiting_count_names_how_many_and_is_absent_at_zero() {
+        let label = |n: usize| format!("{n} waiting");
+        assert_eq!(dioxus::ssr::render_element(waiting_count(0, label)), "");
+        let two = dioxus::ssr::render_element(waiting_count(2, label));
+        assert!(two.contains(r#"title="2 waiting""#) && two.contains(r#"aria-label="2 waiting""#), "{two}");
+        assert!(two.contains(">?2<"), "{two}");
+    }
+
+    #[test]
+    fn test_the_waiting_total_counts_every_conversation_waiting() {
+        let mut list = vec![conversation(1, None), agent(2, 1, None, "waiting for the user"), conversation(3, None)];
+        list[1].waiting_for_user = true;
+        list[2].waiting_for_user = true;
+        assert_eq!(waiting_total(&list), 2);
     }
 
     #[test]
