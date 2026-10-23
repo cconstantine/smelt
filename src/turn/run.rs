@@ -487,6 +487,7 @@ fn run_turn_steps<'a: 'b, 'b>(
             tracing::info!(conversation_id, "starting a turn while a repo is still cloning");
         }
 
+        let mut streak = TextCallStreak::default();
         for _ in 0..max_turns {
             // Checked at the top of every loop iteration, not just once per
             // `run_turn_bounded` call — this is what gives same-turn visibility: if
@@ -571,6 +572,7 @@ fn run_turn_steps<'a: 'b, 'b>(
             let (mut request, budget) =
                 build_request(pool, conversation_id, turn_model, last_known_usage.as_ref(), &pending_new_content)
                     .await?;
+            let offered: Vec<String> = request.tools.iter().map(|tool| tool.name.clone()).collect();
             let (turn, recorder) = call_model(pool, conversation_id, turn_model, &mut request).await?;
             save_reply(pool, conversation_id, &turn, &mut persisted).await?;
             #[cfg(test)]
@@ -584,8 +586,15 @@ fn run_turn_steps<'a: 'b, 'b>(
             pending_new_content.clear();
             save_stop_notice(pool, conversation_id, turn_model, &turn, &budget, &mut persisted).await?;
 
-            if turn.stop_reason != "tool_use" {
-                return Ok(persisted);
+            // A call written as text gets a correction, and the model is
+            // called again (SME-286).
+            let offered: Vec<&str> = offered.iter().map(String::as_str).collect();
+            match after_reply(pool, conversation_id, &turn, &offered, &mut streak, &mut persisted, &mut pending_new_content)
+                .await?
+            {
+                NextStep::RunTools => {}
+                NextStep::CallAgain => continue,
+                NextStep::End => return Ok(persisted),
             }
 
             // Asked the user, or an agent finished (SME-236): the turn ends.

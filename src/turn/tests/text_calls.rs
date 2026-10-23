@@ -1,0 +1,208 @@
+//! SME-286: a tool call the model wrote as text gets a correction, and
+//! the turn carries on; corrections are bounded.
+
+use super::*;
+
+/// A content block of a mock reply.
+enum Block<'a> {
+    Thinking(&'a str),
+    Text(&'a str),
+    /// A `todoread` call (a cheap tool that needs only the database).
+    Todoread(&'a str),
+}
+
+/// A reply of `blocks` ending with `stop_reason`, as SSE, its text
+/// escaped by `serde_json` (`text_reply_body` pastes text into JSON raw,
+/// so it can't carry markup's quotes and newlines).
+fn text_blocks_body(blocks: &[Block], stop_reason: &str) -> String {
+    use serde_json::json;
+    let mut events = vec![json!({"type": "message_start", "message": {"usage": {
+        "input_tokens": 100, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 1}}})];
+    for (index, block) in blocks.iter().enumerate() {
+        let (start, delta) = match block {
+            Block::Thinking(t) => (json!({"type": "thinking", "thinking": ""}), json!({"type": "thinking_delta", "thinking": t})),
+            Block::Text(t) => (json!({"type": "text", "text": ""}), json!({"type": "text_delta", "text": t})),
+            Block::Todoread(id) => (
+                json!({"type": "tool_use", "id": id, "name": "todoread", "input": {}}),
+                json!({"type": "input_json_delta", "partial_json": "{}"}),
+            ),
+        };
+        events.push(json!({"type": "content_block_start", "index": index, "content_block": start}));
+        events.push(json!({"type": "content_block_delta", "index": index, "delta": delta}));
+        events.push(json!({"type": "content_block_stop", "index": index}));
+    }
+    events.push(json!({"type": "message_delta", "delta": {"stop_reason": stop_reason}, "usage": {"output_tokens": 60}}));
+    events.push(json!({"type": "message_stop"}));
+    events.iter().map(|e| format!("data: {e}\n\n")).collect()
+}
+
+/// The evidence: conversation 2294639360's message 98, prose and then a
+/// call written as text, which ended the turn.
+const EVIDENCE: &str = include_str!("../../text_calls/fixtures/evidence_98.txt");
+const EVIDENCE_TOOL: &str = "mcp__linear.app__add_issue_comment";
+
+fn markup_reply() -> String {
+    text_blocks_body(&[Block::Thinking("I'll comment."), Block::Text(EVIDENCE)], "end_turn")
+}
+
+fn call_reply(id: &str) -> String {
+    text_blocks_body(&[Block::Todoread(id)], "tool_use")
+}
+
+fn roles(saved: &[crate::models::Message]) -> Vec<&str> {
+    saved.iter().map(|m| m.role.as_str()).collect()
+}
+
+/// The text of a message that is one text block, or `None`.
+fn notice_text(message: &crate::models::Message) -> Option<String> {
+    match message.blocks().expect("blocks").as_slice() {
+        [anthropic::ContentBlock::Text { text }] => Some(text.clone()),
+        _ => None,
+    }
+}
+
+/// How many saved messages are text-call notices.
+fn notices(saved: &[crate::models::Message]) -> usize {
+    saved
+        .iter()
+        .filter(|m| notice_text(m).and_then(|t| crate::text_calls::parse_text_call_notice(&t)).is_some())
+        .count()
+}
+
+/// The last message request `n` sent: its role and its first text.
+fn last_sent(requests: &std::sync::Mutex<Vec<serde_json::Value>>, n: usize) -> (String, String) {
+    let log = requests.lock().expect("the request log");
+    let last = log[n]["messages"].as_array().expect("messages").last().expect("a message").clone();
+    let text = last["content"][0]["text"].as_str().unwrap_or_default().to_string();
+    (last["role"].as_str().expect("a role").to_string(), text)
+}
+
+/// A1: a reply that only writes a call as text gets the correction, and
+/// the model's next, real call runs.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_call_written_as_text_gets_a_correction_and_the_turn_goes_on(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let requests =
+        start_recording_mock_upstream(&pool, vec![markup_reply(), call_reply("toolu_real"), text_reply_body("Done.")]).await;
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("the turn succeeds");
+
+    assert_eq!(roles(&saved), ["user", "assistant", "user", "assistant", "user", "assistant"], "{saved:?}");
+    let notice = notice_text(&saved[2]).expect("the notice is one text block");
+    assert_eq!(crate::text_calls::parse_text_call_notice(&notice), Some(vec![Some(EVIDENCE_TOOL.to_string())]), "{notice}");
+    assert_eq!(requests.lock().expect("the request log").len(), 3);
+    assert_eq!(last_sent(&requests, 1), ("user".to_string(), notice), "the model reads the notice next");
+}
+
+/// A3: after 3 corrections in a row, the 4th call written as text ends
+/// the turn with an error naming the tool, and every tab is told.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_corrections_are_bounded_and_end_in_a_visible_error(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    // Ids no other test's database hands out: what this test hears on its
+    // conversation's channel mustn't be another test's (SME-135).
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![markup_reply()]).await;
+
+    // Bounded at 10 model calls, so a missing bound fails as 10, not a hang.
+    let error = run_turn_bounded(&pool, TurnInFlight::start(conversation.id), Some(hello()), 10, None, false)
+        .await
+        .expect_err("the turn fails once corrections run out");
+
+    assert_eq!(requests.lock().expect("the request log").len(), 4);
+    let error = error.to_string();
+    assert!(error.contains("4 times in a row") && error.contains(EVIDENCE_TOOL), "{error}");
+    let saved = db::list_messages(&pool, conversation.id).await.expect("list messages");
+    assert_eq!(saved.iter().filter(|m| m.role == "assistant").count(), 4, "{saved:?}");
+    assert_eq!(notices(&saved), 4, "the last notice is saved too, for the next turn");
+
+    // A sent turn's failure reaches every tab, as any turn failure does.
+    let sent = db::create_conversation(&pool).await.expect("create conversation");
+    let mut rx = events::subscribe(sent.id);
+    start_turn(pool.clone(), sent.id, "hi".to_string()).await.expect("send");
+    let published = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            match rx.recv().await {
+                Ok(events::ConversationEvent::TurnError { message }) => return message,
+                Ok(_) => continue,
+                Err(e) => panic!("the event stream ended: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("a TurnError within 10 s");
+    assert!(published.contains("4 times in a row") && published.contains(EVIDENCE_TOOL), "{published}");
+}
+
+/// A4: a real call resets the streak: three corrections after it don't
+/// reach the bound.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_real_call_resets_the_streak(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let bodies = vec![
+        markup_reply(),
+        call_reply("toolu_reset"),
+        markup_reply(),
+        markup_reply(),
+        markup_reply(),
+        text_reply_body("Done."),
+    ];
+    let requests = start_recording_mock_upstream(&pool, bodies).await;
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("the turn succeeds");
+
+    assert_eq!(requests.lock().expect("the request log").len(), 6);
+    assert_eq!(notices(&saved), 4, "{saved:?}");
+}
+
+/// A5: each form the chat templates produce gets the correction through
+/// the turn, not only through `find`.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_every_form_gets_the_correction(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let forms = [
+        include_str!("../../text_calls/fixtures/qwen3_coder.txt"),
+        include_str!("../../text_calls/fixtures/hermes.txt"),
+        include_str!("../../text_calls/fixtures/glm.txt"),
+        include_str!("../../text_calls/fixtures/minimax.txt"),
+        include_str!("../../text_calls/fixtures/seed_oss.txt"),
+        include_str!("../../text_calls/fixtures/mistral.txt"),
+        include_str!("../../text_calls/fixtures/deepseek_v3_1.txt"),
+        include_str!("../../text_calls/fixtures/kimi_k2.txt"),
+        include_str!("../../text_calls/fixtures/gemma4.txt"),
+        include_str!("../../text_calls/fixtures/lfm2.txt"),
+        include_str!("../../text_calls/fixtures/gpt_oss.txt"),
+        include_str!("../../text_calls/fixtures/functionary_v3_1.txt"),
+        include_str!("../../text_calls/fixtures/deepseek_v3_2_dsml.txt"),
+        include_str!("../../text_calls/fixtures/evidence_96.txt"),
+    ];
+    for form in forms {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let body = text_blocks_body(&[Block::Text(form)], "end_turn");
+        let requests = start_recording_mock_upstream(&pool, vec![body, text_reply_body("Done.")]).await;
+        let saved = run_turn(&pool, conversation.id, hello()).await.expect("the turn succeeds");
+        assert_eq!(notices(&saved), 1, "{form:?}: {saved:?}");
+        assert_eq!(requests.lock().expect("the request log").len(), 2, "{form:?}");
+    }
+}
+
+/// A6: a reply that quotes markup in code is an ordinary answer: no
+/// notice, and the turn ends.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_quoted_markup_ends_the_turn_as_before(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let qwen = include_str!("../../text_calls/fixtures/qwen3_coder.txt");
+    let fenced = format!("A Qwen call looks like this:\n\n```xml\n{qwen}\n```");
+    let inline = "Mistral starts its calls with `[TOOL_CALLS]get_time[ARGS]`.".to_string();
+    for text in [fenced, inline] {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let body = text_blocks_body(&[Block::Text(&text)], "end_turn");
+        let requests = start_recording_mock_upstream(&pool, vec![body, text_reply_body("Again?")]).await;
+        let saved = run_turn(&pool, conversation.id, hello()).await.expect("the turn succeeds");
+        assert_eq!(roles(&saved), ["user", "assistant"], "{text:?}");
+        assert_eq!(requests.lock().expect("the request log").len(), 1, "{text:?}");
+    }
+}

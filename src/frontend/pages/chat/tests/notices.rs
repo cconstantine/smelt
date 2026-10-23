@@ -42,6 +42,25 @@ fn test_a_cut_off_notice_reads_as_a_sentence() {
     assert_eq!(system_notice("Your last reply was cut off: it reached its limit of lots", &HashMap::new()), None);
 }
 
+/// SME-286: a correction for a tool call written as text reads as a
+/// notice line naming the calls.
+#[cfg(feature = "server")]
+#[test]
+fn test_a_text_call_notice_names_the_calls() {
+    use crate::text_calls::{TextCall, text_call_notice};
+    let call = |name: Option<&str>| TextCall { name: name.map(str::to_string) };
+    let one = text_call_notice(&[call(Some("mcp__linear.app__add_issue_comment"))], &["mcp__linear.app__save_comment"]);
+    assert_eq!(
+        system_notice(&one, &HashMap::new()).as_deref(),
+        Some("The model wrote a tool call as text (`mcp__linear.app__add_issue_comment`), so it didn't run; smelt told it.")
+    );
+    let two = text_call_notice(&[call(Some("read_file")), call(None)], &["read_file"]);
+    assert_eq!(
+        system_notice(&two, &HashMap::new()).as_deref(),
+        Some("The model wrote 2 tool calls as text (`read_file`, one unnamed), so they didn't run; smelt told it.")
+    );
+}
+
 /// B3 (SME-122): a refusal notice reads as one in the chat, naming a
 /// dropped call, and round-trips.
 #[test]

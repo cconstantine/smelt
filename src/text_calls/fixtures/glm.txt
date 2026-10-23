@@ -1,0 +1,4 @@
+<tool_call>special_function
+<arg_key>arg1</arg_key>
+<arg_value>1</arg_value>
+</tool_call>

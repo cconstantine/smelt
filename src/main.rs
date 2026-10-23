@@ -37,6 +37,7 @@ mod preview;
 mod pricing;
 mod providers;
 mod questions;
+mod text_calls;
 #[cfg(all(test, feature = "server"))]
 mod repo_lints;
 #[cfg(feature = "server")]

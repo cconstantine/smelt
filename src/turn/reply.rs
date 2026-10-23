@@ -246,3 +246,93 @@ fn is_question(name: &str) -> bool {
     name == crate::questions::ASK_USER || name == crate::agents::ASK_PARENT
 }
 
+
+/// A turn's run of replies that wrote a tool call as text (SME-286), kept
+/// in memory for one turn: corrections sent in a row, with no real call
+/// between them.
+#[cfg(feature = "server")]
+#[derive(Default)]
+pub(super) struct TextCallStreak {
+    corrections: usize,
+}
+
+/// What the turn does after a reply: runs its calls, calls the model
+/// again (a notice was saved for it), or ends.
+#[cfg(feature = "server")]
+pub(super) enum NextStep {
+    RunTools,
+    CallAgain,
+    End,
+}
+
+/// Decides what follows a saved reply. A reply that wrote a tool call as
+/// text instead of making it gets a correction naming the call and the
+/// offered tools like it (`offered`), and the model is called again,
+/// rather than the turn ending silently with the call never run (SME-286).
+/// After `MAX_TEXT_CALL_CORRECTIONS` corrections in a row, the next one is
+/// saved (the model reads it next turn) and the turn fails, naming it. A
+/// reply cut off or refused already has its notice and ends as before.
+#[cfg(feature = "server")]
+pub(super) async fn after_reply(
+    pool: &PgPool,
+    conversation_id: i64,
+    turn: &anthropic::stream::StreamedTurn,
+    offered: &[&str],
+    streak: &mut TextCallStreak,
+    persisted: &mut Vec<Message>,
+    pending_new_content: &mut Vec<anthropic::ContentBlock>,
+) -> ServerFnResult<NextStep> {
+    if anthropic::stream::is_cut_off(&turn.stop_reason) || turn.stop_reason == "refusal" {
+        return Ok(NextStep::End);
+    }
+    if turn.stop_reason == "tool_use" {
+        streak.corrections = 0;
+        return Ok(NextStep::RunTools);
+    }
+    if turn.content.iter().any(|b| matches!(b, anthropic::ContentBlock::ToolUse { .. })) {
+        return Ok(NextStep::End);
+    }
+    let calls = text_calls(turn);
+    if calls.is_empty() {
+        return Ok(NextStep::End);
+    }
+    let notice = crate::text_calls::text_call_notice(&calls, offered);
+    save_notice(pool, conversation_id, notice, persisted, pending_new_content).await?;
+    if streak.corrections == crate::text_calls::MAX_TEXT_CALL_CORRECTIONS {
+        return Err(ServerFnError::new(crate::text_calls::bound_error(&calls)));
+    }
+    streak.corrections += 1;
+    Ok(NextStep::CallAgain)
+}
+
+/// The tool calls a reply wrote in its text blocks (never its thinking).
+#[cfg(feature = "server")]
+fn text_calls(turn: &anthropic::stream::StreamedTurn) -> Vec<crate::text_calls::TextCall> {
+    turn.content
+        .iter()
+        .filter_map(|block| match block {
+            anthropic::ContentBlock::Text { text } => Some(crate::text_calls::find(text)),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+/// Saves `notice` as a user message of its own, for the model and every
+/// tab, and counts it as new since the last reply.
+#[cfg(feature = "server")]
+async fn save_notice(
+    pool: &PgPool,
+    conversation_id: i64,
+    notice: String,
+    persisted: &mut Vec<Message>,
+    pending_new_content: &mut Vec<anthropic::ContentBlock>,
+) -> ServerFnResult<()> {
+    let notice = vec![anthropic::ContentBlock::Text { text: notice }];
+    let saved = db::create_message(pool, conversation_id, "user", &notice)
+        .await
+        .map_err(ServerFnError::new)?;
+    record_saved(conversation_id, persisted, saved);
+    pending_new_content.extend(notice);
+    Ok(())
+}

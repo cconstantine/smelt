@@ -1,0 +1,1 @@
+<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_time<｜tool▁sep｜>{"city": "XYZCITY"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>

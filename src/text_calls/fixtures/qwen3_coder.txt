@@ -1,0 +1,7 @@
+<tool_call>
+<function=special_function>
+<parameter=arg1>
+1
+</parameter>
+</function>
+</tool_call>
