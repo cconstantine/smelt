@@ -13,13 +13,35 @@ const MAX_AGENTS_FILES: usize = 50;
 /// can break a line or reorder its text (SME-271). Non-ASCII letters are
 /// plain.
 pub fn plain_path_text(text: &str) -> bool {
-    !text.chars().any(|c| {
-        c.is_control()
-            || matches!(
-                c,
-                '\u{2028}' | '\u{2029}' | '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
-            )
-    })
+    !text.chars().any(breaks_a_line)
+}
+
+/// A control character (C0, DEL, C1), line or paragraph separator, or
+/// bidi control: what `plain_path_text` refuses.
+fn breaks_a_line(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{2028}' | '\u{2029}' | '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// `text` (a failed clone's error, which the remote can write into)
+/// made safe to show the model (SME-275): every character
+/// `plain_path_text` refuses, except the newlines and tabs git's own
+/// messages use, is written as its `\u{…}` escape. The escape is ASCII,
+/// shows the model what was there, and leaves already-escaped text as it
+/// is, so escaping twice changes nothing.
+pub fn plain_multiline_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if breaks_a_line(c) && c != '\n' && c != '\t' {
+            out.extend(c.escape_unicode());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// The `AGENTS.md` files a checkout's listing found, and how many it left

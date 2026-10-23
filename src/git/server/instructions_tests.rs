@@ -67,3 +67,24 @@ async fn test_a_clone_says_how_many_agents_files_it_left_out(pool: PgPool) {
         assert_eq!(row.error.as_deref(), error, "{dir}");
     }
 }
+
+/// SME-275: a failed clone's error is git's output, which the remote can
+/// write into, so before it reaches the model each character that can
+/// break or reorder a line is escaped as `\u{…}`, except the newlines and
+/// tabs git's own messages use. Escaping twice changes nothing.
+#[test]
+fn test_multiline_text_escapes_what_breaks_a_line_but_keeps_newlines_and_tabs() {
+    let raw = "remote: a\u{2028}b\u{2029}c\u{202e}d\u{2066}e\u{200f}f\u{061c}g\u{1b}[31mh\r\u{7f}\u{85}\n\thint: é 日本";
+    let escaped = plain_multiline_text(raw);
+    assert_eq!(
+        escaped,
+        r"remote: a\u{2028}b\u{2029}c\u{202e}d\u{2066}e\u{200f}f\u{61c}g\u{1b}[31mh\u{d}\u{7f}\u{85}".to_string()
+            + "\n\thint: é 日本"
+    );
+    assert_eq!(plain_multiline_text(&escaped), escaped);
+    for line in escaped.lines() {
+        assert!(plain_path_text(&line.replace('\t', "")), "{line:?}");
+    }
+    assert!(!plain_path_text("a\tb"));
+    assert!(plain_path_text("é"));
+}

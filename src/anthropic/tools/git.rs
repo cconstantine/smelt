@@ -75,7 +75,11 @@ async fn clone_repo_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> 
     let optional = |field: &str| input.get(field).and_then(Value::as_str).map(str::to_string);
     let branch = optional("branch");
     let dir = optional("dir");
-    let repo = crate::git::clone_repo(pool, conversation_id, &url, branch.as_deref(), dir.as_deref()).await?;
+    // SME-275: a failed clone's error is git's output, which the remote
+    // can write into; its line breakers and bidi controls go escaped.
+    let repo = crate::git::clone_repo(pool, conversation_id, &url, branch.as_deref(), dir.as_deref())
+        .await
+        .map_err(|e| crate::git::plain_multiline_text(&e))?;
     let persona_files = crate::git::repo_persona_files(pool, repo.id).await;
     Ok(clone_result_for_model(repo, &persona_files))
 }
@@ -93,6 +97,11 @@ pub(super) fn clone_result_for_model(mut repo: crate::git::RepoSummary, persona_
     if repo.branch.as_deref().is_some_and(|b| !crate::git::plain_path_text(b)) {
         told["branch"] = Value::Null;
         notes.push("Its checked-out branch isn't shown: the name holds control characters.".to_string());
+    }
+    // SME-275: an error can quote git's output, which the remote can
+    // write into; its line breakers and bidi controls go escaped.
+    if let Some(error) = repo.error.as_deref() {
+        told["error"] = Value::String(crate::git::plain_multiline_text(error));
     }
     if !repo.agents_files.is_empty() {
         notes.push(format!(
