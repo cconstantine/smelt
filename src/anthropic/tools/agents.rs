@@ -1,6 +1,8 @@
 //! Child agents (SME-236): `start_agent`, offered to a conversation without
 //! a parent, `list_agents` and `stop_agent`, offered to every conversation,
-//! and `finish`, offered to an agent. The lifecycle behind them is `crate::agents`.
+//! and `finish`, offered to an agent; and (SME-238) `message_agent`, offered
+//! to a conversation with a parent or agents of its own. The lifecycle
+//! behind them is `crate::agents`.
 
 use super::{Offer, Registered, Tool};
 use crate::anthropic::ToolDefinition;
@@ -17,8 +19,8 @@ pub(super) fn tools() -> Vec<Registered> {
                          that works on `brief` in the background while you go on. Returns its id at \
                          once. The brief is its first message, so say everything it needs: the task, \
                          what to report back, and when it's done. Its report arrives here as a \
-                         message when it calls finish; list_agents shows its status, and the user can \
-                         open it and write to it. Up to {} characters.",
+                         message when it calls finish; message_agent writes to it, list_agents shows \
+                         its status, and the user can open it and write to it. Up to {} characters.",
                         crate::agents::MAX_BRIEF_CHARS
                     ),
                     input_schema: serde_json::json!({
@@ -99,6 +101,31 @@ pub(super) fn tools() -> Vec<Registered> {
                     }),
                 },
                 run: run!(|c| crate::agents::finish(c.pool, c.conversation_id, c.input)),
+            },
+        },
+        Registered {
+            offer: Offer::Linked,
+            tool: Tool {
+                def: ToolDefinition {
+                    name: "message_agent".to_string(),
+                    description: format!(
+                        "Send a message to your parent (to: \"parent\") or to one of the agents you \
+                         started (to: its id), at any time. It arrives in their conversation as a message \
+                         from you: an idle one is woken to read it, a busy one reads it after its current \
+                         step. Not to anyone else, nor to an agent that is stopped or failed. Up to {} \
+                         characters.",
+                        crate::agents::MAX_MESSAGE_CHARS
+                    ),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "to": {"type": "string", "description": "\"parent\", or the id of one of your agents"},
+                            "text": {"type": "string", "description": "the message"}
+                        },
+                        "required": ["to", "text"]
+                    }),
+                },
+                run: run!(|c| crate::agents::message_agent(c.pool, c.conversation_id, c.input)),
             },
         },
     ]

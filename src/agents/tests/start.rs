@@ -42,6 +42,7 @@ async fn test_start_agent_returns_at_once_and_the_child_runs_its_brief(pool: PgP
     // Its system prompt says what it is.
     let system = requests_for(&requests, Some(child))[0]["system"].to_string();
     assert!(system.contains(&format!("You are agent #{child}, started by conversation #{root}")), "{system}");
+    assert!(system.contains("message_agent with to \\\"parent\\\" writes to your parent"), "{system}");
 }
 
 /// The child runs on its parent's model, not on the default.

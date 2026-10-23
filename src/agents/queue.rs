@@ -24,6 +24,7 @@ pub(crate) async fn finish(pool: &PgPool, child: i64, input: &serde_json::Value)
             crate::turn::notify(pool, parent, vec![crate::turn::Notice::Wake]);
             Ok("Your report was sent to your parent. Your turn ends here; the user may still write to you.".to_string())
         }
+        db::Finish::MessageWaiting => Err("a message arrived since your last step; read it, then finish".to_string()),
         db::Finish::NotActive(Some(state)) if state == db::AGENT_FINISHED => {
             Err("you've already finished: your report was sent".to_string())
         }

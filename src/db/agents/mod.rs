@@ -9,9 +9,11 @@
 use super::*;
 
 mod delete;
+mod messages;
 mod start;
 
 pub use delete::*;
+pub use messages::*;
 pub use start::*;
 
 /// `agents.state`: the start is running; no turn is admitted.
@@ -29,6 +31,8 @@ pub const AGENT_FAILED: &str = "failed";
 pub const KIND_REPORT: &str = "report";
 /// `agent_messages.kind`: a notice from smelt.
 pub const KIND_NOTICE: &str = "notice";
+/// `agent_messages.kind`: a parent's or a child's `message_agent` (SME-238).
+pub const KIND_MESSAGE: &str = "message";
 
 /// One queued report or notice, as the drain reads it.
 #[derive(Clone, Debug, sqlx::FromRow)]
@@ -123,6 +127,9 @@ pub enum Finish {
     /// The agent isn't `active`: its state, or `None` when it isn't an
     /// agent or is gone.
     NotActive(Option<String>),
+    /// A message to the child is still unread (SME-238): it reads it
+    /// first, or it would be `finished` with no way to report on it.
+    MessageWaiting,
 }
 
 /// `finish`'s transaction: the child `finished` and its report queued to
@@ -159,9 +166,27 @@ pub async fn finish_agent(pool: &PgPool, child: i64, label: &str, report: &str) 
             .await?;
         return Ok(Finish::NotActive(state));
     }
+    // A statement after the update got the row: a `message_agent` that
+    // held it first has committed, and its row is seen (SME-238).
+    if unread_by(&mut tx, child).await? {
+        return Ok(Finish::MessageWaiting);
+    }
     queue_agent_message(&mut tx, parent, Some(child), label, KIND_REPORT, report).await?;
     tx.commit().await?;
     Ok(Finish::Queued { parent })
+}
+
+/// Whether a message to `child` is still undelivered, on the caller's
+/// transaction.
+async fn unread_by(conn: &mut sqlx::PgConnection, child: i64) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM agent_messages
+                        WHERE to_conversation_id = $1 AND delivered_at IS NULL AND kind = $2)",
+    )
+    .bind(child)
+    .bind(KIND_MESSAGE)
+    .fetch_one(&mut *conn)
+    .await
 }
 
 /// `stop_subtree`'s outcome.

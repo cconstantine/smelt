@@ -148,7 +148,8 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
     }));
     Ok(format!(
         "Started {} ({named}){on}. It works on its brief in its own conversation; its report \
-         arrives here as a message when it calls finish, and list_agents shows its status.",
+         arrives here as a message when it calls finish, message_agent writes to it, and \
+         list_agents shows its status.",
         label(child, None)
     ))
 }

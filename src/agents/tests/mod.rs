@@ -10,6 +10,7 @@ use std::time::Duration;
 mod delete;
 mod ended;
 mod list;
+mod messages;
 mod pause;
 mod persona;
 mod reports;

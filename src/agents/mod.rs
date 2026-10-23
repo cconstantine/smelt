@@ -15,6 +15,7 @@ use crate::db;
 
 mod checkout;
 mod delete;
+mod messages;
 mod persona;
 mod queue;
 mod start;
@@ -22,6 +23,7 @@ mod sweep;
 
 pub(crate) use checkout::*;
 pub(crate) use delete::*;
+pub(crate) use messages::*;
 pub(crate) use queue::*;
 pub(crate) use start::*;
 pub(crate) use sweep::*;
@@ -31,6 +33,9 @@ pub(crate) const MAX_BRIEF_CHARS: usize = 30_000;
 
 /// The longest report `finish` takes, in characters.
 pub(crate) const MAX_REPORT_CHARS: usize = 30_000;
+
+/// The longest message `message_agent` takes, in characters.
+pub(crate) const MAX_MESSAGE_CHARS: usize = 30_000;
 
 /// The tool a child ends its work with; a successful call ends its turn.
 pub(crate) const FINISH: &str = "finish";

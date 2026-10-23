@@ -275,12 +275,13 @@ pub(super) async fn drain_agent_messages(
     Ok(())
 }
 
-/// A queued row as its recipient reads it: a report names its sender.
+/// A queued row as its recipient reads it: a report or a message names
+/// its sender (`agent #12 (smelt:developer)`, or `your parent`).
 fn agent_message_text(row: &db::AgentMessage) -> String {
-    if row.kind == db::KIND_REPORT {
-        format!("Report from {}:\n\n{}", row.from_label, row.body)
-    } else {
-        format!("Notice: {}", row.body)
+    match row.kind.as_str() {
+        db::KIND_REPORT => format!("Report from {}:\n\n{}", row.from_label, row.body),
+        db::KIND_MESSAGE => format!("Message from {}:\n\n{}", row.from_label, row.body),
+        _ => format!("Notice: {}", row.body),
     }
 }
 
