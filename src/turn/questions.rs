@@ -43,10 +43,17 @@ pub(super) async fn save_turn_message(
 }
 
 /// The `ask_user` call's result for `question`: the user's answer, or that
-/// they wrote a message instead.
+/// they wrote a message instead; for `ask_parent` (SME-238), the parent's
+/// reply, or that the user wrote first.
 fn question_result(question: &db::StoredQuestion) -> anthropic::ContentBlock {
+    let by_parent = question.asked_of == db::ASKED_OF_PARENT;
     let content = match &question.answer {
+        Some(answers) if by_parent => {
+            let reply = answers.first().and_then(|a| a.other.as_deref()).unwrap_or_default();
+            format!("{}\n\n{reply}", crate::questions::PARENT_ANSWERED)
+        }
         Some(answers) => crate::questions::answered_result(&question.questions, answers),
+        None if by_parent => crate::questions::NOT_ANSWERED_BY_PARENT.to_string(),
         None => crate::questions::NOT_ANSWERED.to_string(),
     };
     anthropic::ContentBlock::ToolResult {
@@ -113,13 +120,14 @@ fn publish_question(conversation_id: i64, question: Option<PendingQuestion>) {
 }
 
 /// The question `conversation_id` waits on, for the card; `None` once
-/// answered, even before a turn has taken the answer.
+/// answered, even before a turn has taken the answer, and for a question
+/// to the child's parent (SME-238).
 pub(crate) async fn pending_question(pool: &PgPool, conversation_id: i64) -> ServerFnResult<Option<PendingQuestion>> {
     let question = db::get_pending_question(pool, conversation_id)
         .await
         .map_err(ServerFnError::new)?;
     Ok(question
-        .filter(|q| q.answer.is_none())
+        .filter(|q| q.answer.is_none() && q.asked_of == db::ASKED_OF_USER)
         .map(|q| PendingQuestion { tool_use_id: q.tool_use_id, questions: q.questions }))
 }
 
@@ -135,7 +143,7 @@ pub(crate) async fn answer_question(
     let Some(question) = db::get_pending_question(&pool, conversation_id)
         .await
         .map_err(ServerFnError::new)?
-        .filter(|q| q.answer.is_none() && q.tool_use_id == tool_use_id)
+        .filter(|q| q.answer.is_none() && q.tool_use_id == tool_use_id && q.asked_of == db::ASKED_OF_USER)
     else {
         return Err(ServerFnError::new(ALREADY_ANSWERED));
     };

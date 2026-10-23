@@ -1,8 +1,8 @@
 //! Child agents (SME-236): `start_agent`, offered to a conversation without
 //! a parent, `list_agents` and `stop_agent`, offered to every conversation,
 //! and `finish`, offered to an agent; and (SME-238) `message_agent`, offered
-//! to a conversation with a parent or agents of its own. The lifecycle
-//! behind them is `crate::agents`.
+//! to a conversation with a parent or agents of its own, and `ask_parent`,
+//! offered to an agent. The lifecycle behind them is `crate::agents`.
 
 use super::{Offer, Registered, Tool};
 use crate::anthropic::ToolDefinition;
@@ -53,7 +53,8 @@ pub(super) fn tools() -> Vec<Registered> {
                     name: "list_agents".to_string(),
                     description: "List the agents you started (never anyone else's), newest first: \
                                   id, title, persona, status (starting, running, waiting for the user, \
-                                  idle, finished, stopped or failed), when it started, its last \
+                                  waiting for its parent, idle, finished, stopped or failed), when it \
+                                  started, its last \
                                   message, and how many agents it started itself."
                         .to_string(),
                     input_schema: serde_json::json!({"type": "object", "properties": {}}),
@@ -126,6 +127,31 @@ pub(super) fn tools() -> Vec<Registered> {
                     }),
                 },
                 run: run!(|c| crate::agents::message_agent(c.pool, c.conversation_id, c.input)),
+            },
+        },
+        Registered {
+            offer: Offer::Child,
+            tool: Tool {
+                def: ToolDefinition {
+                    name: crate::agents::ASK_PARENT.to_string(),
+                    description: format!(
+                        "Ask your parent, the conversation that started you, a question and wait for \
+                         the answer: your turn ends here, and your parent's next message_agent to you \
+                         is the answer, which wakes you. If the user writes to you first, their message \
+                         comes instead, and a later reply from your parent arrives as a message. One \
+                         question per reply, and not with ask_user. Up to {} characters.",
+                        crate::agents::MAX_MESSAGE_CHARS
+                    ),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"question": {"type": "string", "description": "the question, with what your parent needs to answer it"}},
+                        "required": ["question"]
+                    }),
+                },
+                // The turn handles it (`turn::run_tools`), as `ask_user`.
+                run: run!(|_c| async {
+                    Err::<String, String>(format!("{} is answered by your parent, not run", crate::agents::ASK_PARENT))
+                }),
             },
         },
     ]

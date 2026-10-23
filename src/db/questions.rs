@@ -2,13 +2,20 @@ use super::*;
 
 // --- Pending questions (the model's ask_user, SME-34) ---
 
+/// `pending_questions.asked_of`: the user (`ask_user`, the card).
+pub const ASKED_OF_USER: &str = "user";
+/// `pending_questions.asked_of`: the child's parent (`ask_parent`, SME-238).
+pub const ASKED_OF_PARENT: &str = "parent";
+
 /// A conversation's `pending_questions` row: the question it waits on, and
-/// the user's answer once given (`None` while waiting).
+/// the answer once given (`None` while waiting), and who it's asked of.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredQuestion {
     pub tool_use_id: String,
     pub questions: Vec<crate::questions::Question>,
     pub answer: Option<Vec<crate::questions::QuestionAnswer>>,
+    /// `ASKED_OF_USER` or `ASKED_OF_PARENT`.
+    pub asked_of: String,
 }
 
 /// Records the question `conversation_id` now waits on, replacing any
@@ -19,19 +26,34 @@ pub async fn create_pending_question(
     tool_use_id: &str,
     questions: &[crate::questions::Question],
 ) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    upsert_pending_question(&mut conn, conversation_id, tool_use_id, questions, ASKED_OF_USER).await
+}
+
+/// `create_pending_question`'s upsert, asked of `asked_of`, on the
+/// caller's connection or transaction.
+pub async fn upsert_pending_question(
+    conn: &mut sqlx::PgConnection,
+    conversation_id: i64,
+    tool_use_id: &str,
+    questions: &[crate::questions::Question],
+    asked_of: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO pending_questions (conversation_id, tool_use_id, questions)
-         VALUES ($1, $2, $3)
+        "INSERT INTO pending_questions (conversation_id, tool_use_id, questions, asked_of)
+         VALUES ($1, $2, $3, $4)
          ON CONFLICT (conversation_id) DO UPDATE SET
              tool_use_id = EXCLUDED.tool_use_id,
              questions = EXCLUDED.questions,
+             asked_of = EXCLUDED.asked_of,
              answer = NULL,
              created_at = now()",
     )
     .bind(conversation_id)
     .bind(tool_use_id)
     .bind(sqlx::types::Json(questions))
-    .execute(pool)
+    .bind(asked_of)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
@@ -40,13 +62,15 @@ type StoredQuestionRow = (
     String,
     sqlx::types::Json<Vec<crate::questions::Question>>,
     Option<sqlx::types::Json<Vec<crate::questions::QuestionAnswer>>>,
+    String,
 );
 
-fn stored_question((tool_use_id, questions, answer): StoredQuestionRow) -> StoredQuestion {
+fn stored_question((tool_use_id, questions, answer, asked_of): StoredQuestionRow) -> StoredQuestion {
     StoredQuestion {
         tool_use_id,
         questions: questions.0,
         answer: answer.map(|a| a.0),
+        asked_of,
     }
 }
 
@@ -56,7 +80,7 @@ pub async fn get_pending_question(
     conversation_id: i64,
 ) -> Result<Option<StoredQuestion>, sqlx::Error> {
     let row = sqlx::query_as::<_, StoredQuestionRow>(
-        "SELECT tool_use_id, questions, answer FROM pending_questions WHERE conversation_id = $1",
+        "SELECT tool_use_id, questions, answer, asked_of FROM pending_questions WHERE conversation_id = $1",
     )
     .bind(conversation_id)
     .fetch_optional(pool)
@@ -64,9 +88,10 @@ pub async fn get_pending_question(
     Ok(row.map(stored_question))
 }
 
-/// Records `answer` for the waiting question `tool_use_id`. False when
-/// there's no such question or it was already answered (another tab got
-/// there first): exactly one answer is ever recorded.
+/// Records the user's `answer` for the waiting question `tool_use_id`.
+/// False when there's no such question, it was already answered (another
+/// tab got there first) or it's asked of the child's parent (SME-238):
+/// exactly one answer is ever recorded.
 pub async fn answer_pending_question(
     pool: &PgPool,
     conversation_id: i64,
@@ -75,11 +100,12 @@ pub async fn answer_pending_question(
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE pending_questions SET answer = $3
-         WHERE conversation_id = $1 AND tool_use_id = $2 AND answer IS NULL",
+         WHERE conversation_id = $1 AND tool_use_id = $2 AND answer IS NULL AND asked_of = $4",
     )
     .bind(conversation_id)
     .bind(tool_use_id)
     .bind(sqlx::types::Json(answer))
+    .bind(ASKED_OF_USER)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
@@ -107,7 +133,7 @@ async fn take_pending_question_on(
     let row = sqlx::query_as::<_, StoredQuestionRow>(
         "DELETE FROM pending_questions
          WHERE conversation_id = $1 AND (answer IS NOT NULL OR $2)
-         RETURNING tool_use_id, questions, answer",
+         RETURNING tool_use_id, questions, answer, asked_of",
     )
     .bind(conversation_id)
     .bind(include_waiting)
@@ -143,10 +169,13 @@ pub async fn create_message_taking_question(
     Ok(Some((saved, question)))
 }
 
-/// Conversations with a question still waiting for an answer, for the
-/// sidebar's waiting mark.
+/// Conversations with a question still waiting for the user's answer,
+/// for the sidebar's waiting mark: not a child waiting for its parent.
 pub async fn list_waiting_conversations(pool: &PgPool) -> Result<Vec<i64>, sqlx::Error> {
-    sqlx::query_scalar("SELECT conversation_id FROM pending_questions WHERE answer IS NULL ORDER BY conversation_id")
-        .fetch_all(pool)
-        .await
+    sqlx::query_scalar(
+        "SELECT conversation_id FROM pending_questions WHERE answer IS NULL AND asked_of = $1 ORDER BY conversation_id",
+    )
+    .bind(ASKED_OF_USER)
+    .fetch_all(pool)
+    .await
 }

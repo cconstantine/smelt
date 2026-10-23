@@ -1,4 +1,5 @@
-//! A parent and its child writing to each other (SME-238): `message_agent`.
+//! A parent and its child writing to each other (SME-238): `message_agent`,
+//! and a child's `ask_parent`, which its parent's next message answers.
 
 use super::*;
 
@@ -44,6 +45,10 @@ pub(crate) async fn message_agent(pool: &PgPool, caller: i64, input: &serde_json
                 db::Recipient::Child(id) => format!("Sent to agent #{id}."),
             })
         }
+        db::MessageOutcome::Answered(child) => {
+            crate::turn::notify(pool, child, vec![crate::turn::Notice::Wake]);
+            Ok(format!("Agent #{child} was waiting for your answer: it has it now."))
+        }
         db::MessageOutcome::NoParent => Err("you have no parent: to is \"parent\" only for an agent".to_string()),
         db::MessageOutcome::NotYourChild(id) => Err(format!("#{id} isn't one of your agents (list_agents lists them)")),
         db::MessageOutcome::Deleted(id) => Err(format!("agent #{id} was deleted")),
@@ -51,5 +56,39 @@ pub(crate) async fn message_agent(pool: &PgPool, caller: i64, input: &serde_json
         db::MessageOutcome::Ended(id, state) => Err(format!(
             "agent #{id} is {state}; it takes no messages unless the user writes to it"
         )),
+    }
+}
+
+/// `ask_parent`'s call `tool_use_id` by `child`, from the turn
+/// (`turn::run_tools`): the question recorded and queued to its parent,
+/// which is woken. `Ok` ends the child's turn, as `ask_user` does; an
+/// error is the call's result, and the turn goes on.
+pub(crate) async fn ask_parent(pool: &PgPool, child: i64, tool_use_id: &str, input: &serde_json::Value) -> Result<(), String> {
+    let question = input
+        .get("question")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("missing or non-string field: question")?;
+    let chars = question.chars().count();
+    if question.trim().is_empty() || chars > MAX_MESSAGE_CHARS {
+        return Err(format!("question must be 1 to {MAX_MESSAGE_CHARS} characters (it has {chars})"));
+    }
+    let label = label_of(pool, child).await;
+    let outcome = db::ask_parent(pool, child, tool_use_id, question, &label)
+        .await
+        .map_err(|e| format!("couldn't ask your parent: {e}"))?;
+    match outcome {
+        db::AskParent::Asked { parent } => {
+            crate::turn::notify(pool, parent, vec![crate::turn::Notice::Wake]);
+            Ok(())
+        }
+        db::AskParent::NoParent => Err(format!("{ASK_PARENT} is only for an agent")),
+        db::AskParent::NotActive(Some(state)) if state == db::AGENT_STOPPED => {
+            Err("you were stopped by your parent, so there's no one to ask".to_string())
+        }
+        db::AskParent::NotActive(state) => Err(format!(
+            "you can't ask your parent now (your state is {})",
+            state.as_deref().unwrap_or("unknown")
+        )),
+        db::AskParent::ParentEnded(why) => Err(format!("your parent takes no questions: it's {why}")),
     }
 }

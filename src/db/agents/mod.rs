@@ -33,12 +33,16 @@ pub const KIND_REPORT: &str = "report";
 pub const KIND_NOTICE: &str = "notice";
 /// `agent_messages.kind`: a parent's or a child's `message_agent` (SME-238).
 pub const KIND_MESSAGE: &str = "message";
+/// `agent_messages.kind`: a child's `ask_parent`, queued to its parent.
+pub const KIND_QUESTION: &str = "question";
 
 /// One queued report or notice, as the drain reads it.
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct AgentMessage {
     pub id: i64,
     pub to_conversation_id: i64,
+    /// The sender, `None` for smelt's own notices and once it's deleted.
+    pub from_conversation_id: Option<i64>,
     pub from_label: String,
     pub kind: String,
     pub body: String,
@@ -176,15 +180,18 @@ pub async fn finish_agent(pool: &PgPool, child: i64, label: &str, report: &str) 
     Ok(Finish::Queued { parent })
 }
 
-/// Whether a message to `child` is still undelivered, on the caller's
+/// Whether a message or a question to `child` is still undelivered, or
+/// an answer to its own question is still untaken, on the caller's
 /// transaction.
 async fn unread_by(conn: &mut sqlx::PgConnection, child: i64) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT 1 FROM agent_messages
-                        WHERE to_conversation_id = $1 AND delivered_at IS NULL AND kind = $2)",
+                        WHERE to_conversation_id = $1 AND delivered_at IS NULL AND kind IN ($2, $3))
+             OR EXISTS (SELECT 1 FROM pending_questions WHERE conversation_id = $1 AND answer IS NOT NULL)",
     )
     .bind(child)
     .bind(KIND_MESSAGE)
+    .bind(KIND_QUESTION)
     .fetch_one(&mut *conn)
     .await
 }
@@ -353,6 +360,8 @@ pub struct ChildAgent {
     pub agents_started: i64,
     /// A question to the user is unanswered, or an AGENTS.md trust card waits.
     pub waiting_for_user: bool,
+    /// Its `ask_parent` question is unanswered (SME-238).
+    pub waiting_for_parent: bool,
 }
 
 /// `parent`'s own children, newest first: never anyone else's.
@@ -361,27 +370,34 @@ pub async fn list_child_agents(pool: &PgPool, parent: i64) -> Result<Vec<ChildAg
         "SELECT c.id, c.title, a.persona_path, a.state, a.created_at,
                 (SELECT max(m.created_at) FROM messages m WHERE m.conversation_id = c.id) AS last_message_at,
                 (SELECT count(*) FROM conversations g WHERE g.parent_id = c.id) AS agents_started,
-                (EXISTS (SELECT 1 FROM pending_questions q WHERE q.conversation_id = c.id AND q.answer IS NULL)
-                 OR EXISTS (SELECT 1 FROM instruction_requests r WHERE r.conversation_id = c.id)) AS waiting_for_user
+                (EXISTS (SELECT 1 FROM pending_questions q
+                         WHERE q.conversation_id = c.id AND q.answer IS NULL AND q.asked_of = $2)
+                 OR EXISTS (SELECT 1 FROM instruction_requests r WHERE r.conversation_id = c.id)) AS waiting_for_user,
+                EXISTS (SELECT 1 FROM pending_questions q
+                        WHERE q.conversation_id = c.id AND q.answer IS NULL AND q.asked_of = $3) AS waiting_for_parent
          FROM conversations c JOIN agents a ON a.conversation_id = c.id
          WHERE c.parent_id = $1
          ORDER BY c.id DESC",
     )
     .bind(parent)
+    .bind(super::ASKED_OF_USER)
+    .bind(super::ASKED_OF_PARENT)
     .fetch_all(pool)
     .await
 }
 
-/// Every conversation with an undelivered report or notice that isn't a
-/// `stopped` agent nor paused by the user (SME-238): the startup sweep
-/// wakes them.
+/// Every conversation with an undelivered report, notice or message, and
+/// every agent with an answer to its question untaken (SME-238), that
+/// isn't a `stopped` agent nor paused by the user: the startup sweep wakes
+/// them.
 pub async fn conversations_with_queued_messages(pool: &PgPool) -> Result<Vec<i64>, sqlx::Error> {
     sqlx::query_scalar::<_, i64>(
-        "SELECT DISTINCT m.to_conversation_id FROM agent_messages m
-         JOIN conversations c ON c.id = m.to_conversation_id
-         LEFT JOIN agents a ON a.conversation_id = m.to_conversation_id
-         WHERE m.delivered_at IS NULL AND (a.state IS NULL OR a.state <> $1) AND c.paused_at IS NULL
-         ORDER BY m.to_conversation_id",
+        "SELECT c.id FROM conversations c LEFT JOIN agents a ON a.conversation_id = c.id
+         WHERE c.paused_at IS NULL AND (a.state IS NULL OR a.state <> $1)
+           AND (EXISTS (SELECT 1 FROM agent_messages m WHERE m.to_conversation_id = c.id AND m.delivered_at IS NULL)
+                OR (a.conversation_id IS NOT NULL
+                    AND EXISTS (SELECT 1 FROM pending_questions q WHERE q.conversation_id = c.id AND q.answer IS NOT NULL)))
+         ORDER BY c.id",
     )
     .bind(AGENT_STOPPED)
     .fetch_all(pool)
@@ -400,7 +416,7 @@ pub async fn delete_instruction_requests_of(pool: &PgPool, conversation_id: i64)
 /// Every undelivered report or notice to `to`, oldest first.
 pub async fn undelivered_agent_messages(pool: &PgPool, to: i64) -> Result<Vec<AgentMessage>, sqlx::Error> {
     sqlx::query_as::<_, AgentMessage>(
-        "SELECT id, to_conversation_id, from_label, kind, body FROM agent_messages
+        "SELECT id, to_conversation_id, from_conversation_id, from_label, kind, body FROM agent_messages
          WHERE to_conversation_id = $1 AND delivered_at IS NULL ORDER BY id",
     )
     .bind(to)

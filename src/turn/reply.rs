@@ -180,22 +180,36 @@ pub(super) async fn run_tools(
     turn: &anthropic::stream::StreamedTurn,
 ) -> ServerFnResult<(Vec<anthropic::ContentBlock>, bool)> {
     let mut result_blocks = Vec::new();
-    let mut asked = false;
+    // The question this reply asked, if any: `ask_user`'s or (SME-238)
+    // `ask_parent`'s. One per reply, of either kind.
+    let mut asked: Option<&str> = None;
     let mut finished = false;
     for block in &turn.content {
         if let anthropic::ContentBlock::ToolUse { id, name, input } = block
-            && name == crate::questions::ASK_USER
+            && is_question(name)
         {
-            let refused = match crate::questions::parse_questions(input) {
-                Ok(_) if asked => {
+            let refused = match asked {
+                Some(first) if first == name && name == crate::questions::ASK_USER => {
                     "ask one set of questions at a time: put them all in one ask_user call".to_string()
                 }
-                Ok(questions) => {
-                    ask(pool, conversation_id, id, questions).await?;
-                    asked = true;
-                    continue;
-                }
-                Err(e) => e,
+                Some(_) => "ask one question at a time: ask_user and ask_parent each end your turn, so call \
+                            only one of them, once"
+                    .to_string(),
+                None if name == crate::questions::ASK_USER => match crate::questions::parse_questions(input) {
+                    Ok(questions) => {
+                        ask(pool, conversation_id, id, questions).await?;
+                        asked = Some(name);
+                        continue;
+                    }
+                    Err(e) => e,
+                },
+                None => match crate::agents::ask_parent(pool, conversation_id, id, input).await {
+                    Ok(()) => {
+                        asked = Some(name);
+                        continue;
+                    }
+                    Err(e) => e,
+                },
             };
             result_blocks.push(anthropic::ContentBlock::ToolResult {
                 tool_use_id: id.clone(),
@@ -206,7 +220,7 @@ pub(super) async fn run_tools(
     }
     for block in &turn.content {
         if let anthropic::ContentBlock::ToolUse { id, name, input } = block
-            && name != crate::questions::ASK_USER
+            && !is_question(name)
         {
             let result =
                 anthropic::tools::execute(pool, conversation_id, id, name, input).await;
@@ -224,6 +238,11 @@ pub(super) async fn run_tools(
             });
         }
     }
-    Ok((result_blocks, asked || finished))
+    Ok((result_blocks, asked.is_some() || finished))
+}
+
+/// Whether `name` is a question that ends the turn while it waits.
+fn is_question(name: &str) -> bool {
+    name == crate::questions::ASK_USER || name == crate::agents::ASK_PARENT
 }
 
