@@ -160,8 +160,22 @@ and on manual dispatch: the full `cargo test
 --features server` suite (Postgres + real-cluster k3s sandbox tests), the
 WASM `cargo check`, and the automated browser tier — the same tests and the
 same `docker-compose.yml` stack described above and in
-[testing.md](testing.md), just running on GitHub's runner instead of a local
+[testing.md](testing.md), just running on a CI runner instead of a local
 machine. See [process/done.md](process/done.md).
+
+It's two jobs that run side by side: `server` (the server suite, the WASM
+check and `scripts/lint-expects`) and `browser` (the browser tier). Each runs
+on a self-hosted runner of its own, `arc-runner-smelt-amd64` and
+`arc-runner-smelt-amd64-browser` (Actions Runner Controller on the homelab
+cluster, set up in the homelab repo's `arc/main.tf`), and starts its own
+compose stack through [.github/actions/start-stack](<../.github/actions/start-stack/action.yml>),
+since both suites want a test cluster to themselves. Each runner keeps a
+cache volume (`CI_CACHE_DIR`) that outlives the job: cargo's downloads,
+`target/` and the compose `docker` service's storage are mounted from it by
+[.github/ci-compose.yml](<../.github/ci-compose.yml>), so a run builds on the
+last one's output. A pull request from a fork runs on GitHub's
+`ubuntu-latest` instead, which has no such volume, so it builds everything
+from scratch.
 
 ## Deploying
 
