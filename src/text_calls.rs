@@ -88,7 +88,10 @@ pub fn find(text: &str) -> Vec<TextCall> {
                 }
             }
         }
-        let indent = line.len() - line.trim_start_matches(' ').len();
+        // The indent of the line as written: a code span blanked at its
+        // start isn't indent (review 1).
+        let written = &text[start..end];
+        let indent = written.len() - written.trim_start_matches(' ').len();
         if start >= consumed && indent <= 3 && line[indent..].starts_with('<') {
             let at = start + indent;
             if let Some((call, used)) = tag_call(&text[at..]) {
@@ -108,33 +111,49 @@ pub fn find(text: &str) -> Vec<TextCall> {
 #[cfg(feature = "server")]
 type ReadAfter = fn(&str) -> Option<TextCall>;
 
-/// Markers that never occur in prose, and count anywhere outside code.
+/// Markers that never occur in prose, and count anywhere outside code, each
+/// only with its form's structure after it, so prose naming a marker isn't
+/// a call (review 1). A section marker (Kimi's, DeepSeek's) counts through
+/// the call marker inside it.
 #[cfg(feature = "server")]
 const SPECIAL_MARKERS: &[(&str, ReadAfter)] = &[
     // Mistral: `[TOOL_CALLS]NAME[ARGS]{…}`, or a JSON list with no name to read.
-    ("[TOOL_CALLS]", |s| Some(named(name_at(s)))),
-    // Kimi K2: a section, then `<|tool_call_begin|>functions.NAME:0`.
-    ("<|tool_calls_section_begin|>", |s| section(s, "<|tool_call_begin|>")),
-    ("<|tool_call_begin|>", |s| {
-        let id = name_at(s);
-        let id = id.strip_prefix("functions.").unwrap_or(id);
-        let name = id.rsplit_once(':').filter(|(_, n)| n.chars().all(|c| c.is_ascii_digit())).map_or(id, |(name, _)| name);
-        Some(named(name))
-    }),
-    // DeepSeek V3.1: a section, then `<｜tool▁call▁begin｜>NAME<｜tool▁sep｜>`
-    // (R1's `function<｜tool▁sep｜>NAME` too).
-    ("<｜tool▁calls▁begin｜>", |s| section(s, "<｜tool▁call▁begin｜>")),
-    ("<｜tool▁call▁begin｜>", |s| {
+    ("[TOOL_CALLS]", |s| {
         let name = name_at(s);
-        match s[name.len()..].strip_prefix("<｜tool▁sep｜>") {
-            Some(rest) if name == "function" => Some(named(name_at(rest))),
-            _ => Some(named(name)),
+        let rest = &s[name.len()..];
+        if !name.is_empty() && (rest.starts_with("[ARGS]") || rest.starts_with("[CALL_ID]")) {
+            Some(named(name))
+        } else {
+            (s.starts_with("[{") || s.starts_with('{')).then_some(TextCall { name: None })
         }
     }),
+    // Kimi K2: `<|tool_call_begin|>functions.NAME:0<|tool_call_argument_begin|>`.
+    ("<|tool_call_begin|>", |s| {
+        let id = name_at(s);
+        s[id.len()..].starts_with("<|tool_call_argument_begin|>").then(|| {
+            let id = id.strip_prefix("functions.").unwrap_or(id);
+            let name = id.rsplit_once(':').filter(|(_, n)| n.chars().all(|c| c.is_ascii_digit())).map_or(id, |(name, _)| name);
+            named(name)
+        })
+    }),
+    // DeepSeek V3.1: `<｜tool▁call▁begin｜>NAME<｜tool▁sep｜>` (R1's
+    // `function<｜tool▁sep｜>NAME` too).
+    ("<｜tool▁call▁begin｜>", |s| {
+        let name = name_at(s);
+        let rest = s[name.len()..].strip_prefix("<｜tool▁sep｜>")?;
+        Some(named(if name == "function" { name_at(rest) } else { name }))
+    }),
     // Gemma 4: `<|tool_call>call:NAME{…}`.
-    ("<|tool_call>call:", |s| Some(named(name_at(s)))),
+    ("<|tool_call>call:", |s| {
+        let name = name_at(s);
+        s[name.len()..].starts_with('{').then(|| named(name))
+    }),
     // LFM2: `<|tool_call_start|>[NAME(…)]`.
-    ("<|tool_call_start|>", |s| Some(named(s.strip_prefix('[').map_or("", name_at)))),
+    ("<|tool_call_start|>", |s| {
+        let s = s.strip_prefix('[')?;
+        let name = name_at(s);
+        s[name.len()..].starts_with('(').then(|| named(name))
+    }),
     // gpt-oss: `to=functions.NAME` in a header, then its next token.
     ("to=functions.", |s| {
         let name = name_at(s);
@@ -146,12 +165,6 @@ const SPECIAL_MARKERS: &[(&str, ReadAfter)] = &[
 #[cfg(feature = "server")]
 fn named(name: &str) -> TextCall {
     TextCall { name: checked(name) }
-}
-
-/// A section marker's call: none of its own when its call marker follows.
-#[cfg(feature = "server")]
-fn section(s: &str, call_marker: &str) -> Option<TextCall> {
-    (!s.trim_start().starts_with(call_marker)).then_some(TextCall { name: None })
 }
 
 /// The local name of the opening tag `s` starts with (what follows `<` and
@@ -254,8 +267,10 @@ fn json_name(s: &str) -> Option<Option<String>> {
 }
 
 /// `text` with its code blanked (spaces, newlines kept, same byte offsets):
-/// fenced blocks (an unclosed fence runs to the end), inline code spans,
-/// lines indented 4 or more, and blockquote lines.
+/// fenced blocks (an unclosed fence runs to the end), inline code spans
+/// (within a paragraph, so one can span a line break), lines indented 4 or
+/// more, blockquote lines, and reasoning leaked into the text between
+/// `<think>` and `</think>` (review 1).
 #[cfg(feature = "server")]
 fn mask_code(text: &str) -> String {
     let mut out = text.as_bytes().to_vec();
@@ -266,13 +281,28 @@ fn mask_code(text: &str) -> String {
             }
         }
     };
+    let mut from = 0;
+    while let Some(open) = text[from..].find("<think>").map(|at| from + at) {
+        let close = text[open..].find("</think>").map_or(text.len(), |at| open + at + "</think>".len());
+        blank(open, close);
+        from = close;
+    }
     let mut fence: Option<(char, usize)> = None;
+    // The plain lines since the last blank or code line: a paragraph, whose
+    // code spans are blanked once it ends.
+    let mut paragraph: Option<usize> = None;
     let mut start = 0;
     for line in text.split_inclusive('\n') {
         let end = start + line.len();
         let indent: usize = line.chars().take_while(|c| *c == ' ' || *c == '\t').map(|c| if c == '\t' { 4 } else { 1 }).sum();
         let body = line.trim_start_matches([' ', '\t']);
         let run = |ch: char| body.chars().take_while(|c| *c == ch).count();
+        let plain = fence.is_none() && indent <= 3 && run('`') < 3 && run('~') < 3 && !body.starts_with('>') && !body.trim().is_empty();
+        if !plain && let Some(para) = paragraph.take() {
+            for (from, to) in code_spans(&text[para..start]) {
+                blank(para + from, para + to);
+            }
+        }
         if let Some((ch, len)) = fence {
             blank(start, end);
             if indent <= 3 && run(ch) >= len && body.trim_start_matches(ch).trim().is_empty() {
@@ -284,25 +314,29 @@ fn mask_code(text: &str) -> String {
             blank(start, end);
         } else if indent >= 4 || body.starts_with('>') {
             blank(start, end);
-        } else {
-            for (from, to) in code_spans(line) {
-                blank(start + from, start + to);
-            }
+        } else if plain && paragraph.is_none() {
+            paragraph = Some(start);
         }
         start = end;
     }
-    // Each blanked range is whole characters (whole lines, or code spans
-    // that start and end at a backtick), every byte of it made a space.
+    if let Some(para) = paragraph {
+        for (from, to) in code_spans(&text[para..]) {
+            blank(para + from, para + to);
+        }
+    }
+    // Each blanked range is whole characters (whole lines, code spans that
+    // start and end at a backtick, `<think>` to `</think>`), every byte of it
+    // made a space.
     #[expect(clippy::expect_used, reason = "only whole characters were replaced, each byte with an ASCII space")]
     let masked = String::from_utf8(out).expect("only whole characters were replaced, with spaces");
     masked
 }
 
-/// The inline code spans in `line`, as byte ranges, backticks included: a
-/// run of backticks up to the next run of the same length.
+/// The inline code spans in `text` (a paragraph), as byte ranges, backticks
+/// included: a run of backticks up to the next run of the same length.
 #[cfg(feature = "server")]
-fn code_spans(line: &str) -> Vec<(usize, usize)> {
-    let bytes = line.as_bytes();
+fn code_spans(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
     let run_at = |i: usize| bytes[i..].iter().take_while(|b| **b == b'`').count();
     let mut spans = Vec::new();
     let mut i = 0;

@@ -226,3 +226,24 @@ fn test_the_notice_never_quotes_parameters() {
     assert!(!notice.contains("SECRET-PARAM-286"), "{notice}");
     assert!(!bound_error(&calls).contains("SECRET-PARAM-286"));
 }
+
+/// Review 1, finding 2: special-token markers named in prose, inline code
+/// broken over lines, markup straight after a code span, and reasoning
+/// leaked into the text inside `<think>` aren't calls.
+#[test]
+fn test_markers_without_their_structure_are_not_calls() {
+    let cases = [
+        "Mistral marks calls with [TOOL_CALLS] before the JSON list.",
+        "Kimi's format starts <|tool_calls_section_begin|> then the calls.",
+        "Kimi: <|tool_call_begin|>functions.x:0 begins one.",
+        "DeepSeek's starts <\u{ff5c}tool\u{2581}calls\u{2581}begin\u{ff5c}> and <\u{ff5c}tool\u{2581}call\u{2581}begin\u{ff5c}> then a name.",
+        "Gemma writes <|tool_call>call: then the name.",
+        "LFM2 uses <|tool_call_start|> markers.",
+        "Use `\n<function=foo>\n<parameter=a>` here.",
+        "`x`<tool_call>\n<function=foo>\n</function>\n</tool_call>",
+        "<think>I'll call it:\n<tool_call>\n<function=foo>\n</function>\n</tool_call>\n</think>\nDone.",
+    ];
+    let found: Vec<(&str, Vec<TextCall>)> = cases.iter().map(|text| (*text, find(text))).filter(|(_, calls)| !calls.is_empty()).collect();
+    assert!(found.is_empty(), "calls found in: {found:#?}");
+}
+
