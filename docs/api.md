@@ -130,7 +130,9 @@ In [api/events.md](api/events.md#the-browsing-panels-own-live-channel).
 | `get_turn_state` | `GET /api/conversations/{id}/turn` | whether a turn is running, with how many whole seconds its busy spell has run, for the Stop button and the "Working…" timer on (re)connect (SME-160) |
 | `get_reply_in_progress` | `GET /api/conversations/{id}/reply` | the reply streamed so far, for a tab that (re)connects mid-reply |
 | `get_turn_error` | `GET /api/conversations/{id}/turn-error` | the last failed turn's error, until the user writes again, for a tab that connects after `TurnError` |
-| `get_busy_conversations` | `GET /api/conversations/busy` | conversations with a turn running or queued, for the sidebar |
+| `get_busy_conversations` | `GET /api/conversations/busy` | conversations with a turn running or queued (the sidebar reads `get_conversation_tree` since SME-246) |
+| `get_conversation_tree` (`api::agents`) | `GET /api/conversations/tree` | the sidebar's list (SME-246): every conversation, most recently active first, with its `parent_id`, its busy and waiting marks, and for an agent its persona (`<dir>:<name>`, from the stored persona path) and status, derived at each call by `agents::status` as `list_agents` gives it, never stored. Refetched on `ConversationsChanged`, `TurnsChanged` and `QuestionsChanged`; the client lays it out as a tree |
+| `get_agents_waiting` (`api::agents`) | `GET /api/conversations/{id}/agents-waiting` | the agents under a conversation, at any depth, waiting for the user (an `ask_user` question or a trust card, never a question to their parent), for the banner over its chat (SME-246) |
 | `get_conversation_model` / `set_conversation_model` | `GET`, `POST /api/conversations/{id}/model` | the picker: which model the next turn uses (`ConversationModel`: `Chosen`, `Default`, `NoDefault`, `NoProviders`), and choosing one (SME-72) |
 | `list_providers` / `get_provider` | `GET /api/providers`, `GET /api/providers/{id}` | the `/providers` pages; never the secret, only `secret_hint` |
 | `create_provider` / `update_provider` | `POST /api/providers`, `POST /api/providers/{id}` | checked (a name, an http(s) base URL, a key when new); an empty key on update keeps the stored one, unless the base URL changed: the key only goes where it was entered for |
@@ -151,7 +153,7 @@ In [api/events.md](api/events.md#the-browsing-panels-own-live-channel).
 | `decide_repo_trust` | `POST /api/conversations/{id}/instruction-requests/{request_id}` | the trust card's answer; remembered for the remote; on Trust loads exactly the file the card showed; tells and wakes the model; runs on if the tab closes (SME-225) |
 | `get_pending_question` (`api::questions`) | `GET /api/conversations/{id}/question` | the question the conversation waits on (none once answered), for the card; live as `QuestionUpdate` |
 | `answer_question` | `POST /api/conversations/{id}/question/answer` | the card's answer, one per question; recorded once, then a turn sends it (see "The model's questions") |
-| `get_waiting_conversations` | `GET /api/questions/waiting` | conversations waiting on an answer, for the sidebar |
+| `get_waiting_conversations` | `GET /api/questions/waiting` | conversations waiting for the user: an unanswered `ask_user` question or, since SME-246, an AGENTS.md trust card (`db::WAITS_FOR_USER`, the one predicate the tree and `list_agents` use too). The sidebar reads `get_conversation_tree` since SME-246 |
 | `get_git_settings` | `GET /api/git` | the `/git` page: commit identity, SSH keys (public halves), trust decisions |
 | `save_git_identity` | `POST /api/git/identity` | commit name and email; reaches running pods at once |
 | `generate_ssh_key` / `import_ssh_key` | `POST /api/git/keys`, `POST /api/git/keys/import` | a new ed25519 key, or a pasted unencrypted OpenSSH private key; installed in running pods at once |
