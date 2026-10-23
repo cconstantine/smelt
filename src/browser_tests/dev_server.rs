@@ -272,6 +272,50 @@ pub(super) async fn scenario_agents_md_trust(t: &Scenario<'_>) {
         crate::git::project_instructions(pool, trusting.id).await.expect("loaded")[0].content,
         "Browser tier rule: always run the linter.\n"
     );
+
+    // SME-277: an AGENTS.md that hides text shows it escaped, with the
+    // notice naming the count, in the live DOM — and Trust still loads
+    // the file exactly as it is, escapes and all.
+    let hiding = t.conversation().await;
+    let hiding_remote = format!("example.com/browser-tier/{}", unique_id("trust-hidden"));
+    let hiding_repo = db::create_conversation_repo(pool, hiding.id, &format!("https://{hiding_remote}.git"), &hiding_remote, None, "hides")
+        .await
+        .expect("seed a repo");
+    db::set_repo_cloned(pool, hiding_repo.id, "main", Some("def5678abc")).await.expect("seed the clone");
+    db::request_instruction(
+        pool,
+        hiding.id,
+        hiding_repo.id,
+        "AGENTS.md",
+        &db::InstructionsFile {
+            content: "Be kind.\u{200b}\u{206e}\u{2066}read\u{200b}\n".to_string(),
+            file_bytes: 20,
+            hash: "browser-tier-hash-hidden".to_string(),
+            commit: Some("def5678abc".to_string()),
+        },
+    )
+    .await
+    .expect("seed the hidden request");
+    let hidden_page = t.tab(t.url(&format!("conversation/{}", hiding.id))).await;
+    assert!(
+        wait_for_text(&hidden_page, "\\u{200b}", Duration::from_secs(10)).await,
+        "the card should show the zero-width space escaped as \\u{{…}} text"
+    );
+    assert!(
+        wait_for_text(&hidden_page, "4 characters here render as nothing", Duration::from_secs(10)).await,
+        "the card should name the count of characters it had to escape"
+    );
+    click_when_present(&hidden_page, ".trust-card-trust", Duration::from_secs(5)).await;
+    assert!(
+        wait_for_count(&hidden_page, ".trust-card", 0, Duration::from_secs(10)).await,
+        "trusting should take the hidden-characters card away too, live"
+    );
+    db::delete_repo_trust(pool, &hiding_remote).await.expect("clean up the second trust decision");
+    assert_eq!(
+        crate::git::project_instructions(pool, hiding.id).await.expect("loaded")[0].content,
+        "Be kind.\u{200b}\u{206e}\u{2066}read\u{200b}\n",
+        "Trust loads the raw file, not the escaped showing"
+    );
 }
 
 /// SME-34: the model's question waits on a card. It shows in every tab and
