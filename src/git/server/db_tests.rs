@@ -641,3 +641,25 @@ async fn test_delete_key_and_save_identity(pool: PgPool) {
     assert!(save_identity(&pool, &bad).await.is_err());
     assert_eq!(db::get_git_identity(&pool).await.expect("get"), identity);
 }
+
+/// SME-246: every write of an AGENTS.md trust card ends in
+/// `publish_repos`, which tells every tab's sidebar that what waits for
+/// the user may have changed: a card waits for the user as a question does.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_publishing_a_conversations_repos_announces_its_waits(pool: PgPool) {
+    let id = db::create_conversation(&pool).await.expect("conversation").id;
+    let mut app = crate::events::subscribe_app();
+    publish_repos(&pool, id).await;
+    let heard = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match app.recv().await {
+                Ok(crate::events::AppEvent::QuestionsChanged) => return true,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(heard, "publishing the repos announced no change to what waits");
+}

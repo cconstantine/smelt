@@ -162,12 +162,16 @@ pub(super) async fn head_commit(shell: &sandbox::PodShell, dir: &str) -> Option<
     (head.exit_code == 0).then(|| head.stdout.trim().to_string())
 }
 
-/// Tells every tab watching the conversation what its repos are now.
+/// Tells every tab watching the conversation what its repos are now, and
+/// every tab's sidebar that what waits for the user may have changed:
+/// every write of an AGENTS.md trust card ends here, and a card waits for
+/// the user as a question does (SME-246).
 pub(crate) async fn publish_repos(pool: &PgPool, conversation_id: i64) {
     match list_repos(pool, conversation_id).await {
         Ok(repos) => events::publish(conversation_id, ConversationEvent::ReposUpdate { repos }),
         Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't list repos to publish"),
     }
+    events::publish_app(events::AppEvent::QuestionsChanged);
 }
 
 /// What a clone request comes to, before anything is written.

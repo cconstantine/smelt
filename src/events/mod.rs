@@ -226,16 +226,20 @@ pub enum AppEvent {
     /// its conversation). Carries nothing: listeners refetch.
     PodsChanged,
     /// A model turn started or ended in some conversation. Carries
-    /// nothing: listeners refetch `api::chat::get_busy_conversations`.
+    /// nothing: listeners refetch `api::agents::get_conversation_tree`,
+    /// whose busy marks and agents' statuses it changes.
     TurnsChanged,
-    /// A conversation started or stopped waiting on an answer to the
-    /// model's question (SME-34). Carries nothing: listeners refetch
-    /// `api::questions::get_waiting_conversations`.
+    /// A conversation started or stopped waiting on the user: an answer to
+    /// the model's question (SME-34), or an AGENTS.md trust card, published
+    /// with any change to its repos (SME-246). Carries nothing: listeners
+    /// refetch `api::agents::get_conversation_tree` and the open
+    /// conversation's `get_agents_waiting`.
     QuestionsChanged,
     /// A conversation was created, retitled (its first message gave it a
-    /// title) or deleted. Carries nothing: listeners refetch
-    /// `api::chat::get_conversations`, which is the list, its titles and
-    /// its order (SME-269).
+    /// title) or deleted, or an agent's stored state changed. Carries
+    /// nothing: listeners refetch `api::agents::get_conversation_tree`,
+    /// which is the list, its titles, its order and its agents (SME-269,
+    /// SME-246).
     ConversationsChanged,
     /// A model provider or the default model was added, edited or
     /// removed. Carries nothing: listeners refetch (SME-72).
