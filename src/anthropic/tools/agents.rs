@@ -4,7 +4,7 @@
 //! to every conversation but callable only by one with a parent or agents
 //! of its own, and `ask_parent`, offered to an agent. The lifecycle behind them is `crate::agents`.
 
-use super::{Offer, Registered, Tool};
+use super::{Class, Offer, Registered, Tool};
 use crate::anthropic::ToolDefinition;
 
 pub(super) fn tools() -> Vec<Registered> {
@@ -43,6 +43,7 @@ pub(super) fn tools() -> Vec<Registered> {
                         "required": ["brief"]
                     }),
                 },
+                class: Class::WRITING,
                 run: run!(|c| crate::agents::start_agent(c.pool, c.conversation_id, c.input)),
             },
         },
@@ -59,6 +60,7 @@ pub(super) fn tools() -> Vec<Registered> {
                         .to_string(),
                     input_schema: serde_json::json!({"type": "object", "properties": {}}),
                 },
+                class: Class::READ_ONLY,
                 run: run!(|c| crate::agents::list_agents(c.pool, c.conversation_id)),
             },
         },
@@ -78,6 +80,7 @@ pub(super) fn tools() -> Vec<Registered> {
                         "required": ["id"]
                     }),
                 },
+                class: Class::WRITING,
                 run: run!(|c| crate::agents::stop_agent(c.pool, c.conversation_id, c.input)),
             },
         },
@@ -101,6 +104,7 @@ pub(super) fn tools() -> Vec<Registered> {
                         "required": ["report"]
                     }),
                 },
+                class: Class::READ_ONLY,
                 run: run!(|c| crate::agents::finish(c.pool, c.conversation_id, c.input)),
             },
         },
@@ -126,6 +130,7 @@ pub(super) fn tools() -> Vec<Registered> {
                         "required": ["to", "text"]
                     }),
                 },
+                class: Class::READ_ONLY,
                 run: run!(|c| crate::agents::message_agent(c.pool, c.conversation_id, c.input)),
             },
         },
@@ -148,6 +153,7 @@ pub(super) fn tools() -> Vec<Registered> {
                         "required": ["question"]
                     }),
                 },
+                class: Class::READ_ONLY,
                 // The turn handles it (`turn::run_tools`), as `ask_user`.
                 run: run!(|_c| async {
                     Err::<String, String>(format!("{} is answered by your parent, not run", crate::agents::ASK_PARENT))

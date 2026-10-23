@@ -3,7 +3,7 @@
 use serde_json::Value;
 use sqlx::PgPool;
 
-use super::Tool;
+use super::{Class, Tool};
 use super::pods::{LINES_BUDGET_CHARS, MAX_LINE_CHARS, fit_lines};
 use super::server::required_str;
 use crate::anthropic::ContentBlock;
@@ -46,6 +46,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     "required": ["path"]
                 }),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| read_file_tool(c.pool, c.conversation_id, c.input)),
         },
         Tool {
@@ -77,6 +78,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     "required": ["path", "old_string", "new_string"]
                 }),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| edit_file_tool(c.pool, c.conversation_id, c.input)),
         },
         Tool {
@@ -97,6 +99,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     "required": ["path", "content"]
                 }),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| write_file_tool(c.pool, c.conversation_id, c.input)),
         },
         Tool {
@@ -112,6 +115,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     "required": ["path"]
                 }),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| list_directory_tool(c.pool, c.conversation_id, c.input)),
         },
         Tool {
@@ -138,6 +142,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     "required": ["path", "pattern"]
                 }),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| glob_tool(c.pool, c.conversation_id, c.input)),
         },
         Tool {
@@ -164,6 +169,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     "required": ["path", "pattern"]
                 }),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| grep_tool(c.pool, c.conversation_id, c.input)),
         },
     ]

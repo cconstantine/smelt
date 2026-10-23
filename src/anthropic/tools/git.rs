@@ -3,7 +3,7 @@
 use serde_json::Value;
 use sqlx::PgPool;
 
-use super::Tool;
+use super::{Class, Tool};
 use super::server::required_str;
 use crate::anthropic::ToolDefinition;
 
@@ -29,6 +29,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     "required": ["url"]
                 }),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| clone_repo_tool(c.pool, c.conversation_id, c.input)),
         },
         Tool {
@@ -50,6 +51,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     "required": ["path"]
                 }),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| load_instructions_tool(c.pool, c.conversation_id, c.input)),
         },
         Tool {
@@ -65,6 +67,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     .to_string(),
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| crate::git::list_personas(c.pool, c.conversation_id)),
         },
     ]

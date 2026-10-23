@@ -41,14 +41,16 @@ impl TodoStatus {
     }
 }
 
-/// One native tool: what the model is told (`def`) and what runs when it
-/// calls it (`run`). Each domain module lists its own in `tools()`, so a
-/// tool's definition and its dispatch sit side by side and can't drift
-/// apart (SME-54).
+/// One native tool: what the model is told (`def`), what runs when it
+/// calls it (`run`) and what a call does outside its sandbox (`class`,
+/// SME-237). Each domain module lists its own in `tools()`, so a tool's
+/// definition, its dispatch and its class sit side by side and can't
+/// drift apart (SME-54).
 #[cfg(feature = "server")]
 struct Tool {
     def: crate::anthropic::ToolDefinition,
     run: Run,
+    class: Class,
 }
 
 /// Who a tool is offered to (SME-236): every conversation, only one
@@ -108,6 +110,12 @@ macro_rules! run {
 
 #[cfg(feature = "server")]
 mod agents;
+#[cfg(feature = "server")]
+mod class;
+#[cfg(feature = "server")]
+use class::Class;
+#[cfg(feature = "server")]
+pub(crate) use class::ToolClass;
 #[cfg(feature = "server")]
 mod browser;
 #[cfg(feature = "server")]
@@ -180,6 +188,7 @@ mod server {
             gen_ai.tool.name = %name,
             gen_ai.tool.call.id = %tool_use_id,
             smelt.tool.mcp_server = Empty,
+            smelt.tool.class = Empty,
             smelt.tool.truncated = Empty,
             otel.status_code = Empty,
             otel.status_description = Empty,
@@ -188,7 +197,7 @@ mod server {
             span.record("smelt.tool.mcp_server", server_name);
         }
         crate::telemetry::in_span(span.clone(), async move {
-            let result = execute_uncapped(pool, conversation_id, tool_use_id, name, input).await;
+            let result = execute_uncapped(pool, &span, conversation_id, tool_use_id, name, input).await;
             let (result, truncated) = match result {
                 Ok(output) => {
                     let (output, truncated) = cap_tool_result(output);
@@ -235,24 +244,54 @@ mod server {
         }
     }
 
+    /// The tool a call names: one of smelt's, or an MCP server's.
+    enum Target<'a> {
+        Native(&'static super::Registered),
+        Mcp { config: crate::db::McpServerConfig, tool: &'a str },
+    }
+
+    /// Finds the tool `name` names. An unknown tool, or an MCP server
+    /// that isn't configured, is a plain tool error: the config could have
+    /// been deleted between when `tool_definitions` last offered the tool
+    /// and when the model called it.
+    async fn resolve<'a>(pool: &PgPool, name: &'a str) -> Result<Target<'a>, String> {
+        if let Some((server_name, tool)) = crate::mcp::parse_tool_name(name) {
+            let config = crate::db::get_mcp_server_config_by_name(pool, server_name)
+                .await
+                .map_err(|e| format!("failed to look up MCP server {server_name:?}: {e}"))?
+                .ok_or_else(|| format!("unknown MCP server: {server_name:?}"))?;
+            return Ok(Target::Mcp { config, tool });
+        }
+        super::REGISTRY
+            .iter()
+            .find(|registered| registered.tool.def.name == name)
+            .map(Target::Native)
+            .ok_or_else(|| format!("unknown tool: {name}"))
+    }
+
     async fn execute_uncapped(
         pool: &PgPool,
+        span: &tracing::Span,
         conversation_id: i64,
         tool_use_id: &str,
         name: &str,
         input: &Value,
     ) -> Result<String, String> {
-        if let Some((server_name, tool_name)) = crate::mcp::parse_tool_name(name) {
-            return call_mcp_tool(pool, server_name, tool_name, input).await;
-        }
-        match super::REGISTRY.iter().find(|registered| registered.tool.def.name == name) {
-            Some(registered) => {
+        // The call's class is what SME-241 will refuse it by: a native
+        // tool's from its `class` and the input, an MCP tool's from its
+        // server's annotations, on the connection the call goes out on.
+        let record = |class: super::ToolClass| {
+            span.record("smelt.tool.class", class.as_str());
+        };
+        match resolve(pool, name).await? {
+            Target::Mcp { config, tool } => crate::mcp::call_tool_classed(pool, &config, tool, input.clone(), record).await,
+            Target::Native(registered) => {
+                record(registered.tool.class.of_call(input));
                 if registered.offer != super::Offer::All {
                     offered_to(pool, conversation_id, name, registered.offer).await?;
                 }
                 (registered.tool.run)(super::Call { pool, conversation_id, tool_use_id, input }).await
             }
-            None => Err(format!("unknown tool: {name}")),
         }
     }
 
@@ -291,25 +330,6 @@ mod server {
     #[cfg(test)]
     pub fn native_tool_definitions() -> Vec<crate::anthropic::ToolDefinition> {
         super::REGISTRY.iter().map(|registered| registered.tool.def.clone()).collect()
-    }
-
-    /// Dispatches a `mcp__<server_name>__<tool_name>` tool call — resolves
-    /// `server_name` back to its `mcp_servers` row (unique on `name`) and
-    /// forwards to `crate::mcp::call_tool`. An unknown server name is a
-    /// plain tool error (not a panic): the config could have been deleted
-    /// between when `tool_definitions` last offered this tool and when the
-    /// model called it.
-    async fn call_mcp_tool(
-        pool: &PgPool,
-        server_name: &str,
-        tool_name: &str,
-        input: &Value,
-    ) -> Result<String, String> {
-        let config = crate::db::get_mcp_server_config_by_name(pool, server_name)
-            .await
-            .map_err(|e| format!("failed to look up MCP server {server_name:?}: {e}"))?
-            .ok_or_else(|| format!("unknown MCP server: {server_name:?}"))?;
-        crate::mcp::call_tool(pool, &config, tool_name, input.clone()).await
     }
 
     /// The full tool list offered to the model on every `send_message`

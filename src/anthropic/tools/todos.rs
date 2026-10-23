@@ -3,7 +3,7 @@
 use serde_json::Value;
 use sqlx::PgPool;
 
-use super::Tool;
+use super::{Class, Tool};
 use super::TodoItem;
 use crate::{db, events};
 use crate::anthropic::ToolDefinition;
@@ -39,6 +39,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     "required": ["todos"]
                 }),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| todowrite_tool(c.pool, c.conversation_id, c.input)),
         },
         Tool {
@@ -49,6 +50,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     .to_string(),
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| todoread_tool(c.pool, c.conversation_id)),
         },
     ]

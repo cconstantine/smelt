@@ -3,7 +3,7 @@
 use serde_json::Value;
 use sqlx::PgPool;
 
-use super::Tool;
+use super::{Class, Tool};
 use super::server::required_str;
 use crate::anthropic::ToolDefinition;
 
@@ -30,6 +30,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     "required": ["url"]
                 }),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| webfetch_tool(c.pool, c.conversation_id, c.input)),
         },
         Tool {
@@ -55,6 +56,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     "required": ["port"]
                 }),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| sandbox_preview_url_tool(c.pool, c.conversation_id, c.input)),
         },
         Tool {
@@ -82,6 +84,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     "required": ["url"]
                 }),
             },
+            class: Class::BY_HTTP_METHOD,
             run: run!(|c| http_request_tool(c.input)),
         },
     ]
@@ -94,13 +97,16 @@ async fn webfetch_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Re
     serde_json::to_string(&result).map_err(|e| e.to_string())
 }
 
+/// The method an `http_request` call sends: its `method`, or `GET` when
+/// that's absent or not a string. Its class is read from the same
+/// (`class::http_request_class`, SME-237).
+pub(super) fn requested_method(input: &Value) -> &str {
+    input.get("method").and_then(Value::as_str).unwrap_or("GET")
+}
+
 async fn http_request_tool(input: &Value) -> Result<String, String> {
     let url = required_str(input, "url")?;
-    let method = input
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or("GET")
-        .to_string();
+    let method = requested_method(input).to_string();
     let headers: Vec<(String, String)> = input
         .get("headers")
         .and_then(Value::as_object)

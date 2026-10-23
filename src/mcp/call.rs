@@ -10,6 +10,17 @@ pub(super) const CALL_TIMEOUT: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_secs(120)
 };
 
+/// [`call_tool_classed`] with no use for the class: the tests' shorthand.
+#[cfg(test)]
+pub async fn call_tool(
+    pool: &sqlx::PgPool,
+    config: &McpServerConfig,
+    tool_name: &str,
+    arguments: serde_json::Value,
+) -> Result<String, String> {
+    call_tool_classed(pool, config, tool_name, arguments, |_| {}).await
+}
+
 /// Dispatches a `tools/call` to `config`'s server and turns the result
 /// into a plain string — `content[].text` blocks concatenated; any other
 /// content block type (image, resource, ...) is JSON-encoded inline rather
@@ -18,11 +29,19 @@ pub(super) const CALL_TIMEOUT: std::time::Duration = if cfg!(test) {
 /// back as `Err` so `anthropic::tools::execute` wraps it in a
 /// `ContentBlock::ToolResult { is_error: Some(true), .. }` like any other
 /// failed tool call.
-pub async fn call_tool(
+///
+/// Hands the call's class to `on_class` just before it goes out
+/// (SME-237): read from the tool list of the very connection the
+/// call is sent on, under the same `REGISTRY` guard, so a `tools/list_changed`
+/// or an `evict` can't put another list between them. A call that fails
+/// before that (arguments that aren't an object, a server that can't be
+/// reached) is never sent and has no class.
+pub async fn call_tool_classed(
     pool: &sqlx::PgPool,
     config: &McpServerConfig,
     tool_name: &str,
     arguments: serde_json::Value,
+    on_class: impl FnOnce(crate::anthropic::tools::ToolClass) + Send,
 ) -> Result<String, String> {
     use tracing::field::Empty;
     // The server and tool, never the arguments or result (SME-137).
@@ -34,7 +53,7 @@ pub async fn call_tool(
         otel.status_description = Empty,
     );
     crate::telemetry::in_span(span.clone(), async move {
-        call_tool_unspanned(pool, config, tool_name, arguments).await.map_err(|e| match e {
+        call_tool_unspanned(pool, config, tool_name, arguments, on_class).await.map_err(|e| match e {
             CallFailure::Reported(message) => {
                 crate::telemetry::mark_error(&span, CallFailure::REPORTED);
                 message
@@ -89,6 +108,7 @@ async fn call_tool_unspanned(
     config: &McpServerConfig,
     tool_name: &str,
     arguments: serde_json::Value,
+    on_class: impl FnOnce(crate::anthropic::tools::ToolClass),
 ) -> Result<String, CallFailure> {
     let arguments = match arguments {
         serde_json::Value::Object(map) => Some(map),
@@ -103,12 +123,13 @@ async fn call_tool_unspanned(
     ensure_connected(pool, config, Attempt::SkipRecentFailures)
         .await
         .map_err(|e| CallFailure::Failed(e.message))?;
-    let service = REGISTRY
+    let (service, class) = REGISTRY
         .lock()
         .await
         .get(&config.id)
-        .map(|conn| conn.service.clone())
+        .map(|conn| (conn.service.clone(), listed_class(&conn.tools, tool_name)))
         .ok_or_else(|| CallFailure::Failed(format!("not connected to MCP server {:?}", config.name)))?;
+    on_class(class);
 
     let mut request = CallToolRequestParams::new(tool_name.to_string());
     if let Some(arguments) = arguments {

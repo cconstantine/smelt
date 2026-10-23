@@ -1,6 +1,7 @@
 //! The `mcp__<server>__<tool>` naming and the model's list of MCP tools.
 
 use super::*;
+use crate::anthropic::tools::ToolClass;
 
 /// How long listing tools for a model call waits for a server that isn't
 /// connected yet. A healthy server connects in a second or two; one that
@@ -27,6 +28,29 @@ pub(super) fn namespaced_tool_name(server_name: &str, tool_name: &str) -> String
 pub fn parse_tool_name(name: &str) -> Option<(&str, &str)> {
     let rest = name.strip_prefix(TOOL_NAME_PREFIX)?;
     rest.split_once(TOOL_NAME_SEPARATOR)
+}
+
+/// An MCP tool's class from its server's annotations (SME-237), with the
+/// spec's defaults for what's absent (`readOnlyHint` false,
+/// `destructiveHint` true): `readOnlyHint: true` is read-only; otherwise
+/// `destructiveHint: false` is writing, and anything else destructive, so
+/// a tool with no annotations is destructive. The hints are the server's
+/// word; SME-240 lets the user override them.
+pub(crate) fn class_from_annotations(annotations: Option<&rmcp::model::ToolAnnotations>) -> ToolClass {
+    let hints = annotations.map(|a| (a.read_only_hint, a.destructive_hint));
+    match hints {
+        Some((Some(true), _)) => ToolClass::ReadOnly,
+        Some((_, Some(false))) => ToolClass::Writing,
+        _ => ToolClass::Destructive,
+    }
+}
+
+/// The class of a call to `tool_name`, from its annotations in a
+/// connection's tool list (`tools`). A tool the list doesn't have is
+/// destructive: nothing says otherwise.
+pub(super) fn listed_class(tools: &[McpTool], tool_name: &str) -> ToolClass {
+    let tool = tools.iter().find(|tool| tool.name == tool_name);
+    tool.map_or(ToolClass::Destructive, |tool| class_from_annotations(tool.annotations.as_ref()))
 }
 
 fn mcp_tool_to_definition(server_name: &str, tool: &McpTool) -> ToolDefinition {

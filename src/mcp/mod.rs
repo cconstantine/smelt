@@ -158,7 +158,7 @@ fn generation(_registry: &HashMap<i64, Connection>, server_id: i64) -> u64 {
 /// a delete, a Disconnect or a new sign-in, so a stale connection (old
 /// URL, old headers, old grant) is never reused. A connect already in
 /// flight is discarded when it finishes (SME-167). A future
-/// `tool_definitions_for`/`call_tool` call reconnects from the row.
+/// `tool_definitions_for`/`call_tool_classed` call reconnects from the row.
 pub async fn evict(server_id: i64) {
     {
         let mut registry = REGISTRY.lock().await;
@@ -519,7 +519,7 @@ pub enum CheckError {
 /// (index page's badge, edit page's full status) rather than a cached
 /// guess, since a stale "looks fine" indicator would be worse than no
 /// indicator at all. Shares `ensure_connected`'s registry/retry logic with
-/// `tool_definitions_for`/`call_tool`, so a server already connected this
+/// `tool_definitions_for`/`call_tool_classed`, so a server already connected this
 /// turn is reported without a second round-trip.
 pub async fn connection_check(
     pool: &sqlx::PgPool,
