@@ -272,8 +272,8 @@ fn json_name(s: &str) -> Option<Option<String>> {
 /// fenced blocks (an unclosed fence runs to the end), inline code spans
 /// (within a paragraph, so one can span a line break; a whole tag call at a
 /// line's start ends the paragraph), lines indented 4 or more, blockquote
-/// lines, and reasoning leaked into the text between `<think>` and
-/// `</think>` (review 1).
+/// lines, and reasoning leaked into the text: a `<think>` at a line's start
+/// up to the `</think>` that closes it (reviews 1 and 2).
 #[cfg(feature = "server")]
 fn mask_code(text: &str) -> String {
     let mut out = text.as_bytes().to_vec();
@@ -284,11 +284,25 @@ fn mask_code(text: &str) -> String {
             }
         }
     };
+    // Leaked reasoning: a `<think>` at a line's start, up to the `</think>`
+    // that closes it. One elsewhere (prose, inline code) or never closed is
+    // text, so it can't hide the rest of the reply (review 2).
     let mut from = 0;
-    while let Some(open) = text[from..].find("<think>").map(|at| from + at) {
-        let close = text[open..].find("</think>").map_or(text.len(), |at| open + at + "</think>".len());
-        blank(open, close);
-        from = close;
+    while from < text.len() {
+        let line_end = text[from..].find('\n').map_or(text.len(), |at| from + at + 1);
+        let line = &text[from..line_end];
+        let body = line.trim_start_matches(' ');
+        if line.len() - body.len() <= 3
+            && body.starts_with("<think>")
+            && let Some(at) = text[line_end - body.len() + "<think>".len()..].find("</think>")
+        {
+            let open = line_end - body.len();
+            let close = open + "<think>".len() + at + "</think>".len();
+            blank(open, close);
+            from = text[close..].find('\n').map_or(text.len(), |at| close + at + 1);
+            continue;
+        }
+        from = line_end;
     }
     let mut fence: Option<(char, usize)> = None;
     // The plain lines since the last blank or code line: a paragraph, whose

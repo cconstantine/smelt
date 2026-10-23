@@ -266,3 +266,14 @@ fn test_an_unmatched_backtick_before_a_call_does_not_hide_it() {
     let text = "Posting the comment for `SME-246 now.\n<tool_call>\n<function=save_comment>\n<parameter=body>\nSee `scripts/check.sh` for details\n</parameter>\n</function>\n</tool_call>";
     assert_eq!(one_name(text).as_deref(), Some("save_comment"));
 }
+
+/// Review 2, finding 2: only leaked reasoning is masked, a `<think>` at a
+/// line's start that a `</think>` closes. One named in prose or inline
+/// code, or never closed, doesn't hide the rest of the reply.
+#[test]
+fn test_a_think_tag_in_prose_does_not_hide_a_call() {
+    let call = "\n<tool_call>\n<function=save_comment>\n<parameter=body>\nhi\n</parameter>\n</function>\n</tool_call>";
+    for prose in ["I won't use a `<think>` block.", "I won't use a <think> block.", "No `<think>` or `</think>` here."] {
+        assert_eq!(one_name(&format!("{prose}{call}")).as_deref(), Some("save_comment"), "{prose}");
+    }
+}
