@@ -422,6 +422,68 @@ pub async fn list_child_agents(pool: &PgPool, parent: i64) -> Result<Vec<ChildAg
     .await
 }
 
+/// A failed start (`fail_start`): the child `failed`, the error queued to
+/// its parent as its report, and saved in the child's own transcript, in
+/// one transaction. `false` when the child is no longer `starting`
+/// (stopped or deleted meanwhile): nothing is written.
+pub async fn fail_start(pool: &PgPool, child: i64, parent: i64, label: &str, text: &str) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    if !lock_conversations(&mut tx, &[(parent, RowLock::KeyShare), (child, RowLock::NoKeyUpdate)]).await? {
+        return Ok(false);
+    }
+    let failed = sqlx::query(
+        "UPDATE agents SET state = $2, state_changed_at = now() WHERE conversation_id = $1 AND state = $3",
+    )
+    .bind(child)
+    .bind(AGENT_FAILED)
+    .bind(AGENT_STARTING)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if failed == 0 {
+        return Ok(false);
+    }
+    queue_agent_message(&mut tx, parent, Some(child), label, KIND_REPORT, text).await?;
+    super::conversations::create_message_on(&mut tx, child, "user", &[ContentBlock::Text { text: text.to_string() }]).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Every child still `starting`, with its parent: the startup sweep's, as
+/// no start survives a restart.
+pub async fn starting_agents(pool: &PgPool) -> Result<Vec<(i64, i64)>, sqlx::Error> {
+    sqlx::query_as::<_, (i64, i64)>(
+        "SELECT c.id, c.parent_id FROM conversations c JOIN agents a ON a.conversation_id = c.id
+         WHERE a.state = $1 AND c.parent_id IS NOT NULL ORDER BY c.id",
+    )
+    .bind(AGENT_STARTING)
+    .fetch_all(pool)
+    .await
+}
+
+/// Every conversation with an undelivered report or notice that isn't a
+/// `stopped` agent: the startup sweep wakes them.
+pub async fn conversations_with_queued_messages(pool: &PgPool) -> Result<Vec<i64>, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT DISTINCT m.to_conversation_id FROM agent_messages m
+         LEFT JOIN agents a ON a.conversation_id = m.to_conversation_id
+         WHERE m.delivered_at IS NULL AND (a.state IS NULL OR a.state <> $1)
+         ORDER BY m.to_conversation_id",
+    )
+    .bind(AGENT_STOPPED)
+    .fetch_all(pool)
+    .await
+}
+
+/// Deletes every AGENTS.md trust card in `conversation_id`; returns how many.
+pub async fn delete_instruction_requests_of(pool: &PgPool, conversation_id: i64) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query("DELETE FROM instruction_requests WHERE conversation_id = $1")
+        .bind(conversation_id)
+        .execute(pool)
+        .await?
+        .rows_affected())
+}
+
 /// Every undelivered report or notice to `to`, oldest first.
 pub async fn undelivered_agent_messages(pool: &PgPool, to: i64) -> Result<Vec<AgentMessage>, sqlx::Error> {
     sqlx::query_as::<_, AgentMessage>(

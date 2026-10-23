@@ -15,9 +15,11 @@ use crate::db;
 
 mod queue;
 mod start;
+mod sweep;
 
 pub(crate) use queue::*;
 pub(crate) use start::*;
+pub(crate) use sweep::*;
 
 /// The longest brief `start_agent` takes, in characters.
 pub(crate) const MAX_BRIEF_CHARS: usize = 30_000;

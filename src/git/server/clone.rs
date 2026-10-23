@@ -157,7 +157,7 @@ pub(super) async fn head_commit(shell: &sandbox::PodShell, dir: &str) -> Option<
 }
 
 /// Tells every tab watching the conversation what its repos are now.
-pub(super) async fn publish_repos(pool: &PgPool, conversation_id: i64) {
+pub(crate) async fn publish_repos(pool: &PgPool, conversation_id: i64) {
     match list_repos(pool, conversation_id).await {
         Ok(repos) => events::publish(conversation_id, ConversationEvent::ReposUpdate { repos }),
         Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't list repos to publish"),

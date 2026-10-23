@@ -182,6 +182,15 @@ async fn start_up(dotenv_problem: Option<String>) -> tokio::net::TcpListener {
         Ok(n) => tracing::info!(clones = n, "marked clones a restart cut off as failed"),
         Err(e) => tracing::warn!(error = %e, "couldn't mark interrupted clones failed"),
     }
+    // Agents a restart cut off mid-start fail; what was queued to a
+    // conversation before the restart wakes it (SME-236).
+    tokio::spawn({
+        let pool = pool.clone();
+        telemetry::in_span(tracing::info_span!("agent_sweep"), async move {
+            // The wakes run on their own.
+            let _wakes = agents::startup_sweep(&pool).await;
+        })
+    });
     // Docker data claims whose conversation deletion didn't reach them (SME-33).
     tokio::spawn({
         let pool = pool.clone();

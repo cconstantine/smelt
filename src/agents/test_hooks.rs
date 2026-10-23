@@ -34,6 +34,18 @@ pub async fn reach(hook: &'static str, id: i64) {
 /// The start of a child of parent `id`, before its done step.
 pub const BEFORE_START_DONE: &str = "before_start_done";
 
+static START_FAILURES: LazyLock<Mutex<HashMap<i64, String>>> = LazyLock::new(Default::default);
+
+/// Makes the next start of a child of parent `id` fail with `error`.
+pub fn fail_next_start(id: i64, error: &str) {
+    START_FAILURES.lock().unwrap_or_else(|e| e.into_inner()).insert(id, error.to_string());
+}
+
+/// The failure a test asked of the next start of a child of parent `id`.
+pub fn injected_start_failure(id: i64) -> Option<String> {
+    START_FAILURES.lock().unwrap_or_else(|e| e.into_inner()).remove(&id)
+}
+
 static STARTS_ENDED: LazyLock<Mutex<std::collections::HashSet<i64>>> = LazyLock::new(Default::default);
 
 /// Records that child `id`'s start task has ended, however it ended.
