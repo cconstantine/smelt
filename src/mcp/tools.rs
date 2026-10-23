@@ -1,6 +1,7 @@
 //! The `mcp__<server>__<tool>` naming and the model's list of MCP tools.
 
 use super::*;
+use crate::anthropic::tools::ToolClass;
 
 /// How long listing tools for a model call waits for a server that isn't
 /// connected yet. A healthy server connects in a second or two; one that
@@ -27,6 +28,36 @@ pub(super) fn namespaced_tool_name(server_name: &str, tool_name: &str) -> String
 pub fn parse_tool_name(name: &str) -> Option<(&str, &str)> {
     let rest = name.strip_prefix(TOOL_NAME_PREFIX)?;
     rest.split_once(TOOL_NAME_SEPARATOR)
+}
+
+/// An MCP tool's class from its server's annotations (SME-237), with the
+/// spec's defaults for what's absent (`readOnlyHint` false,
+/// `destructiveHint` true): `readOnlyHint: true` is read-only; otherwise
+/// `destructiveHint: false` is writing, and anything else destructive, so
+/// a tool with no annotations is destructive. The hints are the server's
+/// word; SME-240 lets the user override them.
+pub(crate) fn class_from_annotations(annotations: Option<&rmcp::model::ToolAnnotations>) -> ToolClass {
+    let hints = annotations.map(|a| (a.read_only_hint, a.destructive_hint));
+    match hints {
+        Some((Some(true), _)) => ToolClass::ReadOnly,
+        Some((_, Some(false))) => ToolClass::Writing,
+        _ => ToolClass::Destructive,
+    }
+}
+
+/// The class of a call to `tool_name` on `config`'s server, from the
+/// annotations in the connection's tool list. Connects or re-lists first
+/// as a model call would (`ensure_connected`), so a call right after an
+/// edit's `evict` or a `tools/list_changed` gets the tool's current class.
+/// A server that can't be reached, or a tool it doesn't list, is
+/// destructive: nothing says otherwise.
+pub(crate) async fn tool_class(pool: &sqlx::PgPool, config: &McpServerConfig, tool_name: &str) -> ToolClass {
+    if ensure_connected(pool, config, Attempt::SkipRecentFailures).await.is_err() {
+        return ToolClass::Destructive;
+    }
+    let registry = REGISTRY.lock().await;
+    let tool = registry.get(&config.id).and_then(|conn| conn.tools.iter().find(|tool| tool.name == tool_name));
+    tool.map_or(ToolClass::Destructive, |tool| class_from_annotations(tool.annotations.as_ref()))
 }
 
 fn mcp_tool_to_definition(server_name: &str, tool: &McpTool) -> ToolDefinition {

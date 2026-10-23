@@ -115,6 +115,8 @@ mod class;
 #[cfg(feature = "server")]
 use class::Class;
 #[cfg(feature = "server")]
+pub(crate) use class::ToolClass;
+#[cfg(feature = "server")]
 mod browser;
 #[cfg(feature = "server")]
 mod files;
@@ -267,6 +269,18 @@ mod server {
             .ok_or_else(|| format!("unknown tool: {name}"))
     }
 
+    impl Target<'_> {
+        /// The class of this call: a native tool's from its `class` and the
+        /// call's input, an MCP tool's from its server's annotations
+        /// (`crate::mcp::tool_class`, which may connect first).
+        async fn call_class(&self, pool: &PgPool, input: &Value) -> super::ToolClass {
+            match self {
+                Target::Native(registered) => registered.tool.class.of_call(input),
+                Target::Mcp { config, tool } => crate::mcp::tool_class(pool, config, tool).await,
+            }
+        }
+    }
+
     async fn execute_uncapped(
         pool: &PgPool,
         span: &tracing::Span,
@@ -275,11 +289,12 @@ mod server {
         name: &str,
         input: &Value,
     ) -> Result<String, String> {
-        match resolve(pool, name).await? {
+        let target = resolve(pool, name).await?;
+        // What SME-241 will refuse a call by.
+        span.record("smelt.tool.class", target.call_class(pool, input).await.as_str());
+        match target {
             Target::Mcp { config, tool } => crate::mcp::call_tool(pool, &config, tool, input.clone()).await,
             Target::Native(registered) => {
-                // What SME-241 will refuse a call by.
-                span.record("smelt.tool.class", registered.tool.class.of_call(input).as_str());
                 if registered.offer != super::Offer::All {
                     offered_to(pool, conversation_id, name, registered.offer).await?;
                 }
