@@ -10,14 +10,7 @@ pub(super) const CALL_TIMEOUT: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_secs(120)
 };
 
-/// Dispatches a `tools/call` to `config`'s server and turns the result
-/// into a plain string — `content[].text` blocks concatenated; any other
-/// content block type (image, resource, ...) is JSON-encoded inline rather
-/// than dropped, matching the same "don't lose it" fallback other tool
-/// dispatch paths in this codebase already use. An `is_error` result comes
-/// back as `Err` so `anthropic::tools::execute` wraps it in a
-/// `ContentBlock::ToolResult { is_error: Some(true), .. }` like any other
-/// failed tool call.
+/// [`call_tool_classed`] with no use for the class: the tests' shorthand.
 #[cfg(test)]
 pub async fn call_tool(
     pool: &sqlx::PgPool,
@@ -28,8 +21,17 @@ pub async fn call_tool(
     call_tool_classed(pool, config, tool_name, arguments, |_| {}).await
 }
 
-/// [`call_tool`], handing the call's class to `on_class` just before it
-/// goes out (SME-237): read from the tool list of the very connection the
+/// Dispatches a `tools/call` to `config`'s server and turns the result
+/// into a plain string — `content[].text` blocks concatenated; any other
+/// content block type (image, resource, ...) is JSON-encoded inline rather
+/// than dropped, matching the same "don't lose it" fallback other tool
+/// dispatch paths in this codebase already use. An `is_error` result comes
+/// back as `Err` so `anthropic::tools::execute` wraps it in a
+/// `ContentBlock::ToolResult { is_error: Some(true), .. }` like any other
+/// failed tool call.
+///
+/// Hands the call's class to `on_class` just before it goes out
+/// (SME-237): read from the tool list of the very connection the
 /// call is sent on, under the same `REGISTRY` guard, so a `tools/list_changed`
 /// or an `evict` can't put another list between them. A call that fails
 /// before that (arguments that aren't an object, a server that can't be
