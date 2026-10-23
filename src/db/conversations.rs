@@ -114,7 +114,7 @@ pub async fn set_paused(pool: &PgPool, id: i64, paused: bool) -> Result<(), sqlx
 }
 
 /// The conversation's parent, and whether it has children of its own: who
-/// `message_agent` is offered to (SME-238). `(None, false)` for one that
+/// may call `message_agent` (SME-238; it's offered to everyone). `(None, false)` for one that
 /// doesn't exist.
 pub async fn conversation_links(pool: &PgPool, id: i64) -> Result<(Option<i64>, bool), sqlx::Error> {
     Ok(sqlx::query_as::<_, (Option<i64>, bool)>(
