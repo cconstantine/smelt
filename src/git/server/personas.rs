@@ -203,7 +203,12 @@ pub(crate) async fn gated_listing(pool: &PgPool, reads: Vec<RepoPersonas>) -> Re
         let Some(read) = read else {
             entry["note"] = Value::String(match repo.status.as_str() {
                 "cloning" => "It's still cloning: call list_personas again once it's ready.".to_string(),
-                _ => format!("Its clone failed: {}", repo.error.as_deref().unwrap_or("no reason recorded")),
+                // SME-275: the error can be git's output, which the remote can
+                // write into, so what breaks or reorders a line goes escaped.
+                _ => format!(
+                    "Its clone failed: {}",
+                    repo.error.as_deref().map_or_else(|| "no reason recorded".to_string(), plain_multiline_text)
+                ),
             });
             repos.push(entry);
             continue;
