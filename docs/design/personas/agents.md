@@ -134,7 +134,7 @@ For a conversation in a group. "Queued" is an `agent_messages` row; "wake" is `N
 | waiting for the user | **queued; the woken turn saves it and waits on** | as left | — | paused | stopped | takes the question | unchanged | — |
 | waiting for its parent | **the reply is the answer; wakes** | as left | **answer recorded, wakes, the turn takes it** | paused | stopped; the reply is **refused** | **takes it with `NOT_ANSWERED_BY_PARENT`; a later reply is a plain message** | **unchanged; an answer recorded before is woken by the sweep** | — |
 | finished | **active, queued, wakes** | — | — | paused | stopped | active, turn runs | unchanged | refused |
-| stopped | **refused** | **queued, no wake** | refused | stays | already | active (started) or refused (stopped while starting) | unchanged | refused |
+| stopped | **refused** | **refused** (`ask_parent` refuses a stopped or failed parent) | refused | stays | already | active (started) or refused (stopped while starting) | unchanged | refused |
 | failed | **refused** | — | — | — | already ended | refused | unchanged | — |
 | deleted | **refused** ("deleted") | rows cascade | refused | — | — | — | — | — |
 
