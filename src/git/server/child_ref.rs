@@ -38,6 +38,16 @@ pub fn validate_ref(r: &str) -> Result<(), String> {
     }
 }
 
+/// A whole commit id (40 or 64 hex digits), as the parent's checkout
+/// reported it.
+pub fn validate_commit_id(sha: &str) -> Result<(), String> {
+    if matches!(sha.len(), 40 | 64) && sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(format!("{sha:?} isn't a commit id: your checkout reported something else as its commit"))
+    }
+}
+
 /// Whether `r` reads as a commit id, whole or abbreviated.
 fn is_hex_id(r: &str) -> bool {
     (4..=64).contains(&r.len()) && r.chars().all(|c| c.is_ascii_hexdigit())

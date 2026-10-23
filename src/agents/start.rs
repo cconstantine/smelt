@@ -91,6 +91,10 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
                         persona::check_in_parent(pool, caller, &parent_repo.dir, name).await?;
                     }
                     let (sha, branch) = checkout_for(caller).parent_commit(pool, caller, &parent_repo.dir).await?;
+                    // Read in the parent's pod, which its model controls, and
+                    // passed to the child's git as arguments (review 2).
+                    crate::git::validate_commit_id(&sha)?;
+                    crate::git::validate_ref(&branch)?;
                     crate::git::CloneTarget::Commit { sha, branch }
                 }
             };

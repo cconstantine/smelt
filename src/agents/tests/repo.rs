@@ -295,3 +295,20 @@ async fn test_a_parent_commit_that_cant_be_shared_is_refused(pool: PgPool) {
     assert_eq!(refused, why);
     assert_eq!(children(&pool, root).await, 0);
 }
+
+/// Review 2, finding 2: the parent's commit and branch come from its own
+/// pod, which its model controls, so they're checked before they reach the
+/// child's git as arguments.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_parent_commit_that_isnt_a_commit_id_or_branch_is_refused(pool: PgPool) {
+    setup(&pool, vec![text_reply("ok")]).await;
+    for (sha, branch) in [("--upload-pack=touch /tmp/x", "main"), (COMMIT, "-x"), ("abc", "main")] {
+        let fake = Arc::new(FakeCheckout { parent: Some(Ok((sha.to_string(), branch.to_string()))), ..Default::default() });
+        let root = root_with_checkout(&pool, Some(true), fake).await;
+        let refused = start_on(&pool, root, serde_json::json!({"brief": "x", "repo": "/workspace/app"}))
+            .await
+            .expect_err("refused");
+        assert!(refused.contains("isn't a commit id") || refused.contains("can't be a ref"), "{sha} {branch}: {refused}");
+        assert_eq!(children(&pool, root).await, 0);
+    }
+}
