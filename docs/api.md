@@ -89,6 +89,10 @@ One layer down, `anthropic::stream::stream_anthropic_message_metered` retries a 
 
 In [api/events.md](api/events.md).
 
+## Child agents
+
+`start_agent`, `list_agents`, `stop_agent` and `finish`, the start, the queue that carries reports and notices, and the subtree delete (SME-236) are in [api/agents.md](api/agents.md).
+
 ### Stopping a turn
 
 In [api/events.md](api/events.md#stopping-a-turn).
@@ -122,7 +126,7 @@ In [api/events.md](api/events.md#the-browsing-panels-own-live-channel).
 | `send_browser_input` | `POST /api/conversations/{id}/browsing/input` | forwards one live-panel mouse/keyboard event, see above |
 | `navigate_browser` | `POST /api/conversations/{id}/browsing/navigate` | the live panel's address bar, see above |
 | `subscribe_conversation_events` | `GET /api/conversations/{id}/events` | always-open live stream, see above |
-| `stop_turn` | `POST /api/conversations/{id}/stop` | the Stop button: end the running turn and pause, see above |
+| `stop_turn` | `POST /api/conversations/{id}/stop` | the Stop button: end the running turn and pause, see above; refused on a child agent still starting, and stopping a working one tells its parent (SME-236) |
 | `get_turn_state` | `GET /api/conversations/{id}/turn` | whether a turn is running, with how many whole seconds its busy spell has run, for the Stop button and the "Working…" timer on (re)connect (SME-160) |
 | `get_reply_in_progress` | `GET /api/conversations/{id}/reply` | the reply streamed so far, for a tab that (re)connects mid-reply |
 | `get_turn_error` | `GET /api/conversations/{id}/turn-error` | the last failed turn's error, until the user writes again, for a tab that connects after `TurnError` |
@@ -166,6 +170,6 @@ In [api/events.md](api/events.md#the-browsing-panels-own-live-channel).
 | `take_mcp_server_oauth_error` | `POST /api/mcp-servers/{id}/oauth/callback-error` | the last failed callback's error, removed as it's read; the edit page calls it when the callback's redirect brought it there with `?oauth_callback=1` (SME-168) |
 | `list_sandbox_volumes` / `create_sandbox_volume` | `GET /api/sandbox-volumes`, `POST /api/sandbox-volumes` | volumes mounted into sandbox pods; create makes the PVC and expands a leading `~` in the mount path |
 | `delete_sandbox_volume` | `DELETE /api/sandbox-volumes/{id}` | deletes the PVC, then the row |
-| `delete_conversation` | `DELETE /api/conversations/{id}` | hard delete; cascades to the conversation's messages (`ON DELETE CASCADE`); also tears down its sandboxes and browsing session, and drops its event channel and turn lock; runs on if the tab closes, in a task of its own (SME-262); deleting a nonexistent id is not an error |
+| `delete_conversation` | `DELETE /api/conversations/{id}` | hard delete of the conversation and its whole subtree of agents (SME-236, see [api/agents.md](api/agents.md#deleting)); cascades to their messages (`ON DELETE CASCADE`); also tears down their sandboxes and browsing sessions, and drops its event channel and turn lock; runs on if the tab closes, in a task of its own (SME-262); deleting a nonexistent id is not an error |
 
 Not yet implemented (a straightforward addition when needed): renaming a conversation.
