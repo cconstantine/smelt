@@ -91,6 +91,10 @@ pub const DELETE_MARKED: &str = "delete_marked";
 /// writes.
 pub const DELETE_LOCKED: &str = "delete_locked";
 
+/// `turn::store_pause` for conversation `id`, after it read the pause from
+/// memory and before it writes it.
+pub const STORE_PAUSE_READ: &str = "store_pause_read";
+
 /// `finish` by child `id`, after its state's update and before its report.
 pub const FINISH_UPDATED: &str = "finish_updated";
 
@@ -116,4 +120,20 @@ pub fn torn_down(id: i64, pod_ids: &[i64]) {
 /// The pods a delete tore down for conversation `id`, if it did.
 pub fn teardown_of(id: i64) -> Option<Vec<i64>> {
     TORN_DOWN.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned()
+}
+
+static STORES_DONE: LazyLock<Mutex<HashMap<i64, usize>>> = LazyLock::new(Default::default);
+
+/// Counts a `turn::store_pause` of `id` once dropped, however it ended.
+pub struct StoreDone(pub i64);
+
+impl Drop for StoreDone {
+    fn drop(&mut self) {
+        *STORES_DONE.lock().unwrap_or_else(|e| e.into_inner()).entry(self.0).or_default() += 1;
+    }
+}
+
+/// How many `turn::store_pause` runs for `id` have ended.
+pub fn stores_done(id: i64) -> usize {
+    STORES_DONE.lock().unwrap_or_else(|e| e.into_inner()).get(&id).copied().unwrap_or(0)
 }

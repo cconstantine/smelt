@@ -52,15 +52,20 @@ struct Tool {
 }
 
 /// Who a tool is offered to (SME-236): every conversation, only one
-/// without a parent (the user's own), or only an agent. `execute` checks
-/// it too, from the database: a call can come from a history written
-/// before the conversation changed.
+/// without a parent (the user's own), or only an agent. `Linked`
+/// (SME-238) is offered to every conversation, so the tool list doesn't
+/// change when a conversation starts its first agent (which would rewrite
+/// its whole cached prompt), but `execute` lets only one with a parent or
+/// agents of its own call it. `execute` checks every offer from the
+/// database: a call can come from a history written before the
+/// conversation changed.
 #[cfg(feature = "server")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Offer {
     All,
     Root,
     Child,
+    Linked,
 }
 
 /// A tool in the registry, with who it's offered to.
@@ -254,12 +259,15 @@ mod server {
     /// Refuses a call to a tool this conversation isn't offered (SME-236),
     /// read from the database rather than from what was offered.
     async fn offered_to(pool: &PgPool, conversation_id: i64, name: &str, offer: super::Offer) -> Result<(), String> {
-        let parent = crate::db::conversation_parent(pool, conversation_id)
+        let (parent, has_children) = crate::db::conversation_links(pool, conversation_id)
             .await
             .map_err(|e| format!("couldn't check who may call {name}: {e}"))?;
         match (offer, parent) {
             (super::Offer::Root, Some(_)) => Err(format!("{name} is only for a conversation without a parent")),
             (super::Offer::Child, None) => Err(format!("{name} is only for an agent")),
+            (super::Offer::Linked, None) if !has_children => {
+                Err(format!("{name} is only for a conversation with a parent or agents of its own"))
+            }
             _ => Ok(()),
         }
     }
@@ -268,7 +276,7 @@ mod server {
     /// (`has_parent`) or without a parent.
     fn is_offered(offer: super::Offer, has_parent: bool) -> bool {
         match offer {
-            super::Offer::All => true,
+            super::Offer::All | super::Offer::Linked => true,
             super::Offer::Root => !has_parent,
             super::Offer::Child => has_parent,
         }
@@ -311,7 +319,8 @@ mod server {
     /// rather than failing the whole request — see
     /// `crate::mcp::tool_definitions_for`. Only the tools offered to
     /// `conversation_id` (SME-236): `start_agent` to a conversation without
-    /// a parent, `finish` to an agent. A failed read offers neither.
+    /// a parent, `finish` and `ask_parent` to an agent. A failed read
+    /// offers neither.
     pub async fn tool_definitions(pool: &PgPool, conversation_id: i64) -> Vec<crate::anthropic::ToolDefinition> {
         let has_parent = match crate::db::conversation_parent(pool, conversation_id).await {
             Ok(parent) => Some(parent.is_some()),
@@ -324,7 +333,7 @@ mod server {
             .iter()
             .filter(|registered| match has_parent {
                 Some(has_parent) => is_offered(registered.offer, has_parent),
-                None => registered.offer == super::Offer::All,
+                None => matches!(registered.offer, super::Offer::All | super::Offer::Linked),
             })
             .map(|registered| registered.tool.def.clone())
             .collect();

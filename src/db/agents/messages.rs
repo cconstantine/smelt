@@ -1,0 +1,245 @@
+//! `message_agent`'s and `ask_parent`'s transactions (SME-238): a parent
+//! and its child write to each other through the `agent_messages` queue,
+//! and a child's question to its parent is a `pending_questions` row the
+//! parent's next message answers. Lock order as in `super`:
+//! `conversations` rows in ascending id, then an `agents` row, then the
+//! question.
+
+use super::*;
+
+/// Who `message_agent` writes to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Recipient {
+    /// The caller's parent.
+    Parent,
+    /// One of the caller's children, by id.
+    Child(i64),
+}
+
+/// `message_agent`'s outcome.
+#[derive(Debug, PartialEq)]
+pub enum MessageOutcome {
+    /// Queued to this conversation; the caller wakes it.
+    Queued(i64),
+    /// It answered this child's question to its parent; the caller wakes it.
+    Answered(i64),
+    /// The caller has no parent.
+    NoParent,
+    /// The id isn't one of the caller's children.
+    NotYourChild(i64),
+    /// The recipient is deleted, or being deleted.
+    Deleted(i64),
+    /// The recipient is an agent that takes no messages: `stopped` or
+    /// `failed`.
+    Ended(i64, String),
+}
+
+/// `message_agent`'s transaction: the recipient checked and the message
+/// queued to it, so a stop or a delete either lands first (and refuses it)
+/// or waits for it. A `finished` recipient is made `active` here, under
+/// its `agents` row's lock. `label` names the caller to the recipient.
+pub async fn message_agent(
+    pool: &PgPool,
+    caller: i64,
+    to: Recipient,
+    label: &str,
+    text: &str,
+) -> Result<MessageOutcome, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let recipient = match to {
+        Recipient::Parent => {
+            let parent = sqlx::query_scalar::<_, Option<i64>>("SELECT parent_id FROM conversations WHERE id = $1")
+                .bind(caller)
+                .fetch_optional(&mut *tx)
+                .await?
+                .flatten();
+            match parent {
+                Some(parent) => parent,
+                None => return Ok(MessageOutcome::NoParent),
+            }
+        }
+        Recipient::Child(id) => {
+            let mine = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM conversations WHERE id = $1 AND parent_id = $2)",
+            )
+            .bind(id)
+            .bind(caller)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !mine {
+                return Ok(MessageOutcome::NotYourChild(id));
+            }
+            id
+        }
+    };
+    if !lock_conversations(&mut tx, &[(caller, RowLock::KeyShare), (recipient, RowLock::KeyShare)]).await? {
+        return Ok(MessageOutcome::Deleted(recipient));
+    }
+    // `FOR NO KEY UPDATE`, not `FOR SHARE`: a finished recipient is updated
+    // below, and two messages upgrading a shared lock would deadlock. A
+    // stop, a `finish` or a delete's marking updates this row, so each
+    // lands wholly before this read or waits for the commit.
+    let state = sqlx::query_scalar::<_, String>("SELECT state FROM agents WHERE conversation_id = $1 FOR NO KEY UPDATE")
+        .bind(recipient)
+        .fetch_optional(&mut *tx)
+        .await?;
+    // Read after the row lock, so a delete's marking that committed first
+    // is seen.
+    let deleting = sqlx::query_scalar::<_, bool>("SELECT deleting_at IS NOT NULL FROM conversations WHERE id = $1")
+        .bind(recipient)
+        .fetch_one(&mut *tx)
+        .await?;
+    if deleting {
+        return Ok(MessageOutcome::Deleted(recipient));
+    }
+    match state.as_deref() {
+        Some(state @ (AGENT_STOPPED | AGENT_FAILED)) => return Ok(MessageOutcome::Ended(recipient, state.to_string())),
+        Some(AGENT_FINISHED) => {
+            // SME-245 adds its "agents at once" check here.
+            sqlx::query(
+                "UPDATE agents SET state = $2, state_changed_at = now() WHERE conversation_id = $1 AND state = $3",
+            )
+            .bind(recipient)
+            .bind(AGENT_ACTIVE)
+            .bind(AGENT_FINISHED)
+            .execute(&mut *tx)
+            .await?;
+        }
+        _ => {}
+    }
+    // A child waiting for its parent: this message is the answer, once the
+    // parent has read the question (review 1, finding 1): its `question`
+    // row, queued in `ask_parent`'s transaction and so sharing the
+    // question's `created_at`, is delivered. A message sent before then
+    // was written without it, and is queued as a plain one. The `answer IS
+    // NULL` re-check after a concurrent take (the user's message) finds
+    // no row, and the message is queued instead.
+    if matches!(to, Recipient::Child(_)) {
+        let answer = [crate::questions::QuestionAnswer { selected: Vec::new(), other: Some(text.to_string()) }];
+        let answered = sqlx::query(
+            "UPDATE pending_questions q SET answer = $2
+             WHERE q.conversation_id = $1 AND q.asked_of = $3 AND q.answer IS NULL
+               AND EXISTS (SELECT 1 FROM agent_messages m
+                           WHERE m.to_conversation_id = $4 AND m.from_conversation_id = $1 AND m.kind = $5
+                             AND m.created_at = q.created_at AND m.delivered_at IS NOT NULL)",
+        )
+        .bind(recipient)
+        .bind(sqlx::types::Json(&answer[..]))
+        .bind(super::super::ASKED_OF_PARENT)
+        .bind(caller)
+        .bind(KIND_QUESTION)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if answered > 0 {
+            tx.commit().await?;
+            return Ok(MessageOutcome::Answered(recipient));
+        }
+    }
+    queue_agent_message(&mut tx, recipient, Some(caller), label, KIND_MESSAGE, text).await?;
+    tx.commit().await?;
+    Ok(MessageOutcome::Queued(recipient))
+}
+
+/// `ask_parent`'s outcome.
+#[derive(Debug, PartialEq)]
+pub enum AskParent {
+    /// Asked; the question is queued to this parent, which the caller wakes.
+    Asked { parent: i64 },
+    /// The caller has no parent.
+    NoParent,
+    /// The caller isn't an `active` agent: its state, `None` when it's gone.
+    NotActive(Option<String>),
+    /// The parent takes no questions: deleted, or a stopped or failed agent.
+    ParentEnded(String),
+}
+
+/// `ask_parent`'s transaction: the child's question recorded as asked of
+/// its parent (`tool_use_id`, so its answer becomes the call's result) and
+/// queued to the parent, both or neither. The child's `agents` row is held
+/// `FOR SHARE`, so a `stop_agent` lands wholly before (and refuses it) or
+/// after. `label` names the child to its parent.
+pub async fn ask_parent(
+    pool: &PgPool,
+    child: i64,
+    tool_use_id: &str,
+    question: &str,
+    label: &str,
+) -> Result<AskParent, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let Some(parent) = sqlx::query_scalar::<_, Option<i64>>("SELECT parent_id FROM conversations WHERE id = $1")
+        .bind(child)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten()
+    else {
+        return Ok(AskParent::NoParent);
+    };
+    if !lock_conversations(&mut tx, &[(parent, RowLock::KeyShare), (child, RowLock::KeyShare)]).await? {
+        return Ok(AskParent::NotActive(None));
+    }
+    let state = sqlx::query_scalar::<_, String>("SELECT state FROM agents WHERE conversation_id = $1 FOR SHARE")
+        .bind(child)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if state.as_deref() != Some(AGENT_ACTIVE) {
+        return Ok(AskParent::NotActive(state));
+    }
+    let (deleting, parent_state) = sqlx::query_as::<_, (bool, Option<String>)>(
+        "SELECT c.deleting_at IS NOT NULL, a.state FROM conversations c
+         LEFT JOIN agents a ON a.conversation_id = c.id WHERE c.id = $1",
+    )
+    .bind(parent)
+    .fetch_one(&mut *tx)
+    .await?;
+    if deleting {
+        return Ok(AskParent::ParentEnded("deleted".to_string()));
+    }
+    if let Some(state @ (AGENT_STOPPED | AGENT_FAILED)) = parent_state.as_deref() {
+        return Ok(AskParent::ParentEnded(state.to_string()));
+    }
+    let asked = [crate::questions::Question {
+        question: question.to_string(),
+        header: "Question for your parent".to_string(),
+        options: Vec::new(),
+        multi_select: false,
+    }];
+    super::super::upsert_pending_question(&mut tx, child, tool_use_id, &asked, super::super::ASKED_OF_PARENT).await?;
+    queue_agent_message(&mut tx, parent, Some(child), label, KIND_QUESTION, question).await?;
+    tx.commit().await?;
+    Ok(AskParent::Asked { parent })
+}
+
+/// Queues `body`, a notice from smelt, to every agent a restart cut off
+/// mid-turn: `active`, not paused or being deleted, with no question open
+/// or answered and untaken (it waits, or the sweep wakes it for the answer;
+/// review 2), its last message a turn's with no reply after it (a tool
+/// result, or a delivered report, message or notice from the queue) or the
+/// model's tool call whose tool was still running (review 2), and
+/// not already holding this notice undelivered (two restarts in a row tell
+/// it once). A notice saved without waking it (the user stopping its pod)
+/// isn't a turn (review 1, finding 2), nor is a user's own conversation.
+/// Returns who was told.
+pub async fn queue_restart_notices(pool: &PgPool, body: &str) -> Result<Vec<i64>, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        "INSERT INTO agent_messages (to_conversation_id, from_label, kind, body)
+         SELECT c.id, 'smelt', $2, $1 FROM conversations c JOIN agents a ON a.conversation_id = c.id
+         WHERE a.state = $3 AND c.paused_at IS NULL AND c.deleting_at IS NULL
+           AND EXISTS (SELECT 1 FROM messages last
+                       WHERE last.id = (SELECT max(m.id) FROM messages m WHERE m.conversation_id = c.id)
+                         AND ((last.role = 'user'
+                               AND (last.content LIKE '%\"type\":\"tool_result\"%'
+                                    OR EXISTS (SELECT 1 FROM agent_messages d WHERE d.delivered_message_id = last.id)))
+                              OR (last.role = 'assistant' AND last.content LIKE '%\"type\":\"tool_use\"%')))
+           AND NOT EXISTS (SELECT 1 FROM pending_questions q WHERE q.conversation_id = c.id)
+           AND NOT EXISTS (SELECT 1 FROM agent_messages m WHERE m.to_conversation_id = c.id
+                           AND m.delivered_at IS NULL AND m.kind = $2 AND m.body = $1)
+         ORDER BY c.id
+         RETURNING to_conversation_id",
+    )
+    .bind(body)
+    .bind(KIND_NOTICE)
+    .bind(AGENT_ACTIVE)
+    .fetch_all(pool)
+    .await
+}

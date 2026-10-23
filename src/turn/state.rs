@@ -40,10 +40,11 @@ pub(super) struct ConversationRuntime {
     /// finished command or another notice doesn't wake the model: its
     /// notice is still saved, and the model sees it on the user's next
     /// message. Otherwise a stop would be undone seconds later by whatever
-    /// was still running. In memory: a restart un-pauses, which is
-    /// harmless. Set by a Stop (`stop_turn_now`); ended by the user's
-    /// send or answer, in its turn's admission
-    /// (`TurnInFlight::start_by_user`), and by a delete's forget.
+    /// was still running. Set by a Stop (`stop_turn_now`); ended by the
+    /// user's send or answer, in its turn's admission
+    /// (`TurnInFlight::start_by_user`), and by a delete's forget. The live
+    /// truth; `paused_at` mirrors it (`store_pause`) so a restart keeps it
+    /// (`restore_pauses`, SME-238).
     paused: bool,
     /// How many turns are running or queued, for the Stop button
     /// (`TurnState`).
@@ -221,6 +222,12 @@ pub(crate) fn stop_turn_now(conversation_id: i64) {
             stops.counter.send_modify(|count| *count += 1);
         }
     });
+}
+
+/// Pauses `conversation_id` as its stored pause says, at startup
+/// (`restore_pauses`, SME-238).
+pub(super) fn restore_pause(conversation_id: i64) {
+    with_runtime(conversation_id, |runtime| runtime.paused = true);
 }
 
 /// Whether `conversation_id` is paused after a stop (see

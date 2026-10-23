@@ -102,6 +102,37 @@ pub async fn conversation_exists(pool: &PgPool, id: i64) -> Result<bool, sqlx::E
         .await
 }
 
+/// Mirrors the in-memory pause after a Stop into `paused_at` (SME-238):
+/// set (keeping when it was first set) or cleared.
+pub async fn set_paused(pool: &PgPool, id: i64, paused: bool) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE conversations SET paused_at = CASE WHEN $2 THEN COALESCE(paused_at, now()) END WHERE id = $1")
+        .bind(id)
+        .bind(paused)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The conversation's parent, and whether it has children of its own: who
+/// may call `message_agent` (SME-238; it's offered to everyone). `(None, false)` for one that
+/// doesn't exist.
+pub async fn conversation_links(pool: &PgPool, id: i64) -> Result<(Option<i64>, bool), sqlx::Error> {
+    Ok(sqlx::query_as::<_, (Option<i64>, bool)>(
+        "SELECT parent_id, EXISTS (SELECT 1 FROM conversations k WHERE k.parent_id = c.id) FROM conversations c WHERE c.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or((None, false)))
+}
+
+/// Every conversation whose pause is stored, for the start's restore.
+pub async fn paused_conversations(pool: &PgPool) -> Result<Vec<i64>, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>("SELECT id FROM conversations WHERE paused_at IS NOT NULL ORDER BY id")
+        .fetch_all(pool)
+        .await
+}
+
 /// A plain delete, for tests: the app deletes through `agents::delete_subtree`.
 #[cfg(test)]
 pub async fn delete_conversation(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {

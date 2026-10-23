@@ -64,6 +64,15 @@ mod server {
     /// answering; their message follows it in the same user message.
     pub const NOT_ANSWERED: &str = "The user didn't answer these questions. Their message follows.";
 
+    /// How `ask_parent`'s result starts when the parent answered (SME-238);
+    /// the parent's reply follows.
+    pub const PARENT_ANSWERED: &str = "Your parent answered:";
+
+    /// `ask_parent`'s result when the user wrote in the child before its
+    /// parent answered.
+    pub const NOT_ANSWERED_BY_PARENT: &str = "Your parent hasn't answered; the user wrote to you instead, and their \
+         message follows. A later reply from your parent arrives as a message.";
+
     /// `ask_user`'s `questions`, checked against the limits. An error is
     /// the call's result, worded for the model to fix and call again.
     pub fn parse_questions(input: &serde_json::Value) -> Result<Vec<Question>, String> {

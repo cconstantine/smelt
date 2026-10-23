@@ -115,10 +115,12 @@ async fn test_list_agents_shows_only_the_callers_children_with_their_status(pool
 
 #[test]
 fn test_status_takes_the_first_that_holds() {
-    assert_eq!(status(db::AGENT_STOPPED, true, true), "stopped", "a stored end wins over a turn in flight");
-    assert_eq!(status(db::AGENT_FINISHED, true, false), "running", "a finished child the user wrote to runs");
-    assert_eq!(status(db::AGENT_FINISHED, false, true), "waiting for the user");
-    assert_eq!(status(db::AGENT_ACTIVE, false, false), "idle");
+    assert_eq!(status(db::AGENT_STOPPED, true, true, false), "stopped", "a stored end wins over a turn in flight");
+    assert_eq!(status(db::AGENT_FINISHED, true, false, false), "running", "a finished child the user wrote to runs");
+    assert_eq!(status(db::AGENT_FINISHED, false, true, false), "waiting for the user");
+    assert_eq!(status(db::AGENT_ACTIVE, false, false, false), "idle");
+    assert_eq!(status(db::AGENT_ACTIVE, false, false, true), "waiting for its parent");
+    assert_eq!(status(db::AGENT_ACTIVE, false, true, true), "waiting for the user", "the user's question first");
 }
 
 #[test]

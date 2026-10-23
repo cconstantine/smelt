@@ -7,11 +7,15 @@ use crate::anthropic::ContentBlock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod ask_parent;
 mod delete;
 mod ended;
 mod list;
+mod messages;
+mod pause;
 mod persona;
 mod reports;
+mod restart;
 pub(super) mod repo;
 mod start;
 mod stop;
@@ -175,5 +179,44 @@ async fn child_of(pool: &PgPool, parent: i64, result: &str) -> i64 {
         .await
         .expect("the child's row");
     assert!(result.contains(&format!("agent #{child}")), "{result}");
+    child
+}
+
+/// What a restart does to `ids`: their turn state is forgotten, then the
+/// start restores the stored pauses and runs the startup sweep, whose
+/// wakes this awaits.
+async fn restart(pool: &PgPool, ids: &[i64]) {
+    for id in ids {
+        crate::turn::forget_conversation_lock(*id);
+    }
+    crate::turn::restore_pauses(pool).await;
+    for wake in startup_sweep(pool).await {
+        tokio::time::timeout(Duration::from_secs(30), wake).await.expect("the wake ends").expect("the wake");
+    }
+}
+
+/// The conversation's stored pause.
+async fn paused_at(pool: &PgPool, id: i64) -> Option<chrono::NaiveDateTime> {
+    sqlx::query_scalar::<_, Option<chrono::NaiveDateTime>>("SELECT paused_at FROM conversations WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("the conversation's row")
+}
+
+/// A child of `parent` made directly, `active` and started: no start and
+/// no turn has run in it.
+async fn active_child(pool: &PgPool, parent: i64) -> i64 {
+    let child = sqlx::query_scalar::<_, i64>("INSERT INTO conversations (title, parent_id) VALUES ('c', $1) RETURNING id")
+        .bind(parent)
+        .fetch_one(pool)
+        .await
+        .expect("a child");
+    sqlx::query("INSERT INTO agents (conversation_id, root_id, depth, brief, state, started_at) VALUES ($1, $2, 1, 'b', 'active', now())")
+        .bind(child)
+        .bind(parent)
+        .execute(pool)
+        .await
+        .expect("its agent row");
     child
 }
