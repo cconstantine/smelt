@@ -13,10 +13,12 @@ use sqlx::PgPool;
 
 use crate::db;
 
+mod checkout;
 mod queue;
 mod start;
 mod sweep;
 
+pub(crate) use checkout::*;
 pub(crate) use queue::*;
 pub(crate) use start::*;
 pub(crate) use sweep::*;

@@ -34,6 +34,10 @@ pub async fn reach(hook: &'static str, id: i64) {
 /// The start of a child of parent `id`, before its done step.
 pub const BEFORE_START_DONE: &str = "before_start_done";
 
+/// The start of a child of parent `id`, after the trust is read again and
+/// before its AGENTS.md is loaded.
+pub const BEFORE_AGENTS_MD_LOAD: &str = "before_agents_md_load";
+
 static START_FAILURES: LazyLock<Mutex<HashMap<i64, String>>> = LazyLock::new(Default::default);
 
 /// Makes the next start of a child of parent `id` fail with `error`.

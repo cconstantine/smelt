@@ -213,6 +213,7 @@ mod start_reports;
 mod death;
 mod manager;
 mod git;
+mod child_checkout;
 mod docker;
 mod starting;
 mod teardown;

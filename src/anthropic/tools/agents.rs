@@ -24,7 +24,15 @@ pub(super) fn tools() -> Vec<Registered> {
                     input_schema: serde_json::json!({
                         "type": "object",
                         "properties": {
-                            "brief": {"type": "string", "description": "the agent's task, as its first message"}
+                            "brief": {"type": "string", "description": "the agent's task, as its first message"},
+                            "repo": {
+                                "type": "string",
+                                "description": "one of your checkouts, /workspace/<dir>: the agent gets its own clone of it, with its AGENTS.md loaded (its remote must be trusted)"
+                            },
+                            "ref": {
+                                "type": "string",
+                                "description": "the branch, tag or commit of repo's remote to check out"
+                            }
                         },
                         "required": ["brief"]
                     }),

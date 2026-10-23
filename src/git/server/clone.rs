@@ -98,6 +98,12 @@ pub async fn clone_into_pod(
     if clone.exit_code != 0 {
         return Err(clone_failure(clone.exit_code, &format!("{}{}", clone.stdout, clone.stderr), url, &path));
     }
+    checked_out(shell, &path).await
+}
+
+/// What the checkout at `path` has checked out: its branch (`HEAD` when
+/// detached) and its commit.
+pub(super) async fn checked_out(shell: &sandbox::PodShell, path: &str) -> Result<ClonedRepo, String> {
     // The branch from HEAD itself, and the commit only if there is
     // one: a brand-new empty repo has a branch but no commit yet.
     let head = shell
@@ -107,7 +113,7 @@ pub async fn clone_into_pod(
                 "-c",
                 r#"cd "$1" && git symbolic-ref --short -q HEAD || git rev-parse --abbrev-ref HEAD; git rev-parse --verify -q HEAD || true"#,
                 "sh",
-                &path,
+                path,
             ],
             None,
         )
@@ -429,7 +435,7 @@ async fn clone_recorded(
 }
 
 /// The conversation's live pod, started if it has none.
-async fn ensure_sandbox(pool: &PgPool, conversation_id: i64) -> Result<i64, String> {
+pub(super) async fn ensure_sandbox(pool: &PgPool, conversation_id: i64) -> Result<i64, String> {
     sandbox::start_or_get_pod(pool, conversation_id)
         .await
         .map_err(|e| format!("Couldn't start the sandbox: {e}"))

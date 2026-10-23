@@ -10,6 +10,7 @@ use std::time::Duration;
 mod ended;
 mod list;
 mod reports;
+mod repo;
 mod start;
 mod stop;
 mod sweep;

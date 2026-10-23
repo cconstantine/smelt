@@ -91,12 +91,24 @@ pub struct NewChild<'a> {
     pub persona_name: Option<&'a str>,
     /// The parent's resolved model, the child's until its persona says otherwise.
     pub model: Option<(i64, String)>,
+    /// The child's checkout, recorded `cloning`: one of the caller's repos.
+    pub repo: Option<NewChildRepo<'a>>,
+}
+
+/// The child's copy of one of its parent's checkouts.
+pub struct NewChildRepo<'a> {
+    pub url: &'a str,
+    pub remote_key: &'a str,
+    pub dir: &'a str,
+    /// The branch its ref asks for, if any.
+    pub branch: Option<&'a str>,
 }
 
 /// `create_child`'s outcome.
 #[derive(Debug, PartialEq)]
 pub enum CreateChild {
-    Created(i64),
+    /// The child, and its repo row when it has one.
+    Created { child: i64, repo: Option<ConversationRepo> },
     /// The caller can't start an agent now, and why.
     Refused(String),
 }
@@ -107,6 +119,11 @@ pub enum CreateChild {
 /// `agents` row (`starting`) and the brief as its first message.
 pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChild, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    // The remote's trust lock first (the lock order), so a trust decision
+    // lands wholly before or after the check below and the `cloning` row.
+    if let Some(repo) = &new.repo {
+        lock_remote_trust(&mut *tx, repo.remote_key).await?;
+    }
     let caller = sqlx::query_scalar::<_, Option<NaiveDateTime>>(
         "SELECT deleting_at FROM conversations WHERE id = $1 FOR NO KEY UPDATE",
     )
@@ -123,7 +140,18 @@ pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChi
         {
             Some(state) if state == AGENT_STOPPED => Some("you were stopped, so you can't start an agent".to_string()),
             Some(_) => Some(crate::agents::ROOT_ONLY.to_string()),
-            None => None,
+            None => match &new.repo {
+                None => None,
+                Some(repo) => match get_repo_trust(&mut *tx, repo.remote_key).await? {
+                    Some(true) => None,
+                    Some(false) => Some(format!("the user declined to trust {}, so no agent can work on it", repo.url)),
+                    None => Some(format!(
+                        "the user hasn't decided whether to trust {}: load its AGENTS.md with \
+                         load_instructions so they're asked, then start the agent once they trust it",
+                        repo.url
+                    )),
+                },
+            },
         },
     };
     if let Some(why) = refused {
@@ -152,8 +180,24 @@ pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChi
     .await?;
     let brief = [ContentBlock::Text { text: new.brief.to_string() }];
     super::conversations::create_message_on(&mut tx, child, "user", &brief).await?;
+    let repo = match &new.repo {
+        None => None,
+        Some(repo) => Some(
+            sqlx::query_as::<_, ConversationRepo>(
+                "INSERT INTO conversation_repos (conversation_id, url, remote_key, branch, dir, status)
+                 VALUES ($1, $2, $3, $4, $5, 'cloning') RETURNING *",
+            )
+            .bind(child)
+            .bind(repo.url)
+            .bind(repo.remote_key)
+            .bind(repo.branch)
+            .bind(repo.dir)
+            .fetch_one(&mut *tx)
+            .await?,
+        ),
+    };
     tx.commit().await?;
-    Ok(CreateChild::Created(child))
+    Ok(CreateChild::Created { child, repo })
 }
 
 /// Queues a report or notice to `to`, on the caller's transaction.

@@ -40,6 +40,7 @@ pub(crate) mod test_support {
 mod keys;
 mod instructions;
 mod repos;
+mod child_ref;
 mod clone;
 mod personas;
 mod trust;
@@ -47,6 +48,7 @@ mod trust;
 pub use keys::*;
 pub use instructions::*;
 pub use repos::*;
+pub use child_ref::*;
 pub use clone::*;
 pub use personas::*;
 pub use trust::*;
