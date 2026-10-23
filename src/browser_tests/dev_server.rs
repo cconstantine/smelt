@@ -285,7 +285,7 @@ pub(super) async fn scenario_agents_md_trust(t: &Scenario<'_>) {
     // Python's own escapes, so the shell command carries only ASCII: three
     // zero-width-ish characters, a bidi isolate pair around "re order" (a
     // reader sees "re order" in the wrong order without the fix) and a BOM.
-    let make_hiding_repo = r#"git init --bare --initial-branch=main -q /tmp/v.git && git clone -q file:///tmp/v.git /tmp/w && cd /tmp/w && python3 -c 'open("AGENTS.md","w").write("# House rules\nBe kind.\u200b\u206e\u2066re order\u200b\nRead every file.\ufeff\n")' && git add AGENTS.md && git -c user.email=smelt@test -c user.name=smelt commit -qm rules && git push -q origin main"#;
+    let make_hiding_repo = r##"git init --bare --initial-branch=main -q /tmp/v.git && git clone -q file:///tmp/v.git /tmp/w && cd /tmp/w && python3 -c 'open("AGENTS.md","w").write("# House rules\nBe kind.\u200b\u206e\u2066re order\u200b\nRead every file.\ufeff\n")' && git add AGENTS.md && git -c user.email=smelt@test -c user.name=smelt commit -qm rules && git push -q origin main"##;
     anthropic::tools::execute(
         pool,
         hiding.id,
@@ -295,6 +295,11 @@ pub(super) async fn scenario_agents_md_trust(t: &Scenario<'_>) {
     )
     .await
     .expect("make the hiding repo");
+    // `run_terminal_command` only *starts* those git commands: the tier has
+    // to wait for the finish before the clone, or it races — a half-made
+    // origin clones empty, and the load says "there's no file". The second
+    // run of this scenario proved it.
+    wait_command_finished(pool, terminal).await;
     anthropic::tools::execute(
         pool,
         hiding.id,
