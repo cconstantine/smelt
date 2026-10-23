@@ -1,5 +1,6 @@
 # Shared by scripts/test-check-server, test-check-server-scratch,
-# test-check-server-guards, test-cluster-lock and test-gate-scripts
+# test-check-server-guards, test-check-server-db-inputs,
+# test-check-server-ports, test-cluster-lock and test-gate-scripts
 # (SME-163; they were one script, test-check-scripts):
 # the stubs and helpers their cases use. Sourced, never run. Each script
 # keeps its files, the stubs and the locks under its own
