@@ -511,17 +511,27 @@ pub(super) async fn record_cloned(
     pool: &PgPool,
     repo: &db::ConversationRepo,
     cloned: &ClonedRepo,
-    agents_files: Result<Vec<String>, String>,
+    agents_files: Result<AgentsPaths, String>,
     persona_files: Result<Vec<String>, String>,
     guard: CloneGuard,
 ) -> Result<(), String> {
     // The clone is good even if its files can't be listed; the panel
     // says why.
     let mut errors = Vec::new();
-    let files = agents_files.unwrap_or_else(|e| {
-        errors.push(format!("Couldn't list its AGENTS.md files: {e}"));
-        Vec::new()
-    });
+    let files = match agents_files {
+        Ok(AgentsPaths { files, left_out }) => {
+            match left_out {
+                0 => {}
+                1 => errors.push("1 AGENTS.md file was left out: its path holds control characters".to_string()),
+                n => errors.push(format!("{n} AGENTS.md files were left out: their paths hold control characters")),
+            }
+            files
+        }
+        Err(e) => {
+            errors.push(format!("Couldn't list its AGENTS.md files: {e}"));
+            Vec::new()
+        }
+    };
     let personas = persona_files.unwrap_or_else(|e| {
         errors.push(format!("Couldn't list its persona files: {e}"));
         Vec::new()

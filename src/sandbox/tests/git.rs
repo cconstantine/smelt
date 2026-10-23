@@ -159,7 +159,7 @@ async fn test_clone_into_pod_checks_out_a_branch_and_reports_failures() {
         assert_eq!(read.file_bytes, 33);
         assert_eq!(read.hash.len(), 64, "sha256 hex: {}", read.hash);
         let listed = crate::git::list_agents_files(&shell, "origin").await.expect("list");
-        assert_eq!(listed, vec!["AGENTS.md".to_string()], "main has no nested files");
+        assert_eq!(listed.files, vec!["AGENTS.md".to_string()], "main has no nested files");
 
         let feature = crate::git::clone_into_pod(
             &shell,
@@ -172,7 +172,7 @@ async fn test_clone_into_pod_checks_out_a_branch_and_reports_failures() {
         assert_eq!(feature.branch, "feature");
         assert_ne!(feature.commit.as_deref(), Some(main_commit.as_str()));
         let listed = crate::git::list_agents_files(&shell, "origin-feature").await.expect("list");
-        assert_eq!(listed, vec!["AGENTS.md".to_string(), "web/AGENTS.md".to_string()], "top-level first");
+        assert_eq!(listed.files, vec!["AGENTS.md".to_string(), "web/AGENTS.md".to_string()], "top-level first");
 
         let bare = sandbox
             .exec(&["git", "init", "-q", "/workspace/no-agents"])
@@ -183,7 +183,7 @@ async fn test_clone_into_pod_checks_out_a_branch_and_reports_failures() {
             .await
             .expect("read a missing file");
         assert_eq!(none, None);
-        assert!(crate::git::list_agents_files(&shell, "no-agents").await.expect("list").is_empty());
+        assert!(crate::git::list_agents_files(&shell, "no-agents").await.expect("list").files.is_empty());
 
         // Bytes that aren't UTF-8 (or a 1 MiB cut through a character)
         // still load, with the bad bytes replaced (SME-32 code review,
@@ -216,14 +216,17 @@ async fn test_clone_into_pod_checks_out_a_branch_and_reports_failures() {
         assert!(read.content.ends_with("END\n"), "the whole file loads: ...{:?}", read.content.chars().rev().take(5).collect::<String>());
 
         // A non-ASCII path is listed as it is, not in git's quoting,
-        // so it can be loaded (SME-32 code review 7, finding 3).
+        // so it can be loaded (SME-32 code review 7, finding 3); a
+        // directory name with a newline in it, which `-z` keeps, is left
+        // out and counted, never recorded (SME-271).
         let unicode = sandbox
-            .exec(&["sh", "-c", "git init -q /workspace/unicode && cd /workspace/unicode && mkdir é && echo x > é/AGENTS.md && git add é/AGENTS.md"])
+            .exec(&["sh", "-c", "git init -q /workspace/unicode && cd /workspace/unicode && mkdir é && echo x > é/AGENTS.md && git add é/AGENTS.md && d=$(printf 'x\\n- y') && mkdir \"$d\" && echo x > \"$d/AGENTS.md\" && git add \"$d/AGENTS.md\""])
             .await
             .expect("exec make unicode");
         assert_eq!(unicode.exit_code, 0, "{}", unicode.stderr);
         let listed = crate::git::list_agents_files(&shell, "unicode").await.expect("list");
-        assert_eq!(listed, vec!["é/AGENTS.md".to_string()]);
+        assert_eq!(listed.files, vec!["é/AGENTS.md".to_string()]);
+        assert_eq!(listed.left_out, 1, "the newline path");
 
         // An AGENTS.md that's a symlink out of the checkout (to a key,
         // say) is refused, not read (SME-32 code review 7, finding 1).
