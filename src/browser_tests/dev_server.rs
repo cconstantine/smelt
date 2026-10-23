@@ -273,36 +273,57 @@ pub(super) async fn scenario_agents_md_trust(t: &Scenario<'_>) {
         "Browser tier rule: always run the linter.\n"
     );
 
-    // SME-277: an AGENTS.md that hides text shows it escaped, with the
-    // notice naming the count, in the live DOM — and Trust still loads
-    // the file exactly as it is, escapes and all.
+    // SME-277: an AGENTS.md that hides text, through the real flow rather
+    // than a seed — the model clones a repo whose file hides characters and
+    // asks to load it, so the card's row comes from `clone_repo` and
+    // `load_instructions` themselves. The card then shows the escapes and
+    // the count in the live DOM, and Trust still loads the file exactly as
+    // it is, invisible characters and all.
     let hiding = t.conversation().await;
-    let hiding_remote = format!("example.com/browser-tier/{}", unique_id("trust-hidden"));
-    let hiding_repo = db::create_conversation_repo(pool, hiding.id, &format!("https://{hiding_remote}.git"), &hiding_remote, None, "hides")
-        .await
-        .expect("seed a repo");
-    db::set_repo_cloned(pool, hiding_repo.id, "main", Some("def5678abc")).await.expect("seed the clone");
-    db::request_instruction(
+    sandbox::create_pod(pool, hiding.id, Default::default()).await.expect("create_pod");
+    let terminal = sandbox::create_terminal(pool, hiding.id).await.expect("create_terminal");
+    // Python's own escapes, so the shell command carries only ASCII: three
+    // zero-width-ish characters, a bidi isolate pair around "re order" (a
+    // reader sees "re order" in the wrong order without the fix) and a BOM.
+    let make_hiding_repo = r#"git init --bare --initial-branch=main -q /tmp/v.git && git clone -q file:///tmp/v.git /tmp/w && cd /tmp/w && python3 -c 'open("AGENTS.md","w").write("# House rules\nBe kind.\u200b\u206e\u2066re order\u200b\nRead every file.\ufeff\n")' && git add AGENTS.md && git -c user.email=smelt@test -c user.name=smelt commit -qm rules && git push -q origin main"#;
+    anthropic::tools::execute(
         pool,
         hiding.id,
-        hiding_repo.id,
-        "AGENTS.md",
-        &db::InstructionsFile {
-            content: "Be kind.\u{200b}\u{206e}\u{2066}read\u{200b}\n".to_string(),
-            file_bytes: 20,
-            hash: "browser-tier-hash-hidden".to_string(),
-            commit: Some("def5678abc".to_string()),
-        },
+        &unique_id("make"),
+        "run_terminal_command",
+        &serde_json::json!({"terminal_id": terminal, "command": make_hiding_repo}),
     )
     .await
-    .expect("seed the hidden request");
+    .expect("make the hiding repo");
+    anthropic::tools::execute(
+        pool,
+        hiding.id,
+        &unique_id("clone"),
+        "clone_repo",
+        &serde_json::json!({"url": "file:///tmp/v.git"}),
+    )
+    .await
+    .expect("clone the hiding repo");
+    anthropic::tools::execute(
+        pool,
+        hiding.id,
+        &unique_id("load"),
+        "load_instructions",
+        &serde_json::json!({"path": "/workspace/v/AGENTS.md"}),
+    )
+    .await
+    .expect("ask to load the hiding AGENTS.md");
     let hidden_page = t.tab(t.url(&format!("conversation/{}", hiding.id))).await;
     assert!(
         wait_for_text(&hidden_page, "\\u{200b}", Duration::from_secs(10)).await,
         "the card should show the zero-width space escaped as \\u{{…}} text"
     );
     assert!(
-        wait_for_text(&hidden_page, "4 characters here render as nothing", Duration::from_secs(10)).await,
+        wait_for_text(&hidden_page, "\\u{feff}", Duration::from_secs(10)).await,
+        "the card should show the BOM escaped too"
+    );
+    assert!(
+        wait_for_text(&hidden_page, "5 characters here render as nothing", Duration::from_secs(10)).await,
         "the card should name the count of characters it had to escape"
     );
     click_when_present(&hidden_page, ".trust-card-trust", Duration::from_secs(5)).await;
@@ -310,10 +331,9 @@ pub(super) async fn scenario_agents_md_trust(t: &Scenario<'_>) {
         wait_for_count(&hidden_page, ".trust-card", 0, Duration::from_secs(10)).await,
         "trusting should take the hidden-characters card away too, live"
     );
-    db::delete_repo_trust(pool, &hiding_remote).await.expect("clean up the second trust decision");
     assert_eq!(
         crate::git::project_instructions(pool, hiding.id).await.expect("loaded")[0].content,
-        "Be kind.\u{200b}\u{206e}\u{2066}read\u{200b}\n",
+        "# House rules\nBe kind.\u{200b}\u{206e}\u{2066}re order\u{200b}\nRead every file.\u{feff}\n",
         "Trust loads the raw file, not the escaped showing"
     );
 }

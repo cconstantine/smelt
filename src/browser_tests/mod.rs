@@ -221,7 +221,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "forms", 30, Box::pin(scenario_forms(&t))).await;
     run_scenario(&t, only, r, k, "empty_conversation", 30, Box::pin(scenario_empty_conversation(&t))).await;
     run_scenario(&t, only, r, k, "sandbox_dev_server", 300, Box::pin(scenario_sandbox_dev_server(&t))).await;
-    run_scenario(&t, only, r, k, "agents_md_trust", 90, Box::pin(scenario_agents_md_trust(&t))).await;
+    run_scenario(&t, only, r, k, "agents_md_trust", 180, Box::pin(scenario_agents_md_trust(&t))).await;
     run_scenario(&t, only, r, k, "switch_resets_context_detail", 30, Box::pin(scenario_switch_resets_context_detail(&t))).await;
     run_scenario(&t, only, r, k, "model_picker", 60, Box::pin(scenario_model_picker(&t))).await;
     run_scenario(&t, only, r, k, "oauth_headers", 30, Box::pin(scenario_oauth_headers(&t))).await;
