@@ -162,6 +162,10 @@ pub enum ConversationEvent {
     /// An app-wide `AppEvent::QuestionsChanged`, relayed like `TurnsChanged`
     /// so the sidebar can mark conversations waiting on an answer.
     QuestionsChanged {},
+    /// An app-wide `AppEvent::ConversationsChanged` (a conversation was
+    /// created, retitled or deleted), relayed like `TurnsChanged` so the
+    /// sidebar's list follows along in every tab (SME-269).
+    ConversationsChanged {},
     /// The conversation's provider or model changed (the user chose
     /// another, or a turn took the default). Carries nothing: the tab
     /// refetches `api::chat::get_conversation_model` (SME-72).
@@ -228,6 +232,11 @@ pub enum AppEvent {
     /// model's question (SME-34). Carries nothing: listeners refetch
     /// `api::questions::get_waiting_conversations`.
     QuestionsChanged,
+    /// A conversation was created, retitled (its first message gave it a
+    /// title) or deleted. Carries nothing: listeners refetch
+    /// `api::chat::get_conversations`, which is the list, its titles and
+    /// its order (SME-269).
+    ConversationsChanged,
     /// A model provider or the default model was added, edited or
     /// removed. Carries nothing: listeners refetch (SME-72).
     ProvidersChanged,
@@ -243,6 +252,6 @@ mod server;
 mod wire_tests;
 
 #[cfg(feature = "server")]
-pub use server::{forget, publish, publish_app, subscribe, subscribe_app};
+pub use server::{Subscription, forget, publish, publish_app, subscribe, subscribe_app};
 #[cfg(all(feature = "server", test))]
 pub use server::{has_channel, subscriber_count};

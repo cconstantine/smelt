@@ -413,18 +413,32 @@ pub(crate) async fn open_conversation_events(
 }
 
 /// Everything a tab watching `id` hears: that conversation's events, plus
-/// the app-wide `PodsChanged`, `TurnsChanged`, `QuestionsChanged` and `ProvidersChanged`, relayed as their
+/// the app-wide `PodsChanged`, `TurnsChanged`, `QuestionsChanged`,
+/// `ProvidersChanged` and `ConversationsChanged`, relayed as their
 /// `ConversationEvent` namesakes for the sidebar.
 /// Ends when the conversation's channel closes (it was deleted).
 #[cfg(feature = "server")]
 pub(crate) fn conversation_event_stream(
     id: i64,
 ) -> impl futures_util::Stream<Item = Result<events::ConversationEvent, axum::BoxError>> {
-    use tokio::sync::broadcast::error::RecvError;
-    // Both subscribed now, not on first poll, so nothing published in
+    // Both subscribed here, not on first poll, so nothing published in
     // between is missed.
-    let receivers = (events::subscribe(id), events::subscribe_app());
-    futures_util::stream::unfold(receivers, move |(mut conversation, mut app)| async move {
+    conversation_relay(id, events::subscribe(id), events::subscribe_app())
+}
+
+/// `conversation_event_stream` from channels already in hand, which is how
+/// a test gives it an app channel of its own: the app-wide bus carries every
+/// other test's events too, so what arrives on it isn't one test's to judge
+/// (SME-135, and the same reason `api::pods::app_events_response` takes its
+/// receiver).
+#[cfg(feature = "server")]
+pub(crate) fn conversation_relay(
+    id: i64,
+    conversation: events::Subscription,
+    app: tokio::sync::broadcast::Receiver<events::AppEvent>,
+) -> impl futures_util::Stream<Item = Result<events::ConversationEvent, axum::BoxError>> {
+    use tokio::sync::broadcast::error::RecvError;
+    futures_util::stream::unfold((conversation, app), move |(mut conversation, mut app)| async move {
         loop {
             tokio::select! {
                 received = conversation.recv() => match received {
@@ -454,6 +468,10 @@ pub(crate) fn conversation_event_stream(
                     }
                     Ok(events::AppEvent::QuestionsChanged) => {
                         let event = events::ConversationEvent::QuestionsChanged {};
+                        return Some((Ok(event), (conversation, app)));
+                    }
+                    Ok(events::AppEvent::ConversationsChanged) => {
+                        let event = events::ConversationEvent::ConversationsChanged {};
                         return Some((Ok(event), (conversation, app)));
                     }
                     // Only ever decoded, never published.
@@ -492,6 +510,29 @@ mod tests {
     fn spawn_delete(pool: &PgPool, id: i64) -> tokio::task::JoinHandle<Result<(), String>> {
         let pool = pool.clone();
         tokio::spawn(async move { delete_and_forget(&pool, id).await })
+    }
+
+    /// SME-269, the ticket's case for a tab that has a conversation open:
+    /// a conversation created, retitled or deleted elsewhere reaches it on
+    /// the stream it already holds. Built from an app channel of the test's
+    /// own — the app-wide bus carries every other test's events too, so a
+    /// first item here would be theirs to judge, not this test's (SME-135).
+    #[tokio::test]
+    async fn test_a_list_change_reaches_every_watched_conversation() {
+        use futures_util::StreamExt;
+        let conversation_id = 9_269_000_001;
+        let (app, app_rx) = tokio::sync::broadcast::channel(16);
+        let stream = conversation_relay(conversation_id, events::subscribe(conversation_id), app_rx);
+        futures_util::pin_mut!(stream);
+        app.send(events::AppEvent::ConversationsChanged).expect("publish");
+        let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("the relayed list change never arrived");
+        assert!(
+            matches!(event, Some(Ok(events::ConversationEvent::ConversationsChanged {}))),
+            "got {event:?}"
+        );
+        events::forget(conversation_id);
     }
 
     /// SME-262, the ticket's case. Interleaving: the delete commits, and

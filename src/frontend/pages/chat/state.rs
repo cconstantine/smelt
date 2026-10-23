@@ -259,6 +259,7 @@ pub(super) fn apply_event(state: Store<ConversationState>, event: ConversationEv
         ConversationEvent::PodsChanged {} => return EventEffect::PodsChanged,
         ConversationEvent::TurnsChanged {} => return EventEffect::TurnsChanged,
         ConversationEvent::QuestionsChanged {} => return EventEffect::QuestionsChanged,
+        ConversationEvent::ConversationsChanged {} => return EventEffect::ConversationsChanged,
         ConversationEvent::ModelChanged {} | ConversationEvent::ProvidersChanged {} => {
             return EventEffect::ModelChanged;
         }

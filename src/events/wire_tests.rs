@@ -17,10 +17,35 @@ fn test_app_events_round_trip_through_json() {
     let json = serde_json::to_string(&event).expect("serialize");
     assert_eq!(json, r#"{"type":"PodsChanged"}"#);
     assert_eq!(serde_json::from_str::<AppEvent>(&json).expect("deserialize"), event);
-    for event in [AppEvent::TurnsChanged, AppEvent::ProvidersChanged, AppEvent::QuestionsChanged] {
+    for event in [
+        AppEvent::TurnsChanged,
+        AppEvent::ProvidersChanged,
+        AppEvent::QuestionsChanged,
+        AppEvent::ConversationsChanged,
+    ] {
         let json = serde_json::to_string(&event).expect("serialize");
         assert_eq!(serde_json::from_str::<AppEvent>(&json).expect("deserialize"), event);
     }
+}
+
+/// SME-269: an older bundle must be able to skip it, so it goes on the wire
+/// as a tagged object like its neighbours — a unit variant written any other
+/// way decodes as `Unknown` there rather than failing loudly.
+#[test]
+fn test_a_list_change_event_round_trips_through_json() {
+    let app = AppEvent::ConversationsChanged;
+    assert_eq!(serde_json::to_string(&app).expect("serialize"), r#"{"type":"ConversationsChanged"}"#);
+    assert_eq!(serde_json::from_str::<AppEvent>(r#"{"type":"ConversationsChanged"}"#).expect("app event"), app);
+    let conversation = ConversationEvent::ConversationsChanged {};
+    assert_eq!(
+        serde_json::to_string(&conversation).expect("serialize"),
+        r#"{"type":"ConversationsChanged"}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<ConversationEvent>(r#"{"type":"ConversationsChanged"}"#)
+            .expect("conversation event"),
+        conversation
+    );
 }
 
 /// A tab still running an older bundle gets event types added since.
@@ -50,6 +75,7 @@ fn one_of_each() -> Vec<ConversationEvent> {
         ConversationEvent::PodsChanged {},
         ConversationEvent::TurnsChanged {},
         ConversationEvent::QuestionsChanged {},
+        ConversationEvent::ConversationsChanged {},
         ConversationEvent::QuestionUpdate { question: None },
         ConversationEvent::QuestionUpdate {
             question: Some(crate::questions::PendingQuestion {
