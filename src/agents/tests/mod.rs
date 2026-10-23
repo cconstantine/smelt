@@ -7,6 +7,7 @@ use crate::anthropic::ContentBlock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod reports;
 mod start;
 mod tools;
 
@@ -20,21 +21,38 @@ async fn setup(pool: &PgPool, bodies: Vec<String>) -> Arc<Mutex<Vec<serde_json::
 /// A mock Anthropic upstream that answers with `bodies` in order (the last
 /// repeated) and keeps every request, saved as the default provider.
 async fn mock_upstream(pool: &PgPool, bodies: Vec<String>) -> Arc<Mutex<Vec<serde_json::Value>>> {
+    let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    mock_with(pool, move |_| {
+        let i = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let body = bodies[i.min(bodies.len() - 1)].clone();
+        Box::pin(async move { body })
+    })
+    .await
+}
+
+type Reply = std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send>>;
+
+/// A mock Anthropic upstream whose reply to each request is `answer`'s,
+/// which may wait; keeps every request, saved as the default provider.
+async fn mock_with(
+    pool: &PgPool,
+    answer: impl Fn(&serde_json::Value) -> Reply + Send + Sync + 'static,
+) -> Arc<Mutex<Vec<serde_json::Value>>> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorded = requests.clone();
+    let answer = Arc::new(answer);
     let app = axum::Router::new().route(
         "/v1/messages",
         axum::routing::post(move |request: String| {
             let recorded = recorded.clone();
-            let bodies = bodies.clone();
+            let answer = answer.clone();
             async move {
                 let parsed: serde_json::Value = serde_json::from_str(&request).expect("a JSON request body");
-                let mut log = recorded.lock().expect("the request log");
-                log.push(parsed);
-                let body = bodies[(log.len() - 1).min(bodies.len() - 1)].clone();
-                ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], body)
+                let reply = answer(&parsed);
+                recorded.lock().expect("the request log").push(parsed);
+                ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], reply.await)
             }
         }),
     );
@@ -43,6 +61,19 @@ async fn mock_upstream(pool: &PgPool, bodies: Vec<String>) -> Arc<Mutex<Vec<serd
     });
     crate::providers::test_support::add_mock_provider(pool, addr).await;
     requests
+}
+
+/// The agent a request is for, read from its system prompt; `None` for a
+/// conversation without a parent.
+fn agent_of(request: &serde_json::Value) -> Option<i64> {
+    let system = request["system"].to_string();
+    let rest = &system[system.find("You are agent #")? + "You are agent #".len()..];
+    rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+}
+
+/// The requests made for `agent` (`None`: for conversations without a parent).
+fn requests_for(requests: &Mutex<Vec<serde_json::Value>>, agent: Option<i64>) -> Vec<serde_json::Value> {
+    requests.lock().expect("the request log").iter().filter(|r| agent_of(r) == agent).cloned().collect()
 }
 
 fn sse_body(events: &[(&str, &str)]) -> String {
@@ -57,6 +88,26 @@ fn text_reply(text: &str) -> String {
         ("content_block_delta", &delta.to_string()),
         ("content_block_stop", r#"{"type":"content_block_stop","index":0}"#),
         ("message_delta", r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#),
+        ("message_stop", r#"{"type":"message_stop"}"#),
+    ])
+}
+
+/// A reply that calls `name` with `input` (id `toolu_<name>`).
+fn tool_call_reply(name: &str, input: serde_json::Value) -> String {
+    let start = serde_json::json!({
+        "type": "content_block_start", "index": 0,
+        "content_block": {"type": "tool_use", "id": format!("toolu_{name}"), "name": name, "input": {}}
+    });
+    let delta = serde_json::json!({
+        "type": "content_block_delta", "index": 0,
+        "delta": {"type": "input_json_delta", "partial_json": input.to_string()}
+    });
+    sse_body(&[
+        ("message_start", r#"{"type":"message_start"}"#),
+        ("content_block_start", &start.to_string()),
+        ("content_block_delta", &delta.to_string()),
+        ("content_block_stop", r#"{"type":"content_block_stop","index":0}"#),
+        ("message_delta", r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#),
         ("message_stop", r#"{"type":"message_stop"}"#),
     ])
 }

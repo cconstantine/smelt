@@ -42,7 +42,9 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
 
 /// The start notice, the child's own: what its first turn drains.
 fn start_notice() -> String {
-    "Your start is done: work on the brief above. The user can also write to you here.".to_string()
+    "Your start is done: work on the brief above. When your work is done, call finish with your \
+     report. The user can also write to you here."
+        .to_string()
 }
 
 /// The child's start: ends with it `active` and its first turn woken. A

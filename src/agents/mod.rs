@@ -13,12 +13,20 @@ use sqlx::PgPool;
 
 use crate::db;
 
+mod queue;
 mod start;
 
+pub(crate) use queue::*;
 pub(crate) use start::*;
 
 /// The longest brief `start_agent` takes, in characters.
 pub(crate) const MAX_BRIEF_CHARS: usize = 30_000;
+
+/// The longest report `finish` takes, in characters.
+pub(crate) const MAX_REPORT_CHARS: usize = 30_000;
+
+/// The tool a child ends its work with; a successful call ends its turn.
+pub(crate) const FINISH: &str = "finish";
 
 /// Why a child can't call `start_agent` (depth 1, until SME-245's limits).
 pub(crate) const ROOT_ONLY: &str = "start_agent is only for a conversation without a parent";

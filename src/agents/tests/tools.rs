@@ -18,14 +18,27 @@ async fn bare_child(pool: &PgPool, parent: i64) -> i64 {
 }
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_a_root_is_offered_start_agent_and_a_child_is_not(pool: PgPool) {
+async fn test_a_root_is_offered_start_agent_and_a_child_finish(pool: PgPool) {
     setup(&pool, vec![text_reply("ok")]).await;
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let child = bare_child(&pool, root).await;
     let root_tools = crate::anthropic::tools::tool_definitions(&pool, root).await;
     assert!(names(&root_tools).contains(&"start_agent"), "{:?}", names(&root_tools));
+    assert!(!names(&root_tools).contains(&"finish"), "{:?}", names(&root_tools));
     let child_tools = crate::anthropic::tools::tool_definitions(&pool, child).await;
     assert!(!names(&child_tools).contains(&"start_agent"), "{:?}", names(&child_tools));
+    assert!(names(&child_tools).contains(&"finish"), "{:?}", names(&child_tools));
+}
+
+/// `finish` from a conversation without a parent is refused by `execute`,
+/// before `finish` itself runs.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_finish_called_by_a_root_is_refused(pool: PgPool) {
+    setup(&pool, vec![text_reply("ok")]).await;
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    let result =
+        crate::anthropic::tools::execute(&pool, root, "toolu_1", "finish", &serde_json::json!({"report": "done"})).await;
+    assert_eq!(result, Err("finish is only for an agent".to_string()));
 }
 
 /// Checked from the database at the call, not from what was offered: a

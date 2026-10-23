@@ -12,6 +12,8 @@ use super::*;
 pub const AGENT_STARTING: &str = "starting";
 /// `agents.state`: started, working or between turns.
 pub const AGENT_ACTIVE: &str = "active";
+/// `agents.state`: it called `finish`.
+pub const AGENT_FINISHED: &str = "finished";
 /// `agents.state`: `stop_agent` or a delete stopped it.
 pub const AGENT_STOPPED: &str = "stopped";
 
@@ -200,6 +202,53 @@ pub async fn complete_start(pool: &PgPool, child: i64, parent: i64, notice: &str
     queue_agent_message(&mut tx, child, None, "smelt", KIND_NOTICE, notice).await?;
     tx.commit().await?;
     Ok(true)
+}
+
+/// `finish_agent`'s outcome.
+#[derive(Debug, PartialEq)]
+pub enum Finish {
+    /// The report is queued to this parent.
+    Queued { parent: i64 },
+    /// The agent isn't `active`: its state, or `None` when it isn't an
+    /// agent or is gone.
+    NotActive(Option<String>),
+}
+
+/// `finish`'s transaction: the child `finished` and its report queued to
+/// its parent, so one lands only if the other does. `label` names the
+/// child to its parent.
+pub async fn finish_agent(pool: &PgPool, child: i64, label: &str, report: &str) -> Result<Finish, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let Some(parent) = sqlx::query_scalar::<_, Option<i64>>("SELECT parent_id FROM conversations WHERE id = $1")
+        .bind(child)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten()
+    else {
+        return Ok(Finish::NotActive(None));
+    };
+    if !lock_conversations(&mut tx, &[(parent, RowLock::KeyShare), (child, RowLock::KeyShare)]).await? {
+        return Ok(Finish::NotActive(None));
+    }
+    let finished = sqlx::query(
+        "UPDATE agents SET state = $2, state_changed_at = now() WHERE conversation_id = $1 AND state = $3",
+    )
+    .bind(child)
+    .bind(AGENT_FINISHED)
+    .bind(AGENT_ACTIVE)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if finished == 0 {
+        let state = sqlx::query_scalar::<_, String>("SELECT state FROM agents WHERE conversation_id = $1")
+            .bind(child)
+            .fetch_optional(&mut *tx)
+            .await?;
+        return Ok(Finish::NotActive(state));
+    }
+    queue_agent_message(&mut tx, parent, Some(child), label, KIND_REPORT, report).await?;
+    tx.commit().await?;
+    Ok(Finish::Queued { parent })
 }
 
 /// Every undelivered report or notice to `to`, oldest first.

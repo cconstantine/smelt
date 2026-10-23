@@ -251,7 +251,8 @@ pub(crate) fn system_prompt(env: &PromptEnvironment) -> String {
     if let Some(agent) = &env.agent {
         prompt.push_str(&format!(
             "- You are agent #{}, started by conversation #{} (your parent) with the brief that \
-             starts this conversation. The user can also write to you.\n",
+             starts this conversation. Call finish with your report when your work is done; the \
+             user can also write to you.\n",
             agent.id, agent.parent_id
         ));
     }

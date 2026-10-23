@@ -60,6 +60,7 @@ struct Tool {
 enum Offer {
     All,
     Root,
+    Child,
 }
 
 /// A tool in the registry, with who it's offered to.
@@ -258,6 +259,7 @@ mod server {
             .map_err(|e| format!("couldn't check who may call {name}: {e}"))?;
         match (offer, parent) {
             (super::Offer::Root, Some(_)) => Err(format!("{name} is only for a conversation without a parent")),
+            (super::Offer::Child, None) => Err(format!("{name} is only for an agent")),
             _ => Ok(()),
         }
     }
@@ -268,6 +270,7 @@ mod server {
         match offer {
             super::Offer::All => true,
             super::Offer::Root => !has_parent,
+            super::Offer::Child => has_parent,
         }
     }
 

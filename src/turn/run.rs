@@ -555,8 +555,9 @@ fn run_turn_steps<'a: 'b, 'b>(
                 return Ok(persisted);
             }
 
-            let (result_blocks, asked) = run_tools(pool, conversation_id, &turn).await?;
-            if asked {
+            // Asked the user, or an agent finished (SME-236): the turn ends.
+            let (result_blocks, ends) = run_tools(pool, conversation_id, &turn).await?;
+            if ends {
                 if !result_blocks.is_empty() {
                     let saved = db::create_message(pool, conversation_id, "user", &result_blocks)
                         .await

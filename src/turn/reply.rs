@@ -166,7 +166,8 @@ pub(super) async fn save_stop_notice(
 }
 
 /// Runs a reply's tool calls and returns their results, and whether the
-/// reply asked the user a question.
+/// turn ends here: the reply asked the user a question, or an agent's
+/// `finish` went through (SME-236), whose turn ends as `ask_user`'s does.
 ///
 /// The model's `ask_user` (SME-34): one per reply; it gets no
 /// result now, and the turn ends waiting on it. Recorded before
@@ -180,6 +181,7 @@ pub(super) async fn run_tools(
 ) -> ServerFnResult<(Vec<anthropic::ContentBlock>, bool)> {
     let mut result_blocks = Vec::new();
     let mut asked = false;
+    let mut finished = false;
     for block in &turn.content {
         if let anthropic::ContentBlock::ToolUse { id, name, input } = block
             && name == crate::questions::ASK_USER
@@ -208,6 +210,9 @@ pub(super) async fn run_tools(
         {
             let result =
                 anthropic::tools::execute(pool, conversation_id, id, name, input).await;
+            if name == crate::agents::FINISH && result.is_ok() {
+                finished = true;
+            }
             let (content, is_error) = match result {
                 Ok(output) => (output, None),
                 Err(message) => (message, Some(true)),
@@ -219,6 +224,6 @@ pub(super) async fn run_tools(
             });
         }
     }
-    Ok((result_blocks, asked))
+    Ok((result_blocks, asked || finished))
 }
 
