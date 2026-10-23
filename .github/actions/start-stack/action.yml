@@ -1,0 +1,103 @@
+name: Start the compose stack
+description: >
+  What both CI jobs test against: docker-compose.yml's postgres, docker and
+  k3s, with the build caches and this commit's sandbox image, on the job's
+  own ARC runner. Sets UID/GID, COMPOSE_FILE, the CI_* cache dirs and
+  SANDBOX_IMAGE for the steps after it.
+runs:
+  using: composite
+  steps:
+    - name: Install the docker compose plugin if missing
+      # The self-hosted ARC runner image has the Docker CLI but not the
+      # compose plugin (GitHub's ubuntu-latest has both). A no-op once the
+      # runner image includes it.
+      shell: bash
+      run: |
+        if ! docker compose version > /dev/null 2>&1; then
+          mkdir -p ~/.docker/cli-plugins
+          curl -fsSL -o ~/.docker/cli-plugins/docker-compose \
+            https://github.com/docker/compose/releases/download/v5.5.1/docker-compose-linux-x86_64
+          chmod +x ~/.docker/cli-plugins/docker-compose
+        fi
+        docker compose version
+
+    - name: Remove anything a previous run left behind
+      # The ARC runner's Docker daemon keeps its storage across jobs (a
+      # persistent volume, unlike ubuntu-latest's fresh VM), so a run
+      # cancelled before "Tear down" would leave its containers and
+      # volumes — k3s's cluster state, postgres's data — for this one.
+      shell: bash
+      run: docker compose down -v --remove-orphans
+
+    - name: Compute UID/GID for docker compose build
+      # docker-compose.yml's `smelt` service builds its dev-user with
+      # these, defaulting to 1000/1000 — match them to the runner's real
+      # user so files the container writes into the bind-mounted repo
+      # (target/, Cargo.lock changes) aren't owned by a mismatched uid.
+      shell: bash
+      run: |
+        echo "UID=$(id -u)" >> "$GITHUB_ENV"
+        echo "GID=$(id -g)" >> "$GITHUB_ENV"
+
+    - name: Build caches
+      # Cargo's crate downloads and target/ live on the runner's cache volume
+      # (CI_CACHE_DIR, which the ARC runner sets) and are mounted into the
+      # smelt service by .github/ci-compose.yml, as is the `docker`
+      # service's storage (the sandbox image's layers). They outlast the job, so
+      # each run builds incrementally on the last instead of saving and
+      # restoring a ~20 GB target/ through actions/cache, which took longer
+      # than the tests. Without CI_CACHE_DIR, both stay in the checkout.
+      # The dirs are made here, as the runner user (UID/GID above), since a
+      # bind mount would otherwise create them root-owned, which the
+      # container's `dev` user can't write. target/ is dropped once it
+      # passes 60 GB: cargo never removes stale artifacts itself.
+      shell: bash
+      run: |
+        cache=${CI_CACHE_DIR:-$PWD/.ci-cache}
+        mkdir -p "$cache/cargo-home/registry" "$cache/cargo-home/git" "$cache/target" "$cache/docker"
+        size=$(du -s --block-size=1G "$cache/target" | cut -f1)
+        echo "target/ cache: ${size} GB"
+        if [ "$size" -gt 60 ]; then
+          echo "::notice::target/ cache passed 60 GB; starting it over"
+          rm -rf "$cache/target" && mkdir "$cache/target"
+        fi
+        {
+          echo "CI_CARGO_HOME=$cache/cargo-home"
+          echo "CI_CARGO_TARGET=$cache/target"
+          echo "CI_DOCKER_DATA=$cache/docker"
+          echo "COMPOSE_FILE=docker-compose.yml:.github/ci-compose.yml"
+        } >> "$GITHUB_ENV"
+
+    - name: Build dev image
+      shell: bash
+      run: docker compose build smelt
+
+    - name: Start service dependencies (postgres, docker-in-docker, k3s)
+      shell: bash
+      run: docker compose up -d postgres docker k3s
+
+    - name: Bootstrap k3s (applies RBAC, writes kubeconfig for sandbox tests)
+      shell: bash
+      run: docker compose up --exit-code-from k3s-bootstrap k3s-bootstrap
+
+    # The sandbox image is delivered with no registry involved (`ctr
+    # images import` straight into this runner's own k3s node — see
+    # SME-17) rather than
+    # pulled, so every sandbox test that creates a pod fails outright
+    # (`ImagePullBackOff`) unless this has run first — a fresh runner's
+    # k3s always starts with nothing imported. Needs `docker`/`k3s`/
+    # `k3s-bootstrap` already up, which the two steps above this one
+    # provide.
+    # The image is named after this commit's agent sources
+    # (scripts/sandbox-image-ref, SME-102), and ci.yml's test steps run
+    # their pods from it through SANDBOX_IMAGE, as scripts/check.sh does
+    # locally. `:latest` isn't imported: nothing here uses it.
+    - name: Sandbox image for this commit
+      shell: bash
+      run: echo "SANDBOX_IMAGE=$(scripts/sandbox-image-ref)" >> "$GITHUB_ENV"
+
+    - name: Build and deliver the sandbox image
+      shell: bash
+      run: |
+        docker compose run --rm \
+          smelt scripts/build-sandbox-image.sh
