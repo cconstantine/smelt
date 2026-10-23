@@ -10,6 +10,8 @@ pub struct Conversation {
     pub title: String,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
+    /// The conversation that started this one as its agent (SME-236).
+    pub parent_id: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -38,6 +40,10 @@ impl Message {
 `Message::blocks()` parses the stored JSON back into `ContentBlock`s — callers (persistence in `db::create_message`, rendering in `frontend/pages/chat/transcript.rs`, history-building in `turn::history_for_request`) always go through `blocks()`/a `&[ContentBlock]` parameter rather than touching `content` as a string directly. A parse error is a real possibility (malformed content shouldn't happen but isn't structurally prevented) — every caller surfaces it rather than silently rendering blank, per `development-process.md`'s "surface fallback outcomes" rule.
 
 Two `ContentBlock` variants exist only for smelt's own bookkeeping, never sent or accepted by Anthropic itself — `CompactionSummary` and `CompactionPlaceholder` (auto-compaction's own output — see SME-18). `history_for_request` translates both into plain `Text` blocks before they're ever replayed to the real API; storage and rendering see the real variant.
+
+`Conversation.parent_id` is null for the user's own conversations and set for a child agent (SME-236). Every listed conversation carries it, so the sidebar counts a row's agents from the list it already has (its armed Delete says "Delete + 2 agents?"); the queries are `SELECT *`/`RETURNING *`, and `conversations.deleting_at` isn't mapped.
+
+A child's own rows are server-only and live in `src/db/agents/`: `AgentMessage` (one queued report or notice, as the drain reads it), `ChildAgent` (a child as `list_agents` shows it, with its status's inputs), `AgentPersona` (the persona snapshot a child's system prompt shows), and `PersonaSnapshot`/`StartDone` (what the start's done step writes). They aren't in `models.rs`: no server function returns them yet (the sidebar tree is SME-246's).
 
 Don't confuse `models::Message` (a database row) with `anthropic::AnthropicMessage` (an Anthropic API wire message, `{role, content: Vec<ContentBlock>}`) — `run_turn_bounded` converts between them when building a request and when persisting a turn.
 

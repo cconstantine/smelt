@@ -228,7 +228,7 @@ pub(super) fn ConversationSidebar(
                                 armed: pending_delete() == Some(conversation.id),
                                 class: "delete-conversation",
                                 idle: "Delete",
-                                confirm: "Confirm?",
+                                confirm: delete_confirm_label(&conversations(), conversation.id),
                                 on_arm: move |_| request_delete(conversation.id),
                                 on_confirm: move |_| request_delete(conversation.id),
                             }
@@ -238,5 +238,47 @@ pub(super) fn ConversationSidebar(
             }
             }
         }
+    }
+}
+
+/// The armed Delete's label: how many agents go with the conversation, its
+/// whole subtree, counted from the list the sidebar already has (SME-236).
+fn delete_confirm_label(conversations: &[crate::models::Conversation], id: i64) -> String {
+    let mut under = 0;
+    let mut frontier = vec![id];
+    while let Some(parent) = frontier.pop() {
+        for child in conversations.iter().filter(|c| c.parent_id == Some(parent)) {
+            under += 1;
+            frontier.push(child.id);
+        }
+    }
+    match under {
+        0 => "Confirm?".to_string(),
+        1 => "Delete + 1 agent?".to_string(),
+        n => format!("Delete + {n} agents?"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conversation(id: i64, parent_id: Option<i64>) -> crate::models::Conversation {
+        let at = chrono::NaiveDateTime::default();
+        crate::models::Conversation { id, title: format!("c{id}"), created_at: at, updated_at: at, parent_id }
+    }
+
+    #[test]
+    fn test_the_delete_label_counts_the_whole_subtree() {
+        let list = vec![
+            conversation(1, None),
+            conversation(2, Some(1)),
+            conversation(3, Some(1)),
+            conversation(4, Some(2)),
+            conversation(5, None),
+        ];
+        assert_eq!(delete_confirm_label(&list, 1), "Delete + 3 agents?");
+        assert_eq!(delete_confirm_label(&list, 2), "Delete + 1 agent?");
+        assert_eq!(delete_confirm_label(&list, 5), "Confirm?");
     }
 }

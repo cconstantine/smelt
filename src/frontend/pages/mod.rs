@@ -48,7 +48,7 @@ pub(crate) fn TwoStepButton(
     armed: bool,
     class: &'static str,
     idle: &'static str,
-    confirm: &'static str,
+    #[props(into)] confirm: String,
     #[props(default)] title: Option<&'static str>,
     on_arm: EventHandler<()>,
     on_confirm: EventHandler<()>,
@@ -74,7 +74,7 @@ pub(crate) fn TwoStepButton(
 /// first one did. Hidden text is left out of `innerText` and of what a
 /// screen reader reads.
 #[component]
-pub(crate) fn TwoStepLabel(armed: bool, idle: &'static str, confirm: &'static str) -> Element {
+pub(crate) fn TwoStepLabel(armed: bool, idle: &'static str, #[props(into)] confirm: String) -> Element {
     rsx! {
         span { class: "two-step-label",
             span { class: if armed { "two-step-text hidden" } else { "two-step-text" }, "{idle}" }

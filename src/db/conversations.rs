@@ -102,6 +102,8 @@ pub async fn conversation_exists(pool: &PgPool, id: i64) -> Result<bool, sqlx::E
         .await
 }
 
+/// A plain delete, for tests: the app deletes through `agents::delete_subtree`.
+#[cfg(test)]
 pub async fn delete_conversation(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM conversations WHERE id = $1")
         .bind(id)

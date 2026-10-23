@@ -19,6 +19,7 @@ mod history;
 mod notify;
 mod outside_turn;
 mod questions;
+mod reply;
 mod run;
 mod state;
 #[cfg(test)]
@@ -33,5 +34,6 @@ pub(crate) use self::history::*;
 pub(crate) use self::notify::*;
 pub(crate) use self::outside_turn::*;
 pub(crate) use self::questions::*;
+use self::reply::*;
 pub(crate) use self::run::*;
 pub(crate) use self::state::*;

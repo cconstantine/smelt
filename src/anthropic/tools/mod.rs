@@ -51,6 +51,25 @@ struct Tool {
     run: Run,
 }
 
+/// Who a tool is offered to (SME-236): every conversation, only one
+/// without a parent (the user's own), or only an agent. `execute` checks
+/// it too, from the database: a call can come from a history written
+/// before the conversation changed.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Offer {
+    All,
+    Root,
+    Child,
+}
+
+/// A tool in the registry, with who it's offered to.
+#[cfg(feature = "server")]
+struct Registered {
+    tool: Tool,
+    offer: Offer,
+}
+
 /// What one tool call brings in.
 #[cfg(feature = "server")]
 #[derive(Clone, Copy)]
@@ -83,6 +102,8 @@ macro_rules! run {
 }
 
 #[cfg(feature = "server")]
+mod agents;
+#[cfg(feature = "server")]
 mod browser;
 #[cfg(feature = "server")]
 mod files;
@@ -101,9 +122,10 @@ mod web;
 
 /// Every native tool, in the order the model is offered them. The order is
 /// part of what the model sees, so it stays fixed: changing it changes the
-/// request like adding or removing a tool would.
+/// request like adding or removing a tool would. The agent tools go last,
+/// so every older tool keeps its place.
 #[cfg(feature = "server")]
-static REGISTRY: std::sync::LazyLock<Vec<Tool>> = std::sync::LazyLock::new(|| {
+static REGISTRY: std::sync::LazyLock<Vec<Registered>> = std::sync::LazyLock::new(|| {
     [
         pods::tools(),
         files::tools(),
@@ -116,6 +138,8 @@ static REGISTRY: std::sync::LazyLock<Vec<Tool>> = std::sync::LazyLock::new(|| {
     ]
         .into_iter()
         .flatten()
+        .map(|tool| Registered { tool, offer: Offer::All })
+        .chain(agents::tools())
         .collect()
 });
 
@@ -216,9 +240,37 @@ mod server {
         if let Some((server_name, tool_name)) = crate::mcp::parse_tool_name(name) {
             return call_mcp_tool(pool, server_name, tool_name, input).await;
         }
-        match super::REGISTRY.iter().find(|tool| tool.def.name == name) {
-            Some(tool) => (tool.run)(super::Call { pool, conversation_id, tool_use_id, input }).await,
+        match super::REGISTRY.iter().find(|registered| registered.tool.def.name == name) {
+            Some(registered) => {
+                if registered.offer != super::Offer::All {
+                    offered_to(pool, conversation_id, name, registered.offer).await?;
+                }
+                (registered.tool.run)(super::Call { pool, conversation_id, tool_use_id, input }).await
+            }
             None => Err(format!("unknown tool: {name}")),
+        }
+    }
+
+    /// Refuses a call to a tool this conversation isn't offered (SME-236),
+    /// read from the database rather than from what was offered.
+    async fn offered_to(pool: &PgPool, conversation_id: i64, name: &str, offer: super::Offer) -> Result<(), String> {
+        let parent = crate::db::conversation_parent(pool, conversation_id)
+            .await
+            .map_err(|e| format!("couldn't check who may call {name}: {e}"))?;
+        match (offer, parent) {
+            (super::Offer::Root, Some(_)) => Err(format!("{name} is only for a conversation without a parent")),
+            (super::Offer::Child, None) => Err(format!("{name} is only for an agent")),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether a tool offered as `offer` goes to a conversation with
+    /// (`has_parent`) or without a parent.
+    fn is_offered(offer: super::Offer, has_parent: bool) -> bool {
+        match offer {
+            super::Offer::All => true,
+            super::Offer::Root => !has_parent,
+            super::Offer::Child => has_parent,
         }
     }
 
@@ -226,9 +278,11 @@ mod server {
     /// tools (see `tool_definitions` below, which appends those).
     /// Deliberately synchronous and pool-free: a caller that only needs
     /// smelt's own static tools (tests) shouldn't pay for a DB round trip
-    /// and MCP connection attempts it doesn't need.
+    /// and MCP connection attempts it doesn't need. Every tool, whoever
+    /// it's offered to.
+    #[cfg(test)]
     pub fn native_tool_definitions() -> Vec<crate::anthropic::ToolDefinition> {
-        super::REGISTRY.iter().map(|tool| tool.def.clone()).collect()
+        super::REGISTRY.iter().map(|registered| registered.tool.def.clone()).collect()
     }
 
     /// Dispatches a `mcp__<server_name>__<tool_name>` tool call — resolves
@@ -255,9 +309,25 @@ mod server {
     /// tools, namespaced `mcp__<server_name>__<tool_name>` (see
     /// `crate::mcp`). A server that fails to connect this turn is skipped
     /// rather than failing the whole request — see
-    /// `crate::mcp::tool_definitions_for`.
-    pub async fn tool_definitions(pool: &PgPool) -> Vec<crate::anthropic::ToolDefinition> {
-        let mut definitions = native_tool_definitions();
+    /// `crate::mcp::tool_definitions_for`. Only the tools offered to
+    /// `conversation_id` (SME-236): `start_agent` to a conversation without
+    /// a parent, `finish` to an agent. A failed read offers neither.
+    pub async fn tool_definitions(pool: &PgPool, conversation_id: i64) -> Vec<crate::anthropic::ToolDefinition> {
+        let has_parent = match crate::db::conversation_parent(pool, conversation_id).await {
+            Ok(parent) => Some(parent.is_some()),
+            Err(e) => {
+                tracing::warn!(conversation_id, error = %e, "couldn't read the conversation's parent; its agent tools are left out this turn");
+                None
+            }
+        };
+        let mut definitions: Vec<crate::anthropic::ToolDefinition> = super::REGISTRY
+            .iter()
+            .filter(|registered| match has_parent {
+                Some(has_parent) => is_offered(registered.offer, has_parent),
+                None => registered.offer == super::Offer::All,
+            })
+            .map(|registered| registered.tool.def.clone())
+            .collect();
         match crate::db::list_mcp_server_configs(pool).await {
             Ok(configs) => {
                 definitions.extend(crate::mcp::tool_definitions_for(pool, &configs).await)

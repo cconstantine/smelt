@@ -6,6 +6,7 @@ session can edit one section without rewriting the others (SME-159). Read this
 one first; the sections are:
 
 * [features.md](features.md) — what the app and the agent do, feature by feature
+* [agents.md](agents.md) — child agents: what a conversation's model hands off, and how it hears back
 * [architecture.md](architecture.md) — how the code is laid out, short version;
   [docs/architecture.md](../architecture.md) is the full picture
 
@@ -25,7 +26,7 @@ A single-user, 100%-Rust AI coding agent. Every conversation is a coding session
 
 The open tickets, by theme (Backlog unless marked):
 
-* **What the model can do:** SME-78 (stop idle sandbox pods, Up Next), SME-73 (compact and carry on when a turn overflows the context, Up Next), SME-29 (model safety, including confirmation before destructive actions), SME-36 (a multi-file patch tool), SME-37 (skills), SME-38 (subagents), SME-31 (MCP servers running alongside the sandbox).
+* **What the model can do:** SME-78 (stop idle sandbox pods, Up Next), SME-73 (compact and carry on when a turn overflows the context, Up Next), SME-29 (model safety, including confirmation before destructive actions), SME-36 (a multi-file patch tool), SME-37 (skills), the rest of Personas and sub-agents (child agents shipped with SME-236, see [agents.md](agents.md); SME-38 was folded into it), SME-31 (MCP servers running alongside the sandbox).
 * **Models and providers:** SME-162 (a provider's limit on concurrent requests, Up Next), SME-109 (pick a cost-effective provider), SME-110 (a ChatGPT plan), SME-74 and SME-98 (keep earlier reasoning across a model, prompt or tool change), SME-120 (thinking blocks whose text is omitted), SME-116 (reasoning priced higher reads low).
 * **The UI:** SME-71 (desktop notifications, Up Next), SME-44 (VS Code into a sandbox), SME-138 (Copy over plain HTTP), SME-160 ("Working" timer, In Progress), and design review 2 (SME-123, Todo).
 * **Security:** SME-45 (previews only for signed-in users), SME-47 (unprivileged Docker, blocked on the homelab node's Linux 5.10), SME-48 (SSH keys encrypted and out of the model's reach), SME-63 (Chrome's sandbox, pod service-account tokens, network policy), SME-128 (listen on loopback only), SME-131 (state-changing remote calls a timeout can cancel), SME-139 (a release build aborts on any panic).

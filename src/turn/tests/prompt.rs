@@ -18,6 +18,7 @@ fn prompt_env() -> PromptEnvironment {
         repos: Vec::new(),
         instructions: Vec::new(),
         persona_files: Default::default(),
+        agent: None,
     }
 }
 

@@ -114,3 +114,40 @@ async fn test_a_clone_records_persona_files_and_list_personas_shows_them_once_tr
     })
     .await;
 }
+
+/// SME-236: a child agent's checkout, cloned at a ref where its persona
+/// differs from the default branch's, holds and reads that ref's persona.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_child_cloned_at_a_ref_reads_that_refs_persona(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
+        let child = db::create_conversation(&pool).await.expect("create conversation").id;
+        let pod = create_pod(&pool, child, PodLimitOverrides::default()).await.expect("create_pod");
+        // main's developer.md says one thing; tag v2's says another.
+        make_origin_with_personas(&client, pod, "/tmp/child.git").await;
+        sh(
+            &client,
+            pod,
+            "set -e; cd /tmp/src; printf -- '---\\nname: developer\\ndescription: The v2 one.\\n---\\nRead v2.\\n' > .agents/personas/developer.md; \
+             git -c user.name=t -c user.email=t@example.com commit -qam v2; git tag v2; git reset -q --hard HEAD~1; \
+             git push -q /tmp/child.git v2",
+        )
+        .await;
+        let repo = db::create_conversation_repo(&pool, child, "file:///tmp/child.git", "file/tmp/child", None, "child")
+            .await
+            .expect("the child's repo row");
+
+        let target = crate::git::CloneTarget::Ref("v2".to_string());
+        crate::git::clone_child_repo(&pool, child, &repo, &target).await.expect("clone at v2");
+        let ready = db::list_conversation_repos(&pool, child).await.expect("repos").remove(0);
+        assert_eq!(ready.status, "ready", "{:?}", ready.error);
+        assert!(ready.persona_files.contains(&".agents/personas/developer.md".to_string()), "{ready:?}");
+        let checkout = crate::agents::PodCheckout;
+        let read = crate::agents::ChildCheckout::read_file(&checkout, &pool, child, "child", ".agents/personas/developer.md")
+            .await
+            .expect("read the persona")
+            .expect("it's there");
+        assert!(read.content.contains("The v2 one.") && read.content.contains("Read v2."), "{}", read.content);
+    })
+    .await;
+}

@@ -42,6 +42,14 @@ pub(super) async fn save_notice_between_turns(
 /// next message. Call it from a spawned task: it waits for a running turn.
 #[cfg(feature = "server")]
 pub(super) async fn deliver_notice(pool: &PgPool, conversation_id: i64, text: String) {
+    // A child still starting, stopped or failed is only told (SME-236):
+    // its next turn, if it has one, reads it.
+    if !crate::agents::admits_notices(pool, conversation_id).await {
+        if let Err(e) = save_notice_between_turns(pool, conversation_id, text).await {
+            tracing::warn!(conversation_id, error = %e, "couldn't save a notice");
+        }
+        return;
+    }
     // Let in past the pause in the same step that counts it, so a Stop
     // either refuses it or ends it (SME-217).
     let Some(turn) = TurnInFlight::start_unless_paused(conversation_id) else {
@@ -105,6 +113,11 @@ pub(super) async fn wake_conversation(
         // Let in as before, so a notice is never dropped; the drain
         // reports the failure if it persists.
         Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't check a wake for pending work"),
+    }
+    // A child still starting, stopped or failed takes no turn (SME-236):
+    // the start wakes one once it's active, the user's send a stopped one.
+    if !crate::agents::admits_notices(pool, conversation_id).await {
+        return Ok(Vec::new());
     }
     // After the user stopped this conversation, pending notices wait for
     // their next message, which drains them the same way (see `ConversationRuntime::paused`).
@@ -230,6 +243,45 @@ pub(super) async fn drain_idle_command_notices(
         record_saved(conversation_id, persisted, saved);
     }
     Ok(())
+}
+
+/// Drains the reports and notices queued to `conversation_id`
+/// (`agent_messages`, SME-236), in the order they were queued: each saved
+/// as one `user` message naming its sender and marked delivered, in one
+/// transaction per row, so a stop between rows leaves the rest queued and
+/// none saved twice. Run with the command drains, at every iteration, so
+/// a busy recipient takes them between a tool result and its next call.
+#[cfg(feature = "server")]
+pub(super) async fn drain_agent_messages(
+    pool: &PgPool,
+    conversation_id: i64,
+    pending_new_content: &mut Vec<anthropic::ContentBlock>,
+    persisted: &mut Vec<Message>,
+) -> ServerFnResult<()> {
+    for row in db::undelivered_agent_messages(pool, conversation_id)
+        .await
+        .map_err(ServerFnError::new)?
+    {
+        let content = vec![anthropic::ContentBlock::Text { text: agent_message_text(&row) }];
+        let Some(saved) = db::deliver_agent_message(pool, &row, &content)
+            .await
+            .map_err(ServerFnError::new)?
+        else {
+            continue;
+        };
+        pending_new_content.extend(content);
+        record_saved(conversation_id, persisted, saved);
+    }
+    Ok(())
+}
+
+/// A queued row as its recipient reads it: a report names its sender.
+fn agent_message_text(row: &db::AgentMessage) -> String {
+    if row.kind == db::KIND_REPORT {
+        format!("Report from {}:\n\n{}", row.from_label, row.body)
+    } else {
+        format!("Notice: {}", row.body)
+    }
 }
 
 /// A duration in seconds, said in words: "45 seconds", "5 minutes",

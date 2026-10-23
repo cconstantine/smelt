@@ -167,3 +167,32 @@ fn test_split_returns_the_frontmatter_and_the_body_after_its_closing_line() {
     assert!(frontmatter::split(" ---\na: 1\n---\n").is_err());
     assert!(frontmatter::split("").is_err());
 }
+
+// --- SME-236: relative links made absolute when a persona is started ---
+
+const DIR: &str = "/workspace/smelt/.agents/personas";
+
+#[test]
+fn test_links_inline_reference_and_image_become_absolute() {
+    let body = "See [the rules](../../docs/rules.md) and [plan][p].\n\n![diagram](img/flow.png \"Flow\")\n\n[p]: ./plan.md \"The plan\"\n";
+    assert_eq!(
+        links::absolute(body, DIR),
+        "See [the rules](/workspace/smelt/docs/rules.md) and [plan][p].\n\n![diagram](/workspace/smelt/.agents/personas/img/flow.png \"Flow\")\n\n[p]: /workspace/smelt/.agents/personas/plan.md \"The plan\"\n"
+    );
+}
+
+#[test]
+fn test_links_keep_a_fragment_and_angle_brackets() {
+    let body = "[a](../../docs/process.md#gates) and [b](<my notes.md>) and [c](x.md?raw=1)";
+    assert_eq!(
+        links::absolute(body, DIR),
+        "[a](/workspace/smelt/docs/process.md#gates) and [b](</workspace/smelt/.agents/personas/my notes.md>) and [c](/workspace/smelt/.agents/personas/x.md?raw=1)"
+    );
+}
+
+#[test]
+fn test_links_left_alone_absolute_urls_fragments_escapes_and_code() {
+    let body = "[web](https://example.com/x.md) [mail](mailto:a@b.c) [top](#intro) [abs](/etc/hosts) \
+                [out](../../../other/x.md) `[code](x.md)`\n\n```\n[block](y.md)\n```\n";
+    assert_eq!(links::absolute(body, DIR), body, "nothing here is a relative link inside the checkout");
+}

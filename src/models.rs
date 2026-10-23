@@ -10,6 +10,9 @@ pub struct Conversation {
     pub title: String,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
+    /// The conversation that started this one as its agent (SME-236);
+    /// `None` for the user's own conversations.
+    pub parent_id: Option<i64>,
 }
 
 /// What a conversation's model calls used and cost in all (SME-106,

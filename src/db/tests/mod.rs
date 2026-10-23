@@ -67,3 +67,4 @@ mod volumes;
 mod usage;
 mod providers;
 mod instance;
+mod agents;
