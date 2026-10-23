@@ -45,18 +45,11 @@ pub(crate) fn class_from_annotations(annotations: Option<&rmcp::model::ToolAnnot
     }
 }
 
-/// The class of a call to `tool_name` on `config`'s server, from the
-/// annotations in the connection's tool list. Connects or re-lists first
-/// as a model call would (`ensure_connected`), so a call right after an
-/// edit's `evict` or a `tools/list_changed` gets the tool's current class.
-/// A server that can't be reached, or a tool it doesn't list, is
+/// The class of a call to `tool_name`, from its annotations in a
+/// connection's tool list (`tools`). A tool the list doesn't have is
 /// destructive: nothing says otherwise.
-pub(crate) async fn tool_class(pool: &sqlx::PgPool, config: &McpServerConfig, tool_name: &str) -> ToolClass {
-    if ensure_connected(pool, config, Attempt::SkipRecentFailures).await.is_err() {
-        return ToolClass::Destructive;
-    }
-    let registry = REGISTRY.lock().await;
-    let tool = registry.get(&config.id).and_then(|conn| conn.tools.iter().find(|tool| tool.name == tool_name));
+pub(super) fn listed_class(tools: &[McpTool], tool_name: &str) -> ToolClass {
+    let tool = tools.iter().find(|tool| tool.name == tool_name);
     tool.map_or(ToolClass::Destructive, |tool| class_from_annotations(tool.annotations.as_ref()))
 }
 

@@ -43,6 +43,16 @@ async fn wait_until_stale(server_id: i64) {
     .expect("tools/list_changed marks the list stale");
 }
 
+/// The class `call_tool_classed` hands over for a call to `tool`.
+async fn class_of_call(config: &McpServerConfig, tool: &str) -> Option<ToolClass> {
+    let class = std::sync::Mutex::new(None);
+    let _ = call_tool_classed(&test_pool(), config, tool, serde_json::json!({}), |c| {
+        *class.lock().unwrap() = Some(c);
+    })
+    .await;
+    class.into_inner().unwrap()
+}
+
 /// Read from the connection's tool list at the call, after the re-list a
 /// `tools/list_changed` asks for.
 #[tokio::test]
@@ -50,15 +60,15 @@ async fn test_a_tools_class_comes_from_the_connections_current_list() {
     let server_id = -237_001;
     let server = register_test_connection(server_id, true).await;
     let config = test_config(server_id, "test-server");
-    assert_eq!(tool_class(&test_pool(), &config, "echo").await, Destructive, "echo has no annotations");
-    assert_eq!(tool_class(&test_pool(), &config, "no_such_tool").await, Destructive, "not listed");
-    assert_eq!(tool_class(&test_pool(), &config, "second_tool").await, Destructive, "hidden, so not listed");
+    assert_eq!(class_of_call(&config, "echo").await, Some(Destructive), "echo has no annotations");
+    assert_eq!(class_of_call(&config, "no_such_tool").await, Some(Destructive), "not listed");
+    assert_eq!(class_of_call(&config, "second_tool").await, Some(Destructive), "hidden, so not listed");
 
     server.router.write().await.enable_route("second_tool");
     wait_until_stale(server_id).await;
-    let class = tool_class(&test_pool(), &config, "second_tool").await;
+    let class = class_of_call(&config, "second_tool").await;
     REGISTRY.lock().await.remove(&server_id);
-    assert_eq!(class, ReadOnly, "annotated readOnlyHint: true");
+    assert_eq!(class, Some(ReadOnly), "annotated readOnlyHint: true");
 }
 
 fn span_class(spans: &[opentelemetry_sdk::trace::SpanData], name: &str) -> Option<opentelemetry::Value> {
@@ -96,4 +106,32 @@ async fn test_an_mcp_calls_class_is_on_its_tool_span(pool: sqlx::PgPool) {
     assert!(second_result.is_ok(), "{second_result:?}");
     assert_eq!(echo_class, Some("destructive".into()));
     assert_eq!(second_class, Some("read-only".into()));
+}
+
+/// Review 1: an MCP call to a server that can't be reached says why,
+/// as before the class: the class lookup isn't a connect of its own,
+/// whose failure would leave the call only "failed to connect recently".
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_unreachable_servers_call_says_why_it_failed(pool: sqlx::PgPool) {
+    let config = create_static_server(&pool, "http://127.0.0.1:1/mcp").await;
+    let name = format!("mcp__{}__echo", config.name);
+    let result = crate::anthropic::tools::execute(&pool, 1, "toolu_237", &name, &serde_json::json!({})).await;
+    lock_failures().remove(&config.id);
+    let error = result.expect_err("nothing listens on port 1");
+    assert!(error.contains("failed to connect to MCP server"), "{error}");
+    assert!(!error.contains("failed to connect recently"), "{error}");
+}
+
+/// Review 1: arguments that aren't an object are refused before any
+/// connect, so they neither wait for one nor start the skip window.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_mcp_call_with_bad_arguments_is_refused_before_connecting(pool: sqlx::PgPool) {
+    let config = create_static_server(&pool, "http://127.0.0.1:1/mcp").await;
+    let name = format!("mcp__{}__echo", config.name);
+    let result = crate::anthropic::tools::execute(&pool, 1, "toolu_237", &name, &serde_json::json!(5)).await;
+    let failed = failed_recently(config.id);
+    lock_failures().remove(&config.id);
+    let error = result.expect_err("5 isn't an object");
+    assert!(error.contains("tool arguments must be a JSON object"), "{error}");
+    assert!(!failed, "no connect was tried, so none failed");
 }

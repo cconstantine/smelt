@@ -54,7 +54,6 @@ POST /api/conversations/{id}/messages        (server; ends at its response)
    ├─ chat {model}   (client) gen_ai.* tokens, finish reason, smelt.retries, smelt.binding
    ├─ tool {name}    gen_ai.tool.name, gen_ai.tool.call.id, smelt.tool.class, smelt.tool.mcp_server, smelt.tool.truncated
    │  ├─ start_or_get_pod → create_pod_attempt → wait_for_running ; agent connect ; agent request
-   │  ├─ mcp connect   (an MCP call's class lookup connects first when it must)
    │  └─ mcp call (→ mcp connect)
    ├─ chat {model}
    └─ compaction → chat {model}
