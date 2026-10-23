@@ -19,6 +19,9 @@ pub(crate) trait ChildCheckout: Send + Sync {
     /// a fetch) with no uncommitted changes to tracked files.
     fn parent_commit<'a>(&'a self, pool: &'a PgPool, parent: i64, dir: &'a str) -> Boxed<'a, Result<(String, String), String>>;
 
+    /// The persona files in the parent's checkout `dir` now, relative to it.
+    fn parent_persona_paths<'a>(&'a self, pool: &'a PgPool, parent: i64, dir: &'a str) -> Boxed<'a, Result<Vec<String>, String>>;
+
     /// Clones `repo` (the child's, recorded `cloning`) at `target` and
     /// records it ready, with its AGENTS.md and persona files.
     fn clone_repo<'a>(
@@ -50,6 +53,15 @@ impl ChildCheckout for PodCheckout {
                 .await
                 .map_err(|e| format!("couldn't reach your sandbox to read your checkout's commit: {e}"))?;
             crate::git::parent_commit(&shell, dir).await
+        })
+    }
+
+    fn parent_persona_paths<'a>(&'a self, pool: &'a PgPool, parent: i64, dir: &'a str) -> Boxed<'a, Result<Vec<String>, String>> {
+        Box::pin(async move {
+            let shell = crate::sandbox::PodShell::for_conversation(pool, parent)
+                .await
+                .map_err(|e| format!("couldn't reach your sandbox to look for the persona: {e}"))?;
+            crate::git::list_persona_files(&shell, dir).await.map(|paths| paths.files)
         })
     }
 

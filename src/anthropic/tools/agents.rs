@@ -32,6 +32,10 @@ pub(super) fn tools() -> Vec<Registered> {
                             "ref": {
                                 "type": "string",
                                 "description": "the branch, tag or commit of repo's remote to check out; without it, the commit your checkout is on, which must be pushed and clean"
+                            },
+                            "persona": {
+                                "type": "string",
+                                "description": "a persona of repo (list_personas lists them), by name: the agent runs under its instructions, read at its ref"
                             }
                         },
                         "required": ["brief"]

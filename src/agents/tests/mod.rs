@@ -9,8 +9,9 @@ use std::time::Duration;
 
 mod ended;
 mod list;
+mod persona;
 mod reports;
-mod repo;
+pub(super) mod repo;
 mod start;
 mod stop;
 mod sweep;

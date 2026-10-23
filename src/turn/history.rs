@@ -237,6 +237,8 @@ pub(crate) struct PromptEnvironment {
 pub(crate) struct AgentPrompt {
     pub id: i64,
     pub parent_id: i64,
+    /// The persona it runs under, as snapshotted when it started.
+    pub persona: Option<crate::db::AgentPersona>,
 }
 
 /// The system prompt sent with every turn: the base prompt, then an
@@ -290,8 +292,28 @@ pub(crate) fn system_prompt(env: &PromptEnvironment) -> String {
             prompt.push('\n');
         }
     }
+    if let Some(persona) = env.agent.as_ref().and_then(|agent| agent.persona.as_ref()) {
+        prompt.push_str(&persona_section(persona));
+    }
     prompt.push_str(&crate::git::render_project_instructions(&env.instructions));
     prompt
+}
+
+/// A child's persona in its system prompt (SME-236): what it is and where
+/// it came from, then its instructions, before the project's.
+#[cfg(feature = "server")]
+fn persona_section(persona: &crate::db::AgentPersona) -> String {
+    let named = crate::agents::persona_label(&persona.persona_path).unwrap_or_else(|| persona.persona_path.clone());
+    let at = match persona.persona_commit.as_deref() {
+        Some(commit) => format!(" at {}", commit.get(..7).unwrap_or(commit)),
+        None => String::new(),
+    };
+    format!(
+        "\n# Persona\n\nYour persona, `{named}` from {}{at}, read when you started; a later change to \
+         the file doesn't change it.\n\n{}\n",
+        persona.persona_path,
+        persona.persona_body.trim_end()
+    )
 }
 
 /// A repo's AGENTS.md files on its Repositories line ("; AGENTS.md
@@ -378,7 +400,9 @@ pub(crate) async fn prompt_environment(
 /// The agent part of the prompt, `None` for a conversation without a parent.
 #[cfg(feature = "server")]
 async fn agent_prompt(pool: &PgPool, conversation_id: i64) -> Result<Option<AgentPrompt>, sqlx::Error> {
-    Ok(db::conversation_parent(pool, conversation_id)
-        .await?
-        .map(|parent_id| AgentPrompt { id: conversation_id, parent_id }))
+    let Some(parent_id) = db::conversation_parent(pool, conversation_id).await? else {
+        return Ok(None);
+    };
+    let persona = db::agent_persona(pool, conversation_id).await?;
+    Ok(Some(AgentPrompt { id: conversation_id, parent_id, persona }))
 }

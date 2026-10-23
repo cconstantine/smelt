@@ -8,6 +8,7 @@
 use serde::Deserialize;
 
 pub(crate) mod frontmatter;
+pub(crate) mod links;
 
 /// A parsed persona file.
 #[derive(Clone, Debug, PartialEq)]

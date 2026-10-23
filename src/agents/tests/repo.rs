@@ -19,6 +19,10 @@ pub(super) struct FakeCheckout {
     pub targets: Mutex<Vec<CloneTarget>>,
     /// What `parent_commit` answers; refused when unset.
     pub parent: Option<Result<(String, String), String>>,
+    /// The parent's persona files, relative to its checkout.
+    pub parent_personas: Vec<String>,
+    /// Other files in the child's checkout, by path relative to it.
+    pub files: Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl ChildCheckout for FakeCheckout {
@@ -29,6 +33,15 @@ impl ChildCheckout for FakeCheckout {
         _dir: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(String, String), String>> + Send + 'a>> {
         Box::pin(async move { self.parent.clone().unwrap_or_else(|| Err("this fake has no parent commit".to_string())) })
+    }
+
+    fn parent_persona_paths<'a>(
+        &'a self,
+        _pool: &'a PgPool,
+        _parent: i64,
+        _dir: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>, String>> + Send + 'a>> {
+        Box::pin(async move { Ok(self.parent_personas.clone()) })
     }
 
     fn clone_repo<'a>(
@@ -67,15 +80,16 @@ impl ChildCheckout for FakeCheckout {
         rel: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<db::InstructionsFile>, String>> + Send + 'a>> {
         Box::pin(async move {
-            Ok(match (rel, &self.agents_md) {
-                ("AGENTS.md", Some(content)) => Some(db::InstructionsFile {
-                    content: content.clone(),
-                    file_bytes: content.len() as i64,
-                    hash: "h".to_string(),
-                    commit: None,
-                }),
-                _ => None,
-            })
+            let content = match rel {
+                "AGENTS.md" => self.agents_md.clone(),
+                rel => self.files.lock().expect("files").get(rel).cloned(),
+            };
+            Ok(content.map(|content| db::InstructionsFile {
+                file_bytes: content.len() as i64,
+                content,
+                hash: "h".to_string(),
+                commit: None,
+            }))
         })
     }
 }
@@ -93,11 +107,11 @@ pub(super) async fn root_with_checkout(pool: &PgPool, trust: Option<bool>, fake:
     root
 }
 
-async fn start_on(pool: &PgPool, root: i64, input: serde_json::Value) -> Result<String, String> {
+pub(super) async fn start_on(pool: &PgPool, root: i64, input: serde_json::Value) -> Result<String, String> {
     crate::anthropic::tools::execute(pool, root, "toolu_s", "start_agent", &input).await
 }
 
-async fn children(pool: &PgPool, root: i64) -> i64 {
+pub(super) async fn children(pool: &PgPool, root: i64) -> i64 {
     sqlx::query_scalar::<_, i64>("SELECT count(*) FROM conversations WHERE parent_id = $1")
         .bind(root)
         .fetch_one(pool)

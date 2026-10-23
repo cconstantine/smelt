@@ -8,6 +8,10 @@
 
 use super::*;
 
+mod start;
+
+pub use start::*;
+
 /// `agents.state`: the start is running; no turn is admitted.
 pub const AGENT_STARTING: &str = "starting";
 /// `agents.state`: started, working or between turns.
@@ -84,122 +88,6 @@ pub async fn agent_state(pool: &PgPool, id: i64) -> Result<Option<String>, sqlx:
         .await
 }
 
-/// What `start_agent` records for a new child.
-pub struct NewChild<'a> {
-    pub caller: i64,
-    pub brief: &'a str,
-    pub persona_name: Option<&'a str>,
-    /// The parent's resolved model, the child's until its persona says otherwise.
-    pub model: Option<(i64, String)>,
-    /// The child's checkout, recorded `cloning`: one of the caller's repos.
-    pub repo: Option<NewChildRepo<'a>>,
-}
-
-/// The child's copy of one of its parent's checkouts.
-pub struct NewChildRepo<'a> {
-    pub url: &'a str,
-    pub remote_key: &'a str,
-    pub dir: &'a str,
-    /// The branch its ref asks for, if any.
-    pub branch: Option<&'a str>,
-}
-
-/// `create_child`'s outcome.
-#[derive(Debug, PartialEq)]
-pub enum CreateChild {
-    /// The child, and its repo row when it has one.
-    Created { child: i64, repo: Option<ConversationRepo> },
-    /// The caller can't start an agent now, and why.
-    Refused(String),
-}
-
-/// `start_agent`'s transaction: the caller's row locked (the lock a
-/// delete takes, so a delete and a start exclude each other), the checks
-/// that it may start an agent, then the child's conversation, its
-/// `agents` row (`starting`) and the brief as its first message.
-pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChild, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    // The remote's trust lock first (the lock order), so a trust decision
-    // lands wholly before or after the check below and the `cloning` row.
-    if let Some(repo) = &new.repo {
-        lock_remote_trust(&mut *tx, repo.remote_key).await?;
-    }
-    let caller = sqlx::query_scalar::<_, Option<NaiveDateTime>>(
-        "SELECT deleting_at FROM conversations WHERE id = $1 FOR NO KEY UPDATE",
-    )
-    .bind(new.caller)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let refused = match caller {
-        None => Some("this conversation no longer exists".to_string()),
-        Some(Some(_)) => Some("this conversation is being deleted".to_string()),
-        Some(None) => match sqlx::query_scalar::<_, String>("SELECT state FROM agents WHERE conversation_id = $1")
-            .bind(new.caller)
-            .fetch_optional(&mut *tx)
-            .await?
-        {
-            Some(state) if state == AGENT_STOPPED => Some("you were stopped, so you can't start an agent".to_string()),
-            Some(_) => Some(crate::agents::ROOT_ONLY.to_string()),
-            None => match &new.repo {
-                None => None,
-                Some(repo) => match get_repo_trust(&mut *tx, repo.remote_key).await? {
-                    Some(true) => None,
-                    Some(false) => Some(format!("the user declined to trust {}, so no agent can work on it", repo.url)),
-                    None => Some(format!(
-                        "the user hasn't decided whether to trust {}: load its AGENTS.md with \
-                         load_instructions so they're asked, then start the agent once they trust it",
-                        repo.url
-                    )),
-                },
-            },
-        },
-    };
-    if let Some(why) = refused {
-        return Ok(CreateChild::Refused(why));
-    }
-    let (provider_id, model) = new.model.clone().unzip();
-    let child = sqlx::query_scalar::<_, i64>(
-        "INSERT INTO conversations (title, parent_id, provider_id, model) VALUES ($1, $2, $3, $4) RETURNING id",
-    )
-    .bind(super::conversations::DEFAULT_TITLE)
-    .bind(new.caller)
-    .bind(provider_id)
-    .bind(model)
-    .fetch_one(&mut *tx)
-    .await?;
-    sqlx::query(
-        "INSERT INTO agents (conversation_id, root_id, depth, brief, persona_name, state)
-         VALUES ($1, $2, 1, $3, $4, $5)",
-    )
-    .bind(child)
-    .bind(new.caller)
-    .bind(new.brief)
-    .bind(new.persona_name)
-    .bind(AGENT_STARTING)
-    .execute(&mut *tx)
-    .await?;
-    let brief = [ContentBlock::Text { text: new.brief.to_string() }];
-    super::conversations::create_message_on(&mut tx, child, "user", &brief).await?;
-    let repo = match &new.repo {
-        None => None,
-        Some(repo) => Some(
-            sqlx::query_as::<_, ConversationRepo>(
-                "INSERT INTO conversation_repos (conversation_id, url, remote_key, branch, dir, status)
-                 VALUES ($1, $2, $3, $4, $5, 'cloning') RETURNING *",
-            )
-            .bind(child)
-            .bind(repo.url)
-            .bind(repo.remote_key)
-            .bind(repo.branch)
-            .bind(repo.dir)
-            .fetch_one(&mut *tx)
-            .await?,
-        ),
-    };
-    tx.commit().await?;
-    Ok(CreateChild::Created { child, repo })
-}
-
 /// Queues a report or notice to `to`, on the caller's transaction.
 pub async fn queue_agent_message(
     conn: &mut sqlx::PgConnection,
@@ -221,33 +109,6 @@ pub async fn queue_agent_message(
     .execute(&mut *conn)
     .await?;
     Ok(())
-}
-
-/// The start's done step: the child `active` and started, and the notice
-/// that gives its first turn something to drain, in one transaction.
-/// `false` when the child is no longer `starting` (stopped or deleted
-/// meanwhile): nothing is written.
-pub async fn complete_start(pool: &PgPool, child: i64, parent: i64, notice: &str) -> Result<bool, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    if !lock_conversations(&mut tx, &[(parent, RowLock::KeyShare), (child, RowLock::NoKeyUpdate)]).await? {
-        return Ok(false);
-    }
-    let updated = sqlx::query(
-        "UPDATE agents SET state = $2, started_at = now(), state_changed_at = now()
-         WHERE conversation_id = $1 AND state = $3",
-    )
-    .bind(child)
-    .bind(AGENT_ACTIVE)
-    .bind(AGENT_STARTING)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    if updated == 0 {
-        return Ok(false);
-    }
-    queue_agent_message(&mut tx, child, None, "smelt", KIND_NOTICE, notice).await?;
-    tx.commit().await?;
-    Ok(true)
 }
 
 /// `finish_agent`'s outcome.
@@ -462,45 +323,6 @@ pub async fn list_child_agents(pool: &PgPool, parent: i64) -> Result<Vec<ChildAg
          ORDER BY c.id DESC",
     )
     .bind(parent)
-    .fetch_all(pool)
-    .await
-}
-
-/// A failed start (`fail_start`): the child `failed`, the error queued to
-/// its parent as its report, and saved in the child's own transcript, in
-/// one transaction. `false` when the child is no longer `starting`
-/// (stopped or deleted meanwhile): nothing is written.
-pub async fn fail_start(pool: &PgPool, child: i64, parent: i64, label: &str, text: &str) -> Result<bool, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    if !lock_conversations(&mut tx, &[(parent, RowLock::KeyShare), (child, RowLock::NoKeyUpdate)]).await? {
-        return Ok(false);
-    }
-    let failed = sqlx::query(
-        "UPDATE agents SET state = $2, state_changed_at = now() WHERE conversation_id = $1 AND state = $3",
-    )
-    .bind(child)
-    .bind(AGENT_FAILED)
-    .bind(AGENT_STARTING)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    if failed == 0 {
-        return Ok(false);
-    }
-    queue_agent_message(&mut tx, parent, Some(child), label, KIND_REPORT, text).await?;
-    super::conversations::create_message_on(&mut tx, child, "user", &[ContentBlock::Text { text: text.to_string() }]).await?;
-    tx.commit().await?;
-    Ok(true)
-}
-
-/// Every child still `starting`, with its parent: the startup sweep's, as
-/// no start survives a restart.
-pub async fn starting_agents(pool: &PgPool) -> Result<Vec<(i64, i64)>, sqlx::Error> {
-    sqlx::query_as::<_, (i64, i64)>(
-        "SELECT c.id, c.parent_id FROM conversations c JOIN agents a ON a.conversation_id = c.id
-         WHERE a.state = $1 AND c.parent_id IS NOT NULL ORDER BY c.id",
-    )
-    .bind(AGENT_STARTING)
     .fetch_all(pool)
     .await
 }

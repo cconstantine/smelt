@@ -14,6 +14,7 @@ use sqlx::PgPool;
 use crate::db;
 
 mod checkout;
+mod persona;
 mod queue;
 mod start;
 mod sweep;
@@ -80,6 +81,18 @@ pub(crate) async fn list_agents(pool: &PgPool, caller: i64) -> Result<String, St
         })
         .collect();
     Ok(serde_json::json!({"agents": agents}).to_string())
+}
+
+/// How agent `id` is named to its parent, with its persona when it has one.
+pub(crate) async fn label_of(pool: &PgPool, id: i64) -> String {
+    let persona = match db::agent_persona(pool, id).await {
+        Ok(persona) => persona.and_then(|p| persona_label(&p.persona_path)),
+        Err(e) => {
+            tracing::warn!(conversation_id = id, error = %e, "couldn't read an agent's persona for its label");
+            None
+        }
+    };
+    label(id, persona.as_deref())
 }
 
 /// How an agent is named to its parent: `agent #12`, or with its persona,

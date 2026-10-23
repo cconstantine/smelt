@@ -5,9 +5,18 @@
 use super::*;
 
 /// What a child's start does besides its done step: the child's checkout,
-/// when it has one.
+/// when it has one, and the persona to read in it.
 pub(crate) struct StartRequest {
     repo: Option<(db::ConversationRepo, crate::git::CloneTarget)>,
+    persona: Option<String>,
+}
+
+/// What the start's steps found, for its done step.
+#[derive(Default)]
+struct Prepared {
+    persona: Option<db::PersonaSnapshot>,
+    model: Option<(i64, String)>,
+    parent_notice: Option<String>,
 }
 
 /// `start_agent`'s `repo`: one of the caller's `ready` checkouts, by its
@@ -60,6 +69,13 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
     if git_ref.is_some() && repo_path.is_none() {
         return Err("ref needs repo: the checkout whose remote it's on".to_string());
     }
+    let persona = optional_str(input, "persona")?;
+    if let Some(name) = persona {
+        if repo_path.is_none() {
+            return Err("persona needs repo: the checkout whose .agents/personas/ it's in".to_string());
+        }
+        persona::check_name(name)?;
+    }
     let repo = match repo_path {
         None => None,
         Some(path) => {
@@ -71,6 +87,9 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
                 }
                 // The parent's exact commit, which must be on its upstream.
                 None => {
+                    if let Some(name) = persona {
+                        persona::check_in_parent(pool, caller, &parent_repo.dir, name).await?;
+                    }
                     let (sha, branch) = checkout_for(caller).parent_commit(pool, caller, &parent_repo.dir).await?;
                     crate::git::CloneTarget::Commit { sha, branch }
                 }
@@ -89,7 +108,7 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
     let new = db::NewChild {
         caller,
         brief,
-        persona_name: None,
+        persona_name: persona,
         model,
         repo: repo.as_ref().map(|(parent_repo, _)| db::NewChildRepo {
             url: &parent_repo.url,
@@ -110,14 +129,21 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
         }
         None => String::new(),
     };
-    let request = StartRequest { repo: child_repo.zip(repo.map(|(_, target)| target)) };
+    let named = match (&repo, persona) {
+        (Some((parent_repo, _)), Some(name)) => format!("{}:{name}", parent_repo.dir),
+        _ => "no persona".to_string(),
+    };
+    let request = StartRequest {
+        repo: child_repo.zip(repo.map(|(_, target)| target)),
+        persona: persona.map(str::to_string),
+    };
     let start_pool = pool.clone();
     // In the tool call's span, so the start is its child.
     tokio::spawn(tracing::Instrument::in_current_span(async move {
         run_start(&start_pool, child, caller, request).await;
     }));
     Ok(format!(
-        "Started {} (no persona){on}. It works on its brief in its own conversation; its report \
+        "Started {} ({named}){on}. It works on its brief in its own conversation; its report \
          arrives here as a message when it calls finish, and list_agents shows its status.",
         label(child, None)
     ))
@@ -136,13 +162,25 @@ fn start_notice() -> String {
 async fn run_start(pool: &PgPool, child: i64, parent: i64, request: StartRequest) {
     let _exit = StartExit { pool: pool.clone(), child };
     let checkout = checkout_for(parent);
-    if let Err(error) = prepare(pool, checkout.as_ref(), child, parent, request).await {
-        fail_start(pool, child, parent, &error).await;
-        return;
-    }
+    let prepared = match prepare(pool, checkout.as_ref(), child, parent, request).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            fail_start(pool, child, parent, &error).await;
+            return;
+        }
+    };
     #[cfg(test)]
     test_hooks::reach(test_hooks::BEFORE_START_DONE, parent).await;
-    match db::complete_start(pool, child, parent, &start_notice()).await {
+    let label = label(child, prepared.persona.as_ref().and_then(|p| persona_label(&p.path)).as_deref());
+    let notice = start_notice();
+    let done = db::StartDone {
+        notice: &notice,
+        persona: prepared.persona,
+        model: prepared.model,
+        parent_notice: prepared.parent_notice,
+        label: &label,
+    };
+    match db::complete_start(pool, child, parent, &done).await {
         Ok(true) => {
             crate::turn::notify(pool, child, vec![crate::turn::Notice::Wake]);
         }
@@ -152,22 +190,22 @@ async fn run_start(pool: &PgPool, child: i64, parent: i64, request: StartRequest
 }
 
 /// The start's steps before its done step: with a repo, its clone at the
-/// child's ref, the remote's trust read again, and its top-level AGENTS.md
-/// loaded.
+/// child's ref, the remote's trust read again, its top-level AGENTS.md
+/// loaded, and its persona read there, with the persona's model.
 async fn prepare(
     pool: &PgPool,
     checkout: &dyn ChildCheckout,
     child: i64,
     parent: i64,
     request: StartRequest,
-) -> Result<(), String> {
+) -> Result<Prepared, String> {
     #[cfg(test)]
     if let Some(error) = test_hooks::injected_start_failure(parent) {
         return Err(error);
     }
     let _ = parent;
     let Some((repo, target)) = request.repo else {
-        return Ok(());
+        return Ok(Prepared::default());
     };
     checkout.clone_repo(pool, child, &repo, &target).await?;
     // The user may have forgotten the remote while it cloned.
@@ -181,7 +219,12 @@ async fn prepare(
     if repo.agents_files.iter().any(|f| f == "AGENTS.md") {
         load_agents_md(pool, checkout, child, parent, &repo).await?;
     }
-    Ok(())
+    let Some(name) = request.persona else {
+        return Ok(Prepared::default());
+    };
+    let snapshot = persona::snapshot(pool, checkout, child, &repo, &name).await?;
+    let (model, parent_notice) = persona::persona_model(pool, child, &snapshot).await?;
+    Ok(Prepared { persona: Some(snapshot), model, parent_notice })
 }
 
 /// Loads the child's top-level AGENTS.md, which needs no card: the remote

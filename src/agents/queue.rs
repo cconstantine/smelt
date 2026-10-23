@@ -16,7 +16,7 @@ pub(crate) async fn finish(pool: &PgPool, child: i64, input: &serde_json::Value)
     if report.trim().is_empty() || chars > MAX_REPORT_CHARS {
         return Err(format!("report must be 1 to {MAX_REPORT_CHARS} characters (it has {chars})"));
     }
-    let outcome = db::finish_agent(pool, child, &label(child, None), report)
+    let outcome = db::finish_agent(pool, child, &label_of(pool, child).await, report)
         .await
         .map_err(|e| format!("couldn't send your report: {e}"))?;
     match outcome {
@@ -98,7 +98,7 @@ async fn user_stopped(pool: &PgPool, child: i64) {
             return;
         }
     };
-    let label = label(child, None);
+    let label = label_of(pool, child).await;
     let body = format!(
         "the user stopped {label}; it carries on if the user writes to it, or call stop_agent to end it"
     );
@@ -130,7 +130,7 @@ pub(crate) async fn after_last_turn(pool: &PgPool, conversation_id: i64, failure
         }
     };
     let (parent, last) = parent;
-    let label = label(conversation_id, None);
+    let label = label_of(pool, conversation_id).await;
     let failed = failure.map(|why| format!(" (it failed: {why})")).unwrap_or_default();
     let body = format!("{label}'s turn ended without a report{failed}; its last message: {last}");
     match db::queue_notice(pool, parent, conversation_id, &label, &body).await {
