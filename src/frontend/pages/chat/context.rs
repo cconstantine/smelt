@@ -292,6 +292,24 @@ mod detail_shown_tests {
         assert!(!html.contains('\u{200b}'), "raw U+200B in the html: {html}");
     }
 
+    /// Review 1, finding 1 (SME-277): the tool's *name* is the same
+    /// server-written text in the same pane, and it reached the html raw
+    /// while its description and schema were escaped either side of it.
+    /// Q3's answer was "escape the Tools panes"; a name is part of one.
+    #[test]
+    fn test_a_tools_name_with_a_hidden_character_is_escaped_too() {
+        let tools = vec![ToolDefinition {
+            name: "mcp__serv\u{200b}er__echo".to_string(),
+            description: "plain".to_string(),
+            input_schema: serde_json::json!({"a": "b"}),
+        }];
+        let snap = snapshot("plain file", Some("plain prompt"), tools);
+        let html = dioxus::ssr::render_element(render_context_detail_body(Some(&Ok(snap))));
+        assert!(!html.contains('\u{200b}'), "raw U+200B in the tool name: {html}");
+        assert!(html.contains("\\u{200b}"), "{html}");
+        assert!(html.contains("1 character here"), "{html}");
+    }
+
     /// The no-regression cell for the context view: nothing hidden, no
     /// notice anywhere, text exactly as today.
     #[test]
@@ -398,12 +416,15 @@ mod context_usage_tests {
     }
 }
 
-/// One notice per tool (the user's answer to SME-277's Q3): both fields
-/// are text the connected server writes, escaped by the same rule as the
-/// panes around them, and the count covers the description and the
-/// schema's JSON text together.
+/// One notice per tool (the user's answer to SME-277's Q3): the name, the
+/// description and the schema are all text the connected server writes, so
+/// all three are escaped by the same rule as the panes around them, and the
+/// count covers the three together. Review round 1, finding 1: the name was
+/// the one left raw, reaching the html while the other two were escaped on
+/// either side of it.
 fn tool_notice(tool: &crate::anthropic::ToolDefinition) -> Element {
-    let hidden = crate::git::hidden_characters(&tool.description)
+    let hidden = crate::git::hidden_characters(&tool.name)
+        + crate::git::hidden_characters(&tool.description)
         + crate::git::hidden_characters(&tool.input_schema.to_string());
     if hidden > 0 {
         hidden_text_notice(hidden)
@@ -478,7 +499,7 @@ pub(super) fn render_context_detail_body(detail: Option<&Result<ContextDetailSna
             h4 { "Tools ({detail.tools.len()})" }
             for tool in &detail.tools {
                 div { class: "context-detail-tool",
-                    strong { "{tool.name}" }
+                    strong { "{crate::git::plain_multiline_text(&tool.name)}" }
                     {tool_notice(tool)}
                     p { "{crate::git::plain_multiline_text(&tool.description)}" }
                     pre { "{crate::git::plain_multiline_text(&tool.input_schema.to_string())}" }
