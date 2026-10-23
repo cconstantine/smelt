@@ -195,6 +195,19 @@ pub(super) async fn scenario_agent_tree(t: &Scenario<'_>) {
         page.close().await.expect("close the tab");
     }
 
+    // Folds outlive a move between pages (review 1, finding 2): Home and
+    // a conversation's page each mount their own chat page.
+    let page = t.tab(t.url("")).await;
+    wait_for_element(&page, "[data-app-live]", Duration::from_secs(15)).await;
+    wait_for_tree(&page, &ids, &expanded, "on Home").await;
+    let caret = format!(".conversation-item[data-conversation-id='{}'] .tree-caret", root.id);
+    click_when_present(&page, &caret, Duration::from_secs(5)).await;
+    wait_for_tree(&page, &ids, &[row(root.id, 0, "", "?1")], "folded on Home").await;
+    click_conversation(&page, root.id).await;
+    wait_for_live_client(&page, root.id).await;
+    wait_for_tree(&page, &ids, &[row(root.id, 0, "", "?1")], "still folded on the parent's page").await;
+    page.close().await.expect("close the tab");
+
     // Live: the developer agent asks the user, and an open tab's tree and
     // banner follow without a reload.
     let page = t.tab(t.url(&format!("conversation/{}", root.id))).await;

@@ -21,6 +21,12 @@ pub(super) fn short_age(seconds: i64) -> String {
     }
 }
 
+/// Which conversations' agents are folded away. App-wide, not the
+/// sidebar's own state: Home and a conversation's page each mount their own
+/// `Chat`, so a sidebar signal reset on every move between them (SME-246
+/// review 1). Per tab, like any signal; a reload unfolds everything.
+static FOLDED: GlobalSignal<HashSet<i64>> = Signal::global(HashSet::new);
+
 #[component]
 pub(super) fn ConversationSidebar(
     selected: Memo<Option<i64>>,
@@ -59,7 +65,7 @@ pub(super) fn ConversationSidebar(
     let mut pending_delete: Signal<Option<i64>> = use_signal(|| None);
     // The conversations whose agents are folded away, in this tab only: a
     // reload shows every agent again (SME-246).
-    let mut collapsed: Signal<HashSet<i64>> = use_signal(HashSet::new);
+    let mut collapsed: Signal<HashSet<i64>> = FOLDED.signal();
     // Whether the conversation list is open on a phone, where it folds
     // behind a button (SME-41 D4). Ignored at wider widths.
     let mut open_on_phone = use_signal(|| false);
