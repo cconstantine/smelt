@@ -256,11 +256,12 @@ pub(super) struct TextCallStreak {
     corrections: usize,
 }
 
-/// What the turn does after a reply: runs its calls, calls the model
-/// again (a notice was saved for it), or ends.
+/// What the turn does after a reply: runs its calls (and then saves the
+/// correction for any it also wrote as text), calls the model again (a
+/// notice was saved for it), or ends.
 #[cfg(feature = "server")]
 pub(super) enum NextStep {
-    RunTools,
+    RunTools(Option<String>),
     CallAgain,
     End,
 }
@@ -271,7 +272,9 @@ pub(super) enum NextStep {
 /// rather than the turn ending silently with the call never run (SME-286).
 /// After `MAX_TEXT_CALL_CORRECTIONS` corrections in a row, the next one is
 /// saved (the model reads it next turn) and the turn fails, naming it. A
-/// reply cut off or refused already has its notice and ends as before.
+/// reply cut off or refused already has its notice and ends as before. A
+/// reply that makes real calls and writes one as text too gets its
+/// correction after the real calls' results (`NextStep::RunTools`).
 #[cfg(feature = "server")]
 pub(super) async fn after_reply(
     pool: &PgPool,
@@ -287,7 +290,9 @@ pub(super) async fn after_reply(
     }
     if turn.stop_reason == "tool_use" {
         streak.corrections = 0;
-        return Ok(NextStep::RunTools);
+        let calls = text_calls(turn);
+        let correction = (!calls.is_empty()).then(|| crate::text_calls::text_call_notice(&calls, offered));
+        return Ok(NextStep::RunTools(correction));
     }
     if turn.content.iter().any(|b| matches!(b, anthropic::ContentBlock::ToolUse { .. })) {
         return Ok(NextStep::End);
@@ -321,7 +326,7 @@ fn text_calls(turn: &anthropic::stream::StreamedTurn) -> Vec<crate::text_calls::
 /// Saves `notice` as a user message of its own, for the model and every
 /// tab, and counts it as new since the last reply.
 #[cfg(feature = "server")]
-async fn save_notice(
+pub(super) async fn save_notice(
     pool: &PgPool,
     conversation_id: i64,
     notice: String,

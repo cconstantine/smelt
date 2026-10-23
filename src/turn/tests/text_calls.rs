@@ -206,3 +206,41 @@ async fn test_quoted_markup_ends_the_turn_as_before(pool: PgPool) {
         assert_eq!(requests.lock().expect("the request log").len(), 1, "{text:?}");
     }
 }
+
+/// A2: a reply that makes a real call and also writes one as text (the
+/// evidence's messages 92 and 96) runs the real one and gets the
+/// correction after its result, so the model doesn't think the written
+/// one ran.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_mixed_reply_gets_the_correction_after_its_results(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let written = include_str!("../../text_calls/fixtures/evidence_96.txt");
+    let mixed = text_blocks_body(
+        &[Block::Text("Now verify."), Block::Todoread("toolu_mixed"), Block::Text(written)],
+        "tool_use",
+    );
+    let requests = start_recording_mock_upstream(&pool, vec![mixed, text_reply_body("Done.")]).await;
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("the turn succeeds");
+
+    assert_eq!(roles(&saved), ["user", "assistant", "user", "user", "assistant"], "{saved:?}");
+    assert!(matches!(saved[2].blocks().expect("blocks").as_slice(), [anthropic::ContentBlock::ToolResult { .. }]), "{saved:?}");
+    let notice = notice_text(&saved[3]).expect("the notice is one text block");
+    assert_eq!(
+        crate::text_calls::parse_text_call_notice(&notice),
+        Some(vec![Some("mcp__linear.app__issue_read".to_string())])
+    );
+    // What the model reads next: the call's result, then the notice.
+    let log = requests.lock().expect("the request log");
+    let sent: Vec<serde_json::Value> = log[1]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .skip(2)
+        .flat_map(|m| m["content"].as_array().expect("content").clone())
+        .collect();
+    let types: Vec<&str> = sent.iter().map(|b| b["type"].as_str().expect("a type")).collect();
+    assert_eq!(types, ["tool_result", "text"], "{sent:?}");
+    assert_eq!(sent[1]["text"], notice.as_str());
+}

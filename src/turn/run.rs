@@ -589,31 +589,40 @@ fn run_turn_steps<'a: 'b, 'b>(
             // A call written as text gets a correction, and the model is
             // called again (SME-286).
             let offered: Vec<&str> = offered.iter().map(String::as_str).collect();
-            match after_reply(pool, conversation_id, &turn, &offered, &mut streak, &mut persisted, &mut pending_new_content)
-                .await?
+            let correction = match after_reply(
+                pool,
+                conversation_id,
+                &turn,
+                &offered,
+                &mut streak,
+                &mut persisted,
+                &mut pending_new_content,
+            )
+            .await?
             {
-                NextStep::RunTools => {}
+                NextStep::RunTools(correction) => correction,
                 NextStep::CallAgain => continue,
                 NextStep::End => return Ok(persisted),
-            }
+            };
 
-            // Asked the user, or an agent finished (SME-236): the turn ends.
+            // Asked the user, or an agent finished (SME-236): the turn ends,
+            // with any results saved.
             let (result_blocks, ends) = run_tools(pool, conversation_id, &turn).await?;
+            if !ends || !result_blocks.is_empty() {
+                let saved = db::create_message(pool, conversation_id, "user", &result_blocks)
+                    .await
+                    .map_err(ServerFnError::new)?;
+                record_saved(conversation_id, &mut persisted, saved);
+            }
+            pending_new_content = result_blocks;
+            // A call the reply wrote as text, told after the real calls'
+            // results, even when the turn ends here (SME-286).
+            if let Some(correction) = correction {
+                save_notice(pool, conversation_id, correction, &mut persisted, &mut pending_new_content).await?;
+            }
             if ends {
-                if !result_blocks.is_empty() {
-                    let saved = db::create_message(pool, conversation_id, "user", &result_blocks)
-                        .await
-                        .map_err(ServerFnError::new)?;
-                    record_saved(conversation_id, &mut persisted, saved);
-                }
                 return Ok(persisted);
             }
-
-            let saved = db::create_message(pool, conversation_id, "user", &result_blocks)
-                .await
-                .map_err(ServerFnError::new)?;
-            pending_new_content = result_blocks;
-            record_saved(conversation_id, &mut persisted, saved);
         }
 
         Err(ServerFnError::new(format!(
