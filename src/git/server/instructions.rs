@@ -216,7 +216,11 @@ pub fn resolve_instructions_path<'a>(
     path: &str,
 ) -> Result<(&'a db::ConversationRepo, String), String> {
     if !plain_path_text(path) {
-        return Err(format!("{path:?} isn't a plain path: it holds control characters."));
+        // Debug quotes it and escapes newlines and tabs, but leaves
+        // characters Rust counts as printable raw (the Hangul fillers):
+        // escape those too (SME-276 review 1).
+        let quoted = plain_multiline_text(&format!("{path:?}"));
+        return Err(format!("{quoted} isn't a plain path: it holds control characters."));
     }
     let not_in = || {
         format!(

@@ -129,10 +129,13 @@ fn test_an_agents_md_path_resolves_to_its_repo() {
         // SME-276: characters that render as nothing.
         "/workspace/smelt/a\u{200b}b/AGENTS.md",
         "/workspace/smelt/a\u{e0041}\u{e0042}b/AGENTS.md",
+        // Review 1: a Hangul filler is a letter to Rust's Debug, which
+        // left it raw in the refusal.
+        "/workspace/smelt/a\u{3164}b/AGENTS.md",
     ] {
         let refused = resolve_instructions_path(&repos, bad).expect_err(bad);
         assert!(refused.contains("control characters"), "{refused}");
-        assert!(!refused.contains(['\n', '\u{2028}', '\u{202e}', '\u{200b}', '\u{e0041}']), "quoted: {refused}");
+        assert!(!refused.contains(['\n', '\u{2028}', '\u{202e}', '\u{200b}', '\u{e0041}', '\u{3164}']), "quoted: {refused}");
     }
     let (_, rel) = resolve_instructions_path(&repos, "/workspace/smelt/é/AGENTS.md").expect("non-ASCII");
     assert_eq!(rel, "é/AGENTS.md");
