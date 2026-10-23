@@ -247,3 +247,12 @@ fn test_markers_without_their_structure_are_not_calls() {
     assert!(found.is_empty(), "calls found in: {found:#?}");
 }
 
+/// Review 1, finding 4: a cut-short JSON call's name is read from that
+/// call only, never from later text in the reply.
+#[test]
+fn test_a_cut_short_json_call_reads_no_name_from_later_text() {
+    let text = "<tool_call>\n{\"arguments\": {\"a\": 1}\n</tool_call>\nIt said \"name\": \"b\" there.";
+    assert_eq!(find(text), []);
+    let cut = "<tool_call>\n{\"name\": \"get_time\", \"arguments\": {\"city\": \"XY";
+    assert_eq!(one_name(cut).as_deref(), Some("get_time"));
+}

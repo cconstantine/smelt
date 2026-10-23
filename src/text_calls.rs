@@ -260,8 +260,10 @@ fn json_name(s: &str) -> Option<Option<String>> {
     if let Some(Ok(value)) = parsed {
         return value.get("name")?.as_str().map(checked);
     }
-    // Cut short (a reply that stopped mid-call): its `"name"` still reads.
-    let (_, rest) = s.split_once("\"name\"")?;
+    // Cut short (a reply that stopped mid-call): its `"name"` still reads,
+    // from this call only, never from text after its end (review 1).
+    let call = s.split_once("</tool_call>").map_or(s, |(call, _)| call);
+    let (_, rest) = call.split_once("\"name\"")?;
     let rest = rest.trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
     Some(checked(rest.split_once('"')?.0))
 }
