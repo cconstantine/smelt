@@ -1,8 +1,8 @@
 //! Child agents (SME-236): `start_agent`, offered to a conversation without
 //! a parent, `list_agents` and `stop_agent`, offered to every conversation,
 //! and `finish`, offered to an agent; and (SME-238) `message_agent`, offered
-//! to a conversation with a parent or agents of its own, and `ask_parent`,
-//! offered to an agent. The lifecycle behind them is `crate::agents`.
+//! to every conversation but callable only by one with a parent or agents
+//! of its own, and `ask_parent`, offered to an agent. The lifecycle behind them is `crate::agents`.
 
 use super::{Offer, Registered, Tool};
 use crate::anthropic::ToolDefinition;

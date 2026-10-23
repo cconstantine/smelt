@@ -52,8 +52,11 @@ struct Tool {
 }
 
 /// Who a tool is offered to (SME-236): every conversation, only one
-/// without a parent (the user's own), only an agent, or (SME-238) one
-/// with a parent or agents of its own. `execute` checks it too, from the
+/// without a parent (the user's own), or only an agent. `Linked`
+/// (SME-238) is offered to every conversation, so the tool list doesn't
+/// change when a conversation starts its first agent (which would rewrite
+/// its whole cached prompt), but `execute` lets only one with a parent or
+/// agents of its own call it. `execute` checks every offer from the
 /// database: a call can come from a history written before the
 /// conversation changed.
 #[cfg(feature = "server")]
@@ -270,13 +273,12 @@ mod server {
     }
 
     /// Whether a tool offered as `offer` goes to a conversation with
-    /// (`has_parent`) or without a parent, and with or without children.
-    fn is_offered(offer: super::Offer, has_parent: bool, has_children: bool) -> bool {
+    /// (`has_parent`) or without a parent.
+    fn is_offered(offer: super::Offer, has_parent: bool) -> bool {
         match offer {
-            super::Offer::All => true,
+            super::Offer::All | super::Offer::Linked => true,
             super::Offer::Root => !has_parent,
             super::Offer::Child => has_parent,
-            super::Offer::Linked => has_parent || has_children,
         }
     }
 
@@ -317,11 +319,11 @@ mod server {
     /// rather than failing the whole request — see
     /// `crate::mcp::tool_definitions_for`. Only the tools offered to
     /// `conversation_id` (SME-236): `start_agent` to a conversation without
-    /// a parent, `finish` to an agent, `message_agent` to one with a parent
-    /// or agents of its own (SME-238). A failed read offers none of them.
+    /// a parent, `finish` and `ask_parent` to an agent. A failed read
+    /// offers neither.
     pub async fn tool_definitions(pool: &PgPool, conversation_id: i64) -> Vec<crate::anthropic::ToolDefinition> {
-        let links = match crate::db::conversation_links(pool, conversation_id).await {
-            Ok((parent, has_children)) => Some((parent.is_some(), has_children)),
+        let has_parent = match crate::db::conversation_parent(pool, conversation_id).await {
+            Ok(parent) => Some(parent.is_some()),
             Err(e) => {
                 tracing::warn!(conversation_id, error = %e, "couldn't read the conversation's parent; its agent tools are left out this turn");
                 None
@@ -329,9 +331,9 @@ mod server {
         };
         let mut definitions: Vec<crate::anthropic::ToolDefinition> = super::REGISTRY
             .iter()
-            .filter(|registered| match links {
-                Some((has_parent, has_children)) => is_offered(registered.offer, has_parent, has_children),
-                None => registered.offer == super::Offer::All,
+            .filter(|registered| match has_parent {
+                Some(has_parent) => is_offered(registered.offer, has_parent),
+                None => matches!(registered.offer, super::Offer::All | super::Offer::Linked),
             })
             .map(|registered| registered.tool.def.clone())
             .collect();

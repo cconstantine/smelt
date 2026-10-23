@@ -93,7 +93,9 @@ async fn test_message_agent_refuses_anyone_but_the_parent_and_its_own_children(p
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let lone = db::create_conversation(&pool).await.expect("create conversation").id;
     let names = |tools: Vec<crate::anthropic::ToolDefinition>| tools.into_iter().map(|t| t.name).collect::<Vec<_>>();
-    assert!(!names(crate::anthropic::tools::tool_definitions(&pool, root).await).contains(&"message_agent".to_string()));
+    // Offered before it has any agent, so the tool list doesn't change
+    // when it starts one (review 1, finding 4); `execute` refuses the call.
+    assert!(names(crate::anthropic::tools::tool_definitions(&pool, root).await).contains(&"message_agent".to_string()));
     let child = active_child(&pool, root).await;
     let sibling = active_child(&pool, root).await;
     let other = db::create_conversation(&pool).await.expect("create conversation").id;
