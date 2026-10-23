@@ -9,9 +9,9 @@ pub(crate) const RESTARTED: &str = "smelt restarted during the start";
 /// Fails every child still `starting` (its start ran in a task the restart
 /// ended), as `fail_start` does, and cleans up after it as a start's exit
 /// would; then wakes every conversation with an undelivered report or
-/// notice that isn't a `stopped` agent. The pause after a user's Stop is in
-/// memory and lost too, so a conversation the user had stopped is woken
-/// (SME-238 stores it). Returns the wakes' tasks.
+/// notice that isn't a `stopped` agent nor paused by the user (the pause
+/// is stored, SME-238, and restored before this runs). Returns the wakes'
+/// tasks.
 pub(crate) async fn startup_sweep(pool: &PgPool) -> Vec<tokio::task::JoinHandle<()>> {
     let mut wakes = Vec::new();
     match db::starting_agents(pool).await {

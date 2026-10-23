@@ -348,12 +348,14 @@ pub async fn list_child_agents(pool: &PgPool, parent: i64) -> Result<Vec<ChildAg
 }
 
 /// Every conversation with an undelivered report or notice that isn't a
-/// `stopped` agent: the startup sweep wakes them.
+/// `stopped` agent nor paused by the user (SME-238): the startup sweep
+/// wakes them.
 pub async fn conversations_with_queued_messages(pool: &PgPool) -> Result<Vec<i64>, sqlx::Error> {
     sqlx::query_scalar::<_, i64>(
         "SELECT DISTINCT m.to_conversation_id FROM agent_messages m
+         JOIN conversations c ON c.id = m.to_conversation_id
          LEFT JOIN agents a ON a.conversation_id = m.to_conversation_id
-         WHERE m.delivered_at IS NULL AND (a.state IS NULL OR a.state <> $1)
+         WHERE m.delivered_at IS NULL AND (a.state IS NULL OR a.state <> $1) AND c.paused_at IS NULL
          ORDER BY m.to_conversation_id",
     )
     .bind(AGENT_STOPPED)
