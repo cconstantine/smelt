@@ -23,7 +23,7 @@ Each SSE/broadcast-shaped stream answers a different question:
 
 1. **Anthropic → smelt server** (`anthropic::stream`): the real Messages API's own SSE stream (`message_start`, `content_block_delta`, `content_block_stop`, `message_delta`, `message_stop`, ...), parsed down to text deltas and `tool_use` blocks. It never reaches the browser, and the browser never sees Anthropic's wire format.
 2. **smelt server → browser, scoped to a conversation** (`api::chat::subscribe_conversation_events`'s `ServerEvents<ConversationEvent>`): "stream me whatever happens to this conversation, unprompted." A chat tab opens it once per viewed conversation and it forwards `events::subscribe(id)` for as long as that tab has the conversation selected, plus the app-wide `PodsChanged` and `TurnsChanged` relayed as `ConversationEvent`s. It carries every turn's messages and streaming reply text too, whoever started the turn: a tab's send, a finished command, another tab.
-3. **smelt server → browser, app-wide** (`api::pods::subscribe_app_events`'s `ServerEvents<AppEvent>`): only the `/pods` page opens it.
+3. **smelt server → browser, app-wide** (`api::pods::subscribe_app_events`'s `ServerEvents<AppEvent>`): the `/pods` page, and a chat tab with no conversation selected — which has no conversation stream of its own, so its sidebar listens here instead and stops the moment one is selected (SME-269).
 4. **Browsing frames** (`api::browsing::subscribe_browser_frames`): the live screencast of the conversation's browsing session, open only while one is.
 
 So a chat tab holds one always-open connection, plus the frames stream while the model is browsing.

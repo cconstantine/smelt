@@ -6,6 +6,7 @@ Conversations, the transcript, replies, stopping, questions and tabs.
 | Ticket | Feature | How to check in the browser |
 | -- | -- | -- |
 | SME-5 | Delete conversations | Two-click Delete in the sidebar (button keeps its width when armed); deleting the open conversation returns to `/`; a link to a deleted conversation says it doesn't exist |
+| SME-269 | A new conversation in every open client | Two windows at `/`, neither with a conversation open: click "New conversation" in one and its row appears in the other's sidebar within a second or two, with no reload; delete it from either and the row goes from both. Same with one window on a conversation instead of `/` — that one listens through the conversation's own stream. Automated: browser scenario `conversations_appear_live` |
 | SME-6 | History persists | Restart the server; the conversation is intact |
 | SME-18 | Context meter, auto-compaction | Meter and detail view; with a small context window set on the conversation's model at `/providers` (e.g. 28000), a turn compacts: the divider appears live in every tab and the model answers the message that triggered it |
 | SME-25 | System prompt | Detail view shows the prompt and the environment (right model name); the model knows today's date |
