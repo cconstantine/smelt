@@ -338,3 +338,68 @@ async fn test_a_paused_child_waiting_for_its_parent(pool: PgPool) {
     );
     eventually("every turn is over", || async { !crate::turn::turn_running(root) }).await;
 }
+
+/// Review 1, finding 1. Interleaving: the parent's model call is held;
+/// the child asks meanwhile, so the question waits undelivered in the
+/// parent's queue; the held reply calls `message_agent` to the child
+/// without having read it. That message isn't the answer: it's queued as
+/// a plain message, the question stays open, and the parent reads it at
+/// its next step.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_message_sent_before_the_parent_read_the_question_is_not_the_answer(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let child_id = Arc::new(Mutex::new(0_i64));
+    let served = Arc::new(Mutex::new(std::collections::HashMap::<Option<i64>, usize>::new()));
+    let requests = mock_with(&pool, {
+        let (gate, child_id) = (gate.clone(), child_id.clone());
+        move |request| {
+            let agent = agent_of(request);
+            let n = {
+                let mut served = served.lock().expect("the counts");
+                let n = served.entry(agent).or_default();
+                *n += 1;
+                *n
+            };
+            let (gate, child) = (gate.clone(), *child_id.lock().expect("the child's id"));
+            Box::pin(async move {
+                match (agent, n) {
+                    (Some(_), 1) => ask_reply(),
+                    (None, 1) => {
+                        gate.acquire().await.expect("the gate").forget();
+                        tool_call_reply("message_agent", serde_json::json!({"to": child, "text": "also run the linter"}))
+                    }
+                    _ => text_reply("Noted."),
+                }
+            })
+        }
+    })
+    .await;
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    let child = active_child(&pool, root).await;
+    *child_id.lock().expect("the child's id") = child;
+    crate::turn::start_turn(pool.clone(), root, "Work.".to_string()).await.expect("the parent's send");
+    eventually("the parent's call is held", || async { requests_for(&requests, None).len() == 1 }).await;
+    crate::turn::start_turn(pool.clone(), child, "Work.".to_string()).await.expect("the child's send");
+    eventually("the child asked", || async {
+        !crate::turn::turn_running(child) && db::get_pending_question(&pool, child).await.expect("read").is_some()
+    })
+    .await;
+
+    gate.add_permits(1);
+    eventually("the parent's turn is over", || async {
+        !crate::turn::turn_running(root) && requests_for(&requests, None).len() >= 2
+    })
+    .await;
+    let parent_results = sqlx::query_scalar::<_, String>("SELECT content FROM messages WHERE conversation_id = $1 ORDER BY id")
+        .bind(root)
+        .fetch_all(&pool)
+        .await
+        .expect("messages")
+        .join("\n");
+    assert!(parent_results.contains(&format!("Sent to agent #{child}.")), "{parent_results}");
+    assert!(parent_results.contains(&format!("Question from agent #{child}, which waits")), "{parent_results}");
+    let stored = db::get_pending_question(&pool, child).await.expect("read").expect("still open");
+    assert_eq!(stored.answer, None, "the unprompted message was taken as the answer");
+    eventually("every turn is over", || async { !crate::turn::turn_running(child) }).await;
+}

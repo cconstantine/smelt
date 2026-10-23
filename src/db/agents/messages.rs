@@ -107,18 +107,27 @@ pub async fn message_agent(
         }
         _ => {}
     }
-    // A child waiting for its parent: this message is the answer. The
-    // `answer IS NULL` re-check after a concurrent take (the user's
-    // message) finds no row, and the message is queued instead.
+    // A child waiting for its parent: this message is the answer, once the
+    // parent has read the question (review 1, finding 1): its `question`
+    // row, queued in `ask_parent`'s transaction and so sharing the
+    // question's `created_at`, is delivered. A message sent before then
+    // was written without it, and is queued as a plain one. The `answer IS
+    // NULL` re-check after a concurrent take (the user's message) finds
+    // no row, and the message is queued instead.
     if matches!(to, Recipient::Child(_)) {
         let answer = [crate::questions::QuestionAnswer { selected: Vec::new(), other: Some(text.to_string()) }];
         let answered = sqlx::query(
-            "UPDATE pending_questions SET answer = $2
-             WHERE conversation_id = $1 AND asked_of = $3 AND answer IS NULL",
+            "UPDATE pending_questions q SET answer = $2
+             WHERE q.conversation_id = $1 AND q.asked_of = $3 AND q.answer IS NULL
+               AND EXISTS (SELECT 1 FROM agent_messages m
+                           WHERE m.to_conversation_id = $4 AND m.from_conversation_id = $1 AND m.kind = $5
+                             AND m.created_at = q.created_at AND m.delivered_at IS NOT NULL)",
         )
         .bind(recipient)
         .bind(sqlx::types::Json(&answer[..]))
         .bind(super::super::ASKED_OF_PARENT)
+        .bind(caller)
+        .bind(KIND_QUESTION)
         .execute(&mut *tx)
         .await?
         .rows_affected();

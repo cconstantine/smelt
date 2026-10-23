@@ -137,7 +137,7 @@ pub(super) fn tools() -> Vec<Registered> {
                     description: format!(
                         "Ask your parent, the conversation that started you, a question and wait for \
                          the answer: your turn ends here, and your parent's next message_agent to you \
-                         is the answer, which wakes you. If the user writes to you first, their message \
+                         after it has read your question is the answer, which wakes you. If the user writes to you first, their message \
                          comes instead, and a later reply from your parent arrives as a message. One \
                          question per reply, and not with ask_user. Up to {} characters.",
                         crate::agents::MAX_MESSAGE_CHARS
