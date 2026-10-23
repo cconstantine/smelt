@@ -45,3 +45,19 @@ pub fn start_ended(id: i64) {
 pub fn starts_ended(id: i64) -> bool {
     STARTS_ENDED.lock().unwrap_or_else(|e| e.into_inner()).contains(&id)
 }
+
+static LAST_TURNS_CHECKED: LazyLock<Mutex<HashMap<i64, usize>>> = LazyLock::new(Default::default);
+
+/// Counts an `after_last_turn` check of `id` once dropped, however it ended.
+pub struct Checked(pub i64);
+
+impl Drop for Checked {
+    fn drop(&mut self) {
+        *LAST_TURNS_CHECKED.lock().unwrap_or_else(|e| e.into_inner()).entry(self.0).or_default() += 1;
+    }
+}
+
+/// How many `after_last_turn` checks of `id` have ended.
+pub fn last_turns_checked(id: i64) -> usize {
+    LAST_TURNS_CHECKED.lock().unwrap_or_else(|e| e.into_inner()).get(&id).copied().unwrap_or(0)
+}

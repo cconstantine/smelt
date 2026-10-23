@@ -155,7 +155,9 @@ async fn test_the_users_stop_on_a_child_tells_its_parent_once(pool: PgPool) {
     user_stop(&pool, child).await.expect("the Stop goes through");
     user_stop(&pool, child).await.expect("a second Stop goes through");
     let notice = format!("the user stopped agent #{child}; it carries on if the user writes to it, or call stop_agent to end it");
-    assert_eq!(queued_to(&pool, root).await, vec![notice.clone()]);
+    let stopped: Vec<String> =
+        queued_to(&pool, root).await.into_iter().filter(|body| body.starts_with("the user stopped")).collect();
+    assert_eq!(stopped, vec![notice.clone()]);
     eventually("the parent reads the notice", || async {
         transcript(&pool, root).await.iter().any(|(_, text)| *text == format!("Notice: {notice}"))
     })

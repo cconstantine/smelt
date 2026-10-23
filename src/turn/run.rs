@@ -154,6 +154,24 @@ pub(super) fn run_turn_bounded<'a>(
                 }
                 Err(TurnFailure::Failed(e)) => crate::telemetry::mark_error(&span, &e.to_string()),
             }
+            // A child agent whose last turn ended without its report tells
+            // its parent (SME-236), checked once this turn no longer counts.
+            // Not after a stop, nor a wake that found nothing to do.
+            drop(in_flight);
+            let ended = match &result {
+                Ok(saved) if saved.is_empty() => None,
+                Ok(_) => Some(None),
+                Err(TurnFailure::Failed(e)) => Some(Some(chat_error_text(e))),
+                Err(TurnFailure::Stopped) => None,
+            };
+            if let Some(failure) = ended
+                && !turn_running(conversation_id)
+            {
+                let pool = pool.clone();
+                tokio::spawn(tracing::Instrument::in_current_span(async move {
+                    crate::agents::after_last_turn(&pool, conversation_id, failure).await;
+                }));
+            }
             result
         })
         .await

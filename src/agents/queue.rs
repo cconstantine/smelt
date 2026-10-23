@@ -1,5 +1,6 @@
-//! What an agent sends its parent (its report, `finish`), and what stops
-//! one: its parent's `stop_agent`, or the user's Stop, which tells the parent.
+//! What an agent sends its parent (its report, `finish`, or a notice that
+//! its turn ended without one), and what stops one: its parent's
+//! `stop_agent`, or the user's Stop, which tells the parent.
 
 use super::*;
 
@@ -106,5 +107,36 @@ async fn user_stopped(pool: &PgPool, child: i64) {
             crate::turn::notify(pool, parent, vec![crate::turn::Notice::Wake]);
         }
         Err(e) => tracing::warn!(conversation_id = child, error = %e, "couldn't tell a parent the user stopped its agent"),
+    }
+}
+
+/// After a child's last turn ends (`failure`: why, when it failed): if it's
+/// `active` with nothing to wait on and not paused by the user, its parent
+/// is told its turn ended without a report, with the start of its last
+/// reply, and woken; otherwise the parent would wait for a report that
+/// won't come. A conversation that isn't an agent does nothing. Something
+/// arriving just after the check wakes the child again, which is fine: the
+/// notice says the turn ended, not the work.
+pub(crate) async fn after_last_turn(pool: &PgPool, conversation_id: i64, failure: Option<String>) {
+    let idle = db::idle_agent_without_report(pool, conversation_id).await;
+    #[cfg(test)]
+    let _checked = test_hooks::Checked(conversation_id);
+    let parent = match idle {
+        Ok(Some(idle)) if !crate::turn::is_paused(conversation_id) => idle,
+        Ok(_) => return,
+        Err(e) => {
+            tracing::warn!(conversation_id, error = %e, "couldn't check whether an agent's turn ended without a report");
+            return;
+        }
+    };
+    let (parent, last) = parent;
+    let label = label(conversation_id, None);
+    let failed = failure.map(|why| format!(" (it failed: {why})")).unwrap_or_default();
+    let body = format!("{label}'s turn ended without a report{failed}; its last message: {last}");
+    match db::queue_notice(pool, parent, conversation_id, &label, &body).await {
+        Ok(()) => {
+            crate::turn::notify(pool, parent, vec![crate::turn::Notice::Wake]);
+        }
+        Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't tell a parent its agent's turn ended"),
     }
 }

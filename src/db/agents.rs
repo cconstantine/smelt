@@ -350,6 +350,46 @@ pub async fn queue_notice(pool: &PgPool, to: i64, from: i64, from_label: &str, b
     queue_agent_message(&mut conn, to, Some(from), from_label, KIND_NOTICE, body).await
 }
 
+/// Whether `id` is an `active` agent with nothing to wait on: no question
+/// to the user unanswered, no AGENTS.md card, no terminal command running
+/// and no agent of its own still starting or active. Its parent then, and
+/// the first 500 characters of its last reply's text. `None` otherwise.
+pub async fn idle_agent_without_report(pool: &PgPool, id: i64) -> Result<Option<(i64, String)>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (i64, Option<String>)>(
+        "SELECT c.parent_id,
+                (SELECT m.content FROM messages m WHERE m.conversation_id = c.id AND m.role = 'assistant'
+                 ORDER BY m.id DESC LIMIT 1)
+         FROM conversations c JOIN agents a ON a.conversation_id = c.id
+         WHERE c.id = $1 AND c.parent_id IS NOT NULL AND a.state = $2
+           AND NOT EXISTS (SELECT 1 FROM pending_questions q WHERE q.conversation_id = c.id AND q.answer IS NULL)
+           AND NOT EXISTS (SELECT 1 FROM instruction_requests r WHERE r.conversation_id = c.id)
+           AND NOT EXISTS (SELECT 1 FROM terminal_commands t WHERE t.conversation_id = c.id AND t.status = 'running')
+           AND NOT EXISTS (SELECT 1 FROM agents g JOIN conversations gc ON gc.id = g.conversation_id
+                           WHERE gc.parent_id = c.id AND g.state IN ($3, $2))",
+    )
+    .bind(id)
+    .bind(AGENT_ACTIVE)
+    .bind(AGENT_STARTING)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(parent, content)| {
+        let text = content
+            .and_then(|content| serde_json::from_str::<Vec<ContentBlock>>(&content).ok())
+            .map(|blocks| {
+                blocks
+                    .into_iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .unwrap_or_default();
+        (parent, text.chars().take(500).collect())
+    }))
+}
+
 /// One of a conversation's children, as `list_agents` shows it.
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct ChildAgent {
