@@ -88,6 +88,12 @@ pub(super) fn clone_result_for_model(mut repo: crate::git::RepoSummary, persona_
     repo.trust_requests.clear();
     let mut told = serde_json::to_value(&repo).unwrap_or_default();
     let mut notes = Vec::new();
+    // SME-272: the checked-out branch is the remote owner's choice, and
+    // serde_json leaves a line separator or bidi control in it raw.
+    if repo.branch.as_deref().is_some_and(|b| !crate::git::plain_path_text(b)) {
+        told["branch"] = Value::Null;
+        notes.push("Its checked-out branch isn't shown: the name holds control characters.".to_string());
+    }
     if !repo.agents_files.is_empty() {
         notes.push(format!(
             "This repo has AGENTS.md files (agents_files, relative to {}). Load the ones for \
@@ -114,3 +120,6 @@ async fn load_instructions_tool(pool: &PgPool, conversation_id: i64, input: &Val
     let path = required_str(input, "path")?;
     crate::git::load_instructions(pool, conversation_id, &path).await
 }
+
+#[cfg(test)]
+mod tests;
