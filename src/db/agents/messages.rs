@@ -214,7 +214,8 @@ pub async fn ask_parent(
 /// mid-turn: `active`, not paused or being deleted, with no question open
 /// or answered and untaken (it waits, or the sweep wakes it for the answer;
 /// review 2), its last message a turn's with no reply after it (a tool
-/// result, or a delivered report, message or notice from the queue), and
+/// result, or a delivered report, message or notice from the queue) or the
+/// model's tool call whose tool was still running (review 2), and
 /// not already holding this notice undelivered (two restarts in a row tell
 /// it once). A notice saved without waking it (the user stopping its pod)
 /// isn't a turn (review 1, finding 2), nor is a user's own conversation.
@@ -226,9 +227,10 @@ pub async fn queue_restart_notices(pool: &PgPool, body: &str) -> Result<Vec<i64>
          WHERE a.state = $3 AND c.paused_at IS NULL AND c.deleting_at IS NULL
            AND EXISTS (SELECT 1 FROM messages last
                        WHERE last.id = (SELECT max(m.id) FROM messages m WHERE m.conversation_id = c.id)
-                         AND last.role = 'user'
-                         AND (last.content LIKE '%\"type\":\"tool_result\"%'
-                              OR EXISTS (SELECT 1 FROM agent_messages d WHERE d.delivered_message_id = last.id)))
+                         AND ((last.role = 'user'
+                               AND (last.content LIKE '%\"type\":\"tool_result\"%'
+                                    OR EXISTS (SELECT 1 FROM agent_messages d WHERE d.delivered_message_id = last.id)))
+                              OR (last.role = 'assistant' AND last.content LIKE '%\"type\":\"tool_use\"%')))
            AND NOT EXISTS (SELECT 1 FROM pending_questions q WHERE q.conversation_id = c.id)
            AND NOT EXISTS (SELECT 1 FROM agent_messages m WHERE m.to_conversation_id = c.id
                            AND m.delivered_at IS NULL AND m.kind = $2 AND m.body = $1)

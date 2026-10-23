@@ -54,8 +54,20 @@ async fn test_a_child_cut_off_mid_turn_gets_the_restart_notice_and_carries_on(po
     let text = vec![ContentBlock::Text { text: "Message from your parent:\n\nOne more thing.".to_string() }];
     db::deliver_agent_message(&pool, &row, &text).await.expect("deliver it").expect("delivered");
 
-    restart(&pool, &[root, child, reading]).await;
-    for id in [child, reading] {
+    // Review 2, finding 1: cut off while its tool ran, before the result
+    // was saved: its last message is the model's call.
+    let calling = active_child(&pool, root).await;
+    say(&pool, calling, "user", vec![ContentBlock::Text { text: "Work.".to_string() }]).await;
+    say(
+        &pool,
+        calling,
+        "assistant",
+        vec![ContentBlock::ToolUse { id: "toolu_l".to_string(), name: "list_agents".to_string(), input: serde_json::json!({}) }],
+    )
+    .await;
+
+    restart(&pool, &[root, child, reading, calling]).await;
+    for id in [child, reading, calling] {
         let calls = requests_for(&requests, Some(id));
         assert_eq!(calls.len(), 1, "#{id} wasn't woken");
         let messages = calls[0]["messages"].as_array().expect("messages");
@@ -63,7 +75,7 @@ async fn test_a_child_cut_off_mid_turn_gets_the_restart_notice_and_carries_on(po
         assert!(last.contains(NOTICE), "{last}");
     }
     eventually("every turn is over", || async {
-        !crate::turn::turn_running(root) && !crate::turn::turn_running(child) && !crate::turn::turn_running(reading)
+        [root, child, reading, calling].iter().all(|id| !crate::turn::turn_running(*id))
     })
     .await;
 }
