@@ -244,3 +244,28 @@ async fn test_a_mixed_reply_gets_the_correction_after_its_results(pool: PgPool) 
     assert_eq!(types, ["tool_result", "text"], "{sent:?}");
     assert_eq!(sent[1]["text"], notice.as_str());
 }
+
+/// A7: a `stop_reason` of `tool_use` with no call in the reply is the
+/// reply's end, not an empty set of results: with a call written as text
+/// it gets the correction; without, the turn ends. No empty message is
+/// saved either way (one was, and the next request sent it).
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_tool_use_with_no_calls_is_the_end_of_the_reply(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let written = text_blocks_body(&[Block::Text(EVIDENCE)], "tool_use");
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![written, text_reply_body("Done.")]).await;
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("the turn succeeds");
+    assert_eq!(roles(&saved), ["user", "assistant", "user", "assistant"], "{saved:?}");
+    assert_eq!(notices(&saved), 1, "{saved:?}");
+    assert_eq!(requests.lock().expect("the request log").len(), 2);
+
+    let plain = text_blocks_body(&[Block::Text("Let me check.")], "tool_use");
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![plain, text_reply_body("Done.")]).await;
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("the turn succeeds");
+    assert_eq!(roles(&saved), ["user", "assistant"], "{saved:?}");
+    assert_eq!(requests.lock().expect("the request log").len(), 1);
+    let all = db::list_messages(&pool, conversation.id).await.expect("list messages");
+    assert!(all.iter().all(|m| m.content != "[]"), "no empty message is saved: {all:?}");
+}

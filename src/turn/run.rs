@@ -606,9 +606,9 @@ fn run_turn_steps<'a: 'b, 'b>(
             };
 
             // Asked the user, or an agent finished (SME-236): the turn ends,
-            // with any results saved.
+            // with any results saved. A reply here makes at least one call.
             let (result_blocks, ends) = run_tools(pool, conversation_id, &turn).await?;
-            if !ends || !result_blocks.is_empty() {
+            if !result_blocks.is_empty() {
                 let saved = db::create_message(pool, conversation_id, "user", &result_blocks)
                     .await
                     .map_err(ServerFnError::new)?;

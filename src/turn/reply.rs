@@ -288,14 +288,17 @@ pub(super) async fn after_reply(
     if anthropic::stream::is_cut_off(&turn.stop_reason) || turn.stop_reason == "refusal" {
         return Ok(NextStep::End);
     }
-    if turn.stop_reason == "tool_use" {
+    // A `stop_reason` of `tool_use` with no call in the reply is its end,
+    // not an empty set of results (which was saved, and sent as an empty
+    // user message).
+    if turn.content.iter().any(|b| matches!(b, anthropic::ContentBlock::ToolUse { .. })) {
+        if turn.stop_reason != "tool_use" {
+            return Ok(NextStep::End);
+        }
         streak.corrections = 0;
         let calls = text_calls(turn);
         let correction = (!calls.is_empty()).then(|| crate::text_calls::text_call_notice(&calls, offered));
         return Ok(NextStep::RunTools(correction));
-    }
-    if turn.content.iter().any(|b| matches!(b, anthropic::ContentBlock::ToolUse { .. })) {
-        return Ok(NextStep::End);
     }
     let calls = text_calls(turn);
     if calls.is_empty() {
