@@ -160,7 +160,7 @@ fn start_notice() -> String {
 /// `failed` (`fail_start`). A child stopped or deleted meanwhile is left
 /// as it is. `StartExit` cleans up on every way out, a dropped task too.
 async fn run_start(pool: &PgPool, child: i64, parent: i64, request: StartRequest) {
-    let _exit = StartExit { pool: pool.clone(), child };
+    let mut exit = StartExit { pool: pool.clone(), child, done: false };
     let checkout = checkout_for(parent);
     let prepared = match prepare(pool, checkout.as_ref(), child, parent, request).await {
         Ok(prepared) => prepared,
@@ -182,6 +182,7 @@ async fn run_start(pool: &PgPool, child: i64, parent: i64, request: StartRequest
     };
     match db::complete_start(pool, child, parent, &done).await {
         Ok(true) => {
+            exit.done = true;
             crate::turn::notify(pool, child, vec![crate::turn::Notice::Wake]);
         }
         Ok(false) => tracing::info!(conversation_id = child, "the agent was stopped or deleted during its start"),
@@ -284,25 +285,33 @@ pub(crate) async fn fail_start(pool: &PgPool, child: i64, parent: i64, error: &s
 struct StartExit {
     pool: PgPool,
     child: i64,
+    /// The start's done step went through: the child is `active`.
+    done: bool,
 }
 
 impl Drop for StartExit {
     fn drop(&mut self) {
-        let pool = self.pool.clone();
-        let child = self.child;
+        let (pool, child, done) = (self.pool.clone(), self.child, self.done);
         tokio::spawn(async move {
-            end_start(&pool, child).await;
+            end_start(&pool, child, done).await;
         });
     }
 }
 
-/// What every way out of a start leaves done: no trust card left in the
-/// child, and the start's credentials removed.
-pub(crate) async fn end_start(pool: &PgPool, child: i64) {
-    match db::delete_instruction_requests_of(pool, child).await {
-        Ok(0) => {}
-        Ok(_) => crate::git::publish_repos(pool, child).await,
-        Err(e) => tracing::warn!(conversation_id = child, error = %e, "couldn't delete an agent's trust cards"),
+/// What every way out of a start leaves done: the start's credentials
+/// removed and, unless the start is `done`, no trust card left in the
+/// child. A done start's AGENTS.md load made no card (a card fails the
+/// start), and the child's first turn, already woken, may have asked about
+/// another file by now (review 1), so its cards are left alone.
+pub(crate) async fn end_start(pool: &PgPool, child: i64, done: bool) {
+    #[cfg(test)]
+    test_hooks::reach(test_hooks::BEFORE_START_EXIT, child).await;
+    if !done {
+        match db::delete_instruction_requests_of(pool, child).await {
+            Ok(0) => {}
+            Ok(_) => crate::git::publish_repos(pool, child).await,
+            Err(e) => tracing::warn!(conversation_id = child, error = %e, "couldn't delete an agent's trust cards"),
+        }
     }
     drop_start_credentials(child).await;
     #[cfg(test)]

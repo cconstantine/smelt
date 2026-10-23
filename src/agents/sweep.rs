@@ -18,7 +18,7 @@ pub(crate) async fn startup_sweep(pool: &PgPool) -> Vec<tokio::task::JoinHandle<
         Ok(starting) => {
             for (child, parent) in starting {
                 fail_start(pool, child, parent, RESTARTED).await;
-                end_start(pool, child).await;
+                end_start(pool, child, false).await;
             }
         }
         Err(e) => tracing::warn!(error = %e, "couldn't list the agents a restart cut off"),

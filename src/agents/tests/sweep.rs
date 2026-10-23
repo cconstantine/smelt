@@ -35,6 +35,10 @@ async fn card(pool: &PgPool, conversation_id: i64) {
     let repo = db::create_conversation_repo(pool, conversation_id, "https://example.com/r.git", "example.com/r", None, "r")
         .await
         .expect("a repo row");
+    // Ready, not cloning: a turn in the conversation would wait for a clone
+    // (`wait_for_clones`, up to 120 s), which under a full gate's load
+    // timed out a test whose child's first turn started after this.
+    db::set_repo_cloned(pool, repo.id, "main", None).await.expect("ready");
     let file = db::InstructionsFile { content: "Rules.".to_string(), file_bytes: 6, hash: "h".to_string(), commit: None };
     db::request_instruction(pool, conversation_id, repo.id, "AGENTS.md", &file).await.expect("a card");
 }
@@ -165,4 +169,25 @@ async fn test_a_stopped_starts_card_is_deleted(pool: PgPool) {
     eventually("the start's exit ran", || async { test_hooks::starts_ended(child) }).await;
     assert_eq!(cards(&pool, child).await, 0);
     eventually("every turn is over", || async { !crate::turn::turn_running(root) }).await;
+}
+
+/// Review 1, finding 4: a start that's done leaves the child's cards alone:
+/// its first turn may already have asked about a file (an AGENTS.md of a
+/// repo it cloned itself) before the start's exit runs.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_done_starts_exit_keeps_a_card_its_first_turn_made(pool: PgPool) {
+    setup(&pool, vec![text_reply("ok")]).await;
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    let (reached_done, release_done) = test_hooks::pause(test_hooks::BEFORE_START_DONE, root);
+    let child = start_child(&pool, root, "Work.").await;
+    tokio::time::timeout(Duration::from_secs(10), reached_done).await.expect("the start runs").expect("paused");
+    let (reached_exit, release_exit) = test_hooks::pause(test_hooks::BEFORE_START_EXIT, child);
+    release_done.send(()).expect("release the start");
+    tokio::time::timeout(Duration::from_secs(10), reached_exit).await.expect("the exit runs").expect("paused");
+    assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_ACTIVE));
+    card(&pool, child).await;
+    release_exit.send(()).expect("release the exit");
+    eventually("the start's exit ran", || async { test_hooks::starts_ended(child) }).await;
+    assert_eq!(cards(&pool, child).await, 1, "the first turn's card stays");
+    eventually("every turn is over", || async { !crate::turn::turn_running(root) && !crate::turn::turn_running(child) }).await;
 }
