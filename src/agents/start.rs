@@ -283,9 +283,9 @@ pub(crate) async fn fail_start(pool: &PgPool, child: i64, parent: i64, error: &s
 }
 
 /// Held by a start from its first step: on every way out (done, failed,
-/// the child stopped or deleted, the task dropped) it deletes any AGENTS.md
-/// trust card in the child and removes the start's credentials, in a task
-/// of its own, as `CloneGuard`'s cleanup runs.
+/// the child stopped or deleted, the task dropped) it removes the start's
+/// credentials and, unless the start is done, deletes any AGENTS.md trust
+/// card in the child, in a task of its own, as `CloneGuard`'s cleanup runs.
 struct StartExit {
     pool: PgPool,
     child: i64,
