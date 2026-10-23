@@ -224,6 +224,9 @@ pub(crate) struct PromptEnvironment {
     pub repos: Vec<crate::git::RepoSummary>,
     /// Their loaded `AGENTS.md` files.
     pub instructions: Vec<crate::git::ProjectInstructions>,
+    /// Each repo's recorded persona files, by repo id (SME-235): names
+    /// only, listed whether or not the repo is trusted.
+    pub persona_files: std::collections::BTreeMap<i64, Vec<String>>,
 }
 
 /// The system prompt sent with every turn: the base prompt, then an
@@ -270,6 +273,9 @@ pub(crate) fn system_prompt(env: &PromptEnvironment) -> String {
                     .collect();
                 prompt.push_str(&format!("; AGENTS.md files: {}", files.join(", ")));
             }
+            if let Some(personas) = env.persona_files.get(&repo.id).filter(|p| !p.is_empty()) {
+                prompt.push_str(&format!("; persona files: {}", personas.join(", ")));
+            }
             prompt.push('\n');
         }
     }
@@ -296,6 +302,12 @@ pub(crate) async fn prompt_environment(
             tracing::warn!(error = %e, "couldn't read project instructions for the system prompt");
             Vec::new()
         });
+    let persona_files = crate::git::persona_files_by_repo(pool, conversation_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "couldn't read persona files for the system prompt");
+            Default::default()
+        });
     let volumes = match db::list_sandbox_volumes(pool).await {
         Ok(volumes) => volumes.into_iter().map(|v| (v.name, v.mount_path)).collect(),
         Err(e) => {
@@ -317,5 +329,6 @@ pub(crate) async fn prompt_environment(
         mcp_servers,
         repos,
         instructions,
+        persona_files,
     }
 }

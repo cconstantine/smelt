@@ -504,27 +504,41 @@ pub(super) async fn fail_attempt(pool: &PgPool, repo: &db::ConversationRepo, err
     }
 }
 
-/// Clones one recorded repo into pod `pod_id` and records how it went.
-/// Records a finished clone, and disarms its guard: whatever runs
-/// afterwards (reading its AGENTS.md) being cut off doesn't make the
-/// clone "interrupted".
+/// Records a finished clone with its AGENTS.md and persona files, and
+/// disarms its guard: whatever runs afterwards (reading its AGENTS.md)
+/// being cut off doesn't make the clone "interrupted".
 pub(super) async fn record_cloned(
     pool: &PgPool,
     repo: &db::ConversationRepo,
     cloned: &ClonedRepo,
     agents_files: Result<Vec<String>, String>,
+    persona_files: Result<Vec<String>, String>,
     guard: CloneGuard,
 ) -> Result<(), String> {
-    // The clone is good even if its AGENTS.md files can't be listed;
-    // the panel says why.
-    let (files, error) = match agents_files {
-        Ok(files) => (files, None),
-        Err(e) => (Vec::new(), Some(format!("Couldn't list its AGENTS.md files: {e}"))),
-    };
-    let recorded =
-        db::set_repo_ready(pool, repo.id, repo.attempt, &cloned.branch, cloned.commit.as_deref(), &files, error.as_deref())
-            .await
-            .map_err(|e| e.to_string())?;
+    // The clone is good even if its files can't be listed; the panel
+    // says why.
+    let mut errors = Vec::new();
+    let files = agents_files.unwrap_or_else(|e| {
+        errors.push(format!("Couldn't list its AGENTS.md files: {e}"));
+        Vec::new()
+    });
+    let personas = persona_files.unwrap_or_else(|e| {
+        errors.push(format!("Couldn't list its persona files: {e}"));
+        Vec::new()
+    });
+    let error = (!errors.is_empty()).then(|| errors.join("; "));
+    let recorded = db::set_repo_ready(
+        pool,
+        repo.id,
+        repo.attempt,
+        &cloned.branch,
+        cloned.commit.as_deref(),
+        &files,
+        &personas,
+        error.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     guard.finish();
     if recorded { Ok(()) } else { Err(CLONE_SUPERSEDED.to_string()) }
 }
@@ -548,7 +562,11 @@ async fn clone_repo_row(
                 tracing::warn!(repo = %crate::telemetry::scrub_urls(&repo.url), error = %e, "couldn't list AGENTS.md files");
                 e.to_string()
             });
-            record_cloned(pool, repo, &cloned, files, guard).await
+            // What list_personas shows once the user trusts the repo.
+            let personas = list_persona_files(&shell, &repo.dir).await.map(|p| p.files).inspect_err(|e| {
+                tracing::warn!(repo = %crate::telemetry::scrub_urls(&repo.url), error = %e, "couldn't list persona files");
+            });
+            record_cloned(pool, repo, &cloned, files, personas, guard).await
         }
         Err(e) => {
             let told = fail_attempt(pool, repo, &e).await;

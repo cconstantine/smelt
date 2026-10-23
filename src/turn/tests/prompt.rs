@@ -17,7 +17,56 @@ fn prompt_env() -> PromptEnvironment {
         mcp_servers: vec!["exa".to_string(), "github".to_string()],
         repos: Vec::new(),
         instructions: Vec::new(),
+        persona_files: Default::default(),
     }
+}
+
+fn ready_repo(id: i64, dir: &str, agents_files: Vec<String>) -> crate::git::RepoSummary {
+    crate::git::RepoSummary {
+        id,
+        url: format!("git@github.com:o/{dir}.git"),
+        path: format!("/workspace/{dir}"),
+        requested_branch: None,
+        branch: Some("main".to_string()),
+        commit: Some("43835b44f939".to_string()),
+        status: crate::git::RepoStatus::Ready,
+        error: None,
+        agents_files,
+        loaded_instructions: vec![],
+        trust_requests: vec![],
+    }
+}
+
+/// SME-235: each repo's line names its persona files, like its AGENTS.md
+/// files: names only, so for a repo the user hasn't trusted too.
+#[test]
+fn test_system_prompt_names_each_repos_persona_files() {
+    let mut env = prompt_env();
+    env.repos = vec![
+        ready_repo(1, "smelt", vec!["AGENTS.md".to_string()]),
+        ready_repo(2, "bare", vec![]),
+        ready_repo(3, "plain", vec![]),
+    ];
+    env.persona_files = [
+        (1, vec![".agents/personas/developer.md".to_string(), ".agents/personas/reviewer.md".to_string()]),
+        (2, vec![".agents/personas/developer.md".to_string()]),
+        (3, vec![]),
+    ]
+    .into_iter()
+    .collect();
+    let prompt = system_prompt(&env);
+    assert!(
+        prompt.contains(
+            "  - /workspace/smelt: git@github.com:o/smelt.git (main); AGENTS.md files: AGENTS.md; \
+             persona files: .agents/personas/developer.md, .agents/personas/reviewer.md\n"
+        ),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("  - /workspace/bare: git@github.com:o/bare.git (main); persona files: .agents/personas/developer.md\n"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("  - /workspace/plain: git@github.com:o/plain.git (main)\n"), "{prompt}");
 }
 
 #[test]
@@ -123,7 +172,16 @@ async fn test_prompt_environment_reads_volumes_and_mcp_servers(pool: PgPool) {
         commit: Some("abc123".to_string()),
     };
     db::load_instruction(&pool, conversation.id, repo.id, "AGENTS.md", &loaded).await.expect("load");
+    sqlx::query("UPDATE conversation_repos SET persona_files = '{.agents/personas/developer.md}' WHERE id = $1")
+        .bind(repo.id)
+        .execute(&pool)
+        .await
+        .expect("persona files");
     let env = prompt_environment(&pool, conversation.id, "some-model").await;
+    assert_eq!(
+        env.persona_files,
+        [(repo.id, vec![".agents/personas/developer.md".to_string()])].into_iter().collect()
+    );
     assert_eq!(env.repos[0].loaded_instructions, vec!["AGENTS.md".to_string()]);
     assert_eq!(env.repos.len(), 1);
     assert_eq!(env.repos[0].path, "/workspace/r");
