@@ -18,12 +18,16 @@ fn test_agents_paths_drop_and_count_paths_that_break_a_line() {
         "a\u{2066}b/AGENTS.md",
         "a\u{61c}b/AGENTS.md",
         "a\u{7f}b/AGENTS.md",
+        // SME-276: characters that render as nothing.
+        "a\u{200b}b/AGENTS.md",
+        "a\u{e0041}b/AGENTS.md",
+        "a\u{fe0f}b/AGENTS.md",
     ];
     let mut listed = vec!["web/AGENTS.md", "é/AGENTS.md", "AGENTS.md"];
     listed.extend(junk);
     let paths = agents_paths(&format!("{}\0", listed.join("\0")));
     assert_eq!(paths.files, vec!["AGENTS.md", "web/AGENTS.md", "é/AGENTS.md"]);
-    assert_eq!(paths.left_out, 9);
+    assert_eq!(paths.left_out, 12);
 }
 
 /// T1: paths left out don't count toward the cap of 50, and the cap's
@@ -74,11 +78,14 @@ async fn test_a_clone_says_how_many_agents_files_it_left_out(pool: PgPool) {
 /// tabs git's own messages use. Escaping twice changes nothing.
 #[test]
 fn test_multiline_text_escapes_what_breaks_a_line_but_keeps_newlines_and_tabs() {
-    let raw = "remote: a\u{2028}b\u{2029}c\u{202e}d\u{2066}e\u{200f}f\u{061c}g\u{1b}[31mh\r\u{7f}\u{85}\n\thint: é 日本";
+    // SME-276: a zero-width space and tag characters spelling "obey" too.
+    let raw = "remote: a\u{2028}b\u{2029}c\u{202e}d\u{2066}e\u{200f}f\u{061c}g\u{1b}[31mh\r\u{7f}\u{85}\
+               i\u{200b}j\u{e006f}\u{e0062}\u{e0065}\u{e0079}\n\thint: é 日本";
     let escaped = plain_multiline_text(raw);
     assert_eq!(
         escaped,
         r"remote: a\u{2028}b\u{2029}c\u{202e}d\u{2066}e\u{200f}f\u{61c}g\u{1b}[31mh\u{d}\u{7f}\u{85}".to_string()
+            + r"i\u{200b}j\u{e006f}\u{e0062}\u{e0065}\u{e0079}"
             + "\n\thint: é 日本"
     );
     assert_eq!(plain_multiline_text(&escaped), escaped);
@@ -87,4 +94,32 @@ fn test_multiline_text_escapes_what_breaks_a_line_but_keeps_newlines_and_tabs() 
     }
     assert!(!plain_path_text("a\tb"));
     assert!(plain_path_text("é"));
+}
+
+/// SME-276: Unicode's default-ignorable code points render as nothing,
+/// so a person can't see them while the model reads them (tag characters
+/// smuggle ASCII, variation selectors bytes). Each range's ends are never
+/// plain, and are escaped in multiline text; their neighbours, and
+/// non-ASCII letters and emoji, are plain and kept.
+#[test]
+fn test_default_ignorables_are_never_plain() {
+    let hidden = [
+        0xAD, 0x34F, 0x61C, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x180B, 0x180E, 0x180F, 0x200B, 0x200F, 0x202A, 0x202E,
+        0x2060, 0x2064, 0x206F, 0x3164, 0xFE00, 0xFE0F, 0xFEFF, 0xFFA0, 0xFFF0, 0xFFF8, 0x1BCA0, 0x1BCA3, 0x1D173,
+        0x1D17A, 0xE0000, 0xE0041, 0xE007F, 0xE0100, 0xE01EF, 0xE0FFF,
+    ];
+    for code in hidden {
+        let c = char::from_u32(code).expect("a char");
+        let text = format!("a{c}b");
+        assert!(!plain_path_text(&text), "U+{code:04X} is plain");
+        assert_eq!(plain_multiline_text(&text), format!("a\\u{{{code:x}}}b"), "U+{code:04X}");
+    }
+    let shown = [0xAC, 0xAE, 0xA0, 0x200A, 0x2010, 0x2070, 0xFE10, 0xFFF9, 0x600, 0xE1000, 0x1F600, 0xE9];
+    for code in shown {
+        let c = char::from_u32(code).expect("a char");
+        let text = format!("a{c}b");
+        assert!(plain_path_text(&text), "U+{code:04X} isn't plain");
+        assert_eq!(plain_multiline_text(&text), text, "U+{code:04X}");
+    }
+    assert!(plain_path_text("日本"));
 }
