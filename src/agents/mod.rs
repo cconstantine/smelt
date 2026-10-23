@@ -15,6 +15,7 @@ use crate::db;
 
 mod checkout;
 mod delete;
+mod messages;
 mod persona;
 mod queue;
 mod start;
@@ -22,6 +23,7 @@ mod sweep;
 
 pub(crate) use checkout::*;
 pub(crate) use delete::*;
+pub(crate) use messages::*;
 pub(crate) use queue::*;
 pub(crate) use start::*;
 pub(crate) use sweep::*;
@@ -31,6 +33,13 @@ pub(crate) const MAX_BRIEF_CHARS: usize = 30_000;
 
 /// The longest report `finish` takes, in characters.
 pub(crate) const MAX_REPORT_CHARS: usize = 30_000;
+
+/// The longest message `message_agent` takes, in characters.
+pub(crate) const MAX_MESSAGE_CHARS: usize = 30_000;
+
+/// The tool a child asks its parent with (SME-238); a successful call
+/// ends its turn, as `ask_user`'s does.
+pub(crate) const ASK_PARENT: &str = "ask_parent";
 
 /// The tool a child ends its work with; a successful call ends its turn.
 pub(crate) const FINISH: &str = "finish";
@@ -49,15 +58,16 @@ pub(crate) fn persona_label(path: &str) -> Option<String> {
 
 /// An agent's status, first that holds: its stored lifecycle when that
 /// ends it or hasn't begun, a turn in flight, a question or card waiting
-/// on the user, finished, else idle (agents.md, "Statuses", without
-/// SME-238's "waiting for its parent").
-pub(crate) fn status(state: &str, running: bool, waiting_for_user: bool) -> &'static str {
+/// on the user, a question to its parent (SME-238), finished, else idle
+/// (agents.md, "Statuses").
+pub(crate) fn status(state: &str, running: bool, waiting_for_user: bool, waiting_for_parent: bool) -> &'static str {
     match state {
         db::AGENT_STARTING => "starting",
         db::AGENT_FAILED => "failed",
         db::AGENT_STOPPED => "stopped",
         _ if running => "running",
         _ if waiting_for_user => "waiting for the user",
+        _ if waiting_for_parent => "waiting for its parent",
         db::AGENT_FINISHED => "finished",
         _ => "idle",
     }
@@ -75,7 +85,12 @@ pub(crate) async fn list_agents(pool: &PgPool, caller: i64) -> Result<String, St
                 "id": child.id,
                 "title": child.title,
                 "persona": child.persona_path.as_deref().and_then(persona_label),
-                "status": status(&child.state, crate::turn::turn_running(child.id), child.waiting_for_user),
+                "status": status(
+                    &child.state,
+                    crate::turn::turn_running(child.id),
+                    child.waiting_for_user,
+                    child.waiting_for_parent
+                ),
                 "created_at": child.created_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
                 "last_message_at": child.last_message_at.map(|at| at.format("%Y-%m-%d %H:%M:%S UTC").to_string()),
                 "agents_started": child.agents_started,

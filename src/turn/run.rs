@@ -377,6 +377,8 @@ pub(crate) async fn start_turn(pool: PgPool, id: i64, content: String) -> Server
     #[cfg(test)]
     crate::agents::test_hooks::reach(crate::agents::test_hooks::AFTER_USER_ADMITTED, id).await;
     let (in_flight, generation) = TurnInFlight::start_by_user(id);
+    // The pause the admission ended, stored for the next start (SME-238).
+    spawn_store_pause(&pool, id);
     // A parent's stop between the admission and the count (SME-236).
     crate::agents::confirm_user_turn(&pool, id).await.map_err(ServerFnError::new)?;
     let new_message = anthropic::AnthropicMessage {

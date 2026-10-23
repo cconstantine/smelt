@@ -1,6 +1,8 @@
 //! Child agents (SME-236): `start_agent`, offered to a conversation without
 //! a parent, `list_agents` and `stop_agent`, offered to every conversation,
-//! and `finish`, offered to an agent. The lifecycle behind them is `crate::agents`.
+//! and `finish`, offered to an agent; and (SME-238) `message_agent`, offered
+//! to every conversation but callable only by one with a parent or agents
+//! of its own, and `ask_parent`, offered to an agent. The lifecycle behind them is `crate::agents`.
 
 use super::{Offer, Registered, Tool};
 use crate::anthropic::ToolDefinition;
@@ -17,8 +19,8 @@ pub(super) fn tools() -> Vec<Registered> {
                          that works on `brief` in the background while you go on. Returns its id at \
                          once. The brief is its first message, so say everything it needs: the task, \
                          what to report back, and when it's done. Its report arrives here as a \
-                         message when it calls finish; list_agents shows its status, and the user can \
-                         open it and write to it. Up to {} characters.",
+                         message when it calls finish; message_agent writes to it, list_agents shows \
+                         its status, and the user can open it and write to it. Up to {} characters.",
                         crate::agents::MAX_BRIEF_CHARS
                     ),
                     input_schema: serde_json::json!({
@@ -51,7 +53,8 @@ pub(super) fn tools() -> Vec<Registered> {
                     name: "list_agents".to_string(),
                     description: "List the agents you started (never anyone else's), newest first: \
                                   id, title, persona, status (starting, running, waiting for the user, \
-                                  idle, finished, stopped or failed), when it started, its last \
+                                  waiting for its parent, idle, finished, stopped or failed), when it \
+                                  started, its last \
                                   message, and how many agents it started itself."
                         .to_string(),
                     input_schema: serde_json::json!({"type": "object", "properties": {}}),
@@ -99,6 +102,56 @@ pub(super) fn tools() -> Vec<Registered> {
                     }),
                 },
                 run: run!(|c| crate::agents::finish(c.pool, c.conversation_id, c.input)),
+            },
+        },
+        Registered {
+            offer: Offer::Linked,
+            tool: Tool {
+                def: ToolDefinition {
+                    name: "message_agent".to_string(),
+                    description: format!(
+                        "Send a message to your parent (to: \"parent\") or to one of the agents you \
+                         started (to: its id), at any time. It arrives in their conversation as a message \
+                         from you: an idle one is woken to read it, a busy one reads it after its current \
+                         step. Not to anyone else, nor to an agent that is stopped or failed. Up to {} \
+                         characters.",
+                        crate::agents::MAX_MESSAGE_CHARS
+                    ),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "to": {"type": "string", "description": "\"parent\", or the id of one of your agents"},
+                            "text": {"type": "string", "description": "the message"}
+                        },
+                        "required": ["to", "text"]
+                    }),
+                },
+                run: run!(|c| crate::agents::message_agent(c.pool, c.conversation_id, c.input)),
+            },
+        },
+        Registered {
+            offer: Offer::Child,
+            tool: Tool {
+                def: ToolDefinition {
+                    name: crate::agents::ASK_PARENT.to_string(),
+                    description: format!(
+                        "Ask your parent, the conversation that started you, a question and wait for \
+                         the answer: your turn ends here, and your parent's next message_agent to you \
+                         after it has read your question is the answer, which wakes you. If the user writes to you first, their message \
+                         comes instead, and a later reply from your parent arrives as a message. One \
+                         question per reply, and not with ask_user. Up to {} characters.",
+                        crate::agents::MAX_MESSAGE_CHARS
+                    ),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"question": {"type": "string", "description": "the question, with what your parent needs to answer it"}},
+                        "required": ["question"]
+                    }),
+                },
+                // The turn handles it (`turn::run_tools`), as `ask_user`.
+                run: run!(|_c| async {
+                    Err::<String, String>(format!("{} is answered by your parent, not run", crate::agents::ASK_PARENT))
+                }),
             },
         },
     ]

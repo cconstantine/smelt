@@ -43,3 +43,19 @@ async fn test_a_pending_question_goes_with_its_conversation(pool: PgPool) {
     delete_conversation(&pool, conversation.id).await.expect("delete");
     assert!(list_waiting_conversations(&pool).await.expect("list").is_empty());
 }
+
+/// SME-238: a question a child asked its parent isn't the user's: the
+/// sidebar doesn't list it and the card's answer can't land on it.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_question_for_the_parent_is_not_waiting_for_the_user(pool: PgPool) {
+    let id = create_conversation(&pool).await.expect("conversation").id;
+    sqlx::query("INSERT INTO pending_questions (conversation_id, tool_use_id, questions, asked_of) VALUES ($1, 'toolu_p', '[]', 'parent')")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("a question for the parent");
+    assert!(list_waiting_conversations(&pool).await.expect("list").is_empty(), "listed as waiting for the user");
+    assert!(!answer_pending_question(&pool, id, "toolu_p", &sample_answer("Yes")).await.expect("answer"), "the card answered it");
+    let stored = get_pending_question(&pool, id).await.expect("get").expect("still there");
+    assert_eq!((stored.asked_of.as_str(), stored.answer), ("parent", None));
+}
