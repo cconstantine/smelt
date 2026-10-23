@@ -140,6 +140,10 @@ pub(crate) async fn answer_question(
         return Err(ServerFnError::new(ALREADY_ANSWERED));
     };
     crate::questions::validate_answers(&question.questions, &answers).map_err(ServerFnError::new)?;
+    // A finished or stopped agent is active again (SME-236); one that can't
+    // take a turn refuses before the answer is recorded, so its card stays
+    // (review 2).
+    crate::agents::admit_user_turn(&pool, conversation_id).await.map_err(ServerFnError::new)?;
     if !db::answer_pending_question(&pool, conversation_id, &tool_use_id, &answers)
         .await
         .map_err(ServerFnError::new)?
@@ -147,13 +151,14 @@ pub(crate) async fn answer_question(
         return Err(ServerFnError::new(ALREADY_ANSWERED));
     }
     publish_question(conversation_id, None);
-    // A finished or stopped agent is active again (SME-236).
-    crate::agents::admit_user_turn(&pool, conversation_id).await.map_err(ServerFnError::new)?;
     // Admitted before this returns, so a Stop sent after it ends the
     // answer's turn (SME-216).
     let (in_flight, generation) = TurnInFlight::start_by_user(conversation_id);
-    // A parent's stop between the admission and the count (SME-236).
-    crate::agents::confirm_user_turn(&pool, conversation_id).await.map_err(ServerFnError::new)?;
+    // A parent's stop between the admission and the count (SME-236): the
+    // answer is recorded by now, and the next turn takes it.
+    crate::agents::confirm_user_turn(&pool, conversation_id)
+        .await
+        .map_err(|why| ServerFnError::new(format!("{why} Your answer is kept for its next turn.")))?;
     tokio::spawn(async move {
         if let Err(e) = run_turn_bounded(&pool, in_flight, None, MAX_TURNS, Some(generation), false).await {
             let message = e.message();

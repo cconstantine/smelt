@@ -256,3 +256,24 @@ async fn test_a_stop_between_the_users_admission_and_its_turn_refuses_the_send(p
     assert_eq!(requests_for(&requests, Some(child)).len(), before, "no turn ran");
     assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_STOPPED));
 }
+
+/// Review 2, finding 3: an answer from the card in a child that can't take
+/// a turn (its start failed) is refused before it's recorded, so the card
+/// stays, still answerable.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_answer_in_a_child_that_cant_take_a_turn_is_refused_before_its_recorded(pool: PgPool) {
+    setup(&pool, vec![text_reply("ok")]).await;
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    let child = settled_child(&pool, root, "Work.").await;
+    sqlx::query("INSERT INTO pending_questions (conversation_id, tool_use_id, questions) VALUES ($1, 'toolu_q', '[]')")
+        .bind(child)
+        .execute(&pool)
+        .await
+        .expect("a question");
+    set_state(&pool, child, db::AGENT_FAILED).await;
+    let answered = crate::turn::answer_question(pool.clone(), child, "toolu_q".to_string(), vec![]).await;
+    let error = answered.expect_err("refused");
+    assert!(crate::api::chat::chat_error_text(&error).contains("start failed"), "{error:?}");
+    let question = db::get_pending_question(&pool, child).await.expect("read").expect("still there");
+    assert!(question.answer.is_none(), "the answer wasn't recorded");
+}
