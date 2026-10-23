@@ -38,7 +38,7 @@ Each native tool's class sits beside its definition in the registry (`Tool { def
 | `create_volume` | writing | A claim outside the pod ([checkouts-and-volumes.md](checkouts-and-volumes.md#the-volume-tools)). |
 | `delete_volume` | destructive | Deletes a claim other agents may mount. |
 
-`message_agent`, `ask_parent`, `finish`, `list_personas`, the agent and volume tools are added by SME-235, 236, 238 and 239; SME-236's land without a class, and SME-237 classes them with the rest (the user's order, 2026-10-22).
+`message_agent`, `ask_parent`, `finish`, `list_personas`, the agent and volume tools are added by SME-235, 236, 238 and 239; SME-236's landed without a class, and SME-237 classed them with the rest (the user's order, 2026-10-22); SME-239's volume tools are classed in SME-239, since the registry's test fails on a tool without its row.
 
 ### MCP tools
 

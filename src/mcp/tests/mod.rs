@@ -58,7 +58,9 @@ impl MockMcpServer {
                     Arc::new(
                         serde_json::from_value(serde_json::json!({"type": "object"})).unwrap(),
                     ),
-                ),
+                )
+                // Read-only, for the classes tests (SME-237).
+                .annotate(rmcp::model::ToolAnnotations::new().read_only(true)),
                 |_ctx| Box::pin(async { Ok(CallToolResult::default().into()) }),
             ));
             router.disable_route("second_tool");
@@ -563,6 +565,7 @@ mod gated_http;
 mod client;
 mod registry;
 mod spans;
+mod classes;
 mod connection;
 mod hanging;
 mod oauth;

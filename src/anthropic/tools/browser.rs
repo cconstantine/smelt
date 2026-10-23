@@ -3,7 +3,7 @@
 use serde_json::Value;
 use sqlx::PgPool;
 
-use super::Tool;
+use super::{Class, Tool};
 use super::server::{required_i64, required_str};
 use crate::anthropic::ToolDefinition;
 
@@ -21,6 +21,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     .to_string(),
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| open_browser_session_tool(c.pool, c.conversation_id)),
         },
         Tool {
@@ -30,6 +31,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     .to_string(),
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| close_browser_session_tool(c.conversation_id)),
         },
         Tool {
@@ -50,6 +52,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     "required": ["url"]
                 }),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| browser_navigate_tool(c.conversation_id, c.input)),
         },
         Tool {
@@ -69,6 +72,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     "required": ["element_index"]
                 }),
             },
+            class: Class::WRITING,
             run: run!(|c| browser_click_tool(c.conversation_id, c.input)),
         },
         Tool {
@@ -89,6 +93,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     "required": ["element_index", "value"]
                 }),
             },
+            class: Class::WRITING,
             run: run!(|c| browser_fill_tool(c.conversation_id, c.input)),
         },
         Tool {
@@ -99,6 +104,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     .to_string(),
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| browser_back_tool(c.conversation_id)),
         },
         Tool {
@@ -111,6 +117,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     .to_string(),
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| browser_read_tool(c.conversation_id)),
         },
     ]

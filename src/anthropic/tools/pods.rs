@@ -3,7 +3,7 @@
 use serde_json::Value;
 use sqlx::PgPool;
 
-use super::Tool;
+use super::{Class, Tool};
 use super::server::{optional_notice_secs, required_i64, required_notice_secs, required_str};
 use crate::{db, sandbox};
 use crate::anthropic::ToolDefinition;
@@ -47,6 +47,7 @@ fn pod_tools() -> Vec<Tool> {
                     }
                 }),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| create_pod_tool(c.pool, c.conversation_id, c.input)),
         },
         Tool {
@@ -58,6 +59,7 @@ fn pod_tools() -> Vec<Tool> {
                     .to_string(),
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| terminate_pod_tool(c.pool, c.conversation_id)),
         },
         Tool {
@@ -68,6 +70,7 @@ fn pod_tools() -> Vec<Tool> {
                     .to_string(),
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| list_pods_tool(c.pool, c.conversation_id)),
         },
     ]
@@ -93,6 +96,7 @@ fn terminal_tools() -> Vec<Tool> {
                     .to_string(),
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| create_terminal_tool(c.pool, c.conversation_id)),
         },
         Tool {
@@ -109,6 +113,7 @@ fn terminal_tools() -> Vec<Tool> {
                     "required": ["terminal_id"]
                 }),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| terminate_terminal_tool(c.pool, c.conversation_id, c.input)),
         },
         Tool {
@@ -120,6 +125,7 @@ fn terminal_tools() -> Vec<Tool> {
                     .to_string(),
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| list_terminals_tool(c.pool, c.conversation_id)),
         },
     ]
@@ -162,6 +168,7 @@ fn command_tools() -> Vec<Tool> {
                     "required": ["terminal_id", "command"]
                 }),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| run_terminal_command_tool(c.pool, c.conversation_id, c.tool_use_id, c.input)),
         },
         Tool {
@@ -184,6 +191,7 @@ fn command_tools() -> Vec<Tool> {
                     "required": ["command_id", "signal"]
                 }),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| send_signal_tool(c.pool, c.conversation_id, c.input)),
         },
         Tool {
@@ -205,6 +213,7 @@ fn command_tools() -> Vec<Tool> {
                     "required": ["command_id"]
                 }),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| terminal_command_status_tool(c.pool, c.conversation_id, c.input)),
         },
         Tool {
@@ -230,6 +239,7 @@ fn command_tools() -> Vec<Tool> {
                     "required": ["command_id"]
                 }),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| read_terminal_output_tool(c.pool, c.conversation_id, c.input)),
         },
         Tool {
@@ -249,6 +259,7 @@ fn command_tools() -> Vec<Tool> {
                     "required": ["terminal_id"]
                 }),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| list_commands_tool(c.pool, c.conversation_id, c.input)),
         },
         Tool {
@@ -272,6 +283,7 @@ fn command_tools() -> Vec<Tool> {
                     "required": ["command_id", "idle_notice_seconds"]
                 }),
             },
+            class: Class::READ_ONLY,
             run: run!(|c| set_idle_notice_tool(c.pool, c.conversation_id, c.input)),
         },
     ]

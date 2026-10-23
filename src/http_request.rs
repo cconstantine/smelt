@@ -150,7 +150,7 @@ fn resolve_redirect_target(base: &str, location: &str) -> Result<String, String>
 /// Parses a model-supplied HTTP method string — `reqwest::Method`'s own
 /// `FromStr` already handles case/validity, this just gives a clearer
 /// error than its default.
-fn parse_method(method: &str) -> Result<reqwest::Method, String> {
+pub(crate) fn parse_method(method: &str) -> Result<reqwest::Method, String> {
     // `reqwest::Method`'s `FromStr` is case-sensitive (HTTP method tokens
     // are, per RFC 7230) — uppercasing first is a lenient nicety for a
     // model that writes "post" rather than "POST", not a spec violation

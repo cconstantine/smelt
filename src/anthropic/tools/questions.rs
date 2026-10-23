@@ -3,7 +3,7 @@
 //! turn and the conversation waits for the answer, which becomes the
 //! call's result. This module only offers the definition.
 
-use super::Tool;
+use super::{Class, Tool};
 use crate::anthropic::ToolDefinition;
 use crate::questions::{ASK_USER, MAX_HEADER_CHARS, MAX_OPTIONS, MAX_QUESTIONS, MIN_OPTIONS};
 
@@ -62,6 +62,7 @@ pub(super) fn tools() -> Vec<Tool> {
                 "required": ["questions"]
             }),
         },
+        class: Class::READ_ONLY,
         run: run!(|_c| async { Err::<String, String>(format!("{ASK_USER} is answered by the user, not run")) }),
     }]
 }
