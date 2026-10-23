@@ -59,3 +59,27 @@ async fn test_a_question_for_the_parent_is_not_waiting_for_the_user(pool: PgPool
     let stored = get_pending_question(&pool, id).await.expect("get").expect("still there");
     assert_eq!((stored.asked_of.as_str(), stored.answer), ("parent", None));
 }
+
+/// SME-246: an AGENTS.md trust card waits for the user as a question
+/// does (agents.md, "Statuses"), so it is the sidebar's mark too.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_trust_card_is_waiting_for_the_user(pool: PgPool) {
+    let id = create_conversation(&pool).await.expect("conversation").id;
+    let asking = create_conversation(&pool).await.expect("conversation").id;
+    create_pending_question(&pool, asking, "toolu_q", &sample_questions()).await.expect("create");
+    let repo = create_conversation_repo(&pool, id, "https://example.com/r.git", "example.com/r", None, "r")
+        .await
+        .expect("a repo row");
+    let file = InstructionsFile { content: "Rules.".to_string(), file_bytes: 6, hash: "h".to_string(), commit: None };
+    let card = request_instruction(&pool, id, repo.id, "AGENTS.md", &file).await.expect("a card");
+    assert_eq!(list_waiting_conversations(&pool).await.expect("list"), vec![id, asking]);
+    delete_instruction_request(&pool, card.id).await.expect("decided");
+    assert_eq!(list_waiting_conversations(&pool).await.expect("list"), vec![asking]);
+}
+
+/// `WAITS_FOR_USER` spells the user's `asked_of` value inline; it must be
+/// the one questions are recorded with.
+#[test]
+fn test_the_waiting_predicate_names_the_users_asked_of() {
+    assert!(WAITS_FOR_USER.contains(&format!("q.asked_of = '{ASKED_OF_USER}'")));
+}

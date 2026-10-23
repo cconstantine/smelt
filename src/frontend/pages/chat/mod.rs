@@ -19,7 +19,7 @@ use crate::api::sandbox::SandboxSnapshot;
 use crate::api::browsing::{navigate_browser, send_browser_input};
 use crate::api::chat::{
     ContextDetailSnapshot, ContextUsageSnapshot, create_conversation,
-    delete_conversation, get_context_detail, get_conversations, get_messages, send_message,
+    delete_conversation, get_context_detail, get_messages, send_message,
 };
 // Only called from the live event-subscription loops below, which are
 // `web`-only (see their own cfg) — a native `server`-only build never
@@ -47,12 +47,12 @@ use crate::api::sandbox::{
 #[cfg(any(feature = "web", test))]
 use crate::events::ConversationEvent;
 use crate::questions::{PendingQuestion, QuestionAnswer, ASK_USER};
-use crate::api::questions::{answer_question, get_waiting_conversations};
+use crate::api::questions::answer_question;
 #[cfg(feature = "web")]
 use crate::api::questions::get_pending_question;
 use crate::events::SandboxPreview;
 use crate::frontend::Route;
-use crate::models::{Conversation, Message};
+use crate::models::Message;
 
 mod actions;
 mod composer;

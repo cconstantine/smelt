@@ -1,6 +1,7 @@
 //! The conversation list.
 
 use super::*;
+use crate::api::agents::{ConversationNode, get_conversation_tree};
 
 /// How long ago a conversation was last active, as the sidebar shows it:
 /// one unit, `now`, `5m`, `3h`, `2d`, `3w` (SME-41 D8).
@@ -31,25 +32,17 @@ pub(super) fn ConversationSidebar(
     let has_live_pod = move |id: i64| {
         matches!(&*live_pods.read(), Some(Ok(ids)) if ids.contains(&id))
     };
-    // Which conversations have a turn running, marked as working
-    // (SME-41 D9).
-    let busy = use_resource(move || {
-        let _ = turns_changed();
-        crate::api::chat::get_busy_conversations()
-    });
-    let is_busy = move |id: i64| matches!(&*busy.read(), Some(Ok(ids)) if ids.contains(&id));
-    // Which conversations wait on the user's answer to the model's question
-    // (SME-34).
-    let waiting = use_resource(move || {
-        let _ = questions_changed();
-        get_waiting_conversations()
-    });
-    let is_waiting = move |id: i64| matches!(&*waiting.read(), Some(Ok(ids)) if ids.contains(&id));
+    // Every conversation with its marks: a turn running (SME-41 D9), a
+    // question or trust card waiting for the user (SME-34), and an agent's
+    // persona and status (SME-246). Derived on the server at each fetch, so
+    // a conversation, turn or question change refetches it all.
     let initial_conversations = use_resource(move || {
         let _ = conversations_changed();
-        get_conversations()
+        let _ = turns_changed();
+        let _ = questions_changed();
+        get_conversation_tree()
     });
-    let mut conversations: Signal<Vec<Conversation>> = use_signal(Vec::new);
+    let mut conversations: Signal<Vec<ConversationNode>> = use_signal(Vec::new);
     let mut loaded = use_signal(|| false);
     // Why the list couldn't load, and why the last New conversation or
     // Delete failed. Each is cleared by its own next success: the list
@@ -98,7 +91,7 @@ pub(super) fn ConversationSidebar(
                 Ok(conversation) => {
                     action_error.set(None);
                     let id = conversation.id;
-                    conversations.write().insert(0, conversation);
+                    conversations.write().insert(0, ConversationNode::from(conversation));
                     navigator.push(Route::ConversationRoute { id });
                 }
                 Err(e) => action_error.set(Some(server_error_message(&e))),
@@ -212,10 +205,10 @@ pub(super) fn ConversationSidebar(
                                 },
                                 "{conversation.title}"
                             }
-                            if is_busy(conversation.id) {
+                            if conversation.busy {
                                 span { class: "conversation-busy", title: "Working" }
                             }
-                            if is_waiting(conversation.id) {
+                            if conversation.waiting_for_user {
                                 span { class: "conversation-waiting", title: "Waiting for your answer", "?" }
                             }
                             if has_live_pod(conversation.id) {
@@ -243,7 +236,7 @@ pub(super) fn ConversationSidebar(
 
 /// The armed Delete's label: how many agents go with the conversation, its
 /// whole subtree, counted from the list the sidebar already has (SME-236).
-fn delete_confirm_label(conversations: &[crate::models::Conversation], id: i64) -> String {
+fn delete_confirm_label(conversations: &[ConversationNode], id: i64) -> String {
     let mut under = 0;
     let mut frontier = vec![id];
     while let Some(parent) = frontier.pop() {
@@ -263,9 +256,9 @@ fn delete_confirm_label(conversations: &[crate::models::Conversation], id: i64) 
 mod tests {
     use super::*;
 
-    fn conversation(id: i64, parent_id: Option<i64>) -> crate::models::Conversation {
+    fn conversation(id: i64, parent_id: Option<i64>) -> ConversationNode {
         let at = chrono::NaiveDateTime::default();
-        crate::models::Conversation { id, title: format!("c{id}"), created_at: at, updated_at: at, parent_id }
+        ConversationNode::from(crate::models::Conversation { id, title: format!("c{id}"), created_at: at, updated_at: at, parent_id })
     }
 
     #[test]

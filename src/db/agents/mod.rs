@@ -11,10 +11,12 @@ use super::*;
 mod delete;
 mod messages;
 mod start;
+mod tree;
 
 pub use delete::*;
 pub use messages::*;
 pub use start::*;
+pub use tree::*;
 
 /// `agents.state`: the start is running; no turn is admitted.
 pub const AGENT_STARTING: &str = "starting";
@@ -366,21 +368,19 @@ pub struct ChildAgent {
 
 /// `parent`'s own children, newest first: never anyone else's.
 pub async fn list_child_agents(pool: &PgPool, parent: i64) -> Result<Vec<ChildAgent>, sqlx::Error> {
-    sqlx::query_as::<_, ChildAgent>(
+    sqlx::query_as::<_, ChildAgent>(&format!(
         "SELECT c.id, c.title, a.persona_path, a.state, a.created_at,
                 (SELECT max(m.created_at) FROM messages m WHERE m.conversation_id = c.id) AS last_message_at,
                 (SELECT count(*) FROM conversations g WHERE g.parent_id = c.id) AS agents_started,
-                (EXISTS (SELECT 1 FROM pending_questions q
-                         WHERE q.conversation_id = c.id AND q.answer IS NULL AND q.asked_of = $2)
-                 OR EXISTS (SELECT 1 FROM instruction_requests r WHERE r.conversation_id = c.id)) AS waiting_for_user,
+                {} AS waiting_for_user,
                 EXISTS (SELECT 1 FROM pending_questions q
-                        WHERE q.conversation_id = c.id AND q.answer IS NULL AND q.asked_of = $3) AS waiting_for_parent
+                        WHERE q.conversation_id = c.id AND q.answer IS NULL AND q.asked_of = $2) AS waiting_for_parent
          FROM conversations c JOIN agents a ON a.conversation_id = c.id
          WHERE c.parent_id = $1
          ORDER BY c.id DESC",
-    )
+        super::WAITS_FOR_USER
+    ))
     .bind(parent)
-    .bind(super::ASKED_OF_USER)
     .bind(super::ASKED_OF_PARENT)
     .fetch_all(pool)
     .await
