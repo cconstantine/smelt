@@ -99,3 +99,63 @@ async fn test_a_stop_and_a_send_racing_leave_the_row_as_memory_says(pool: PgPool
     eventually("the turn is over", || async { !crate::turn::turn_running(root) }).await;
     crate::turn::forget_conversation_lock(root);
 }
+
+/// SME-246 review 1: a parent's message that reopens a paused, finished
+/// agent, or answers a paused agent's question, starts no turn there, so
+/// nothing else would tell other tabs' sidebars its status changed.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_message_to_a_paused_agent_announces_its_new_status(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    setup(&pool, vec![text_reply("ok")]).await;
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    let send = |to: i64| {
+        let pool = pool.clone();
+        async move {
+            crate::anthropic::tools::execute(&pool, root, "toolu_m", "message_agent", &serde_json::json!({"to": to, "text": "Go on."}))
+                .await
+        }
+    };
+
+    let finished = active_child(&pool, root).await;
+    crate::turn::stop_conversation(&pool, finished).await;
+    sqlx::query("UPDATE agents SET state = 'finished' WHERE conversation_id = $1")
+        .bind(finished)
+        .execute(&pool)
+        .await
+        .expect("finish it");
+    let recording = crate::events::AppRecording::start();
+    assert_eq!(send(finished).await, Ok(format!("Sent to agent #{finished}.")));
+    assert_eq!(state(&pool, finished).await.as_deref(), Some(db::AGENT_ACTIVE), "the message reopened it");
+    assert!(!crate::turn::turn_running(finished), "a paused agent runs no turn");
+    assert!(
+        recording.events().contains(&crate::events::AppEvent::ConversationsChanged),
+        "reopening a paused agent announced nothing: {:?}",
+        recording.events()
+    );
+    drop(recording);
+
+    let asking = active_child(&pool, root).await;
+    crate::turn::stop_conversation(&pool, asking).await;
+    // Asked, and read by the parent: its queued question delivered.
+    sqlx::query(
+        "WITH q AS (INSERT INTO pending_questions (conversation_id, tool_use_id, questions, asked_of)
+                    VALUES ($1, 'toolu_p', '[]', 'parent') RETURNING created_at)
+         INSERT INTO agent_messages (to_conversation_id, from_conversation_id, from_label, kind, body, created_at, delivered_at)
+         SELECT $2, $1, 'agent', 'question', 'Which file?', q.created_at, now() FROM q",
+    )
+    .bind(asking)
+    .bind(root)
+    .execute(&pool)
+    .await
+    .expect("a question its parent has read");
+    let recording = crate::events::AppRecording::start();
+    assert_eq!(send(asking).await, Ok(format!("Agent #{asking} was waiting for your answer: it has it now.")));
+    assert!(
+        recording.events().contains(&crate::events::AppEvent::ConversationsChanged),
+        "answering a paused agent announced nothing: {:?}",
+        recording.events()
+    );
+    for id in [root, finished, asking] {
+        crate::turn::forget_conversation_lock(id);
+    }
+}

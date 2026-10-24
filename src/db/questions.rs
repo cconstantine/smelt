@@ -7,6 +7,14 @@ pub const ASKED_OF_USER: &str = "user";
 /// `pending_questions.asked_of`: the child's parent (`ask_parent`, SME-238).
 pub const ASKED_OF_PARENT: &str = "parent";
 
+/// Whether conversation `c` waits for the user: an unanswered question
+/// asked of the user, or an AGENTS.md trust card (agents.md, "Statuses").
+/// A child's question to its parent never counts. One predicate for the
+/// sidebar's mark, the tree, the banner and `list_agents` (SME-246).
+pub(crate) const WAITS_FOR_USER: &str = "(EXISTS (SELECT 1 FROM pending_questions q
+          WHERE q.conversation_id = c.id AND q.answer IS NULL AND q.asked_of = 'user')
+     OR EXISTS (SELECT 1 FROM instruction_requests r WHERE r.conversation_id = c.id))";
+
 /// A conversation's `pending_questions` row: the question it waits on, and
 /// the answer once given (`None` while waiting), and who it's asked of.
 #[derive(Debug, Clone, PartialEq)]
@@ -172,10 +180,7 @@ pub async fn create_message_taking_question(
 /// Conversations with a question still waiting for the user's answer,
 /// for the sidebar's waiting mark: not a child waiting for its parent.
 pub async fn list_waiting_conversations(pool: &PgPool) -> Result<Vec<i64>, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT conversation_id FROM pending_questions WHERE answer IS NULL AND asked_of = $1 ORDER BY conversation_id",
-    )
-    .bind(ASKED_OF_USER)
-    .fetch_all(pool)
+    sqlx::query_scalar(&format!("SELECT c.id FROM conversations c WHERE {WAITS_FOR_USER} ORDER BY c.id"))
+        .fetch_all(pool)
     .await
 }

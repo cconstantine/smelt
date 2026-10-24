@@ -152,6 +152,74 @@ body {
     white-space: nowrap;
 }
 
+/* The tree (SME-246): an agent indents under its parent, 14px a level up
+   to three (`--depth`, capped by the sidebar), and its status and persona
+   wrap onto a second line. The title's `flex: 1` has no width of its own,
+   so only that line ever wraps. */
+.conversation-item {
+    flex-wrap: wrap;
+    row-gap: 2px;
+    padding-left: calc(10px + var(--depth, 0) * 14px);
+}
+
+.tree-caret,
+.tree-caret-spacer {
+    flex-shrink: 0;
+    width: 18px;
+    height: 18px;
+    margin: 0 -4px 0 -4px;
+}
+
+.tree-caret {
+    padding: 0;
+    border: none;
+    border-radius: 4px;
+    background: none;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.tree-caret:hover,
+.tree-caret:focus-visible {
+    background: var(--border);
+    color: var(--text);
+}
+
+.conversation-agent-meta {
+    flex-basis: 100%;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 400;
+}
+
+/* Under the title, past the caret's room. */
+.tree-caret ~ .conversation-agent-meta,
+.tree-caret-spacer ~ .conversation-agent-meta {
+    padding-left: 18px;
+}
+
+.conversation-agent-meta .status-waiting-for-the-user {
+    color: var(--accent);
+    font-weight: 600;
+}
+
+.conversation-agent-meta .status-failed {
+    color: var(--danger);
+}
+
+/* On a two-line row, Delete covers the first line's end, where the age is,
+   not the persona and status. */
+.conversation-agent .delete-conversation {
+    top: 7px;
+    transform: none;
+}
+
 /* Laid over the end of the row rather than taking room from the title
    (SME-41 D8); it covers the age while shown. */
 .delete-conversation {

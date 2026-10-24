@@ -39,6 +39,9 @@ pub(crate) async fn message_agent(pool: &PgPool, caller: i64, input: &serde_json
         .map_err(|e| format!("couldn't send the message: {e}"))?;
     match outcome {
         db::MessageOutcome::Queued(recipient) => {
+            // A finished recipient is `active` again; a paused one runs no
+            // turn whose start would say so to other tabs (SME-246).
+            crate::events::publish_app(crate::events::AppEvent::ConversationsChanged);
             crate::turn::notify(pool, recipient, vec![crate::turn::Notice::Wake]);
             Ok(match to {
                 db::Recipient::Parent => "Sent to your parent.".to_string(),
@@ -46,6 +49,8 @@ pub(crate) async fn message_agent(pool: &PgPool, caller: i64, input: &serde_json
             })
         }
         db::MessageOutcome::Answered(child) => {
+            // No longer waiting for its parent, turn or not (SME-246).
+            crate::events::publish_app(crate::events::AppEvent::ConversationsChanged);
             crate::turn::notify(pool, child, vec![crate::turn::Notice::Wake]);
             Ok(format!("Agent #{child} was waiting for your answer: it has it now."))
         }

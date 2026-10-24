@@ -603,9 +603,10 @@ pub(super) static MOCK_PROVIDER: std::sync::OnceLock<i64> = std::sync::OnceLock:
 /// The model `MOCK_PROVIDER` serves (any name does: the mock ignores it).
 pub(super) const MOCK_MODEL: &str = "mock-model";
 
-/// How many times `page` has fetched the conversation list.
+/// How many times `page` has fetched the conversation list (the tree, since
+/// SME-246).
 pub(super) async fn list_requests(page: &chromiumoxide::Page) -> usize {
-    page.evaluate("performance.getEntriesByType('resource').filter(e => e.name.endsWith('/api/conversations')).length")
+    page.evaluate("performance.getEntriesByType('resource').filter(e => e.name.endsWith('/api/conversations/tree')).length")
         .await
         .expect("read resource timings")
         .into_value()

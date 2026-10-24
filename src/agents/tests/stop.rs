@@ -277,3 +277,20 @@ async fn test_an_answer_in_a_child_that_cant_take_a_turn_is_refused_before_its_r
     let question = db::get_pending_question(&pool, child).await.expect("read").expect("still there");
     assert!(question.answer.is_none(), "the answer wasn't recorded");
 }
+
+/// SME-246: stopping a child with no turn running changes its status in
+/// every tab's sidebar, so it's announced like any other list change;
+/// before, nothing was published and other tabs kept "idle".
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_stop_agent_on_an_idle_child_announces_the_change(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    let child = active_child(&pool, root).await;
+    let recording = crate::events::AppRecording::start();
+    assert_eq!(stop(&pool, root, child).await, Ok(format!("Stopped agent #{child}.")));
+    assert!(
+        recording.events().contains(&crate::events::AppEvent::ConversationsChanged),
+        "stopping an idle agent announced nothing: {:?}",
+        recording.events()
+    );
+}

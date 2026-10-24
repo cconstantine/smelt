@@ -109,7 +109,49 @@ static APP_BUS: LazyLock<broadcast::Sender<super::AppEvent>> =
 
 /// Publishes `event` to every app-wide subscriber.
 pub fn publish_app(event: super::AppEvent) {
+    #[cfg(test)]
+    RECORDED_APP.with(|recorded| {
+        if let Some(events) = recorded.borrow_mut().as_mut() {
+            events.push(event.clone());
+        }
+    });
     let _ = APP_BUS.send(event);
+}
+
+#[cfg(test)]
+thread_local! {
+    static RECORDED_APP: std::cell::RefCell<Option<Vec<super::AppEvent>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The app-wide events published on this thread while it lives (SME-246
+/// review 1). The bus is shared by every test in the process, so a test
+/// that listens on it can pass on another test's event; a
+/// `#[sqlx::test]` runs on a current-thread runtime, so what this
+/// records is what the test's code published on that runtime (inline, or
+/// from a task spawned onto it that ran before `events`); a publish from
+/// another thread is missed, which fails a test rather than passing one.
+/// One recording at a time per thread: dropping one ends any other.
+#[cfg(test)]
+pub struct AppRecording(());
+
+#[cfg(test)]
+impl AppRecording {
+    pub fn start() -> Self {
+        RECORDED_APP.with(|recorded| *recorded.borrow_mut() = Some(Vec::new()));
+        AppRecording(())
+    }
+
+    /// What was published so far, in order.
+    pub fn events(&self) -> Vec<super::AppEvent> {
+        RECORDED_APP.with(|recorded| recorded.borrow().clone().unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+impl Drop for AppRecording {
+    fn drop(&mut self) {
+        RECORDED_APP.with(|recorded| *recorded.borrow_mut() = None);
+    }
 }
 
 /// Subscribes to app-wide events from this point forward.

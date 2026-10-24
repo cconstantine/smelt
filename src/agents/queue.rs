@@ -56,6 +56,10 @@ pub(crate) async fn stop_agent(pool: &PgPool, caller: i64, input: &serde_json::V
             for conversation_id in &subtree {
                 crate::turn::stop_conversation(pool, *conversation_id).await;
             }
+            // Their status changed in every tab's sidebar, a turn running
+            // or not: a stopped turn's end says nothing for an idle one
+            // (SME-246).
+            crate::events::publish_app(crate::events::AppEvent::ConversationsChanged);
             Ok(match subtree.len() - 1 {
                 0 => format!("Stopped agent #{id}."),
                 1 => format!("Stopped agent #{id} and 1 agent under it."),

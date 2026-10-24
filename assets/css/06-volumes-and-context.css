@@ -446,6 +446,30 @@
     color: var(--danger);
 }
 
+/* SME-246: the agents under the open conversation that wait for the user,
+   above its context bar; absent while none does. */
+.agents-waiting-banner {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 12px;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--subtle);
+    font-size: 13px;
+    overflow-wrap: anywhere;
+}
+
+.agents-waiting-label {
+    color: var(--text);
+    font-weight: 600;
+}
+
+.agents-waiting-link {
+    min-width: 0;
+    color: var(--accent);
+}
+
 .conversation-missing {
     margin: 48px auto;
     color: var(--text-2);

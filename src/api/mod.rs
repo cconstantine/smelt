@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod browsing;
 pub mod chat;
 pub mod git;
