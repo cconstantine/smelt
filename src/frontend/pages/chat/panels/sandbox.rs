@@ -22,20 +22,46 @@ pub(in super::super) fn repo_status_class(status: RepoStatus) -> &'static str {
     }
 }
 
-/// A repo's state under its path in the sandbox panel.
+/// A repo's state under its path in the sandbox panel. A branch name is
+/// the remote's choice (Ready) or the model's request (Cloning), and
+/// neither is checked on the way in, so both show through SME-276's
+/// escape: a name carrying a bidi control or an invisible character
+/// can't reorder or hide what the user reads (SME-273).
 pub(in super::super) fn repo_detail(repo: &RepoSummary) -> String {
     match repo.status {
         RepoStatus::Cloning => match &repo.requested_branch {
-            Some(branch) => format!("Cloning {branch}\u{2026}"),
+            Some(branch) => format!("Cloning {}\u{2026}", crate::git::plain_multiline_text(branch)),
             None => "Cloning\u{2026}".to_string(),
         },
         RepoStatus::Failed => "Clone failed".to_string(),
         RepoStatus::Ready => {
-            let branch = repo.branch.clone().unwrap_or_default();
+            let branch = crate::git::plain_multiline_text(repo.branch.as_deref().unwrap_or_default());
             let commit: String = repo.commit.clone().unwrap_or_default().chars().take(7).collect();
             format!("{branch} \u{b7} {commit}")
         }
     }
+}
+
+/// The hover notice for the branch name `repo_detail` shows: `Some`
+/// when that name has characters the escape had to write out, naming
+/// how many in exactly the trust card's wording so the two can't drift
+/// (SME-273). `None` for a plain name, and for a Cloning row with no
+/// requested name.
+pub(in super::super) fn repo_detail_notice(repo: &RepoSummary) -> Option<String> {
+    let name = match repo.status {
+        RepoStatus::Cloning => repo.requested_branch.as_deref()?,
+        RepoStatus::Ready => repo.branch.as_deref().unwrap_or_default(),
+        RepoStatus::Failed => "",
+    };
+    let hidden = crate::git::hidden_characters(name);
+    (hidden > 0).then(|| super::super::shown_text::hidden_text_note(hidden))
+}
+
+/// The failed-clone error as the panel shows it (SME-273): escaped by
+/// the same rule SME-275/276 already apply to that string toward the
+/// model — the remote writes into it, and it's never checked.
+pub(in super::super) fn repo_error_shown(repo: &RepoSummary) -> Option<String> {
+    repo.error.as_deref().map(|error| crate::git::plain_multiline_text(error))
 }
 
 /// What a terminal's titlebar says about its most recent command
@@ -166,7 +192,17 @@ pub(in super::super) fn SandboxPanel(
                                     class: "sandbox-repo sandbox-repo-{repo_status_class(repo.status)}",
                                     title: "{repo.url}",
                                     code { class: "sandbox-repo-path", "{repo.path}" }
-                                    span { class: "sandbox-repo-detail", "{repo_detail(&repo)}" }
+                                    {
+                                        let detail = repo_detail(&repo);
+                                        match repo_detail_notice(&repo) {
+                                            Some(notice) => rsx! {
+                                                span { class: "sandbox-repo-detail", title: "{notice}", "{detail}" }
+                                            },
+                                            None => rsx! {
+                                                span { class: "sandbox-repo-detail", "{detail}" }
+                                            },
+                                        }
+                                    }
                                     if let Some(label) = instructions_label(&repo) {
                                         span {
                                             class: "sandbox-repo-instructions",
@@ -174,7 +210,7 @@ pub(in super::super) fn SandboxPanel(
                                             "{label}"
                                         }
                                     }
-                                    if let Some(err) = repo.error.clone() {
+                                    if let Some(err) = repo_error_shown(&repo) {
                                         pre { class: "sandbox-repo-error", "{err}" }
                                     }
                                 }
