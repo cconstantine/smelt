@@ -5,7 +5,9 @@
 # and names the server that holds it, that a pid file only ever claims a group
 # that looks like this worktree's server, and that the default check worktree
 # belongs to this checkout alone. G8 (SME-226) covers the two database settings:
-# each accepts exactly 1, and they refuse each other. The stubs and helpers are
+# each accepts exactly 1, and they refuse each other. G10 (SME-265) covers the
+# check worktree's own shape: a plain directory is refused, because checking out
+# there would move the repository containing it. The stubs and helpers are
 # in scripts/lib/test-check-scripts.sh.
 #
 #   scripts/test-check-server-guards
@@ -567,5 +569,35 @@ flock -n "$port_lock" true || fail "G8 (both flags): the refused pair took the p
 # The old flag alone is still accepted: it is the default now (question 2's
 # answer), so the docs and runbooks that set it keep working.
 check_server stop >/dev/null
+
+# G10 (SME-265): a CHECK_WORKTREE that exists but isn't the top level of a git
+# working tree of its own is refused. A plain directory sits inside a repository
+# — this checkout, for one under target/ — and start's checkout walked up out of
+# it and detached that one instead, at the commit of a fixture clone made
+# whenever the suite first ran: which is how gates detached the very checkout
+# running them (SME-267, SME-270, SME-277). The refusal names the directory and
+# exits 1: nothing checked out, written, created, locked or moved.
+plain_wt=$dir/plain-worktree
+mkdir -p "$plain_wt"
+check_server stop >/dev/null
+: >"$SQLX_CALLS"
+: >"$pid_file"
+: >"$scratch_file"
+g10_head=$(git rev-parse HEAD)
+g10_ref=$(git symbolic-ref -q HEAD || echo DETACHED)
+out=$("${guard_env[@]}" CHECK_WORKTREE="$plain_wt" scripts/check-server start HEAD 2>&1)
+rc=$?
+[ "$rc" = 1 ] || fail "G10: a start in a plain directory exited $rc, not 1: $out"
+grep -qF "$plain_wt" <<<"$out" || fail "G10: the refusal doesn't name the directory: $out"
+grep -qF "not the top level of a git working tree" <<<"$out" ||
+    fail "G10: the refusal doesn't say what's wrong with the directory: $out"
+grep -q "check server up" <<<"$out" && fail "G10: a start in a plain directory came up: $out"
+[ -s "$SQLX_CALLS" ] && fail "G10: a refused start called sqlx: $(cat "$SQLX_CALLS")"
+[ -n "$(ls -A "$plain_wt")" ] && fail "G10: a refused start wrote into the plain directory: $(ls -A "$plain_wt")"
+[ "$(git rev-parse HEAD)" = "$g10_head" ] && [ "$(git symbolic-ref -q HEAD || echo DETACHED)" = "$g10_ref" ] ||
+    fail "G10: a refused start moved this checkout's HEAD: '$g10_ref $g10_head' → '$(git symbolic-ref -q HEAD || echo DETACHED) $(git rev-parse HEAD)'"
+flock -n "$port_lock" true || fail "G10: a refused start took the port lock"
+# Whatever a red run brought up, so the case leaves nothing for the next one.
+"${guard_env[@]}" CHECK_WORKTREE="$plain_wt" scripts/check-server stop >/dev/null 2>&1
 
 finish
