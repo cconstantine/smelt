@@ -1,0 +1,16 @@
+<tool_call>
+<function=mcp__linear.app__issue_read>
+<parameter=issue_number>
+239
+</parameter>
+<parameter=method>
+get_comments
+</parameter>
+<parameter=owner>
+cconstantine
+</parameter>
+<parameter=repo>
+smelt
+</parameter>
+</function>
+</tool_call>

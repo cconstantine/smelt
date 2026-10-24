@@ -1,0 +1,7 @@
+Let me check the time</think>
+
+<｜DSML｜function_calls>
+<｜DSML｜invoke name="get_time">
+<｜DSML｜parameter name="city" string="true">Tokyo</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜function_calls>

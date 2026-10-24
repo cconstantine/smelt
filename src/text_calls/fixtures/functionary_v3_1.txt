@@ -1,0 +1,1 @@
+<function=special_function>{"arg1": 1}</function>

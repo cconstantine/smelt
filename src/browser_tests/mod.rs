@@ -266,6 +266,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "attach_error_outlives_a_switch", 60, Box::pin(scenario_attach_error_outlives_a_switch(&t))).await;
     run_scenario(&t, only, r, k, "attach_error_after_the_first_message", 60, Box::pin(scenario_attach_error_after_the_first_message(&t))).await;
     run_scenario(&t, only, r, k, "delete_names_its_agents", 60, Box::pin(scenario_delete_names_its_agents(&t))).await;
+    run_scenario(&t, only, r, k, "text_call_correction", 30, Box::pin(scenario_text_call_correction(&t))).await;
 
     let mut failures: Vec<String> = results
         .iter()
@@ -321,6 +322,7 @@ mod keyboard_and_errors;
 mod links_and_commands;
 mod repo_attach;
 mod agents;
+mod text_calls;
 
 use harness::*;
 use basics::*;
@@ -338,3 +340,4 @@ use keyboard_and_errors::*;
 use links_and_commands::*;
 use repo_attach::*;
 use agents::*;
+use text_calls::*;
