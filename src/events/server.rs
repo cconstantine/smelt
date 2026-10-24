@@ -127,7 +127,10 @@ thread_local! {
 /// review 1). The bus is shared by every test in the process, so a test
 /// that listens on it can pass on another test's event; a
 /// `#[sqlx::test]` runs on a current-thread runtime, so what this
-/// records is only what the test's own code published inline.
+/// records is what the test's code published on that runtime (inline, or
+/// from a task spawned onto it that ran before `events`); a publish from
+/// another thread is missed, which fails a test rather than passing one.
+/// One recording at a time per thread: dropping one ends any other.
 #[cfg(test)]
 pub struct AppRecording(());
 

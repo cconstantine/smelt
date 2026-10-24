@@ -87,11 +87,18 @@ pub(super) fn ConversationSidebar(
         });
     });
 
-    // The open conversation's row always shows: opening an agent inside a
-    // folded parent (its banner link, a URL) unfolds the parents above it.
+    // Opening an agent inside a folded parent (its banner link, a URL)
+    // unfolds the parents above it, once per opening: the list refetches on
+    // every turn anywhere, and a fold the user makes after opening must hold
+    // (SME-246 review 2). It waits for the list to have the open row.
+    let mut unfolded_for: Signal<Option<i64>> = use_signal(|| None);
     use_effect(move || {
         let open = selected();
         let nodes = conversations();
+        if *unfolded_for.peek() == open || !open.is_some_and(|id| nodes.iter().any(|n| n.id == id)) {
+            return;
+        }
+        unfolded_for.set(open);
         let mut folded = collapsed.peek().clone();
         if unfold_to(&mut folded, &nodes, open) {
             collapsed.set(folded);

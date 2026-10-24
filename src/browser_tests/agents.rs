@@ -239,4 +239,17 @@ pub(super) async fn scenario_agent_tree(t: &Scenario<'_>) {
         Duration::from_secs(10),
     )
     .await;
+    // Folding the open agent's grandparent then holds through the next
+    // refetch of the tree (review 2): the unfold is once per opening.
+    click_when_present(&page, &caret, Duration::from_secs(5)).await;
+    wait_for_tree(&page, &ids, &[row(root.id, 0, "", "?2")], "folded above the open agent").await;
+    let fetches = list_requests(&page).await;
+    crate::events::publish_app(crate::events::AppEvent::TurnsChanged);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while list_requests(&page).await <= fetches {
+        assert!(tokio::time::Instant::now() < deadline, "the tree never refetched after TurnsChanged");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(tree_rows(&page, &ids).await, vec![row(root.id, 0, "", "?2")], "the fold sprang open on a refetch");
 }
