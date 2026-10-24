@@ -1,0 +1,24 @@
+Verified: blocked-by SME-246 recorded, status Up Next, started comment exists. Now the finished comment.
+
+<tool_call>
+<function=mcp__linear.app__add_issue_comment>
+<parameter=body>
+Planner finished (planning stopped on overlap — no plan written):
+
+- Applied "Planning waits for overlapping work" (docs/personas/project-manager.md) across the whole board: the only unshipped Planned/Todo/In Progress ticket sharing files with this plan is SME-246 (In Progress; its plan docs/plans/sme-246.md on sme-246-agent-tree-sidebar).
+- Overlap: src/db/agents/start.rs — this ticket's design records the child's mounts and locks the volume rows FOR SHARE in start_agent's transaction (db::agents::start::create_child), and SME-246's plan edits the same file (PersonaSnapshot gains dir; complete_start's UPDATE). Also src/agents/tests/mod.rs: both plans append a mod line for a new test file.
+- Left behind: a "Plan (partial — planning stopped on overlap)" section in the description — the worked-out file list with sizes at main b151495, the overlap details, and criticals (sandbox/spec.rs is 2,591 bytes under the 40,000 ceiling so a split-first commit; the migration must sort after 20261023210000 on SME-246's branch; the classes are already fixed in docs/design/personas/tool-rules.md — create_volume writing, delete_volume destructive; the volumes page's create_volume/delete_volume server functions are a separate namespace, don't touch).
+- Waits for: SME-246, recorded as a blocked-by relation. Status stays Up Next; the Project Manager starts a fresh Planner from those notes once SME-246 is Done.
+- No branch, no plan file, no code. No questions for the user.
+</parameter>
+<parameter=issue_number>
+239
+</parameter>
+<parameter=owner>
+cconstantine
+</parameter>
+<parameter=repo>
+smelt
+</parameter>
+</function>
+</tool_call>

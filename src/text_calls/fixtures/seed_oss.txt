@@ -1,0 +1,5 @@
+<seed:tool_call>
+<function=special_function>
+<parameter=arg1>1</parameter>
+</function>
+</seed:tool_call>

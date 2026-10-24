@@ -1,0 +1,20 @@
+## What happens
+
+On the deployed smelt (llama.cpp provider), the model sometimes writes a tool call as plain text in its reply instead of making it, e.g.:
+
+```
+<tool_call>
+<function=mcp__linear.app__add_issue_comment>
+<parameter=body>
+Planner finished …
+</parameter>
+<parameter=issue_number>239</parameter>
+<parameter=owner>cconstantine</parameter>
+…
+```
+
+The named tool doesn't exist: it is the GitHub MCP server's `add_issue_comment` (not offered; X-MCP-Tools filters it) crossed with Linear's prefix, while Linear's real comment tool, `mcp__linear.app__save_comment`, is offered and never tried.
+
+## Fix (proposed)
+
+When an assistant reply contains tool-call markup that wasn't parsed as a tool call (`<tool_call>`, `<function=`, and the other forms the provider templates produce), don't end the turn on it. Send the model a correction as the next message and let the loop continue, e.g. "That wasn't a tool call: no tool named `mcp__linear.app__add_issue_comment` is offered."

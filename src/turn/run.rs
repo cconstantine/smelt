@@ -487,6 +487,7 @@ fn run_turn_steps<'a: 'b, 'b>(
             tracing::info!(conversation_id, "starting a turn while a repo is still cloning");
         }
 
+        let mut streak = TextCallStreak::default();
         for _ in 0..max_turns {
             // Checked at the top of every loop iteration, not just once per
             // `run_turn_bounded` call — this is what gives same-turn visibility: if
@@ -571,6 +572,7 @@ fn run_turn_steps<'a: 'b, 'b>(
             let (mut request, budget) =
                 build_request(pool, conversation_id, turn_model, last_known_usage.as_ref(), &pending_new_content)
                     .await?;
+            let offered: Vec<String> = request.tools.iter().map(|tool| tool.name.clone()).collect();
             let (turn, recorder) = call_model(pool, conversation_id, turn_model, &mut request).await?;
             save_reply(pool, conversation_id, &turn, &mut persisted).await?;
             #[cfg(test)]
@@ -584,27 +586,43 @@ fn run_turn_steps<'a: 'b, 'b>(
             pending_new_content.clear();
             save_stop_notice(pool, conversation_id, turn_model, &turn, &budget, &mut persisted).await?;
 
-            if turn.stop_reason != "tool_use" {
-                return Ok(persisted);
-            }
+            // A call written as text gets a correction, and the model is
+            // called again (SME-286).
+            let offered: Vec<&str> = offered.iter().map(String::as_str).collect();
+            let correction = match after_reply(
+                pool,
+                conversation_id,
+                &turn,
+                &offered,
+                &mut streak,
+                &mut persisted,
+                &mut pending_new_content,
+            )
+            .await?
+            {
+                NextStep::RunTools(correction) => correction,
+                NextStep::CallAgain => continue,
+                NextStep::End => return Ok(persisted),
+            };
 
-            // Asked the user, or an agent finished (SME-236): the turn ends.
+            // Asked the user, or an agent finished (SME-236): the turn ends,
+            // with any results saved. A reply here makes at least one call.
             let (result_blocks, ends) = run_tools(pool, conversation_id, &turn).await?;
+            if !result_blocks.is_empty() {
+                let saved = db::create_message(pool, conversation_id, "user", &result_blocks)
+                    .await
+                    .map_err(ServerFnError::new)?;
+                record_saved(conversation_id, &mut persisted, saved);
+            }
+            pending_new_content = result_blocks;
+            // A call the reply wrote as text, told after the real calls'
+            // results, even when the turn ends here (SME-286).
+            if let Some(correction) = correction {
+                save_notice(pool, conversation_id, correction, &mut persisted, &mut pending_new_content).await?;
+            }
             if ends {
-                if !result_blocks.is_empty() {
-                    let saved = db::create_message(pool, conversation_id, "user", &result_blocks)
-                        .await
-                        .map_err(ServerFnError::new)?;
-                    record_saved(conversation_id, &mut persisted, saved);
-                }
                 return Ok(persisted);
             }
-
-            let saved = db::create_message(pool, conversation_id, "user", &result_blocks)
-                .await
-                .map_err(ServerFnError::new)?;
-            pending_new_content = result_blocks;
-            record_saved(conversation_id, &mut persisted, saved);
         }
 
         Err(ServerFnError::new(format!(

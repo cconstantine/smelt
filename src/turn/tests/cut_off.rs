@@ -84,6 +84,8 @@ fn sent_messages(requests: &std::sync::Mutex<Vec<serde_json::Value>>, n: usize) 
 
 /// B3 (SME-122): an empty reply isn't saved: the API refuses an empty
 /// assistant message once it isn't the last, so every later turn failed.
+/// Since SME-286 the first gets a nudge and the model is called again;
+/// the blank reply after it ends the turn, saving nothing either.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_empty_reply_is_not_saved_and_the_next_turn_works(pool: PgPool) {
     let _guard = lock_turn_tests();
@@ -94,10 +96,8 @@ async fn test_an_empty_reply_is_not_saved_and_the_next_turn_works(pool: PgPool) 
 
     let saved = run_turn(&pool, conversation.id, hello()).await.expect("an empty reply doesn't fail the turn");
     let roles: Vec<&str> = saved.iter().map(|m| m.role.as_str()).collect();
-    assert_eq!(roles, ["user"], "nothing saved for the empty reply: {saved:?}");
-    let saved = run_turn(&pool, conversation.id, hello()).await.expect("a blank reply doesn't fail the turn");
-    let roles: Vec<&str> = saved.iter().map(|m| m.role.as_str()).collect();
-    assert_eq!(roles, ["user"], "nothing saved for the blank reply: {saved:?}");
+    assert_eq!(roles, ["user", "user"], "nothing saved for the empty or the blank reply, only the nudge: {saved:?}");
+    assert_eq!(only_text(&saved[1]), crate::text_calls::EMPTY_REPLY_NOTICE);
 
     run_turn(&pool, conversation.id, hello()).await.expect("the next turn");
     let roles: Vec<String> = sent_messages(&requests, 2).into_iter().map(|(role, _)| role).collect();

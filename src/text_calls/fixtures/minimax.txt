@@ -1,0 +1,7 @@
+Let's call a tool:
+</think>
+
+<minimax:tool_call>
+<invoke name="empty_args">
+</invoke>
+</minimax:tool_call>
