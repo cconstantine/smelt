@@ -254,3 +254,66 @@ mod context_usage_tests {
         assert_eq!(breakdown.free_tokens, 0);
     }
 }
+/// SME-244: the "Spent so far" group line. An agent's context view always
+/// shows its group's spend under the root's title; a root shows the group
+/// line only once an agent's call has landed, never its own figure twice.
+/// The cost text is the same one the conversation's own line uses, so an
+/// unpriced group call reads through it the same way. (Titles without
+/// apostrophes so the html escaping doesn't confuse the assertions — the
+/// possessive `'s` in the copy itself is SSR-escaped, as detail_body_tests
+/// pins.)
+#[cfg(all(test, feature = "server"))]
+mod group_spend_tests {
+    use super::*;
+    use crate::models::ConversationSpend;
+
+    fn spend(calls: i64, cost_usd: Option<f64>, unpriced_calls: i64) -> ConversationSpend {
+        ConversationSpend { calls, cost_usd, unpriced_calls, ..ConversationSpend::default() }
+    }
+
+    fn detail(spend: ConversationSpend, group_spend: ConversationSpend, group_root_title: Option<&str>) -> ContextDetailSnapshot {
+        ContextDetailSnapshot {
+            system: None,
+            instructions: vec![],
+            tools: vec![],
+            message_count: 0,
+            usage: None,
+            context_window: 200_000,
+            spend,
+            prices_as_of: None,
+            group_spend,
+            group_root_title: group_root_title.map(|t| t.to_string()),
+        }
+    }
+
+    fn render(detail: ContextDetailSnapshot) -> String {
+        dioxus::ssr::render_element(render_context_detail_body(Some(&Ok(detail))))
+    }
+
+    #[test]
+    fn test_an_agents_context_view_shows_its_groups_spend_under_the_root_title() {
+        let html = render(detail(spend(1, Some(1.0), 0), spend(2, Some(5.0), 0), Some("Build the thing")));
+        assert!(html.contains("In Build the thing&#39;s group: $5.00"), "{html}");
+        assert!(html.contains("$1.00"), "its own line stays: {html}");
+    }
+
+    #[test]
+    fn test_a_root_shows_the_group_line_once_an_agents_call_has_landed() {
+        let html = render(detail(spend(1, Some(1.0), 0), spend(2, Some(2.0), 0), None));
+        assert!(html.contains("With its agents: $2.00"), "{html}");
+        assert!(html.contains("$1.00"), "its own line comes first: {html}");
+    }
+
+    #[test]
+    fn test_a_root_with_no_agent_calls_shows_no_group_line() {
+        let html = render(detail(spend(1, Some(1.0), 0), spend(1, Some(1.0), 0), None));
+        assert!(!html.contains("With its agents"), "its own figure would print twice: {html}");
+        assert!(!html.contains("group:"), "{html}");
+    }
+
+    #[test]
+    fn test_the_group_line_prices_what_has_a_price_and_counts_what_hasnt() {
+        let html = render(detail(spend(1, Some(0.25), 0), spend(2, Some(0.5), 1), Some("Build the thing")));
+        assert!(html.contains("$0.50, plus 1 call with no price"), "{html}");
+    }
+}

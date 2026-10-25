@@ -230,6 +230,18 @@ pub(super) fn render_context_detail_body(detail: Option<&Result<ContextDetailSna
             p { "Context window: {detail.context_window}" }
             h4 { class: "context-detail-heading", "Spent so far" }
             p { "{spend_cost_text(&detail.spend)}" }
+            // The group line (SME-244): an agent's always shows it — it
+            // answers "which group is this?" with the root's title, and
+            // it's never empty (a group's root had to run a turn to
+            // start the agent). A root shows it only once an agent's
+            // call has landed: shown always, a root with no agents
+            // would see its own figure twice. The tests in
+            // context/tests.rs pin these exact strings.
+            if let Some(root_title) = &detail.group_root_title {
+                p { "In {root_title}'s group: {spend_cost_text(&detail.group_spend)}" }
+            } else if detail.group_spend.calls > detail.spend.calls {
+                p { "With its agents: {spend_cost_text(&detail.group_spend)}" }
+            }
             if detail.spend.calls > 0 {
                 p {
                     "{crate::models::calls_text(detail.spend.calls)} — uncached input: {detail.spend.input_tokens}, "
