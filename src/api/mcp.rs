@@ -246,6 +246,192 @@ pub async fn disconnect_mcp_server_oauth(id: i64) -> ServerFnResult<()> {
     Ok(())
 }
 
+// --- Per-tool class overrides (SME-240) ---
+
+/// One tool's class row for the edit page: the server's own answer from
+/// its annotations (`server_class`, `None` when the tool isn't in the
+/// current live list — an override saved for a tool that has since
+/// disappeared), the user's override (`override_class`, `None` when
+/// there is none), and whether the server lists the tool at all
+/// (`listed`, `None` when the server was unreachable so the live list
+/// is unknown). Classes ride as the `as_str()` texts; the page and the
+/// POST both speak those names.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct McpToolClassRow {
+    pub tool_name: String,
+    pub server_class: Option<String>,
+    /// Whether the server annotated the tool it lists (SME-240: the page
+    /// says "from the server" or "the server doesn't annotate it (the
+    /// default)" by it). `None` when there's no live listing to read
+    /// hints from — the tool isn't listed, or the server is unreachable.
+    /// (The plan's struct named this only in `McpToolClassInfo`; the page
+    /// can't tell annotation from default without it crossing, so the
+    /// merge carries it across.)
+    pub annotated: Option<bool>,
+    pub override_class: Option<String>,
+    pub listed: Option<bool>,
+}
+
+/// The edit page's Tool-classes section: one row per listed tool plus
+/// one per saved override for a no-longer-listed tool, and `server_note`
+/// — why the live list is missing (unreachable, sign-in expired, OAuth
+/// not connected yet) — when it is.
+#[cfg_attr(not(feature = "server"), expect(dead_code, reason = "SME-240's Tool-classes section renders these rows"))]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct McpToolClasses {
+    pub rows: Vec<McpToolClassRow>,
+    pub server_note: Option<String>,
+}
+
+/// The page's rows: listed tools in the server's own order, each carrying
+/// the server's annotation class and (when one exists) its override;
+/// then, by tool name, the saved overrides whose tool the current live
+/// list no longer has — the design keeps those, and the page offers them
+/// for clearing. Pure, so it's testable without a connection.
+#[cfg(feature = "server")]
+fn merge_tool_class_rows(
+    listed: Vec<crate::mcp::McpToolClassInfo>,
+    saved: Vec<(String, String)>,
+) -> Vec<McpToolClassRow> {
+    let overrides: HashMap<&str, &str> =
+        saved.iter().map(|(name, class)| (name.as_str(), class.as_str())).collect();
+    let mut rows: Vec<McpToolClassRow> = listed
+        .iter()
+        .map(|tool| McpToolClassRow {
+            tool_name: tool.name.clone(),
+            server_class: Some(tool.server_class.as_str().to_string()),
+            annotated: Some(tool.annotated),
+            override_class: overrides.get(tool.name.as_str()).map(|class| (*class).to_string()),
+            listed: Some(true),
+        })
+        .collect();
+    let listed_names: std::collections::HashSet<&str> =
+        listed.iter().map(|tool| tool.name.as_str()).collect();
+    // `db::list_mcp_tool_classes` already delivers by tool name, so the
+    // stale overrides come out by name without another sort.
+    rows.extend(saved.into_iter().filter(|(name, _)| !listed_names.contains(name.as_str())).map(|(tool_name, class)| McpToolClassRow {
+        tool_name,
+        server_class: None,
+        annotated: None,
+        override_class: Some(class),
+        listed: Some(false),
+    }));
+    rows
+}
+
+/// The GET's rows when there is no live list to merge with: the saved
+/// overrides alone, `listed: None` — the live state is unknown, not
+/// absent.
+#[cfg(feature = "server")]
+fn saved_only_rows(saved: Vec<(String, String)>) -> Vec<McpToolClassRow> {
+    saved
+        .into_iter()
+        .map(|(tool_name, class)| McpToolClassRow {
+            tool_name,
+            server_class: None,
+            annotated: None,
+            override_class: Some(class),
+            listed: None,
+        })
+        .collect()
+}
+
+/// The POST's tool-name check. The page only ever offers listed and
+/// saved names, so a blank one means a hand-built request — refuse it
+/// rather than store an unaddressable row.
+#[cfg(feature = "server")]
+fn check_override_tool_name(tool_name: &str) -> Result<(), String> {
+    if tool_name.trim().is_empty() {
+        Err("a tool name is required".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+/// The POST's class check: the three names, or the table's CHECK's words
+/// back to the sender.
+#[cfg(feature = "server")]
+fn parse_override_class(class: Option<String>) -> Result<Option<crate::anthropic::tools::ToolClass>, String> {
+    match class.as_deref() {
+        None => Ok(None),
+        Some(text) => crate::anthropic::tools::ToolClass::parse(text)
+            .map(Some)
+            .ok_or_else(|| format!("unknown tool class {text:?}: expected read-only, writing or destructive")),
+    }
+}
+
+/// The edit page's Tool-classes section: every live tool with the class
+/// the server's own annotations give it, merged with the user's saved
+/// overrides. When the server can't be listed right now — unreachable,
+/// expired sign-in, or an OAuth server never connected — the section is
+/// the saved overrides plus a `server_note` saying why, still editable
+/// so an override can be cleared while the server is down.
+#[get("/api/mcp-servers/{id}/tool-classes")]
+pub async fn get_mcp_tool_classes(id: i64) -> ServerFnResult<McpToolClasses> {
+    let config = db::get_mcp_server_config(db::get(), id)
+        .await
+        .map_err(ServerFnError::new)?
+        .ok_or_else(|| ServerFnError::new(format!("no MCP server config with id {id}")))?;
+    let saved = db::list_mcp_tool_classes(db::get(), id).await.map_err(ServerFnError::new)?;
+    // Mirrors `mcp_server_status`'s `NotConnected` short-circuit: there's
+    // nothing to connect with, so don't spend a connect attempt on it.
+    if config.auth_mode == "oauth" && config.oauth_credentials.is_none() {
+        return Ok(McpToolClasses {
+            rows: saved_only_rows(saved),
+            server_note: Some("Not connected \u{2014} connect this server first".to_string()),
+        });
+    }
+    match crate::mcp::tool_class_report(db::get(), &config).await {
+        Ok(listed) => Ok(McpToolClasses { rows: merge_tool_class_rows(listed, saved), server_note: None }),
+        // The page's own status section already shows these states; the
+        // note here keeps the Tool-classes section consistent with it.
+        Err(crate::mcp::CheckError::Unreachable(error)) => Ok(McpToolClasses {
+            rows: saved_only_rows(saved),
+            server_note: Some(format!("Unreachable: {error}")),
+        }),
+        Err(crate::mcp::CheckError::SignInExpired(error)) => Ok(McpToolClasses {
+            rows: saved_only_rows(saved),
+            server_note: Some(format!("Sign-in expired: {error}")),
+        }),
+    }
+}
+
+/// Sets (or, with `class: None`, clears) one tool's class override.
+/// Reachability doesn't matter: pre-classifying a server that doesn't
+/// annotate is the point, and an override for a gone tool must stay
+/// clearable. An override may exist for a tool the server doesn't
+/// currently list (the design keeps those); the page only ever offers
+/// listed and saved names, so no free-text name reaches here. No `evict`
+/// — nothing caches a class: the call reads its override fresh (SME-240).
+#[post("/api/mcp-servers/{id}/tool-classes")]
+pub async fn set_mcp_tool_class(
+    id: i64,
+    tool_name: String,
+    class: Option<String>,
+) -> ServerFnResult<()> {
+    let config = db::get_mcp_server_config(db::get(), id)
+        .await
+        .map_err(ServerFnError::new)?
+        .ok_or_else(|| ServerFnError::new(format!("no MCP server config with id {id}")))?;
+    check_override_tool_name(&tool_name).map_err(ServerFnError::new)?;
+    match parse_override_class(class).map_err(ServerFnError::new)? {
+        Some(class) => db::set_mcp_tool_class(db::get(), config.id, &tool_name, class)
+            .await
+            .map_err(ServerFnError::new)?,
+        None => {
+            if !db::clear_mcp_tool_class(db::get(), config.id, &tool_name)
+                .await
+                .map_err(ServerFnError::new)?
+            {
+                // Can't happen from the page (it only offers rows it just
+                // read); names it to the user from a second tab's clear.
+                return Err(ServerFnError::new(format!("no override was saved for {tool_name}")));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +511,152 @@ mod tests {
         // guarantee: neither secret string leaks into any field we do have.
         assert_ne!(summary.name, "Bearer super-secret-token");
         assert_ne!(summary.url, "another-secret");
+    }
+
+    // --- Per-tool class overrides (SME-240) ---
+
+    fn info(name: &str, server_class: crate::anthropic::tools::ToolClass, annotated: bool) -> crate::mcp::McpToolClassInfo {
+        crate::mcp::McpToolClassInfo { name: name.to_string(), server_class, annotated }
+    }
+
+    /// Listed rows keep the server's own order and carry `server_class`
+    /// and `listed: Some(true)`; saved overrides for tools the server no
+    /// longer listed follow, by name, with `server_class: None` and
+    /// `listed: Some(false)`; an override on a listed tool rides its row.
+    #[test]
+    fn test_merge_tool_class_rows_lists_first_then_stale_overrides_by_name() {
+        use crate::anthropic::tools::ToolClass;
+        let rows = merge_tool_class_rows(
+            vec![
+                info("web_search_exa", ToolClass::ReadOnly, true),
+                info("edit_thing", ToolClass::Destructive, false),
+            ],
+            // `list_mcp_tool_classes` delivers these already by name.
+            vec![
+                ("old_tool".to_string(), "writing".to_string()),
+                ("web_search_exa".to_string(), "destructive".to_string()),
+            ],
+        );
+        assert_eq!(
+            rows,
+            vec![
+                McpToolClassRow {
+                    tool_name: "web_search_exa".to_string(),
+                    server_class: Some("read-only".to_string()),
+                    annotated: Some(true),
+                    override_class: Some("destructive".to_string()),
+                    listed: Some(true),
+                },
+                McpToolClassRow {
+                    tool_name: "edit_thing".to_string(),
+                    server_class: Some("destructive".to_string()),
+                    annotated: Some(false),
+                    override_class: None,
+                    listed: Some(true),
+                },
+                McpToolClassRow {
+                    tool_name: "old_tool".to_string(),
+                    server_class: None,
+                    annotated: None,
+                    override_class: Some("writing".to_string()),
+                    listed: Some(false),
+                },
+            ]
+        );
+    }
+
+    /// A server with no annotations at all still merges: every listed row
+    /// says the default class, and the saved set can be empty.
+    #[test]
+    fn test_merge_tool_class_rows_handles_the_empty_ends() {
+        use crate::anthropic::tools::ToolClass;
+        let rows = merge_tool_class_rows(vec![info("t", ToolClass::Destructive, false)], Vec::new());
+        assert_eq!(
+            rows,
+            vec![McpToolClassRow {
+                tool_name: "t".to_string(),
+                server_class: Some("destructive".to_string()),
+                annotated: Some(false),
+                override_class: None,
+                listed: Some(true),
+            }]
+        );
+        let rows = merge_tool_class_rows(
+            Vec::new(),
+            vec![("gone".to_string(), "read-only".to_string())],
+        );
+        assert_eq!(
+            rows,
+            vec![McpToolClassRow {
+                tool_name: "gone".to_string(),
+                server_class: None,
+                annotated: None,
+                override_class: Some("read-only".to_string()),
+                listed: Some(false),
+            }]
+        );
+    }
+
+    /// The POST's validation: a blank tool name is refused (the page only
+    /// ever offers real names), and a class text outside the three — the
+    /// table's CHECK's words, so a bad send says what it expected.
+    #[test]
+    fn test_override_input_checks_refuse_blank_names_and_unknown_classes() {
+        assert_eq!(check_override_tool_name(""), Err("a tool name is required".to_string()));
+        assert_eq!(check_override_tool_name("   "), Err("a tool name is required".to_string()));
+        assert_eq!(check_override_tool_name("get_pr"), Ok(()));
+
+        use crate::anthropic::tools::ToolClass;
+        assert_eq!(parse_override_class(None), Ok(None));
+        assert_eq!(parse_override_class(Some("read-only".to_string())), Ok(Some(ToolClass::ReadOnly)));
+        assert_eq!(parse_override_class(Some("writing".to_string())), Ok(Some(ToolClass::Writing)));
+        assert_eq!(parse_override_class(Some("destructive".to_string())), Ok(Some(ToolClass::Destructive)));
+        assert_eq!(
+            parse_override_class(Some("nope".to_string())),
+            Err("unknown tool class \"nope\": expected read-only, writing or destructive".to_string())
+        );
+        // Not the parser's job to be forgiving: the three names only.
+        assert_eq!(parse_override_class(Some("Read-Only".to_string())), Err("unknown tool class \"Read-Only\": expected read-only, writing or destructive".to_string()));
+        assert_eq!(parse_override_class(Some("".to_string())), Err("unknown tool class \"\": expected read-only, writing or destructive".to_string()));
+    }
+
+    /// `ToolClass::parse` accepts exactly the three `as_str()` names
+    /// (SME-240), and round-trips each.
+    #[test]
+    fn test_tool_class_parse_accepts_exactly_the_three_names() {
+        use crate::anthropic::tools::ToolClass;
+        for class in [ToolClass::ReadOnly, ToolClass::Writing, ToolClass::Destructive] {
+            assert_eq!(ToolClass::parse(class.as_str()), Some(class));
+        }
+        for text in ["", "read only", "READ-ONLY", "destructive ", "read", "safe"] {
+            assert_eq!(ToolClass::parse(text), None, "{text:?}");
+        }
+    }
+
+    /// The rows cross as a server function's result.
+    #[test]
+    fn test_tool_classes_round_trip_through_json() {
+        let classes = McpToolClasses {
+            rows: vec![
+                McpToolClassRow {
+                    tool_name: "web_search_exa".to_string(),
+                    server_class: Some("read-only".to_string()),
+                    annotated: Some(true),
+                    override_class: None,
+                    listed: Some(true),
+                },
+                McpToolClassRow {
+                    tool_name: "old_tool".to_string(),
+                    server_class: None,
+                    annotated: None,
+                    override_class: Some("writing".to_string()),
+                    listed: None,
+                },
+            ],
+            server_note: Some("Unreachable: refused".to_string()),
+        };
+        let json = serde_json::to_string(&classes).expect("serialize");
+        let back: McpToolClasses = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, classes);
     }
 }

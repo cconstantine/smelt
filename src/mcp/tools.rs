@@ -53,6 +53,58 @@ pub(super) fn listed_class(tools: &[McpTool], tool_name: &str) -> ToolClass {
     tool.map_or(ToolClass::Destructive, |tool| class_from_annotations(tool.annotations.as_ref()))
 }
 
+/// One listed tool's class information for the settings page (SME-240):
+/// the class the server's own annotations give it, and whether the
+/// server annotated it at all — `annotated` counts a hint, not a bare
+/// title, so a title-only annotation leaves the tool at the default.
+pub(crate) struct McpToolClassInfo {
+    pub name: String,
+    pub server_class: ToolClass,
+    pub annotated: bool,
+}
+
+/// Each of the server's current tools with the class *its own
+/// annotations* give it — for the settings page (SME-240), which merges
+/// these with the user's saved overrides and shows each side's answer.
+/// `connection_check`'s flow kept per-tool instead of name-only: the
+/// user is asking, so always try (`Attempt::Always`), then one
+/// `REGISTRY` read. `server_class` deliberately ignores any saved
+/// override — "Server's answer" on the page means undoing back to this.
+pub(crate) async fn tool_class_report(
+    pool: &sqlx::PgPool,
+    config: &McpServerConfig,
+) -> Result<Vec<McpToolClassInfo>, CheckError> {
+    if let Err(e) = ensure_connected(pool, config, Attempt::Always).await {
+        if !e.sign_in_rejected {
+            return Err(CheckError::Unreachable(e.message));
+        }
+        // As `check_connection` does for a refusal it sees itself.
+        evict(config.id).await;
+        return Err(CheckError::SignInExpired(e.message));
+    }
+    let registry = REGISTRY.lock().await;
+    let conn = registry.get(&config.id).ok_or_else(|| {
+        CheckError::Unreachable(format!(
+            "connection to MCP server {:?} vanished immediately after connecting",
+            config.name
+        ))
+    })?;
+    Ok(conn
+        .tools
+        .iter()
+        .map(|tool| McpToolClassInfo {
+            name: tool.name.to_string(),
+            server_class: class_from_annotations(tool.annotations.as_ref()),
+            // Either hint counts as annotated; a title-only annotation
+            // leaves the tool at the default (the plan's rule).
+            annotated: tool
+                .annotations
+                .as_ref()
+                .is_some_and(|a| a.read_only_hint.is_some() || a.destructive_hint.is_some()),
+        })
+        .collect())
+}
+
 fn mcp_tool_to_definition(server_name: &str, tool: &McpTool) -> ToolDefinition {
     ToolDefinition {
         name: namespaced_tool_name(server_name, tool.name.as_ref()),

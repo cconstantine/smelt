@@ -337,10 +337,6 @@ pub async fn clear_mcp_server_oauth_credentials_if(
 
 /// Sets `tool_name`'s override class for server `server_id`, one row per
 /// (server, tool).
-// The tool-classes endpoints call this; kept whole with `get_mcp_tool_class`
-// (its first production caller) as the plan's one commit, so the attribute
-// is removed when those land.
-#[cfg_attr(not(test), expect(dead_code, reason = "SME-240's tool-classes endpoints call it"))]
 pub async fn set_mcp_tool_class(
     pool: &PgPool,
     server_id: i64,
@@ -361,7 +357,6 @@ pub async fn set_mcp_tool_class(
 
 /// Removes `tool_name`'s override, back to the server's own answer.
 /// `false` when nothing matched.
-#[cfg_attr(not(test), expect(dead_code, reason = "SME-240's tool-classes endpoints call it"))]
 pub async fn clear_mcp_tool_class(
     pool: &PgPool,
     server_id: i64,
@@ -376,7 +371,6 @@ pub async fn clear_mcp_tool_class(
 }
 
 /// Every override saved for `server_id`, as `(tool_name, class)` by name.
-#[cfg_attr(not(test), expect(dead_code, reason = "SME-240's tool-classes endpoints call it"))]
 pub async fn list_mcp_tool_classes(
     pool: &PgPool,
     server_id: i64,
