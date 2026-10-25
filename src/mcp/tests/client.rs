@@ -91,13 +91,13 @@ async fn test_tool_definitions_for_merges_and_namespaces_tools_from_connected_se
     REGISTRY.lock().await.remove(&server_id);
 }
 
-#[tokio::test]
-async fn test_call_tool_dispatches_and_returns_text_content() {
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_call_tool_dispatches_and_returns_text_content(pool: sqlx::PgPool) {
     let server_id = -1002;
     register_test_connection(server_id, false).await;
 
     let result = call_tool(
-        &test_pool(),
+        &pool,
         &test_config(server_id, "test-server"),
         "echo",
         serde_json::json!({"hello": "world"}),

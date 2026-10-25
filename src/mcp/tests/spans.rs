@@ -2,15 +2,15 @@ use super::*;
 
 /// SME-137: an MCP tool call is an `mcp call` span under its caller's,
 /// failed when the server refuses the call.
-#[tokio::test]
-async fn test_an_mcp_call_is_a_span_under_its_caller() {
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_mcp_call_is_a_span_under_its_caller(pool: sqlx::PgPool) {
     let server_id = -137_001;
     register_test_connection(server_id, false).await;
     let config = test_config(server_id, "test-server");
     let ((ok, refused), spans) = crate::telemetry::capture_spans(async {
         crate::telemetry::in_span(tracing::info_span!("caller"), async {
-            let ok = call_tool(&test_pool(), &config, "echo", serde_json::json!({"x": "SECRET-ARG"})).await;
-            let refused = call_tool(&test_pool(), &config, "no_such_tool", serde_json::json!({})).await;
+            let ok = call_tool(&pool, &config, "echo", serde_json::json!({"x": "SECRET-ARG"})).await;
+            let refused = call_tool(&pool, &config, "no_such_tool", serde_json::json!({})).await;
             (ok, refused)
         })
         .await
@@ -71,14 +71,14 @@ async fn test_a_failed_connect_exports_no_query_from_the_servers_url(pool: sqlx:
 
 /// Review 1: a tool's own error output, and input it was refused for,
 /// stay out of the span; smelt's own failures keep their message.
-#[tokio::test]
-async fn test_a_tools_reported_error_exports_none_of_its_output() {
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_tools_reported_error_exports_none_of_its_output(pool: sqlx::PgPool) {
     let server_id = -137_005;
     register_test_connection(server_id, false).await;
     let config = test_config(server_id, "test-server");
     let ((failed, refused), spans) = crate::telemetry::capture_spans(async {
-        let failed = call_tool(&test_pool(), &config, "fail", serde_json::json!({})).await;
-        let refused = call_tool(&test_pool(), &config, "echo", serde_json::json!(["SECRET-INPUT"])).await;
+        let failed = call_tool(&pool, &config, "fail", serde_json::json!({})).await;
+        let refused = call_tool(&pool, &config, "echo", serde_json::json!(["SECRET-INPUT"])).await;
         (failed, refused)
     })
     .await;
