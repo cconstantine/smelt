@@ -135,3 +135,53 @@ async fn test_an_mcp_call_with_bad_arguments_is_refused_before_connecting(pool: 
     assert!(error.contains("tool arguments must be a JSON object"), "{error}");
     assert!(!failed, "no connect was tried, so none failed");
 }
+
+/// The class of one `call_tool_classed` of `tool` on `pool`'s database.
+async fn class_of_call_on(pool: &sqlx::PgPool, config: &McpServerConfig, tool: &str) -> Option<ToolClass> {
+    let class = std::sync::Mutex::new(None);
+    let _ = call_tool_classed(pool, config, tool, serde_json::json!({}), |c| {
+        *class.lock().unwrap() = Some(c);
+    })
+    .await;
+    class.into_inner().unwrap()
+}
+
+/// SME-240: the user's override wins at the call, and clearing it hands
+/// the answer back to the server — all on one connection, no `evict`, so
+/// this is also the proof there is no per-connection class cache: the
+/// override is re-read at every call.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_override_wins_at_the_call_and_a_clear_gives_the_server_its_answer_back(pool: sqlx::PgPool) {
+    let config = create_static_server(&pool, &test_config(0, "unused").url).await;
+    let server = register_test_connection(config.id, true).await;
+    server.router.write().await.enable_route("second_tool");
+    wait_until_stale(config.id).await;
+
+    assert_eq!(class_of_call_on(&pool, &config, "second_tool").await, Some(ReadOnly), "the server's answer first");
+    crate::db::set_mcp_tool_class(&pool, config.id, "second_tool", Destructive)
+        .await
+        .expect("set a destructive override");
+    assert_eq!(class_of_call_on(&pool, &config, "second_tool").await, Some(Destructive), "the override wins");
+    crate::db::clear_mcp_tool_class(&pool, config.id, "second_tool")
+        .await
+        .expect("clear the override");
+    let class = class_of_call_on(&pool, &config, "second_tool").await;
+    REGISTRY.lock().await.remove(&config.id);
+    assert_eq!(class, Some(ReadOnly), "the same connection gives the server's answer back");
+}
+
+/// SME-240: an override exists whether or not the server lists the tool
+/// — it classes the call where the annotation rule alone says
+/// destructive (unlisted). The mock refuses the call itself (the name
+/// isn't in its router); the class was handed over before sending.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_override_for_a_tool_the_server_does_not_list_classes_the_call(pool: sqlx::PgPool) {
+    let config = create_static_server(&pool, &test_config(0, "unused").url).await;
+    let _server = register_test_connection(config.id, false).await;
+    crate::db::set_mcp_tool_class(&pool, config.id, "no_such_tool", ReadOnly)
+        .await
+        .expect("set a read-only override for an unlisted tool");
+    let class = class_of_call_on(&pool, &config, "no_such_tool").await;
+    REGISTRY.lock().await.remove(&config.id);
+    assert_eq!(class, Some(ReadOnly), "the override classes the call; the server never answered it");
+}
