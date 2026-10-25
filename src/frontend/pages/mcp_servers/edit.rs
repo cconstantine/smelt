@@ -6,9 +6,11 @@ use crate::frontend::Route;
 use super::form::McpServerEditForm;
 use super::oauth::{McpDeleteSection, McpOAuthPanel};
 use super::status_summary;
+use super::tool_classes::McpToolClassesSection;
 
 /// The full-detail view for one server: its live connection status (every
-/// tool it currently exposes, or why it's unreachable), editable
+/// tool it currently exposes, or why it's unreachable), the Tool-classes
+/// section (SME-240), editable
 /// name/URL, either in-place header editing or an OAuth connection panel
 /// depending on `auth_mode` (see `McpServerEdit`'s headers section below
 /// for how a header value's real content, which the browser never
@@ -178,6 +180,8 @@ pub fn McpServerEdit(id: i64) -> Element {
                         }
                     }
                 }
+
+                McpToolClassesSection { id }
 
                 McpServerEditForm {
                     id,

@@ -434,3 +434,54 @@ div.mcp-status-needs-reconnect .mcp-status-detail {
     background: var(--danger-bg);
 }
 
+/* Tool classes section (SME-240). The /mcp-servers/{id} route is a
+   single narrow content column at every width — the column is what
+   05-mcp.css already caps at laptop width; at phone width it's the
+   viewport minus page padding (a 320px viewport gives the row ~288px).
+   The row wraps: name on the first line, select + origin note after,
+   when the width can't hold them on one. It covers nothing; it pushes
+   the edit form down. */
+.mcp-tool-classes-section {
+    margin-bottom: 24px;
+}
+
+.mcp-tool-classes-section h2 {
+    font-size: 14px;
+    margin-bottom: 8px;
+}
+
+.mcp-tool-classes-note {
+    font-size: 13px;
+    color: var(--text-2);
+    margin: 0 0 8px;
+}
+
+.mcp-tool-class-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 10px;
+    padding: 4px 0;
+}
+
+.mcp-tool-class-name {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    color: var(--text);
+}
+
+.mcp-tool-class-select {
+    max-width: 100%;
+    padding: 4px 8px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--text);
+    font-size: 13px;
+}
+
+.mcp-tool-class-origin {
+    font-size: 13px;
+    color: var(--text-2);
+}
+

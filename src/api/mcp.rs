@@ -276,7 +276,6 @@ pub struct McpToolClassRow {
 /// one per saved override for a no-longer-listed tool, and `server_note`
 /// — why the live list is missing (unreachable, sign-in expired, OAuth
 /// not connected yet) — when it is.
-#[cfg_attr(not(feature = "server"), expect(dead_code, reason = "SME-240's Tool-classes section renders these rows"))]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct McpToolClasses {
     pub rows: Vec<McpToolClassRow>,

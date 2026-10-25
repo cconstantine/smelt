@@ -17,6 +17,10 @@ mod form;
 mod index;
 mod new;
 mod oauth;
+mod tool_classes;
+
+#[cfg(test)]
+mod tests;
 
 pub use edit::*;
 pub use index::*;
