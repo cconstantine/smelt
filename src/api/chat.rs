@@ -326,6 +326,20 @@ pub struct ContextDetailSnapshot {
     pub spend: crate::models::ConversationSpend,
     /// When the price catalog was last fetched; `None` before the first.
     pub prices_as_of: Option<chrono::NaiveDateTime>,
+    /// The whole cost group's spend (SME-244): this conversation's calls
+    /// plus every agent's under it and the agents' children's, deleted
+    /// ones included. For a conversation that is a group's root, its own
+    /// calls are the group's own part; for an agent, the group runs from
+    /// its root down, so this covers the root and any sibling agents too —
+    /// the view labels it with `group_root_title`.
+    /// `group_spend.calls >= spend.calls` whenever both are for the same
+    /// rows.
+    pub group_spend: crate::models::ConversationSpend,
+    /// Set when this conversation is an agent: the title of the
+    /// conversation whose group it belongs to (the group's root). `None`
+    /// when it is a group's root itself — a conversation with no `agents`
+    /// row (SME-244).
+    pub group_root_title: Option<String>,
 }
 
 #[get("/api/conversations/{id}/context-detail")]
@@ -352,6 +366,14 @@ pub(crate) async fn context_detail(pool: &PgPool, id: i64) -> ServerFnResult<Con
         .map_or((String::new(), crate::providers::ASSUMED_CONTEXT_WINDOW), |choice| {
             (choice.model.clone(), choice.context_window)
         });
+    // The cost group this conversation belongs to (SME-244): its own id
+    // when it has no `agents` row, and the agent tree's root otherwise.
+    // One more round trip per dialog open — an index scan, and the dialog
+    // refetches on every open rather than caching, so there's no stale
+    // group to worry about.
+    let group = db::get_group_root(pool, id).await.map_err(ServerFnError::new)?;
+    let (group_root_id, group_root_title) =
+        group.map_or((id, None), |(root, title)| (root, (root != id).then_some(title)));
     Ok(ContextDetailSnapshot {
         system: Some(system_prompt(&prompt_environment(pool, id, &model).await)),
         instructions: crate::git::project_instructions(pool, id)
@@ -365,6 +387,10 @@ pub(crate) async fn context_detail(pool: &PgPool, id: i64) -> ServerFnResult<Con
             .await
             .map_err(ServerFnError::new)?,
         prices_as_of: crate::pricing::CATALOG.current().map(|c| c.fetched_at),
+        group_spend: db::get_group_spend(pool, group_root_id)
+            .await
+            .map_err(ServerFnError::new)?,
+        group_root_title,
     })
 }
 

@@ -96,6 +96,8 @@ mod detail_shown_tests {
             context_window: 200_000,
             spend: Default::default(),
             prices_as_of: None,
+            group_spend: Default::default(),
+            group_root_title: None,
         }
     }
 

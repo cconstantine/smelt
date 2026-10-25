@@ -470,3 +470,208 @@ async fn test_a_clear_waits_for_an_older_record_and_leaves_no_usage(pool: PgPool
         .expect("the clear");
     assert_eq!(get_conversation_usage(&pool, conversation.id).await.expect("usage"), None);
 }
+
+// --- Cost groups (SME-244) ---
+
+/// A child conversation of `parent` with an `agents` row, `root_id` as
+/// given — the way `create_child` inserts it (`src/db/agents/start.rs`),
+/// at `depth` as asked. `create_child` is depth-1-only until SME-245, so
+/// the depth-2 row goes in directly, `root_id` the tree's root the way an
+/// opened-up nesting will bind it; the fill and the backfill both read
+/// `root_id`, which is what this tests.
+async fn agent_row(pool: &PgPool, parent: i64, root: i64, depth: i32) -> i64 {
+    let child = sqlx::query_scalar::<_, i64>("INSERT INTO conversations (title, parent_id) VALUES ($1, $2) RETURNING id")
+        .bind(format!("agent of {parent}"))
+        .bind(parent)
+        .fetch_one(pool)
+        .await
+        .expect("a child row");
+    sqlx::query("INSERT INTO agents (conversation_id, root_id, depth, brief, state) VALUES ($1, $2, $3, 'a brief', 'active')")
+        .bind(child)
+        .bind(root)
+        .bind(depth)
+        .execute(pool)
+        .await
+        .expect("its agent row");
+    child
+}
+
+/// Test 1: a group is the root plus every agent under it, at any depth;
+/// a compaction call counts, as it does in a conversation's own spend.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_groups_spend_sums_the_root_and_every_agent_under_it(pool: PgPool) {
+    let root = create_conversation(&pool).await.expect("root");
+    let child = agent_row(&pool, root.id, root.id, 1).await;
+    let grandchild = agent_row(&pool, child, root.id, 2).await;
+    let provider = test_provider(&pool, "p").await;
+    let call = |conversation_id, kind, usage_tokens, cost_usd| ModelCall {
+        conversation_id,
+        provider_id: provider.id,
+        model: "m",
+        kind,
+        usage: usage_tokens,
+        cost_usd,
+        finished: true,
+    };
+    record_model_call(&pool, &call(root.id, ModelCallKind::Turn, usage(10, 1, 2, 3), Some(1.0)))
+        .await
+        .expect("the root's call");
+    record_model_call(&pool, &call(child, ModelCallKind::Turn, usage(100, 10, 20, 30), Some(2.0)))
+        .await
+        .expect("the child's call");
+    record_model_call(&pool, &call(grandchild, ModelCallKind::Compaction, usage(1_000, 100, 200, 300), Some(3.0)))
+        .await
+        .expect("the grandchild's compaction call");
+
+    let group = get_group_spend(&pool, root.id).await.expect("group spend");
+    assert_eq!(
+        group,
+        crate::models::ConversationSpend {
+            calls: 3,
+            input_tokens: 1_110,
+            output_tokens: 111,
+            cache_creation_input_tokens: 222,
+            cache_read_input_tokens: 333,
+            cost_usd: Some(6.0),
+            unpriced_calls: 0,
+        },
+        "the root's own call plus every agent's under it, the compaction included"
+    );
+    assert_eq!(
+        get_conversation_spend(&pool, root.id).await.expect("root spend").calls,
+        1,
+        "the root's own spend is still only its own"
+    );
+    assert_eq!(
+        get_conversation_spend(&pool, grandchild).await.expect("grandchild spend"),
+        crate::models::ConversationSpend {
+            calls: 1,
+            input_tokens: 1_000,
+            output_tokens: 100,
+            cache_creation_input_tokens: 200,
+            cache_read_input_tokens: 300,
+            cost_usd: Some(3.0),
+            unpriced_calls: 0,
+        },
+        "the grandchild's own spend is its one call"
+    );
+    assert_eq!(
+        get_group_spend(&pool, grandchild).await.expect("no group keyed on the grandchild").calls,
+        0,
+        "the group is keyed on the tree's root, not the direct parent"
+    );
+}
+
+/// Test 2: deleting the child SET NULLs its rows' `conversation_id` but
+/// keeps their group — the root's group number keeps counting the deleted
+/// agent's calls, the ticket's Done-when.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_deleted_childs_calls_stay_in_its_groups_spend(pool: PgPool) {
+    let root = create_conversation(&pool).await.expect("root");
+    let child = agent_row(&pool, root.id, root.id, 1).await;
+    let provider = test_provider(&pool, "p").await;
+    record_model_call(&pool, &ModelCall {
+        conversation_id: child,
+        provider_id: provider.id,
+        model: "m",
+        kind: ModelCallKind::Turn,
+        usage: usage(10, 1, 0, 0),
+        cost_usd: Some(2.0),
+        finished: true,
+    })
+    .await
+    .expect("the child's call");
+
+    delete_conversation(&pool, child).await.expect("delete the child");
+
+    let group = get_group_spend(&pool, root.id).await.expect("group spend");
+    assert_eq!((group.calls, group.cost_usd), (1, Some(2.0)), "the deleted child still counts in its group");
+    let kept: (Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT conversation_id, group_root_id FROM model_call_usage WHERE model = 'm'")
+            .fetch_one(&pool)
+            .await
+            .expect("the row");
+    assert_eq!(kept, (None, Some(root.id)), "conversation_id SET NULLs, the group stays");
+}
+
+/// Test 3: an unpriced call adds to `unpriced_calls`, not to `cost_usd` —
+/// the same semantics `ConversationSpend`'s docs state, through the group
+/// query (the Done-when's "unpriced calls" cell).
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_group_spend_keeps_unpriced_calls_apart_from_the_cost(pool: PgPool) {
+    let root = create_conversation(&pool).await.expect("root");
+    let provider = test_provider(&pool, "p").await;
+    let call = |cost_usd| ModelCall {
+        conversation_id: root.id,
+        provider_id: provider.id,
+        model: "m",
+        kind: ModelCallKind::Turn,
+        usage: usage(10, 1, 0, 0),
+        cost_usd,
+        finished: true,
+    };
+    record_model_call(&pool, &call(None)).await.expect("an unpriced call");
+    record_model_call(&pool, &call(Some(0.5))).await.expect("a priced call");
+
+    let group = get_group_spend(&pool, root.id).await.expect("group spend");
+    assert_eq!((group.calls, group.cost_usd, group.unpriced_calls), (2, Some(0.5), 1));
+}
+
+/// Test 4: the fill writes the column as the row lands — an agent's rows
+/// carry its `agents.root_id`, a conversation without an `agents` row its
+/// own id (the design's budget row wants the root's own spend inside its
+/// group).
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_conversations_own_calls_get_its_group_recorded_at_record_time(pool: PgPool) {
+    let root = create_conversation(&pool).await.expect("root");
+    let child = agent_row(&pool, root.id, root.id, 1).await;
+    let provider = test_provider(&pool, "p").await;
+    let call = |conversation_id| ModelCall {
+        conversation_id,
+        provider_id: provider.id,
+        model: "m",
+        kind: ModelCallKind::Turn,
+        usage: usage(10, 1, 0, 0),
+        cost_usd: Some(1.0),
+        finished: true,
+    };
+    record_model_call(&pool, &call(root.id)).await.expect("the root's call");
+    record_model_call(&pool, &call(child)).await.expect("the child's call");
+
+    let groups: Vec<i64> =
+        sqlx::query_scalar("SELECT group_root_id FROM model_call_usage WHERE conversation_id = $1")
+            .bind(root.id)
+            .fetch_all(&pool)
+            .await
+            .expect("the root's rows");
+    assert_eq!(groups, vec![root.id], "a conversation without an agents row is its own group");
+    let groups: Vec<i64> =
+        sqlx::query_scalar("SELECT group_root_id FROM model_call_usage WHERE conversation_id = $1")
+            .bind(child)
+            .fetch_all(&pool)
+            .await
+            .expect("the child's rows");
+    assert_eq!(groups, vec![root.id], "the child's call carries its agents row's root_id");
+}
+
+/// Test 5: the SME-178 shape — a call recorded after its conversation's
+/// delete committed has no conversation, and no group either. The fill's
+/// fallback is the conversations subselect, so a deleted conversation's
+/// id is never stamped onto the row (a bare `$1` fallback would).
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_call_recorded_after_its_conversation_was_deleted_has_no_group(pool: PgPool) {
+    let conversation = create_conversation(&pool).await.expect("conversation");
+    let provider = test_provider(&pool, "p").await;
+    delete_conversation(&pool, conversation.id).await.expect("delete");
+
+    record_model_call(&pool, &turn_call(conversation.id, provider.id, true))
+        .await
+        .expect("a deleted conversation doesn't lose the call");
+
+    let both: (Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT conversation_id, group_root_id FROM model_call_usage")
+            .fetch_one(&pool)
+            .await
+            .expect("the call's row");
+    assert_eq!(both, (None, None), "no conversation and no group, as it joins no conversation's spend today");
+}
