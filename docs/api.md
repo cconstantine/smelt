@@ -167,7 +167,7 @@ In [api/events.md](api/events.md#the-browsing-panels-own-live-channel).
 | `lookup_language_server` | `GET /api/language-servers/lookup/{package}` | a suggested config from mason's registry and Helix |
 | `list_mcp_servers` / `get_mcp_server` | `GET /api/mcp-servers`, `GET /api/mcp-servers/{id}` | the `/mcp-servers` pages; header names only, never values (see [mcp.md](mcp.md)) |
 | `mcp_server_status` | `GET /api/mcp-servers/{id}/status` | a real connection attempt: `Connected { tool_names }`, `Unreachable { error }`, `NotConnected` or `NeedsReconnect { error }` (an OAuth sign-in that can't be refreshed, SME-113) |
-| `create_mcp_server` / `update_mcp_server` | `POST /api/mcp-servers`, `POST /api/mcp-servers/{id}` | update merges headers and drops the cached connection |
+| `create_mcp_server` / `update_mcp_server` | `POST /api/mcp-servers`, `POST /api/mcp-servers/{id}` | update merges headers and drops the cached connection; both refuse a name holding `/` or `*`, which no tool rule could name it by (SME-241) |
 | `delete_mcp_server` | `DELETE /api/mcp-servers/{id}` | also drops the cached connection |
 | `start_mcp_server_oauth` | `POST /api/mcp-servers/{id}/oauth/start` | returns the authorization URL the browser goes to (SME-16) |
 | `disconnect_mcp_server_oauth` | `POST /api/mcp-servers/{id}/oauth/disconnect` | clears the stored OAuth credentials |
