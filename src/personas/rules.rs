@@ -230,6 +230,46 @@ impl ToolRules {
             )),
         }
     }
+
+    /// The patterns naming a server `server_names` has no match for: what
+    /// a renamed or removed server leaves behind, a rule that silently
+    /// rules nothing. Never an error — a pattern may name a server that
+    /// isn't configured yet — so this is a report, made where the rules
+    /// are read (SME-241: `list_personas`, and `start_agent` to the parent).
+    /// Allow's patterns first, then deny's, each in the order written.
+    pub(crate) fn unmatched_servers(&self, server_names: &[String]) -> Vec<String> {
+        self.allow
+            .iter()
+            .chain(self.deny.iter())
+            .filter(|p| match &p.server {
+                // A smelt-tool pattern names no server, so it's never
+                // unmatched; a server pattern is unmatched exactly when no
+                // configured server has that name — the same exact match
+                // `matches` makes when it rules.
+                None => false,
+                Some(server) => !server_names.iter().any(|name| name == server),
+            })
+            .map(|p| String::from(p.clone()))
+            .collect()
+    }
+}
+
+/// The report both readers say, in one sentence: which patterns name no
+/// configured server. Each caller says whose patterns they are — the
+/// persona in `list_personas`, the child in `start_agent`'s notice — so
+/// this part stays the same words everywhere (SME-241).
+pub(crate) fn unmatched_note(patterns: &[String]) -> Option<String> {
+    match patterns.len() {
+        0 => None,
+        1 => Some(format!(
+            "smelt.tools pattern `{}` names no configured server, so it rules nothing (a renamed server leaves this behind)",
+            patterns[0]
+        )),
+        _ => Some(format!(
+            "smelt.tools patterns {} name no configured server, so they rule nothing (a renamed server leaves this behind)",
+            patterns.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
+        )),
+    }
 }
 
 impl Pattern {

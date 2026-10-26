@@ -597,6 +597,7 @@ mod oauth_http {
 
 mod gated_http;
 mod client;
+mod names;
 mod registry;
 mod spans;
 mod classes;

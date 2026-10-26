@@ -168,8 +168,11 @@ async fn remote_trust(pool: &PgPool, remote_key: &str) -> Result<Option<bool>, S
 }
 
 /// One persona as the model sees it: named `<dir>:<name>`, at its
-/// absolute path; a file that doesn't parse, with its error.
-fn persona_entry(dir: &str, file: PersonaFile) -> Value {
+/// absolute path; a file that doesn't parse, with its error; and, when
+/// the configured servers are known, a rule naming one of them by a name
+/// no longer configured (SME-241's report — an unknown server list
+/// reports nothing rather than accusing every pattern).
+fn persona_entry(dir: &str, file: PersonaFile, server_names: Option<&[String]>) -> Value {
     let full = format!("{}/{dir}/{}", crate::sandbox::WORKSPACE_DIR, file.path);
     match file.parsed {
         Ok(persona) => {
@@ -178,6 +181,15 @@ fn persona_entry(dir: &str, file: PersonaFile) -> Value {
                 "description": persona.description,
                 "file": full,
             });
+            // A rule naming a server that isn't configured rules nothing:
+            // said where the model reads the rules, so a rename's leftover
+            // pattern is visible rather than silently inert (SME-241).
+            if let (Some(names), Some(rules)) = (server_names, persona.tools.as_ref()) {
+                let unmatched = rules.unmatched_servers(names);
+                if let Some(note) = crate::personas::rules::unmatched_note(&unmatched) {
+                    entry["rules"] = Value::String(note);
+                }
+            }
             if let Some(model) = persona.model {
                 entry["model"] = Value::String(model);
             }
@@ -197,6 +209,16 @@ pub(crate) async fn gated_listing(pool: &PgPool, reads: Vec<RepoPersonas>) -> Re
     }
     let mut any_persona = false;
     let mut repos = Vec::with_capacity(reads.len());
+    // The configured MCP servers, once for the whole listing (SME-241's
+    // report of a rule naming a server that isn't one). A failed read
+    // reports nothing rather than calling every pattern unmatched.
+    let server_names: Option<Vec<String>> = match db::list_mcp_server_configs(pool).await {
+        Ok(configs) => Some(configs.into_iter().map(|config| config.name).collect()),
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't read the configured MCP servers; this listing reports no stale rule patterns");
+            None
+        }
+    };
     for RepoPersonas { repo, read } in reads {
         let path = format!("{}/{}", crate::sandbox::WORKSPACE_DIR, repo.dir);
         let mut entry = json!({"path": path, "url": repo.url});
@@ -220,7 +242,8 @@ pub(crate) async fn gated_listing(pool: &PgPool, reads: Vec<RepoPersonas>) -> Re
                     if files.is_empty() {
                         notes.push(format!("It has no persona files ({PERSONAS_DIR}*.md)."));
                     } else {
-                        let personas: Vec<Value> = files.into_iter().map(|f| persona_entry(&repo.dir, f)).collect();
+                        let personas: Vec<Value> =
+                            files.into_iter().map(|f| persona_entry(&repo.dir, f, server_names.as_deref())).collect();
                         any_persona |= personas.iter().any(|p| p.get("persona").is_some());
                         entry["personas"] = Value::Array(personas);
                     }

@@ -42,6 +42,10 @@ pub fn McpServerEdit(id: i64) -> Element {
     // `save_all`), never by typing.
     let mut saved_name: Signal<String> = use_signal(String::new);
     let mut saved_url: Signal<String> = use_signal(String::new);
+    // Whether the stored name is one no `smelt.tools` pattern can name
+    // (SME-241): shown under the name field, and only ever set from the
+    // server's own summary.
+    let mut name_unrulable: Signal<bool> = use_signal(|| false);
     // One row per currently-configured header: `(name, new_value)`, value
     // starting blank meaning "leave this header exactly as it is" — the
     // browser never has the real value to prefill, so blank can't mean
@@ -59,6 +63,7 @@ pub fn McpServerEdit(id: i64) -> Element {
                     has_oauth_client_secret.set(summary.has_oauth_client_secret);
                     saved_name.set(summary.name);
                     saved_url.set(summary.url);
+                    name_unrulable.set(summary.name_unrulable);
                     existing_header_edits.set(
                         summary
                             .header_names
@@ -185,6 +190,7 @@ pub fn McpServerEdit(id: i64) -> Element {
 
                 McpServerEditForm {
                     id,
+                    name_unrulable: name_unrulable(),
                     edit_name,
                     edit_url,
                     edit_auth_mode,

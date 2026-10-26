@@ -79,6 +79,21 @@ pub fn check_extra_headers(auth_mode: &str, headers: &HashMap<String, String>) -
     Ok(())
 }
 
+/// Refuses an MCP server name a tool-rule pattern could never name it by
+/// (SME-241): `/` is the separator between a pattern's server and tool
+/// parts, and `*` would be a wildcard in the server part, which the
+/// grammar refuses there. A server named with either is still reachable,
+/// but only ruleable by class — hence the report on existing rows
+/// (`McpServerSummary::name_unrulable`) rather than a database check.
+pub fn check_server_name(name: &str) -> Result<(), String> {
+    if name.contains('/') || name.contains('*') {
+        return Err(format!(
+            "MCP server name {name:?} can't hold / or *: a tool rule names a server exactly (/ splits its server from its tool, and a server part holds no wildcard), so this name's tools can only be ruled on by class"
+        ));
+    }
+    Ok(())
+}
+
 /// Parses `extra_headers` into the `http` crate's typed header map
 /// `rmcp`'s transport config expects. A per-server config error (an
 /// invalid header name/value the UI let through) surfaces as a plain

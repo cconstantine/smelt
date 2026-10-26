@@ -237,8 +237,19 @@ async fn prepare(
         return Ok(Prepared::default());
     };
     let snapshot = persona::snapshot(pool, checkout, child, &repo, &name).await?;
-    let (model, parent_notice) = persona::persona_model(pool, child, &snapshot).await?;
-    Ok(Prepared { persona: Some(snapshot), model, parent_notice })
+    let (model, model_notice) = persona::persona_model(pool, child, &snapshot).await?;
+    // A rule naming a server that isn't configured rules nothing: the
+    // parent hears that too, on the notice channel (SME-241's report).
+    let rules_notice = persona::rules_notice(pool, child, &snapshot).await;
+    Ok(Prepared { persona: Some(snapshot), model, parent_notice: one_notice([model_notice, rules_notice]) })
+}
+
+/// One notice to the parent, whatever the start found to tell it: the
+/// channel carries a single message, so several notes go in it one per
+/// line, each naming the child it's about.
+fn one_notice(notes: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    let notes: Vec<String> = notes.into_iter().flatten().collect();
+    (!notes.is_empty()).then(|| notes.join("\n"))
 }
 
 /// Loads the child's top-level AGENTS.md, which needs no card: the remote

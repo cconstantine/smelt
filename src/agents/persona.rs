@@ -69,6 +69,28 @@ pub(crate) async fn snapshot(
     })
 }
 
+/// The rules note for a child's persona snapshot: which of its
+/// `smelt.tools` patterns name no configured server (SME-241's report —
+/// what a rename leaves behind), said to its parent on the notice channel.
+/// A snapshot with no rules, or a server list that can't be read, says
+/// nothing: an unknown list mustn't accuse every pattern.
+pub(crate) async fn rules_notice(pool: &PgPool, child: i64, persona: &db::PersonaSnapshot) -> Option<String> {
+    let rules = persona
+        .settings
+        .get("tools")
+        .filter(|tools| !tools.is_null())
+        .and_then(|tools| serde_json::from_value::<crate::personas::rules::ToolRules>(tools.clone()).ok())?;
+    let servers: Vec<String> = match db::list_mcp_server_configs(pool).await {
+        Ok(configs) => configs.into_iter().map(|config| config.name).collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't read the configured MCP servers for the agent's rules note");
+            return None;
+        }
+    };
+    let note = crate::personas::rules::unmatched_note(&rules.unmatched_servers(&servers))?;
+    Some(format!("{}'s {note}", label(child, crate::agents::persona_label(&persona.path).as_deref())))
+}
+
 /// The model a persona asks for (`smelt.model`), on a provider that has
 /// it; `None` keeps the parent's. When no provider has it, the second is
 /// the notice its parent gets.

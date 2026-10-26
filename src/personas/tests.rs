@@ -268,6 +268,30 @@ fn test_a_star_in_a_tools_pattern_server_is_refused_saying_the_server_is_named()
     }
 }
 
+/// SME-241's report: a rule naming a server that isn't configured rules
+/// nothing, and the listing says which patterns those are — the rename
+/// edge case, where a server's old name lingers in a persona file.
+#[test]
+fn test_patterns_naming_no_configured_server_are_the_report() {
+    let rules = parse_ok(
+        DEV,
+        "---\nname: developer\ndescription: d\nsmelt:\n  tools:\n    allow: [github/get_*, gh/create_*, write_file]\n    deny: [linear/*]\n---\n",
+    )
+    .tools
+    .expect("tools");
+    let servers = vec!["github".to_string(), "linear".to_string()];
+    assert_eq!(
+        rules.unmatched_servers(&servers),
+        vec!["gh/create_*"],
+        "only the pattern naming no configured server, from either list"
+    );
+    assert_eq!(
+        rules.unmatched_servers(&[]),
+        vec!["github/get_*", "gh/create_*", "linear/*"],
+        "with no server configured every server pattern names nothing; a smelt-tool pattern never does"
+    );
+}
+
 #[test]
 fn test_a_pattern_in_both_allow_and_deny_is_refused_naming_it() {
     let error = parse_err(

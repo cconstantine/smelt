@@ -25,6 +25,20 @@ fn planner_rules() -> String {
     "---\nname: planner\ndescription: Plans one ticket.\nsmelt:\n  tools:\n    class: no-destructive\n---\nPlan.\n".to_string()
 }
 
+/// Rules naming two servers, so one of them can be the one that isn't
+/// configured.
+fn server_named_rules() -> String {
+    "---\nname: developer\ndescription: Works one ticket.\nsmelt:\n  tools:\n    allow: [github/get_*, gh/create_*]\n---\nWork.\n"
+        .to_string()
+}
+
+/// One configured MCP server named `name`.
+async fn configured_server(pool: &PgPool, name: &str) {
+    crate::db::create_mcp_server_config(pool, name, "https://example.invalid/mcp", &std::collections::HashMap::new(), "static_headers", None, None)
+        .await
+        .expect("an mcp server row");
+}
+
 /// The edited file's entry: the same name, wider rules.
 fn dev_rules_widened() -> String {
     "---\nname: developer\ndescription: Works one ticket.\nsmelt:\n  tools:\n    allow:\n      - stop_agent\n---\nWork.\n".to_string()
@@ -213,4 +227,40 @@ async fn test_editing_the_persona_after_a_start_changes_no_stored_chain(pool: Pg
         !crate::turn::turn_running(root) && !crate::turn::turn_running(first) && !crate::turn::turn_running(second)
     })
     .await;
+}
+
+/// A rule naming a server that isn't configured rules nothing, and the
+/// parent is told at the child's done step — the report `list_personas`
+/// makes, on the notice channel (SME-241).
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_rule_naming_no_configured_server_is_noticed_to_the_parent(pool: PgPool) {
+    setup(&pool, vec![text_reply("ok")]).await;
+    let fake = Arc::new(FakeCheckout {
+        files: Mutex::new([(DEVELOPER.to_string(), server_named_rules())].into_iter().collect()),
+        ..Default::default()
+    });
+    let root = root_with_checkout(&pool, Some(true), fake.clone()).await;
+    configured_server(&pool, "github").await;
+
+    let child = child_of(
+        &pool,
+        root,
+        &start_on(&pool, root, serde_json::json!({"brief": "x", "repo": "/workspace/app", "ref": "v2", "persona": "developer"}))
+            .await
+            .expect("started"),
+    )
+    .await;
+    eventually("the child goes active", || async { state(&pool, child).await.as_deref() == Some(db::AGENT_ACTIVE) }).await;
+
+    let notices: Vec<String> = sqlx::query_scalar("SELECT body FROM agent_messages WHERE to_conversation_id = $1 AND kind = 'notice'")
+        .bind(root)
+        .fetch_all(&pool)
+        .await
+        .expect("notices");
+    let told = notices
+        .iter()
+        .find(|n| n.contains("gh/create_*"))
+        .unwrap_or_else(|| panic!("{notices:?} name the pattern that rules nothing"));
+    assert!(!told.contains("github/get_"), "{told} leaves a configured server's pattern alone");
+    eventually("every turn is over", || async { !crate::turn::turn_running(root) && !crate::turn::turn_running(child) }).await;
 }

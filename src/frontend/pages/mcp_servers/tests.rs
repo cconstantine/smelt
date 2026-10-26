@@ -1,8 +1,9 @@
-//! Pure-helper tests for the Tool-classes section (SME-240) — there is
-//! no SSR component harness (docs/testing.md), so the two helpers the
-//! section renders per row carry the logic that can be tested: the
-//! select's value and the origin note.
+//! Pure-helper tests for the Tool-classes section (SME-240) and the edit
+//! form (SME-241) — there is no SSR component harness (docs/testing.md), so
+//! the helpers each renders carry the logic that can be tested: the select's
+//! value, the origin note, and the line under the name field.
 
+use super::form::unrulable_name_note;
 use super::tool_classes::{SERVER_ANSWER, class_select_value, tool_class_origin_note};
 use crate::api::mcp::McpToolClassRow;
 
@@ -61,4 +62,15 @@ fn test_the_origin_note_names_the_class_and_where_it_came_from() {
     // No class at all to show (a state the GET never sends): the note is
     // empty rather than a wrong origin.
     assert_eq!(tool_class_origin_note(&row(None, None, None, None)), "");
+}
+
+/// SME-241: a stored name no tool rule can name is said under the name
+/// field — why its tools can't be ruled on by name, and what to do about it.
+#[test]
+fn test_an_unrulable_server_name_says_its_tools_are_ruled_by_class_only() {
+    let note = unrulable_name_note(true).expect("the line under the name field");
+    for said in ["/", "*", "class", "rename"] {
+        assert!(note.contains(said), "{note} says {said:?}");
+    }
+    assert!(unrulable_name_note(false).is_none(), "an ordinary name gets no line");
 }
