@@ -63,7 +63,9 @@ pub(crate) async fn snapshot(
         path: format!("{checkout_dir}/{rel}"),
         commit: repo.commit_sha.clone(),
         body,
-        settings: serde_json::json!({ "model": persona.model }),
+        // `tools` rides along so the start can append it to the child's
+        // rule chain without re-reading the file (SME-241).
+        settings: serde_json::json!({ "model": persona.model, "tools": persona.tools }),
     })
 }
 

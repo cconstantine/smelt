@@ -9,6 +9,7 @@ use serde::Deserialize;
 
 pub(crate) mod frontmatter;
 pub(crate) mod links;
+pub(crate) mod rules;
 
 /// A parsed persona file.
 #[derive(Clone, Debug, PartialEq)]
@@ -21,6 +22,9 @@ pub struct Persona {
     pub instructions: String,
     /// `smelt.model`: a model name, never a provider.
     pub model: Option<String>,
+    /// `smelt.tools`: the persona's tool rules, checked against the grammar
+    /// (SME-241). `None` allows everything, as before the field existed.
+    pub tools: Option<rules::ToolRules>,
 }
 
 /// The frontmatter. Claude Code's own keys (`tools`, `model`, ...) are
@@ -35,13 +39,15 @@ struct Frontmatter {
     smelt: Option<SmeltSettings>,
 }
 
-/// smelt's own settings. Later tickets add `tools` (SME-241),
+/// smelt's own settings. `tools` arrived with SME-241; later tickets add
 /// `credentials` (SME-242), `egress` (SME-243) and `limits` (SME-245).
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SmeltSettings {
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    tools: Option<rules::RawToolRules>,
 }
 
 /// The largest persona file: `AGENTS.md`'s cap, since it's read the same
@@ -106,15 +112,18 @@ pub fn parse(path: &str, text: &str, file_bytes: u64) -> Result<Persona, String>
             "{path}: `description` must be 1 to 1024 characters (it's {description_chars})."
         ));
     }
-    let model = front.smelt.and_then(|s| s.model);
+    let smelt = front.smelt.unwrap_or_default();
+    let model = smelt.model;
     if model.as_deref().is_some_and(|m| m.trim().is_empty()) {
         return Err(format!("{path}: `smelt.model` is empty: name a model, or leave it out."));
     }
+    let tools = smelt.tools.map(|raw| rules::check(path, raw)).transpose()?;
     Ok(Persona {
         name: front.name,
         description: front.description,
         instructions: body.to_string(),
         model,
+        tools,
     })
 }
 

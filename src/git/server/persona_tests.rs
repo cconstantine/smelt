@@ -106,6 +106,7 @@ fn read_from(repo: db::ConversationRepo, marker: &str) -> RepoPersonas {
         description: format!("Works one ticket. {marker}-description"),
         instructions: format!("{marker}-body"),
         model: Some(format!("{marker}-model")),
+        tools: None,
     };
     RepoPersonas {
         repo,
