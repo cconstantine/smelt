@@ -53,19 +53,20 @@ struct Tool {
     class: Class,
 }
 
-/// Who a tool is offered to (SME-236): every conversation, only one
-/// without a parent (the user's own), or only an agent. `Linked`
-/// (SME-238) is offered to every conversation, so the tool list doesn't
-/// change when a conversation starts its first agent (which would rewrite
-/// its whole cached prompt), but `execute` lets only one with a parent or
-/// agents of its own call it. `execute` checks every offer from the
-/// database: a call can come from a history written before the
-/// conversation changed.
+/// Who a tool is offered to (SME-236): every conversation, or only one
+/// with a parent. `Linked` (SME-238) is offered to every conversation, so
+/// the tool list doesn't change when a conversation starts its first
+/// agent (which would rewrite its whole cached prompt), but `execute`
+/// lets only one with a parent or agents of its own call it. `execute`
+/// checks every offer from the database: a call can come from a history
+/// written before the conversation changed. (`Offer::Root`, which gave
+/// `start_agent` only to a parent-less conversation, is gone: SME-241
+/// made it an ordinary writing tool, kept in check by the rule chain and
+/// the depth ceiling.)
 #[cfg(feature = "server")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Offer {
     All,
-    Root,
     Child,
     Linked,
 }
@@ -318,7 +319,6 @@ mod server {
             .await
             .map_err(|e| format!("couldn't check who may call {name}: {e}"))?;
         match (offer, parent) {
-            (super::Offer::Root, Some(_)) => Err(format!("{name} is only for a conversation without a parent")),
             (super::Offer::Child, None) => Err(format!("{name} is only for an agent")),
             (super::Offer::Linked, None) if !has_children => {
                 Err(format!("{name} is only for a conversation with a parent or agents of its own"))
@@ -332,7 +332,6 @@ mod server {
     fn is_offered(offer: super::Offer, has_parent: bool) -> bool {
         match offer {
             super::Offer::All | super::Offer::Linked => true,
-            super::Offer::Root => !has_parent,
             super::Offer::Child => has_parent,
         }
     }
@@ -354,8 +353,8 @@ mod server {
     /// `crate::mcp`). A server that fails to connect this turn is skipped
     /// rather than failing the whole request — see
     /// `crate::mcp::tool_definitions_for`. Only the tools offered to
-    /// `conversation_id` (SME-236): `start_agent` to a conversation without
-    /// a parent, `finish` and `ask_parent` to an agent; and only those its
+    /// `conversation_id` (SME-236): `finish` and `ask_parent` to an agent;
+    /// and only those its
     /// stored rule chain allows (SME-241). A failed read offers neither
     /// agent tools nor ruled-away narrowing: the chain falls open, warned.
     pub async fn tool_definitions(pool: &PgPool, conversation_id: i64) -> Vec<crate::anthropic::ToolDefinition> {

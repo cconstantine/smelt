@@ -18,7 +18,7 @@ async fn bare_child(pool: &PgPool, parent: i64) -> i64 {
 }
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_a_root_is_offered_start_agent_and_a_child_finish(pool: PgPool) {
+async fn test_start_agent_is_offered_to_a_root_and_a_child_alike(pool: PgPool) {
     setup(&pool, vec![text_reply("ok")]).await;
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let child = bare_child(&pool, root).await;
@@ -26,7 +26,7 @@ async fn test_a_root_is_offered_start_agent_and_a_child_finish(pool: PgPool) {
     assert!(names(&root_tools).contains(&"start_agent"), "{:?}", names(&root_tools));
     assert!(!names(&root_tools).contains(&"finish"), "{:?}", names(&root_tools));
     let child_tools = crate::anthropic::tools::tool_definitions(&pool, child).await;
-    assert!(!names(&child_tools).contains(&"start_agent"), "{:?}", names(&child_tools));
+    assert!(names(&child_tools).contains(&"start_agent"), "an ordinary writing tool, SME-241");
     assert!(names(&child_tools).contains(&"finish"), "{:?}", names(&child_tools));
 }
 
@@ -41,16 +41,23 @@ async fn test_finish_called_by_a_root_is_refused(pool: PgPool) {
     assert_eq!(result, Err("finish is only for an agent".to_string()));
 }
 
-/// Checked from the database at the call, not from what was offered: a
-/// call can come from history written before the conversation changed.
+/// `start_agent` is now an ordinary tool, so the only structural limit is
+/// the depth ceiling: a conversation with a parent but no `agents` row
+/// (only a test artifact — never one smelt started) has unknown depth and
+/// is refused, without a child row being made.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_start_agent_called_by_a_child_is_refused_without_running(pool: PgPool) {
+async fn test_a_child_with_no_agent_row_is_refused_start_agent_without_running(pool: PgPool) {
     setup(&pool, vec![text_reply("ok")]).await;
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let child = bare_child(&pool, root).await;
     let result =
         crate::anthropic::tools::execute(&pool, child, "toolu_1", "start_agent", &serde_json::json!({"brief": "go"})).await;
-    assert_eq!(result, Err("start_agent is only for a conversation without a parent".to_string()));
+    assert_eq!(
+        result,
+        Err("this conversation has a parent but no agent row, so its depth is unknown — \
+            start_agent needs a conversation smelt started"
+            .to_string())
+    );
     let grandchildren = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM conversations WHERE parent_id = $1")
         .bind(child)
         .fetch_one(&pool)

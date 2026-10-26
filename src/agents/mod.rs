@@ -44,8 +44,39 @@ pub(crate) const ASK_PARENT: &str = "ask_parent";
 /// The tool a child ends its work with; a successful call ends its turn.
 pub(crate) const FINISH: &str = "finish";
 
-/// Why a child can't call `start_agent` (depth 1, until SME-245's limits).
-pub(crate) const ROOT_ONLY: &str = "start_agent is only for a conversation without a parent";
+/// `SMELT_AGENT_DEPTH`'s default (SME-241): how many levels of agents
+/// below the user's own conversation `start_agent` may go. An env-set
+/// ceiling, like `SANDBOX_IDLE_NOTICE_MINUTES`: read at each call, and
+/// an unparseable setting falls back to this with a warning. (SME-245
+/// adds the persona's own limit on top; until then this is the only one.)
+pub(crate) const DEFAULT_AGENT_DEPTH: i32 = 5;
+
+/// The depth ceiling for a `start_agent` call now.
+pub(crate) fn agent_depth() -> i32 {
+    agent_depth_from(std::env::var("SMELT_AGENT_DEPTH").ok())
+}
+
+/// The ceiling for a `SMELT_AGENT_DEPTH` of `setting`. Pulled out of
+/// `agent_depth` so the parsing is testable without the environment; an
+/// empty setting is no setting, and anything that isn't a level count of
+/// 1 or more gets a warning — the operator set it, and silently falling
+/// back would hide that it isn't being used.
+pub(crate) fn agent_depth_from(setting: Option<String>) -> i32 {
+    let Some(setting) = setting.filter(|s| !s.is_empty()) else {
+        return DEFAULT_AGENT_DEPTH;
+    };
+    match setting.parse::<i32>() {
+        Ok(levels) if levels >= 1 => levels,
+        _ => {
+            tracing::warn!(
+                setting = %setting,
+                default = DEFAULT_AGENT_DEPTH,
+                "SMELT_AGENT_DEPTH is not a level count of 1 or more; using the default"
+            );
+            DEFAULT_AGENT_DEPTH
+        }
+    }
+}
 
 /// A persona as `<dir>:<name>`, from its path in the child's checkout
 /// (`/workspace/<dir>/.agents/personas/<name>.md`).

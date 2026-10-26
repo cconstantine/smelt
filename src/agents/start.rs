@@ -114,6 +114,7 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
         brief,
         persona_name: persona,
         model,
+        max_depth: agent_depth(),
         repo: repo.as_ref().map(|(parent_repo, _)| db::NewChildRepo {
             url: &parent_repo.url,
             remote_key: &parent_repo.remote_key,
