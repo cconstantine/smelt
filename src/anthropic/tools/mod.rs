@@ -285,7 +285,20 @@ mod server {
             span.record("smelt.tool.class", class.as_str());
         };
         match resolve(pool, name).await? {
-            Target::Mcp { config, tool } => crate::mcp::call_tool_classed(pool, &config, tool, input.clone(), record).await,
+            Target::Mcp { config, tool } => {
+                // SME-241: an MCP call is ruled at its class, and the class
+                // is only known inside the call — after the connect and the
+                // override read, on the very connection it goes out on. So
+                // the chain travels in as the check `call_tool_classed`
+                // consults before it sends; the class is recorded either
+                // way, allowed or refused.
+                let chain = call_rule_chain(pool, conversation_id).await;
+                crate::mcp::call_tool_classed(pool, &config, tool, input.clone(), |class| {
+                    record(class);
+                    chain.allows_at(crate::personas::rules::ToolRef::Mcp { server: &config.name, tool }, class)
+                })
+                .await
+            }
             Target::Native(registered) => {
                 let class = registered.tool.class.of_call(input);
                 record(class);
@@ -296,18 +309,25 @@ mod server {
                 // like the offer path: offer and call stay a consistent
                 // pair, and a bad store strands no tools (SME-241's plan,
                 // threat model).
-                let chain = match crate::db::agent_rule_chain(pool, conversation_id).await {
-                    Ok(stored) => crate::personas::rules::RuleChain::from_stored(stored),
-                    Err(e) => {
-                        tracing::warn!(conversation_id, error = %e, "couldn't read the conversation's rule chain; its tools are unruled this call");
-                        crate::personas::rules::RuleChain::default()
-                    }
-                };
+                let chain = call_rule_chain(pool, conversation_id).await;
                 chain.allows_at(crate::personas::rules::ToolRef::Native(name), class)?;
                 if registered.offer != super::Offer::All {
                     offered_to(pool, conversation_id, name, registered.offer).await?;
                 }
                 (registered.tool.run)(super::Call { pool, conversation_id, tool_use_id, input }).await
+            }
+        }
+    }
+
+    /// The conversation's stored rule chain as the call path reads it
+    /// (SME-241): absent, unreadable or unparseable falls open with a
+    /// warning, the same pair `tool_definitions` offers by.
+    async fn call_rule_chain(pool: &PgPool, conversation_id: i64) -> crate::personas::rules::RuleChain {
+        match crate::db::agent_rule_chain(pool, conversation_id).await {
+            Ok(stored) => crate::personas::rules::RuleChain::from_stored(stored),
+            Err(e) => {
+                tracing::warn!(conversation_id, error = %e, "couldn't read the conversation's rule chain; its tools are unruled this call");
+                crate::personas::rules::RuleChain::default()
             }
         }
     }
@@ -388,7 +408,7 @@ mod server {
             .collect();
         match crate::db::list_mcp_server_configs(pool).await {
             Ok(configs) => {
-                definitions.extend(crate::mcp::tool_definitions_for(pool, &configs).await)
+                definitions.extend(crate::mcp::tool_definitions_for(pool, &configs, &chain).await)
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to list configured MCP servers; their tools are unavailable this turn")

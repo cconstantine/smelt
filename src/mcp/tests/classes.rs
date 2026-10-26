@@ -52,6 +52,7 @@ async fn class_of_call_on(pool: &sqlx::PgPool, config: &McpServerConfig, tool: &
     let class = std::sync::Mutex::new(None);
     let _ = call_tool_classed(pool, config, tool, serde_json::json!({}), |c| {
         *class.lock().unwrap() = Some(c);
+        Ok(())
     })
     .await;
     class.into_inner().unwrap()
@@ -194,4 +195,88 @@ async fn test_an_override_for_a_tool_the_server_does_not_list_classes_the_call(p
     let class = class_of_call_on(&pool, &config, "no_such_tool").await;
     REGISTRY.lock().await.remove(&config.id);
     assert_eq!(class, Some(ReadOnly), "the override classes the call; the server never answered it");
+}
+
+/// SME-241: the stored chain rules the *offer* too. A `class: read-only`
+/// entry hides the mock's unannotated (so destructive) `echo` and keeps
+/// the annotated read-only `second_tool`; a saved read-only override —
+/// the same read the call path makes — shows `echo` again; and a deny
+/// pattern naming the server hides a tool its class alone would keep.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_chain_rules_which_mcp_tools_are_offered(pool: sqlx::PgPool) {
+    let config = create_static_server(&pool, &test_config(0, "unused").url).await;
+    let server = register_test_connection(config.id, true).await;
+    server.router.write().await.enable_route("second_tool");
+    wait_until_stale(config.id).await;
+    let echo = format!("mcp__{}__echo", config.name);
+    let second = format!("mcp__{}__second_tool", config.name);
+
+    let read_only = crate::personas::rules::RuleChain::from_stored(Some(serde_json::json!([{"class": "read-only"}])));
+    let names = tool_definitions_for(&pool, std::slice::from_ref(&config), &read_only)
+        .await
+        .into_iter()
+        .map(|d| d.name)
+        .collect::<Vec<_>>();
+    assert!(names.contains(&second), "annotated read-only stays: {names:?}");
+    assert!(!names.contains(&echo), "unannotated means destructive, so the ceiling hides it: {names:?}");
+
+    crate::db::set_mcp_tool_class(&pool, config.id, "echo", ReadOnly).await.expect("read-only override");
+    let names = tool_definitions_for(&pool, std::slice::from_ref(&config), &read_only)
+        .await
+        .into_iter()
+        .map(|d| d.name)
+        .collect::<Vec<_>>();
+    assert!(names.contains(&echo), "the user's override rules the offer as it rules the call: {names:?}");
+    crate::db::clear_mcp_tool_class(&pool, config.id, "echo").await.expect("clear the override");
+
+    let denied = crate::personas::rules::RuleChain::from_stored(Some(serde_json::json!([
+        { "class": "all", "deny": [format!("{}/second_tool", config.name)] }
+    ])));
+    let names = tool_definitions_for(&pool, std::slice::from_ref(&config), &denied)
+        .await
+        .into_iter()
+        .map(|d| d.name)
+        .collect::<Vec<_>>();
+    assert!(!names.contains(&second), "the server's deny pattern hides just it: {names:?}");
+    assert!(names.contains(&echo), "and only it: {names:?}");
+    REGISTRY.lock().await.remove(&config.id);
+}
+
+/// SME-241: a chain that denies the class refuses an MCP call before its
+/// server is asked. The mock would have answered `echo`, so the refusal
+/// and the mock's own counter together say the send never happened; the
+/// message names the rule and the tool as the model calls it.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_denied_mcp_call_is_refused_before_its_server_is_asked(pool: sqlx::PgPool) {
+    let config = create_static_server(&pool, &test_config(0, "unused").url).await;
+    let server = register_test_connection(config.id, false).await;
+    let conversation = agent_conversation(&pool, serde_json::json!([{ "class": "read-only" }])).await;
+    let name = format!("mcp__{}__echo", config.name);
+    let result =
+        crate::anthropic::tools::execute(&pool, conversation, "toolu_241", &name, &serde_json::json!({"q": "SECRET-ARG"})).await;
+    REGISTRY.lock().await.remove(&config.id);
+    let error = result.expect_err("a read-only ceiling denies the destructive echo");
+    assert_eq!(
+        error,
+        format!("{name} is denied by this conversation's tool rules (class ceiling read-only doesn't allow a destructive tool)")
+    );
+    assert_eq!(server.calls.load(Ordering::SeqCst), 0, "the server was never asked");
+}
+
+/// SME-240's ordering, kept: the override read still speaks first. A rule
+/// can't be evaluated without the class that read answers with, so a call
+/// whose override row can't be read fails with the read's message and not
+/// the rule's. Green by construction — this is the guard, not the new
+/// behaviour.
+#[tokio::test]
+async fn test_a_rule_check_still_waits_for_the_class_override_read() {
+    let server_id = -241_001;
+    register_test_connection(server_id, false).await;
+    let config = test_config(server_id, "test-server");
+    let failed =
+        call_tool_classed(&test_pool(), &config, "echo", serde_json::json!({}), |_| Err("the chain denies it".to_string())).await;
+    REGISTRY.lock().await.remove(&server_id);
+    let error = failed.expect_err("the override read fails the call first");
+    assert!(error.contains("class override"), "{error}");
+    assert!(!error.contains("the chain denies it"), "{error}");
 }

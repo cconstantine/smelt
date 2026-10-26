@@ -128,12 +128,13 @@ pub(crate) fn check(path: &str, raw: RawToolRules) -> Result<ToolRules, String> 
     Ok(ToolRules { class: raw.class, allow, deny })
 }
 
-/// What one rule entry judges: a smelt tool by name. (SME-241's MCP step
-/// widens this with `Mcp { server, tool }` — the same name split
-/// `crate::mcp::parse_tool_name` does.)
+/// What one rule entry judges: a smelt tool by name, or an MCP tool by
+/// its server and the name that server lists it under — the same split
+/// `crate::mcp::parse_tool_name` does.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ToolRef<'a> {
     Native(&'a str),
+    Mcp { server: &'a str, tool: &'a str },
 }
 
 impl ToolRef<'_> {
@@ -141,6 +142,7 @@ impl ToolRef<'_> {
     fn name(&self) -> String {
         match self {
             ToolRef::Native(name) => name.to_string(),
+            ToolRef::Mcp { server, tool } => crate::mcp::namespaced_tool_name(server, tool),
         }
     }
 }
@@ -244,10 +246,13 @@ impl Pattern {
     }
 
     /// Whether the pattern names this tool. A smelt-tool pattern never
-    /// carries a server part, and vice versa.
+    /// carries a server part, and vice versa: an MCP tool is named by its
+    /// server exactly (a wildcard there is refused by the grammar) plus a
+    /// pattern in the tool name.
     fn matches(&self, tool: ToolRef) -> bool {
         match (tool, &self.server) {
             (ToolRef::Native(name), None) => glob(&self.tool, name),
+            (ToolRef::Mcp { server, tool }, Some(pattern_server)) => pattern_server == server && glob(&self.tool, tool),
             _ => false,
         }
     }

@@ -1,5 +1,7 @@
 use super::*;
 
+use std::sync::atomic::AtomicU32;
+
 use rmcp::handler::server::router::tool::{ToolRoute, ToolRouter};
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::model::{
@@ -18,6 +20,9 @@ use tokio::sync::RwLock;
 #[derive(Clone)]
 struct MockMcpServer {
     router: Arc<RwLock<ToolRouter<Self>>>,
+    /// Every `tools/call` this server has been asked for (SME-241):
+    /// a refused call proves the refusal happened by this staying 0.
+    calls: Arc<AtomicU32>,
 }
 
 impl MockMcpServer {
@@ -67,6 +72,7 @@ impl MockMcpServer {
         }
         Self {
             router: Arc::new(RwLock::new(router)),
+            calls: Arc::new(AtomicU32::new(0)),
         }
     }
 }
@@ -81,6 +87,7 @@ impl ServerHandler for MockMcpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         // An unlisted tool that never answers, for the call timeout.
         if request.name == "hang" {
             std::future::pending::<()>().await;
@@ -205,6 +212,31 @@ fn test_config(id: i64, name: &str) -> McpServerConfig {
         created_at: Default::default(),
         updated_at: Default::default(),
     }
+}
+
+/// The chain a test that rules nothing passes to `tool_definitions_for`:
+/// allow-all, what a conversation with no `agents` row gets.
+fn unruled() -> crate::personas::rules::RuleChain {
+    crate::personas::rules::RuleChain::default()
+}
+
+/// A conversation with an `active` agent row whose stored `rule_chain` is
+/// `entries` (SME-241): the stand-in for a started agent, so the offer and
+/// the call both read real rules from the database.
+async fn agent_conversation(pool: &sqlx::PgPool, entries: serde_json::Value) -> i64 {
+    let id = sqlx::query_scalar::<_, i64>("INSERT INTO conversations (title) VALUES ('ruled') RETURNING id")
+        .fetch_one(pool)
+        .await
+        .expect("a conversation");
+    sqlx::query(
+        "INSERT INTO agents (conversation_id, root_id, depth, brief, state, rule_chain) VALUES ($1, $1, 1, 'b', 'active', $2)",
+    )
+    .bind(id)
+    .bind(entries)
+    .execute(pool)
+    .await
+    .expect("an agent row");
+    id
 }
 
 /// Makes the next row `pool`'s database inserts into `mcp_servers` take
