@@ -222,6 +222,10 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "empty_conversation", 30, Box::pin(scenario_empty_conversation(&t))).await;
     run_scenario(&t, only, r, k, "sandbox_dev_server", 300, Box::pin(scenario_sandbox_dev_server(&t))).await;
     run_scenario(&t, only, r, k, "agents_md_trust", 180, Box::pin(scenario_agents_md_trust(&t))).await;
+    // 90s, not 60: one tab hydrates, then the card's five waits and the
+    // Trust hop. Every wait returns early on a working run — the bound is
+    // only so a broken one reads as itself, not as infrastructure.
+    run_scenario(&t, only, r, k, "repo_trust_card", 90, Box::pin(scenario_repo_trust_card(&t))).await;
     run_scenario(&t, only, r, k, "switch_resets_context_detail", 30, Box::pin(scenario_switch_resets_context_detail(&t))).await;
     run_scenario(&t, only, r, k, "model_picker", 60, Box::pin(scenario_model_picker(&t))).await;
     run_scenario(&t, only, r, k, "oauth_headers", 30, Box::pin(scenario_oauth_headers(&t))).await;
