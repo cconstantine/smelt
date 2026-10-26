@@ -84,13 +84,44 @@ impl Class {
 /// writing, one that doesn't parse included (nothing is sent then). A
 /// redirect can't raise it: every redirect keeps the method but a 303,
 /// which makes it a `GET`.
+///
+/// A method-override header can raise it (SME-241's Question 1, SME-237's
+/// review finding): some frameworks honour `X-HTTP-Method-Override`,
+/// `X-HTTP-Method` or `X-Method-Override` in place of the request method,
+/// so a `POST` naming `DELETE` is a delete behind one. The class is the
+/// most reaching of the two — an override raises a call, never lowers it,
+/// since the literal method goes out whatever that framework does, and one
+/// naming a method that doesn't parse raises nothing because no framework
+/// can honour it. The offer doesn't move: `http_request` can already be
+/// any class, so it's offered under every ceiling either way.
 fn http_request_class(input: &Value) -> ToolClass {
+    let literal = method_class(crate::http_request::parse_method(super::web::requested_method(input)));
+    super::web::requested_headers(input)
+        .iter()
+        .filter(|(name, _)| names_a_method_override(name))
+        .map(|(_, value)| method_class(crate::http_request::parse_method(value)))
+        .max()
+        .map_or(literal, |overridden| overridden.max(literal))
+}
+
+/// The class of a parsed method: the design's split, with an unparsable
+/// method writing ("any other", since nothing is sent with it).
+fn method_class(method: Result<reqwest::Method, String>) -> ToolClass {
     use reqwest::Method;
-    match crate::http_request::parse_method(super::web::requested_method(input)) {
+    match method {
         Ok(method) if [Method::GET, Method::HEAD, Method::OPTIONS].contains(&method) => ToolClass::ReadOnly,
         Ok(Method::DELETE) => ToolClass::Destructive,
         _ => ToolClass::Writing,
     }
+}
+
+/// Whether a header name is one of the three that name the method a
+/// framework should treat the request as, compared the way HTTP header
+/// names are compared.
+fn names_a_method_override(name: &str) -> bool {
+    ["x-http-method-override", "x-http-method", "x-method-override"]
+        .iter()
+        .any(|header| name.eq_ignore_ascii_case(header))
 }
 
 #[cfg(test)]

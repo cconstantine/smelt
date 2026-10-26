@@ -104,10 +104,12 @@ pub(super) fn requested_method(input: &Value) -> &str {
     input.get("method").and_then(Value::as_str).unwrap_or("GET")
 }
 
-async fn http_request_tool(input: &Value) -> Result<String, String> {
-    let url = required_str(input, "url")?;
-    let method = requested_method(input).to_string();
-    let headers: Vec<(String, String)> = input
+/// The headers an `http_request` call sends: its `headers` object's string
+/// values; anything else (no object, a non-string value) is skipped, as the
+/// tool skips it. The class reads them from here too, so it sees exactly
+/// what goes out (`class::http_request_class`, SME-241).
+pub(super) fn requested_headers(input: &Value) -> Vec<(String, String)> {
+    input
         .get("headers")
         .and_then(Value::as_object)
         .map(|obj| {
@@ -115,7 +117,13 @@ async fn http_request_tool(input: &Value) -> Result<String, String> {
                 .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+async fn http_request_tool(input: &Value) -> Result<String, String> {
+    let url = required_str(input, "url")?;
+    let method = requested_method(input).to_string();
+    let headers = requested_headers(input);
     let body = input.get("body").and_then(Value::as_str);
     let result = crate::http_request::request(&method, &url, &headers, body).await?;
     serde_json::to_string(&result).map_err(|e| e.to_string())

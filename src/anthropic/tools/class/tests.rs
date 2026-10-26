@@ -123,6 +123,53 @@ fn test_http_request_is_classed_by_the_method_it_sends() {
     }
 }
 
+/// A method-override header names the method a framework may treat the
+/// request as, so it can **raise** the call's class: a `POST` naming
+/// `DELETE` is a delete behind a framework that honours the header
+/// (SME-237's review finding, taken as SME-241's Question 1). It never
+/// lowers one: the literal method goes out whatever the framework does.
+/// The three names are the ones in the wild — Rails/Symfony's
+/// `X-HTTP-Method-Override`, Zend's `X-HTTP-Method`, Angular's
+/// `X-Method-Override` — matched the way header names are.
+#[test]
+fn test_http_request_is_classed_by_a_method_override_header_too() {
+    let url = "https://example.com/";
+    let cases: &[(serde_json::Value, ToolClass)] = &[
+        (
+            serde_json::json!({"url": url, "method": "POST", "headers": {"X-HTTP-Method-Override": "DELETE"}}),
+            Destructive,
+        ),
+        // Header names are case-insensitive; `parse_method` uppercases the
+        // value, as it does for the method itself.
+        (
+            serde_json::json!({"url": url, "method": "post", "headers": {"x-http-method-override": "delete"}}),
+            Destructive,
+        ),
+        // The other two names raise what would otherwise be the `GET`.
+        (serde_json::json!({"url": url, "headers": {"X-HTTP-Method": "DELETE"}}), Destructive),
+        (serde_json::json!({"url": url, "headers": {"X-Method-Override": "PUT"}}), Writing),
+        // A class only ever goes up: the literal `DELETE` is sent as well.
+        (
+            serde_json::json!({"url": url, "method": "DELETE", "headers": {"X-HTTP-Method-Override": "GET"}}),
+            Destructive,
+        ),
+        // An override that doesn't parse names no method a framework could
+        // honour: the literal method's class stands.
+        (
+            serde_json::json!({"url": url, "method": "POST", "headers": {"X-HTTP-Method-Override": "GET /x"}}),
+            Writing,
+        ),
+        // An unrelated header, and a non-string or missing headers object,
+        // change nothing.
+        (serde_json::json!({"url": url, "method": "POST", "headers": {"X-MCP-Toolsets": "all"}}), Writing),
+        (serde_json::json!({"url": url, "headers": {"X-HTTP-Method-Override": 5}}), ReadOnly),
+        (serde_json::json!({"url": url, "headers": null}), ReadOnly),
+    ];
+    for (input, expected) in cases {
+        assert_eq!(http_request_class_of(input.clone()), *expected, "{input}");
+    }
+}
+
 fn span_attribute<'a>(
     span: &'a opentelemetry_sdk::trace::SpanData,
     key: &str,
