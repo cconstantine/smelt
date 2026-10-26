@@ -168,6 +168,32 @@ async fn agent_rows(pool: &PgPool, root: i64) -> i64 {
 }
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_repo_card_answered_with_trust_unblocks_the_next_start(pool: PgPool) {
+    setup(&pool, vec![text_reply("ok")]).await;
+    let root = root_with_checkout(&pool, None, Arc::new(FakeCheckout::default())).await;
+    let input = serde_json::json!({"brief": "Fix it.", "repo": "/workspace/app", "ref": "main"});
+    start_on(&pool, root, input.clone()).await.expect_err("refused");
+    let card = db::list_instruction_requests(&pool, root).await.expect("cards").remove(0);
+
+    let notices = crate::git::decide_trust(&pool, root, card.id, &card.hash, true).await.expect("trust");
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    // Trust on a repo card loads no file: its notice tells the model it
+    // can ask for an agent again (SME-279).
+    let notice = &notices[0].1;
+    assert!(notice.contains("https://example.com/team/app.git"), "{notice}");
+    assert!(notice.contains("start_agent"), "{notice}");
+    assert!(!notice.contains("AGENTS.md"), "{notice}");
+    assert_eq!(db::get_repo_trust(&pool, KEY).await.expect("get"), Some(true));
+    assert!(db::list_instruction_requests(&pool, root).await.expect("cards").is_empty());
+    assert!(db::list_loaded_instructions(&pool, root).await.expect("loaded").is_empty(), "a repo card loads no file");
+
+    let result = start_on(&pool, root, input).await.expect("started");
+    let child = child_of(&pool, root, &result).await;
+    eventually("the child goes active", || async { state(&pool, child).await.as_deref() == Some(db::AGENT_ACTIVE) }).await;
+    eventually("every turn is over", || async { !crate::turn::turn_running(root) && !crate::turn::turn_running(child) }).await;
+}
+
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_child_clones_at_its_ref_and_loads_its_agents_md(pool: PgPool) {
     let requests = setup(&pool, vec![text_reply("ok")]).await;
     let hold = Arc::new(tokio::sync::Notify::new());

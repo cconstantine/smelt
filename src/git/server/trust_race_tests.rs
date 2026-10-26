@@ -499,3 +499,59 @@ async fn test_work_on_a_repo_and_a_delete_of_a_conversation_with_two_cards_dont_
     assert_eq!(db::get_repo_trust(&pool, "github.com/o/r").await.expect("trust"), Some(true));
     assert!(attach_waited, "the attach waited for the delete rather than running first");
 }
+
+/// SME-279: the card a refused `start_agent` asks and a trust decision
+/// on the same remote each land wholly before or after the other, under
+/// its trust lock. Either order's end state is consistent — the decision
+/// first lets the next start through and leaves no card; the start first
+/// leaves the card it asked with, and one decision answers it. End
+/// states, not timing.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_start_agent_card_and_a_decision_come_wholly_in_order(pool: PgPool) {
+    let _turn = ONE_AT_A_TIME.lock().await;
+
+    // The decision first: it answers the pending card, and the next
+    // start creates the child with no card recorded.
+    let root = db::create_conversation(&pool).await.expect("conversation");
+    let repo = cloned_repo(&pool, root.id).await;
+    let card = db::request_repo_trust_card(&pool, root.id, repo.id).await.expect("ask");
+    decide_trust(&pool, root.id, card.id, &card.hash, true).await.expect("trust");
+    let created = db::create_child(&pool, &new_child(root.id, &repo)).await.expect("start");
+    assert!(matches!(created, db::CreateChild::Created { .. }), "{created:?}");
+    assert!(db::list_instruction_requests(&pool, root.id).await.expect("cards").is_empty());
+
+    // The start first: undecided, it refuses with its card committed,
+    // and one decision then takes exactly that card.
+    db::delete_repo_trust(&pool, "github.com/o/r").await.expect("forget");
+    let second = db::create_conversation(&pool).await.expect("second conversation");
+    let repo = cloned_repo(&pool, second.id).await;
+    let refused = db::create_child(&pool, &new_child(second.id, &repo)).await.expect("start");
+    let (why, asked) = match refused {
+        db::CreateChild::Refused { why, asked } => (why, asked),
+        other => panic!("not refused: {other:?}"),
+    };
+    assert!(asked && why.contains("a card is asking"), "{why}");
+    let cards = db::list_instruction_requests(&pool, second.id).await.expect("cards");
+    assert_eq!(cards.len(), 1, "{cards:?}");
+    assert_eq!(cards[0].path, "");
+    let notices = decide_trust(&pool, second.id, cards[0].id, &cards[0].hash, true).await.expect("trust");
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(db::get_repo_trust(&pool, "github.com/o/r").await.expect("get"), Some(true));
+    assert!(db::list_instruction_requests(&pool, second.id).await.expect("cards").is_empty());
+}
+
+fn new_child<'a>(caller: i64, repo: &'a db::ConversationRepo) -> db::NewChild<'a> {
+    db::NewChild {
+        caller,
+        brief: "Fix it.",
+        persona_name: None,
+        model: None,
+        repo: Some(db::NewChildRepo {
+            url: &repo.url,
+            remote_key: &repo.remote_key,
+            dir: &repo.dir,
+            branch: Some("main"),
+            parent_repo_id: repo.id,
+        }),
+    }
+}

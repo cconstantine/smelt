@@ -6,10 +6,23 @@ const ANSWERED: &str = "No such request in this conversation (it may have been a
 struct Settled {
     repo: db::ConversationRepo,
     file: String,
-    /// The remote's other cards it dropped, and their files.
+    /// The answered card was about the repo itself, not a file (SME-279).
+    is_repo: bool,
+    /// The remote's other cards it dropped: the card and the file or
+    /// checkout path to quote for it.
     others: Vec<(db::InstructionRequest, String)>,
     /// Declined: `(conversation, file)` of each file unloaded.
     unloaded: Vec<(i64, String)>,
+}
+
+/// What a card row quotes: the file it showed, or — for the sentinel
+/// path `''` — the checkout directory itself, no trailing slash (SME-279).
+fn card_path(dir: &str, path: &str) -> String {
+    if path.is_empty() {
+        format!("{}/{}", crate::sandbox::WORKSPACE_DIR, dir)
+    } else {
+        format!("{}/{}/{}", crate::sandbox::WORKSPACE_DIR, dir, path)
+    }
 }
 
 /// The user's answer on the trust card for request `request_id`, from
@@ -91,9 +104,11 @@ async fn settle(
         return Err("The file changed since the card showed it. Read the card again, then decide.".to_string());
     }
     db::set_repo_trust(&mut *tx, remote_key, trusted).await.map_err(e)?;
-    let file = format!("{}/{}/{}", crate::sandbox::WORKSPACE_DIR, repo.dir, request.path);
-    if trusted {
+    let file = card_path(&repo.dir, &request.path);
+    let is_repo = request.path.is_empty();
+    if trusted && !is_repo {
         // Exactly what the card showed, not whatever the file says now.
+        // A repo card showed no file, so Trust loads nothing (SME-279).
         db::load_instruction(&mut *tx, conversation_id, repo.id, &request.path, &request.file())
             .await
             .map_err(e)?;
@@ -112,7 +127,7 @@ async fn settle(
     // they're dropped, and their conversations told where things stand.
     let others = drop_cards_for_remote(&mut *tx, remote_key).await?;
 
-    Ok(Settled { repo, file, others, unloaded })
+    Ok(Settled { repo, file, is_repo, others, unloaded })
 }
 
 /// Drops every card about the remote, in `tx` under its trust lock with
@@ -133,8 +148,8 @@ async fn drop_cards_for_remote(
         let Some(repo) = db::get_conversation_repo(&mut *tx, card.repo_id).await.map_err(e)? else {
             continue;
         };
-        let file = format!("{}/{}/{}", crate::sandbox::WORKSPACE_DIR, repo.dir, card.path);
-        dropped.push((card, file));
+        let quoted = card_path(&repo.dir, &card.path);
+        dropped.push((card, quoted));
     }
     Ok(dropped)
 }
@@ -177,29 +192,53 @@ pub(super) async fn trust_named_remote(
     Ok(dropped
         .into_iter()
         .map(|(card, file)| {
-            (
-                card.conversation_id,
+            // A dropped repo card is told with the agent wording: that
+            // model was refused a start, not a load (SME-279).
+            let notice = if card.path.is_empty() {
+                format!(
+                    "The user now trusts {url}. You can start agents on it there; call start_agent again."
+                )
+            } else {
                 format!(
                     "The user now trusts {url}. {file} wasn't loaded; call load_instructions \
                          again for it if you still want it (it loads without asking now)."
-                ),
-            )
+                )
+            };
+            (card.conversation_id, notice)
         })
         .collect())
 }
 
 /// What to tell each conversation's model about a decision, the
-/// deciding one first.
+/// deciding one first. Repo cards (path `''`) speak of agents; file
+/// cards keep the load wording (SME-279).
 fn notices(conversation_id: i64, trusted: bool, settled: &Settled) -> Vec<(i64, String)> {
-    let Settled { repo, file, others, unloaded } = settled;
-    let mut also_mine = Vec::new();
+    let Settled { repo, file, is_repo, others, unloaded } = settled;
+    let mut also_files = Vec::new();
+    let mut also_repos = Vec::new();
     let mut others_told = Vec::new();
     for (other, other_file) in others {
         if other.conversation_id == conversation_id {
-            also_mine.push(other_file.clone());
+            if other.path.is_empty() {
+                also_repos.push(other_file.clone());
+            } else {
+                also_files.push(other_file.clone());
+            }
             continue;
         }
-        let notice = if trusted {
+        let notice = if other.path.is_empty() {
+            if trusted {
+                format!(
+                    "The user now trusts {}. You can start agents on it there; call start_agent again.",
+                    repo.url
+                )
+            } else {
+                format!(
+                    "The user chose not to trust {}, so no agent can work on it there.",
+                    repo.url
+                )
+            }
+        } else if trusted {
             format!(
                 "The user now trusts {}. {other_file} wasn't loaded; call load_instructions \
                      again for it if you still want it.",
@@ -214,7 +253,21 @@ fn notices(conversation_id: i64, trusted: bool, settled: &Settled) -> Vec<(i64, 
         others_told.push((other.conversation_id, notice));
     }
 
-    let mut notice = if trusted {
+    let mut notice = if *is_repo {
+        if trusted {
+            format!(
+                "The user trusts {}: agents can now be started on it. Call start_agent again \
+                     if you want one.",
+                repo.url
+            )
+        } else {
+            format!(
+                "The user chose not to trust {}, so no agent can work on it, and its AGENTS.md \
+                     files won't be loaded.",
+                repo.url
+            )
+        }
+    } else if trusted {
         format!(
             "The user trusts {}: {file} is now in your Project instructions, as they read it. \
                  Follow it from now on.",
@@ -229,12 +282,20 @@ fn notices(conversation_id: i64, trusted: bool, settled: &Settled) -> Vec<(i64, 
     };
     // The conversation's other requests for this repo were dropped
     // with the decision; say so, rather than leave the model waiting.
-    if !also_mine.is_empty() {
-        let files = also_mine.join(", ");
+    if !also_files.is_empty() {
+        let files = also_files.join(", ");
         notice.push_str(&if trusted {
             format!(" {files} weren't loaded with it; call load_instructions again for any you still need (the repo is trusted now, so they load at once).")
         } else {
             format!(" {files} won't be loaded either.")
+        });
+    }
+    if !also_repos.is_empty() {
+        let dirs = also_repos.join(", ");
+        notice.push_str(&if trusted {
+            format!(" Agents can be started on {dirs} now.")
+        } else {
+            format!(" No agent can work on {dirs} either.")
         });
     }
     let mut unloaded_elsewhere: std::collections::BTreeMap<i64, Vec<String>> = Default::default();

@@ -230,6 +230,75 @@ async fn test_a_request_is_decided_only_from_its_own_conversation(pool: PgPool) 
     assert_eq!(db::get_repo_trust(&pool, "github.com/o/r").await.expect("get"), None);
 }
 
+/// SME-279: a card asked by a refused `start_agent` (path `''`, no file).
+/// Trusting it trusts the remote and loads nothing.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_repo_card_trusts_the_remote_and_loads_nothing(pool: PgPool) {
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let repo = cloned_repo(&pool, conversation.id).await;
+    let card = db::request_repo_trust_card(&pool, conversation.id, repo.id).await.expect("ask");
+    assert_eq!(card.path, "");
+
+    let notices = decide_trust(&pool, conversation.id, card.id, &card.hash, true).await.expect("trust");
+    assert_eq!(db::get_repo_trust(&pool, "github.com/o/r").await.expect("get"), Some(true));
+    assert!(project_instructions(&pool, conversation.id).await.expect("loaded").is_empty(), "a repo card loads no file");
+    assert!(only_repo(&pool, conversation.id).await.trust_requests.is_empty(), "the card was answered");
+    // Its notice names agents, not files: this model asked with start_agent.
+    let notice = &notices[0].1;
+    assert!(notice.contains("start_agent"), "{notice}");
+    assert!(!notice.contains("AGENTS.md"), "{notice}");
+}
+
+/// Declining a repo card refuses later loads of that remote's files.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_repo_card_declined_refuses_later_loads(pool: PgPool) {
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let repo = cloned_repo(&pool, conversation.id).await;
+    let card = db::request_repo_trust_card(&pool, conversation.id, repo.id).await.expect("ask");
+    let notice = decide_trust(&pool, conversation.id, card.id, &card.hash, false).await.expect("decline").remove(0).1;
+    assert!(notice.contains("not to trust"), "{notice}");
+    assert_eq!(db::get_repo_trust(&pool, "github.com/o/r").await.expect("get"), Some(false));
+    let refused = request_or_load(&pool, conversation.id, &repo, "AGENTS.md", &file("x")).await.expect_err("declined");
+    assert!(refused.contains("doesn't trust"), "{refused}");
+}
+
+/// A repo card and a file card for one remote, in two conversations:
+/// each decision drops the other's card. The notice about a repo card
+/// names `start_agent` and quotes no file path; the file card's notice
+/// keeps today's wording.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_repo_card_and_a_file_card_decide_each_other(pool: PgPool) {
+    let asking = db::create_conversation(&pool).await.expect("asking conversation");
+    let repo = cloned_repo(&pool, asking.id).await;
+    let other = db::create_conversation(&pool).await.expect("other conversation");
+    let other_repo = cloned_repo(&pool, other.id).await;
+
+    // The repo card decides first.
+    let repo_card = db::request_repo_trust_card(&pool, asking.id, repo.id).await.expect("repo ask");
+    request_or_load(&pool, other.id, &other_repo, "AGENTS.md", &file("x")).await.expect("file ask");
+    let notices = decide_trust(&pool, asking.id, repo_card.id, &repo_card.hash, true).await.expect("trust");
+    assert!(notices[0].1.contains("start_agent") && !notices[0].1.contains("AGENTS.md"), "{:?}", notices[0]);
+    assert!(only_repo(&pool, other.id).await.trust_requests.is_empty(), "the file card went with the decision");
+    assert!(
+        notices.iter().any(|(id, text)| *id == other.id
+            && text.contains("load_instructions again")
+            && text.contains("/workspace/r/AGENTS.md")),
+        "the file card's conversation keeps today's wording: {notices:?}"
+    );
+
+    // The file card decides first.
+    db::delete_repo_trust(&pool, "github.com/o/r").await.expect("reset for the next round");
+    let repo_card = db::request_repo_trust_card(&pool, asking.id, repo.id).await.expect("repo ask again");
+    request_or_load(&pool, other.id, &other_repo, "AGENTS.md", &file("x")).await.expect("file ask again");
+    let file_card = only_repo(&pool, other.id).await.trust_requests.remove(0);
+    let notices = decide_trust(&pool, other.id, file_card.id, &file_card.hash, true).await.expect("trust");
+    assert!(only_repo(&pool, asking.id).await.trust_requests.is_empty(), "the repo card went with the decision");
+    assert!(
+        notices.iter().any(|(id, text)| *id == asking.id && text.contains("start_agent") && !text.contains("AGENTS.md")),
+        "the repo card's conversation hears about agents: {notices:?}"
+    );
+}
+
 /// SME-246: every write of an AGENTS.md trust card ends in
 /// `publish_repos`, which tells every tab's sidebar that what waits for
 /// the user may have changed: a card waits for the user as a question does.
