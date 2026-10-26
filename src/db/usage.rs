@@ -138,8 +138,8 @@ pub async fn record_model_call_if_current(
         // (`db::agents::start::create_child`), and the conversation
         // row's lock was taken above before this reads, so a delete —
         // its own or an ancestor's cascade — lands wholly before (the
-        // agents row there, its root read) or wholly after (the agents
-        // row cascaded away, the re-read null): never half a state,
+        // agents row cascaded away, the re-read null) or wholly after
+        // (the agents row there, its root read): never half a state,
         // and no foreign key to fire, the column holding none by
         // design.
         "INSERT INTO model_call_usage
