@@ -72,6 +72,9 @@ pub struct TrustRequest {
     /// sha256 of `content`: the card sends it back with the decision, so
     /// Trust loads only the version the user read.
     pub hash: String,
+    /// The card is about the repo itself — a refused `start_agent`, no
+    /// file behind it: the card shows repo copy and no preview (SME-279).
+    pub is_repo: bool,
 }
 
 /// An `AGENTS.md` loaded into the model's context: what the system prompt

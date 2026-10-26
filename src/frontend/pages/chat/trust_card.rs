@@ -36,10 +36,7 @@ pub(super) fn TrustCards(
                     code { "{repo.url}" }
                     "?"
                 }
-                p { class: "muted",
-                    "The model wants to load this AGENTS.md as instructions it follows on every turn. Trust loads exactly the file below, and later ones from this repo load without asking. Only trust repos whose instructions you're happy for the model to follow."
-                }
-                {render_trust_card_preview(&request)}
+                {render_trust_card_body(&request)}
                 div { class: "trust-card-buttons",
                     button {
                         class: "trust-card-trust",
@@ -65,6 +62,26 @@ pub(super) fn TrustCards(
             }
         }
         ErrorText { message: repo_action_error() }
+    }
+}
+
+/// The card's body, by card kind (SME-279): a repo card (no file) says
+/// agents are what's at stake and shows no preview; a file card keeps
+/// its copy and its preview (SME-277).
+fn render_trust_card_body(request: &TrustRequest) -> Element {
+    if request.is_repo {
+        rsx! {
+            p { class: "muted",
+                "The model wants to start an agent on this repo. Trust lets agents clone and work on {request.path}, and its AGENTS.md files load without asking. Only trust repos you're happy for the model to work on."
+            }
+        }
+    } else {
+        rsx! {
+            p { class: "muted",
+                "The model wants to load this AGENTS.md as instructions it follows on every turn. Trust loads exactly the file below, and later ones from this repo load without asking. Only trust repos whose instructions you're happy for the model to follow."
+            }
+            {render_trust_card_preview(request)}
+        }
     }
 }
 
@@ -98,8 +115,20 @@ mod preview_tests {
             path: "/workspace/v/AGENTS.md".to_string(),
             content: content.to_string(),
             hash: "0".repeat(64),
+            is_repo: false,
         };
         dioxus::ssr::render_element(render_trust_card_preview(&request))
+    }
+
+    fn body(is_repo: bool) -> String {
+        let request = TrustRequest {
+            id: 7,
+            path: if is_repo { "/workspace/v".to_string() } else { "/workspace/v/AGENTS.md".to_string() },
+            content: "x".to_string(),
+            hash: "0".repeat(64),
+            is_repo,
+        };
+        dioxus::ssr::render_element(render_trust_card_body(&request))
     }
 
     #[test]
@@ -120,5 +149,21 @@ mod preview_tests {
         let html = card("# House rules\nBe kind.\n日本 é\n");
         assert!(!html.contains("muted"), "{html}");
         assert!(html.contains("Be kind."), "{html}");
+    }
+
+    /// SME-279: a repo card (no file) says it's about agents and shows no
+    /// preview; a file card's copy and preview stay as they were.
+    #[test]
+    fn test_the_repo_card_shows_repo_copy_and_no_preview() {
+        let html = body(true);
+        assert!(html.contains("start an agent"), "{html}");
+        assert!(html.contains("/workspace/v"), "{html}");
+        assert!(!html.contains("trust-card-preview"), "{html}");
+        assert!(!html.contains("load this AGENTS.md"), "{html}");
+
+        let html = body(false);
+        assert!(html.contains("trust-card-preview"), "{html}");
+        assert!(html.contains("load this AGENTS.md"), "{html}");
+        assert!(!html.contains("start an agent"), "{html}");
     }
 }

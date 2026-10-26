@@ -76,9 +76,12 @@ fn repo_summary(
             .into_iter()
             .map(|r| TrustRequest {
                 id: r.id,
-                path: format!("{path}/{}", r.path),
+                // A repo card quotes the checkout dir itself, not a
+                // file under it (SME-279).
+                path: if r.path.is_empty() { path.clone() } else { format!("{path}/{}", r.path) },
                 content: r.content,
                 hash: r.hash,
+                is_repo: r.path.is_empty(),
             })
             .collect(),
         loaded_instructions: loaded,
