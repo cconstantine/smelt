@@ -87,7 +87,6 @@ pub fn McpToolClassesSection(id: i64) -> Element {
                                     select {
                                         class: "mcp-tool-class-select",
                                         "aria-label": "Tool class for {tool_name}",
-                                        value: "{select_value}",
                                         onchange: move |evt| {
                                             let sent = evt.value();
                                             let class = if sent == SERVER_ANSWER { None } else { Some(sent) };
@@ -100,10 +99,14 @@ pub fn McpToolClassesSection(id: i64) -> Element {
                                                 }
                                             });
                                         },
-                                        option { value: SERVER_ANSWER, "{SERVER_ANSWER}" }
-                                        option { value: "read-only", "read-only" }
-                                        option { value: "writing", "writing" }
-                                        option { value: "destructive", "destructive" }
+                                        // The current choice goes on the options, not a `value:` on
+                                        // the select: Dioxus doesn't reflect a select's value attribute
+                                        // to the DOM, so the select would render blank — the pattern
+                                        // providers/models.rs already uses.
+                                        option { value: SERVER_ANSWER, selected: select_value == SERVER_ANSWER, "{SERVER_ANSWER}" }
+                                        option { value: "read-only", selected: select_value == "read-only", "read-only" }
+                                        option { value: "writing", selected: select_value == "writing", "writing" }
+                                        option { value: "destructive", selected: select_value == "destructive", "destructive" }
                                     }
                                     span { class: "mcp-tool-class-origin", "{note}" }
                                 }
