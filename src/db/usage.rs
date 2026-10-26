@@ -127,12 +127,29 @@ pub async fn record_model_call_if_current(
         // its last-known usage (SME-178 code review 1). Taken before the
         // provider's: a provider's delete locks its conversations first
         // too, so the two can't wait on each other.
+        //
+        // The cost group `group_root_id` (SME-244): the conversation's
+        // `agents.root_id` for an agent, and a re-read of the
+        // conversation for one without an `agents` row — not the bare
+        // id, so a deleted conversation's late record lands NULL-both
+        // and joins no group, as it joins no conversation's spend. A
+        // child's `agents` row is committed together with its
+        // conversation row before its first turn
+        // (`db::agents::start::create_child`), and the conversation
+        // row's lock was taken above before this reads, so a delete —
+        // its own or an ancestor's cascade — lands wholly before (the
+        // agents row cascaded away, the re-read null) or wholly after
+        // (the agents row there, its root read): never half a state,
+        // and no foreign key to fire, the column holding none by
+        // design.
         "INSERT INTO model_call_usage
              (conversation_id, provider_id, model, kind, input_tokens, output_tokens,
-              cache_creation_input_tokens, cache_read_input_tokens, cost_usd)
+              cache_creation_input_tokens, cache_read_input_tokens, cost_usd, group_root_id)
          VALUES ((SELECT id FROM conversations WHERE id = $1 FOR NO KEY UPDATE),
                  (SELECT id FROM inference_providers WHERE id = $2 FOR KEY SHARE),
-                 $3, $4, $5, $6, $7, $8, $9)
+                 $3, $4, $5, $6, $7, $8, $9,
+                 COALESCE((SELECT root_id FROM agents WHERE conversation_id = $1),
+                          (SELECT id FROM conversations WHERE id = $1)))
          RETURNING conversation_id",
     )
     .bind(call.conversation_id)
@@ -176,5 +193,48 @@ pub async fn get_conversation_spend(
     )
     .bind(conversation_id)
     .fetch_one(pool)
+    .await
+}
+
+/// What the whole cost group's calls used and cost (SME-244): every row
+/// recorded with `group_root_id = root_id` — the root's own calls plus
+/// every agent's under it, deleted children included, since the column
+/// carries no FK. One index scan, no recursion: `agents.root_id` already
+/// names the root (`get_group_root`). Compaction calls count, as they do
+/// in `get_conversation_spend`.
+pub async fn get_group_spend(
+    pool: &PgPool,
+    root_id: i64,
+) -> Result<crate::models::ConversationSpend, sqlx::Error> {
+    sqlx::query_as::<_, crate::models::ConversationSpend>(
+        "SELECT count(*) AS calls,
+                COALESCE(sum(input_tokens), 0)::BIGINT AS input_tokens,
+                COALESCE(sum(output_tokens), 0)::BIGINT AS output_tokens,
+                COALESCE(sum(cache_creation_input_tokens), 0)::BIGINT AS cache_creation_input_tokens,
+                COALESCE(sum(cache_read_input_tokens), 0)::BIGINT AS cache_read_input_tokens,
+                sum(cost_usd) AS cost_usd,
+                count(*) FILTER (WHERE cost_usd IS NULL) AS unpriced_calls
+         FROM model_call_usage WHERE group_root_id = $1",
+    )
+    .bind(root_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// The conversation a cost group is keyed on (SME-244): the `agents` row's
+/// `root_id` for an agent, the conversation itself for one without an
+/// `agents` row. With the root's title, for an agent's group label. `None`
+/// only when the conversation row is gone — as elsewhere in the context
+/// detail, that answers with nothing rather than failing.
+pub async fn get_group_root(
+    pool: &PgPool,
+    conversation_id: i64,
+) -> Result<Option<(i64, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT c.id, c.title FROM conversations c
+         WHERE c.id = COALESCE((SELECT root_id FROM agents WHERE conversation_id = $1), $1)",
+    )
+    .bind(conversation_id)
+    .fetch_optional(pool)
     .await
 }

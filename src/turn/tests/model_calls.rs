@@ -336,3 +336,70 @@ async fn test_a_llama_cpp_turn_sends_a_thinking_budget(pool: PgPool) {
     assert!(requests[3].get("thinking").is_none(), "{}", requests[3]);
     assert_eq!(requests[3]["chat_template_kwargs"], serde_json::json!({"enable_thinking": false}));
 }
+
+/// The context detail's group data (SME-244): an agent's shows its own
+/// spend plus the whole group's, labelled with the group root's title;
+/// the root's shows the group against its own, unlabelled. No turn run,
+/// so no mock or guard: the pool-only shape is proven by
+/// `prompt.rs`'s `test_context_detail_shows_the_system_prompt_a_turn_sends`.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_context_detail_shows_the_groups_spend_and_a_childs_group(pool: PgPool) {
+    let root = db::create_conversation(&pool).await.expect("root");
+    sqlx::query("UPDATE conversations SET title = 'Build the thing' WHERE id = $1")
+        .bind(root.id)
+        .execute(&pool)
+        .await
+        .expect("title the root");
+    let child = sqlx::query_scalar::<_, i64>("INSERT INTO conversations (title, parent_id) VALUES ($1, $2) RETURNING id")
+        .bind("agent of the root")
+        .bind(root.id)
+        .fetch_one(&pool)
+        .await
+        .expect("a child row");
+    sqlx::query("INSERT INTO agents (conversation_id, root_id, depth, brief, state) VALUES ($1, $2, 1, 'a brief', 'active')")
+        .bind(child)
+        .bind(root.id)
+        .execute(&pool)
+        .await
+        .expect("its agent row");
+    let provider = db::create_inference_provider(
+        &pool,
+        "p",
+        "anthropic",
+        "https://api.anthropic.com",
+        "api_key",
+        "sk-ant-0123456789",
+        false,
+        None,
+        true,
+        None,
+    )
+    .await
+    .expect("provider");
+    let call = |conversation_id| db::ModelCall {
+        conversation_id,
+        provider_id: provider.id,
+        model: "m",
+        kind: db::ModelCallKind::Turn,
+        usage: crate::anthropic::TokenUsage {
+            input_tokens: 10,
+            output_tokens: 1,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        },
+        cost_usd: Some(1.0),
+        finished: true,
+    };
+    db::record_model_call(&pool, &call(root.id)).await.expect("the root's call");
+    db::record_model_call(&pool, &call(child)).await.expect("the child's call");
+
+    let detail = context_detail(&pool, child).await.expect("the child's context detail");
+    assert_eq!(detail.spend.calls, 1, "the agent's own spend is its own");
+    assert_eq!(detail.group_spend.calls, 2, "and its group runs from the root down");
+    assert_eq!(detail.group_root_title.as_deref(), Some("Build the thing"), "labelled with the group's root");
+
+    let root_detail = context_detail(&pool, root.id).await.expect("the root's context detail");
+    assert_eq!(root_detail.spend.calls, 1, "the root's own spend stays its own");
+    assert_eq!(root_detail.group_spend.calls, 2, "its group holds its call and its agent's");
+    assert_eq!(root_detail.group_root_title, None, "the root is not in another conversation's group");
+}

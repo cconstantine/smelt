@@ -34,11 +34,11 @@ pub struct SandboxPodSummary { pod_id: i64, status: String, terminals: Vec<Sandb
 pub struct SandboxSnapshot { pods: Vec<SandboxPodSummary> }
 ```
 
-`get_context_usage` is the always-visible indicator's one-shot pull — the last real `usage` numbers persisted for this conversation (`None` if no turn has completed yet) plus the configured model's context window. `get_context_detail` is the click-through view: the same usage numbers, plus the exact system prompt a turn sends (from the same `system_prompt`/`prompt_environment` pair), the loaded `AGENTS.md` files in it with where each came from, every available tool's full definition, and the current message count — reconstructed from current state each call, not a stored snapshot of some specific past request:
+`get_context_usage` is the always-visible indicator's one-shot pull — the last real `usage` numbers persisted for this conversation (`None` if no turn has completed yet) plus the configured model's context window. `get_context_detail` is the click-through view: the same usage numbers, plus the exact system prompt a turn sends (from the same `system_prompt`/`prompt_environment` pair), the loaded `AGENTS.md` files in it with where each came from, every available tool's full definition, the current message count, and the spend so far — the conversation's own and its cost group's, itself plus every agent under it, deleted ones included, with the group root's title for an agent (SME-106, SME-244) — reconstructed from current state each call, not a stored snapshot of some specific past request:
 
 ```rust
 pub struct ContextUsageSnapshot { usage: Option<anthropic::TokenUsage>, context_window: u32 }
-pub struct ContextDetailSnapshot { system: Option<String>, instructions: Vec<git::ProjectInstructions>, tools: Vec<anthropic::ToolDefinition>, message_count: usize, usage: Option<anthropic::TokenUsage>, context_window: u32 }
+pub struct ContextDetailSnapshot { system: Option<String>, instructions: Vec<git::ProjectInstructions>, tools: Vec<anthropic::ToolDefinition>, message_count: usize, usage: Option<anthropic::TokenUsage>, context_window: u32, spend: models::ConversationSpend, prices_as_of: Option<chrono::NaiveDateTime>, group_spend: models::ConversationSpend, group_root_title: Option<String> }
 ```
 
 `get_browsing_state` (`api::browsing`) is the browsing panel's own one-shot check — is a session open right now, and on what URL (`browsing::current_url`) — so the panel can show an idle state instead of trying to subscribe to a frame stream that doesn't exist yet, and fill its address bar:
