@@ -193,10 +193,12 @@ pub(super) async fn trust_named_remote(
         .into_iter()
         .map(|(card, file)| {
             // A dropped repo card is told with the agent wording: that
-            // model was refused a start, not a load (SME-279).
+            // model was refused a start, not a load (SME-279). No "there":
+            // the notice reaches that conversation, so its own agents are
+            // what becomes possible (round 1, F9).
             let notice = if card.path.is_empty() {
                 format!(
-                    "The user now trusts {url}. You can start agents on it there; call start_agent again."
+                    "The user now trusts {url}. You can start agents on it; call start_agent again."
                 )
             } else {
                 format!(
@@ -229,12 +231,12 @@ fn notices(conversation_id: i64, trusted: bool, settled: &Settled) -> Vec<(i64, 
         let notice = if other.path.is_empty() {
             if trusted {
                 format!(
-                    "The user now trusts {}. You can start agents on it there; call start_agent again.",
+                    "The user now trusts {}. You can start agents on it; call start_agent again.",
                     repo.url
                 )
             } else {
                 format!(
-                    "The user chose not to trust {}, so no agent can work on it there.",
+                    "The user chose not to trust {}, so no agent can work on it.",
                     repo.url
                 )
             }

@@ -300,7 +300,12 @@ async fn test_a_repo_card_and_a_file_card_decide_each_other(pool: PgPool) {
     let notices = decide_trust(&pool, other.id, file_card.id, &file_card.hash, true).await.expect("trust");
     assert!(only_repo(&pool, asking.id).await.trust_requests.is_empty(), "the repo card went with the decision");
     assert!(
-        notices.iter().any(|(id, text)| *id == asking.id && text.contains("start_agent") && !text.contains("AGENTS.md")),
+        notices.iter().any(|(id, text)| *id == asking.id
+            // The sentence as written: it reaches the conversation that was
+            // refused a start, so it says what that conversation can do
+            // now, with no "there" pointing at itself (round 1, F9).
+            && text.contains("You can start agents on it; call start_agent again.")
+            && !text.contains("AGENTS.md")),
         "the repo card's conversation hears about agents: {notices:?}"
     );
 }
