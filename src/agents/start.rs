@@ -119,11 +119,18 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
             remote_key: &parent_repo.remote_key,
             dir: &parent_repo.dir,
             branch: branch.as_deref(),
+            parent_repo_id: parent_repo.id,
         }),
     };
     let (child, child_repo) = match db::create_child(pool, &new).await.map_err(|e| format!("couldn't start the agent: {e}"))? {
         db::CreateChild::Created { child, repo } => (child, repo),
-        db::CreateChild::Refused(why) => return Err(why),
+        db::CreateChild::Refused { why, asked } => {
+            if asked {
+                // The card must reach open tabs, as load_instructions' does.
+                crate::git::publish_repos(pool, caller).await;
+            }
+            return Err(why);
+        }
     };
     crate::events::publish_app(crate::events::AppEvent::ConversationsChanged);
     let on = match &repo {

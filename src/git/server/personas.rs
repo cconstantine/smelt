@@ -247,7 +247,8 @@ pub(crate) async fn gated_listing(pool: &PgPool, reads: Vec<RepoPersonas>) -> Re
             None if repo.agents_files.is_empty() => {
                 entry["note"] = Value::String(format!(
                     "The user hasn't decided whether to trust {}, so its personas aren't shown. It has \
-                     no AGENTS.md to ask with: the user can trust it by opening it with Work on a repo.",
+                     no AGENTS.md to ask with: ask for an agent on it and the user will be asked, or \
+                     they can open it with Work on a repo.",
                     repo.url
                 ));
             }

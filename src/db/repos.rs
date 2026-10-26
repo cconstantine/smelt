@@ -155,6 +155,31 @@ pub async fn request_instruction(
     .await
 }
 
+/// Asks the user to trust the repo itself — a card about no file
+/// (SME-279): the sentinel path `''`, empty content, and that empty
+/// string's sha256 as its hash, so the card's hash round-trip works
+/// like a file card's. `UNIQUE (repo_id, path)` keeps one per checkout
+/// row, and a repeat ask keeps the same card.
+pub async fn request_repo_trust_card(
+    executor: impl sqlx::PgExecutor<'_>,
+    conversation_id: i64,
+    repo_id: i64,
+) -> Result<InstructionRequest, sqlx::Error> {
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest("")
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    request_instruction(
+        executor,
+        conversation_id,
+        repo_id,
+        "",
+        &InstructionsFile { content: String::new(), file_bytes: 0, hash, commit: None },
+    )
+    .await
+}
+
 /// Share-locks, in id order, the rows of conversation `id` and of every
 /// conversation with a repo of this remote, until the transaction ends,
 /// as a foreign key to them would: deleting any of them then waits, or

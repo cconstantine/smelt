@@ -21,6 +21,9 @@ pub struct NewChildRepo<'a> {
     pub dir: &'a str,
     /// The branch its ref asks for, if any.
     pub branch: Option<&'a str>,
+    /// The parent's checkout row: an undecided remote's trust card asks
+    /// about it, in the parent's conversation (SME-279).
+    pub parent_repo_id: i64,
 }
 
 /// `create_child`'s outcome.
@@ -28,8 +31,11 @@ pub struct NewChildRepo<'a> {
 pub enum CreateChild {
     /// The child, and its repo row when it has one.
     Created { child: i64, repo: Option<ConversationRepo> },
-    /// The caller can't start an agent now, and why.
-    Refused(String),
+    /// The caller can't start an agent now, and why. `asked`: the user
+    /// has just been asked to trust the repo — the refusal recorded a
+    /// card — so the tool layer publishes the conversation's repos to
+    /// open tabs (SME-279).
+    Refused { why: String, asked: bool },
 }
 
 /// `start_agent`'s transaction: the caller's row locked (the lock a
@@ -49,33 +55,56 @@ pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChi
     .bind(new.caller)
     .fetch_optional(&mut *tx)
     .await?;
+    // Each refusal is a (why, asked) pair: `asked` means this
+    // transaction also recorded the repo's trust card (SME-279).
     let refused = match caller {
-        None => Some("this conversation no longer exists".to_string()),
-        Some(Some(_)) => Some("this conversation is being deleted".to_string()),
+        None => Some(("this conversation no longer exists".to_string(), false)),
+        Some(Some(_)) => Some(("this conversation is being deleted".to_string(), false)),
         Some(None) => match sqlx::query_scalar::<_, String>("SELECT state FROM agents WHERE conversation_id = $1")
             .bind(new.caller)
             .fetch_optional(&mut *tx)
             .await?
         {
-            Some(state) if state == AGENT_STOPPED => Some("you were stopped, so you can't start an agent".to_string()),
-            Some(_) => Some(crate::agents::ROOT_ONLY.to_string()),
+            Some(state) if state == AGENT_STOPPED => {
+                Some(("you were stopped, so you can't start an agent".to_string(), false))
+            }
+            Some(_) => Some((crate::agents::ROOT_ONLY.to_string(), false)),
             None => match &new.repo {
                 None => None,
                 Some(repo) => match get_repo_trust(&mut *tx, repo.remote_key).await? {
                     Some(true) => None,
-                    Some(false) => Some(format!("the user declined to trust {}, so no agent can work on it", repo.url)),
-                    None => Some(format!(
-                        "the user hasn't decided whether to trust {}, so no agent can work on it yet: \
-                         ask them to trust it. They can open it with \"Work on a repo\", or, if it has an \
-                         AGENTS.md, load that with load_instructions so they're asked",
-                        repo.url
+                    Some(false) => Some((
+                        format!("the user declined to trust {}, so no agent can work on it", repo.url),
+                        false,
                     )),
+                    None => {
+                        // The repo itself asks: a card on the parent's own
+                        // checkout row, in the parent's conversation, under
+                        // the trust lock held since this transaction opened
+                        // — a decision then lands wholly before or after it,
+                        // as for a card a load asked with (SME-181, SME-279).
+                        request_repo_trust_card(&mut *tx, new.caller, repo.parent_repo_id).await?;
+                        Some((
+                            format!(
+                                "the user hasn't decided whether to trust {}, so no agent can work on it yet: \
+                                 a card is asking them in this conversation now. You'll get a message when \
+                                 they decide; call start_agent again then.",
+                                repo.url
+                            ),
+                            true,
+                        ))
+                    }
                 },
             },
         },
     };
-    if let Some(why) = refused {
-        return Ok(CreateChild::Refused(why));
+    if let Some((why, asked)) = refused {
+        if asked {
+            // The card commits with the refusal (nothing else in this
+            // transaction was written); every other way out rolls back.
+            tx.commit().await?;
+        }
+        return Ok(CreateChild::Refused { why, asked });
     }
     let (provider_id, model) = new.model.clone().unzip();
     let child = sqlx::query_scalar::<_, i64>(

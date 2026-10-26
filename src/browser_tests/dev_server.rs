@@ -343,6 +343,68 @@ pub(super) async fn scenario_agents_md_trust(t: &Scenario<'_>) {
     );
 }
 
+/// SME-279: a card about the repo itself — what a refused `start_agent`
+/// asks with, on a repo that has no AGENTS.md to ask with. The row is
+/// seeded with the same helper that refusal uses
+/// (`db::request_repo_trust_card`); the refusal itself is
+/// `agents::tests::repo`'s and the decision is `git::server::db_tests`'s.
+/// What this scenario holds is the card's own wire and click path: the
+/// `is_repo` flag reaching the hydrated card, the checkout path it quotes
+/// instead of a file, no preview, and the empty-string hash the buttons
+/// send back deciding rather than erroring — with nothing loaded after.
+pub(super) async fn scenario_repo_trust_card(t: &Scenario<'_>) {
+    let pool = t.pool;
+    let asking = t.conversation().await;
+    let remote = format!("example.com/browser-tier/{}", unique_id("repo-card"));
+    let repo = db::create_conversation_repo(
+        pool,
+        asking.id,
+        &format!("https://{remote}.git"),
+        &remote,
+        None,
+        "repo-card",
+    )
+    .await
+    .expect("seed a repo");
+    db::set_repo_cloned(pool, repo.id, "main", Some("abc1234def")).await.expect("seed the clone");
+    db::request_repo_trust_card(pool, asking.id, repo.id).await.expect("seed the repo card");
+
+    let page = t.tab(t.url(&format!("conversation/{}", asking.id))).await;
+    assert!(
+        wait_for_text(&page, "wants to start an agent on this repo", Duration::from_secs(10)).await,
+        "the repo card should say what a refused start_agent is asking about"
+    );
+    assert!(
+        wait_for_text(&page, "work on /workspace/repo-card, and", Duration::from_secs(5)).await,
+        "the repo card should quote the checkout itself, not a file under it"
+    );
+    assert!(
+        wait_for_count(&page, ".trust-card", 1, Duration::from_secs(5)).await,
+        "the conversation should show exactly the one repo card"
+    );
+    assert!(
+        wait_for_count(&page, ".trust-card-preview", 0, Duration::from_secs(5)).await,
+        "a repo card has no file preview to show"
+    );
+    assert!(
+        !wait_for_text(&page, "load this AGENTS.md", Duration::from_secs(2)).await,
+        "a repo card is not a file card"
+    );
+
+    click_when_present(&page, ".trust-card-trust", Duration::from_secs(5)).await;
+    assert!(
+        wait_for_count(&page, ".trust-card", 0, Duration::from_secs(10)).await,
+        "trusting should take the card away, live"
+    );
+    let trusted = db::get_repo_trust(pool, &remote).await.expect("read trust");
+    assert_eq!(trusted, Some(true), "the decision is remembered for the remote");
+    assert!(
+        crate::git::project_instructions(pool, asking.id).await.expect("loaded").is_empty(),
+        "trusting the repo card loads no file"
+    );
+    db::delete_repo_trust(pool, &remote).await.expect("clean up the trust decision");
+}
+
 /// SME-34: the model's question waits on a card. It shows in every tab and
 /// survives a reload, the sidebar marks the conversation, and choosing an
 /// option answers it: the card goes from every tab, the mark clears, and

@@ -124,21 +124,73 @@ async fn child_repo(pool: &PgPool, child: i64) -> db::ConversationRepo {
 }
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_an_undecided_or_declined_remote_is_refused_before_anything_is_written(pool: PgPool) {
+async fn test_an_undecided_remote_asks_with_a_repo_card_and_a_declined_one_refuses(pool: PgPool) {
     setup(&pool, vec![text_reply("ok")]).await;
     let undecided = root_with_checkout(&pool, None, Arc::new(FakeCheckout::default())).await;
     let input = serde_json::json!({"brief": "Fix it.", "repo": "/workspace/app", "ref": "main"});
     let refused = start_on(&pool, undecided, input.clone()).await.expect_err("refused");
+    // SME-279: a repo the user hasn't decided about asks them itself — no
+    // AGENTS.md to ask with needed — and the refusal says the card is there.
     assert!(refused.contains("hasn't decided whether to trust https://example.com/team/app.git"), "{refused}");
-    // Review 1, finding 6: a repo with no AGENTS.md has no card to ask with,
-    // so the refusal names the user's own way to trust it too.
-    assert!(refused.contains("\"Work on a repo\""), "{refused}");
+    assert!(refused.contains("a card is asking"), "{refused}");
     assert_eq!(children(&pool, undecided).await, 0);
+    assert_eq!(agent_rows(&pool, undecided).await, 0);
+    // Exactly one card, on the parent's own checkout row, with the sentinel
+    // path and the empty file's hash; a repeat refusal is the same card.
+    let repo = db::list_conversation_repos(&pool, undecided).await.expect("repos").remove(0);
+    let cards = db::list_instruction_requests(&pool, undecided).await.expect("cards");
+    assert_eq!(cards.len(), 1, "{cards:?}");
+    assert_eq!(cards[0].repo_id, repo.id);
+    assert_eq!(cards[0].path, "");
+    // sha256 of the empty string: the card shows no file.
+    assert_eq!(cards[0].hash, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    let asked = cards[0].id;
+    let refused = start_on(&pool, undecided, input).await.expect_err("refused again");
+    assert!(refused.contains("a card is asking"), "{refused}");
+    let cards = db::list_instruction_requests(&pool, undecided).await.expect("cards");
+    assert_eq!(cards.len(), 1, "the card stays the same card: {cards:?}");
+    assert_eq!(cards[0].id, asked);
 
-    db::set_repo_trust(&pool, KEY, false).await.expect("decline");
-    let refused = start_on(&pool, undecided, input).await.expect_err("refused");
+    let declined = root_with_checkout(&pool, Some(false), Arc::new(FakeCheckout::default())).await;
+    let input = serde_json::json!({"brief": "Fix it.", "repo": "/workspace/app", "ref": "main"});
+    let refused = start_on(&pool, declined, input).await.expect_err("refused");
     assert!(refused.contains("declined to trust https://example.com/team/app.git"), "{refused}");
-    assert_eq!(children(&pool, undecided).await, 0);
+    assert_eq!(children(&pool, declined).await, 0);
+    assert!(db::list_instruction_requests(&pool, declined).await.expect("cards").is_empty());
+}
+
+async fn agent_rows(pool: &PgPool, root: i64) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM agents WHERE root_id = $1")
+        .bind(root)
+        .fetch_one(pool)
+        .await
+        .expect("count")
+}
+
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_repo_card_answered_with_trust_unblocks_the_next_start(pool: PgPool) {
+    setup(&pool, vec![text_reply("ok")]).await;
+    let root = root_with_checkout(&pool, None, Arc::new(FakeCheckout::default())).await;
+    let input = serde_json::json!({"brief": "Fix it.", "repo": "/workspace/app", "ref": "main"});
+    start_on(&pool, root, input.clone()).await.expect_err("refused");
+    let card = db::list_instruction_requests(&pool, root).await.expect("cards").remove(0);
+
+    let notices = crate::git::decide_trust(&pool, root, card.id, &card.hash, true).await.expect("trust");
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    // Trust on a repo card loads no file: its notice tells the model it
+    // can ask for an agent again (SME-279).
+    let notice = &notices[0].1;
+    assert!(notice.contains("https://example.com/team/app.git"), "{notice}");
+    assert!(notice.contains("start_agent"), "{notice}");
+    assert!(!notice.contains("AGENTS.md"), "{notice}");
+    assert_eq!(db::get_repo_trust(&pool, KEY).await.expect("get"), Some(true));
+    assert!(db::list_instruction_requests(&pool, root).await.expect("cards").is_empty());
+    assert!(db::list_loaded_instructions(&pool, root).await.expect("loaded").is_empty(), "a repo card loads no file");
+
+    let result = start_on(&pool, root, input).await.expect("started");
+    let child = child_of(&pool, root, &result).await;
+    eventually("the child goes active", || async { state(&pool, child).await.as_deref() == Some(db::AGENT_ACTIVE) }).await;
+    eventually("every turn is over", || async { !crate::turn::turn_running(root) && !crate::turn::turn_running(child) }).await;
 }
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]

@@ -29,7 +29,7 @@ pub(super) fn tools() -> Vec<Registered> {
                             "brief": {"type": "string", "description": "the agent's task, as its first message"},
                             "repo": {
                                 "type": "string",
-                                "description": "one of your checkouts, /workspace/<dir>: the agent gets its own clone of it, with its AGENTS.md loaded (its remote must be trusted)"
+                                "description": "one of your checkouts, /workspace/<dir>: the agent gets its own clone of it, with its AGENTS.md loaded; starting the first agent on a repo the user hasn't trusted yet asks them to trust it"
                             },
                             "ref": {
                                 "type": "string",
