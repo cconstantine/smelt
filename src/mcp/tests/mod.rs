@@ -180,11 +180,13 @@ async fn register_test_connection(server_id: i64, second_tool_disabled: bool) ->
 
 /// Never actually connected to — every test below either pre-populates
 /// `REGISTRY` directly (so `connect`, which reads the server's row, is
-/// never reached). Tests that connect use a `#[sqlx::test]` pool and a
-/// row (`create_static_server`). Same lazy-fake-pool
-/// pattern `anthropic::tools`' own tests already use for the same
-/// reason. OAuth-touching behavior gets its own `#[sqlx::test]`s in
-/// `mcp_oauth.rs`.
+/// never reached) and reads nothing else from the pool. Tests that
+/// connect, and any test that calls a tool (since SME-240 the call
+/// reads the class-override row), take a real `#[sqlx::test]` pool;
+/// connecting ones also a row (`create_static_server`). Same
+/// lazy-fake-pool pattern `anthropic::tools`' own tests already use for
+/// the same reason. OAuth-touching behavior gets its own
+/// `#[sqlx::test]`s in `mcp_oauth.rs`.
 fn test_pool() -> sqlx::PgPool {
     sqlx::PgPool::connect_lazy("postgres://unused:unused@localhost/unused")
         .expect("lazy pool construction never fails")

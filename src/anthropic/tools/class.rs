@@ -27,6 +27,18 @@ impl ToolClass {
             ToolClass::Destructive => "destructive",
         }
     }
+
+    /// The three `as_str()` names, and only those (SME-240): the POST
+    /// endpoint's validation, so a page can't send a class the table's
+    /// CHECK would refuse.
+    pub(crate) fn parse(text: &str) -> Option<ToolClass> {
+        match text {
+            "read-only" => Some(ToolClass::ReadOnly),
+            "writing" => Some(ToolClass::Writing),
+            "destructive" => Some(ToolClass::Destructive),
+            _ => None,
+        }
+    }
 }
 
 /// A native tool's class, beside its definition (`Tool { def, run, class }`).

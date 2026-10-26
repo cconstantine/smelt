@@ -31,11 +31,14 @@ pub async fn call_tool(
 /// failed tool call.
 ///
 /// Hands the call's class to `on_class` just before it goes out
-/// (SME-237): read from the tool list of the very connection the
-/// call is sent on, under the same `REGISTRY` guard, so a `tools/list_changed`
-/// or an `evict` can't put another list between them. A call that fails
-/// before that (arguments that aren't an object, a server that can't be
-/// reached) is never sent and has no class.
+/// (SME-237): the user's override for this server and tool when one is
+/// saved (SME-240, read from Postgres at every call — a save on the
+/// settings page takes effect at the next call), and otherwise the class
+/// read from the tool list of the very connection the call is sent on,
+/// under the same `REGISTRY` guard, so a `tools/list_changed` or an
+/// `evict` can't put another list between them. A call that fails before
+/// that (arguments that aren't an object, a server that can't be reached,
+/// an override row Postgres can't read) is never sent and has no class.
 pub async fn call_tool_classed(
     pool: &sqlx::PgPool,
     config: &McpServerConfig,
@@ -123,12 +126,44 @@ async fn call_tool_unspanned(
     ensure_connected(pool, config, Attempt::SkipRecentFailures)
         .await
         .map_err(|e| CallFailure::Failed(e.message))?;
-    let (service, class) = REGISTRY
+    // The user's override, read fresh at every call (SME-240), so a save
+    // on the settings page takes effect at the next call — no cache, no
+    // evict. Read *after* the connect (SME-237 review 1: a failed connect
+    // says why, unhid behind a lookup of its own) and *off* the REGISTRY
+    // guard (it's a DB query, not connection state). A failure here fails
+    // the call before it is sent rather than falling back to the
+    // annotations: the override is the user's answer to untrustworthy
+    // annotations, and a silent fallback would drop it exactly where
+    // SME-241 is about to enforce on this same read. The message names
+    // server and tool only — both already on the `mcp call` span — never
+    // tool input or output (SME-137).
+    let override_class = crate::db::get_mcp_tool_class(pool, config.id, tool_name)
+        .await
+        .map_err(|e| {
+            CallFailure::Failed(format!(
+                "couldn't read {tool_name:?}'s class override for {:?}: {e}",
+                config.name
+            ))
+        })?;
+    let (service, listed) = REGISTRY
         .lock()
         .await
         .get(&config.id)
         .map(|conn| (conn.service.clone(), listed_class(&conn.tools, tool_name)))
         .ok_or_else(|| CallFailure::Failed(format!("not connected to MCP server {:?}", config.name)))?;
+    // The override wins over the connection's list; an unknown text —
+    // unreachable under the table's CHECK — is taken as destructive,
+    // failing closed toward what SME-241 will enforce.
+    let class = match override_class.as_deref() {
+        None => listed,
+        Some(text) => crate::anthropic::tools::ToolClass::parse(text).unwrap_or_else(|| {
+            tracing::warn!(
+                "the class override saved for {tool_name:?} on {:?} reads {text:?}, which isn't a class; treating the call as destructive",
+                config.name
+            );
+            crate::anthropic::tools::ToolClass::Destructive
+        }),
+    };
     on_class(class);
 
     let mut request = CallToolRequestParams::new(tool_name.to_string());

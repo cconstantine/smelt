@@ -62,6 +62,7 @@ mod conversations;
 mod pods;
 mod commands;
 mod mcp;
+mod mcp_tool_classes;
 mod git;
 mod volumes;
 mod usage;

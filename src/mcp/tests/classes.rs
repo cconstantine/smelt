@@ -43,10 +43,14 @@ async fn wait_until_stale(server_id: i64) {
     .expect("tools/list_changed marks the list stale");
 }
 
-/// The class `call_tool_classed` hands over for a call to `tool`.
-async fn class_of_call(config: &McpServerConfig, tool: &str) -> Option<ToolClass> {
+/// The class `call_tool_classed` hands over for a call to `tool`, on
+/// `pool`'s database. Since SME-240 the call reads that pool for the
+/// tool's class override, so every test of a call needs a real
+/// (`#[sqlx::test]`) pool — `test_pool()`'s fake errors on the read and
+/// the call fails closed before sending.
+async fn class_of_call_on(pool: &sqlx::PgPool, config: &McpServerConfig, tool: &str) -> Option<ToolClass> {
     let class = std::sync::Mutex::new(None);
-    let _ = call_tool_classed(&test_pool(), config, tool, serde_json::json!({}), |c| {
+    let _ = call_tool_classed(pool, config, tool, serde_json::json!({}), |c| {
         *class.lock().unwrap() = Some(c);
     })
     .await;
@@ -55,18 +59,18 @@ async fn class_of_call(config: &McpServerConfig, tool: &str) -> Option<ToolClass
 
 /// Read from the connection's tool list at the call, after the re-list a
 /// `tools/list_changed` asks for.
-#[tokio::test]
-async fn test_a_tools_class_comes_from_the_connections_current_list() {
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_tools_class_comes_from_the_connections_current_list(pool: sqlx::PgPool) {
     let server_id = -237_001;
     let server = register_test_connection(server_id, true).await;
     let config = test_config(server_id, "test-server");
-    assert_eq!(class_of_call(&config, "echo").await, Some(Destructive), "echo has no annotations");
-    assert_eq!(class_of_call(&config, "no_such_tool").await, Some(Destructive), "not listed");
-    assert_eq!(class_of_call(&config, "second_tool").await, Some(Destructive), "hidden, so not listed");
+    assert_eq!(class_of_call_on(&pool, &config, "echo").await, Some(Destructive), "echo has no annotations");
+    assert_eq!(class_of_call_on(&pool, &config, "no_such_tool").await, Some(Destructive), "not listed");
+    assert_eq!(class_of_call_on(&pool, &config, "second_tool").await, Some(Destructive), "hidden, so not listed");
 
     server.router.write().await.enable_route("second_tool");
     wait_until_stale(server_id).await;
-    let class = class_of_call(&config, "second_tool").await;
+    let class = class_of_call_on(&pool, &config, "second_tool").await;
     REGISTRY.lock().await.remove(&server_id);
     assert_eq!(class, Some(ReadOnly), "annotated readOnlyHint: true");
 }
@@ -134,4 +138,60 @@ async fn test_an_mcp_call_with_bad_arguments_is_refused_before_connecting(pool: 
     let error = result.expect_err("5 isn't an object");
     assert!(error.contains("tool arguments must be a JSON object"), "{error}");
     assert!(!failed, "no connect was tried, so none failed");
+}
+
+/// SME-240 test 8, made cheap by the fix above: a call whose pool can't
+/// answer the class-override read (the fake `test_pool()` never
+/// connects) fails before sending, with the read's own message — no
+/// silent fallback to the annotations, and the server is never asked:
+/// the mock would have answered `echo`, and the call comes back refused.
+#[tokio::test]
+async fn test_a_call_refuses_when_its_class_override_row_cannot_be_read() {
+    let server_id = -240_003;
+    register_test_connection(server_id, false).await;
+    let config = test_config(server_id, "test-server");
+    let failed = call_tool(&test_pool(), &config, "echo", serde_json::json!({})).await;
+    REGISTRY.lock().await.remove(&server_id);
+    let error = failed.expect_err("an unreadable override row fails the call, not falls back");
+    assert!(error.contains("class override"), "{error}");
+}
+
+/// SME-240: the user's override wins at the call, and clearing it hands
+/// the answer back to the server — all on one connection, no `evict`, so
+/// this is also the proof there is no per-connection class cache: the
+/// override is re-read at every call.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_override_wins_at_the_call_and_a_clear_gives_the_server_its_answer_back(pool: sqlx::PgPool) {
+    let config = create_static_server(&pool, &test_config(0, "unused").url).await;
+    let server = register_test_connection(config.id, true).await;
+    server.router.write().await.enable_route("second_tool");
+    wait_until_stale(config.id).await;
+
+    assert_eq!(class_of_call_on(&pool, &config, "second_tool").await, Some(ReadOnly), "the server's answer first");
+    crate::db::set_mcp_tool_class(&pool, config.id, "second_tool", Destructive)
+        .await
+        .expect("set a destructive override");
+    assert_eq!(class_of_call_on(&pool, &config, "second_tool").await, Some(Destructive), "the override wins");
+    crate::db::clear_mcp_tool_class(&pool, config.id, "second_tool")
+        .await
+        .expect("clear the override");
+    let class = class_of_call_on(&pool, &config, "second_tool").await;
+    REGISTRY.lock().await.remove(&config.id);
+    assert_eq!(class, Some(ReadOnly), "the same connection gives the server's answer back");
+}
+
+/// SME-240: an override exists whether or not the server lists the tool
+/// — it classes the call where the annotation rule alone says
+/// destructive (unlisted). The mock refuses the call itself (the name
+/// isn't in its router); the class was handed over before sending.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_override_for_a_tool_the_server_does_not_list_classes_the_call(pool: sqlx::PgPool) {
+    let config = create_static_server(&pool, &test_config(0, "unused").url).await;
+    let _server = register_test_connection(config.id, false).await;
+    crate::db::set_mcp_tool_class(&pool, config.id, "no_such_tool", ReadOnly)
+        .await
+        .expect("set a read-only override for an unlisted tool");
+    let class = class_of_call_on(&pool, &config, "no_such_tool").await;
+    REGISTRY.lock().await.remove(&config.id);
+    assert_eq!(class, Some(ReadOnly), "the override classes the call; the server never answered it");
 }

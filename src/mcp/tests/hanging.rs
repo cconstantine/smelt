@@ -62,13 +62,13 @@ async fn test_the_status_check_gives_up_on_a_hanging_server(pool: sqlx::PgPool) 
 
 /// SME-51 B8: a tool call that never returns held the turn, and the
 /// conversation's lock, forever.
-#[tokio::test]
-async fn test_a_tool_call_that_never_returns_times_out() {
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_tool_call_that_never_returns_times_out(pool: sqlx::PgPool) {
     register_test_connection(-1112, false).await;
     let config = test_config(-1112, "hangs");
     let called = tokio::time::timeout(
         CALL_TIMEOUT + std::time::Duration::from_secs(3),
-        call_tool(&test_pool(), &config, "hang", serde_json::json!({})),
+        call_tool(&pool, &config, "hang", serde_json::json!({})),
     )
     .await;
     assert!(

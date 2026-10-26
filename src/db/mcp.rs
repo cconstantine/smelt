@@ -329,3 +329,68 @@ pub async fn clear_mcp_server_oauth_credentials_if(
     .await?;
     Ok(updated.rows_affected() == 1)
 }
+
+// --- Per-tool class overrides (mcp_tool_classes, SME-240) ---
+// The user's class for one of a server's tools, winning over the
+// server's annotations wherever a class is read
+// (docs/design/personas/tool-rules.md#mcp-tools).
+
+/// Sets `tool_name`'s override class for server `server_id`, one row per
+/// (server, tool).
+pub async fn set_mcp_tool_class(
+    pool: &PgPool,
+    server_id: i64,
+    tool_name: &str,
+    class: crate::anthropic::tools::ToolClass,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO mcp_tool_classes (server_id, tool_name, class) VALUES ($1, $2, $3) \
+         ON CONFLICT (server_id, tool_name) DO UPDATE SET class = excluded.class, updated_at = now()",
+    )
+    .bind(server_id)
+    .bind(tool_name)
+    .bind(class.as_str())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Removes `tool_name`'s override, back to the server's own answer.
+/// `false` when nothing matched.
+pub async fn clear_mcp_tool_class(
+    pool: &PgPool,
+    server_id: i64,
+    tool_name: &str,
+) -> Result<bool, sqlx::Error> {
+    let deleted = sqlx::query("DELETE FROM mcp_tool_classes WHERE server_id = $1 AND tool_name = $2")
+        .bind(server_id)
+        .bind(tool_name)
+        .execute(pool)
+        .await?;
+    Ok(deleted.rows_affected() == 1)
+}
+
+/// Every override saved for `server_id`, as `(tool_name, class)` by name.
+pub async fn list_mcp_tool_classes(
+    pool: &PgPool,
+    server_id: i64,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as("SELECT tool_name, class FROM mcp_tool_classes WHERE server_id = $1 ORDER BY tool_name")
+        .bind(server_id)
+        .fetch_all(pool)
+        .await
+}
+
+/// The call path's one-row PK read: `server_id`'s override class text
+/// for `tool_name`, `None` when there is none.
+pub async fn get_mcp_tool_class(
+    pool: &PgPool,
+    server_id: i64,
+    tool_name: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT class FROM mcp_tool_classes WHERE server_id = $1 AND tool_name = $2")
+        .bind(server_id)
+        .bind(tool_name)
+        .fetch_optional(pool)
+        .await
+}
