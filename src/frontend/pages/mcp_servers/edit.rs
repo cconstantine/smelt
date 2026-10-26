@@ -181,7 +181,7 @@ pub fn McpServerEdit(id: i64) -> Element {
                     }
                 }
 
-                McpToolClassesSection { id }
+                McpToolClassesSection { id, status_reload }
 
                 McpServerEditForm {
                     id,

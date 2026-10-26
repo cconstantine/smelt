@@ -9,6 +9,16 @@
 //! override fresh at every call (`crate::mcp::call_tool_classed`) — so
 //! a save takes effect at the next call with no refresh dance of its
 //! own.
+//!
+//! It refetches on the page's `status_reload` bump as well (SME-240
+//! review 1, F1): saving the form, or an OAuth connect/disconnect,
+//! evicts the server's cached connection server-side
+//! (`crate::mcp::evict`), so the live half of this section's answer —
+//! which tools exist and how they're annotated — is stale the moment
+//! Status refetches. The two sections read the same connection, so they
+//! reload on the same signal; without that, the page shows a Status of
+//! "Unreachable" beside a tool list read from the connection that's
+//! gone.
 
 use dioxus::prelude::*;
 
@@ -47,16 +57,20 @@ pub(super) fn tool_class_origin_note(row: &McpToolClassRow) -> String {
 }
 
 /// The Tool-classes section between the edit page's Status section and
-/// its edit form. Its own resource and reload bump; a failed save shows
+/// its edit form. Its own resource, reloaded by its own saves and by the
+/// page's `status_reload` (see the module note); a failed save shows
 /// here, not on the form. When the server is unreachable or not
 /// connected yet, the GET answers with just the saved overrides and a
 /// note — the rows stay editable, so an override can be cleared while
 /// the server is down (the plan's states table).
 #[component]
-pub fn McpToolClassesSection(id: i64) -> Element {
+pub fn McpToolClassesSection(id: i64, status_reload: Signal<u32>) -> Element {
     let mut classes_reload: Signal<u32> = use_signal(|| 0);
     let classes = use_resource(move || {
         let _ = classes_reload();
+        // The same bump Status reloads on: a saved edit or an OAuth change
+        // evicts the connection this section's live rows came from.
+        let _ = status_reload();
         get_mcp_tool_classes(id)
     });
     let mut save_error: Signal<Option<String>> = use_signal(|| None);
