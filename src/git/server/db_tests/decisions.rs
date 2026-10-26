@@ -289,6 +289,12 @@ async fn test_a_repo_card_and_a_file_card_decide_each_other(pool: PgPool) {
     // The file card decides first.
     db::delete_repo_trust(&pool, "github.com/o/r").await.expect("reset for the next round");
     let repo_card = db::request_repo_trust_card(&pool, asking.id, repo.id).await.expect("repo ask again");
+    assert_eq!(repo_card.path, "", "the re-ask is about the repo itself, not a file");
+    assert_eq!(
+        only_repo(&pool, asking.id).await.trust_requests.iter().map(|c| c.id).collect::<Vec<_>>(),
+        vec![repo_card.id],
+        "the re-asked card is the one the file decision then drops"
+    );
     request_or_load(&pool, other.id, &other_repo, "AGENTS.md", &file("x")).await.expect("file ask again");
     let file_card = only_repo(&pool, other.id).await.trust_requests.remove(0);
     let notices = decide_trust(&pool, other.id, file_card.id, &file_card.hash, true).await.expect("trust");
