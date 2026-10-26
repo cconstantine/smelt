@@ -59,6 +59,7 @@ mod files;
 mod git;
 mod pods;
 mod previews;
+mod rules;
 mod spans;
 mod terminals;
 mod todos;

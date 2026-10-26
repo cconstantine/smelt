@@ -1,8 +1,8 @@
 //! Every tool's class (SME-237): what a call does outside the agent's own
 //! sandbox and conversation, on one scale for smelt's tools and MCP tools
 //! (`docs/design/personas/tool-rules.md#classes`). A persona's tool rules
-//! (SME-241) allow or deny by it; nothing filters by it yet, and a call's
-//! class rides on its `tool` span as `smelt.tool.class`.
+//! (SME-241) allow or deny by it, and a call's class rides on its `tool`
+//! span as `smelt.tool.class`.
 
 use serde_json::Value;
 
@@ -70,7 +70,6 @@ impl Class {
 
     /// Every class a call to this tool can have: what the offered list
     /// is judged by (SME-241).
-    #[cfg_attr(not(test), expect(dead_code, reason = "SME-241 offers tools by it"))]
     pub(super) fn can_be(&self) -> &[ToolClass] {
         match self {
             Class::Fixed(class) => std::slice::from_ref(class),

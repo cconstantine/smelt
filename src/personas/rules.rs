@@ -2,8 +2,10 @@
 //! allow/deny patterns, as `docs/design/personas/tool-rules.md#the-grammar`
 //! spells them. `check` turns the YAML's raw text into `ToolRules`; a
 //! pattern that can't be one is an error naming the persona file.
-//! Evaluation of a rule chain against a tool call is SME-241's next step.
+//! `RuleChain` evaluates the chain a conversation stores against a tool
+//! offer and a tool call — the one evaluation SME-241 enforces everywhere.
 
+use crate::anthropic::tools::ToolClass;
 use serde::{Deserialize, Serialize};
 
 /// The class ceiling: which classes the rules allow unless a pattern says
@@ -15,6 +17,26 @@ pub(crate) enum Ceiling {
     All,
     NoDestructive,
     ReadOnly,
+}
+
+impl Ceiling {
+    /// The design's spelling, as the refusal message quotes it.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Ceiling::All => "all",
+            Ceiling::NoDestructive => "no-destructive",
+            Ceiling::ReadOnly => "read-only",
+        }
+    }
+
+    /// The ceiling with no pattern matching: the class at or below it.
+    fn allows(self, class: ToolClass) -> bool {
+        match self {
+            Ceiling::All => true,
+            Ceiling::NoDestructive => class != ToolClass::Destructive,
+            Ceiling::ReadOnly => class == ToolClass::ReadOnly,
+        }
+    }
 }
 
 /// A parsed tool pattern: `write_file` names a smelt tool, `github/create_*`
@@ -104,4 +126,143 @@ pub(crate) fn check(path: &str, raw: RawToolRules) -> Result<ToolRules, String> 
         return Err(format!("{path}: smelt.tools pattern {dup:?} is in both allow and deny: it belongs to one."));
     }
     Ok(ToolRules { class: raw.class, allow, deny })
+}
+
+/// What one rule entry judges: a smelt tool by name. (SME-241's MCP step
+/// widens this with `Mcp { server, tool }` — the same name split
+/// `crate::mcp::parse_tool_name` does.)
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ToolRef<'a> {
+    Native(&'a str),
+}
+
+impl ToolRef<'_> {
+    /// The name the model calls it by, as the refusal quotes it.
+    fn name(&self) -> String {
+        match self {
+            ToolRef::Native(name) => name.to_string(),
+        }
+    }
+}
+
+/// A conversation's effective rules: the `agents.rule_chain` array read
+/// back, oldest entry first. Evaluation is a conjunction over entries —
+/// each narrows what came before, and nothing re-reads persona files
+/// (docs/design/personas/tool-rules.md#narrowing).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RuleChain(Vec<ToolRules>);
+
+impl RuleChain {
+    /// The stored column: absent or NULL is the empty chain — allow-all,
+    /// the user's own conversation as today. JSON that won't read as
+    /// entries is possible only if the store was corrupted behind smelt's
+    /// back (it's written by typed serde): fall open with a warning, the
+    /// same way the call path reads, so offer and call stay a consistent
+    /// pair rather than offering tools whose calls are refused.
+    pub(crate) fn from_stored(stored: Option<serde_json::Value>) -> RuleChain {
+        let entries = match stored
+            .map(serde_json::from_value::<Vec<ToolRules>>)
+            .transpose()
+        {
+            Ok(entries) => entries.unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(error = %e, "an agents.rule_chain value won't read as tool rules; its conversation is left unruled");
+                Vec::new()
+            }
+        };
+        RuleChain(entries)
+    }
+
+    /// Whether the tool may be called at `class`: every entry must allow
+    /// it. The Err names the deciding rule and the tool.
+    pub(crate) fn allows_at(&self, tool: ToolRef, class: ToolClass) -> Result<(), String> {
+        for entry in &self.0 {
+            entry.allows(tool, class)?;
+        }
+        Ok(())
+    }
+
+    /// Whether to offer the tool: allowed at some class it can have
+    /// (`Class::can_be` — only `http_request` has more than one).
+    pub(crate) fn allows_any(&self, tool: ToolRef, classes: &[ToolClass]) -> bool {
+        classes.iter().any(|class| self.allows_at(tool, *class).is_ok())
+    }
+}
+
+impl ToolRules {
+    /// One entry's verdict: the most specific matching pattern decides,
+    /// and a deny wins a tie at that level. Nothing matches: the class
+    /// against the ceiling — specificity level 4 in the design.
+    fn allows(&self, tool: ToolRef, class: ToolClass) -> Result<(), String> {
+        let mut best: Option<(u8, &Pattern, bool)> = None; // level, pattern, denies?
+        for (patterns, denies) in [(&self.allow, false), (&self.deny, true)] {
+            for pattern in patterns {
+                if !pattern.matches(tool) {
+                    continue;
+                }
+                let better = match best {
+                    None => true,
+                    Some((best_level, _, best_denies)) => {
+                        pattern.level() < best_level
+                            || (pattern.level() == best_level && denies && !best_denies)
+                    }
+                };
+                if better {
+                    best = Some((pattern.level(), pattern, denies));
+                }
+            }
+        }
+        match best {
+            Some((_, pattern, true)) => Err(format!(
+                "{} is denied by this conversation's tool rules (deny pattern `{}`)",
+                tool.name(),
+                String::from(pattern.clone())
+            )),
+            Some((_, _, false)) => Ok(()),
+            None if self.class.allows(class) => Ok(()),
+            None => Err(format!(
+                "{} is denied by this conversation's tool rules (class ceiling {} doesn't allow a {} tool)",
+                tool.name(),
+                self.class.as_str(),
+                class.as_str()
+            )),
+        }
+    }
+}
+
+impl Pattern {
+    /// The design's specificity: 1 exact, 2 a wildcard in the tool name,
+    /// 3 a whole server (`<server>/*`). Computed, never stored.
+    fn level(&self) -> u8 {
+        if self.server.is_some() && self.tool == "*" {
+            3
+        } else if self.tool.contains('*') {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Whether the pattern names this tool. A smelt-tool pattern never
+    /// carries a server part, and vice versa.
+    fn matches(&self, tool: ToolRef) -> bool {
+        match (tool, &self.server) {
+            (ToolRef::Native(name), None) => glob(&self.tool, name),
+            _ => false,
+        }
+    }
+}
+
+/// The pattern's `*` matches any run of characters with no `/` in it —
+/// a wildcard can't reach across a separator into another server's name.
+fn glob(pattern: &str, text: &str) -> bool {
+    match pattern.split_once('*') {
+        None => pattern == text,
+        Some((head, tail)) => {
+            let Some(rest) = text.strip_prefix(head) else { return false };
+            (0..=rest.len()).any(|cut| {
+                rest.get(cut..).is_some() && !rest[..cut].contains('/') && glob(tail, &rest[cut..])
+            })
+        }
+    }
 }

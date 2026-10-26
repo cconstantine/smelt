@@ -286,7 +286,23 @@ mod server {
         match resolve(pool, name).await? {
             Target::Mcp { config, tool } => crate::mcp::call_tool_classed(pool, &config, tool, input.clone(), record).await,
             Target::Native(registered) => {
-                record(registered.tool.class.of_call(input));
+                let class = registered.tool.class.of_call(input);
+                record(class);
+                // SME-241: the conversation's stored chain speaks before the
+                // tool runs — a refusal names the rule and no side effect
+                // happened. A chain it doesn't have (no agent row), can't
+                // read, or can't parse falls open with a warning, exactly
+                // like the offer path: offer and call stay a consistent
+                // pair, and a bad store strands no tools (SME-241's plan,
+                // threat model).
+                let chain = match crate::db::agent_rule_chain(pool, conversation_id).await {
+                    Ok(stored) => crate::personas::rules::RuleChain::from_stored(stored),
+                    Err(e) => {
+                        tracing::warn!(conversation_id, error = %e, "couldn't read the conversation's rule chain; its tools are unruled this call");
+                        crate::personas::rules::RuleChain::default()
+                    }
+                };
+                chain.allows_at(crate::personas::rules::ToolRef::Native(name), class)?;
                 if registered.offer != super::Offer::All {
                     offered_to(pool, conversation_id, name, registered.offer).await?;
                 }
@@ -339,8 +355,9 @@ mod server {
     /// rather than failing the whole request — see
     /// `crate::mcp::tool_definitions_for`. Only the tools offered to
     /// `conversation_id` (SME-236): `start_agent` to a conversation without
-    /// a parent, `finish` and `ask_parent` to an agent. A failed read
-    /// offers neither.
+    /// a parent, `finish` and `ask_parent` to an agent; and only those its
+    /// stored rule chain allows (SME-241). A failed read offers neither
+    /// agent tools nor ruled-away narrowing: the chain falls open, warned.
     pub async fn tool_definitions(pool: &PgPool, conversation_id: i64) -> Vec<crate::anthropic::ToolDefinition> {
         let has_parent = match crate::db::conversation_parent(pool, conversation_id).await {
             Ok(parent) => Some(parent.is_some()),
@@ -349,11 +366,24 @@ mod server {
                 None
             }
         };
+        let chain = match crate::db::agent_rule_chain(pool, conversation_id).await {
+            Ok(stored) => crate::personas::rules::RuleChain::from_stored(stored),
+            Err(e) => {
+                tracing::warn!(conversation_id, error = %e, "couldn't read the conversation's rule chain; its tools are unruled this turn");
+                crate::personas::rules::RuleChain::default()
+            }
+        };
         let mut definitions: Vec<crate::anthropic::ToolDefinition> = super::REGISTRY
             .iter()
             .filter(|registered| match has_parent {
                 Some(has_parent) => is_offered(registered.offer, has_parent),
                 None => matches!(registered.offer, super::Offer::All | super::Offer::Linked),
+            })
+            .filter(|registered| {
+                chain.allows_any(
+                    crate::personas::rules::ToolRef::Native(&registered.tool.def.name),
+                    registered.tool.class.can_be(),
+                )
             })
             .map(|registered| registered.tool.def.clone())
             .collect();
