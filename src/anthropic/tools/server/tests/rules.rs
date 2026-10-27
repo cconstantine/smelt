@@ -66,9 +66,36 @@ async fn test_a_read_only_chain_hides_writing_tools_from_the_offer(pool: PgPool)
          create_pod by its own pin (class/tests.rs)"
     );
     assert_eq!(
-        present(&names, &["browser_click", "browser_fill", "stop_agent"]),
+        present(&names, &["browser_click", "browser_fill", "stop_agent", "create_volume"]),
         Vec::<&str>::new(),
-        "the writing tools go"
+        "the writing tools go, SME-239's create_volume among them"
+    );
+}
+
+/// The other ceiling's turn (SME-239, A-F3): `delete_volume` is the registry's
+/// first destructive built-in, and a no-destructive chain hides it at the
+/// offer and refuses its call — while `create_volume`, two classes down,
+/// stays offered, proving the hide is the class and not the tool's name.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_no_destructive_chain_hides_delete_volume_and_keeps_create_volume(pool: PgPool) {
+    let child = child_with_chain(&pool, chain_of(vec![entry("no-destructive", &[], &[])])).await;
+    let names = offered_names(&pool, child).await;
+    assert_eq!(present(&names, &["delete_volume"]), Vec::<&str>::new(), "the destructive tool goes");
+    assert_eq!(
+        missing(&names, &["create_volume", "browser_click"]),
+        Vec::<&str>::new(),
+        "writing tools stay — the ceiling stopped destructive, not writing"
+    );
+
+    // And the call gate, not just the offer: refused naming the ceiling,
+    // before the tool reads a single row.
+    let message = execute(&pool, child, "t1", "delete_volume", &serde_json::json!({"name": "mine"}))
+        .await
+        .expect_err("a destructive call under a no-destructive ceiling is refused");
+    assert!(
+        message.contains("delete_volume is denied by this conversation's tool rules")
+            && message.contains("class ceiling no-destructive doesn't allow a destructive tool"),
+        "{message}"
     );
 }
 
@@ -77,9 +104,10 @@ async fn test_an_empty_chain_offers_an_agent_what_untouched_conversations_see(po
     let child = child_with_chain(&pool, None).await;
     let names = offered_names(&pool, child).await;
     assert_eq!(
-        missing(&names, &["read_file", "browser_click", "http_request", "stop_agent"]),
+        missing(&names, &["read_file", "browser_click", "http_request", "stop_agent", "create_volume", "delete_volume"]),
         Vec::<&str>::new(),
-        "no entries means allow-all, as before the column existed"
+        "no entries means allow-all, as before the column existed — SME-239's two volume tools \
+         included, so a hide below means the rules hid them, not the registry"
     );
 }
 
