@@ -11,9 +11,13 @@ fn test_chat_error_text_drops_the_server_function_wrapper() {
 
 fn prompt_env() -> PromptEnvironment {
     PromptEnvironment {
+        conversation_id: 42,
         date: chrono::NaiveDate::from_ymd_opt(2026, 9, 25).expect("a valid date"),
         model: "claude-test-model".to_string(),
-        volumes: vec![("cargo-cache".to_string(), "/home/sandbox/.cargo".to_string())],
+        volumes: vec![PromptVolume::Global {
+            name: "cargo-cache".to_string(),
+            path: "/home/sandbox/.cargo".to_string(),
+        }],
         mcp_servers: vec!["exa".to_string(), "github".to_string()],
         repos: Vec::new(),
         instructions: Vec::new(),
@@ -215,6 +219,32 @@ fn test_system_prompt_leaves_out_empty_volume_and_mcp_lines() {
     assert!(!environment.contains("MCP servers"), "got: {environment}");
 }
 
+/// A model-created volume (SME-239) says who owns it: the prompt is where
+/// the model learns that a passed-down volume isn't its own to delete, and
+/// that its own can go to its agents with `start_agent`. A global volume
+/// keeps its line exactly as it was.
+#[test]
+fn test_system_prompt_names_the_volume_owner() {
+    let mut env = prompt_env();
+    env.volumes = vec![
+        PromptVolume::Global { name: "cargo-cache".to_string(), path: "/home/sandbox/.cargo".to_string() },
+        PromptVolume::Agent { name: "worktrees".to_string(), path: "/worktrees".to_string(), owner: 42 },
+        PromptVolume::Agent { name: "cache".to_string(), path: "/cache".to_string(), owner: 7 },
+    ];
+    let prompt = system_prompt(&env);
+    let environment = prompt
+        .strip_prefix(BASE_SYSTEM_PROMPT)
+        .expect("the environment follows the base prompt");
+    assert!(environment.contains("  - cargo-cache mounted at /home/sandbox/.cargo\n"), "got: {environment}");
+    assert!(environment.contains("  - worktrees mounted at /worktrees (you created it)"), "got: {environment}");
+    assert!(
+        environment.contains(
+            "  - cache mounted at /cache (owned by conversation #7; pass it to your agents with start_agent)"
+        ),
+        "got: {environment}"
+    );
+}
+
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_prompt_environment_reads_volumes_and_mcp_servers(pool: PgPool) {
     db::create_sandbox_volume(&pool, "cargo-cache", "/home/sandbox/.cargo")
@@ -243,6 +273,21 @@ async fn test_prompt_environment_reads_volumes_and_mcp_servers(pool: PgPool) {
         .execute(&pool)
         .await
         .expect("persona files");
+    let creator = db::create_conversation(&pool).await.expect("creator conversation");
+    let mut conn = pool.acquire().await.expect("a connection");
+    db::create_agent_volume_with_owner_mount(&mut conn, conversation.id, "worktrees", "/worktrees")
+        .await
+        .expect("the conversation's own volume");
+    let passed = db::create_agent_volume_with_owner_mount(&mut conn, creator.id, "cache", "/cache")
+        .await
+        .expect("another conversation's volume");
+    drop(conn);
+    sqlx::query("INSERT INTO conversation_volume_mounts (conversation_id, volume_id) VALUES ($1, $2)")
+        .bind(conversation.id)
+        .bind(passed.id)
+        .execute(&pool)
+        .await
+        .expect("pass that volume to the conversation");
     let env = prompt_environment(&pool, conversation.id, "some-model").await;
     assert_eq!(
         env.persona_files,
@@ -266,7 +311,22 @@ async fn test_prompt_environment_reads_volumes_and_mcp_servers(pool: PgPool) {
     assert_eq!(env.model, "some-model");
     assert_eq!(
         env.volumes,
-        vec![("cargo-cache".to_string(), "/home/sandbox/.cargo".to_string())]
+        vec![
+            PromptVolume::Global {
+                name: "cargo-cache".to_string(),
+                path: "/home/sandbox/.cargo".to_string(),
+            },
+            PromptVolume::Agent {
+                name: "worktrees".to_string(),
+                path: "/worktrees".to_string(),
+                owner: conversation.id,
+            },
+            PromptVolume::Agent {
+                name: "cache".to_string(),
+                path: "/cache".to_string(),
+                owner: creator.id,
+            },
+        ]
     );
     assert_eq!(env.mcp_servers, vec!["exa".to_string()]);
 }
