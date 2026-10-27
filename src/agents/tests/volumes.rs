@@ -173,6 +173,71 @@ async fn test_delete_volume_takes_its_rows_even_when_no_claim_can_be_reached(poo
     assert_eq!(row_counts(&pool).await, (0, 0), "the row and its mount row are gone");
 }
 
+/// Which conversations mount `volume`, oldest first.
+async fn holders(pool: &PgPool, volume: i64) -> Vec<i64> {
+    sqlx::query_scalar::<_, i64>("SELECT conversation_id FROM conversation_volume_mounts WHERE volume_id = $1 ORDER BY conversation_id")
+        .bind(volume)
+        .fetch_all(pool)
+        .await
+        .expect("mount rows")
+}
+
+/// Passing a volume to a child (SME-239): by name only, only one the caller
+/// holds, and the mount row it records is what the child's pod will mount.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_start_agent_refuses_a_volume_its_caller_doesnt_hold(pool: PgPool) {
+    setup(&pool, vec![text_reply("ok")]).await;
+    let root = conversation(&pool).await;
+
+    let error = call(&pool, root, "start_agent", serde_json::json!({"brief": "work", "volumes": "cache"}))
+        .await
+        .expect_err("a list of names is asked for");
+    assert!(error.contains("volumes must be an array of volume names"), "{error}");
+
+    let error = call(&pool, root, "start_agent", serde_json::json!({"brief": "work", "volumes": ["nope"]}))
+        .await
+        .expect_err("a name nobody holds is refused");
+    assert!(error.contains("you don't hold a volume named \"nope\""), "{error}");
+    assert!(error.contains("create_volume makes one"), "{error}");
+
+    let children = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversations WHERE parent_id = $1")
+        .bind(root)
+        .fetch_one(&pool)
+        .await
+        .expect("count children");
+    assert_eq!(children, 0, "a refused start leaves no child");
+    assert_eq!(row_counts(&pool).await, (0, 0), "nor does it write a mount row");
+}
+
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_start_agent_mounts_a_held_volume_on_the_child_and_names_it(pool: PgPool) {
+    setup(&pool, vec![text_reply("ok")]).await;
+    let root = conversation(&pool).await;
+    let volume = own_volume(&pool, root, "cache", "/data/cache").await;
+
+    // The same name twice in one call: the child mounts it once.
+    let result = call(&pool, root, "start_agent", serde_json::json!({"brief": "work", "volumes": ["cache", "cache"]}))
+        .await
+        .expect("the caller holds the name");
+    let child = child_of(&pool, root, &result).await;
+    assert!(result.contains("cache"), "the reply names what it passed: {result}");
+    assert_eq!(holders(&pool, volume).await, vec![root, child], "committed by the time the tool returns");
+
+    // A passed volume is held, so the child can pass it on: a grandchild gets
+    // its own mount row for the same one volume, and still can't delete it.
+    let grand = call(&pool, child, "start_agent", serde_json::json!({"brief": "more work", "volumes": ["cache"]}))
+        .await
+        .expect("a volume passed down is held, so it is re-passable");
+    let grandchild = child_of(&pool, child, &grand).await;
+    assert_eq!(holders(&pool, volume).await, vec![root, child, grandchild], "one claim, three mounting pods");
+
+    let error = call(&pool, grandchild, "start_agent", serde_json::json!({"brief": "deeper", "volumes": ["cache2"]}))
+        .await
+        .expect_err("the grandchild holds no such volume");
+    assert!(error.contains("you don't hold a volume named \"cache2\""), "{error}");
+    assert_eq!(holders(&pool, volume).await, vec![root, child, grandchild], "and nothing changed");
+}
+
 /// The sentence each tool ends with: the design's "the tool's result says so"
 /// for a volume that can only mount at the next pod start.
 #[test]

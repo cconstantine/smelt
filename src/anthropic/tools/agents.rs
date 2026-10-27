@@ -22,7 +22,9 @@ pub(super) fn tools() -> Vec<Registered> {
                          once. The brief is its first message, so say everything it needs: the task, \
                          what to report back, and when it's done. Its report arrives here as a \
                          message when it calls finish; message_agent writes to it, list_agents shows \
-                         its status, and the user can open it and write to it. Up to {} characters.",
+                         its status, and the user can open it and write to it. Pass it the volumes \
+                         you hold (`volumes`) and they mount in its pod too — a child never mounts \
+                         more than you do. Up to {} characters.",
                         crate::agents::MAX_BRIEF_CHARS
                     ),
                     input_schema: serde_json::json!({
@@ -40,6 +42,11 @@ pub(super) fn tools() -> Vec<Registered> {
                             "persona": {
                                 "type": "string",
                                 "description": "a persona of repo (list_personas lists them), by name: the agent runs under its instructions, read at its ref"
+                            },
+                            "volumes": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "names of volumes you hold — one you created with create_volume, or one a parent passed to you — to mount in the agent's pod as well; you can pass only volumes you hold, and the agent can pass them on"
                             }
                         },
                         "required": ["brief"]

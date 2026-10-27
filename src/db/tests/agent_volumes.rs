@@ -233,6 +233,112 @@ async fn test_delete_agent_volume_if_unused_refuses_while_a_holder_is_starting_o
         DeleteAgentVolume::Deleted(_)));
 }
 
+/// The lookup `create_child` runs inside its transaction (SME-239): which of
+/// the names a caller asks to pass are volumes it holds — created or passed
+/// down — and which it therefore can't.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_agent_volumes_held_for_names_a_holders_own_and_passed_names_only(pool: PgPool) {
+    let parent = test_conversation(&pool).await;
+    let child = test_conversation(&pool).await;
+    let creator = test_conversation(&pool).await;
+
+    let own = insert_volume(&pool, parent.id, "cache", "/data/cache").await;
+    insert_mount(&pool, parent.id, own).await;
+    let passed = insert_volume(&pool, creator.id, "hand-me-down", "/data/hand").await;
+    insert_mount(&pool, parent.id, passed).await;
+    // Someone else's volume under a name the parent uses too: the lookup
+    // goes over the parent's mount rows, so it can't reach this one.
+    let theirs = insert_volume(&pool, creator.id, "cache", "/data/theirs").await;
+    insert_mount(&pool, creator.id, theirs).await;
+
+    let mut tx = pool.begin().await.expect("begin");
+    let held = agent_volumes_held_for(&mut *tx, parent.id, &["cache", "hand-me-down", "nope"])
+        .await
+        .expect("the pass's lookup");
+    assert_eq!(
+        held.iter().map(|v| (v.id, v.name.as_str())).collect::<Vec<_>>(),
+        vec![(own, "cache"), (passed, "hand-me-down")],
+        "the two names it holds, oldest first; one it doesn't is simply not there"
+    );
+    assert_eq!(held[0].mount_path, "/data/cache", "the mount row the child gets is built from this path");
+    assert!(
+        agent_volumes_held_for(&mut *tx, child.id, &["cache", "hand-me-down"]).await.expect("the child's lookup").is_empty(),
+        "a conversation holding nothing passes nothing on, whatever its parent holds"
+    );
+    tx.commit().await.expect("commit");
+
+    assert_ne!(theirs, own, "and the same name means two different volumes for two conversations");
+}
+
+/// What the design's lock pair is for, end to end (SME-239): `create_child`
+/// records the child's mount rows under its share of the volume row, so the
+/// creator's `delete_volume` — which takes that row exclusive — then refuses,
+/// because the child it just mounted is `starting`.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_create_child_mounts_the_volumes_it_holds_and_a_delete_then_refuses(pool: PgPool) {
+    let parent = test_conversation(&pool).await;
+    let volume = insert_volume(&pool, parent.id, "cache", "/data/cache").await;
+    insert_mount(&pool, parent.id, volume).await;
+
+    // The name twice in one call: one mount row, not two.
+    let new = NewChild {
+        caller: parent.id,
+        brief: "b",
+        persona_name: None,
+        model: None,
+        repo: None,
+        max_depth: 5,
+        volumes: &["cache", "cache"],
+    };
+    let CreateChild::Created { child, .. } = create_child(&pool, &new).await.expect("start") else {
+        panic!("the parent holds the volume it asked to pass");
+    };
+    assert_eq!(mount_rows(&pool, volume).await, vec![parent.id, child], "the child mounts it, once");
+
+    assert_eq!(
+        delete_agent_volume_if_unused(&pool, parent.id, "cache").await.expect("delete"),
+        DeleteAgentVolume::HeldBy(vec![(child, AGENT_STARTING.to_string())]),
+        "the mount row the start just wrote is what the delete reads, with the child's state"
+    );
+    assert_eq!(volume_rows(&pool).await, 1, "so the volume stays, and its child's pod will mount it");
+}
+
+/// A name the caller doesn't hold is the whole call's refusal: no child, no
+/// mount rows, and the sentence names the volume.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_create_child_refuses_a_volume_name_its_caller_doesnt_hold(pool: PgPool) {
+    let parent = test_conversation(&pool).await;
+    let other = test_conversation(&pool).await;
+    let theirs = insert_volume(&pool, other.id, "cache", "/data/cache").await;
+    insert_mount(&pool, other.id, theirs).await;
+
+    let new = NewChild {
+        caller: parent.id,
+        brief: "b",
+        persona_name: None,
+        model: None,
+        repo: None,
+        max_depth: 5,
+        volumes: &["cache"],
+    };
+    let CreateChild::Refused { why, asked } = create_child(&pool, &new).await.expect("start") else {
+        panic!("a volume the caller doesn't hold is refused");
+    };
+    assert!(!asked, "nothing was asked of the user; the caller asked for the wrong name");
+    assert!(why.contains("you don't hold a volume named \"cache\""), "{why}");
+    assert!(why.contains("create_volume makes one"), "{why}");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversations WHERE parent_id = $1")
+            .bind(parent.id)
+            .fetch_one(&pool)
+            .await
+            .expect("count children"),
+        0,
+        "a refused start leaves no child"
+    );
+    assert_eq!(mount_rows(&pool, theirs).await, vec![other.id], "nor does it mount anything on anybody");
+}
+
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_concurrent_pass_of_a_volume_and_its_delete_exclude_each_other(pool: PgPool) {
     // The pair the design locks for: `create_child` shares the volume row

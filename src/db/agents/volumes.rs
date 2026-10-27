@@ -135,6 +135,39 @@ pub async fn delete_agent_volume_row(
         > 0)
 }
 
+/// The volumes named in `names` that `conversation_id` holds — one it created
+/// or one passed down to it — each locked `FOR SHARE` for as long as the
+/// transaction that records a child's mount rows runs (SME-239).
+/// `create_child` runs it, and that share is the pair with
+/// [`delete_agent_volume_if_unused`]'s `FOR UPDATE`: a delete either waits for
+/// the child's rows to commit and then refuses because the child it just
+/// mounted is `starting`, or it commits first and this lookup answers with no
+/// row for that name, and the start refuses. Either way one of the two
+/// refuses, and no child is left mounted to a volume that isn't there.
+///
+/// A name the conversation doesn't hold is simply absent — `create_child`
+/// names the first missing one in its refusal. `names` may repeat: the join
+/// answers once per volume, and mount rows are keyed by (conversation,
+/// volume), so a repeated name still means one row.
+pub async fn agent_volumes_held_for(
+    conn: &mut sqlx::PgConnection,
+    conversation_id: i64,
+    names: &[&str],
+) -> Result<Vec<AgentVolume>, sqlx::Error> {
+    sqlx::query_as::<_, AgentVolume>(
+        "SELECT v.id, v.owner_conversation_id, v.name, v.mount_path
+           FROM conversation_volume_mounts m
+           JOIN agent_volumes v ON v.id = m.volume_id
+          WHERE m.conversation_id = $1 AND v.name = ANY($2)
+          ORDER BY v.id
+            FOR SHARE OF v",
+    )
+    .bind(conversation_id)
+    .bind(names)
+    .fetch_all(&mut *conn)
+    .await
+}
+
 /// What `delete_volume`'s transaction decided.
 #[derive(Debug, PartialEq)]
 pub enum DeleteAgentVolume {
