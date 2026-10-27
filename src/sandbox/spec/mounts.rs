@@ -193,19 +193,26 @@ pub(in crate::sandbox) fn normalize_mount_path(path: &str) -> String {
     }
 }
 
-/// The directories a model volume can't be mounted at or under. The first
-/// three are smelt's own places in the pod: the conversation's `/workspace`
-/// claim, over which a volume would hide the checkout every terminal starts
-/// in; the git key directory, whose value this keeps as a literal so the
-/// module stays free of `crate::git` — a test in `sandbox::tests` keeps the
-/// two equal; and the Docker socket directory, over which a volume would
-/// break every command the pod runs through its sidecar, the one the design
-/// leaves out of its list and this ticket's plan adds. The rest are the
-/// system directories the design refuses (SME-239).
+/// Directories a model volume can't be mounted at or under. The first five
+/// are smelt's own places in the pod: the conversation's `/workspace` claim,
+/// over which a volume would hide the checkout every terminal starts in; the
+/// git key directory, whose value this keeps as a literal so the module stays
+/// free of `crate::git` — a test in `sandbox::tests` keeps the two equal; the
+/// Docker socket directory, over which a volume would break every command the
+/// pod runs through its sidecar, the one the design leaves out of its list and
+/// this ticket's plan adds; and dockerd's own `/run/docker` and containerd's
+/// `/run/containerd` — a model volume mounts in the sidecar too (pods.rs's
+/// shared mounts), and over either it would hold the runtime state and pid
+/// files that outlive the sidecar's automatic restart and make the next
+/// dockerd fail: the same SME-33 finding that keeps `DOCKER_SOCK_DIR` down to
+/// the socket alone, widened to the directories a model could pick (B-F4).
+/// The rest are the system directories the design refuses (SME-239).
 const RESERVED_MODEL_MOUNT_DIRS: &[&str] = &[
     WORKSPACE_DIR,
     "/etc/smelt",
     DOCKER_SOCK_DIR,
+    "/run/docker",
+    "/run/containerd",
     "/etc",
     "/usr",
     "/bin",
