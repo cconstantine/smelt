@@ -32,6 +32,7 @@ pub use pods::{pod_name, DockerSidecar, PodStorage};
 pub(crate) use images::default_sandbox_image;
 #[cfg(test)]
 pub(crate) use images::OWN_SANDBOX_IMAGE;
+pub(crate) use mounts::model_volume_mount_path;
 pub(crate) use ownership::INSTANCE_LABEL;
 #[cfg(test)]
 pub(crate) use ownership::{test_instance, TEST_INSTANCE};

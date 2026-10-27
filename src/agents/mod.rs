@@ -20,6 +20,7 @@ mod persona;
 mod queue;
 mod start;
 mod sweep;
+mod volumes;
 
 pub(crate) use checkout::*;
 pub(crate) use delete::*;
@@ -27,6 +28,7 @@ pub(crate) use messages::*;
 pub(crate) use queue::*;
 pub(crate) use start::*;
 pub(crate) use sweep::*;
+pub(crate) use volumes::*;
 
 /// The longest brief `start_agent` takes, in characters.
 pub(crate) const MAX_BRIEF_CHARS: usize = 30_000;

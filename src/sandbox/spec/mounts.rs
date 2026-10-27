@@ -173,3 +173,70 @@ pub(in crate::sandbox) fn agent_volume_mounts_for(volumes: &[db::AgentVolume]) -
         })
         .unzip()
 }
+
+/// A path with its `.` segments, repeated `/` and trailing `/` gone and
+/// otherwise unchanged — a relative path included, so `validate_mount_path`
+/// stays the one that refuses it. Kubernetes takes a mount path exactly as
+/// given, and smelt compares one volume's path against every other one the
+/// same pod mounts, so what's stored has to be the one canonical form:
+/// `/data//cache/.` and `/data/cache` are one place in the pod, not two
+/// claims sitting on each other (SME-239).
+pub(in crate::sandbox) fn normalize_mount_path(path: &str) -> String {
+    if !path.starts_with('/') {
+        return path.to_string();
+    }
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty() && *part != ".").collect();
+    if parts.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", parts.join("/"))
+    }
+}
+
+/// The directories a model volume can't be mounted at or under. The first
+/// three are smelt's own places in the pod: the conversation's `/workspace`
+/// claim, over which a volume would hide the checkout every terminal starts
+/// in; the git key directory, whose value this keeps as a literal so the
+/// module stays free of `crate::git` — a test in `sandbox::tests` keeps the
+/// two equal; and the Docker socket directory, over which a volume would
+/// break every command the pod runs through its sidecar, the one the design
+/// leaves out of its list and this ticket's plan adds. The rest are the
+/// system directories the design refuses (SME-239).
+const RESERVED_MODEL_MOUNT_DIRS: &[&str] = &[
+    WORKSPACE_DIR,
+    "/etc/smelt",
+    DOCKER_SOCK_DIR,
+    "/etc",
+    "/usr",
+    "/bin",
+    "/lib",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/var/lib/docker",
+];
+
+/// The reserved directory `path` is at or under, the narrowest when several
+/// match: `/etc/smelt/keys` is refused as `/etc/smelt`, not `/etc`, because
+/// that's the reason it's refused.
+pub(in crate::sandbox) fn reserved_mount_path(path: &str) -> Option<&'static str> {
+    RESERVED_MODEL_MOUNT_DIRS
+        .iter()
+        .filter(|dir| path == **dir || path.starts_with(&format!("{dir}/")))
+        .max_by_key(|dir| dir.len())
+        .copied()
+}
+
+/// The mount path a model's `create_volume` has stored: `~` expanded,
+/// normalized, then the checks a global volume's path already gets, then the
+/// reserved-directory rule only a model volume needs — a global volume is a
+/// user's choice, a model volume the model's. The error is the sentence the
+/// model gets.
+pub(crate) fn model_volume_mount_path(path: &str) -> Result<String, String> {
+    let path = normalize_mount_path(&resolve_mount_path(path));
+    validate_mount_path(&path)?;
+    if let Some(dir) = reserved_mount_path(&path) {
+        return Err(format!("{path:?} is at or under {dir:?}, which a volume can't be mounted over"));
+    }
+    Ok(path)
+}

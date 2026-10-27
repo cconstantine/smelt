@@ -54,6 +54,7 @@ pub(super) enum Class {
 impl Class {
     pub(super) const READ_ONLY: Class = Class::Fixed(ToolClass::ReadOnly);
     pub(super) const WRITING: Class = Class::Fixed(ToolClass::Writing);
+    pub(super) const DESTRUCTIVE: Class = Class::Fixed(ToolClass::Destructive);
     /// `http_request`'s: by the method it sends.
     pub(super) const BY_HTTP_METHOD: Class = Class::ByInput {
         can_be: &[ToolClass::ReadOnly, ToolClass::Writing, ToolClass::Destructive],

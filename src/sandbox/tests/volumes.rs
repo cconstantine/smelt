@@ -231,3 +231,71 @@ fn test_orphaned_agent_volume_claims_are_the_ones_their_creating_conversation_le
         "sorted, so the sweep's log reads the same way every run"
     );
 }
+
+/// The path a model volume is stored at: `~` expanded, `.` segments and
+/// repeated slashes gone, no trailing slash. What the pod mounts, what the
+/// prompt lists and what the next call compares against are one string only
+/// if it's normalized before it's stored — Kubernetes takes the path as given,
+/// and smelt compares paths as text (SME-239).
+#[test]
+fn test_model_volume_mount_path_normalizes_and_resolves() {
+    assert_eq!(model_volume_mount_path("/data//cache/").expect("ok"), "/data/cache");
+    assert_eq!(model_volume_mount_path("/data/./cache").expect("ok"), "/data/cache");
+    assert_eq!(model_volume_mount_path("/data/cache///").expect("ok"), "/data/cache");
+    assert_eq!(model_volume_mount_path("~/cache").expect("ok"), "/home/sandbox/cache");
+    assert_eq!(model_volume_mount_path("~").expect("ok"), "/home/sandbox");
+    // Normalizing doesn't make a relative path absolute, and `..` survives it,
+    // so both keep the global volume's own refusal words.
+    assert_eq!(model_volume_mount_path("cache").unwrap_err(), "\"cache\" must be an absolute path (start with / or ~)");
+    assert_eq!(model_volume_mount_path("/data/../cache").unwrap_err(), "\"/data/../cache\" must not contain ..");
+    assert_eq!(model_volume_mount_path("/").unwrap_err(), "a volume can't be mounted over the root directory");
+}
+
+/// The directories a model volume can't be mounted at or under: the design's
+/// list, plus the pod's Docker socket — a volume over which would break every
+/// command the pod runs through its sidecar.
+#[test]
+fn test_model_volume_mount_path_refuses_reserved_directories() {
+    for path in [
+        "/workspace",
+        "/workspace/repo",
+        "/etc/smelt",
+        "/etc/smelt/keys/id_ed25519",
+        "/run/docker-sock",
+        "/run/docker-sock/docker.sock",
+        "/etc/ssl",
+        "/usr/local",
+        "/bin",
+        "/lib",
+        "/proc/1",
+        "/sys",
+        "/dev/shm",
+        "/var/lib/docker/overlay2",
+        "/etc/smelt-x",
+    ] {
+        assert!(model_volume_mount_path(path).is_err(), "{path} is a reserved mount path");
+    }
+    // Named by the narrowest match, since that's the reason it's refused.
+    assert_eq!(
+        model_volume_mount_path("/etc/smelt/keys").unwrap_err(),
+        "\"/etc/smelt/keys\" is at or under \"/etc/smelt\", which a volume can't be mounted over"
+    );
+    // What merely sits next to a reserved directory isn't under it. (`/etc/…`
+    // itself always is: `/etc` is on the list.)
+    for allowed in ["/run/docker-sock-x", "/var/lib/dockerx", "/workspace-x", "/data/cache"] {
+        assert_eq!(model_volume_mount_path(allowed).expect("not reserved"), allowed);
+    }
+}
+
+/// `/etc/smelt` is a literal in spec's reserved list, which keeps that module
+/// (test-only here) free of `crate::git` in production. It has to stay equal to the directory the pod's SSH
+/// key is written into, or a model volume could carry that key onto a claim
+/// another conversation mounts (SME-239).
+#[test]
+fn test_reserved_git_dir_literal_is_pods_git_dir() {
+    assert_eq!(
+        model_volume_mount_path(crate::git::POD_GIT_DIR).unwrap_err(),
+        "\"/etc/smelt\" is at or under \"/etc/smelt\", which a volume can't be mounted over",
+        "POD_GIT_DIR moved; the reserved list has to move with it"
+    );
+}

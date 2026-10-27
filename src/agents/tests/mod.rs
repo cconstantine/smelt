@@ -22,6 +22,7 @@ mod start;
 mod stop;
 mod sweep;
 mod tools;
+mod volumes;
 
 /// Ids clear of other tests', and a mock upstream answering every request
 /// with `bodies` in order (the last repeated); returns the request log.

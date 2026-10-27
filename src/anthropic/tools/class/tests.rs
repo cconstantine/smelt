@@ -60,6 +60,9 @@ const DESIGN: &[(&str, &[ToolClass])] = &[
     ("finish", &[ReadOnly]),
     ("start_agent", &[Writing]),
     ("stop_agent", &[Writing]),
+    // Volumes the model creates for itself and its agents (SME-239).
+    ("create_volume", &[Writing]),
+    ("delete_volume", &[Destructive]),
 ];
 
 #[test]
@@ -85,7 +88,7 @@ fn test_every_native_tool_has_the_designs_class() {
         wrong.is_empty() && missing.is_empty(),
         "classes differ from the design's: {wrong:?}; in the design but not the registry: {missing:?}"
     );
-    assert_eq!(registry.len(), 43, "every tool that exists at SME-237");
+    assert_eq!(registry.len(), 45, "every tool that exists at SME-237, plus SME-239's two volume tools");
 }
 
 fn http_request_class_of(input: serde_json::Value) -> ToolClass {
