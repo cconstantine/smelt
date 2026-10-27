@@ -30,11 +30,19 @@ pub struct McpServerSummary {
     /// Whether a client *secret* is configured — never the value itself,
     /// same write-only precedent as header values.
     pub has_oauth_client_secret: bool,
+    /// Whether this server's existing name is one no `smelt.tools` pattern
+    /// can name (SME-241): it holds `/` or `*`, so its tools can only be
+    /// ruled on by class. Rows that predate the name rule keep working;
+    /// the edit page says so under the name field, and the name can be
+    /// changed to one that is nameable.
+    pub name_unrulable: bool,
 }
 
 #[cfg(feature = "server")]
 impl From<db::McpServerConfig> for McpServerSummary {
     fn from(config: db::McpServerConfig) -> Self {
+        // Judged before the name moves into the summary below.
+        let name_unrulable = crate::mcp::check_server_name(&config.name).is_err();
         let mut header_names: Vec<String> = config.extra_headers.0.into_keys().collect();
         header_names.sort();
         Self {
@@ -45,6 +53,7 @@ impl From<db::McpServerConfig> for McpServerSummary {
             auth_mode: config.auth_mode,
             oauth_client_id: config.oauth_client_id,
             has_oauth_client_secret: config.oauth_client_secret.is_some(),
+            name_unrulable,
         }
     }
 }
@@ -132,6 +141,17 @@ pub async fn mcp_server_status(id: i64) -> ServerFnResult<McpConnectionStatus> {
     )
 }
 
+/// What both write paths check before they touch the database: the name,
+/// which a `smelt.tools` pattern must be able to name (SME-241), and the
+/// headers the `auth_mode` can have. One seam so create and update can't
+/// drift apart, and so the refusal reads without a pool. Server-side like
+/// the checks it calls: `crate::mcp` is server-only.
+#[cfg(feature = "server")]
+fn check_server_fields(name: &str, auth_mode: &str, headers: &HashMap<String, String>) -> Result<(), String> {
+    crate::mcp::check_server_name(name)?;
+    crate::mcp::check_extra_headers(auth_mode, headers)
+}
+
 #[post("/api/mcp-servers")]
 pub async fn create_mcp_server(
     name: String,
@@ -141,7 +161,7 @@ pub async fn create_mcp_server(
     oauth_client_id: Option<String>,
     oauth_client_secret: Option<String>,
 ) -> ServerFnResult<McpServerSummary> {
-    crate::mcp::check_extra_headers(&auth_mode, &extra_headers).map_err(ServerFnError::new)?;
+    check_server_fields(&name, &auth_mode, &extra_headers).map_err(ServerFnError::new)?;
     let config = db::create_mcp_server_config(
         db::get(),
         &name,
@@ -174,7 +194,7 @@ pub async fn update_mcp_server(
     remove_headers: Vec<String>,
     auth_mode: String,
 ) -> ServerFnResult<McpServerSummary> {
-    crate::mcp::check_extra_headers(&auth_mode, &upsert_headers).map_err(ServerFnError::new)?;
+    check_server_fields(&name, &auth_mode, &upsert_headers).map_err(ServerFnError::new)?;
     let config = db::update_mcp_server_config(
         db::get(),
         id,
@@ -510,6 +530,46 @@ mod tests {
         // guarantee: neither secret string leaks into any field we do have.
         assert_ne!(summary.name, "Bearer super-secret-token");
         assert_ne!(summary.url, "another-secret");
+    }
+
+    /// SME-241: a row whose name no tool-rule pattern can name is
+    /// reported rather than broken — the edit page says so under the name
+    /// field, and renaming it is the way to rule on its tools.
+    #[test]
+    fn test_a_server_whose_name_no_rule_can_name_is_reported_unrulable() {
+        let named = |name: &str| {
+            McpServerSummary::from(db::McpServerConfig {
+                id: 1,
+                name: name.to_string(),
+                url: "https://example.invalid/mcp".to_string(),
+                extra_headers: sqlx::types::Json(HashMap::new()),
+                auth_mode: "static_headers".to_string(),
+                oauth_credentials: None,
+                oauth_client_id: None,
+                oauth_client_secret: None,
+                created_at: Default::default(),
+                updated_at: Default::default(),
+            })
+        };
+        assert!(named("prod/deleted").name_unrulable, "a / can't be in a pattern's server part");
+        assert!(named("a*b").name_unrulable, "nor a `*` there");
+        assert!(!named("github").name_unrulable, "an ordinary name is nameable");
+    }
+
+    /// Both write paths refuse a name no tool rule could name the server
+    /// by (SME-241), saying the name and both grammar rules, before
+    /// anything reaches the database.
+    #[test]
+    fn test_a_write_path_refuses_a_server_name_no_rule_can_name() {
+        let no_headers = HashMap::new();
+        for name in ["a/b", "a*b"] {
+            let error = check_server_fields(name, "static_headers", &no_headers)
+                .expect_err("{name} can't be named by a tool rule");
+            assert!(error.contains(name) && error.contains('/') && error.contains('*'), "{name}: {error}");
+        }
+        for name in ["github", "linear.app"] {
+            check_server_fields(name, "static_headers", &no_headers).expect("{name} is a name a rule can use");
+        }
     }
 
     // --- Per-tool class overrides (SME-240) ---

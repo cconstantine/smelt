@@ -6,11 +6,21 @@ use crate::api::mcp::update_mcp_server;
 
 use super::{header_rows, headers_from_rows};
 
+/// The line under the name field for a server whose stored name no
+/// `smelt.tools` pattern can name (SME-241): a `/` or a `*` in it puts
+/// its tools out of reach of a named rule, so only its class rules them
+/// until the name is changed.
+pub(super) fn unrulable_name_note(name_unrulable: bool) -> Option<&'static str> {
+    name_unrulable.then(|| {
+        "this name holds `/` or `*`, so no tool rule can name it: its tools are ruled on by class only \u{2014} rename it to rule on them"
+    })
+}
+
 /// The edit form: name, URL and headers, saved together. Its own state is
 /// the header rows being added or removed and the save in flight; the
 /// values it edits are the page's, which loads them.
 #[component]
-pub(super) fn McpServerEditForm(id: i64, edit_name: Signal<String>, edit_url: Signal<String>, edit_auth_mode: Signal<String>, saved_name: Signal<String>, saved_url: Signal<String>, existing_header_edits: Signal<Vec<(String, String)>>, status_reload: Signal<u32>) -> Element {
+pub(super) fn McpServerEditForm(id: i64, name_unrulable: bool, edit_name: Signal<String>, edit_url: Signal<String>, edit_auth_mode: Signal<String>, saved_name: Signal<String>, saved_url: Signal<String>, existing_header_edits: Signal<Vec<(String, String)>>, status_reload: Signal<u32>) -> Element {
     let mut edit_name = edit_name;
     let mut edit_url = edit_url;
     let mut saved_name = saved_name;
@@ -91,6 +101,9 @@ pub(super) fn McpServerEditForm(id: i64, edit_name: Signal<String>, edit_url: Si
                 r#type: "text",
                 value: "{edit_name}",
                 oninput: move |e| edit_name.set(e.value()),
+            }
+            if let Some(note) = unrulable_name_note(name_unrulable) {
+                p { class: "mcp-name-unrulable", "{note}" }
             }
             label { r#for: "mcp-edit-url", "URL" }
             input {

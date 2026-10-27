@@ -102,6 +102,19 @@ pub async fn agent_state(pool: &PgPool, id: i64) -> Result<Option<String>, sqlx:
         .await
 }
 
+/// The agent's stored `rule_chain` (SME-241): the JSON array as written,
+/// `None` for no agent row or a NULL chain — both mean allow-all. One
+/// indexed read; the primary key is the conversation id.
+pub async fn agent_rule_chain(pool: &PgPool, id: i64) -> Result<Option<serde_json::Value>, sqlx::Error> {
+    Ok(sqlx::query_scalar::<_, Option<serde_json::Value>>(
+        "SELECT rule_chain FROM agents WHERE conversation_id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?
+    .flatten())
+}
+
 /// Queues a report or notice to `to`, on the caller's transaction.
 pub async fn queue_agent_message(
     conn: &mut sqlx::PgConnection,

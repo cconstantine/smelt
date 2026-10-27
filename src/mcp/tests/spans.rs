@@ -38,7 +38,7 @@ async fn test_a_tool_lists_connect_is_a_child_of_its_caller(pool: sqlx::PgPool) 
     let config = create_static_server(&pool, &test_config(0, "unused").url).await;
     let (_, spans) = crate::telemetry::capture_spans(async {
         crate::telemetry::in_span(tracing::info_span!("caller"), async {
-            tool_definitions_for(&pool, std::slice::from_ref(&config)).await
+            tool_definitions_for(&pool, std::slice::from_ref(&config), &unruled()).await
         })
         .await
     })
@@ -59,7 +59,7 @@ async fn test_a_failed_connect_exports_no_query_from_the_servers_url(pool: sqlx:
             let _ = connection_check(&pool, &config).await;
             evict(config.id).await;
             lock_failures().remove(&config.id);
-            tool_definitions_for(&pool, std::slice::from_ref(&config)).await
+            tool_definitions_for(&pool, std::slice::from_ref(&config), &unruled()).await
         })
         .await
     })
@@ -172,4 +172,38 @@ async fn test_a_failed_mcp_connect_is_a_failed_span(pool: sqlx::PgPool) {
     );
     let check = spans.iter().find(|span| span.name == "mcp connection_check").expect("the check's span");
     assert!(matches!(check.status, opentelemetry::trace::Status::Error { .. }), "{:?}", check.status);
+}
+
+/// SME-241: a call the rules refuse keeps the class it was refused for on
+/// its `tool` span, and its `mcp call` span says the rule rather than
+/// "the MCP tool call failed" — there was no tool call. Neither span
+/// holds the input.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_rule_refused_mcp_call_marks_its_spans_with_the_rule(pool: sqlx::PgPool) {
+    let config = create_static_server(&pool, &test_config(0, "unused").url).await;
+    register_test_connection(config.id, false).await;
+    let conversation = agent_conversation(&pool, serde_json::json!([{ "class": "read-only" }])).await;
+    let name = format!("mcp__{}__echo", config.name);
+    let (result, spans) = crate::telemetry::capture_spans(crate::anthropic::tools::execute(
+        &pool,
+        conversation,
+        "toolu_241",
+        &name,
+        &serde_json::json!({"q": "SECRET-ARG"}),
+    ))
+    .await;
+    REGISTRY.lock().await.remove(&config.id);
+    assert!(result.is_err(), "{result:?}");
+    let tool = spans.iter().find(|span| span.name == format!("tool {name}")).expect("the tool span");
+    let class = tool.attributes.iter().find(|kv| kv.key.as_str() == "smelt.tool.class").map(|kv| kv.value.clone());
+    assert_eq!(class, Some("destructive".into()), "the refused call records the class it was refused for");
+    let call = spans.iter().find(|span| span.name == "mcp call").expect("the mcp call span");
+    match &call.status {
+        opentelemetry::trace::Status::Error { description } => {
+            assert!(description.contains("class ceiling read-only"), "{description}");
+        }
+        status => panic!("the refused call's span says the rule, not {status:?}"),
+    }
+    let exported = format!("{spans:?}");
+    assert!(!exported.contains("SECRET"), "{exported}");
 }

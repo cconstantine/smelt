@@ -1,8 +1,8 @@
-//! Child agents (SME-236): `start_agent`, offered to a conversation without
-//! a parent, `list_agents` and `stop_agent`, offered to every conversation,
-//! and `finish`, offered to an agent; and (SME-238) `message_agent`, offered
-//! to every conversation but callable only by one with a parent or agents
-//! of its own, and `ask_parent`, offered to an agent. The lifecycle behind them is `crate::agents`.
+//! Child agents (SME-236): `start_agent` — an ordinary writing tool since
+//! SME-241, bounded by the rule chain and the depth ceiling — plus
+//! `list_agents`, `stop_agent`, `message_agent`, and `finish` and
+//! `ask_parent`, offered to an agent. The lifecycle behind them is
+//! `crate::agents`.
 
 use super::{Class, Offer, Registered, Tool};
 use crate::anthropic::ToolDefinition;
@@ -10,7 +10,9 @@ use crate::anthropic::ToolDefinition;
 pub(super) fn tools() -> Vec<Registered> {
     vec![
         Registered {
-            offer: Offer::Root,
+            // SME-241: an ordinary writing tool — a `read-only` persona's
+            // chain denies it, the depth ceiling bounds it (until SME-245).
+            offer: Offer::All,
             tool: Tool {
                 def: ToolDefinition {
                     name: "start_agent".to_string(),

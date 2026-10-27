@@ -12,7 +12,7 @@ async fn test_tool_list_changed_notification_refreshes_cached_tools() {
     let server = register_test_connection(server_id, true).await;
 
     let before =
-        tool_definitions_for(&test_pool(), &[test_config(server_id, "test-server")]).await;
+        tool_definitions_for(&test_pool(), &[test_config(server_id, "test-server")], &unruled()).await;
     assert_eq!(
         before.len(),
         1,
@@ -28,7 +28,7 @@ async fn test_tool_list_changed_notification_refreshes_cached_tools() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     let after =
-        tool_definitions_for(&test_pool(), &[test_config(server_id, "test-server")]).await;
+        tool_definitions_for(&test_pool(), &[test_config(server_id, "test-server")], &unruled()).await;
     let names: Vec<&str> = after.iter().map(|d| d.name.as_str()).collect();
     assert_eq!(
         after.len(),

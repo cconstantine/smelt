@@ -37,7 +37,7 @@ async fn start_refusing_server() -> (String, Arc<std::sync::atomic::AtomicU32>) 
 async fn test_a_hanging_server_doesnt_block_other_servers(pool: sqlx::PgPool) {
     let hanging = create_static_server(&pool, &start_hanging_server().await).await;
     let listing = tokio::spawn(async move {
-        tool_definitions_for(&pool, &[hanging]).await
+        tool_definitions_for(&pool, &[hanging], &unruled()).await
     });
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
@@ -91,7 +91,7 @@ async fn test_listing_tools_waits_a_bounded_time_for_a_hanging_server(pool: sqlx
     let started = std::time::Instant::now();
     let tools = tokio::time::timeout(
         TOOL_LIST_WAIT + std::time::Duration::from_secs(2),
-        tool_definitions_for(&pool, &[hanging]),
+        tool_definitions_for(&pool, &[hanging], &unruled()),
     )
     .await
     .expect("listing tools should give up on a hanging server");
@@ -105,11 +105,11 @@ async fn test_listing_tools_waits_a_bounded_time_for_a_hanging_server(pool: sqlx
 async fn test_a_failed_server_isnt_retried_on_every_turn(pool: sqlx::PgPool) {
     let (url, attempts) = start_refusing_server().await;
     let refusing = create_static_server(&pool, &url).await;
-    tool_definitions_for(&pool, std::slice::from_ref(&refusing)).await;
+    tool_definitions_for(&pool, std::slice::from_ref(&refusing), &unruled()).await;
     let after_first = attempts.load(Ordering::SeqCst);
     assert!(after_first > 0, "the first turn should try the server");
 
-    tool_definitions_for(&pool, std::slice::from_ref(&refusing)).await;
+    tool_definitions_for(&pool, std::slice::from_ref(&refusing), &unruled()).await;
     assert_eq!(
         attempts.load(Ordering::SeqCst),
         after_first,
@@ -123,7 +123,7 @@ async fn test_a_failed_server_isnt_retried_on_every_turn(pool: sqlx::PgPool) {
 async fn test_the_status_check_retries_a_failed_server(pool: sqlx::PgPool) {
     let (url, attempts) = start_refusing_server().await;
     let refusing = create_static_server(&pool, &url).await;
-    tool_definitions_for(&pool, std::slice::from_ref(&refusing)).await;
+    tool_definitions_for(&pool, std::slice::from_ref(&refusing), &unruled()).await;
     let after_first = attempts.load(Ordering::SeqCst);
 
     assert!(connection_check(&pool, &refusing).await.is_err());

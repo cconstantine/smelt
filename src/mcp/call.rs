@@ -18,7 +18,7 @@ pub async fn call_tool(
     tool_name: &str,
     arguments: serde_json::Value,
 ) -> Result<String, String> {
-    call_tool_classed(pool, config, tool_name, arguments, |_| {}).await
+    call_tool_classed(pool, config, tool_name, arguments, |_| Ok(())).await
 }
 
 /// Dispatches a `tools/call` to `config`'s server and turns the result
@@ -30,7 +30,7 @@ pub async fn call_tool(
 /// `ContentBlock::ToolResult { is_error: Some(true), .. }` like any other
 /// failed tool call.
 ///
-/// Hands the call's class to `on_class` just before it goes out
+/// Hands the call's class to `check_class` just before it goes out
 /// (SME-237): the user's override for this server and tool when one is
 /// saved (SME-240, read from Postgres at every call — a save on the
 /// settings page takes effect at the next call), and otherwise the class
@@ -39,12 +39,17 @@ pub async fn call_tool(
 /// `evict` can't put another list between them. A call that fails before
 /// that (arguments that aren't an object, a server that can't be reached,
 /// an override row Postgres can't read) is never sent and has no class.
+///
+/// A `check_class` that says no (SME-241: the conversation's stored rule
+/// chain) stops the call *before* `tools/call` is sent: its message is
+/// what the model gets and what the `mcp call` span records, so a refused
+/// call still shows the class it was refused for and never its input.
 pub async fn call_tool_classed(
     pool: &sqlx::PgPool,
     config: &McpServerConfig,
     tool_name: &str,
     arguments: serde_json::Value,
-    on_class: impl FnOnce(crate::anthropic::tools::ToolClass) + Send,
+    check_class: impl FnOnce(crate::anthropic::tools::ToolClass) -> Result<(), String> + Send,
 ) -> Result<String, String> {
     use tracing::field::Empty;
     // The server and tool, never the arguments or result (SME-137).
@@ -56,7 +61,7 @@ pub async fn call_tool_classed(
         otel.status_description = Empty,
     );
     crate::telemetry::in_span(span.clone(), async move {
-        call_tool_unspanned(pool, config, tool_name, arguments, on_class).await.map_err(|e| match e {
+        call_tool_unspanned(pool, config, tool_name, arguments, check_class).await.map_err(|e| match e {
             CallFailure::Reported(message) => {
                 crate::telemetry::mark_error(&span, CallFailure::REPORTED);
                 message
@@ -111,7 +116,7 @@ async fn call_tool_unspanned(
     config: &McpServerConfig,
     tool_name: &str,
     arguments: serde_json::Value,
-    on_class: impl FnOnce(crate::anthropic::tools::ToolClass),
+    check_class: impl FnOnce(crate::anthropic::tools::ToolClass) -> Result<(), String>,
 ) -> Result<String, CallFailure> {
     let arguments = match arguments {
         serde_json::Value::Object(map) => Some(map),
@@ -153,18 +158,17 @@ async fn call_tool_unspanned(
         .ok_or_else(|| CallFailure::Failed(format!("not connected to MCP server {:?}", config.name)))?;
     // The override wins over the connection's list; an unknown text —
     // unreachable under the table's CHECK — is taken as destructive,
-    // failing closed toward what SME-241 will enforce.
-    let class = match override_class.as_deref() {
-        None => listed,
-        Some(text) => crate::anthropic::tools::ToolClass::parse(text).unwrap_or_else(|| {
-            tracing::warn!(
-                "the class override saved for {tool_name:?} on {:?} reads {text:?}, which isn't a class; treating the call as destructive",
-                config.name
-            );
-            crate::anthropic::tools::ToolClass::Destructive
-        }),
-    };
-    on_class(class);
+    // failing closed toward what SME-241 enforces. The offer path judges
+    // by the same function, from the same rows.
+    let class = super::judged_class(override_class.as_deref(), listed, &config.name, tool_name);
+    // SME-241: the conversation's rule chain speaks here — once the class
+    // is known and before the request is built — so a refused call is
+    // never sent. Its message is what the model gets and what this span
+    // marks failed, and the class the call was refused for is already
+    // recorded on the caller's `tool` span.
+    if let Err(rule) = check_class(class) {
+        return Err(CallFailure::Failed(rule));
+    }
 
     let mut request = CallToolRequestParams::new(tool_name.to_string());
     if let Some(arguments) = arguments {

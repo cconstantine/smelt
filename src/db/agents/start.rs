@@ -12,6 +12,9 @@ pub struct NewChild<'a> {
     pub model: Option<(i64, String)>,
     /// The child's checkout, recorded `cloning`: one of the caller's repos.
     pub repo: Option<NewChildRepo<'a>>,
+    /// The deepest the caller may be and still start one (SME-241):
+    /// `SMELT_AGENT_DEPTH`, passed in so tests set it directly.
+    pub max_depth: i32,
 }
 
 /// The child's copy of one of its parent's checkouts.
@@ -49,55 +52,76 @@ pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChi
     if let Some(repo) = &new.repo {
         lock_remote_trust(&mut *tx, repo.remote_key).await?;
     }
-    let caller = sqlx::query_scalar::<_, Option<NaiveDateTime>>(
-        "SELECT deleting_at FROM conversations WHERE id = $1 FOR NO KEY UPDATE",
+    let caller = sqlx::query_as::<_, (Option<NaiveDateTime>, Option<i64>)>(
+        "SELECT deleting_at, parent_id FROM conversations WHERE id = $1 FOR NO KEY UPDATE",
     )
     .bind(new.caller)
     .fetch_optional(&mut *tx)
     .await?;
-    // Each refusal is a (why, asked) pair: `asked` means this
-    // transaction also recorded the repo's trust card (SME-279).
-    let refused = match caller {
-        None => Some(("this conversation no longer exists".to_string(), false)),
-        Some(Some(_)) => Some(("this conversation is being deleted".to_string(), false)),
-        Some(None) => match sqlx::query_scalar::<_, String>("SELECT state FROM agents WHERE conversation_id = $1")
+    let agent = match &caller {
+        Some((None, _)) => Some(
+            sqlx::query_as::<_, (String, i32, i64, Option<serde_json::Value>)>(
+                "SELECT state, depth, root_id, rule_chain FROM agents WHERE conversation_id = $1",
+            )
             .bind(new.caller)
             .fetch_optional(&mut *tx)
-            .await?
-        {
-            Some(state) if state == AGENT_STOPPED => {
-                Some(("you were stopped, so you can't start an agent".to_string(), false))
-            }
-            Some(_) => Some((crate::agents::ROOT_ONLY.to_string(), false)),
-            None => match &new.repo {
-                None => None,
-                Some(repo) => match get_repo_trust(&mut *tx, repo.remote_key).await? {
-                    Some(true) => None,
-                    Some(false) => Some((
-                        format!("the user declined to trust {}, so no agent can work on it", repo.url),
-                        false,
-                    )),
-                    None => {
-                        // The repo itself asks: a card on the parent's own
-                        // checkout row, in the parent's conversation, under
-                        // the trust lock held since this transaction opened
-                        // — a decision then lands wholly before or after it,
-                        // as for a card a load asked with (SME-181, SME-279).
-                        request_repo_trust_card(&mut *tx, new.caller, repo.parent_repo_id).await?;
-                        Some((
-                            format!(
-                                "the user hasn't decided whether to trust {}, so no agent can work on it yet: \
-                                 a card is asking them in this conversation now. You'll get a message when \
-                                 they decide; call start_agent again then.",
-                                repo.url
-                            ),
-                            true,
-                        ))
-                    }
-                },
-            },
-        },
+            .await?,
+        ),
+        _ => None,
     };
+    // Each refusal is a (why, asked) pair: `asked` means this
+    // transaction also recorded the repo's trust card (SME-279).
+    let mut refused = match (&caller, agent.as_ref().map(Option::as_ref)) {
+        (None, _) => Some(("this conversation no longer exists".to_string(), false)),
+        (Some((Some(_), _)), _) => Some(("this conversation is being deleted".to_string(), false)),
+        (Some((None, _)), Some(Some((state, _, _, _)))) if state == AGENT_STOPPED => {
+            Some(("you were stopped, so you can't start an agent".to_string(), false))
+        }
+        // SME-241: depth replaces the root-only rule — an agent may start
+        // one below it until `SMELT_AGENT_DEPTH` levels are used up.
+        (Some((None, _)), Some(Some((_, depth, _, _)))) if *depth >= new.max_depth => Some((format!(
+            "start_agent can't go deeper than {} levels of agents (you're at depth {depth})",
+            new.max_depth
+        ), false)),
+        // A parent but no `agents` row is never a conversation smelt
+        // started: its depth and chain are unknown, so it can't start one.
+        (Some((None, Some(_))), Some(None) | None) => Some((
+            "this conversation has a parent but no agent row, so its depth is unknown — \
+             start_agent needs a conversation smelt started"
+                .to_string(),
+            false,
+        )),
+        _ => None,
+    };
+    // The repo's trust checks, on every path that's otherwise allowed.
+    if refused.is_none() {
+        if let Some(repo) = &new.repo {
+            match get_repo_trust(&mut *tx, repo.remote_key).await? {
+                Some(true) => {}
+                Some(false) => refused = Some((
+                    format!("the user declined to trust {}, so no agent can work on it", repo.url),
+                    false,
+                )),
+                None => {
+                    // The repo itself asks: a card on the parent's own
+                    // checkout row, in the parent's conversation, under
+                    // the trust lock held since this transaction opened
+                    // — a decision then lands wholly before or after it,
+                    // as for a card a load asked with (SME-181, SME-279).
+                    request_repo_trust_card(&mut *tx, new.caller, repo.parent_repo_id).await?;
+                    refused = Some((
+                        format!(
+                            "the user hasn't decided whether to trust {}, so no agent can work on it yet: \
+                             a card is asking them in this conversation now. You'll get a message when \
+                             they decide; call start_agent again then.",
+                            repo.url
+                        ),
+                        true,
+                    ));
+                }
+            }
+        }
+    }
     if let Some((why, asked)) = refused {
         if asked {
             // The card commits with the refusal (nothing else in this
@@ -106,6 +130,13 @@ pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChi
         }
         return Ok(CreateChild::Refused { why, asked });
     }
+    // A started agent nests under its own row: its depth plus one, its
+    // root's root, its rule chain (SME-241). An agent-less root starts
+    // the line: depth 1, itself the root, no chain.
+    let (depth, root, chain) = match agent.flatten() {
+        Some((_, depth, root, chain)) => (depth + 1, root, chain),
+        None => (1, new.caller, None),
+    };
     let (provider_id, model) = new.model.clone().unzip();
     let child = sqlx::query_scalar::<_, i64>(
         "INSERT INTO conversations (title, parent_id, provider_id, model) VALUES ($1, $2, $3, $4) RETURNING id",
@@ -117,14 +148,16 @@ pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChi
     .fetch_one(&mut *tx)
     .await?;
     sqlx::query(
-        "INSERT INTO agents (conversation_id, root_id, depth, brief, persona_name, state)
-         VALUES ($1, $2, 1, $3, $4, $5)",
+        "INSERT INTO agents (conversation_id, root_id, depth, brief, persona_name, state, rule_chain)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(child)
-    .bind(new.caller)
+    .bind(root)
+    .bind(depth)
     .bind(new.brief)
     .bind(new.persona_name)
     .bind(AGENT_STARTING)
+    .bind(chain)
     .execute(&mut *tx)
     .await?;
     let brief = [ContentBlock::Text { text: new.brief.to_string() }];
@@ -206,6 +239,21 @@ pub async fn complete_start(pool: &PgPool, child: i64, parent: i64, done: &Start
     .rows_affected();
     if updated == 0 {
         return Ok(false);
+    }
+    // SME-241: the persona's own entry joins the chain it inherited at
+    // `create_child` — read-modify-write inside this transaction, the
+    // child's row already locked. The entry is the snapshot's, not the
+    // file's: a later edit changes nothing, and a persona without
+    // `smelt.tools` appends nothing, its parent's chain (or none) as is.
+    if let Some(tools) = persona.and_then(|p| p.settings.get("tools")).filter(|t| !t.is_null()) {
+        sqlx::query(
+            "UPDATE agents SET rule_chain = COALESCE(rule_chain, '[]'::jsonb) || $2::jsonb
+             WHERE conversation_id = $1",
+        )
+        .bind(child)
+        .bind(tools)
+        .execute(&mut *tx)
+        .await?;
     }
     if let Some((provider_id, model)) = &done.model {
         sqlx::query("UPDATE conversations SET provider_id = $2, model = $3 WHERE id = $1")

@@ -15,7 +15,10 @@ pub(super) const TOOL_LIST_WAIT: std::time::Duration = if cfg!(test) {
 const TOOL_NAME_PREFIX: &str = "mcp__";
 const TOOL_NAME_SEPARATOR: &str = "__";
 
-pub(super) fn namespaced_tool_name(server_name: &str, tool_name: &str) -> String {
+/// The name the model calls an MCP tool by: `mcp__<server>__<tool>`.
+/// `pub(crate)` because a rule refusal names the tool the same way
+/// (SME-241), in `crate::personas::rules`.
+pub(crate) fn namespaced_tool_name(server_name: &str, tool_name: &str) -> String {
     format!("{TOOL_NAME_PREFIX}{server_name}{TOOL_NAME_SEPARATOR}{tool_name}")
 }
 
@@ -51,6 +54,25 @@ pub(crate) fn class_from_annotations(annotations: Option<&rmcp::model::ToolAnnot
 pub(super) fn listed_class(tools: &[McpTool], tool_name: &str) -> ToolClass {
     let tool = tools.iter().find(|tool| tool.name == tool_name);
     tool.map_or(ToolClass::Destructive, |tool| class_from_annotations(tool.annotations.as_ref()))
+}
+
+/// The class an MCP call — or the offer of one — is judged by: the user's
+/// saved override for this server and tool when one is set, and otherwise
+/// `listed`, the class the server's own annotations give it. An override
+/// text that isn't a class (unreachable under the table's CHECK) is taken
+/// as destructive, failing closed. One function for both of SME-241's
+/// paths, so a tool is offered under exactly the class its call is
+/// judged by.
+pub(crate) fn judged_class(saved: Option<&str>, listed: ToolClass, server: &str, tool: &str) -> ToolClass {
+    match saved {
+        None => listed,
+        Some(text) => ToolClass::parse(text).unwrap_or_else(|| {
+            tracing::warn!(
+                "the class override saved for {tool:?} on {server:?} reads {text:?}, which isn't a class; treating the call as destructive"
+            );
+            ToolClass::Destructive
+        }),
+    }
 }
 
 /// One listed tool's class information for the settings page (SME-240):
@@ -118,10 +140,13 @@ fn mcp_tool_to_definition(server_name: &str, tool: &McpTool) -> ToolDefinition {
 /// static tool list on every `send_message` call. A server that fails to
 /// connect this turn is skipped (logged, not fatal) rather than failing
 /// the whole tool list — the model just doesn't see that server's tools
-/// until it's reachable again.
+/// until it's reachable again. Of the tools a connected server lists, only
+/// those `chain` allows (SME-241) are offered: the same evaluation, at the
+/// same class, that refuses the call.
 pub async fn tool_definitions_for(
     pool: &sqlx::PgPool,
     configs: &[McpServerConfig],
+    chain: &crate::personas::rules::RuleChain,
 ) -> Vec<ToolDefinition> {
     // All servers at once, each given at most `TOOL_LIST_WAIT`. A connect
     // that takes longer carries on in the background (it's spawned, so
@@ -154,13 +179,58 @@ pub async fn tool_definitions_for(
     });
     futures_util::future::join_all(attempts).await;
 
+    // Each connected server's saved class overrides — the same rows the
+    // call path reads, so a tool is offered under exactly the class its
+    // call will be judged by (SME-241). Read off the `REGISTRY` guard, as
+    // the call path reads them: a DB query, not connection state. A read
+    // that fails leaves that server ruled by its own annotations, because
+    // an offer is best-effort — the call itself still fails closed on the
+    // same read.
+    let connected: Vec<(i64, String)> = {
+        let registry = REGISTRY.lock().await;
+        configs
+            .iter()
+            .filter(|config| registry.contains_key(&config.id))
+            .map(|config| (config.id, config.name.clone()))
+            .collect()
+    };
+    let overrides: HashMap<i64, HashMap<String, String>> = futures_util::future::join_all(
+        connected.iter().map(|(id, _)| async move { (*id, crate::db::list_mcp_tool_classes(pool, *id).await) }),
+    )
+    .await
+    .into_iter()
+    .map(|(id, saved)| match saved {
+        Ok(rows) => (id, rows.into_iter().collect()),
+        Err(e) => {
+            let server = connected.iter().find(|(cid, _)| *cid == id).map(|(_, name)| name.as_str()).unwrap_or("?");
+            tracing::warn!(server, error = %e, "couldn't read the saved class overrides; the offer falls back to the server's own annotations");
+            (id, HashMap::new())
+        }
+    })
+    .collect();
+
     let registry = REGISTRY.lock().await;
     configs
         .iter()
         .filter_map(|config| registry.get(&config.id).map(|conn| (config, conn)))
         .flat_map(|(config, conn)| {
+            let saved = overrides.get(&config.id);
             conn.tools
                 .iter()
+                // SME-241: the conversation's stored chain decides which of
+                // a server's tools it is offered, judged at the class its
+                // call would be judged by.
+                .filter(|tool| {
+                    let class = judged_class(
+                        saved.and_then(|rows| rows.get(tool.name.as_ref())).map(String::as_str),
+                        class_from_annotations(tool.annotations.as_ref()),
+                        &config.name,
+                        tool.name.as_ref(),
+                    );
+                    chain
+                        .allows_at(crate::personas::rules::ToolRef::Mcp { server: &config.name, tool: tool.name.as_ref() }, class)
+                        .is_ok()
+                })
                 .map(|tool| mcp_tool_to_definition(&config.name, tool))
                 .collect::<Vec<_>>()
         })

@@ -106,6 +106,7 @@ fn read_from(repo: db::ConversationRepo, marker: &str) -> RepoPersonas {
         description: format!("Works one ticket. {marker}-description"),
         instructions: format!("{marker}-body"),
         model: Some(format!("{marker}-model")),
+        tools: None,
     };
     RepoPersonas {
         repo,
@@ -226,6 +227,64 @@ async fn test_a_listing_says_why_a_trusted_repo_has_no_personas(pool: PgPool) {
     let one_more = repo_entry(&listing, "/workspace/one-more")["note"].as_str().expect("note").to_string();
     assert!(one_more.contains("1 other .md file there wasn't"), "{told}");
     assert!(listing.get("note").is_none(), "no persona listed, so no note about using one: {told}");
+}
+
+/// A persona whose rules name a configured server and one that isn't: the
+/// listing reports only the latter (SME-241 — a renamed server's stale
+/// pattern, which rules nothing).
+fn read_from_with_rules(repo: &db::ConversationRepo) -> RepoPersonas {
+    let text = "---\nname: developer\ndescription: Works one ticket.\nsmelt:\n  tools:\n    allow: [github/get_*, gh/create_*]\n---\n";
+    let persona = crate::personas::parse(".agents/personas/developer.md", text, text.len() as u64).expect("a valid persona");
+    RepoPersonas {
+        repo: repo.clone(),
+        read: Some(Ok(CheckoutPersonas {
+            files: vec![PersonaFile { path: ".agents/personas/developer.md".to_string(), parsed: Ok(persona) }],
+            unread: 0,
+        })),
+    }
+}
+
+/// `db::list_mcp_server_configs` as a row of its own: one configured
+/// server named `name`.
+async fn configured_server(pool: &PgPool, name: &str) {
+    crate::db::create_mcp_server_config(pool, name, "https://example.invalid/mcp", &std::collections::HashMap::new(), "static_headers", None, None)
+        .await
+        .expect("an mcp server row");
+}
+
+/// SME-241: `list_personas` says which of a persona's rule patterns name
+/// no configured server — the report a rename leaves behind, made where
+/// the model reads the rules. A pattern naming a configured server isn't
+/// mentioned, and after the server is renamed it's the other pattern that's
+/// left behind.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_rule_pattern_naming_no_configured_server_is_reported_in_the_listing(pool: PgPool) {
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let a = ready_repo(&pool, conversation.id, "a", true).await;
+    db::set_repo_trust(&pool, "github.com/o/a", true).await.expect("trust a");
+    configured_server(&pool, "github").await;
+
+    let told = gated_listing(&pool, vec![read_from_with_rules(&a)]).await.expect("listing");
+    let listing: serde_json::Value = serde_json::from_str(&told).expect("json");
+    let personas = repo_entry(&listing, "/workspace/a")["personas"].as_array().expect("personas").clone();
+    let developer = personas.iter().find(|p| p["persona"] == "a:developer").expect("developer");
+    let rules = developer["rules"].as_str().expect("the rules note");
+    assert!(rules.contains("gh/create_*"), "{rules} names the pattern that rules nothing");
+    assert!(!rules.contains("github/get_"), "{rules} leaves a configured server's pattern alone");
+
+    // Renaming the server to `gh` makes its pattern real and leaves the
+    // other one behind: the report follows the server list, not the file.
+    sqlx::query_scalar::<_, i64>("UPDATE mcp_servers SET name = 'gh' WHERE name = 'github' RETURNING id")
+        .fetch_one(&pool)
+        .await
+        .expect("rename");
+    let told = gated_listing(&pool, vec![read_from_with_rules(&a)]).await.expect("listing");
+    let listing: serde_json::Value = serde_json::from_str(&told).expect("json");
+    let personas = repo_entry(&listing, "/workspace/a")["personas"].as_array().expect("personas").clone();
+    let developer = personas.iter().find(|p| p["persona"] == "a:developer").expect("developer");
+    let rules = developer["rules"].as_str().expect("the note follows the rename");
+    assert!(rules.contains("github/get_"), "{rules} names the pattern the rename left behind");
+    assert!(!rules.contains("gh/create_*"), "{rules} leaves the pattern that matches now alone");
 }
 
 /// SME-275: a failed clone's note quotes its stored error, which can be

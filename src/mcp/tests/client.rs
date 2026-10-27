@@ -82,7 +82,7 @@ async fn test_tool_definitions_for_merges_and_namespaces_tools_from_connected_se
     register_test_connection(server_id, false).await;
 
     let definitions =
-        tool_definitions_for(&test_pool(), &[test_config(server_id, "test-server")]).await;
+        tool_definitions_for(&test_pool(), &[test_config(server_id, "test-server")], &unruled()).await;
 
     assert_eq!(definitions.len(), 1);
     assert_eq!(definitions[0].name, "mcp__test-server__echo");

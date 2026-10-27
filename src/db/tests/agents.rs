@@ -130,3 +130,93 @@ async fn test_agents_waiting_under_finds_every_depth_and_only_the_users_waits(po
     assert_eq!(agents_waiting_under(&pool, child).await.expect("waiting"), vec![(grandchild, titles(child))]);
     assert!(agents_waiting_under(&pool, grandchild).await.expect("waiting").is_empty());
 }
+
+/// SME-241: `create_child`'s new shape — a caller row, and a `NewChild`
+/// with the depth ceiling set directly (never by env in tests).
+fn new_child(caller: i64, max_depth: i32) -> NewChild<'static> {
+    NewChild { caller, brief: "b", persona_name: None, model: None, repo: None, max_depth }
+}
+
+/// A conversation under `parent` with an `active` agent row at `depth`,
+/// rooted at `root`, storing `chain`: the stand-in for a started agent.
+async fn nested_agent(pool: &PgPool, parent: i64, root: i64, depth: i32, chain: Option<serde_json::Value>) -> i64 {
+    let child = sqlx::query_scalar::<_, i64>("INSERT INTO conversations (title, parent_id) VALUES ('n', $1) RETURNING id")
+        .bind(parent)
+        .fetch_one(pool)
+        .await
+        .expect("a conversation");
+    sqlx::query("INSERT INTO agents (conversation_id, root_id, depth, brief, state, rule_chain) VALUES ($1, $2, $3, 'b', 'active', $4)")
+        .bind(child)
+        .bind(root)
+        .bind(depth)
+        .bind(chain)
+        .execute(pool)
+        .await
+        .expect("an agent row");
+    child
+}
+
+/// The created child's (depth, root_id, rule_chain).
+async fn child_row(pool: &PgPool, id: i64) -> (i32, i64, Option<serde_json::Value>) {
+    sqlx::query_as::<_, (i32, i64, Option<serde_json::Value>)>(
+        "SELECT depth, root_id, rule_chain FROM agents WHERE conversation_id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("the agent row")
+}
+
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_create_child_nests_depth_under_its_caller_and_inherits_root_and_chain(pool: PgPool) {
+    let root = test_conversation(&pool).await.id;
+    let chain = serde_json::json!([{"class": "read-only", "allow": [], "deny": ["x*"]}]);
+    let caller = nested_agent(&pool, root, root, 3, Some(chain.clone())).await;
+    let CreateChild::Created { child, repo } = create_child(&pool, &new_child(caller, 5)).await.expect("start") else {
+        panic!("a caller below the ceiling starts one");
+    };
+    assert!(repo.is_none());
+    assert_eq!(child_row(&pool, child).await, (4, root, Some(chain)), "depth nests; root and chain are the line's");
+    assert_eq!(conversation_parent(&pool, child).await.expect("parent"), Some(caller), "its parent is its caller");
+}
+
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_create_child_refuses_only_at_the_depth_ceiling(pool: PgPool) {
+    let root = test_conversation(&pool).await.id;
+    let caller = nested_agent(&pool, root, root, 5, None).await;
+    let CreateChild::Refused { why, asked } = create_child(&pool, &new_child(caller, 5)).await.expect("start") else {
+        panic!("a caller at the ceiling can't go deeper");
+    };
+    assert_eq!(why, "start_agent can't go deeper than 5 levels of agents (you're at depth 5)");
+    assert!(!asked);
+    // The same caller under a higher ceiling nests one more level.
+    let CreateChild::Created { child, .. } = create_child(&pool, &new_child(caller, 6)).await.expect("start") else {
+        panic!("the ceiling is the setting, not a stored number");
+    };
+    assert_eq!(child_row(&pool, child).await.0, 6);
+}
+
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_create_child_refuses_a_parented_conversation_with_no_agent_row(pool: PgPool) {
+    let root = test_conversation(&pool).await.id;
+    let bare = sqlx::query_scalar::<_, i64>("INSERT INTO conversations (title, parent_id) VALUES ('bare', $1) RETURNING id")
+        .bind(root)
+        .fetch_one(&pool)
+        .await
+        .expect("a bare child row");
+    let CreateChild::Refused { why, asked } = create_child(&pool, &new_child(bare, 5)).await.expect("start") else {
+        panic!("its depth is unknown");
+    };
+    assert_eq!(
+        why,
+        "this conversation has a parent but no agent row, so its depth is unknown — \
+         start_agent needs a conversation smelt started"
+    );
+    assert!(!asked);
+    let children = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM conversations WHERE parent_id = $1")
+        .bind(bare)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(children, 0, "the refusal wrote nothing");
+}

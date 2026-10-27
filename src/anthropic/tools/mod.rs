@@ -53,19 +53,20 @@ struct Tool {
     class: Class,
 }
 
-/// Who a tool is offered to (SME-236): every conversation, only one
-/// without a parent (the user's own), or only an agent. `Linked`
-/// (SME-238) is offered to every conversation, so the tool list doesn't
-/// change when a conversation starts its first agent (which would rewrite
-/// its whole cached prompt), but `execute` lets only one with a parent or
-/// agents of its own call it. `execute` checks every offer from the
-/// database: a call can come from a history written before the
-/// conversation changed.
+/// Who a tool is offered to (SME-236): every conversation, or only one
+/// with a parent. `Linked` (SME-238) is offered to every conversation, so
+/// the tool list doesn't change when a conversation starts its first
+/// agent (which would rewrite its whole cached prompt), but `execute`
+/// lets only one with a parent or agents of its own call it. `execute`
+/// checks every offer from the database: a call can come from a history
+/// written before the conversation changed. (`Offer::Root`, which gave
+/// `start_agent` only to a parent-less conversation, is gone: SME-241
+/// made it an ordinary writing tool, kept in check by the rule chain and
+/// the depth ceiling.)
 #[cfg(feature = "server")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Offer {
     All,
-    Root,
     Child,
     Linked,
 }
@@ -284,13 +285,49 @@ mod server {
             span.record("smelt.tool.class", class.as_str());
         };
         match resolve(pool, name).await? {
-            Target::Mcp { config, tool } => crate::mcp::call_tool_classed(pool, &config, tool, input.clone(), record).await,
+            Target::Mcp { config, tool } => {
+                // SME-241: an MCP call is ruled at its class, and the class
+                // is only known inside the call — after the connect and the
+                // override read, on the very connection it goes out on. So
+                // the chain travels in as the check `call_tool_classed`
+                // consults before it sends; the class is recorded either
+                // way, allowed or refused.
+                let chain = call_rule_chain(pool, conversation_id).await;
+                crate::mcp::call_tool_classed(pool, &config, tool, input.clone(), |class| {
+                    record(class);
+                    chain.allows_at(crate::personas::rules::ToolRef::Mcp { server: &config.name, tool }, class)
+                })
+                .await
+            }
             Target::Native(registered) => {
-                record(registered.tool.class.of_call(input));
+                let class = registered.tool.class.of_call(input);
+                record(class);
+                // SME-241: the conversation's stored chain speaks before the
+                // tool runs — a refusal names the rule and no side effect
+                // happened. A chain it doesn't have (no agent row), can't
+                // read, or can't parse falls open with a warning, exactly
+                // like the offer path: offer and call stay a consistent
+                // pair, and a bad store strands no tools (SME-241's plan,
+                // threat model).
+                let chain = call_rule_chain(pool, conversation_id).await;
+                chain.allows_at(crate::personas::rules::ToolRef::Native(name), class)?;
                 if registered.offer != super::Offer::All {
                     offered_to(pool, conversation_id, name, registered.offer).await?;
                 }
                 (registered.tool.run)(super::Call { pool, conversation_id, tool_use_id, input }).await
+            }
+        }
+    }
+
+    /// The conversation's stored rule chain as the call path reads it
+    /// (SME-241): absent, unreadable or unparseable falls open with a
+    /// warning, the same pair `tool_definitions` offers by.
+    async fn call_rule_chain(pool: &PgPool, conversation_id: i64) -> crate::personas::rules::RuleChain {
+        match crate::db::agent_rule_chain(pool, conversation_id).await {
+            Ok(stored) => crate::personas::rules::RuleChain::from_stored(stored),
+            Err(e) => {
+                tracing::warn!(conversation_id, error = %e, "couldn't read the conversation's rule chain; its tools are unruled this call");
+                crate::personas::rules::RuleChain::default()
             }
         }
     }
@@ -302,7 +339,6 @@ mod server {
             .await
             .map_err(|e| format!("couldn't check who may call {name}: {e}"))?;
         match (offer, parent) {
-            (super::Offer::Root, Some(_)) => Err(format!("{name} is only for a conversation without a parent")),
             (super::Offer::Child, None) => Err(format!("{name} is only for an agent")),
             (super::Offer::Linked, None) if !has_children => {
                 Err(format!("{name} is only for a conversation with a parent or agents of its own"))
@@ -316,7 +352,6 @@ mod server {
     fn is_offered(offer: super::Offer, has_parent: bool) -> bool {
         match offer {
             super::Offer::All | super::Offer::Linked => true,
-            super::Offer::Root => !has_parent,
             super::Offer::Child => has_parent,
         }
     }
@@ -338,9 +373,10 @@ mod server {
     /// `crate::mcp`). A server that fails to connect this turn is skipped
     /// rather than failing the whole request — see
     /// `crate::mcp::tool_definitions_for`. Only the tools offered to
-    /// `conversation_id` (SME-236): `start_agent` to a conversation without
-    /// a parent, `finish` and `ask_parent` to an agent. A failed read
-    /// offers neither.
+    /// `conversation_id` (SME-236): `finish` and `ask_parent` to an agent;
+    /// and only those its
+    /// stored rule chain allows (SME-241). A failed read offers neither
+    /// agent tools nor ruled-away narrowing: the chain falls open, warned.
     pub async fn tool_definitions(pool: &PgPool, conversation_id: i64) -> Vec<crate::anthropic::ToolDefinition> {
         let has_parent = match crate::db::conversation_parent(pool, conversation_id).await {
             Ok(parent) => Some(parent.is_some()),
@@ -349,17 +385,30 @@ mod server {
                 None
             }
         };
+        let chain = match crate::db::agent_rule_chain(pool, conversation_id).await {
+            Ok(stored) => crate::personas::rules::RuleChain::from_stored(stored),
+            Err(e) => {
+                tracing::warn!(conversation_id, error = %e, "couldn't read the conversation's rule chain; its tools are unruled this turn");
+                crate::personas::rules::RuleChain::default()
+            }
+        };
         let mut definitions: Vec<crate::anthropic::ToolDefinition> = super::REGISTRY
             .iter()
             .filter(|registered| match has_parent {
                 Some(has_parent) => is_offered(registered.offer, has_parent),
                 None => matches!(registered.offer, super::Offer::All | super::Offer::Linked),
             })
+            .filter(|registered| {
+                chain.allows_any(
+                    crate::personas::rules::ToolRef::Native(&registered.tool.def.name),
+                    registered.tool.class.can_be(),
+                )
+            })
             .map(|registered| registered.tool.def.clone())
             .collect();
         match crate::db::list_mcp_server_configs(pool).await {
             Ok(configs) => {
-                definitions.extend(crate::mcp::tool_definitions_for(pool, &configs).await)
+                definitions.extend(crate::mcp::tool_definitions_for(pool, &configs, &chain).await)
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to list configured MCP servers; their tools are unavailable this turn")

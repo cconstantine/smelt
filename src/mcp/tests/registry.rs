@@ -22,7 +22,7 @@ async fn edit(pool: &sqlx::PgPool, config: &McpServerConfig, url: &str, headers:
 /// connect is spawned inside and outlives it.
 fn list_tools_in_background(pool: &sqlx::PgPool, config: &McpServerConfig) -> tokio::task::JoinHandle<Vec<ToolDefinition>> {
     let (pool, config) = (pool.clone(), config.clone());
-    tokio::spawn(async move { tool_definitions_for(&pool, &[config]).await })
+    tokio::spawn(async move { tool_definitions_for(&pool, &[config], &unruled()).await })
 }
 
 /// Waits, at most `WAIT`, for `task` to finish.
@@ -42,7 +42,7 @@ async fn connect_ended(server_id: i64) {
 }
 
 async fn tool_names(pool: &sqlx::PgPool, config: &McpServerConfig) -> Vec<String> {
-    let listed = tokio::time::timeout(WAIT, tool_definitions_for(pool, std::slice::from_ref(config)))
+    let listed = tokio::time::timeout(WAIT, tool_definitions_for(pool, std::slice::from_ref(config), &unruled()))
         .await
         .expect("listing tools didn't finish in time");
     listed.into_iter().map(|tool| tool.name).collect()
