@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn test_pod_spec_runs_dockerd_in_a_privileged_native_sidecar() {
-    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], &[], TEST_INSTANCE);
     let spec = pod.spec.expect("pod should have a spec");
     let docker = container(&spec.init_containers, "docker");
 
@@ -38,7 +38,7 @@ fn test_pod_spec_runs_dockerd_in_a_privileged_native_sidecar() {
 
 #[test]
 fn test_pod_spec_leaves_the_sandbox_container_unprivileged() {
-    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], &[], TEST_INSTANCE);
     let spec = pod.spec.expect("pod should have a spec");
     let main = Some(spec.containers);
     let sandbox = container(&main, "sandbox");
@@ -55,7 +55,7 @@ fn test_pod_spec_leaves_the_sandbox_container_unprivileged() {
 /// x86_64 is what Kubernetes calls amd64.
 #[test]
 fn test_pod_spec_pins_pods_to_amd64_nodes() {
-    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], &[], TEST_INSTANCE);
     let selector = pod
         .spec
         .as_ref()
@@ -70,7 +70,7 @@ fn test_pod_spec_pins_pods_to_amd64_nodes() {
 
 #[test]
 fn test_pod_spec_shares_workspace_and_socket_but_keeps_docker_data_in_the_sidecar() {
-    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], &[], TEST_INSTANCE);
     let spec = pod.spec.expect("pod should have a spec");
     let docker = container(&spec.init_containers, "docker");
     let main = Some(spec.containers.clone());
@@ -113,7 +113,7 @@ fn test_pod_spec_ephemeral_storage_is_empty_dirs() {
         storage: PodStorage::Ephemeral,
         ..docker_for_conversation(42)
     };
-    let pod = build_pod_spec("sandbox-1", "1Gi", &docker, &[], TEST_INSTANCE);
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker, &[], &[], TEST_INSTANCE);
     let volumes = pod.spec.and_then(|s| s.volumes).expect("pod should have volumes");
     for name in ["docker-data", "workspace"] {
         let v = volumes.iter().find(|v| v.name == name).expect(name);
@@ -131,7 +131,7 @@ fn test_pod_spec_mounts_user_volumes_into_both_containers_at_the_same_path() {
         created_at: chrono::Utc::now().naive_utc(),
         updated_at: chrono::Utc::now().naive_utc(),
     }];
-    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &volumes, TEST_INSTANCE);
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &volumes, &[], TEST_INSTANCE);
     let spec = pod.spec.expect("pod should have a spec");
     let docker = container(&spec.init_containers, "docker");
     let main = Some(spec.containers.clone());
@@ -143,7 +143,7 @@ fn test_pod_spec_mounts_user_volumes_into_both_containers_at_the_same_path() {
 
 #[test]
 fn test_pod_spec_labels_a_pod_with_its_conversation_only_when_it_uses_the_claim() {
-    let labelled = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);
+    let labelled = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], &[], TEST_INSTANCE);
     assert_eq!(
         labelled.metadata.labels.as_ref().and_then(|l| l.get(CONVERSATION_LABEL)).map(String::as_str),
         Some("42"),
@@ -153,7 +153,7 @@ fn test_pod_spec_labels_a_pod_with_its_conversation_only_when_it_uses_the_claim(
         storage: PodStorage::Ephemeral,
         ..docker_for_conversation(42)
     };
-    let unlabelled = build_pod_spec("sandbox-1", "1Gi", &ephemeral, &[], TEST_INSTANCE);
+    let unlabelled = build_pod_spec("sandbox-1", "1Gi", &ephemeral, &[], &[], TEST_INSTANCE);
     assert!(unlabelled.metadata.labels.and_then(|l| l.get(CONVERSATION_LABEL).cloned()).is_none());
 }
 
@@ -168,7 +168,7 @@ fn test_every_pod_and_claim_carries_its_instance() {
         ..docker_for_conversation(42)
     };
     for docker in [docker_for_conversation(42), ephemeral] {
-        let pod = build_pod_spec("sandbox-1", "1Gi", &docker, &[], instance);
+        let pod = build_pod_spec("sandbox-1", "1Gi", &docker, &[], &[], instance);
         assert_eq!(label(&pod.metadata).as_deref(), Some(instance), "a pod on {:?}", docker.storage);
     }
     for (_, claim) in conversation_pvc_specs(42, instance) {
@@ -200,7 +200,7 @@ fn test_pod_limit_overrides_replace_only_the_limits_they_name() {
 /// no memory and has no CPU request or limit at all.
 #[test]
 fn test_pod_spec_reserves_nothing_and_limits_only_memory() {
-    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], &[], TEST_INSTANCE);
     let spec = pod.spec.expect("a pod spec");
     let containers = spec.containers.iter().chain(spec.init_containers.iter().flatten());
     for container in containers {
@@ -220,7 +220,7 @@ fn test_pod_spec_reserves_nothing_and_limits_only_memory() {
 
 #[test]
 fn test_pod_container_limits_include_the_docker_sidecar() {
-    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], &[], TEST_INSTANCE);
     assert_eq!(
         pod_container_limits(&pod),
         (vec!["1Gi".to_string(), "2Gi".to_string()], Vec::<String>::new())
@@ -233,7 +233,7 @@ fn test_pod_container_limits_include_the_docker_sidecar() {
 /// the pair.
 #[test]
 fn test_both_containers_fetch_their_image_with_the_same_policy() {
-    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], &[], TEST_INSTANCE);
     let spec = pod.spec.expect("a pod spec");
     for container in spec.containers.iter().chain(spec.init_containers.iter().flatten()) {
         assert_eq!(
@@ -265,7 +265,7 @@ fn test_a_pull_policy_is_read_in_any_case_with_the_spaces_trimmed() {
 /// one-setting-covers-both-images shape as the pull policy.
 #[test]
 fn test_a_pod_carries_the_pull_credentials_the_deployment_names() {
-    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], &[], TEST_INSTANCE);
     let named = |secrets: Option<Vec<LocalObjectReference>>| {
         secrets.unwrap_or_default().into_iter().map(|secret| secret.name).collect::<Vec<_>>()
     };

@@ -199,6 +199,7 @@ async fn test_another_databases_pod_of_the_same_name_is_never_reused() {
             "128Mi",
             &DockerSidecar { memory: "512Mi".to_string(), storage: PodStorage::Ephemeral },
             &[],
+            &[],
             Duration::from_secs(5),
             &test_instance(),
         )

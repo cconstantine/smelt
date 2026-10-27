@@ -199,7 +199,10 @@ async fn start_up(dotenv_problem: Option<String>) -> tokio::net::TcpListener {
     tokio::spawn({
         let pool = pool.clone();
         telemetry::in_span(tracing::info_span!("claim_sweep"), async move {
-            sandbox::sweep_orphaned_conversation_claims(&pool).await
+            sandbox::sweep_orphaned_conversation_claims(&pool).await;
+            // The same for a model volume's claim (SME-239): each is
+            // instance-labelled, so the two sweeps never overlap.
+            sandbox::sweep_orphaned_agent_volume_claims(&pool).await;
         })
     });
 

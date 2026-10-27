@@ -138,3 +138,38 @@ pub(in crate::sandbox) fn docker_data_volume(storage: &PodStorage) -> Volume {
         PodStorage::Ephemeral => empty_dir_volume(DOCKER_DATA_VOLUME),
     }
 }
+
+/// A model-created volume's claim, `agent-volume-<id>` (SME-239) — not a
+/// global volume's `sandbox-volume-<id>`: `agent_volumes` and `sandbox_volumes`
+/// count from their own sequences, and one pod can mount both, so the two names
+/// must differ for the same number.
+pub(in crate::sandbox) fn agent_volume_pvc_name(volume_id: i64) -> String {
+    format!("agent-volume-{volume_id}")
+}
+
+/// Every volume one conversation mounts, as its `Volume`/`VolumeMount` pair —
+/// the same pure shape as `volume_mounts_for`, over one conversation's mounts
+/// instead of every configured volume: a model volume reaches only the
+/// conversations that hold it (SME-239).
+pub(in crate::sandbox) fn agent_volume_mounts_for(volumes: &[db::AgentVolume]) -> (Vec<Volume>, Vec<VolumeMount>) {
+    volumes
+        .iter()
+        .map(|v| {
+            let name = agent_volume_pvc_name(v.id);
+            let volume = Volume {
+                name: name.clone(),
+                persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                    claim_name: name.clone(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mount = VolumeMount {
+                name,
+                mount_path: v.mount_path.clone(),
+                ..Default::default()
+            };
+            (volume, mount)
+        })
+        .unzip()
+}

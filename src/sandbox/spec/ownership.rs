@@ -6,6 +6,12 @@ use super::*;
 /// that mounts that PVC.
 pub(in crate::sandbox) const CONVERSATION_LABEL: &str = "smelt/conversation";
 
+/// Label naming the conversation that *created* a model volume, on its claim
+/// (SME-239). Not `smelt/conversation`: every conversation that mounts the
+/// volume mounts the one claim, so the sweep needs the creator's id in
+/// particular — that's the conversation whose deletion takes the volume.
+pub(in crate::sandbox) const AGENT_VOLUME_LABEL: &str = "smelt/agent-volume-owner";
+
 /// Label naming the database an object belongs to: its `smelt_instance`
 /// id (SME-115). Every smelt server shares the namespace and names its
 /// objects after its own database's ids, so this is what tells one

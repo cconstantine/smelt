@@ -153,3 +153,49 @@ pub(in crate::sandbox) async fn delete_volume_claim(
         }
     }
 }
+
+/// Creates any claim this conversation's pod mounts that's missing, the same
+/// shape as `ensure_volume_claims` for a global volume: a pod whose claim
+/// doesn't exist can only wait out the start-up timeout, and a claim goes
+/// missing when the cluster is rebuilt, or when the row was committed and the
+/// claim create wasn't (SME-239's `create_volume` has that gap by design —
+/// the row is the record, the claim is re-made here).
+pub(in crate::sandbox) async fn ensure_agent_volume_claims(
+    client: &kube::Client,
+    volumes: &[db::AgentVolume],
+    instance: &db::SmeltInstance,
+) -> Result<(), SandboxError> {
+    let pvcs = pvc_api(client);
+    for volume in volumes {
+        // Boxed, like the other claim ensures (SME-115 review 1).
+        Box::pin(ensure_agent_volume_claim(&pvcs, volume, instance)).await?;
+    }
+    Ok(())
+}
+
+/// One of `ensure_agent_volume_claims`' claims: made if missing, and refused
+/// unless it's ours. No adoption branch — an agent-volume claim postdates
+/// SME-115, so an unlabelled one of that name is somebody else's and the start
+/// fails closed, as for a foreign global-volume claim.
+async fn ensure_agent_volume_claim(
+    pvcs: &Api<PersistentVolumeClaim>,
+    volume: &db::AgentVolume,
+    instance: &db::SmeltInstance,
+) -> Result<(), SandboxError> {
+    let claim = agent_volume_pvc_name(volume.id);
+    match pvcs.get_opt(&claim).await? {
+        None => {
+            tracing::warn!(claim = %claim, "volume claim missing; recreating it");
+            pvcs.create(
+                &PostParams::default(),
+                &build_agent_volume_pvc_spec(volume.id, volume.owner_conversation_id, &instance.id),
+            )
+            .await?;
+            Ok(())
+        }
+        Some(existing) => match ownership(&existing.metadata, &instance.id) {
+            Ownership::Ours => Ok(()),
+            other => Err(SandboxError::NotOurs { name: claim, ownership: other }),
+        },
+    }
+}

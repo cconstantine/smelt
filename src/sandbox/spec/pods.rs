@@ -72,6 +72,9 @@ pub struct DockerSidecar {
 /// Starts dockerd inside the sidecar's own cgroup instead of through the
 /// docker:dind image's entrypoint; see the script's own comment.
 pub(in crate::sandbox) const START_DOCKERD_SCRIPT: &str = include_str!("../../../docker/sandbox/start-dockerd.sh");
+/// `agent_volumes` is every volume this conversation mounts — its own and the
+/// ones passed down to it (SME-239); an empty slice is every pod today's shape.
+
 /// `memory` is a plain Kubernetes `Quantity` string (`"8Gi"`)
 /// — no app-side parsing or validation of the format; an invalid value is
 /// rejected by the Kubernetes API itself when the pod is actually
@@ -83,9 +86,16 @@ pub(in crate::sandbox) fn build_pod_spec(
     memory: &str,
     docker: &DockerSidecar,
     volumes: &[db::SandboxVolume],
+    agent_volumes: &[db::AgentVolume],
     instance: &str,
 ) -> Pod {
-    let (mut pod_volumes, user_mounts) = volume_mounts_for(volumes);
+    let (mut pod_volumes, mut user_mounts) = volume_mounts_for(volumes);
+    // A model volume goes on both containers, exactly as a global one does:
+    // a bind mount dockerd resolves finds what the model wrote either way
+    // (SME-239).
+    let (agent_vols, agent_mounts) = agent_volume_mounts_for(agent_volumes);
+    pod_volumes.extend(agent_vols);
+    user_mounts.extend(agent_mounts);
     pod_volumes.extend([
         workspace_volume(&docker.storage),
         empty_dir_volume(DOCKER_SOCK_VOLUME),

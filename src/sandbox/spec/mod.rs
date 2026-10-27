@@ -44,12 +44,12 @@ pub(in crate::sandbox) use images::{image_pull_policy_from, image_pull_secrets_f
 pub(in crate::sandbox) use limits::{memory_only, pod_container_limits, running_wait_timeout};
 #[cfg(test)]
 pub(in crate::sandbox) use limits::{default_docker_memory_limit, default_memory_limit};
-pub(in crate::sandbox) use mounts::{docker_data_volume, empty_dir_volume, mount, resolve_mount_path, sandbox_volume_pvc_name, validate_mount_path, volume_mounts_for, workspace_volume, DOCKER_DATA_VOLUME, DOCKER_GID, DOCKER_HOST, DOCKER_SOCK_DIR, DOCKER_SOCK_VOLUME, SANDBOX_OWNER, WORKSPACE_VOLUME};
-pub(in crate::sandbox) use ownership::{instance_labels, CONVERSATION_LABEL};
+pub(in crate::sandbox) use mounts::{agent_volume_mounts_for, agent_volume_pvc_name, docker_data_volume, empty_dir_volume, mount, resolve_mount_path, sandbox_volume_pvc_name, validate_mount_path, volume_mounts_for, workspace_volume, DOCKER_DATA_VOLUME, DOCKER_GID, DOCKER_HOST, DOCKER_SOCK_DIR, DOCKER_SOCK_VOLUME, SANDBOX_OWNER, WORKSPACE_VOLUME};
+pub(in crate::sandbox) use ownership::{instance_labels, AGENT_VOLUME_LABEL, CONVERSATION_LABEL};
 pub(in crate::sandbox) use pods::{build_pod_spec, sandbox_delete_params};
 #[cfg(test)]
 pub(in crate::sandbox) use pods::{immediate_delete_params, START_DOCKERD_SCRIPT};
-pub(in crate::sandbox) use pvcs::{build_volume_pvc_spec, conversation_pvc_specs, docker_pvc_name};
+pub(in crate::sandbox) use pvcs::{build_agent_volume_pvc_spec, build_volume_pvc_spec, conversation_pvc_specs, docker_pvc_name};
 #[cfg(test)]
-pub(in crate::sandbox) use pvcs::{build_conversation_pvc_spec, default_docker_storage_size};
+pub(in crate::sandbox) use pvcs::{build_conversation_pvc_spec, default_docker_storage_size, default_volume_storage_size};
 pub(in crate::sandbox) use status::{pod_pending_detail, pod_startup_failure};

@@ -118,3 +118,41 @@ pub(in crate::sandbox) fn build_volume_pvc_spec(volume_id: i64, instance: &str) 
         ..Default::default()
     }
 }
+
+/// A model-created volume's claim: one per volume, mounted by every pod whose
+/// conversation holds it. RWO across pods is what smelt's single-node k3s
+/// requires (the design's spike S2); `smelt/instance` keeps another
+/// deployment's same-numbered volume from ever being mounted (SME-115), and
+/// `smelt/agent-volume-owner` names the creator for the startup sweep
+/// (SME-239).
+pub(in crate::sandbox) fn build_agent_volume_pvc_spec(
+    volume_id: i64,
+    owner_conversation_id: i64,
+    instance: &str,
+) -> PersistentVolumeClaim {
+    let mut requests = std::collections::BTreeMap::new();
+    requests.insert(
+        "storage".to_string(),
+        Quantity(default_volume_storage_size()),
+    );
+    let mut labels = instance_labels(instance);
+    labels.insert(AGENT_VOLUME_LABEL.to_string(), owner_conversation_id.to_string());
+
+    PersistentVolumeClaim {
+        metadata: ObjectMeta {
+            name: Some(agent_volume_pvc_name(volume_id)),
+            namespace: Some(NAMESPACE.to_string()),
+            labels: Some(labels),
+            ..Default::default()
+        },
+        spec: Some(PersistentVolumeClaimSpec {
+            access_modes: Some(vec!["ReadWriteOnce".to_string()]),
+            resources: Some(VolumeResourceRequirements {
+                requests: Some(requests),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}

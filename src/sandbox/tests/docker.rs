@@ -21,7 +21,7 @@ async fn test_docker_in_a_sandbox_pod_works_and_stays_inside_the_pod() {
 
     let checks = tokio::time::timeout(Duration::from_secs(300), async {
         let first = manager
-            .create_with_docker(&unique_session_id("docker"), "256Mi", &docker, &[], &test_instance())
+            .create_with_docker(&unique_session_id("docker"), "256Mi", &docker, &[], &[], &test_instance())
             .await
             .expect("create pod with docker");
         created.lock().expect("created").push(first.pod_name.clone());
@@ -181,7 +181,7 @@ async fn test_docker_in_a_sandbox_pod_works_and_stays_inside_the_pod() {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
         let second = manager
-            .create_with_docker(&unique_session_id("docker"), "256Mi", &docker, &[], &test_instance())
+            .create_with_docker(&unique_session_id("docker"), "256Mi", &docker, &[], &[], &test_instance())
             .await
             .expect("recreate pod on the same claim");
         created.lock().expect("created").push(second.pod_name.clone());
@@ -230,7 +230,7 @@ async fn test_an_oom_in_a_nested_container_restarts_only_the_docker_sidecar() {
         storage: PodStorage::Ephemeral,
     };
     let sandbox = manager
-        .create_with_docker(&unique_session_id("docker-oom"), "128Mi", &docker, &[], &test_instance())
+        .create_with_docker(&unique_session_id("docker-oom"), "128Mi", &docker, &[], &[], &test_instance())
         .await
         .expect("create pod");
     let name = sandbox.pod_name.clone();
