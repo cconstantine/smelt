@@ -99,6 +99,8 @@ The tables after every migration has run. All `id`s are `BIGINT GENERATED ALWAYS
 | `terminal_events` | A command's output: `command_id`, `stream`, `seq`, `data` | `stream` `CHECK`ed to `stdout`/`stderr`. FK → `terminal_commands(command_id)` cascade. |
 | `sandbox_pod_previews` | Ports shared as previews: `pod_id`, `host` (`''` is the pod's localhost), `port` | PK `(pod_id, host, port)`; `port` `CHECK`ed to 1–65535. FK → `sandbox_pods` cascade. |
 | `sandbox_volumes` | Volumes mounted into every pod: `name`, `mount_path` | `name` unique. No FKs. |
+| `agent_volumes` | A volume the model created (SME-239): `owner_conversation_id`, `name`, `mount_path` (resolved and normalized in code, so the pod's mount and the prompt's line are the same string) | `name` `CHECK`ed to `[A-Za-z0-9_-]{1,64}`; `UNIQUE (owner_conversation_id, name)` — and `create_volume` also refuses a name any volume this conversation mounts takes, so a passed name never means two volumes. FK → `conversations` cascade. Its claim is `agent-volume-<id>` — never a global's `sandbox-volume-<id>`, since the two id spaces collide in one pod — labelled `smelt/instance` and `smelt/agent-volume-owner`. |
+| `conversation_volume_mounts` | Whose pod mounts a model volume: the creating conversation first, then every child it was passed to (SME-239): `conversation_id`, `volume_id` | PK `(conversation_id, volume_id)`. FKs → `conversations` and `agent_volumes`, both cascade. `start_agent(volumes: …)` writes a child's row under a `FOR SHARE` lock on the volume row — the pair to `delete_volume`'s `FOR UPDATE`, so a pass and a delete exclude each other and one of the two refuses. |
 
 ### Git
 
@@ -136,6 +138,8 @@ conversations
 ├── pending_questions
 ├── agents             (by conversation_id, and by root_id)
 ├── agent_messages     (to it; one it sent keeps a null from_conversation_id)
+├── agent_volumes      (the volumes its model created, SME-239)
+├── conversation_volume_mounts  (its own and passed to it; cascades from the volume too)
 ├── conversations      (its children, by parent_id, and theirs)
 ├── sandbox_pods
 │   ├── sandbox_pod_previews
@@ -148,7 +152,7 @@ conversations
     └── instruction_requests  (also directly, by conversation_id)
 ```
 
-This only covers rows: the pod and its Kubernetes resources are torn down separately by `api::chat::delete_conversation` (`sandbox::teardown_conversation`), for every conversation in the subtree (`agents::delete_subtree`, SME-236: it first marks the subtree `deleting_at` and its agents `stopped` under the group root's lock, then deletes with a notice to the deleted agent's parent in the same transaction). `repo_trust`, `ssh_keys`, `git_settings`, `mcp_servers`, `sandbox_volumes` and `language_servers` belong to no conversation and are untouched.
+This only covers rows: the pod and its Kubernetes resources are torn down separately by `api::chat::delete_conversation` (`sandbox::teardown_conversation`), for every conversation in the subtree (`agents::delete_subtree`, SME-236: it first marks the subtree `deleting_at` and its agents `stopped` under the group root's lock, then deletes with a notice to the deleted agent's parent in the same transaction). `repo_trust`, `ssh_keys`, `git_settings`, `mcp_servers`, `sandbox_volumes` and `language_servers` belong to no conversation and are untouched. (Model volumes are not: `agent_volumes` cascades with its *creator* — SME-239 — and `agents::delete_subtree` deletes each one's `agent-volume-<id>` claim after the teardown; a delete cut off before the claim leaves it for the startup sweep.)
 
 ## Testing against the database
 
