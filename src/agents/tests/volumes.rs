@@ -160,8 +160,9 @@ async fn test_delete_volume_refuses_what_it_didnt_create_and_what_is_still_mount
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_delete_volume_takes_its_rows_even_when_no_claim_can_be_reached(pool: PgPool) {
     // No cluster in this test: the rows are the record and the claim is left
-    // for the startup sweep — the design's answer to a delete cut off
-    // part-way, so this is the behaviour rather than a test artefact.
+    // undeleted — it comes down with this conversation, the only moment the
+    // startup sweep could take it (R2-F1); the design's answer to a delete
+    // cut off part-way, so this is the behaviour rather than a test artefact.
     let conversation = conversation(&pool).await;
     own_volume(&pool, conversation, "mine", "/data/mine").await;
 
@@ -170,10 +171,34 @@ async fn test_delete_volume_takes_its_rows_even_when_no_claim_can_be_reached(poo
         .expect("the rows go whatever the claim does");
     assert!(result.contains("volume \"mine\" deleted"), "{result}");
     // The copy answers for the claim too: it was never reached, so it isn't
-    // gone — the startup sweep is what will delete it (A-F1).
-    assert!(result.contains("its claim is left for the startup sweep"), "{result}");
+    // gone, and it dates the sweep to this conversation's own delete — a live
+    // owner's leftover claim is never the sweep's catch (A-F1, R2-F1).
+    assert!(result.contains("its claim could not be deleted"), "{result}");
+    assert!(result.contains("once this conversation is deleted"), "{result}");
     assert!(!result.contains("and its claim are gone"), "the claim didn't go: {result}");
     assert!(result.contains("Nothing mounts it now."), "{result}");
+    assert_eq!(row_counts(&pool).await, (0, 0), "the row and its mount row are gone");
+}
+
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_delete_volume_keeps_its_sentence_when_the_instance_row_cannot_be_read(pool: PgPool) {
+    // Past `sandbox::get()` on the stand-in manager, then this database's
+    // instance row is gone: the delete tx has already committed, so the raw
+    // DB error must not replace the delete sentence — the copy answers for
+    // the claim it never reached (R2-F1).
+    crate::sandbox::test_support::use_unreachable_test_manager();
+    let conversation = conversation(&pool).await;
+    own_volume(&pool, conversation, "mine", "/data/mine").await;
+    sqlx::query("DELETE FROM smelt_instance")
+        .execute(&pool)
+        .await
+        .expect("drop the instance row");
+
+    let result = call(&pool, conversation, "delete_volume", serde_json::json!({"name": "mine"}))
+        .await
+        .expect("the sentence survives an unreadable instance row");
+    assert!(result.contains("volume \"mine\" deleted"), "{result}");
+    assert!(result.contains("its claim could not be deleted"), "{result}");
     assert_eq!(row_counts(&pool).await, (0, 0), "the row and its mount row are gone");
 }
 
@@ -253,12 +278,13 @@ fn test_the_volume_results_say_when_a_mount_takes_effect() {
     assert!(create_sentence(true).contains("terminate_pod then create_pod"), "{}", create_sentence(true));
     assert!(delete_sentence(true, true).contains("until its next start"), "{}", delete_sentence(true, true));
     assert_eq!(delete_sentence(false, true), "its row, every mount row and its claim are gone. Nothing mounts it now.");
-    // With the claim unreachable, the copy says what will take it — the
-    // startup sweep — and never that it's gone; and the mount half keeps
-    // its own answer for both pod states.
+    // With the claim unreachable, the copy says it couldn't be deleted and
+    // dates the sweep to the conversation's own delete (R2-F1), never that
+    // it's gone; and the mount half keeps its own answer for both pod states.
     for live in [true, false] {
         let text = delete_sentence(live, false);
-        assert!(text.contains("its claim is left for the startup sweep"), "{text}");
+        assert!(text.contains("its claim could not be deleted"), "{text}");
+        assert!(text.contains("once this conversation is deleted"), "{text}");
         assert!(!text.contains("claim are gone"), "an unreachable claim isn't gone: {text}");
     }
     assert!(delete_sentence(false, false).contains("Nothing mounts it now."), "{}", delete_sentence(false, false));

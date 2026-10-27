@@ -669,11 +669,17 @@ pub(super) fn orphaned_agent_volume_claims(
     orphans
 }
 
-/// Deletes the volume claims of conversations this database no longer has.
-/// `delete_subtree` and `delete_volume` both delete claims after their rows
-/// commit, so this catches what a crash between the two left, and what a
-/// cluster rebuild left of a live volume is re-made at its next pod start. Run
-/// once at startup by `main` (SME-239).
+/// Deletes the volume claims of conversations this database no longer has:
+/// what a crashed `delete_subtree` left between its rows and its claims,
+/// and any claim left of a conversation deleted since. The filter is the
+/// owner conversation's absence — pinned by `orphaned_agent_volume_claims`'
+/// unit test and by the cluster test that keeps a live creator's claim — so
+/// a claim `delete_volume` left is not its catch: that conversation is
+/// live, and the claim comes down with the conversation's own delete (the
+/// sweep only takes it from there, and only if that delete crashed too). A
+/// live volume whose claim a cluster rebuild stripped is re-made at its
+/// next pod start (`ensure_agent_volume_claims`). Run once at startup by
+/// `main` (SME-239).
 pub async fn sweep_orphaned_agent_volume_claims(pool: &PgPool) {
     match get() {
         Ok(manager) => sweep_orphaned_agent_volume_claims_with(&manager.client, pool).await,

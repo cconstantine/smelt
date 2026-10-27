@@ -65,14 +65,15 @@ pub(crate) fn create_sentence(live_pod: bool) -> &'static str {
 
 /// The same for a delete: the rows are gone now, the mount isn't.
 /// `claim_gone` is whether the claim actually came down: with the cluster
-/// unreachable it waits, and the sentence then names what will take it —
-/// the startup sweep — rather than promising the model it's gone (A-F1).
+/// unreachable it waits, and the sentence says so and dates the sweep to
+/// this conversation's own delete — the sweep only takes claims whose owner
+/// is gone, so promising it any earlier would be false (A-F1, R2-F1).
 /// `pub(crate)` for the same reason as [`create_sentence`].
 pub(crate) fn delete_sentence(live_pod: bool, claim_gone: bool) -> String {
     let claim = if claim_gone {
         "its row, every mount row and its claim are gone."
     } else {
-        "its row and every mount row are gone; its claim is left for the startup sweep."
+        "its row and every mount row are gone; its claim could not be deleted — the startup sweep takes it once this conversation is deleted."
     };
     let mounts = if live_pod {
         "A pod that's already running keeps what it mounted until its next start."
@@ -174,32 +175,43 @@ pub(crate) async fn delete_volume(pool: &PgPool, conversation_id: i64, input: &V
             if holders.len() == 1 { "it" } else { "them" }
         )),
         db::DeleteAgentVolume::Deleted(volume) => {
-            // The claim goes after the commit, best-effort: a crash leaves it
-            // for the startup sweep, and Kubernetes' `pvc-protection` holds a
-            // claim until the last pod mounting it is gone, which smelt
-            // doesn't do. Either way the row — the record — is gone; what the
-            // claim's answer was decides the sentence, so a model whose
-            // cluster is unreachable isn't told its claim came down (A-F1).
+            // The claim goes after the commit, best-effort: a crash leaves
+            // it until the conversation itself is deleted — the startup
+            // sweep only takes claims whose owner conversation is gone —
+            // and Kubernetes' `pvc-protection` holds a claim until the last
+            // pod mounting it is gone, which smelt doesn't do. Either way
+            // the row — the record — is gone; what answering for the claim
+            // cost decides the sentence, so a model whose cluster is
+            // unreachable isn't told its claim came down, and a model whose
+            // instance row can't be read isn't handed a raw DB error after
+            // its delete already committed (A-F1, R2-F1).
             let claim_gone = match sandbox::get() {
-                Ok(manager) => {
-                    let instance = db::smelt_instance(pool).await.map_err(|e| e.to_string())?;
-                    match sandbox::delete_agent_volume_claim(manager, volume.id, &instance).await {
+                Ok(manager) => match db::smelt_instance(pool).await {
+                    Ok(instance) => match sandbox::delete_agent_volume_claim(manager, volume.id, &instance).await {
                         Ok(()) => true,
                         Err(e) => {
                             tracing::warn!(
                                 volume = volume.id,
                                 error = %e,
-                                "the volume's rows are gone; its claim is left for the startup sweep"
+                                "the volume's rows are gone; its claim is left until the conversation is deleted"
                             );
                             false
                         }
                     }
-                }
+                    Err(e) => {
+                        tracing::warn!(
+                            volume = volume.id,
+                            error = %e,
+                            "the volume's rows are gone; couldn't read this instance to delete its claim"
+                        );
+                        false
+                    }
+                },
                 Err(e) => {
                     tracing::warn!(
                         volume = volume.id,
                         error = %e,
-                        "the volume's rows are gone; its claim waits for the startup sweep"
+                        "the volume's rows are gone; its claim waits to be deleted with the conversation"
                     );
                     false
                 }
