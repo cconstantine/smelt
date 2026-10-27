@@ -207,7 +207,7 @@ pub(in crate::sandbox) fn normalize_mount_path(path: &str) -> String {
 /// dockerd fail: the same SME-33 finding that keeps `DOCKER_SOCK_DIR` down to
 /// the socket alone, widened to the directories a model could pick (B-F4).
 /// The rest are the system directories the design refuses (SME-239).
-const RESERVED_MODEL_MOUNT_DIRS: &[&str] = &[
+pub(crate) const RESERVED_MODEL_MOUNT_DIRS: &[&str] = &[
     WORKSPACE_DIR,
     "/etc/smelt",
     DOCKER_SOCK_DIR,

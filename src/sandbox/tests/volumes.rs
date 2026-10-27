@@ -320,3 +320,29 @@ fn test_reserved_git_dir_literal_is_pods_git_dir() {
         "POD_GIT_DIR moved; the reserved list has to move with it"
     );
 }
+
+/// The `create_volume` description is what tells the model which paths are
+/// refused, so it has to name every reserved directory: a description that
+/// stops naming one offers what the check then refuses (R2-F2). Same idea as
+/// the `/etc/smelt` equality pin above — copy and list drift apart silently
+/// otherwise. A name counts only as a path of its own, not as the start of a
+/// longer one: `/run/docker` isn't named just because `/run/docker-sock` is.
+#[test]
+fn test_the_create_volume_description_names_every_reserved_dir() {
+    let description = crate::anthropic::tools::native_tool_definitions()
+        .into_iter()
+        .find(|tool| tool.name == "create_volume")
+        .expect("create_volume is a native tool")
+        .description;
+    let names = |dir: &str| {
+        description
+            .match_indices(dir)
+            .any(|(at, _)| match description[at + dir.len()..].chars().next() {
+                Some(c) if c.is_alphanumeric() || c == '-' || c == '_' || c == '/' => false,
+                _ => true,
+            })
+    };
+    for dir in RESERVED_MODEL_MOUNT_DIRS {
+        assert!(names(dir), "the create_volume description never names {dir} as a reserved path: {description}");
+    }
+}

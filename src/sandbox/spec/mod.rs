@@ -33,6 +33,10 @@ pub(crate) use images::default_sandbox_image;
 #[cfg(test)]
 pub(crate) use images::OWN_SANDBOX_IMAGE;
 pub(crate) use mounts::model_volume_mount_path;
+// Test-only so the reserved-dir pin can iterate the list; a production
+// build never names it and would warn.
+#[cfg(test)]
+pub(crate) use mounts::RESERVED_MODEL_MOUNT_DIRS;
 pub(crate) use ownership::INSTANCE_LABEL;
 #[cfg(test)]
 pub(crate) use ownership::{test_instance, TEST_INSTANCE};
