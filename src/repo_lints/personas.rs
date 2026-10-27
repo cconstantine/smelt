@@ -1,7 +1,9 @@
 //! The repo's own persona files (SME-247): every `.agents/personas/<name>.md`
 //! parses through the same parser the server runs, the smelt-tool patterns in
-//! its `smelt.tools` name tools the server registers, and the persona table
-//! in `docs/personas/README.md` names exactly the files that exist. The
+//! its `smelt.tools` name tools the server registers, the persona table
+//! in `docs/personas/README.md` names exactly the files that exist, and
+//! `.claude/agents` — the symlink that makes the same files Claude Code
+//! subagents — is tracked. The
 //! process runs from those files, so a file that drifts from the format is a
 //! seat that fails to start, and a pattern renamed out of the registry is a
 //! rule that silently rules nothing.
@@ -239,6 +241,22 @@ mod tests {
             ]
         );
         assert_eq!(parity(&table, &[".agents/personas/developer.md".to_string(), ".agents/personas/facilitator.md".to_string()]), Vec::<String>::new());
+    }
+
+    /// The same files are Claude Code subagents through `.claude/agents`,
+    /// a tracked symlink. A `.gitignore` sweep re-ignoring it — git cannot
+    /// re-include a file under an ignored directory — would otherwise just
+    /// silently drop it from fresh clones (SME-247).
+    #[test]
+    fn test_claude_agents_is_a_tracked_symlink_to_the_persona_dir() {
+        let tracked = super::super::tracked_files();
+        assert!(
+            tracked.iter().any(|path| path == ".claude/agents"),
+            ".claude/agents is not tracked: keep `.gitignore`'s `!/.claude/agents`."
+        );
+        let target = std::fs::read_link(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".claude/agents"))
+            .expect(".claude/agents is not a symlink");
+        assert_eq!(target, std::path::Path::new("../.agents/personas"));
     }
 
     /// Every persona file the repo tracks parses the way the server parses
