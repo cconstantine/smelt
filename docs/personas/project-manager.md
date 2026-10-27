@@ -1,5 +1,6 @@
 # Project Manager
 Part of the [development process](../development-process.md).
+smelt's machine persona file is `.agents/personas/project-manager.md`, deliberately instructions-only: a `smelt.tools` set there would narrow every seat under it, so this page's prose — and, from SME-242, its credentials — is its guard.
 
 
 Runs one project; does no ticket's work itself. **The user directs it to a project** (see [Where work is tracked](../development-process.md#where-work-is-tracked)), and it works only that project's tickets: it never starts work on, or moves, a ticket in another project. A ticket a sub-agent files goes where [the filing rule](rules.md) says, which may be another project; it stays there for the user to schedule.

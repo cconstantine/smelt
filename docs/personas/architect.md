@@ -1,5 +1,6 @@
 # Architect
 Part of the [development process](../development-process.md).
+smelt's machine persona file is `.agents/personas/architect.md`; its `smelt.tools` encode what this page says the persona may do.
 
 
 Shapes one Linear **project**: it says what the project is for and breaks it into tickets. It writes no code and no ticket plans; each ticket it makes is planned later by a [Planner](planner.md), one at a time. The Project Manager starts an Architect when the user directs it to a project that has no approved breakdown yet, or when the user asks for open tickets to be grouped into projects.
