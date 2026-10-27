@@ -61,6 +61,30 @@ async fn test_deleting_the_creating_conversation_takes_the_volume_and_every_moun
     assert_eq!(mount_rows(&pool, volume).await, Vec::<i64>::new(), "and so did every conversation mounting it");
 }
 
+/// The migration's name `CHECK` (SME-239), at the insert: the tool refuses a bad
+/// name with a sentence, but this constraint is the backstop that refuses one no
+/// matter who writes it — the three shapes the tool's check refuses, a name that
+/// isn't one, the empty name, and one 65 long.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_migrations_name_check_refuses_invalid_names_at_the_insert(pool: PgPool) {
+    let owner = test_conversation(&pool).await;
+    for name in ["bad name!", "", &"x".repeat(65)] {
+        let inserted = sqlx::query(
+            "INSERT INTO agent_volumes (owner_conversation_id, name, mount_path) VALUES ($1, $2, '/data/cache')",
+        )
+        .bind(owner.id)
+        .bind(name)
+        .execute(&pool)
+        .await;
+        assert!(inserted.is_err(), "{name:?} slipped past the migration's name CHECK");
+    }
+    assert_eq!(volume_rows(&pool).await, 0, "a refused insert writes no row");
+    // The refusal is the shape, not a CHECK that rejects everything: a valid
+    // name of the same parts still goes in.
+    insert_volume(&pool, owner.id, "a-valid_name1", "/data/cache").await;
+    assert_eq!(volume_rows(&pool).await, 1, "and lands");
+}
+
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_deleting_a_conversation_holding_a_passed_volume_keeps_the_volume(pool: PgPool) {
     let owner = test_conversation(&pool).await;
