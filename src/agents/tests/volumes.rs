@@ -169,6 +169,10 @@ async fn test_delete_volume_takes_its_rows_even_when_no_claim_can_be_reached(poo
         .await
         .expect("the rows go whatever the claim does");
     assert!(result.contains("volume \"mine\" deleted"), "{result}");
+    // The copy answers for the claim too: it was never reached, so it isn't
+    // gone — the startup sweep is what will delete it (A-F1).
+    assert!(result.contains("its claim is left for the startup sweep"), "{result}");
+    assert!(!result.contains("and its claim are gone"), "the claim didn't go: {result}");
     assert!(result.contains("Nothing mounts it now."), "{result}");
     assert_eq!(row_counts(&pool).await, (0, 0), "the row and its mount row are gone");
 }
@@ -239,12 +243,24 @@ async fn test_start_agent_mounts_a_held_volume_on_the_child_and_names_it(pool: P
 }
 
 /// The sentence each tool ends with: the design's "the tool's result says so"
-/// for a volume that can only mount at the next pod start.
+/// for a volume that can only mount at the next pod start, and — for a delete
+/// whose claim never could be deleted — one that answers for the claim too
+/// instead of promising it went (A-F1).
 #[test]
 fn test_the_volume_results_say_when_a_mount_takes_effect() {
     assert_eq!(create_sentence(false), "It mounts there when your pod next starts.");
     assert!(create_sentence(true).contains("can't add a volume to a live pod"), "{}", create_sentence(true));
     assert!(create_sentence(true).contains("terminate_pod then create_pod"), "{}", create_sentence(true));
-    assert!(delete_sentence(true).contains("until its next start"), "{}", delete_sentence(true));
-    assert_eq!(delete_sentence(false), "Nothing mounts it now.");
+    assert!(delete_sentence(true, true).contains("until its next start"), "{}", delete_sentence(true, true));
+    assert_eq!(delete_sentence(false, true), "its row, every mount row and its claim are gone. Nothing mounts it now.");
+    // With the claim unreachable, the copy says what will take it — the
+    // startup sweep — and never that it's gone; and the mount half keeps
+    // its own answer for both pod states.
+    for live in [true, false] {
+        let text = delete_sentence(live, false);
+        assert!(text.contains("its claim is left for the startup sweep"), "{text}");
+        assert!(!text.contains("claim are gone"), "an unreachable claim isn't gone: {text}");
+    }
+    assert!(delete_sentence(false, false).contains("Nothing mounts it now."), "{}", delete_sentence(false, false));
+    assert!(delete_sentence(true, false).contains("until its next start"), "{}", delete_sentence(true, false));
 }

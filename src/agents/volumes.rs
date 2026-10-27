@@ -64,13 +64,22 @@ pub(crate) fn create_sentence(live_pod: bool) -> &'static str {
 }
 
 /// The same for a delete: the rows are gone now, the mount isn't.
+/// `claim_gone` is whether the claim actually came down: with the cluster
+/// unreachable it waits, and the sentence then names what will take it —
+/// the startup sweep — rather than promising the model it's gone (A-F1).
 /// `pub(crate)` for the same reason as [`create_sentence`].
-pub(crate) fn delete_sentence(live_pod: bool) -> &'static str {
-    if live_pod {
+pub(crate) fn delete_sentence(live_pod: bool, claim_gone: bool) -> String {
+    let claim = if claim_gone {
+        "its row, every mount row and its claim are gone."
+    } else {
+        "its row and every mount row are gone; its claim is left for the startup sweep."
+    };
+    let mounts = if live_pod {
         "A pod that's already running keeps what it mounted until its next start."
     } else {
         "Nothing mounts it now."
-    }
+    };
+    format!("{claim} {mounts}")
 }
 
 /// `create_volume(name, mount_path)`: a volume this conversation owns, to
@@ -168,27 +177,36 @@ pub(crate) async fn delete_volume(pool: &PgPool, conversation_id: i64, input: &V
             // The claim goes after the commit, best-effort: a crash leaves it
             // for the startup sweep, and Kubernetes' `pvc-protection` holds a
             // claim until the last pod mounting it is gone, which smelt
-            // doesn't do. Either way the row — the record — is gone.
-            match sandbox::get() {
+            // doesn't do. Either way the row — the record — is gone; what the
+            // claim's answer was decides the sentence, so a model whose
+            // cluster is unreachable isn't told its claim came down (A-F1).
+            let claim_gone = match sandbox::get() {
                 Ok(manager) => {
                     let instance = db::smelt_instance(pool).await.map_err(|e| e.to_string())?;
-                    if let Err(e) = sandbox::delete_agent_volume_claim(manager, volume.id, &instance).await {
-                        tracing::warn!(
-                            volume = volume.id,
-                            error = %e,
-                            "the volume's rows are gone; its claim is left for the startup sweep"
-                        );
+                    match sandbox::delete_agent_volume_claim(manager, volume.id, &instance).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!(
+                                volume = volume.id,
+                                error = %e,
+                                "the volume's rows are gone; its claim is left for the startup sweep"
+                            );
+                            false
+                        }
                     }
                 }
-                Err(e) => tracing::warn!(
-                    volume = volume.id,
-                    error = %e,
-                    "the volume's rows are gone; its claim waits for the startup sweep"
-                ),
-            }
+                Err(e) => {
+                    tracing::warn!(
+                        volume = volume.id,
+                        error = %e,
+                        "the volume's rows are gone; its claim waits for the startup sweep"
+                    );
+                    false
+                }
+            };
             Ok(format!(
-                "volume {name:?} deleted: its row, every mount row and its claim are gone. {}",
-                delete_sentence(holds_a_live_pod(pool, conversation_id).await)
+                "volume {name:?} deleted: {}",
+                delete_sentence(holds_a_live_pod(pool, conversation_id).await, claim_gone)
             ))
         }
     }
