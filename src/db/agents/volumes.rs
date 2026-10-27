@@ -168,6 +168,19 @@ pub async fn agent_volumes_held_for(
     .await
 }
 
+/// The volumes whose *creating* conversation is in `subtree` (SME-239): the
+/// ones a subtree delete takes with it. A conversation that merely mounts one
+/// of these volumes isn't in this list — its mount row cascades away and the
+/// volume, its rows and its claim stay for whoever created it. That's the
+/// difference `delete_subtree`'s claim delete depends on: it deletes these
+/// claims and no others.
+pub async fn agent_volume_ids_of(pool: &PgPool, subtree: &[i64]) -> Result<Vec<i64>, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>("SELECT id FROM agent_volumes WHERE owner_conversation_id = ANY($1) ORDER BY id")
+        .bind(subtree)
+        .fetch_all(pool)
+        .await
+}
+
 /// What `delete_volume`'s transaction decided.
 #[derive(Debug, PartialEq)]
 pub enum DeleteAgentVolume {
