@@ -144,7 +144,7 @@ async fn test_open_pod_port_reaches_the_conversations_own_pod(pool: PgPool) {
     let instance = db::smelt_instance(&pool).await.expect("instance");
     let docker = DockerSidecar { memory: "512Mi".to_string(), storage: PodStorage::Ephemeral };
     let sandbox = manager
-        .create_with_docker(&row.id.to_string(), "128Mi", &docker, &[], &instance)
+        .create_with_docker(&row.id.to_string(), "128Mi", &docker, &[], &[], &instance)
         .await
         .expect("create the pod");
     let open = |conversation_id: i64, port: u16| {
@@ -288,7 +288,7 @@ async fn test_kube_exec_and_the_agent_dial_refuse_another_databases_pod() {
     let pod_id = unused_conversation_id();
     let name = pod_name(pod_id);
     let docker = DockerSidecar { memory: "512Mi".to_string(), storage: PodStorage::Ephemeral };
-    let mut pod = build_pod_spec(&name, "256Mi", &docker, &[], "another-smelt-database");
+    let mut pod = build_pod_spec(&name, "256Mi", &docker, &[], &[], "another-smelt-database");
     pod.spec.as_mut().expect("a pod spec").active_deadline_seconds = Some(600);
     pods.create(&PostParams::default(), &pod).await.expect("create the pod");
 

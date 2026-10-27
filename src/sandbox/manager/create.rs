@@ -247,6 +247,11 @@ pub(in crate::sandbox) async fn create_pod_attempt_unspanned(
     let volumes = db::list_sandbox_volumes(pool)
         .await
         .map_err(SandboxError::Db)?;
+    // What this conversation mounts on top of its own `/workspace`: its own
+    // and passed-down model volumes (SME-239).
+    let agent_volumes = db::list_conversation_volume_mounts(pool, conversation_id)
+        .await
+        .map_err(SandboxError::Db)?;
     // Reuses SandboxManager::create's existing get-or-create-on-Running
     // logic rather than duplicating it — the returned Sandbox is only a
     // handle for exec/Drop-cleanup purposes, neither of which apply here
@@ -265,8 +270,16 @@ pub(in crate::sandbox) async fn create_pod_attempt_unspanned(
         let _ = db::terminate_sandbox_pod(pool, row.id).await;
         return Err(e);
     }
+    // A model volume's claim can be missing the same way a global one's is
+    // (cluster rebuilt, crash between the row and the claim); one its
+    // conversation doesn't own refuses the start rather than mounting
+    // somebody else's data (SME-239, SME-115).
+    if let Err(e) = ensure_agent_volume_claims(&manager.client, &agent_volumes, &instance).await {
+        let _ = db::terminate_sandbox_pod(pool, row.id).await;
+        return Err(e);
+    }
     match manager
-        .create_with_docker(&row.id.to_string(), &memory, &docker, &volumes, &instance)
+        .create_with_docker(&row.id.to_string(), &memory, &docker, &volumes, &agent_volumes, &instance)
         .await
     {
         Ok(sandbox) => {

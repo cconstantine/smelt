@@ -15,6 +15,11 @@ pub struct NewChild<'a> {
     /// The deepest the caller may be and still start one (SME-241):
     /// `SMELT_AGENT_DEPTH`, passed in so tests set it directly.
     pub max_depth: i32,
+    /// The names of the volumes the caller holds and passes to this child
+    /// (SME-239). Each becomes a mount row for the child in this transaction;
+    /// a name the caller doesn't hold refuses the whole call, because a child
+    /// must never mount more than its parent does.
+    pub volumes: &'a [&'a str],
 }
 
 /// The child's copy of one of its parent's checkouts.
@@ -122,6 +127,25 @@ pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChi
             }
         }
     }
+    // The volumes to pass, if any (SME-239): read over the caller's own mount
+    // rows, each volume row held `FOR SHARE` — the pair that excludes a
+    // concurrent `delete_volume`, see `agent_volumes_held_for`. The first
+    // asked name with nothing behind it refuses the whole call: a child
+    // mounts no more than its parent does.
+    let mut passed: Vec<AgentVolume> = Vec::new();
+    if refused.is_none() && !new.volumes.is_empty() {
+        let held = agent_volumes_held_for(&mut *tx, new.caller, new.volumes).await?;
+        match new.volumes.iter().find(|name| !held.iter().any(|v| v.name == **name)) {
+            Some(missing) => refused = Some((
+                format!(
+                    "you don't hold a volume named {missing:?}: create_volume makes one, and you can pass \
+                     only volumes you hold"
+                ),
+                false,
+            )),
+            None => passed = held,
+        }
+    }
     if let Some((why, asked)) = refused {
         if asked {
             // The card commits with the refusal (nothing else in this
@@ -162,6 +186,16 @@ pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChi
     .await?;
     let brief = [ContentBlock::Text { text: new.brief.to_string() }];
     super::conversations::create_message_on(&mut tx, child, "user", &brief).await?;
+    // Every passed volume gets the child a mount row exactly like its
+    // creator's (SME-239): its pod mounts it at the volume's own path at its
+    // first start, and it can pass it on to its own agents.
+    for volume in &passed {
+        sqlx::query("INSERT INTO conversation_volume_mounts (conversation_id, volume_id) VALUES ($1, $2)")
+            .bind(child)
+            .bind(volume.id)
+            .execute(&mut *tx)
+            .await?;
+    }
     let repo = match &new.repo {
         None => None,
         Some(repo) => Some(

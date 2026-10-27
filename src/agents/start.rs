@@ -52,6 +52,27 @@ fn optional_str<'a>(input: &'a serde_json::Value, field: &str) -> Result<Option<
     }
 }
 
+/// `start_agent`'s optional `volumes`: the names of the volumes the caller
+/// holds, to mount in the child's pod too (SME-239). Kept in the order asked
+/// and deduplicated, so a name written twice is one mount row; whether the
+/// caller holds each name is `create_child`'s check, inside its transaction.
+fn optional_volumes(input: &serde_json::Value) -> Result<Vec<&str>, String> {
+    match input.get("volumes") {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(values)) => {
+            let mut names = Vec::new();
+            for value in values {
+                let name = value.as_str().ok_or("volumes must be an array of volume names")?;
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            Ok(names)
+        }
+        Some(_) => Err("volumes must be an array of volume names".to_string()),
+    }
+}
+
 /// `start_agent`'s run: checks the input, records the child (`starting`)
 /// with its brief as its first message, spawns its start, and returns the
 /// child's id at once.
@@ -70,6 +91,7 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
         return Err("ref needs repo: the checkout whose remote it's on".to_string());
     }
     let persona = optional_str(input, "persona")?;
+    let volumes = optional_volumes(input)?;
     if let Some(name) = persona {
         if repo_path.is_none() {
             return Err("persona needs repo: the checkout whose .agents/personas/ it's in".to_string());
@@ -115,6 +137,7 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
         persona_name: persona,
         model,
         max_depth: agent_depth(),
+        volumes: &volumes,
         repo: repo.as_ref().map(|(parent_repo, _)| db::NewChildRepo {
             url: &parent_repo.url,
             remote_key: &parent_repo.remote_key,
@@ -145,6 +168,14 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
         (Some((parent_repo, _)), Some(name)) => format!("{}:{name}", parent_repo.dir),
         _ => "no persona".to_string(),
     };
+    // What the start mounted for the child, named back to the caller: those
+    // volumes mount in the child's pod at their own paths, and the child can
+    // pass them on (SME-239).
+    let vols = if volumes.is_empty() {
+        String::new()
+    } else {
+        format!(", with volumes {}", volumes.iter().map(|name| format!("{name:?}")).collect::<Vec<_>>().join(", "))
+    };
     let request = StartRequest {
         repo: child_repo.zip(repo.map(|(_, target)| target)),
         persona: persona.map(str::to_string),
@@ -155,7 +186,7 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
         run_start(&start_pool, child, caller, request).await;
     }));
     Ok(format!(
-        "Started {} ({named}){on}. It works on its brief in its own conversation; its report \
+        "Started {} ({named}){on}{vols}. It works on its brief in its own conversation; its report \
          arrives here as a message when it calls finish, message_agent writes to it, and \
          list_agents shows its status.",
         label(child, None)

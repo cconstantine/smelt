@@ -12,11 +12,13 @@ mod delete;
 mod messages;
 mod start;
 mod tree;
+mod volumes;
 
 pub use delete::*;
 pub use messages::*;
 pub use start::*;
 pub use tree::*;
+pub use volumes::*;
 
 /// `agents.state`: the start is running; no turn is admitted.
 pub const AGENT_STARTING: &str = "starting";

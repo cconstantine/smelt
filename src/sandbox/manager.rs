@@ -35,7 +35,7 @@ impl SandboxManager {
             memory: "512Mi".to_string(),
             storage: PodStorage::Ephemeral,
         };
-        self.create_with_docker(session_id, memory, &docker, volumes, &test_instance()).await
+        self.create_with_docker(session_id, memory, &docker, volumes, &[], &test_instance()).await
     }
 
     /// `memory` is an already-resolved value (the caller's own
@@ -46,14 +46,17 @@ impl SandboxManager {
     /// `volumes` is every currently-configured `sandbox_volumes` row —
     /// every pod gets every one of them mounted, unconditionally (see
     /// SME-17's Phase 4); an empty slice is fine for callers (mostly
-    /// tests) that don't care. `instance` is the database's (SME-115):
-    /// the pod is labelled with it.
+    /// tests) that don't care. `agent_volumes` is every volume this
+    /// conversation mounts, its own and passed (SME-239) — read at this
+    /// moment, since Kubernetes mounts only at the pod's start. `instance` is
+    /// the database's (SME-115): the pod is labelled with it.
     pub async fn create_with_docker(
         &self,
         session_id: &str,
         memory: &str,
         docker: &DockerSidecar,
         volumes: &[db::SandboxVolume],
+        agent_volumes: &[db::AgentVolume],
         instance: &db::SmeltInstance,
     ) -> Result<Sandbox, SandboxError> {
         self.create_with_running_timeout(
@@ -61,6 +64,7 @@ impl SandboxManager {
             memory,
             docker,
             volumes,
+            agent_volumes,
             running_wait_timeout(),
             instance,
         )
@@ -80,6 +84,7 @@ impl SandboxManager {
         memory: &str,
         docker: &DockerSidecar,
         volumes: &[db::SandboxVolume],
+        agent_volumes: &[db::AgentVolume],
         running_timeout: Duration,
         instance: &db::SmeltInstance,
     ) -> Result<Sandbox, SandboxError> {
@@ -118,7 +123,7 @@ impl SandboxManager {
                 let made = pods
                     .create(
                         &PostParams::default(),
-                        &build_pod_spec(&name, memory, docker, volumes, &instance.id),
+                        &build_pod_spec(&name, memory, docker, volumes, agent_volumes, &instance.id),
                     )
                     .await?;
                 (true, made.metadata.uid)

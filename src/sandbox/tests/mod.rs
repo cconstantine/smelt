@@ -160,7 +160,7 @@ mod cluster {
         let name = format!("sandbox-{}", unique_session_id("stuck-at-mount"));
         let missing = format!("sme-132-missing-{}", uuid_like());
         let docker = DockerSidecar { memory: "1Gi".to_string(), storage: PodStorage::Ephemeral };
-        let mut pod = build_pod_spec(&name, "1Gi", &docker, &[], TEST_INSTANCE);
+        let mut pod = build_pod_spec(&name, "1Gi", &docker, &[], &[], TEST_INSTANCE);
         let spec = pod.spec.as_mut().expect("a pod spec");
         spec.active_deadline_seconds = Some(60);
         spec.volumes.get_or_insert_with(Vec::new).push(Volume {

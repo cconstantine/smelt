@@ -215,10 +215,15 @@ pub(super) const BASE_SYSTEM_PROMPT: &str = include_str!("system_prompt.md");
 #[cfg(feature = "server")]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PromptEnvironment {
+    /// Who this prompt is for: an `Agent` volume's owner reads against it,
+    /// which is how the line knows to say "you created it".
+    pub conversation_id: i64,
     pub date: chrono::NaiveDate,
     pub model: String,
-    /// `(name, mount path)`, the path already resolved.
-    pub volumes: Vec<(String, String)>,
+    /// The volumes this conversation's pod mounts, paths already resolved:
+    /// the deployment's globals plus the model-created ones it holds
+    /// (SME-239).
+    pub volumes: Vec<PromptVolume>,
     pub mcp_servers: Vec<String>,
     /// The conversation's repos (SME-32).
     pub repos: Vec<crate::git::RepoSummary>,
@@ -229,6 +234,18 @@ pub(crate) struct PromptEnvironment {
     pub persona_files: std::collections::BTreeMap<i64, Vec<String>>,
     /// Set when the conversation is a child agent (SME-236).
     pub agent: Option<AgentPrompt>,
+}
+
+/// One volume in the environment section (SME-239): a global volume from
+/// the user's volumes page, or a model-created one — whose creating
+/// conversation rides along, because it decides who may delete the volume
+/// and who may only pass it on. Mount paths are already resolved here, as
+/// the rows store them.
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PromptVolume {
+    Global { name: String, path: String },
+    Agent { name: String, path: String, owner: i64 },
 }
 
 /// What a child agent's system prompt says about it (SME-236).
@@ -261,8 +278,19 @@ pub(crate) fn system_prompt(env: &PromptEnvironment) -> String {
     }
     if !env.volumes.is_empty() {
         prompt.push_str("- Volumes (their contents survive the pod ending):\n");
-        for (name, path) in &env.volumes {
-            prompt.push_str(&format!("  - {name} mounted at {path}\n"));
+        for volume in &env.volumes {
+            match volume {
+                PromptVolume::Global { name, path } => {
+                    prompt.push_str(&format!("  - {name} mounted at {path}\n"))
+                }
+                PromptVolume::Agent { name, path, owner } if *owner == env.conversation_id => {
+                    prompt.push_str(&format!("  - {name} mounted at {path} (you created it)\n"))
+                }
+                PromptVolume::Agent { name, path, owner } => prompt.push_str(&format!(
+                    "  - {name} mounted at {path} \
+                     (owned by conversation #{owner}; pass it to your agents with start_agent)\n"
+                )),
+            }
         }
     }
     if !env.mcp_servers.is_empty() {
@@ -365,13 +393,30 @@ pub(crate) async fn prompt_environment(
             tracing::warn!(error = %e, "couldn't read persona files for the system prompt");
             Default::default()
         });
-    let volumes = match db::list_sandbox_volumes(pool).await {
-        Ok(volumes) => volumes.into_iter().map(|v| (v.name, v.mount_path)).collect(),
+    let mut volumes: Vec<PromptVolume> = match db::list_sandbox_volumes(pool).await {
+        Ok(volumes) => volumes
+            .into_iter()
+            .map(|v| PromptVolume::Global { name: v.name, path: v.mount_path })
+            .collect(),
         Err(e) => {
             tracing::warn!(error = %e, "couldn't list sandbox volumes for the system prompt");
             Vec::new()
         }
     };
+    // The model-created volumes this conversation holds (SME-239): its own
+    // and any passed down. The owner rides along because the line has to
+    // say which — and no volume this lists is a secret: its pod already
+    // mounts it.
+    match db::list_conversation_volume_mounts(pool, conversation_id).await {
+        Ok(mounts) => volumes.extend(mounts.into_iter().map(|v| PromptVolume::Agent {
+            name: v.name,
+            path: v.mount_path,
+            owner: v.owner_conversation_id,
+        })),
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't list the conversation's volumes for the system prompt");
+        }
+    }
     let mcp_servers = match db::list_mcp_server_configs(pool).await {
         Ok(configs) => configs.into_iter().map(|c| c.name).collect(),
         Err(e) => {
@@ -387,6 +432,7 @@ pub(crate) async fn prompt_environment(
         }
     };
     PromptEnvironment {
+        conversation_id,
         date: chrono::Utc::now().date_naive(),
         model: model.to_string(),
         volumes,

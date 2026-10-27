@@ -134,7 +134,7 @@ async fn test_agents_waiting_under_finds_every_depth_and_only_the_users_waits(po
 /// SME-241: `create_child`'s new shape — a caller row, and a `NewChild`
 /// with the depth ceiling set directly (never by env in tests).
 fn new_child(caller: i64, max_depth: i32) -> NewChild<'static> {
-    NewChild { caller, brief: "b", persona_name: None, model: None, repo: None, max_depth }
+    NewChild { caller, brief: "b", persona_name: None, model: None, repo: None, max_depth, volumes: &[] }
 }
 
 /// A conversation under `parent` with an `active` agent row at `depth`,

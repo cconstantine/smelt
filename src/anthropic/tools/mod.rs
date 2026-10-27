@@ -133,6 +133,8 @@ mod questions;
 mod todos;
 #[cfg(feature = "server")]
 mod web;
+#[cfg(feature = "server")]
+mod volumes;
 
 /// Every native tool, in the order the model is offered them. The order is
 /// part of what the model sees, so it stays fixed: changing it changes the
@@ -149,6 +151,7 @@ static REGISTRY: std::sync::LazyLock<Vec<Registered>> = std::sync::LazyLock::new
         browser::tools(),
         lsp::tools(),
         questions::tools(),
+        volumes::tools(),
     ]
         .into_iter()
         .flatten()

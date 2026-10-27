@@ -153,3 +153,106 @@ pub(in crate::sandbox) async fn delete_volume_claim(
         }
     }
 }
+
+/// Creates any claim this conversation's pod mounts that's missing, the same
+/// shape as `ensure_volume_claims` for a global volume: a pod whose claim
+/// doesn't exist can only wait out the start-up timeout, and a claim goes
+/// missing when the cluster is rebuilt, or when the row was committed and the
+/// claim create wasn't (SME-239's `create_volume` has that gap by design —
+/// the row is the record, the claim is re-made here).
+pub(in crate::sandbox) async fn ensure_agent_volume_claims(
+    client: &kube::Client,
+    volumes: &[db::AgentVolume],
+    instance: &db::SmeltInstance,
+) -> Result<(), SandboxError> {
+    let pvcs = pvc_api(client);
+    for volume in volumes {
+        // Boxed, like the other claim ensures (SME-115 review 1).
+        Box::pin(ensure_agent_volume_claim(&pvcs, volume, instance)).await?;
+    }
+    Ok(())
+}
+
+/// One of `ensure_agent_volume_claims`' claims: made if missing, and refused
+/// unless it's ours. No adoption branch — an agent-volume claim postdates
+/// SME-115, so an unlabelled one of that name is somebody else's and the start
+/// fails closed, as for a foreign global-volume claim.
+async fn ensure_agent_volume_claim(
+    pvcs: &Api<PersistentVolumeClaim>,
+    volume: &db::AgentVolume,
+    instance: &db::SmeltInstance,
+) -> Result<(), SandboxError> {
+    let claim = agent_volume_pvc_name(volume.id);
+    match pvcs.get_opt(&claim).await? {
+        None => {
+            tracing::warn!(claim = %claim, "volume claim missing; recreating it");
+            pvcs.create(
+                &PostParams::default(),
+                &build_agent_volume_pvc_spec(volume.id, volume.owner_conversation_id, &instance.id),
+            )
+            .await?;
+            Ok(())
+        }
+        Some(existing) => match ownership(&existing.metadata, &instance.id) {
+            Ownership::Ours => Ok(()),
+            other => Err(SandboxError::NotOurs { name: claim, ownership: other }),
+        },
+    }
+}
+
+/// One model volume's claim, made now: `create_volume`'s half of its create,
+/// so a failed claim takes the row back — and the same create-if-missing
+/// `ensure_agent_volume_claims` does at every pod start, which is what
+/// re-makes a claim lost to a crash between the commit and this call.
+pub async fn create_agent_volume_claim(
+    manager: &SandboxManager,
+    volume: &db::AgentVolume,
+    instance: &db::SmeltInstance,
+) -> Result<(), SandboxError> {
+    ensure_agent_volume_claim(&pvc_api(&manager.client), volume, instance).await
+}
+
+/// A model volume's claim, deleted if it's still ours and still the object
+/// that was read: `delete_volume`'s half, after its rows are committed, and
+/// `delete_subtree`'s after the pods are torn down (SME-239). A missing claim
+/// is not an error — it's already gone, or it was never made. A claim of that
+/// name belonging to another database, or unlabelled, is left and logged: the
+/// volume row is ours, the object isn't, and deleting it would take somebody
+/// else's data (SME-115). No adoption branch, as in
+/// `ensure_agent_volume_claim`: these claims postdate SME-115, so an
+/// unlabelled one is not an object we ever made.
+pub async fn delete_agent_volume_claim(
+    manager: &SandboxManager,
+    volume_id: i64,
+    instance: &db::SmeltInstance,
+) -> Result<(), SandboxError> {
+    let pvcs = pvc_api(&manager.client);
+    let name = agent_volume_pvc_name(volume_id);
+    let Some(claim) = pvcs.get_opt(&name).await? else {
+        return Ok(());
+    };
+    let instance = instance.id.as_str();
+    match (ownership(&claim.metadata, instance), claim.metadata.uid) {
+        (Ownership::Ours, Some(uid)) => {
+            let params = DeleteParams {
+                preconditions: Some(kube::api::Preconditions { uid: Some(uid), resource_version: None }),
+                ..Default::default()
+            };
+            match pvcs.delete(&name, &params).await {
+                Ok(_) => {
+                    // The record of what this server deleted (SME-117).
+                    let uid = params.preconditions.as_ref().and_then(|p| p.uid.as_deref()).unwrap_or_default();
+                    tracing::info!(claim = %name, %uid, "deleted agent volume claim");
+                    Ok(())
+                }
+                // Gone, or replaced since it was read: not ours to delete.
+                Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        }
+        (other, _) => {
+            tracing::warn!(claim = %name, ownership = ?other, "left a volume claim that isn't this database's");
+            Ok(())
+        }
+    }
+}

@@ -16,7 +16,7 @@ async fn test_wait_for_conversation_pods_gone_waits_out_a_stopping_pod() {
     };
     ensure_conversation_pvcs(&client, conversation_id, &test_instance()).await.expect("ensure docker claim");
     let sandbox = manager
-        .create_with_docker(&unique_session_id("stopping"), "128Mi", &docker, &[], &test_instance())
+        .create_with_docker(&unique_session_id("stopping"), "128Mi", &docker, &[], &[], &test_instance())
         .await
         .expect("create pod");
     let name = sandbox.pod_name.clone();

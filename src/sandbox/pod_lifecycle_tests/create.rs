@@ -180,7 +180,7 @@ async fn test_volumes_are_backed_by_claims_and_mounted_into_pods(pool: PgPool) {
         let docker = DockerSidecar { memory: "512Mi".to_string(), storage: PodStorage::Ephemeral };
         let sandbox = get()
             .expect("this test's manager")
-            .create_with_docker(&super::super::tests::unique_session_id(VOLUME_MOUNT_SESSION_LABEL), "128Mi", &docker, &volumes, &instance)
+            .create_with_docker(&super::super::tests::unique_session_id(VOLUME_MOUNT_SESSION_LABEL), "128Mi", &docker, &volumes, &[], &instance)
             .await
             .expect("create a pod with the volume");
         let write = sandbox.exec(&["sh", "-c", "echo hello > /data/testvol/marker.txt"]).await;

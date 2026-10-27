@@ -641,3 +641,92 @@ pub(super) mod log_tests {
         );
     }
 }
+
+/// The model volumes whose creator is gone: labelled with a creating
+/// conversation that isn't in `live`, and ours (SME-239). A conversation that
+/// merely *mounts* the volume never appears in that label, so a passed-to
+/// child's deletion leaves the claim alone — the owner's does not. As with the
+/// Docker claims, an unlabelled or another database's claim is never an orphan.
+pub(super) fn orphaned_agent_volume_claims(
+    claims: &[PersistentVolumeClaim],
+    live: &std::collections::HashSet<i64>,
+    instance: &str,
+) -> Vec<OrphanedClaim> {
+    let mut orphans: Vec<OrphanedClaim> = claims
+        .iter()
+        .filter(|c| ownership(&c.metadata, instance) == Ownership::Ours)
+        .filter(|c| c.metadata.deletion_timestamp.is_none())
+        .filter_map(|c| {
+            Some(OrphanedClaim {
+                conversation_id: c.metadata.labels.as_ref()?.get(AGENT_VOLUME_LABEL)?.parse().ok()?,
+                name: c.metadata.name.clone()?,
+                uid: c.metadata.uid.clone()?,
+            })
+        })
+        .filter(|orphan| !live.contains(&orphan.conversation_id))
+        .collect();
+    orphans.sort_by(|a, b| a.name.cmp(&b.name));
+    orphans
+}
+
+/// Deletes the volume claims of conversations this database no longer has:
+/// what a crashed `delete_subtree` left between its rows and its claims,
+/// and any claim left of a conversation deleted since. The filter is the
+/// owner conversation's absence — pinned by `orphaned_agent_volume_claims`'
+/// unit test and by the cluster test that keeps a live creator's claim — so
+/// a claim `delete_volume` left is not its catch: that conversation is
+/// live, and the claim comes down with the conversation's own delete (the
+/// sweep only takes it from there, and only if that delete crashed too). A
+/// live volume whose claim a cluster rebuild stripped is re-made at its
+/// next pod start (`ensure_agent_volume_claims`). Run once at startup by
+/// `main` (SME-239).
+pub async fn sweep_orphaned_agent_volume_claims(pool: &PgPool) {
+    match get() {
+        Ok(manager) => sweep_orphaned_agent_volume_claims_with(&manager.client, pool).await,
+        Err(e) => tracing::warn!(error = %e, "couldn't sweep orphaned agent volume claims"),
+    }
+}
+
+/// `sweep_orphaned_agent_volume_claims` on `client`. Listed by the owner label
+/// and this database's instance: one server's sweep never touches another's
+/// volumes (SME-115), and — like the Docker sweep — claims are listed *before*
+/// conversations, so none can be missed in between.
+pub(super) async fn sweep_orphaned_agent_volume_claims_with(client: &kube::Client, pool: &PgPool) {
+    let instance = match db::smelt_instance(pool).await {
+        Ok(instance) => instance.id,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't read this database's instance; skipping the volume claim sweep");
+            return;
+        }
+    };
+    let selector = ListParams::default().labels(&format!("{AGENT_VOLUME_LABEL},{INSTANCE_LABEL}={instance}"));
+    let claims = match pvc_api(client).list(&selector).await {
+        Ok(list) => list.items,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't list volume claims to sweep");
+            return;
+        }
+    };
+    let live = match db::list_conversations(pool).await {
+        Ok(conversations) => conversations.into_iter().map(|c| c.id).collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't list conversations to sweep their volume claims");
+            return;
+        }
+    };
+    let listed = claims.len();
+    let mut deleted = 0;
+    for orphan in orphaned_agent_volume_claims(&claims, &live, &instance) {
+        tracing::info!(
+            claim = %orphan.name,
+            conversation_id = orphan.conversation_id,
+            "deleting a deleted conversation's volume claim"
+        );
+        if delete_claim_if_unchanged(client, &orphan.name, &orphan.uid).await {
+            deleted += 1;
+        }
+    }
+    // Always, as the Docker sweep's line is: its absence says the sweep
+    // didn't finish (SME-117).
+    tracing::info!(%instance, listed, deleted, "swept orphaned agent volume claims");
+}

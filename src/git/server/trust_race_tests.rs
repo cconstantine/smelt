@@ -547,6 +547,7 @@ fn new_child<'a>(caller: i64, repo: &'a db::ConversationRepo) -> db::NewChild<'a
         persona_name: None,
         model: None,
         max_depth: crate::agents::DEFAULT_AGENT_DEPTH,
+        volumes: &[],
         repo: Some(db::NewChildRepo {
             url: &repo.url,
             remote_key: &repo.remote_key,
