@@ -140,8 +140,10 @@ pub async fn start_ids_clear_if_fresh(pool: &PgPool) -> Result<Option<i64>, sqlx
 }
 
 /// The tables whose ids name cluster objects: claims and pod labels after
-/// the conversation, `sandbox-{id}` pods, volume claims.
-const CLEAR_ID_TABLES: [&str; 3] = ["conversations", "sandbox_pods", "sandbox_volumes"];
+/// the conversation, `sandbox-{id}` pods, volume claims — global ones and
+/// the model's (SME-239), whose `agent-volume-<id>` claims two parallel
+/// test databases otherwise collide over.
+const CLEAR_ID_TABLES: [&str; 4] = ["conversations", "sandbox_pods", "sandbox_volumes", "agent_volumes"];
 
 /// Far above the low ids a database counts from (the dev database is in
 /// the thousands, every fresh `#[sqlx::test]` one starts at 1, and some
