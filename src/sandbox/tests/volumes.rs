@@ -255,7 +255,9 @@ fn test_model_volume_mount_path_normalizes_and_resolves() {
 /// list, plus the pod's Docker socket — a volume over which would break every
 /// command the pod runs through its sidecar — and the sidecar's own runtime
 /// directories, `/run/docker` and `/run/containerd`, over which a volume
-/// would outlive the sidecar's restart and stop the next dockerd (B-F4).
+/// would outlive the sidecar's restart and stop the next dockerd (B-F4), and
+/// `/lib64` and `/sbin`, which the boundary-aware match keeps out of `/lib`'s
+/// and `/bin`'s shadows though they hold the same kind of binaries (R2-F3).
 #[test]
 fn test_model_volume_mount_path_refuses_reserved_directories() {
     for path in [
@@ -273,6 +275,10 @@ fn test_model_volume_mount_path_refuses_reserved_directories() {
         "/usr/local",
         "/bin",
         "/lib",
+        "/lib64",
+        "/lib64/ld-linux-x86-64.so.2",
+        "/sbin",
+        "/sbin/ip",
         "/proc/1",
         "/sys",
         "/dev/shm",
@@ -294,6 +300,14 @@ fn test_model_volume_mount_path_refuses_reserved_directories() {
         model_volume_mount_path("/run/containerd/runc").unwrap_err(),
         "\"/run/containerd/runc\" is at or under \"/run/containerd\", which a volume can't be mounted over"
     );
+    assert_eq!(
+        model_volume_mount_path("/lib64/ld-linux-x86-64.so.2").unwrap_err(),
+        "\"/lib64/ld-linux-x86-64.so.2\" is at or under \"/lib64\", which a volume can't be mounted over"
+    );
+    assert_eq!(
+        model_volume_mount_path("/sbin/ip").unwrap_err(),
+        "\"/sbin/ip\" is at or under \"/sbin\", which a volume can't be mounted over"
+    );
     // What merely sits next to a reserved directory isn't under it. (`/etc/…`
     // itself always is: `/etc` is on the list.)
     for allowed in [
@@ -302,6 +316,8 @@ fn test_model_volume_mount_path_refuses_reserved_directories() {
         "/run/containerd-x",
         "/var/lib/dockerx",
         "/workspace-x",
+        "/lib64-extra",
+        "/sbin-bin",
         "/data/cache",
     ] {
         assert_eq!(model_volume_mount_path(allowed).expect("not reserved"), allowed);

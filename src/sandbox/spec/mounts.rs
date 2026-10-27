@@ -206,7 +206,12 @@ pub(in crate::sandbox) fn normalize_mount_path(path: &str) -> String {
 /// files that outlive the sidecar's automatic restart and make the next
 /// dockerd fail: the same SME-33 finding that keeps `DOCKER_SOCK_DIR` down to
 /// the socket alone, widened to the directories a model could pick (B-F4).
-/// The rest are the system directories the design refuses (SME-239).
+/// The rest are the system directories the design refuses (SME-239), and
+/// `/lib64` and `/sbin` beside them: the match below is directory-
+/// boundary-aware (`path == dir` or `dir/…`), so `/lib64` is not under
+/// `/lib` any more than `/bin` is — on the Debian sandbox image `/lib64`
+/// holds the dynamic loader and `/sbin` the system admin binaries, and a
+/// volume over either breaks every exec in the pod (R2-F3).
 pub(crate) const RESERVED_MODEL_MOUNT_DIRS: &[&str] = &[
     WORKSPACE_DIR,
     "/etc/smelt",
@@ -217,6 +222,8 @@ pub(crate) const RESERVED_MODEL_MOUNT_DIRS: &[&str] = &[
     "/usr",
     "/bin",
     "/lib",
+    "/lib64",
+    "/sbin",
     "/proc",
     "/sys",
     "/dev",
