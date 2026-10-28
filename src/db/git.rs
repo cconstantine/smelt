@@ -150,13 +150,15 @@ const CLEAR_ID_TABLES: [&str; 4] = ["conversations", "sandbox_pods", "sandbox_vo
 /// unit tests move their own pod ids to the millions).
 const CLEAR_IDS_BASE: i64 = 2_000_000_000;
 
-/// `CLEAR_IDS_BASE` plus nanoseconds since the epoch folded into a
-/// billion-wide window: a fresh base every call, and still far inside
-/// BIGINT and anything a name or a browser's number can hold.
+/// A fresh base for this database's id sequences: the next value of the
+/// `[2e9, 3e9)` band `crate::id_alloc` allocates (SME-255). No two
+/// callers share a base, and consecutive ones sit `id_alloc::ID_STRIDE`
+/// apart — the fold it replaces (`CLEAR_IDS_BASE + nanos % 1e9`) handed
+/// two near-simultaneous callers the same base whenever their clock reads
+/// shared a tick, and their pods met by name in the shared test
+/// namespace.
 pub(super) fn clear_ids_base() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default();
-    CLEAR_IDS_BASE + i64::try_from(nanos % 1_000_000_000).unwrap_or_default()
+    crate::id_alloc::GLOBAL_IDS.next_base()
 }
 
 /// Moves `CLEAR_ID_TABLES`' id sequences to `base`: the next id is above it.

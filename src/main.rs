@@ -20,6 +20,8 @@ mod git;
 mod headless_chrome;
 mod highlight;
 #[cfg(feature = "server")]
+mod id_alloc;
+#[cfg(feature = "server")]
 mod lsp;
 mod markdown;
 #[cfg(feature = "server")]
