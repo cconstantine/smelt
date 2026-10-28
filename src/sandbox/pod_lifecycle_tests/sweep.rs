@@ -63,11 +63,18 @@ fn check_namespace(sweep: &str, tests: &str) -> Result<(), String> {
 }
 
 /// How far before the process's own start an object must predate to be
-/// taken by the predates arm: creation stamps are the API server's clock
-/// floored to the second and `/proc` start times are floored too, so the
-/// margin keeps "created before this process began" a proof and not a
-/// likelihood. A killed run's leftovers predate a re-run's start by far
-/// more; this run's own objects never reach it.
+/// taken by the predates arm. The premise is the supported topology:
+/// the test process and the API server share one machine and one kernel
+/// clock (the compose stack's k3s sidecar), and no correction of 2 s or
+/// more lands between boot and process start — `btime` freezes the boot
+/// clock's reading, and a later NTP step cannot move it back here. On
+/// that premise the two second-floors can shift the comparison by at
+/// most 1 s, which this margin outdistances; a start that still reads
+/// ahead of the clock judging it turns the arm off (in `choose` and in
+/// `process_start_time`), and a `KUBECONFIG` pointing at another
+/// machine is outside the supported set (docs/testing.md). A killed
+/// run's leftovers predate a re-run's start by far more; this run's own
+/// objects never reach it.
 const START_MARGIN: SignedDuration = SignedDuration::from_secs(2);
 
 /// The pods and claims to delete: in `SWEEP_NAMESPACE`, not already being
@@ -77,6 +84,11 @@ const START_MARGIN: SignedDuration = SignedDuration::from_secs(2);
 fn choose(pods: &[Pod], claims: &[PersistentVolumeClaim], now: Timestamp, max_age: Duration, process_start: Option<Timestamp>) -> Choice {
     // A bound too large for a signed duration makes nothing old.
     let max_age = SignedDuration::try_from(max_age).unwrap_or(SignedDuration::MAX);
+    // A start that reads ahead of the clock judging it is not a fact
+    // about the past but the forward-bias signature (a boot-time clock
+    // corrected later: `btime` keeps the old reading) — with it every
+    // young object would read as pre-start, so the arm is off.
+    let process_start = process_start.filter(|ps| *ps <= now);
     // The name and uid of an object this sweep may delete; `None` for
     // anything outside the namespace, already being deleted, younger than
     // `max_age` and not predating `process_start`, or missing what a
@@ -262,9 +274,12 @@ const SWEEP_BOUND: Duration = Duration::from_secs(60);
 
 /// This process's start, read from `/proc`: field 22 of `/proc/self/stat`
 /// (clock ticks since boot, USER_HZ being 100) added to `btime`, the
-/// boot's epoch second from `/proc/stat`. `None` if anything reads oddly —
-/// the predates arm stays off then and the hour arm goes on unaffected.
-/// Second precision only, the floor [`START_MARGIN`] answers.
+/// boot's epoch second from `/proc/stat`. `None` if anything reads oddly
+/// — the predates arm stays off then and the hour arm goes on
+/// unaffected. Second precision only, the floor [`START_MARGIN`]
+/// answers. A derived start later than the clock right now is the
+/// forward-bias shape [`START_MARGIN`] describes and is refused the
+/// same way: no `Some` that would eat this run's own objects.
 fn process_start_time() -> Option<Timestamp> {
     let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
     // Field 22 sits past the comm field, which can hold spaces and
@@ -279,7 +294,8 @@ fn process_start_time() -> Option<Timestamp> {
         .nth(1)?
         .parse()
         .ok()?;
-    Timestamp::from_second(btime.saturating_add(starttime / 100) as i64).ok()
+    let start = Timestamp::from_second(btime.saturating_add(starttime / 100) as i64).ok()?;
+    (start <= Timestamp::now()).then_some(start)
 }
 
 static SWEPT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
@@ -513,6 +529,22 @@ mod tests {
         assert_eq!(choice.kept_claims, 0);
         // With no process start the arm is off: the hour alone decides.
         assert_eq!(choose(&pods, &claims, start, HOUR, None), Choice::default());
+    }
+
+    /// Reviewer B-1: a `process_start` that reads **ahead of the clock
+    /// judging it** is not a fact about the past, it is the forward-bias
+    /// signature — `btime` freezes the clock as it read at boot, and a
+    /// later correction leaves every young object reading as made before
+    /// that frozen start. An ahead start means the arm is off; taking
+    /// everything would be the sweep producing this ticket's own flake.
+    #[test]
+    fn test_a_process_start_ahead_of_the_clock_takes_nothing() {
+        let start = now();
+        let ahead = start.checked_add(SignedDuration::from_secs(10)).expect("time");
+        let pods = [pod("young", Duration::from_secs(1), &[])];
+        let claims = [claim("young-claim", Duration::from_secs(1))];
+
+        assert_eq!(choose(&pods, &claims, start, HOUR, Some(ahead)), Choice::default());
     }
 
     /// The real-cluster tests, in a module of their own so a filter on
