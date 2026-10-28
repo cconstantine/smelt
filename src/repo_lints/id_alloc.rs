@@ -1,19 +1,22 @@
-//! No new clock-fold id sites (SME-255): `crate::id_alloc` allocates the
-//! ids whose values name cluster objects, from one cursor per band. A
-//! fold — a clock read reduced through a modulo — is the flake it
-//! replaces: two callers in one clock tick (whose granularity, on the
-//! gate machines, is far coarser than the read's unit) draw the same id,
-//! and their pods and claims meet by name in the one shared test
-//! namespace. This fails the gate on a new fold, or a new
-//! `uuid_like`-style helper, in any tracked file outside [`ALLOWED`].
+//! No new clock-derived ids from the fold this lint knows (SME-255):
+//! `crate::id_alloc` allocates the ids whose values name cluster
+//! objects, from one cursor per band. A finding is the identifier
+//! `uuid_like` in code, or — within [`WINDOW`] lines of a clock read
+//! (`as_nanos`, `as_micros`, `as_millis`, `as_secs`) — a remainder
+//! against a numeric literal of six or more digits, written as `%` or
+//! as a rem method (`rem_euclid`, `wrapping_rem`, `checked_rem`): the
+//! shape every met site was folded in, from `2e9 + nanos % 1e9` to the
+//! LSP band's `(seconds % 1e6) * 1000`. It fails the gate on any of
+//! those in a tracked file outside [`ALLOWED`].
 //!
-//! A finding is the identifier `uuid_like` in code, or a `%` whose
-//! right-hand operand is a numeric literal of six or more digits within
-//! [`WINDOW`] lines of a clock read (`as_nanos`, `as_micros`,
-//! `as_millis`, `as_secs`) — the shape every site was folded in, from
-//! `2e9 + nanos % 1e9` to the LSP band's `(seconds % 1e6) * 1000`.
-//! Comments hold neither, on `components`' `classify`; strings do, on
-//! purpose: a fold pasted in a string is a fold one `include!` away.
+//! That is the grammar, not the concept: `% (1_000_000_000)` (operands
+//! inside parentheses), `% 1e9` (a float literal), `% BAND_WIDTH` (a
+//! named constant), `nanos %= …`, and a renamed helper all pass — the
+//! one known renamed site, `sandbox_instance_cleanup`'s bare-nanos
+//! `unique()`, was fixed and pinned outside this grammar (its tests
+//! carry the cross-reference). Comments hold neither finding, on
+//! `components`' `classify`; strings do, on purpose: a fold pasted in a
+//! string is a fold one `include!` away.
 
 use super::components::{classify, Kind};
 
@@ -24,6 +27,10 @@ pub(crate) const ALLOWED: &[&str] = &["src/id_alloc.rs", "src/repo_lints/id_allo
 
 /// The clock reads a fold starts from.
 const CLOCK: &[&str] = &["as_nanos", "as_micros", "as_millis", "as_secs"];
+
+/// The rem methods: `%` written as a call. A fold through one has no
+/// `%` character at all, so the scan for one alone would miss it.
+const REM_METHODS: &[&str] = &["rem_euclid", "wrapping_rem", "checked_rem"];
 
 /// How many lines apart a clock read and its modulo may sit and still
 /// read as one fold — three covers the statement-per-line style every
@@ -55,7 +62,8 @@ fn reads_clock(line: &str) -> bool {
     words(line).any(|w| CLOCK.contains(&w))
 }
 
-/// Whether `line` modulo-folds through a literal of six or more digits.
+/// Whether `line` takes a remainder of a literal of six or more digits,
+/// as an operator or a rem method.
 fn folds(line: &str) -> bool {
     let chars: Vec<char> = line.chars().collect();
     for (k, c) in chars.iter().enumerate() {
@@ -66,18 +74,45 @@ fn folds(line: &str) -> bool {
         while chars.get(j) == Some(&' ') {
             j += 1;
         }
-        let mut digits = 0;
-        while matches!(chars.get(j), Some(d) if d.is_ascii_digit() || *d == '_') {
-            if chars[j].is_ascii_digit() {
-                digits += 1;
-            }
-            j += 1;
-        }
-        if digits >= 6 {
+        if digits_from(&chars, j) >= 6 {
             return true;
         }
     }
+    for method in REM_METHODS {
+        let mut from = 0;
+        while let Some(k) = line[from..].find(method) {
+            // The literal is the argument: `method(1_000_000_000)`.
+            let after: Vec<char> = line[from + k + method.len()..].chars().collect();
+            let mut i = 0;
+            while matches!(after.get(i), Some(c) if c.is_whitespace()) {
+                i += 1;
+            }
+            if after.get(i) == Some(&'(') {
+                i += 1;
+                while matches!(after.get(i), Some(c) if c.is_whitespace()) {
+                    i += 1;
+                }
+                if after[i..].iter().take_while(|c| c.is_ascii_digit() || **c == '_').filter(|c| c.is_ascii_digit()).count() >= 6 {
+                    return true;
+                }
+            }
+            from += k + method.len();
+        }
+    }
     false
+}
+
+/// How many decimal digits start at `j` in `chars`, underscores ignored.
+fn digits_from(chars: &[char], j: usize) -> usize {
+    let mut j = j;
+    let mut digits = 0;
+    while matches!(chars.get(j), Some(d) if d.is_ascii_digit() || *d == '_') {
+        if chars[j].is_ascii_digit() {
+            digits += 1;
+        }
+        j += 1;
+    }
+    digits
 }
 
 /// `path:line` for each fold and each `uuid_like` in `source`.
@@ -110,6 +145,9 @@ mod tests {
             "    let nanos = clock.as_nanos();\n    3_000_000_000 + i64::try_from(nanos % 1_000_000_000).unwrap_or_default()\n",
             "    let seconds = clock.as_secs() as i64;\n    3_000_000_000 + (seconds % 1_000_000) * 1_000 + next\n",
             "    let id = (nanos.as_nanos() % 1_000_000_000) as i64 + 1_000_000_000;\n",
+            "    let nanos = clock.as_nanos();\n    3_000_000_000 + nanos.rem_euclid(1_000_000_000)\n",
+            "    let id = clock.as_nanos().checked_rem(1_000_000_000) as i64;\n",
+            "    let seconds = clock.as_secs();\n    let id = seconds.wrapping_rem(1_000_000);\n",
         ] {
             assert!(!scan(source).is_empty(), "{source}");
         }
@@ -128,6 +166,8 @@ mod tests {
             "    let id = crate::id_alloc::GLOBAL_IDS.next_base();\n",
             "    let age = now.duration_since(then).as_secs();\n    assert!(age < 60, \"{age} s\");\n",
             "    let small = total % 97;\n    let half = split % 1000;\n",
+            "    let m = total.rem_euclid(97);\n    let h = span.checked_rem(60);\n",
+            "    fn rem_euclid_safe() {}\n",
         ] {
             assert!(scan(source).is_empty(), "{source}");
         }
