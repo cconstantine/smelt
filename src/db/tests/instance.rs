@@ -163,3 +163,24 @@ async fn test_harness_moves_never_repeat_or_crowd(pool: PgPool) {
         previous = Some(base);
     }
 }
+
+/// SME-255: one harness move clears **every** sequence in the database,
+/// not a list. Two parallel test databases that both counted some table
+/// from 1 named the same cluster objects — `agent-volume-1` was this
+/// class, met — and no allocation fix prevents the next one. After one
+/// move, no sequence may sit below the base, counting by its own start
+/// included.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_one_harness_move_clears_every_sequence(pool: PgPool) {
+    let base = test_support::start_ids_clear_of_other_runs(&pool).await.expect("move the id sequences");
+    let low: Vec<String> = sqlx::query_scalar(
+        "SELECT format('%I.%I', schemaname, sequencename)
+         FROM pg_sequences
+         WHERE schemaname = 'public' AND (last_value IS NULL OR last_value < $1)",
+    )
+    .bind(base)
+    .fetch_all(&pool)
+    .await
+    .expect("read the sequences");
+    assert!(low.is_empty(), "{low:?} sit below the moved base {base}: one harness move left them counting from their own start");
+}

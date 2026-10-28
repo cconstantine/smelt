@@ -161,15 +161,23 @@ pub(super) fn clear_ids_base() -> i64 {
     crate::id_alloc::GLOBAL_IDS.next_base()
 }
 
-/// Moves `CLEAR_ID_TABLES`' id sequences to `base`: the next id is above it.
+/// Moves **every** sequence in the test database to `base`: the next id
+/// in any of them is above it. Not the `CLEAR_ID_TABLES` list — the
+/// production path keeps that (their ids are the ones that name cluster
+/// objects there, and the used-database check reads exactly those) —
+/// the test path moves everything structurally, so the next table whose
+/// ids name a cluster object is clear of other runs without anyone
+/// extending a list (SME-255; two test databases naming `agent-volume-1`
+/// was this class, met).
 #[cfg(test)]
 pub(super) async fn move_id_sequences(pool: &PgPool, base: i64) -> Result<(), sqlx::Error> {
-    for table in CLEAR_ID_TABLES {
-        sqlx::query("SELECT setval(pg_get_serial_sequence($1, 'id'), $2)")
-            .bind(table)
-            .bind(base)
-            .execute(pool)
-            .await?;
-    }
+    sqlx::query(
+        "SELECT setval(format('%I.%I', schemaname, sequencename)::regclass, $1)
+         FROM pg_sequences
+         WHERE schemaname = 'public'",
+    )
+    .bind(base)
+    .execute(pool)
+    .await?;
     Ok(())
 }

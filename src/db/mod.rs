@@ -94,13 +94,15 @@ mod tests;
 pub(crate) mod test_support {
     use sqlx::PgPool;
 
-    /// Moves the conversation, sandbox pod and sandbox volume id
-    /// sequences to a base of their own, different on every call, and
-    /// returns it, used or not (unlike `start_ids_clear_if_fresh`, which
-    /// `main` runs). The browser tier shares its namespace with the
+    /// Moves every id sequence in this test database to a base of their
+    /// own, different on every call, and returns it, used or not (unlike
+    /// `start_ids_clear_if_fresh`, which `main` runs — that one moves the
+    /// production list). The browser tier shares its namespace with the
     /// real-cluster unit tests, whose databases also count from 1: a run
     /// that met a pod an earlier run was still stopping waited it out
-    /// and failed (SME-99).
+    /// and failed (SME-99); moving everything, not a list, is what keeps
+    /// the next table whose ids name cluster objects out of the way too
+    /// (SME-255).
     pub(crate) async fn start_ids_clear_of_other_runs(pool: &PgPool) -> Result<i64, sqlx::Error> {
         let base = super::clear_ids_base();
         super::move_id_sequences(pool, base).await?;
