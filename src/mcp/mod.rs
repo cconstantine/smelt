@@ -181,12 +181,16 @@ fn purpose_line(raw: &str) -> Option<String> {
 }
 
 /// What `service`'s server said it is, at `initialize` (SME-309):
-/// `description`, else `title` — sanitized, or none when it sent neither.
+/// `description` unless absent or blank, else `title` — sanitized, or
+/// none when neither carries a word. A present-but-empty `Some("")`
+/// description must not swallow the title fallback (review round 1).
 fn server_purpose(service: &RunningService<RoleClient, SmeltClientHandler>) -> Option<String> {
     let peer = service.peer_info()?;
     let info = peer.server_info.as_ref()?;
     info.description
         .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
         .or(info.title.as_deref())
         .and_then(purpose_line)
 }

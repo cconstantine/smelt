@@ -103,6 +103,27 @@ fn test_a_description_that_leads_with_its_server_is_not_labelled_twice() {
     );
 }
 
+/// The review-round-1 pin: `MockMcpServer` advertises a present-but-empty
+/// `initialize` description beside a real title, and the purpose
+/// registered for it is that title — an empty description falls through
+/// to the fallback instead of swallowing it.
+#[tokio::test]
+async fn test_an_empty_description_at_initialize_falls_back_to_the_title() {
+    let server_id = -3092;
+    register_test_connection(server_id, false).await;
+    let purpose = REGISTRY
+        .lock()
+        .await
+        .get(&server_id)
+        .and_then(|conn| conn.purpose.clone());
+    REGISTRY.lock().await.remove(&server_id);
+    assert_eq!(
+        purpose.as_deref(),
+        Some("Mock echo server"),
+        "a present-but-empty description must fall back to the title"
+    );
+}
+
 /// G (SME-309): the live capture — smelt's own client connects to the
 /// keyless Exa server, and the purpose `prompt_servers` reports is what
 /// Exa said it is at `initialize`, on one sanitized line. Same gate as
