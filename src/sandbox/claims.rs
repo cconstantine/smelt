@@ -399,7 +399,7 @@ pub(super) async fn delete_conversation_pvcs(client: &kube::Client, conversation
 #[cfg(test)]
 pub(super) mod log_tests {
     use super::*;
-    use crate::sandbox::tests::test_client;
+    use crate::sandbox::tests::{test_client, unused_conversation_id};
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 
@@ -435,15 +435,6 @@ pub(super) mod log_tests {
     /// The line of `log` holding every one of `parts`, if any.
     pub(in crate::sandbox) fn line_with<'a>(log: &'a str, parts: &[&str]) -> Option<&'a str> {
         log.lines().find(|line| parts.iter().all(|part| line.contains(part)))
-    }
-
-    /// A conversation id no other test or run uses (as `tests.rs`'s).
-    fn unused_conversation_id() -> i64 {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default();
-        3_000_000_000 + i64::try_from(nanos % 1_000_000_000).unwrap_or_default()
     }
 
     /// A small claim for `conversation_id` labelled with `instance`; its uid.

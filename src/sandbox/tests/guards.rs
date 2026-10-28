@@ -122,7 +122,7 @@ async fn test_open_pod_port_reaches_the_conversations_own_pod(pool: PgPool) {
     // Pod names are `sandbox-{pod_id}`, and every `#[sqlx::test]`
     // database restarts ids at 1 — start this one's ids far from the
     // low range.
-    let first_id = (uuid_like().parse::<u128>().unwrap() % 1_000_000_000) as i64 + 1_000_000;
+    let first_id = unused_conversation_id();
     sqlx::query("SELECT setval(pg_get_serial_sequence('sandbox_pods', 'id'), $1)")
         .bind(first_id)
         .execute(&pool)

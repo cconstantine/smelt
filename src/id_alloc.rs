@@ -28,7 +28,9 @@
 //! a clock that steps backward (NTP) cannot matter. Tests assert the
 //! invariants (band membership, distinctness), never a value.
 //! `src/repo_lints/id_alloc.rs` refuses to let a new clock-fold id site
-//! join this module.
+//! join this module. (`src/bin/sandbox_instance_cleanup/tests.rs`'s
+//! `unique()` is the same scheme restated locally — that bin is its own
+//! crate and cannot reach here.)
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::OnceLock;
@@ -94,3 +96,13 @@ impl Band {
 /// moves and the production fresh-database start alike — is its
 /// `next_base`.
 pub(crate) static GLOBAL_IDS: Band = Band::new("GLOBAL_IDS", 2_000_000_000, 1_000_000_000);
+
+/// The band for the ids a test picks by hand: fixture conversation and
+/// pod ids, the session-name suffixes that become ephemeral pod names,
+/// and the offsets that move a test database's own sequences away:
+/// `[3_000_000_000, 4_000_000_000)`. The old hand-picked `[1e9, 2e9)`
+/// band retired with SME-255: two tests that want disjoint ids call the
+/// allocator twice, and a fold's shared tick can no longer hand two of
+/// them the same value.
+#[cfg(test)]
+pub(crate) static FIXTURE_IDS: Band = Band::new("FIXTURE_IDS", 3_000_000_000, 1_000_000_000);
