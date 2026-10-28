@@ -547,6 +547,28 @@ mod tests {
         assert_eq!(choose(&pods, &claims, start, HOUR, Some(ahead)), Choice::default());
     }
 
+    /// Reviewer B-2: the function that decides whether the predates arm
+    /// runs at all was untested — a misparsed field or a wrong `USER_HZ`
+    /// yields a valid-looking `Some` far off the truth (a 10× future one
+    /// would arm the arm against the run's own objects), and the C5
+    /// cluster test injects its own start, so the gate proved only that
+    /// one machine's `/proc` parsed. Pin the reading to reality.
+    #[test]
+    fn test_the_process_start_reads_the_real_boot() {
+        let start = process_start_time().expect("this runs on Linux: /proc/self/stat and btime read");
+        let now = Timestamp::now();
+        assert!(
+            start <= now.checked_add(START_MARGIN).expect("time"),
+            "the process started {start}, ahead of the clock {now} reading it"
+        );
+        // The test binary is minutes old; hours would mean boot
+        // arithmetic gone wrong, not this process's start.
+        assert!(
+            now.duration_since(start) <= SignedDuration::from_hours(6),
+            "a process running at {now} cannot have started at {start}"
+        );
+    }
+
     /// The real-cluster tests, in a module of their own so a filter on
     /// the pure tests' path (`sweep::tests::test_`) can't match them.
     mod cluster {
