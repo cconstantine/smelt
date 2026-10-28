@@ -102,3 +102,44 @@ fn test_a_description_that_leads_with_its_server_is_not_labelled_twice() {
         format!("[linear.app] {tail}")
     );
 }
+
+/// G (SME-309): the live capture — smelt's own client connects to the
+/// keyless Exa server, and the purpose `prompt_servers` reports is what
+/// Exa said it is at `initialize`, on one sanitized line. Same gate as
+/// the live search test: `SMELT_LIVE_EXA=1 scripts/cluster-test --features
+/// server -- --ignored --exact
+/// mcp::tests::labels::test_live_exa_purpose_arrives_from_its_initialize_handshake`
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+#[ignore]
+async fn test_live_exa_purpose_arrives_from_its_initialize_handshake(pool: sqlx::PgPool) {
+    if std::env::var("SMELT_LIVE_EXA").as_deref() != Ok("1") {
+        eprintln!("skipped: set SMELT_LIVE_EXA=1 to run against the real Exa service");
+        return;
+    }
+    let config = create_static_server(&pool, EXA_MCP_URL).await;
+    connection_check(&pool, &config)
+        .await
+        .expect("smelt's MCP client should connect to Exa keylessly");
+    let servers = prompt_servers(&pool).await;
+    let exa = servers
+        .iter()
+        .find(|s| s.name == config.name)
+        .expect("the connected server is listed");
+    let purpose = exa
+        .purpose
+        .as_deref()
+        .expect("Exa sends a serverInfo description at initialize");
+    assert!(!purpose.is_empty(), "purpose line is empty");
+    assert!(!purpose.contains('\n') && !purpose.contains('\u{7f}'), "not one clean line: {purpose:?}");
+    evict(config.id).await;
+    assert!(
+        prompt_servers(&pool)
+            .await
+            .iter()
+            .find(|s| s.name == config.name)
+            .expect("still listed")
+            .purpose
+            .is_none(),
+        "evict drops the purpose, §8's state model"
+    );
+}

@@ -177,6 +177,7 @@ async fn register_test_connection(server_id: i64, second_tool_disabled: bool) ->
     REGISTRY.lock().await.insert(
         server_id,
         Connection {
+            purpose: server_purpose(&service),
             service: Arc::new(service),
             tools,
             stale,
