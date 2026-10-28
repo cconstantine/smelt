@@ -86,7 +86,7 @@ async fn test_tool_definitions_for_merges_and_namespaces_tools_from_connected_se
 
     assert_eq!(definitions.len(), 1);
     assert_eq!(definitions[0].name, "mcp__test-server__echo");
-    assert_eq!(definitions[0].description, "Echoes its input back");
+    assert_eq!(definitions[0].description, "[test-server] Echoes its input back");
 
     REGISTRY.lock().await.remove(&server_id);
 }
