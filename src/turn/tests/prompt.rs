@@ -195,6 +195,20 @@ fn test_system_prompt_starts_with_the_base_prompt() {
     assert!(prompt.starts_with(BASE_SYSTEM_PROMPT), "got: {prompt}");
 }
 
+/// C (SME-309): the base prompt names the confusions the ticket recorded
+/// — the two halves the seat actually mixed up, and the crossed-prefix
+/// names it assembled. Asserted on the stable phrases §4.3 was drafted
+/// with, not the whole section.
+#[test]
+fn test_system_prompt_names_the_tool_confusions() {
+    for phrase in [
+        "A comment tool on an MCP server writes a record on a ticket",
+        "doesn't exist, however plausible its name reads",
+    ] {
+        assert!(BASE_SYSTEM_PROMPT.contains(phrase), "missing {phrase:?} in the base prompt");
+    }
+}
+
 #[test]
 fn test_system_prompt_describes_the_environment() {
     let prompt = system_prompt(&prompt_env());
