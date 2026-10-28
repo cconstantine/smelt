@@ -206,7 +206,7 @@ pub(super) const CUT_OFF_TOOL_CALL: &str = "Not run: your reply was cut off befo
 /// sandbox and tools work, and how its replies are shown. Kept as prose in
 /// its own file so it reads and edits like prose.
 #[cfg(feature = "server")]
-pub(super) const BASE_SYSTEM_PROMPT: &str = include_str!("system_prompt.md");
+pub(crate) const BASE_SYSTEM_PROMPT: &str = include_str!("system_prompt.md");
 
 /// The parts of the system prompt that depend on this deployment or the
 /// day, gathered per turn by `prompt_environment`. An empty list means

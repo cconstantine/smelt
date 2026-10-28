@@ -143,3 +143,38 @@ async fn test_live_exa_purpose_arrives_from_its_initialize_handshake(pool: sqlx:
         "evict drops the purpose, §8's state model"
     );
 }
+
+/// F — Done-when's combined bullet over the assembled real lists: every
+/// offered description says who owns it (an MCP tool leads `[server] `,
+/// or is skipped only by the no-double-label rule), the four smelt
+/// natives lead `smelt`, and the base prompt names the confusions.
+#[test]
+fn test_the_assembled_offer_says_who_owns_everything() {
+    // MCP: every deployed description leaves the composition point owned.
+    for (server, entries) in SERVER_NAMES.iter().zip(SERVERS) {
+        for (name, description) in *entries {
+            let labelled = labelled_description(server, description);
+            let owned = labelled.starts_with(&format!("[{server}] "))
+                || description
+                    .to_lowercase()
+                    .starts_with(&server.to_lowercase());
+            assert!(owned, "{server}::{name} offers no owner: {labelled:?}");
+        }
+    }
+    // smelt's own four: label, and the agent-message one rules out the tracker.
+    let confused = ["message_agent", "finish", "ask_parent", "ask_user"];
+    let natives = crate::anthropic::tools::native_tool_definitions();
+    for name in confused {
+        let def = natives
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} is offered"));
+        assert!(def.description.starts_with("smelt"), "{name}: {:?}", def.description);
+    }
+    // The prose half of the same promise, from §4.3.
+    assert!(
+        crate::turn::BASE_SYSTEM_PROMPT
+            .contains("A comment tool on an MCP server writes a record on a ticket"),
+        "the base prompt must name the comment-not-a-message confusion"
+    );
+}
