@@ -19,10 +19,14 @@
 //!   if their seeds land within a few strides of each other, and the
 //!   harness's sweep (SME-134 with SME-255's arm) takes a finished run's
 //!   leftovers whatever their names.
-//! * **past the band's end**: asking for more ids than a band holds
-//!   (10,000 calls) panics by name rather than wrapping into spent
-//!   values. A caller that panics after its base leaves it spent — it is
-//!   never re-handed.
+//! * **past the reserve**: each band holds back a documented reserve of
+//!   calls (GLOBAL_IDS 4,000, FIXTURE_IDS 8,000 — each at least four
+//!   times the server suite's heaviest draw, ≈1,000 and ≈2,100) from its
+//!   seed window, so even the worst seed leaves a full reserve above it.
+//!   A process that asks for more than the reserve is a pathological
+//!   loop: it panics by name rather than wrapping into spent values. A
+//!   caller that panics after its base leaves it spent — it is never
+//!   re-handed.
 //!
 //! Nothing survives the process by design, and the seed is read once, so
 //! a clock that steps backward (NTP) cannot matter. Tests assert the
@@ -46,6 +50,11 @@ pub(crate) struct Band {
     name: &'static str,
     base: i64,
     width: i64,
+    /// Calls this band guarantees a process, whatever seed it draws: the
+    /// seed window gives up `reserve × ID_STRIDE` from the band's top, so
+    /// the worst seed still leaves the whole reserve above it, and the
+    /// assert in `next_base` guards only loops past that reserve.
+    reserve: i64,
     /// The seed for this process: the clock mixed with the pid, read on
     /// the first call and never again.
     seed: OnceLock<i64>,
@@ -55,8 +64,15 @@ pub(crate) struct Band {
 }
 
 impl Band {
-    const fn new(name: &'static str, base: i64, width: i64) -> Self {
-        Band { name, base, width, seed: OnceLock::new(), steps: AtomicI64::new(0) }
+    const fn new(name: &'static str, base: i64, width: i64, reserve: i64) -> Self {
+        Band { name, base, width, reserve, seed: OnceLock::new(), steps: AtomicI64::new(0) }
+    }
+
+    /// The largest seed the draw can hand out: the top of the window
+    /// that remains once the reserve is held back.
+    #[cfg(test)]
+    fn worst_seed(&self) -> i64 {
+        self.base + (self.width - self.reserve * ID_STRIDE) - 1
     }
 
     /// The next base in this band: `ID_STRIDE` above the last one this
@@ -74,9 +90,10 @@ impl Band {
             x ^= x >> 27;
             x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
             x ^= x >> 31;
-            // Keep the whole run of advances inside the band: the seed
-            // leaves room for at least one stride.
-            self.base + (x % (self.width - 2 * ID_STRIDE) as u64) as i64
+            // Keep the whole reserve of advances inside the band: the
+            // window gives up the reserve from its top, so even the
+            // worst seed leaves `reserve` strides below the band end.
+            self.base + (x % (self.width - self.reserve * ID_STRIDE) as u64) as i64
         });
         let value = seed + (self.steps.fetch_add(ID_STRIDE, Ordering::Relaxed) + ID_STRIDE);
         assert!(
@@ -94,8 +111,10 @@ impl Band {
 /// The band for the sequences that name pods and claims:
 /// `[2_000_000_000, 3_000_000_000)`. `db::clear_ids_base()` — the harness
 /// moves and the production fresh-database start alike — is its
-/// `next_base`.
-pub(crate) static GLOBAL_IDS: Band = Band::new("GLOBAL_IDS", 2_000_000_000, 1_000_000_000);
+/// `next_base`. Observed worst single process: ≈1,000 calls (T1's 512 +
+/// T2's 200 + one gate run's harness moves) — the reserve of 4,000
+/// leaves four times that as seed-window room.
+pub(crate) static GLOBAL_IDS: Band = Band::new("GLOBAL_IDS", 2_000_000_000, 1_000_000_000, 4_000);
 
 /// The band for the ids a test picks by hand: fixture conversation and
 /// pod ids, the session-name suffixes that become ephemeral pod names,
@@ -103,6 +122,41 @@ pub(crate) static GLOBAL_IDS: Band = Band::new("GLOBAL_IDS", 2_000_000_000, 1_00
 /// `[3_000_000_000, 4_000_000_000)`. The old hand-picked `[1e9, 2e9)`
 /// band retired with SME-255: two tests that want disjoint ids call the
 /// allocator twice, and a fold's shared tick can no longer hand two of
-/// them the same value.
+/// them the same value. Observed worst single process: ≈2,100 calls
+/// (T5 alone draws 2,000) — the reserve of 8,000 leaves the rest of the
+/// band to the seed window.
 #[cfg(test)]
-pub(crate) static FIXTURE_IDS: Band = Band::new("FIXTURE_IDS", 3_000_000_000, 1_000_000_000);
+pub(crate) static FIXTURE_IDS: Band = Band::new("FIXTURE_IDS", 3_000_000_000, 1_000_000_000, 8_000);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reviewer A-F1: the seed is drawn from the band's whole width, so
+    /// the calls left at the worst seed are `(band end − worst seed) /
+    /// stride` — and that must cover the heaviest run, or the exhaustion
+    /// panic fires on legitimate traffic. The reserve each band documents
+    /// is the promise; the seed window and the reserve are one constant,
+    /// so the pin that breaks when the two drift apart is this relation:
+    /// **the worst seed plus the whole reserve stays under the band end.**
+    /// Red against the seed-draws-what-it-likes form: worst seed + 8,000
+    /// strides lands 800 million past the FIXTURE band's end.
+    #[test]
+    fn test_the_worst_seed_leaves_the_whole_reserve() {
+        let demand = [("GLOBAL_IDS", &GLOBAL_IDS, 4_000_i64), ("FIXTURE_IDS", &FIXTURE_IDS, 8_000)];
+        for (name, band, calls) in demand {
+            assert!(band.reserve * ID_STRIDE < band.width, "{name}: the reserve must leave a seed window at all");
+            assert!(
+                band.reserve >= calls,
+                "{name}: the run's documented worst case is {calls} calls (see the band's comment), the reserve is {}",
+                band.reserve
+            );
+            assert!(
+                band.worst_seed() + band.reserve * ID_STRIDE < band.base + band.width,
+                "{name}: the worst seed leaves room for only {}, not the reserve of {}",
+                (band.base + band.width - band.worst_seed()) / ID_STRIDE,
+                band.reserve
+            );
+        }
+    }
+}
