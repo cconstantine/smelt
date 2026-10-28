@@ -12,7 +12,7 @@ pub(super) fn tools() -> Vec<Tool> {
         def: ToolDefinition {
             name: ASK_USER.to_string(),
             description: format!(
-                "Ask the user one to {MAX_QUESTIONS} questions and wait for their answer, when the \
+                "smelt: ask the user one to {MAX_QUESTIONS} questions and wait for their answer, when the \
                  answer changes what you do next (which of two approaches, whether to delete or \
                  overwrite something, a choice only they can make). Your turn ends here: the user \
                  answers on a card in the chat, maybe much later, and their answer comes back as \

@@ -127,10 +127,27 @@ pub(crate) async fn tool_class_report(
         .collect())
 }
 
+/// The description as the model sees it: the owning server leads, so a
+/// hundred-tool list says which room each tool is in. Skips the label when
+/// the description already leads with the server's name — no double label.
+pub(crate) fn labelled_description(server_name: &str, description: &str) -> String {
+    if description
+        .to_lowercase()
+        .starts_with(&server_name.to_lowercase())
+    {
+        description.to_string()
+    } else {
+        format!("[{server_name}] {description}")
+    }
+}
+
 fn mcp_tool_to_definition(server_name: &str, tool: &McpTool) -> ToolDefinition {
     ToolDefinition {
         name: namespaced_tool_name(server_name, tool.name.as_ref()),
-        description: tool.description.clone().unwrap_or_default().into_owned(),
+        description: labelled_description(
+            server_name,
+            tool.description.as_deref().unwrap_or_default(),
+        ),
         input_schema: serde_json::Value::Object((*tool.input_schema).clone()),
     }
 }

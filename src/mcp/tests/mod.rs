@@ -79,7 +79,14 @@ impl MockMcpServer {
 
 impl ServerHandler for MockMcpServer {
     fn get_info(&self) -> ServerInfo {
+        // The shape a sloppy server sends (SME-309 review round 1): a
+        // present-but-empty description beside a real title. What the
+        // client side does with it is pinned in `labels`.
+        let mut server_info = rmcp::model::Implementation::new("mock", "0");
+        server_info.description = Some(String::new());
+        server_info.title = Some("Mock echo server".to_string());
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(server_info)
     }
 
     async fn call_tool(
@@ -177,6 +184,7 @@ async fn register_test_connection(server_id: i64, second_tool_disabled: bool) ->
     REGISTRY.lock().await.insert(
         server_id,
         Connection {
+            purpose: server_purpose(&service),
             service: Arc::new(service),
             tools,
             stale,
@@ -596,6 +604,7 @@ mod oauth_http {
 }
 
 mod gated_http;
+mod labels;
 mod client;
 mod names;
 mod registry;
