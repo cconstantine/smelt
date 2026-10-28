@@ -26,12 +26,19 @@ use crate::personas::rules::ToolRules;
 pub(crate) const PERSONA_DIR: &str = ".agents/personas/";
 pub(crate) const PERSONA_TABLE: &str = "docs/personas/README.md";
 
-/// The tracked files sitting directly under `PERSONA_DIR`: what a clone
-/// records and `list_personas` reads. A subdirectory holds nobody's persona.
+/// The persona-named files sitting directly under `PERSONA_DIR`: exactly
+/// what a clone records and `list_personas` reads — a name failing
+/// `is_persona_file_name` is never a persona to the server, so judging it
+/// would hold the repo to files no seat can start with (a `README.md` or
+/// `TEMPLATE.md` there would fail the gate with a parse error and a parity
+/// hint pointing the wrong way). A subdirectory holds nobody's persona.
 pub(crate) fn persona_files(tracked: &[String]) -> Vec<String> {
     tracked
         .iter()
-        .filter(|path| path.strip_prefix(PERSONA_DIR).is_some_and(|rest| !rest.is_empty() && !rest.contains('/')))
+        .filter(|path| {
+            path.strip_prefix(PERSONA_DIR)
+                .is_some_and(|rest| !rest.is_empty() && !rest.contains('/') && personas::is_persona_file_name(rest))
+        })
         .cloned()
         .collect()
 }
@@ -105,7 +112,7 @@ pub(crate) fn table_personas(markdown: &str) -> Vec<String> {
 /// file's name that no table row gives a page to. Both directions: a persona
 /// the process names but smelt can't start, and a file nothing documents.
 pub(crate) fn parity(table: &[String], files: &[String]) -> Vec<String> {
-    let name_of = |path: &str| path[PERSONA_DIR.len()..].trim_end_matches(".md").to_string();
+    let name_of = |path: &str| path[PERSONA_DIR.len()..].strip_suffix(".md").unwrap_or(path).to_string();
     let mut findings = Vec::new();
     for name in table {
         if !files.iter().any(|path| name_of(path) == *name) {
@@ -207,15 +214,18 @@ mod tests {
         let tracked = [
             ".agents/personas/developer.md".to_string(),
             ".agents/personas/README.md".to_string(),
+            ".agents/personas/TEMPLATE.md".to_string(),
+            ".agents/personas/_notes.md".to_string(),
+            ".agents/personas/x.md.md".to_string(),
             ".agents/personas/old/architect.md".to_string(),
             ".agents/personas/".to_string(),
             ".agents/skills/x/SKILL.md".to_string(),
             "docs/personas/developer.md".to_string(),
         ];
-        assert_eq!(
-            persona_files(&tracked),
-            vec![".agents/personas/developer.md".to_string(), ".agents/personas/README.md".to_string()]
-        );
+        // Only names the server would call personas: it ignores the rest
+        // (is_persona_file_name), so judging them would hold the repo to
+        // files no seat can ever start with.
+        assert_eq!(persona_files(&tracked), vec![".agents/personas/developer.md".to_string()]);
     }
 
     #[test]
