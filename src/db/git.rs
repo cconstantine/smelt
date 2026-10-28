@@ -146,8 +146,10 @@ pub async fn start_ids_clear_if_fresh(pool: &PgPool) -> Result<Option<i64>, sqlx
 const CLEAR_ID_TABLES: [&str; 4] = ["conversations", "sandbox_pods", "sandbox_volumes", "agent_volumes"];
 
 /// Far above the low ids a database counts from (the dev database is in
-/// the thousands, every fresh `#[sqlx::test]` one starts at 1, and some
-/// unit tests move their own pod ids to the millions).
+/// the thousands, every fresh `#[sqlx::test]` one starts at 1). Nothing
+/// a test run hands out sits below it: since SME-255 every harness move
+/// and every fixture id comes from `crate::id_alloc`'s bands at 2e9 and
+/// above.
 const CLEAR_IDS_BASE: i64 = 2_000_000_000;
 
 /// A fresh base for this database's id sequences: the next value of the
