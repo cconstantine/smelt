@@ -518,7 +518,15 @@ mod tests {
             pod("edge", Duration::from_secs(2), &[]),
             pod("hair-inside", Duration::from_millis(1900), &[]),
             pod("mine", Duration::from_secs(1), &[]),
+            pod("exact-start", Duration::ZERO, &[]),
             pod_from(deleting(meta("terminating", Some(SWEEP_NAMESPACE), five, serde_json::json!({}))), &[]),
+            // Reviewer B-3: an object the API server never stamped can
+            // be neither old nor pre-start — the arm must spare it.
+            pod_from({
+                let mut no_stamp = meta("no-stamp", Some(SWEEP_NAMESPACE), five, serde_json::json!({}));
+                no_stamp.as_object_mut().expect("meta").remove("creationTimestamp");
+                no_stamp
+            }, &[]),
         ];
         let claims = [claim("predates-claim", five), claim("mine-claim", Duration::from_secs(1))];
 
