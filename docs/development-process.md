@@ -8,7 +8,7 @@ The process is split into a file per part, so an agent reads only the part its j
 | -- | -- |
 | Personas: who does what, and the statuses each moves | [personas/README.md](personas/README.md) |
 | Rules every persona follows (ownership, worktrees, the cluster lock, hands-on checks, questions for the user) | [personas/rules.md](personas/rules.md) |
-| Project Manager, Architect, Planner, Ticket Driver, Developer, Code Reviewer, Integrator | [personas/](personas/README.md) |
+| Project Manager, Architect, Planner, Ticket Driver, Developer, Code Reviewer, Integrator, Facilitator | [personas/](personas/README.md) |
 | Phase 1: the plan | [process/plan.md](process/plan.md) |
 | Phase 2: test-first implementation, and the testing rules | [process/tdd.md](process/tdd.md) |
 | Rules for the code: outside APIs, spikes, Kubernetes, async boundaries, errors | [process/rules-code.md](process/rules-code.md) |
