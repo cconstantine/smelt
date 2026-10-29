@@ -9,11 +9,14 @@ Every persona still follows the rest of the [development process](../development
 | Project Manager | the one project the user directs it to | Backlog to Up Next, within that project | [project-manager.md](project-manager.md) |
 | Architect | one project: its description and its breakdown into tickets | creates tickets in Backlog | [architect.md](architect.md) |
 | Planner | one Up Next ticket | to Planned, or Todo with no questions | [planner.md](planner.md) |
+| Ticket Driver | one Todo ticket, to merged | keeps it true to its trail; its seats make the moves, the driver only a move its seat died before making | [ticket-driver.md](ticket-driver.md) |
 | Developer | one Todo ticket | to In Progress, then In Review, or Approved with no questions | [developer.md](developer.md) |
-| Code Reviewer | one PR | none: it reports to the Developer | [code-reviewer.md](code-reviewer.md) |
+| Code Reviewer | one PR | none: it reports to the Developer — on a driven ticket, to its starter, the Ticket Driver | [code-reviewer.md](code-reviewer.md) |
 | Integrator | one Approved ticket | to In Review after merging — a seat decision; a merge never moves it | [integrator.md](integrator.md) |
 | Facilitator | the "Next retrospective" ticket | to In Review, or Approved with no questions | [facilitator.md](facilitator.md) |
 
 Every persona follows [Rules every persona follows](rules.md). Ownership is recorded in Linear as a `started` comment either way the seat takes: `worktree <path>, branch <branch>`, or `conversation <id>, clone <path>` when the persona runs in a conversation (rules.md, "Working from a conversation sandbox"; SME-254, proposal 13).
+
+**From Todo to merged, one Ticket Driver per ticket** (SME-306): when the user approves a plan, the Project Manager starts one driver for the ticket and the driver, not the Project Manager, starts the seats that do the ticket's phases — Developer, Code Reviewers, Integrator, a Planner for a revision round — and posts each seat's `started:` and keeps its `finished:` on the ticket (the seat's own `finished:` comment is the sub-agent's, rules.md). The Project Manager keeps the queue and sequencing, cross-ticket conflicts, the stack-slot decision, the user's plan answers, scope increases, and any merge whose tip has moved; planning seats and retrospectives it still starts itself. What the driver reports and when, and the capacity protocol it keeps seats by, are on its page.
 
 Every persona above also has a persona file in the repo, `.agents/personas/<name>.md` (SME-247): a short file whose body links these pages and whose `smelt.tools` encode what its page says the persona may do — the machine facts live there, the role's prose stays here. `.claude/agents` is a symlink to `.agents/personas/`, so the same files load as Claude Code subagents; under Claude Code a file's smelt rules, model and credentials do not apply at all. Under smelt a seat is started with `start_agent`'s `persona` parameter (shown `smelt:<name>`); the lint `repo_lints::personas` parses every file and holds the table above and the files in parity.

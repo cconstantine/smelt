@@ -8,7 +8,7 @@ The process is split into a file per part, so an agent reads only the part its j
 | -- | -- |
 | Personas: who does what, and the statuses each moves | [personas/README.md](personas/README.md) |
 | Rules every persona follows (ownership, worktrees, the cluster lock, hands-on checks, questions for the user) | [personas/rules.md](personas/rules.md) |
-| Project Manager, Architect, Planner, Developer, Code Reviewer, Integrator | [personas/](personas/README.md) |
+| Project Manager, Architect, Planner, Ticket Driver, Developer, Code Reviewer, Integrator, Facilitator | [personas/](personas/README.md) |
 | Phase 1: the plan | [process/plan.md](process/plan.md) |
 | Phase 2: test-first implementation, and the testing rules | [process/tdd.md](process/tdd.md) |
 | Rules for the code: outside APIs, spikes, Kubernetes, async boundaries, errors | [process/rules-code.md](process/rules-code.md) |
@@ -45,6 +45,14 @@ Each ticket gets one label: **Feature**, **Improvement** or **Bug**. Related tic
 The **Current state** docs (`docs/current-state/`, one file per section — index.md first) describe current features, architecture and goals. The **Feature checklist** (`docs/feature-checklist/`, one file per area — index.md first) lists every shipped feature with the steps to check it through the web UI, one row per ticket.
 
 Linear's markdown differs from GitHub's in ways that bite: don't hard-wrap lines (a wrapped line starting with `+` or `-` becomes a list item), put file names in backticks (Linear turns a bare `name.rs` into a web link), and link repo files by their GitHub URL, not a relative path.
+
+---
+
+## From Todo to merged: one Ticket Driver per ticket
+
+When a ticket reaches **Todo** — plan approved, the user's questions answered — the Project Manager starts one **Ticket Driver** for it, and that agent owns the ticket from there to merged and closed: it starts the seats the phases need — the Developer, the Code Reviewers, the Integrator, and a Planner if a revision round is asked for — so each direct child of the Project Manager is responsible for exactly one ticket (SME-306; first run: SME-255, 2026-10-28). No code is needed for the shape: `start_agent`'s depth check (SME-241, default 5) already lets a depth-1 driver start the seats under it. The [Ticket Driver](personas/ticket-driver.md) page holds the model.
+
+What the Project Manager **keeps**: the queue and sequencing; cross-ticket file and design conflicts; **cluster capacity** — a seat that brings up the compose stack runs only on a stack slot it grants, and today that ceiling is the cluster's two nodes with nothing yet saying which node a pod lands on (SME-304); relaying the user's answers to a plan; every scope increase; and any merge whose tip has moved under the rebase. What the driver **owns**: phase dispatch; the two review rounds and their severity calls; the seat briefs; the ticket's `started:`/`finished:` trail ([rules.md](personas/rules.md)); and four reports back — **Developer started, PR opened, reviews closed, merged**.
 
 ---
 
