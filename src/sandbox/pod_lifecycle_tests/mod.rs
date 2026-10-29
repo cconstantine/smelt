@@ -45,6 +45,39 @@ async fn test_own_sandbox_sweeps_once_per_process(pool: PgPool) {
     assert_eq!(sweep::sweeps_started(), 1);
 }
 
+/// SME-255: two harness moves in one database must name distinct cluster
+/// objects: pods and claims are named after the ids they hand out, and in
+/// the one shared test namespace a re-hand id is a collision — the
+/// `NotOurs`/409 flake family. `own_sandbox` moves once; the scenario
+/// moves again and creates after each move.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_two_harness_moves_in_one_database_name_distinct_objects(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
+        let instance = db::smelt_instance(&pool).await.expect("instance");
+        let mut ids = Vec::new();
+        let mut names = std::collections::BTreeSet::new();
+        for round in 0..2 {
+            if round == 1 {
+                db::test_support::start_ids_clear_of_other_runs(&pool)
+                    .await
+                    .expect("the second harness move");
+            }
+            let conversation = db::create_conversation(&pool).await.expect("create conversation");
+            let pod = db::create_sandbox_pod(&pool, conversation.id).await.expect("create pod row");
+            ensure_conversation_pvcs(&client, conversation.id, &instance).await.expect("ensure claims");
+            names.insert(pod_name(pod.id));
+            names.insert(docker_pvc_name(conversation.id));
+            names.insert(workspace_pvc_name(conversation.id));
+            ids.push(conversation.id);
+        }
+        println!("SME-255 T4: conversation ids {ids:?}, cluster names {names:?}");
+        assert_ne!(ids[0], ids[1], "both harness moves handed out conversation id {}", ids[0]);
+        assert_eq!(names.len(), 6, "the two moves' cluster object names are not distinct: {names:?}");
+    })
+    .await;
+}
+
 /// How many of these tests run their scenarios at once. Each starts a pod
 /// or more, with a Docker sidecar each; a dozen starting together on one
 /// node took longer than a pod start may (90 s), failing these and the

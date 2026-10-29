@@ -8,8 +8,7 @@ async fn test_docker_in_a_sandbox_pod_works_and_stays_inside_the_pod() {
     let client = test_client().await;
     let manager = SandboxManager::new(client.clone());
     let pods = pods_api(&client);
-    let conversation_id = (uuid_like().parse::<u128>().expect("nanos") % 1_000_000_000) as i64
-        + 1_000_000_000;
+    let conversation_id = unused_conversation_id();
     let docker = DockerSidecar {
         memory: "1Gi".to_string(),
         storage: PodStorage::Conversation(conversation_id),

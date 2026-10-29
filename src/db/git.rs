@@ -146,28 +146,40 @@ pub async fn start_ids_clear_if_fresh(pool: &PgPool) -> Result<Option<i64>, sqlx
 const CLEAR_ID_TABLES: [&str; 4] = ["conversations", "sandbox_pods", "sandbox_volumes", "agent_volumes"];
 
 /// Far above the low ids a database counts from (the dev database is in
-/// the thousands, every fresh `#[sqlx::test]` one starts at 1, and some
-/// unit tests move their own pod ids to the millions).
+/// the thousands, every fresh `#[sqlx::test]` one starts at 1). Nothing
+/// a test run hands out sits below it: since SME-255 every harness move
+/// and every fixture id comes from `crate::id_alloc`'s bands at 2e9 and
+/// above.
 const CLEAR_IDS_BASE: i64 = 2_000_000_000;
 
-/// `CLEAR_IDS_BASE` plus nanoseconds since the epoch folded into a
-/// billion-wide window: a fresh base every call, and still far inside
-/// BIGINT and anything a name or a browser's number can hold.
+/// A fresh base for this database's id sequences: the next value of the
+/// `[2e9, 3e9)` band `crate::id_alloc` allocates (SME-255). No two
+/// callers share a base, and consecutive ones sit `id_alloc::ID_STRIDE`
+/// apart — the fold it replaces (`CLEAR_IDS_BASE + nanos % 1e9`) handed
+/// two near-simultaneous callers the same base whenever their clock reads
+/// shared a tick, and their pods met by name in the shared test
+/// namespace.
 pub(super) fn clear_ids_base() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default();
-    CLEAR_IDS_BASE + i64::try_from(nanos % 1_000_000_000).unwrap_or_default()
+    crate::id_alloc::GLOBAL_IDS.next_base()
 }
 
-/// Moves `CLEAR_ID_TABLES`' id sequences to `base`: the next id is above it.
+/// Moves **every** sequence in the test database to `base`: the next id
+/// in any of them is above it. Not the `CLEAR_ID_TABLES` list — the
+/// production path keeps that (their ids are the ones that name cluster
+/// objects there, and the used-database check reads exactly those) —
+/// the test path moves everything structurally, so the next table whose
+/// ids name a cluster object is clear of other runs without anyone
+/// extending a list (SME-255; two test databases naming `agent-volume-1`
+/// was this class, met).
 #[cfg(test)]
 pub(super) async fn move_id_sequences(pool: &PgPool, base: i64) -> Result<(), sqlx::Error> {
-    for table in CLEAR_ID_TABLES {
-        sqlx::query("SELECT setval(pg_get_serial_sequence($1, 'id'), $2)")
-            .bind(table)
-            .bind(base)
-            .execute(pool)
-            .await?;
-    }
+    sqlx::query(
+        "SELECT setval(format('%I.%I', schemaname, sequencename)::regclass, $1)
+         FROM pg_sequences
+         WHERE schemaname = 'public'",
+    )
+    .bind(base)
+    .execute(pool)
+    .await?;
     Ok(())
 }

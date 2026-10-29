@@ -32,8 +32,7 @@ async fn test_ensure_docker_pvc_creates_once_and_delete_removes_it() {
     let client = test_client().await;
     let pvcs = pvc_api(&client);
     // Far above any id a fresh test database hands out, and unique per run.
-    let conversation_id = (uuid_like().parse::<u128>().expect("nanos") % 1_000_000_000) as i64
-        + 1_000_000_000;
+    let conversation_id = unused_conversation_id();
     let name = docker_pvc_name(conversation_id);
 
     ensure_conversation_pvcs(&client, conversation_id, &test_instance()).await.expect("first ensure should create");

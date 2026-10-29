@@ -8,8 +8,7 @@ use super::*;
 async fn test_teardown_deletes_a_conversations_pod_that_has_no_record() {
     let client = test_client().await;
     let pods = pods_api(&client);
-    let conversation_id = (uuid_like().parse::<u128>().expect("nanos") % 1_000_000_000) as i64
-        + 1_000_000_000;
+    let conversation_id = unused_conversation_id();
     // Only the label matters, so the pod never needs to start: an image
     // that doesn't exist keeps it Pending and costs the cluster nothing.
     let name = format!("sandbox-{conversation_id}");
@@ -52,8 +51,7 @@ async fn test_teardown_deletes_a_conversations_pod_that_has_no_record() {
 async fn test_teardown_deletes_our_pod_named_by_its_record_but_not_an_unlabelled_one() {
     let client = test_client().await;
     let pods = pods_api(&client);
-    let conversation_id = (uuid_like().parse::<u128>().expect("nanos") % 1_000_000_000) as i64
-        + 1_000_000_000;
+    let conversation_id = unused_conversation_id();
     // Ours, with no conversation label (SME-88), and one from before
     // SME-115, with no label at all.
     let ours = pod_name(conversation_id + 1);

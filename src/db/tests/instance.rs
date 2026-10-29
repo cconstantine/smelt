@@ -113,3 +113,74 @@ async fn test_ids_start_clear_of_other_runs(pool: PgPool) {
     let again = test_support::start_ids_clear_of_other_runs(&pool).await.expect("move them again");
     assert_ne!(again, base, "two runs got the same base");
 }
+
+/// SME-255: `clear_ids_base()` never hands two callers the same base.
+/// The gate flake: two near-simultaneous `#[sqlx::test]` workers drew the
+/// same base, so the pod names they derive met in the shared test
+/// namespace. 64 threads × 8 calls hammer the call the way the workers
+/// do; every value must be distinct and inside the band `[2e9, 3e9)`
+/// that names pods and claims.
+#[test]
+fn test_clear_ids_base_hands_no_two_callers_the_same_base() {
+    let handles: Vec<_> = (0..64)
+        .map(|_| {
+            std::thread::spawn(|| -> Vec<i64> {
+                (0..8).map(|_| crate::db::git::clear_ids_base()).collect()
+            })
+        })
+        .collect();
+    let bases: Vec<i64> = handles.into_iter().flat_map(|h| h.join().expect("the id thread")).collect();
+    assert_eq!(bases.len(), 512, "64 threads × 8 calls");
+    for base in &bases {
+        assert!((2_000_000_000..3_000_000_000).contains(base), "base {base} is outside the band that names pods and claims");
+    }
+    let distinct: std::collections::HashSet<i64> = bases.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        512,
+        "the set holds fewer than 512 values; two near-simultaneous calls returned the same base"
+    );
+}
+
+/// SME-255: back-to-back harness moves never repeat and never crowd. The
+/// test path moves the id sequences on every `own_sandbox` and ~80 test
+/// setups; consecutive moves must sit at least `id_alloc::ID_STRIDE`
+/// (100_000) apart, so one test's first ids can't reach the next
+/// caller's. (The old fold drew each base from that call's own clock
+/// tick: consecutive calls differed only by the clock ticks between two
+/// reads, and the modulo wrapped downward about once a second.)
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_harness_moves_never_repeat_or_crowd(pool: PgPool) {
+    let mut previous: Option<i64> = None;
+    for round in 0..200 {
+        let base = test_support::start_ids_clear_of_other_runs(&pool).await.expect("move the id sequences");
+        if let Some(last) = previous {
+            assert!(
+                base >= last + 100_000,
+                "round {round}: a harness move landed at {base}, less than 100_000 above the previous {last}"
+            );
+        }
+        previous = Some(base);
+    }
+}
+
+/// SME-255: one harness move clears **every** sequence in the database,
+/// not a list. Two parallel test databases that both counted some table
+/// from 1 named the same cluster objects — `agent-volume-1` was this
+/// class, met — and no allocation fix prevents the next one. After one
+/// move, no sequence may sit below the base, counting by its own start
+/// included.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_one_harness_move_clears_every_sequence(pool: PgPool) {
+    let base = test_support::start_ids_clear_of_other_runs(&pool).await.expect("move the id sequences");
+    let low: Vec<String> = sqlx::query_scalar(
+        "SELECT format('%I.%I', schemaname, sequencename)
+         FROM pg_sequences
+         WHERE schemaname = 'public' AND (last_value IS NULL OR last_value < $1)",
+    )
+    .bind(base)
+    .fetch_all(&pool)
+    .await
+    .expect("read the sequences");
+    assert!(low.is_empty(), "{low:?} sit below the moved base {base}: one harness move left them counting from their own start");
+}

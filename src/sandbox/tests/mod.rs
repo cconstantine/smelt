@@ -89,29 +89,26 @@ fn pod_with_phase(phase: &str) -> Pod {
 }
 
 pub(super) fn unique_session_id(label: &str) -> String {
-    format!("test-{label}-{}", uuid_like())
+    format!("test-{label}-{}", crate::id_alloc::FIXTURE_IDS.next_base())
 }
 
-// Not a real UUID — just enough entropy to avoid pod-name collisions
-// between concurrent test runs, without adding a `uuid` dependency.
-fn uuid_like() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    format!(
-        "{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    )
+/// A conversation id no other test or run uses: claims are named after
+/// it. One cursor per process (SME-255): the fold this replaces
+/// (`3e9 + nanos % 1e9`) handed two calls in one clock tick the same id.
+pub(super) fn unused_conversation_id() -> i64 {
+    crate::id_alloc::FIXTURE_IDS.next_base()
 }
 
-/// A conversation id no other test or run uses: claims are named after it.
-fn unused_conversation_id() -> i64 {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    3_000_000_000 + i64::try_from(nanos % 1_000_000_000).unwrap_or_default()
+/// SME-255 (T5): the fixture helpers never hand two calls the same id or
+/// name. 1000 back-to-back calls each — the mechanism of a raw fixture
+/// pod 409 (no database sequences involved): two calls in one clock tick
+/// returned one id, because the fold read the clock on every call.
+#[test]
+fn test_the_fixture_helpers_never_repeat() {
+    let ids: std::collections::HashSet<i64> = (0..1000).map(|_| unused_conversation_id()).collect();
+    assert_eq!(ids.len(), 1000, "the fixture id helper repeated an id across 1000 calls");
+    let names: std::collections::HashSet<String> = (0..1000).map(|_| unique_session_id("t5")).collect();
+    assert_eq!(names.len(), 1000, "the session-name helper repeated a name across 1000 calls");
 }
 
 /// A small claim for `conversation_id` labelled with `instance` (or with
@@ -158,7 +155,7 @@ mod cluster {
         let client = test_client().await;
         let pods = pods_api(&client);
         let name = format!("sandbox-{}", unique_session_id("stuck-at-mount"));
-        let missing = format!("sme-132-missing-{}", uuid_like());
+        let missing = format!("sme-132-missing-{}", crate::id_alloc::FIXTURE_IDS.next_base());
         let docker = DockerSidecar { memory: "1Gi".to_string(), storage: PodStorage::Ephemeral };
         let mut pod = build_pod_spec(&name, "1Gi", &docker, &[], &[], TEST_INSTANCE);
         let spec = pod.spec.as_mut().expect("a pod spec");

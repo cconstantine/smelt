@@ -185,12 +185,32 @@ fn test_parse_args_takes_dry_run_with_the_urls() {
 
 // --- Against a real Postgres ---
 
-/// A unique number for a test's own object and database names.
+/// A unique number for a test's own object and database names: the
+/// same seed-once-plus-counter scheme as the server's `crate::id_alloc`
+/// (this bin is its own crate and can't reach it; SME-255) — nanos
+/// mixed with the pid read once, then a call counter. The bare
+/// `as_nanos()` this replaces handed two calls in one clock tick the
+/// same scratch database and object names.
 fn unique() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default()
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let seed = *SEED.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default() as u64;
+        nanos ^ u64::from(std::process::id()).rotate_left(32)
+    });
+    u128::from(seed) * 1_000 + u128::from(CALLS.fetch_add(1, Ordering::Relaxed))
+}
+
+/// SME-255: 1000 back-to-back calls never repeat (the bare-nanos fold
+/// did, on a coarse clock, two calls in one tick).
+#[test]
+fn test_unique_never_repeats() {
+    let seen: std::collections::HashSet<u128> = (0..1000).map(|_| unique()).collect();
+    assert_eq!(seen.len(), 1000, "unique() repeated a value across 1000 calls");
 }
 
 /// A connection of our own to the test database, the pool's own closed

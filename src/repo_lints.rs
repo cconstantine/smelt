@@ -8,6 +8,7 @@
 
 mod cluster_lock;
 mod components;
+mod id_alloc;
 mod links;
 mod personas;
 
@@ -202,6 +203,34 @@ mod tests {
             "{} #[sqlx::test]s that don't take the cluster lock: name a guarded migrator in the \
              attribute's own brackets, migrator = \"crate::test_lock::MIGRATOR\" (or NO_MIGRATIONS \
              for none), see src/test_lock.rs\n{}",
+            findings.len(),
+            findings.join("\n")
+        );
+    }
+
+    /// No tracked file outside the allowlist folds a clock read into an
+    /// id or names a `uuid_like` helper: `crate::id_alloc` allocates
+    /// those ids (SME-255). Pure: it reads the files.
+    #[test]
+    fn test_no_new_clock_fold_id_sites() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut findings = Vec::new();
+        let mut scanned = 0;
+        for path in tracked_files().into_iter().filter(|p| p.ends_with(".rs")) {
+            // Exact tracked paths, not suffixes: an ends_with allowlist
+            // would exempt any path merely ending in one.
+            if id_alloc::ALLOWED.contains(&path.as_str()) {
+                continue;
+            }
+            scanned += 1;
+            let Ok(source) = std::fs::read_to_string(root.join(&path)) else { continue };
+            findings.extend(id_alloc::folds_and_helpers(&path, &source));
+        }
+        assert!(scanned > 100, "the walk found the repo's files ({scanned} scanned)");
+        assert!(
+            findings.is_empty(),
+            "{} clock-fold id sites and uuid-like helpers (SME-255): allocate from crate::id_alloc \
+             instead — its bands' cursors never hand two callers one value\n{}",
             findings.len(),
             findings.join("\n")
         );

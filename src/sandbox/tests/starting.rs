@@ -8,8 +8,7 @@ async fn test_wait_for_conversation_pods_gone_waits_out_a_stopping_pod() {
     let client = test_client().await;
     let manager = SandboxManager::new(client.clone());
     let pods = pods_api(&client);
-    let conversation_id = (uuid_like().parse::<u128>().expect("nanos") % 1_000_000_000) as i64
-        + 1_000_000_000;
+    let conversation_id = unused_conversation_id();
     let docker = DockerSidecar {
         memory: "256Mi".to_string(),
         storage: PodStorage::Conversation(conversation_id),
@@ -224,7 +223,7 @@ async fn test_a_failed_start_for_a_deleted_conversation_leaves_no_claims(pool: P
     let live = db::create_conversation(&pool).await.expect("conversation");
     // Ids from a fresh test database are tiny; offset them away from
     // other runs' claims in the shared test namespace.
-    let offset = (uuid_like().parse::<u128>().expect("nanos") % 1_000_000_000) as i64 + 2_000_000_000;
+    let offset = crate::id_alloc::FIXTURE_IDS.next_base();
     db::delete_conversation(&pool, deleted.id).await.expect("delete");
     let instance = db::smelt_instance(&pool).await.expect("instance");
     for id in [deleted.id, live.id] {
