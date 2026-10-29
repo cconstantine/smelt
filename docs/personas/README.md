@@ -9,7 +9,7 @@ Every persona still follows the rest of the [development process](../development
 | Project Manager | the one project the user directs it to | Backlog to Up Next, within that project | [project-manager.md](project-manager.md) |
 | Architect | one project: its description and its breakdown into tickets | creates tickets in Backlog | [architect.md](architect.md) |
 | Planner | one Up Next ticket | to Planned, or Todo with no questions | [planner.md](planner.md) |
-| Ticket Driver | one Todo ticket, to merged | keeps it true to its trail; its seats make the moves | [ticket-driver.md](ticket-driver.md) |
+| Ticket Driver | one Todo ticket, to merged | keeps it true to its trail; its seats make the moves, the driver only a move its seat died before making | [ticket-driver.md](ticket-driver.md) |
 | Developer | one Todo ticket | to In Progress, then In Review, or Approved with no questions | [developer.md](developer.md) |
 | Code Reviewer | one PR | none: it reports to the Developer | [code-reviewer.md](code-reviewer.md) |
 | Integrator | one Approved ticket | to In Review after merging — a seat decision; a merge never moves it | [integrator.md](integrator.md) |
