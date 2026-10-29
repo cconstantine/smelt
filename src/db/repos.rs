@@ -506,3 +506,20 @@ pub async fn set_repo_failed(pool: &PgPool, id: i64, attempt: i32, error: &str) 
     .await?;
     Ok(result.rows_affected() > 0)
 }
+
+/// SME-253: a conversation's sandbox storage was removed, so the checkouts
+/// on it are gone. Marks its finished clones failed — the panel shows
+/// Clone failed and `clone_repo`'s retry path re-creates them; clones still
+/// running are left to the normal crash paths. Returns how many there were.
+#[expect(dead_code, reason = "called by the storage removal (SME-253), which lands next; only its test uses it until then")]
+pub async fn fail_repos_after_storage_removal(pool: &PgPool, conversation_id: i64, error: &str) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE conversation_repos SET status = 'failed', error = $2, updated_at = now()
+          WHERE conversation_id = $1 AND status = 'ready'",
+    )
+    .bind(conversation_id)
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
