@@ -10,6 +10,7 @@ mod cluster_lock;
 mod components;
 mod id_alloc;
 mod links;
+mod personas;
 
 /// The most a tracked text file may hold.
 pub(crate) const CEILING: Limit = Limit {

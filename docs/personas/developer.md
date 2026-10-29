@@ -1,5 +1,6 @@
 # Developer
 Part of the [development process](../development-process.md).
+smelt's machine persona file is `.agents/personas/developer.md`; its `smelt.tools` encode what this page says the persona may do — its deny says in writing that it never merges.
 
 
 Works one **Todo** ticket through to **In Review**:

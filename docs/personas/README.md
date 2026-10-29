@@ -12,6 +12,8 @@ Every persona still follows the rest of the [development process](../development
 | Developer | one Todo ticket | to In Progress, then In Review, or Approved with no questions | [developer.md](developer.md) |
 | Code Reviewer | one PR | none: it reports to the Developer | [code-reviewer.md](code-reviewer.md) |
 | Integrator | one Approved ticket | to Done | [integrator.md](integrator.md) |
-| Facilitator (a Claude Code sub-agent) | the "Next retrospective" ticket | to In Review, or Approved with no questions | [facilitator.md](facilitator.md) |
+| Facilitator | the "Next retrospective" ticket | to In Review, or Approved with no questions | [facilitator.md](facilitator.md) |
 
 Every persona follows [Rules every persona follows](rules.md). Ownership is recorded in Linear as a `started` comment either way the seat takes: `worktree <path>, branch <branch>`, or `conversation <id>, clone <path>` when the persona runs in a conversation (rules.md, "Working from a conversation sandbox"; SME-254, proposal 13).
+
+Every persona above also has a persona file in the repo, `.agents/personas/<name>.md` (SME-247): a short file whose body links these pages and whose `smelt.tools` encode what its page says the persona may do — the machine facts live there, the role's prose stays here. `.claude/agents` is a symlink to `.agents/personas/`, so the same files load as Claude Code subagents; under Claude Code a file's smelt rules, model and credentials do not apply at all. Under smelt a seat is started with `start_agent`'s `persona` parameter (shown `smelt:<name>`); the lint `repo_lints::personas` parses every file and holds the table above and the files in parity.
