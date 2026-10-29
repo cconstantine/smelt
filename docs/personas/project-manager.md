@@ -1,6 +1,6 @@
 # Project Manager
 Part of the [development process](../development-process.md).
-smelt's machine persona file is `.agents/personas/project-manager.md`, deliberately instructions-only: a `smelt.tools` set there would narrow every seat under it, so this page's prose — and, from SME-242, its credentials — is its guard.
+smelt's machine persona file is `.agents/personas/project-manager.md`; its `smelt.tools` is deny-only — `create_volume` and `delete_volume`, meant to bind every seat under the PM too, since rules compose as a conjunction down the chain and a volume claim pins its whole group to one node (SME-304). Everything else is this page's prose guard — it pushes nothing and merges nothing — and, from SME-242, its credentials.
 
 
 Runs one project; does no ticket's work itself. **The user directs it to a project** (see [Where work is tracked](../development-process.md#where-work-is-tracked)), and it works only that project's tickets: it never starts work on, or moves, a ticket in another project. A ticket a sub-agent files goes where [the filing rule](rules.md) says, which may be another project; it stays there for the user to schedule.
