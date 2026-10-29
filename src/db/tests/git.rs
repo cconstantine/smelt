@@ -251,3 +251,38 @@ async fn test_persona_files_are_re_recorded_only_on_the_ready_attempt_read(pool:
     let row = get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
     assert_eq!(row.persona_files, files);
 }
+
+/// SME-253: removing a conversation's sandbox storage marks its finished
+/// clones failed — this conversation's only, and never one still cloning.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_storage_removal_marks_only_this_conversations_finished_clones(pool: PgPool) {
+    let mine = create_conversation(&pool).await.expect("conversation");
+    let other = create_conversation(&pool).await.expect("other conversation");
+    let ready = create_conversation_repo(&pool, mine.id, "u", "k1", None, "r")
+        .await
+        .expect("ready repo");
+    set_repo_ready(&pool, ready.id, 1, "main", None, &[], &[], None).await.expect("ready");
+    let cloning = create_conversation_repo(&pool, mine.id, "u", "k2", None, "c")
+        .await
+        .expect("cloning repo");
+    let theirs = create_conversation_repo(&pool, other.id, "u", "k3", None, "t")
+        .await
+        .expect("other repo");
+    set_repo_ready(&pool, theirs.id, 1, "main", None, &[], &[], None).await.expect("other ready");
+
+    let marked = fail_repos_after_storage_removal(&pool, mine.id, "the sandbox storage was deleted; clone again")
+        .await
+        .expect("mark");
+    assert_eq!(marked, 1, "only this conversation's finished clone is marked");
+
+    let row = get_conversation_repo(&pool, ready.id).await.expect("get").expect("exists");
+    assert_eq!(
+        (row.status.as_str(), row.error.as_deref()),
+        ("failed", Some("the sandbox storage was deleted; clone again")),
+        "the lost checkout reads failed so the panel offers a fresh clone"
+    );
+    let row = get_conversation_repo(&pool, cloning.id).await.expect("get").expect("exists");
+    assert_eq!(row.status, "cloning", "a clone still running is left to the normal crash paths");
+    let row = get_conversation_repo(&pool, theirs.id).await.expect("get").expect("exists");
+    assert_eq!(row.status, "ready", "another conversation's clone is not touched");
+}

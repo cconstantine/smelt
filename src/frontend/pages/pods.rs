@@ -1,8 +1,12 @@
 use chrono::NaiveDateTime;
 use dioxus::prelude::*;
 
-use crate::api::pods::{AgentStatus, PodActivity, PodUsage, ServerPodOverview, get_pods, stop_pod};
+use crate::api::pods::{
+    AgentStatus, PodActivity, PodUsage, ServerPodOverview, StorageKind, StoredStorage,
+    get_pods, get_stored_storage, remove_stored_storage, stop_pod,
+};
 use crate::frontend::Route;
+use crate::frontend::pages::STORAGE_REMOVE_WARNING;
 
 /// A counter that goes up every time a pod is created or goes away, in
 /// any conversation (`AppEvent::PodsChanged`). Read it inside a
@@ -134,7 +138,94 @@ pub fn PodsIndex() -> Element {
                     }
                 },
             }
+            StoredVolumes { pods_changed, tick }
         }
+    }
+}
+
+/// The stored-volumes section under the pods table (SME-253): which
+/// conversations hold sandbox disk — the two claims that outlive their
+/// pods. Stopped conversations are the ones to look for: their pods are
+/// gone and their `/workspace` and Docker data stay until removed here
+/// or the conversation is deleted. Refetches on the same signals as the
+/// pods table (a removal publishes `PodsChanged`, and the removal's own
+/// `removing…` state rides the 30 s tick).
+#[component]
+fn StoredVolumes(pods_changed: Signal<u64>, tick: Signal<u64>) -> Element {
+    let fetched = use_resource(move || {
+        let _ = (pods_changed(), tick());
+        get_stored_storage()
+    });
+    let mut pending_remove: Signal<Option<i64>> = use_signal(|| None);
+    let mut remove_error: Signal<Option<String>> = use_signal(|| None);
+    let mut confirm_remove = move |conversation_id: i64| {
+        pending_remove.set(None);
+        spawn(async move {
+            remove_error
+                .set(remove_stored_storage(conversation_id).await.err().map(|e| super::server_error_message(&e)));
+        });
+    };
+
+    rsx! {
+        section { class: "stored-volumes",
+            h2 { "Stored volumes" }
+            p { class: "muted",
+                "Each conversation's sandbox keeps its /workspace and its Docker images in two volumes that outlive its pods; they hold node disk until removed here or when the conversation is deleted."
+            }
+            super::ErrorText { message: remove_error() }
+            match fetched() {
+                None => rsx! { p { class: "muted", "Loading..." } },
+                Some(Err(e)) => rsx! { super::ErrorText { message: Some(super::server_error_message(&e)) } },
+                Some(Ok(rows)) if rows.is_empty() => rsx! { p { class: "muted", "No stored volumes." } },
+                Some(Ok(rows)) => rsx! {
+                    table { class: "pods-table storage-table",
+                        thead {
+                            tr {
+                                th { "Conversation" }
+                                th { "/workspace" }
+                                th { "Docker" }
+                                th {}
+                            }
+                        }
+                        tbody {
+                            for row in rows {
+                                tr { key: "{row.conversation_id}", "data-storage-conversation": "{row.conversation_id}",
+                                    td {
+                                        Link { to: Route::ConversationRoute { id: row.conversation_id }, "{row.conversation_title}" }
+                                    }
+                                    td { "{volume_cell_text(&row, StorageKind::Workspace)}" }
+                                    td { "{volume_cell_text(&row, StorageKind::Docker)}" }
+                                    td {
+                                        super::TwoStepButton {
+                                            armed: pending_remove() == Some(row.conversation_id),
+                                            class: "storage-remove",
+                                            idle: "Remove volumes",
+                                            confirm: "Confirm remove?",
+                                            title: Some(STORAGE_REMOVE_WARNING),
+                                            on_arm: move |_| pending_remove.set(Some(row.conversation_id)),
+                                            on_confirm: move |_| confirm_remove(row.conversation_id),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// A stored-volumes cell: the claim's size (`"20Gi"` — its capacity,
+/// which under local-path is the request, never usage),
+/// `"removing…"` while it carries a deletion timestamp, `"stored"` if
+/// it has no size to show, and `"none"` if that column's claim isn't
+/// there (one half of a halfway removal that failed).
+fn volume_cell_text(row: &StoredStorage, kind: StorageKind) -> String {
+    match row.volumes.iter().find(|volume| volume.kind == kind) {
+        Some(volume) if volume.deleting => "removing\u{2026}".to_string(),
+        Some(volume) => volume.size.clone().unwrap_or_else(|| "stored".to_string()),
+        None => "none".to_string(),
     }
 }
 
@@ -304,5 +395,32 @@ mod tests {
         assert_eq!(memory_text(None, Some("8Gi")), "unavailable of 8Gi");
         assert_eq!(cpu_text(None, None), "unavailable");
         assert_eq!(memory_text(Some(&usage), None), "512 MiB");
+    }
+
+    #[test]
+    fn test_volume_cell_text_reads_the_claim_or_says_its_absence() {
+        use crate::api::pods::{StoredStorage, StoredVolume};
+        let volume = |kind, size: Option<&str>, deleting| StoredVolume {
+            kind,
+            size: size.map(str::to_string),
+            deleting,
+        };
+        let row = |volumes| StoredStorage {
+            conversation_id: 7,
+            conversation_title: "seat".to_string(),
+            volumes,
+        };
+        let both = row(vec![
+            volume(StorageKind::Workspace, Some("20Gi"), false),
+            volume(StorageKind::Docker, Some("20Gi"), true),
+        ]);
+        assert_eq!(volume_cell_text(&both, StorageKind::Workspace), "20Gi");
+        assert_eq!(volume_cell_text(&both, StorageKind::Docker), "removing\u{2026}");
+        // A halfway removal: the docker claim's delete failed and this
+        // row lists only the workspace; and a claim with no size reads
+        // "stored" rather than an empty cell.
+        let half = row(vec![volume(StorageKind::Workspace, None, false)]);
+        assert_eq!(volume_cell_text(&half, StorageKind::Workspace), "stored");
+        assert_eq!(volume_cell_text(&half, StorageKind::Docker), "none");
     }
 }

@@ -273,18 +273,27 @@ pub(super) async fn report_docker_restart(pool: &PgPool, pod_id: i64, reason: Op
 /// cluster, so a new pod never shares the Docker claim with one still
 /// stopping. Ours, and ones with no instance label (from before SME-115:
 /// possibly ours, and waiting harms nothing); never another database's.
+/// `extra_labels` (SME-253: the storage removal adds the language-server
+/// label) widens it: the ours + no-instance pair is checked per label.
 pub(super) async fn wait_for_conversation_pods_gone(
     client: &kube::Client,
     conversation_id: i64,
     timeout: Duration,
     instance: &str,
+    extra_labels: &[&'static str],
 ) -> Result<(), SandboxError> {
     let pods = pods_api(client);
-    let selectors = [
-        format!("{CONVERSATION_LABEL}={conversation_id},{INSTANCE_LABEL}={instance}"),
-        format!("{CONVERSATION_LABEL}={conversation_id},!{INSTANCE_LABEL}"),
-    ]
-    .map(|labels| ListParams::default().labels(&labels));
+    let selectors: Vec<ListParams> = [CONVERSATION_LABEL]
+        .into_iter()
+        .chain(extra_labels.iter().copied())
+        .flat_map(|label| {
+            [
+                format!("{label}={conversation_id},{INSTANCE_LABEL}={instance}"),
+                format!("{label}={conversation_id},!{INSTANCE_LABEL}"),
+            ]
+        })
+        .map(|labels| ListParams::default().labels(&labels))
+        .collect();
     let waited = tokio::time::timeout(timeout, async {
         loop {
             let mut remaining = false;
@@ -304,6 +313,12 @@ pub(super) async fn wait_for_conversation_pods_gone(
         ))
     })?
 }
+
+/// How long `ensure_conversation_claim` waits for one of its
+/// conversation's claims that is already being deleted (a storage removal
+/// not yet finished, SME-253) to go, polling every 500 ms, before the
+/// create gives up with `Timeout`.
+const TERMINATING_CLAIM_WAIT: Duration = Duration::from_secs(20);
 
 /// Creates the conversation's claims unless they already exist, so its
 /// later pods reuse its images and build cache and find /workspace as the
@@ -332,14 +347,45 @@ async fn ensure_conversation_claim(
     conversation_id: i64,
     instance: &db::SmeltInstance,
 ) -> Result<(), SandboxError> {
-    let existing = match pvcs.get_opt(&name).await? {
-        Some(claim) => claim,
-        None => match pvcs.create(&PostParams::default(), &spec).await {
-            Ok(_) => return Ok(()),
-            // Another create got there first: whose is it?
-            Err(kube::Error::Api(e)) if e.code == 409 => pvcs.get(&name).await?,
-            Err(e) => return Err(e.into()),
-        },
+    // How long this claim, if found already being deleted, has to finish
+    // going before the create gives up (SME-253). Normally only finalizer
+    // and volume-detach latency remains — the create path waited for the
+    // conversation's pods first.
+    let doomed_gone_by = tokio::time::Instant::now() + TERMINATING_CLAIM_WAIT;
+    let existing = loop {
+        let existing = match pvcs.get_opt(&name).await? {
+            Some(claim) => claim,
+            None => match pvcs.create(&PostParams::default(), &spec).await {
+                Ok(_) => return Ok(()),
+                // Another create got there first: whose is it?
+                Err(kube::Error::Api(e)) if e.code == 409 => pvcs.get(&name).await?,
+                Err(e) => return Err(e.into()),
+            },
+        };
+        // A claim already being deleted is never mounted (SME-253): its
+        // volume is freed the moment its last holder goes, which would
+        // drop /workspace out from under a pod started onto it. Wait it
+        // out and create fresh; a fresh same-name claim means the next
+        // read finds it, and ownership is settled below. A doomed
+        // unlabelled claim is waited out too when this database owns
+        // unlabelled objects — adopting one mid-deletion would mount it
+        // just the same (SME-253 review 1, finding 4).
+        let doomed = existing.metadata.deletion_timestamp.is_some()
+            && match ownership(&existing.metadata, &instance.id) {
+                Ownership::Ours => true,
+                Ownership::Unlabelled => instance.owns_unlabelled,
+                Ownership::Foreign => false,
+            };
+        if doomed {
+            if tokio::time::Instant::now() >= doomed_gone_by {
+                return Err(SandboxError::Timeout(Some(
+                    "this conversation's sandbox storage is still being removed; try again".to_string(),
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
+        break existing;
     };
     // Never another database's /workspace (SME-115). One from before the
     // fix that startup missed is adopted now, by its owner only.
@@ -388,6 +434,61 @@ pub(super) async fn delete_conversation_pvcs(client: &kube::Client, conversation
             (Ownership::Foreign, _) => {
                 tracing::info!(claim = %name, "left another smelt database's claim of the same name")
             }
+        }
+    }
+}
+
+/// What `remove_conversation_claim` did to one named claim (SME-253).
+pub(super) enum ClaimRemoval {
+    /// Ours, and the delete was accepted.
+    Deleted,
+    /// Already gone, or already being deleted.
+    AlreadyGone,
+    /// Still here and not ours to delete — unlabelled, no uid, or the
+    /// delete failed. Counted as failed: the caller says something still
+    /// holds the disk, and the panel will still show it.
+    Failed,
+    /// Another database's: left, and no failure of ours either.
+    Foreign,
+}
+
+/// The storage removal's delete of one named claim (SME-253), with the
+/// SME-115 guard: only ours is deleted, held to the uid it was read at,
+/// and a foreign claim that shares the name is never touched. Best-
+/// effort like the rest: what happened is returned as a count, not an
+/// error — a halfway removal is a real, reportable state.
+pub(super) async fn remove_conversation_claim(client: &kube::Client, name: &str, instance: &str) -> ClaimRemoval {
+    let claim = match pvc_api(client).get_opt(name).await {
+        // Already gone: as good as deleted.
+        Ok(None) => return ClaimRemoval::AlreadyGone,
+        // Already being deleted (its teardown, another removal): nothing
+        // to do, and nothing to log again (SME-117 review 1).
+        Ok(Some(claim)) if claim.metadata.deletion_timestamp.is_some() => return ClaimRemoval::AlreadyGone,
+        Ok(Some(claim)) => claim,
+        Err(e) => {
+            tracing::warn!(claim = %name, error = %e, "couldn't read a conversation's claim to remove its storage");
+            return ClaimRemoval::Failed;
+        }
+    };
+    match (ownership(&claim.metadata, instance), claim.metadata.uid) {
+        (Ownership::Ours, Some(uid)) => {
+            if delete_claim_if_unchanged(client, name, &uid).await {
+                ClaimRemoval::Deleted
+            } else {
+                ClaimRemoval::Failed
+            }
+        }
+        (Ownership::Ours, None) => {
+            tracing::warn!(claim = %name, "a claim with no uid; left alone");
+            ClaimRemoval::Failed
+        }
+        (Ownership::Unlabelled, _) => {
+            tracing::warn!(claim = %name, "left a claim with no smelt/instance label (made before SME-115)");
+            ClaimRemoval::Failed
+        }
+        (Ownership::Foreign, _) => {
+            tracing::info!(claim = %name, "left another smelt database's claim of the same name");
+            ClaimRemoval::Foreign
         }
     }
 }

@@ -190,7 +190,7 @@ pub(crate) fn pods_api(client: &kube::Client) -> Api<Pod> {
     Api::namespaced(client.clone(), NAMESPACE)
 }
 
-fn pvc_api(client: &kube::Client) -> Api<PersistentVolumeClaim> {
+pub(crate) fn pvc_api(client: &kube::Client) -> Api<PersistentVolumeClaim> {
     Api::namespaced(client.clone(), NAMESPACE)
 }
 

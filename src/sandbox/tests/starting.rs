@@ -29,7 +29,7 @@ async fn test_wait_for_conversation_pods_gone_waits_out_a_stopping_pod() {
         .expect("start deleting the pod");
     let listed_while_stopping = pods.get_opt(&name).await.expect("get pod").is_some();
     let waited =
-        wait_for_conversation_pods_gone(&client, conversation_id, Duration::from_secs(60), TEST_INSTANCE).await;
+        wait_for_conversation_pods_gone(&client, conversation_id, Duration::from_secs(60), TEST_INSTANCE, &[]).await;
     let still_there = pods.get_opt(&name).await.expect("get pod").is_some();
 
     pods.delete(&name, &immediate_delete_params()).await.ok();
@@ -164,7 +164,7 @@ async fn test_a_stopping_pod_from_another_run_doesnt_hold_up_the_tier(pool: PgPo
             .map_err(|e| format!("move the id sequences: {e}"))?;
         let conversation = db::create_conversation(&pool).await.map_err(|e| format!("conversation: {e}"))?;
         let instance = db::smelt_instance(&pool).await.map_err(|e| format!("instance: {e}"))?.id;
-        wait_for_conversation_pods_gone(&client, conversation.id, Duration::from_secs(10), &instance)
+        wait_for_conversation_pods_gone(&client, conversation.id, Duration::from_secs(10), &instance, &[])
             .await
             .map_err(|e| format!("conversation {}'s pod would wait: {e:?}", conversation.id))?;
         Ok(conversation.id)

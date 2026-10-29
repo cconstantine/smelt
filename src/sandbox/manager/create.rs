@@ -260,7 +260,13 @@ pub(in crate::sandbox) async fn create_pod_attempt_unspanned(
     // `SandboxManager::delete` itself already uses for the same reason.
     // A pod terminate_pod just stopped can still hold the Docker claim.
     if let Err(e) =
-        wait_for_conversation_pods_gone(&manager.client, conversation_id, running_wait_timeout(), &instance.id)
+        wait_for_conversation_pods_gone(
+        &manager.client,
+        conversation_id,
+        running_wait_timeout(),
+        &instance.id,
+        &[],
+    )
             .await
     {
         let _ = db::terminate_sandbox_pod(pool, row.id).await;

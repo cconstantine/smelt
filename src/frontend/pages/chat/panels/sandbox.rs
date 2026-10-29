@@ -2,6 +2,9 @@
 
 use super::super::*;
 
+use crate::api::pods::{StorageKind, StoredVolume, remove_stored_storage};
+use crate::frontend::pages::STORAGE_REMOVE_WARNING;
+
 /// What the sandbox panel says about a repo's `AGENTS.md` files, if it
 /// has any: which the model has loaded.
 pub(in super::super) fn instructions_label(repo: &RepoSummary) -> Option<String> {
@@ -62,6 +65,30 @@ pub(in super::super) fn repo_detail_notice(repo: &RepoSummary) -> Option<String>
 /// model — the remote writes into it, and it's never checked.
 pub(in super::super) fn repo_error_shown(repo: &RepoSummary) -> Option<String> {
     repo.error.as_deref().map(|error| crate::git::plain_multiline_text(error))
+}
+
+/// The sandbox panel's storage line (SME-253): `Sandbox storage:
+/// /workspace 20Gi · Docker images 20Gi`. A claim being deleted reads
+/// `removing…`; the size shown is the claim's capacity, which under
+/// local-path is its *request*, never usage — the Remove button's title
+/// says so at length.
+pub(in super::super) fn storage_line(volumes: &[StoredVolume]) -> String {
+    let parts: Vec<String> = volumes
+        .iter()
+        .map(|volume| {
+            let label = match volume.kind {
+                StorageKind::Workspace => "/workspace",
+                StorageKind::Docker => "Docker images",
+            };
+            let size = if volume.deleting {
+                "removing\u{2026}".to_string()
+            } else {
+                volume.size.clone().unwrap_or_else(|| "unknown size".to_string())
+            };
+            format!("{label} {size}")
+        })
+        .collect();
+    format!("Sandbox storage: {}", parts.join(" \u{b7} "))
 }
 
 /// What a terminal's titlebar says about its most recent command
@@ -171,6 +198,7 @@ fn short_command(command: &str) -> String {
 pub(in super::super) fn SandboxPanel(
     selected: Memo<Option<i64>>,
     state: Store<ConversationState>,
+    stored_volumes: Vec<StoredVolume>,
     on_stop_pod: EventHandler<i64>,
 ) -> Element {
     let repos = state.repos();
@@ -178,6 +206,19 @@ pub(in super::super) fn SandboxPanel(
     let sandbox_terminals = state.sandbox_terminals();
     let pending_pod_stop = state.pending_pod_stop();
     let pod_stop_error = state.pod_stop_error();
+    // Storage removal (SME-253) arms and confirms right here; the
+    // `PodsChanged` the server publishes refetches the chat page's
+    // stored-volumes resource, and this prop follows.
+    let mut pending_storage_remove = use_signal(|| false);
+    let mut storage_remove_error: Signal<Option<String>> = use_signal(|| None);
+    let mut confirm_storage_removal = move || {
+        pending_storage_remove.set(false);
+        let Some(conversation_id) = selected() else { return };
+        spawn(async move {
+            let result = remove_stored_storage(conversation_id).await;
+            storage_remove_error.set(result.err().map(|e| super::server_error_message(&e)));
+        });
+    };
     rsx! {
         aside { class: "sandbox-panel",
             h3 { "Sandbox" }
@@ -217,6 +258,27 @@ pub(in super::super) fn SandboxPanel(
                             }
                         }
                     }
+            // Sandbox storage (SME-253): the two claims outlive the pod,
+            // so this sits above the pod blocks and shows with no pod —
+            // a stopped conversation still holding disk is the whole
+            // point of the control.
+            if !stored_volumes.is_empty() {
+                div { class: "sandbox-storage",
+                    div { class: "sandbox-storage-line", title: "{STORAGE_REMOVE_WARNING}",
+                        "{storage_line(&stored_volumes)}"
+                    }
+                    super::TwoStepButton {
+                        armed: pending_storage_remove(),
+                        class: "storage-remove",
+                        idle: "Remove volumes",
+                        confirm: "Confirm remove?",
+                        title: Some(STORAGE_REMOVE_WARNING),
+                        on_arm: move |_| pending_storage_remove.set(true),
+                        on_confirm: move |_| confirm_storage_removal(),
+                    }
+                    super::ErrorText { message: storage_remove_error() }
+                }
+            }
             // A conversation has at most one live pod (see
             // SME-11's "One pod
             // per conversation") — straight through, no tab
