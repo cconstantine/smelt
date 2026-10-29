@@ -273,18 +273,27 @@ pub(super) async fn report_docker_restart(pool: &PgPool, pod_id: i64, reason: Op
 /// cluster, so a new pod never shares the Docker claim with one still
 /// stopping. Ours, and ones with no instance label (from before SME-115:
 /// possibly ours, and waiting harms nothing); never another database's.
+/// `extra_labels` (SME-253: the storage removal adds the language-server
+/// label) widens it: the ours + no-instance pair is checked per label.
 pub(super) async fn wait_for_conversation_pods_gone(
     client: &kube::Client,
     conversation_id: i64,
     timeout: Duration,
     instance: &str,
+    extra_labels: &[&'static str],
 ) -> Result<(), SandboxError> {
     let pods = pods_api(client);
-    let selectors = [
-        format!("{CONVERSATION_LABEL}={conversation_id},{INSTANCE_LABEL}={instance}"),
-        format!("{CONVERSATION_LABEL}={conversation_id},!{INSTANCE_LABEL}"),
-    ]
-    .map(|labels| ListParams::default().labels(&labels));
+    let selectors: Vec<ListParams> = [CONVERSATION_LABEL]
+        .into_iter()
+        .chain(extra_labels.iter().copied())
+        .flat_map(|label| {
+            [
+                format!("{label}={conversation_id},{INSTANCE_LABEL}={instance}"),
+                format!("{label}={conversation_id},!{INSTANCE_LABEL}"),
+            ]
+        })
+        .map(|labels| ListParams::default().labels(&labels))
+        .collect();
     let waited = tokio::time::timeout(timeout, async {
         loop {
             let mut remaining = false;
@@ -304,6 +313,12 @@ pub(super) async fn wait_for_conversation_pods_gone(
         ))
     })?
 }
+
+/// How long `ensure_conversation_claim` waits for one of its
+/// conversation's claims that is already being deleted (a storage removal
+/// not yet finished, SME-253) to go, polling every 500 ms, before the
+/// create gives up with `Timeout`.
+const TERMINATING_CLAIM_WAIT: Duration = Duration::from_secs(20);
 
 /// Creates the conversation's claims unless they already exist, so its
 /// later pods reuse its images and build cache and find /workspace as the
@@ -332,14 +347,38 @@ async fn ensure_conversation_claim(
     conversation_id: i64,
     instance: &db::SmeltInstance,
 ) -> Result<(), SandboxError> {
-    let existing = match pvcs.get_opt(&name).await? {
-        Some(claim) => claim,
-        None => match pvcs.create(&PostParams::default(), &spec).await {
-            Ok(_) => return Ok(()),
-            // Another create got there first: whose is it?
-            Err(kube::Error::Api(e)) if e.code == 409 => pvcs.get(&name).await?,
-            Err(e) => return Err(e.into()),
-        },
+    // How long this claim, if found already being deleted, has to finish
+    // going before the create gives up (SME-253). Normally only finalizer
+    // and volume-detach latency remains — the create path waited for the
+    // conversation's pods first.
+    let doomed_gone_by = tokio::time::Instant::now() + TERMINATING_CLAIM_WAIT;
+    let existing = loop {
+        let existing = match pvcs.get_opt(&name).await? {
+            Some(claim) => claim,
+            None => match pvcs.create(&PostParams::default(), &spec).await {
+                Ok(_) => return Ok(()),
+                // Another create got there first: whose is it?
+                Err(kube::Error::Api(e)) if e.code == 409 => pvcs.get(&name).await?,
+                Err(e) => return Err(e.into()),
+            },
+        };
+        // A claim of ours already being deleted is never mounted
+        // (SME-253): its volume is freed the moment its last holder goes,
+        // which would drop /workspace out from under a pod started onto
+        // it. Wait it out and create fresh; a fresh same-name claim means
+        // the next read finds it, and ownership is settled below.
+        if existing.metadata.deletion_timestamp.is_some()
+            && ownership(&existing.metadata, &instance.id) == Ownership::Ours
+        {
+            if tokio::time::Instant::now() >= doomed_gone_by {
+                return Err(SandboxError::Timeout(Some(
+                    "this conversation's sandbox storage is still being removed; try again".to_string(),
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
+        break existing;
     };
     // Never another database's /workspace (SME-115). One from before the
     // fix that startup missed is adopted now, by its owner only.
