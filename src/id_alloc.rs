@@ -20,8 +20,8 @@
 //!   harness's sweep (SME-134 with SME-255's arm) takes a finished run's
 //!   leftovers whatever their names.
 //! * **past the reserve**: each band holds back a documented reserve of
-//!   calls (GLOBAL_IDS 4,000, FIXTURE_IDS 8,000 — each at least four
-//!   times the server suite's heaviest draw, ≈1,000 and ≈2,100) from its
+//!   calls (GLOBAL_IDS 4,000, FIXTURE_IDS 8,000 — each ≈ four times the
+//!   server suite's heaviest draw, ≈1,000 and ≈2,100) from its
 //!   seed window, so even the worst seed leaves a full reserve above it.
 //!   A process that asks for more than the reserve is a pathological
 //!   loop: it panics by name rather than wrapping into spent values. A
