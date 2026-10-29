@@ -362,14 +362,21 @@ async fn ensure_conversation_claim(
                 Err(e) => return Err(e.into()),
             },
         };
-        // A claim of ours already being deleted is never mounted
-        // (SME-253): its volume is freed the moment its last holder goes,
-        // which would drop /workspace out from under a pod started onto
-        // it. Wait it out and create fresh; a fresh same-name claim means
-        // the next read finds it, and ownership is settled below.
-        if existing.metadata.deletion_timestamp.is_some()
-            && ownership(&existing.metadata, &instance.id) == Ownership::Ours
-        {
+        // A claim already being deleted is never mounted (SME-253): its
+        // volume is freed the moment its last holder goes, which would
+        // drop /workspace out from under a pod started onto it. Wait it
+        // out and create fresh; a fresh same-name claim means the next
+        // read finds it, and ownership is settled below. A doomed
+        // unlabelled claim is waited out too when this database owns
+        // unlabelled objects — adopting one mid-deletion would mount it
+        // just the same (SME-253 review 1, finding 4).
+        let doomed = existing.metadata.deletion_timestamp.is_some()
+            && match ownership(&existing.metadata, &instance.id) {
+                Ownership::Ours => true,
+                Ownership::Unlabelled => instance.owns_unlabelled,
+                Ownership::Foreign => false,
+            };
+        if doomed {
             if tokio::time::Instant::now() >= doomed_gone_by {
                 return Err(SandboxError::Timeout(Some(
                     "this conversation's sandbox storage is still being removed; try again".to_string(),

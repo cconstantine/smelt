@@ -1,4 +1,39 @@
+use kube::api::{Patch, PatchParams};
+
 use super::*;
+
+/// Waits for `holder` to be Running and for `claim` to carry the
+/// `pvc-protection` finalizer — the moment a delete of it is guaranteed
+/// to leave it Terminating rather than finish (SME-253 review 1). A pod
+/// only holds a claim once it's scheduled and the protection controller
+/// has caught up, so deleting the moment after creating the holder is a
+/// race, not a held claim. Holders ask for tiny resources explicitly:
+/// the namespaces' LimitRange otherwise defaults every container to a
+/// 64Gi request, which no node here can fit.
+async fn wait_holder_mounting(client: &kube::Client, holder: &str, claim: &str) {
+    let running = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let phase = pods_api(client).get(holder).await.expect("get holder").status.unwrap_or_default().phase;
+            if phase.as_deref() == Some("Running") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(running.is_ok(), "{holder} never reached Running");
+    let protected = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let finalizers = pvc_api(client).get(claim).await.expect("get claim").metadata.finalizers.unwrap_or_default();
+            if finalizers.iter().any(|f| f == "kubernetes.io/pvc-protection") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(protected.is_ok(), "{claim} never gained the pvc-protection finalizer while {holder} mounted it");
+}
 
 /// SME-253: a claim already being deleted is never mounted by the next
 /// pod. A holder pod (one that never starts, so nothing real is mounted)
@@ -257,6 +292,227 @@ async fn test_removal_stops_the_conversations_language_server_pods_and_frees_the
         })
         .await;
         assert!(gone.is_ok(), "the claim the LSP pod mounted is freed after removal");
+    })
+    .await;
+}
+
+/// SME-253 review 1, finding 1: a start racing a removal can never mount a
+/// doomed claim — the removal takes the conversation's pod-start lock, so a
+/// start is either wholly before it or waits for storage that is already
+/// gone. The test holds that lock the way a start would; removal must wait.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_removal_waits_for_the_pod_start_lock(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT * 2, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let id = conversation.id;
+        create_pod(&pool, id, PodLimitOverrides::default()).await.expect("create_pod");
+        terminate_pod(&pool, id).await.expect("terminate_pod");
+        let names = [workspace_pvc_name(id), docker_pvc_name(id)];
+
+        let start_lock = pod_start_lock(id);
+        let start_held = start_lock.lock().await;
+        let removal = tokio::time::timeout(Duration::from_secs(5), remove_conversation_storage(&pool, id)).await;
+        assert!(removal.is_err(), "a removal waits for the pod-start lock a start holds");
+        for name in &names {
+            assert!(pvc_api(&client).get_opt(name).await.expect("get_opt").is_some(), "{name} is untouched while the start lock is held");
+        }
+        drop(start_held);
+
+        let removal = remove_conversation_storage(&pool, id).await.expect("remove after the start released");
+        assert_eq!((removal.claims_deleted, removal.claims_failed), (2, 0), "{removal:?}");
+        assert!(claims_gone(&client, &names).await, "both claims go once the lock frees");
+    })
+    .await;
+}
+
+/// SME-253 review 1, finding 2: a claim left in place (not ours to delete)
+/// is not a removed storage — the checkouts survive on it, so `ready` repos
+/// stay ready and nothing says they were lost. The claim goes back into
+/// the pre-SME-115 state (bound, then stripped of its instance label),
+/// which is the state that actually keeps serving files.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_removal_that_deletes_nothing_leaves_ready_repos_ready(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT * 2, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let id = conversation.id;
+        create_pod(&pool, id, PodLimitOverrides::default()).await.expect("create_pod");
+        terminate_pod(&pool, id).await.expect("terminate_pod");
+        let repo = db::create_conversation_repo(&pool, id, "u", &format!("k-{id}"), None, "r").await.expect("repo row");
+        db::set_repo_ready(&pool, repo.id, 1, "main", None, &[], &[], None).await.expect("ready");
+
+        let name = workspace_pvc_name(id);
+        pvc_api(&client)
+            .patch(
+                &name,
+                &PatchParams::default(),
+                &Patch::Merge(serde_json::json!({"metadata": {"labels": {INSTANCE_LABEL: null}}})),
+            )
+            .await
+            .expect("strip the instance label");
+
+        let removal = remove_conversation_storage(&pool, id).await.expect("remove_conversation_storage");
+        pvc_api(&client).delete(&name, &DeleteParams::default()).await.ok();
+
+        assert_eq!((removal.claims_deleted, removal.claims_failed), (1, 1), "the docker claim went; the unlabelled workspace stayed: {removal:?}");
+        let row = db::get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
+        assert_eq!(row.status, "ready", "a storage that survived kept its checkouts: the repo still reads ready: {row:?}");
+        assert!(row.error.is_none(), "{row:?}");
+    })
+    .await;
+}
+
+/// SME-253 review 1, finding 3: a claim that outlives the removal's
+/// confirm still announces itself when it goes — the chat panel refetches
+/// on nothing else, and one refetch at the return would sit at
+/// "removing…" forever.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_claim_outliving_the_removal_publishes_pods_changed_when_it_goes(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT * 2, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let id = conversation.id;
+        create_pod(&pool, id, PodLimitOverrides::default()).await.expect("create_pod");
+        terminate_pod(&pool, id).await.expect("terminate_pod");
+
+        // A holder with no labels at all, invisible to the removal's own
+        // waits, mounts the workspace claim — so its delete is still
+        // finishing as the removal returns, past its 5 s confirm.
+        let name = workspace_pvc_name(id);
+        let holder: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": format!("slow-claim-holder-{id}")},
+            "spec": {
+                "restartPolicy": "Never",
+                "containers": [{"name": "sleep", "image": OWN_SANDBOX_IMAGE, "command": ["sleep", "3600"], "imagePullPolicy": "IfNotPresent", "resources": {"requests": {"memory": "32Mi", "cpu": "10m"}, "limits": {"memory": "256Mi"}}}],
+                "volumes": [{"name": "workspace", "persistentVolumeClaim": {"claimName": name}}],
+            },
+        }))
+        .expect("pod");
+        let holder_name = pods_api(&client)
+            .create(&PostParams::default(), &holder)
+            .await
+            .expect("create the holder")
+            .metadata
+            .name
+            .expect("a created pod's name");
+        wait_holder_mounting(&client, &holder_name, &name).await;
+
+        remove_conversation_storage(&pool, id).await.expect("remove_conversation_storage");
+        // Non-vacuity: the holder really held it — the removal returned
+        // with the claim still Terminating, which is the state the panel
+        // would otherwise sit on.
+        let held = pvc_api(&client).get(&name).await.expect("the holder held the claim past the removal");
+        assert!(held.metadata.deletion_timestamp.is_some(), "the claim was still deleting when the removal returned");
+
+        // Subscribe before freeing the holder: the announcement comes at
+        // most a poll after the claim goes, and this can't miss it.
+        let mut rx = crate::events::subscribe_app();
+        pods_api(&client).delete(&holder_name, &immediate_delete_params()).await.expect("free the claim");
+
+        // Any `PodsChanged` counts only once the claim has actually gone:
+        // another test's can't answer for ours while it stands (the
+        // broadcast is shared, so a stray event a full window after the
+        // claim went is the one thing this can't rule out — kept tight).
+        let settled = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match rx.recv().await {
+                    Ok(crate::events::AppEvent::PodsChanged) => {
+                        if pvc_api(&client).get_opt(&name).await.ok().flatten().is_none() {
+                            return true;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => panic!("the app event stream closed: {e}"),
+                }
+            }
+        })
+        .await
+        .is_ok();
+        assert!(settled, "a `PodsChanged` arrives when the slow claim finally goes");
+        assert!(claims_gone(&client, &[name]).await, "the claim went too");
+    })
+    .await;
+}
+
+/// SME-253 review 1, finding 4: a doomed pre-SME-115 claim is never a
+/// mount target either — even the database that owns unlabelled claims
+/// waits it out and re-creates, rather than adopting one mid-deletion.
+///
+/// The claim is made by the pod lifecycle (only a Bound claim is ever
+/// protected — pvc-protection skips unbound ones, and local-path binds
+/// late), then stripped of its instance label to put it back into the
+/// pre-SME-115 state.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_doomed_unlabelled_claim_is_waited_out_not_adopted(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT * 2, async {
+        sqlx::query("UPDATE smelt_instance SET owns_unlabelled = true")
+            .execute(&pool)
+            .await
+            .expect("a database that owns unlabelled objects");
+        let instance = db::smelt_instance(&pool).await.expect("instance");
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let id = conversation.id;
+        create_pod(&pool, id, PodLimitOverrides::default()).await.expect("create_pod");
+        terminate_pod(&pool, id).await.expect("terminate_pod");
+
+        // Bound, held by no pod, and unlabelled again — the state SME-115
+        // left behind, which this database owns.
+        let name = workspace_pvc_name(id);
+        pvc_api(&client)
+            .patch(
+                &name,
+                &PatchParams::default(),
+                &Patch::Merge(serde_json::json!({"metadata": {"labels": {INSTANCE_LABEL: null}}})),
+            )
+            .await
+            .expect("strip the instance label");
+        let doomed_uid = pvc_api(&client)
+            .get(&name)
+            .await
+            .expect("read the unlabelled claim")
+            .metadata
+            .uid
+            .expect("a created claim's uid");
+        let holder: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {
+                "name": format!("doomed-unlabelled-holder-{id}"),
+                "labels": {INSTANCE_LABEL: instance.id.clone()},
+            },
+            "spec": {
+                "restartPolicy": "Never",
+                "containers": [{"name": "sleep", "image": OWN_SANDBOX_IMAGE, "command": ["sleep", "3600"], "imagePullPolicy": "IfNotPresent", "resources": {"requests": {"memory": "32Mi", "cpu": "10m"}, "limits": {"memory": "256Mi"}}}],
+                "volumes": [{"name": "workspace", "persistentVolumeClaim": {"claimName": name.clone()}}],
+            },
+        }))
+        .expect("pod");
+        let holder_name = pods_api(&client)
+            .create(&PostParams::default(), &holder)
+            .await
+            .expect("create the holder pod")
+            .metadata
+            .name
+            .expect("a created pod's name");
+        wait_holder_mounting(&client, &holder_name, &name).await;
+
+        pvc_api(&client).delete(&name, &DeleteParams::default()).await.expect("delete the claim");
+        let doomed = pvc_api(&client).get(&name).await.expect("read the claim back");
+        assert!(doomed.metadata.deletion_timestamp.is_some(), "the holder should leave it Terminating, not gone");
+
+        // The holder goes a moment after the wait begins, as test 4's does.
+        let freer = client.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            pods_api(&freer).delete(&holder_name, &immediate_delete_params()).await.ok();
+        });
+
+        ensure_conversation_pvcs(&client, id, &instance)
+            .await
+            .expect("a doomed unlabelled claim is waited out and re-created, not adopted mid-deletion");
+        let fresh = pvc_api(&client).get(&name).await.expect("get the fresh claim");
+        assert_ne!(fresh.metadata.uid.clone().expect("the fresh claim's uid"), doomed_uid, "the next pod gets a fresh claim, never the doomed one");
+        assert!(fresh.metadata.deletion_timestamp.is_none(), "the re-created claim isn't being deleted");
     })
     .await;
 }

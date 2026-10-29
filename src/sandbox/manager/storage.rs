@@ -18,16 +18,22 @@ const STORAGE_REMOVED_ERROR: &str = "the sandbox storage was deleted; clone the 
 /// language-server pods, since only after their last holder is gone do
 /// the claims' finalizers release.
 ///
-/// Deliberately outside the pod-start lock: a start racing a removal
-/// converges through `create_pod`'s own SME-122 checks (its pod row
-/// closed, its claim gone or Terminating under it — the reuse guard
-/// waits that out) and reports "the sandbox was stopped while it was
-/// starting".
+/// Takes the conversation's pod-start lock for its whole body (SME-253
+/// review 1, finding 1): a start racing a removal is then either wholly
+/// before it — its pod row is live and stopped below — or queued behind
+/// the lock and meets the reuse guard normally (its own SME-122 re-check
+/// reads its row after ours closed, and its claim bind waits out or
+/// skips what this removal left Terminating). Nothing below takes any
+/// other lock, so the bounded pod wait inside cannot deadlock.
 pub async fn remove_conversation_storage(
     pool: &PgPool,
     conversation_id: i64,
 ) -> Result<StorageRemoval, SandboxError> {
     let manager = get()?;
+    // One removal or one start at a time for this conversation, for the
+    // whole body (review 1, finding 1).
+    let start_lock = pod_start_lock(conversation_id);
+    let _starting = start_lock.lock().await;
     // Gone: its teardown owns its claims now, and a panel mid-delete
     // shouldn't error.
     if !db::conversation_exists(pool, conversation_id).await.map_err(SandboxError::Db)? {
@@ -103,14 +109,30 @@ pub async fn remove_conversation_storage(
     // volumes and the global sandbox volumes claims can never be caught
     // even if labels change later.
     let mut deleted: Vec<String> = Vec::new();
-    for name in [docker_pvc_name(conversation_id), workspace_pvc_name(conversation_id)] {
+    // The checkouts live on the workspace claim: if that one is left
+    // behind (Failed or Foreign), its disk and everything cloned on it
+    // are still there, and neither the repos nor the model are told
+    // otherwise (SME-253 review 1, finding 2). Already gone counts as
+    // gone; Foreign means it stands, another server's.
+    let mut workspace_gone = true;
+    for (name, is_workspace) in [(docker_pvc_name(conversation_id), false), (workspace_pvc_name(conversation_id), true)] {
         match remove_conversation_claim(&manager.client, &name, &instance.id).await {
             ClaimRemoval::Deleted => {
                 removal.claims_deleted += 1;
                 deleted.push(name);
             }
-            ClaimRemoval::Failed => removal.claims_failed += 1,
-            ClaimRemoval::AlreadyGone | ClaimRemoval::Foreign => {}
+            ClaimRemoval::Failed => {
+                removal.claims_failed += 1;
+                if is_workspace {
+                    workspace_gone = false;
+                }
+            }
+            ClaimRemoval::AlreadyGone => {}
+            ClaimRemoval::Foreign => {
+                if is_workspace {
+                    workspace_gone = false;
+                }
+            }
         }
     }
 
@@ -137,21 +159,54 @@ pub async fn remove_conversation_storage(
         .await;
         if confirm.is_err() {
             tracing::info!(conversation_id, "a claim was still deleting as the removal returned");
+            // The chat panel refetches its stored volumes on
+            // `PodsChanged` and on nothing else (the /pods page has a
+            // 30 s tick; the panel doesn't), and this call's event
+            // published while the claim still stood — without another
+            // word its row sits at "removing…" until some unrelated
+            // event (SME-253 review 1, finding 3). Announce once more
+            // when the names themselves are gone; bounded, so a stuck
+            // finalizer costs one quiet task and not a leak, and its
+            // late event is just a refetch of what already shows.
+            let client = manager.client.clone();
+            let names = deleted;
+            tokio::spawn(async move {
+                let gone_by = tokio::time::Instant::now() + Duration::from_secs(600);
+                loop {
+                    let mut left = 0;
+                    for name in &names {
+                        if pvc_api(&client).get_opt(name).await.ok().flatten().is_some() {
+                            left += 1;
+                        }
+                    }
+                    if left == 0 || tokio::time::Instant::now() >= gone_by {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                events::publish_app(events::AppEvent::PodsChanged);
+            });
         }
     }
 
-    // The checkouts are gone: mark the conversation's finished repos
-    // failed. Logged, not returned: a display lag with nothing on disk
-    // depending on it (the panel refreshes with the repos themselves).
-    match db::fail_repos_after_storage_removal(pool, conversation_id, STORAGE_REMOVED_ERROR).await {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(conversation_id, repos_failed = n, "marked the conversation's repos after a storage removal"),
-        Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't mark the conversation's repos after a storage removal"),
+    // The checkouts are gone with the workspace claim: mark the
+    // conversation's finished repos failed — unless that claim stood,
+    // in which case they're all still on disk (review 1, finding 2).
+    // Logged, not returned: a display lag with nothing on disk depending
+    // on it (the panel refreshes with the repos themselves).
+    if workspace_gone {
+        match db::fail_repos_after_storage_removal(pool, conversation_id, STORAGE_REMOVED_ERROR).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(conversation_id, repos_failed = n, "marked the conversation's repos after a storage removal"),
+            Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't mark the conversation's repos after a storage removal"),
+        }
     }
 
     // The model learns on its next turn, like a user Stop — and only
-    // when something was running to experience it.
-    if removal.pod_stopped {
+    // when something was running to experience it, and it really lost
+    // its storage (review 1, finding 2: a claim left standing keeps its
+    // files; the model must not be told to re-clone over live ones).
+    if removal.pod_stopped && workspace_gone {
         crate::turn::notify(
             pool,
             conversation_id,
