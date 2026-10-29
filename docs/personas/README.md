@@ -11,7 +11,7 @@ Every persona still follows the rest of the [development process](../development
 | Planner | one Up Next ticket | to Planned, or Todo with no questions | [planner.md](planner.md) |
 | Ticket Driver | one Todo ticket, to merged | keeps it true to its trail; its seats make the moves, the driver only a move its seat died before making | [ticket-driver.md](ticket-driver.md) |
 | Developer | one Todo ticket | to In Progress, then In Review, or Approved with no questions | [developer.md](developer.md) |
-| Code Reviewer | one PR | none: it reports to the Developer | [code-reviewer.md](code-reviewer.md) |
+| Code Reviewer | one PR | none: it reports to the Developer — on a driven ticket, to its starter, the Ticket Driver | [code-reviewer.md](code-reviewer.md) |
 | Integrator | one Approved ticket | to In Review after merging — a seat decision; a merge never moves it | [integrator.md](integrator.md) |
 | Facilitator | the "Next retrospective" ticket | to In Review, or Approved with no questions | [facilitator.md](facilitator.md) |
 

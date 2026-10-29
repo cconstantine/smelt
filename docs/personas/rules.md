@@ -54,4 +54,4 @@ A persona running in a smelt conversation sandbox rather than on the user's mach
 - A report from this seat says which evidence it has: with no toolchain, no Postgres and no cluster at the prompt, "confirmed" means "traced the code path" unless the change was run through the compose stack — say so in the report's header (SME-185's Code Reviewer).
 - The run ends with `docker compose down -v`, `docker system prune -af --volumes`, no `target/` left behind, and `du -sh /workspace` reported in the final report.
 
-- **Reports back** in a few lines: what it did, the ticket's new status, and anything that needs the user or the Project Manager.
+- **Reports back** in a few lines: what it did, the ticket's new status, and anything that needs the user or the Project Manager — on a driven ticket that means its own starter, the Ticket Driver, which relays to the Project Manager whatever the Project Manager must decide.
