@@ -1,26 +1,5 @@
-#![expect(
-    dead_code,
-    reason = "the first production caller is the /api/storage remove endpoint, the next SME-253 commit; the lifecycle tests exercise it now"
-)]
-
 use super::*;
-
-/// What one run of `remove_conversation_storage` did. Counts, not
-/// assertions: a halfway removal is a real state (a claim another
-/// server made between list and delete), and the panel's refetch —
-/// driven by the `PodsChanged` this publishes — is what shows the rest.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct StorageRemoval {
-    /// Whether a running sandbox pod was stopped first.
-    pub pod_stopped: bool,
-    /// How many of the conversation's language-server pods were deleted.
-    pub lsp_pods_stopped: u8,
-    /// How many of the two named claims were deleted here.
-    pub claims_deleted: u8,
-    /// How many were left behind (unlabelled, replaced, a failed
-    /// delete): the panel will still show them.
-    pub claims_failed: u8,
-}
+pub use crate::api::pods::StorageRemoval;
 
 /// How long a removal waits for the conversation's pods — its sandbox
 /// pod and its language-server pods — to be gone before giving up, so

@@ -282,5 +282,4 @@ pub(in crate::sandbox) use start::*;
 pub use create::*;
 pub use terminate::*;
 pub use teardown::*;
-#[expect(unused_imports, reason = "used through sandbox::* from the /api/storage remove endpoint, the next SME-253 commit")]
 pub use storage::*;
