@@ -242,20 +242,10 @@ fn parse_pod_metrics(list: &serde_json::Value) -> std::collections::HashMap<Stri
         .collect()
 }
 
-/// Which claim of the conversation pair a claim name is (SME-253);
-/// `None` for anything else — belt after the label guard, since agent
-/// volumes and the global sandbox volumes share no prefix with these.
-#[cfg(feature = "server")]
-fn storage_kind(name: &str) -> Option<StorageKind> {
-    if name.starts_with("sandbox-workspace-") {
-        Some(StorageKind::Workspace)
-    } else if name.starts_with("sandbox-docker-") {
-        Some(StorageKind::Docker)
-    } else {
-        None
-    }
-}
-
+/// Which claim of the conversation pair a claim name is lives in
+/// `sandbox::spec::conversation_claim_kind` — one decision, one place
+/// (SME-253 review 1, finding 5).
+///
 /// The stored-volumes view's rows: `claims` (already narrowed to this
 /// instance's conversation claims) grouped per conversation, `deleting`
 /// from the deletion timestamp, `size` from bound capacity else the
@@ -270,8 +260,13 @@ fn storage_rows(
 ) -> Vec<StoredStorage> {
     let mut by_id: std::collections::BTreeMap<i64, Vec<StoredVolume>> = Default::default();
     for claim in claims {
-        let Some(kind) = claim.metadata.name.as_deref().and_then(storage_kind) else { continue };
-        let Some(value) = claim.metadata.labels.as_ref().and_then(|labels| labels.get("smelt/conversation")) else {
+        let Some(kind) = claim.metadata.name.as_deref().and_then(crate::sandbox::conversation_claim_kind) else { continue };
+        let Some(value) = claim
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(crate::sandbox::CONVERSATION_LABEL))
+        else {
             continue;
         };
         let Ok(conversation_id) = value.parse::<i64>() else { continue };
@@ -314,7 +309,7 @@ pub(crate) async fn stored_storage(pool: &sqlx::PgPool) -> Result<Vec<StoredStor
     let instance = db::smelt_instance(pool).await.map_err(|e| e.to_string())?;
     let client = crate::sandbox::kube_client().map_err(|e| e.to_string())?;
     let selector = kube::api::ListParams::default()
-        .labels(&format!("smelt/conversation,{}={}", crate::sandbox::INSTANCE_LABEL, instance.id));
+        .labels(&format!("{},{}={}", crate::sandbox::CONVERSATION_LABEL, crate::sandbox::INSTANCE_LABEL, instance.id));
     let claims = crate::sandbox::pvc_api(&client)
         .list(&selector)
         .await
@@ -744,7 +739,7 @@ mod tests {
         });
         if let Some(conversation) = conversation {
             metadata.as_object_mut().expect("object")["labels"].as_object_mut().expect("labels")
-                .insert("smelt/conversation".into(), conversation.into());
+                .insert(crate::sandbox::CONVERSATION_LABEL.into(), conversation.into());
         }
         if deleting {
             metadata.as_object_mut().expect("object")
@@ -761,12 +756,24 @@ mod tests {
     }
 
     #[test]
+    fn test_conversation_claim_kind_reads_the_generated_names() {
+        // Belt: the two names the specs generate are the two kinds, and
+        // every other claim's name is no kind at all — the generic
+        // volume's shares no prefix with these.
+        assert_eq!(crate::sandbox::conversation_claim_kind(&crate::sandbox::workspace_pvc_name(7)), Some(StorageKind::Workspace));
+        assert_eq!(crate::sandbox::conversation_claim_kind(&crate::sandbox::docker_pvc_name(7)), Some(StorageKind::Docker));
+        for name in ["sandbox-volume-7", "agent-volume-7", "sandbox-workspaces-7", "sandbox-docker", "workspace-7"] {
+            assert_eq!(crate::sandbox::conversation_claim_kind(name), None, "{name} is not the pair's");
+        }
+    }
+
+    #[test]
     fn test_storage_rows_groups_a_conversations_two_claims() {
         let titles = std::collections::HashMap::from([(7i64, "seat a".to_string())]);
         let rows = storage_rows(
             &[
-                stored_claim("sandbox-docker-7", Some("7"), None, Some("20Gi"), true),
-                stored_claim("sandbox-workspace-7", Some("7"), Some("20Gi"), None, false),
+                stored_claim(&crate::sandbox::docker_pvc_name(7), Some("7"), None, Some("20Gi"), true),
+                stored_claim(&crate::sandbox::workspace_pvc_name(7), Some("7"), Some("20Gi"), None, false),
             ],
             &titles,
         );
@@ -789,8 +796,8 @@ mod tests {
         let titles = std::collections::HashMap::from([(7i64, "seat".to_string())]);
         let rows = storage_rows(
             &[
-                stored_claim("sandbox-workspace-7", Some("7"), Some("20Gi"), Some("1Gi"), false),
-                stored_claim("sandbox-docker-7", Some("7"), None, None, false),
+                stored_claim(&crate::sandbox::workspace_pvc_name(7), Some("7"), Some("20Gi"), Some("1Gi"), false),
+                stored_claim(&crate::sandbox::docker_pvc_name(7), Some("7"), None, None, false),
             ],
             &titles,
         );
@@ -804,13 +811,13 @@ mod tests {
         let rows = storage_rows(
             &[
                 // Its conversation row is gone (deleted while these listed).
-                stored_claim("sandbox-workspace-9", Some("9"), Some("20Gi"), None, false),
+                stored_claim(&crate::sandbox::workspace_pvc_name(9), Some("9"), Some("20Gi"), None, false),
                 // A global sandbox volume: right label, not this pair's name.
                 stored_claim("sandbox-volume-7", Some("7"), Some("10Gi"), None, false),
                 // Its conversation label is no id.
-                stored_claim("sandbox-docker-x", Some("x"), None, Some("20Gi"), false),
+                stored_claim(&crate::sandbox::docker_pvc_name(7), Some("x"), None, Some("20Gi"), false),
                 // And one the list shouldn't have returned: no label at all.
-                stored_claim("sandbox-workspace-7", None, Some("20Gi"), None, false),
+                stored_claim(&crate::sandbox::workspace_pvc_name(7), None, Some("20Gi"), None, false),
             ],
             &titles,
         );
@@ -825,8 +832,8 @@ mod tests {
         ]);
         let rows = storage_rows(
             &[
-                stored_claim("sandbox-workspace-9", Some("9"), None, None, false),
-                stored_claim("sandbox-workspace-7", Some("7"), None, None, false),
+                stored_claim(&crate::sandbox::workspace_pvc_name(9), Some("9"), None, None, false),
+                stored_claim(&crate::sandbox::workspace_pvc_name(7), Some("7"), None, None, false),
             ],
             &titles,
         );

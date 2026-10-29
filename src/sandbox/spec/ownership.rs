@@ -4,7 +4,7 @@ use super::*;
 
 /// Label naming a conversation, on its Docker data PVC and on every pod
 /// that mounts that PVC.
-pub(in crate::sandbox) const CONVERSATION_LABEL: &str = "smelt/conversation";
+pub(crate) const CONVERSATION_LABEL: &str = "smelt/conversation";
 
 /// Label naming the conversation that *created* a model volume, on its claim
 /// (SME-239). Not `smelt/conversation`: every conversation that mounts the

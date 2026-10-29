@@ -3,13 +3,34 @@
 use super::*;
 
 /// The conversation's Docker data PVC, `sandbox-docker-<id>`.
-pub(in crate::sandbox) fn docker_pvc_name(conversation_id: i64) -> String {
-    format!("sandbox-docker-{conversation_id}")
+pub(crate) fn docker_pvc_name(conversation_id: i64) -> String {
+    format!("{DOCKER_PVC_PREFIX}{conversation_id}")
 }
 
 /// The conversation's /workspace PVC, `sandbox-workspace-<id>` (SME-32).
 pub(crate) fn workspace_pvc_name(conversation_id: i64) -> String {
-    format!("sandbox-workspace-{conversation_id}")
+    format!("{WORKSPACE_PVC_PREFIX}{conversation_id}")
+}
+
+/// The two claims' name prefixes — the single place they're spelled, so
+/// a view that tells the pair's claims apart can't drift from the names
+/// these make (SME-253 review 1, finding 5). Neither shares a prefix
+/// with the generic `sandbox-volume-<id>` or `agent-volume-<id>` names.
+const WORKSPACE_PVC_PREFIX: &str = "sandbox-workspace-";
+const DOCKER_PVC_PREFIX: &str = "sandbox-docker-";
+
+/// Which claim of the conversation pair a claim name is (SME-253), the
+/// decision behind the stored-volumes view's rows. `None` for anything
+/// else — belt after the label guard, since agent volumes and the global
+/// sandbox volumes share no prefix with these.
+pub(crate) fn conversation_claim_kind(name: &str) -> Option<crate::api::pods::StorageKind> {
+    if name.starts_with(WORKSPACE_PVC_PREFIX) {
+        Some(crate::api::pods::StorageKind::Workspace)
+    } else if name.starts_with(DOCKER_PVC_PREFIX) {
+        Some(crate::api::pods::StorageKind::Docker)
+    } else {
+        None
+    }
 }
 
 /// `SANDBOX_DOCKER_STORAGE_SIZE`, default `"20Gi"` — see
