@@ -11,7 +11,7 @@ Every persona still follows the rest of the [development process](../development
 | Planner | one Up Next ticket | to Planned, or Todo with no questions | [planner.md](planner.md) |
 | Developer | one Todo ticket | to In Progress, then In Review, or Approved with no questions | [developer.md](developer.md) |
 | Code Reviewer | one PR | none: it reports to the Developer | [code-reviewer.md](code-reviewer.md) |
-| Integrator | one Approved ticket | to Done | [integrator.md](integrator.md) |
+| Integrator | one Approved ticket | to In Review after merging — a seat decision; a merge never moves it | [integrator.md](integrator.md) |
 | Facilitator | the "Next retrospective" ticket | to In Review, or Approved with no questions | [facilitator.md](facilitator.md) |
 
 Every persona follows [Rules every persona follows](rules.md). Ownership is recorded in Linear as a `started` comment either way the seat takes: `worktree <path>, branch <branch>`, or `conversation <id>, clone <path>` when the persona runs in a conversation (rules.md, "Working from a conversation sandbox"; SME-254, proposal 13).

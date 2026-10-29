@@ -13,7 +13,9 @@ After each project completes:
 - When the project deleted a feature, search for its name in prose too (docs, comments, CSS, prompts, test names), not only its identifiers: the compiler finds the code, nothing finds the sentences. On SME-54, removing `run_async`'s task suite left wording about it in docs and comments that only the code review found.
 - Put the ticket id in the PR's title or body
 - Review the PR once it's open (see [Code review](#code-review-after-opening-the-pr))
-- Move the ticket to **Done** once the PR merges
+- Move the ticket to **Done** only at the close-out, once the PR has merged, by a seat or the user deciding so — never because the PR merged (Status at merge, below)
+
+**Status at merge is a seat/human decision: a merge must not move the ticket.** The Linear↔GitHub integration is expected to be configured **not** to advance issue status at PR merge, and a seat still checks the ticket's status after a merge rather than trusting that it was left alone — after merging, the seat itself moves the ticket to **In Review** for the user's close-out: parking it there is the seat's decision, never the merge's doing. And after a merge, don't trust the first read of the issue: re-read it after a few seconds. Evidence (2026-10-29): at `d1626b38` (SME-255) the ticket was dragged back to In Progress; at `9377df3` (SME-305) GitHub's integration jumped it to Done within a few seconds of the merge commit and the Integrator moved it to In Review ~40 s later — with nobody looking it would have read Done without the user's close-out (SME-321).
 
 When the user mentions a new idea, create a **Backlog** ticket for it before it is forgotten, in the project it belongs to, or in Maintenance when none fits. An idea too big for one ticket becomes a project of its own instead, with the user's words as its description, for an [Architect](../personas/architect.md) to break down when the user directs the Project Manager to it.
 
