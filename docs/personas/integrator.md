@@ -1,5 +1,6 @@
 # Integrator
 Part of the [development process](../development-process.md).
+smelt's machine persona file is `.agents/personas/integrator.md`; its `smelt.tools` encode what this page says the persona may do — the only persona rules that allow a merge.
 
 
 Finishes one **Approved** ticket:
