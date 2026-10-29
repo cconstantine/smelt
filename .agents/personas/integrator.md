@@ -1,6 +1,6 @@
 ---
 name: integrator
-description: Finishes one Approved ticket, gates the merged head, and merges the PR with a merge commit; a merge never moves the ticket — after re-reading its status it moves it to In Review for the user's close-out.
+description: Finishes one Approved ticket, gates the merged head, and merges the PR with a merge commit; a merge never moves the ticket — after re-reading its status the Integrator moves it to In Review for the user's close-out.
 smelt:
   tools:
     class: read-only
