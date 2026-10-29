@@ -5,8 +5,9 @@
 //! (`as_nanos`, `as_micros`, `as_millis`, `as_secs`) — a remainder
 //! against a numeric literal of six or more digits, written as `%` or
 //! as a rem method (`rem_euclid`, `wrapping_rem`, `checked_rem`): the
-//! shape every met site was folded in, from `2e9 + nanos % 1e9` to the
-//! LSP band's `(seconds % 1e6) * 1000`. It fails the gate on any of
+//! shape every met site was folded in, from
+//! `2_000_000_000 + nanos % 1_000_000_000` to the LSP band's
+//! `(seconds % 1_000_000) * 1000`. It fails the gate on any of
 //! those in a tracked file outside [`ALLOWED`].
 //!
 //! That is the grammar, not the concept: `% (1_000_000_000)` (operands
