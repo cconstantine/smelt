@@ -99,7 +99,8 @@ pub(super) fn tools() -> Vec<Registered> {
                 def: ToolDefinition {
                     name: crate::agents::FINISH.to_string(),
                     description: format!(
-                        "Finish your work as an agent: `report` goes to your parent, the conversation \
+                        "smelt agent report: finish your work as an agent — `report` goes to your \
+                         parent, the conversation \
                          that started you, as your final report, and your turn ends here. Say what you \
                          did, what you found and anything left undone; your parent reads only this. \
                          Up to {} characters. The user may still write to you afterwards.",
@@ -123,11 +124,14 @@ pub(super) fn tools() -> Vec<Registered> {
                 def: ToolDefinition {
                     name: "message_agent".to_string(),
                     description: format!(
-                        "Send a message to your parent (to: \"parent\") or to one of the agents you \
-                         started (to: its id), at any time. It arrives in their conversation as a message \
-                         from you: an idle one is woken to read it, a busy one reads it after its current \
-                         step. Not to anyone else, nor to an agent that is stopped or failed. Up to {} \
-                         characters.",
+                        "smelt agent message: send a message into another agent's conversation — \
+                         your parent (to: \"parent\") or one of the agents you started (to: its \
+                         id) — at any time. Nothing leaves smelt: this is how agents report to \
+                         each other; a comment in an issue tracker is a ticket record, not a \
+                         message. It arrives in their conversation as a message from you: an \
+                         idle one is woken to read it, a busy one reads it after its current \
+                         step. Not to anyone else, nor to an agent that is stopped or failed. \
+                         Up to {} characters.",
                         crate::agents::MAX_MESSAGE_CHARS
                     ),
                     input_schema: serde_json::json!({
@@ -149,7 +153,8 @@ pub(super) fn tools() -> Vec<Registered> {
                 def: ToolDefinition {
                     name: crate::agents::ASK_PARENT.to_string(),
                     description: format!(
-                        "Ask your parent, the conversation that started you, a question and wait for \
+                        "smelt agent question: ask your parent, the conversation that started you, \
+                         a question and wait for \
                          the answer: your turn ends here, and your parent's next message_agent to you \
                          after it has read your question is the answer, which wakes you. If the user writes to you first, their message \
                          comes instead, and a later reply from your parent arrives as a message. One \

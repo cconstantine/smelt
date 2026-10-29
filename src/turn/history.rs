@@ -206,7 +206,7 @@ pub(super) const CUT_OFF_TOOL_CALL: &str = "Not run: your reply was cut off befo
 /// sandbox and tools work, and how its replies are shown. Kept as prose in
 /// its own file so it reads and edits like prose.
 #[cfg(feature = "server")]
-pub(super) const BASE_SYSTEM_PROMPT: &str = include_str!("system_prompt.md");
+pub(crate) const BASE_SYSTEM_PROMPT: &str = include_str!("system_prompt.md");
 
 /// The parts of the system prompt that depend on this deployment or the
 /// day, gathered per turn by `prompt_environment`. An empty list means
@@ -224,7 +224,9 @@ pub(crate) struct PromptEnvironment {
     /// the deployment's globals plus the model-created ones it holds
     /// (SME-239).
     pub volumes: Vec<PromptVolume>,
-    pub mcp_servers: Vec<String>,
+    /// Each configured server, and what it said it is for once a
+    /// connection captured its `initialize` handshake (SME-309).
+    pub mcp_servers: Vec<crate::mcp::PromptMcpServer>,
     /// The conversation's repos (SME-32).
     pub repos: Vec<crate::git::RepoSummary>,
     /// Their loaded `AGENTS.md` files.
@@ -294,10 +296,16 @@ pub(crate) fn system_prompt(env: &PromptEnvironment) -> String {
         }
     }
     if !env.mcp_servers.is_empty() {
-        prompt.push_str(&format!(
-            "- MCP servers: {} (their tools are named mcp__<server>__<tool>)\n",
-            env.mcp_servers.join(", ")
-        ));
+        prompt.push_str(
+            "- MCP servers (their tools are named mcp__<server>__<tool>, and every description \
+             starts [server]):\n",
+        );
+        for server in &env.mcp_servers {
+            match &server.purpose {
+                Some(purpose) => prompt.push_str(&format!("  - {} — {}\n", server.name, purpose)),
+                None => prompt.push_str(&format!("  - {}\n", server.name)),
+            }
+        }
     }
     if !env.repos.is_empty() {
         prompt.push_str("- Repositories:\n");
@@ -417,13 +425,7 @@ pub(crate) async fn prompt_environment(
             tracing::warn!(error = %e, "couldn't list the conversation's volumes for the system prompt");
         }
     }
-    let mcp_servers = match db::list_mcp_server_configs(pool).await {
-        Ok(configs) => configs.into_iter().map(|c| c.name).collect(),
-        Err(e) => {
-            tracing::warn!(error = %e, "couldn't list MCP servers for the system prompt");
-            Vec::new()
-        }
-    };
+    let mcp_servers = crate::mcp::prompt_servers(pool).await;
     let agent = match agent_prompt(pool, conversation_id).await {
         Ok(agent) => agent,
         Err(e) => {

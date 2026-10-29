@@ -18,7 +18,13 @@ fn prompt_env() -> PromptEnvironment {
             name: "cargo-cache".to_string(),
             path: "/home/sandbox/.cargo".to_string(),
         }],
-        mcp_servers: vec!["exa".to_string(), "github".to_string()],
+        mcp_servers: vec![
+            crate::mcp::PromptMcpServer { name: "exa".to_string(), purpose: None },
+            crate::mcp::PromptMcpServer {
+                name: "github".to_string(),
+                purpose: Some("Repos, issues and pull requests.".to_string()),
+            },
+        ],
         repos: Vec::new(),
         instructions: Vec::new(),
         persona_files: Default::default(),
@@ -189,6 +195,20 @@ fn test_system_prompt_starts_with_the_base_prompt() {
     assert!(prompt.starts_with(BASE_SYSTEM_PROMPT), "got: {prompt}");
 }
 
+/// C (SME-309): the base prompt names the confusions the ticket recorded
+/// — the two halves the seat actually mixed up, and the crossed-prefix
+/// names it assembled. Asserted on the stable phrases §4.3 was drafted
+/// with, not the whole section.
+#[test]
+fn test_system_prompt_names_the_tool_confusions() {
+    for phrase in [
+        "A comment tool on an MCP server writes a record on a ticket",
+        "doesn't exist, however plausible its name reads",
+    ] {
+        assert!(BASE_SYSTEM_PROMPT.contains(phrase), "missing {phrase:?} in the base prompt");
+    }
+}
+
 #[test]
 fn test_system_prompt_describes_the_environment() {
     let prompt = system_prompt(&prompt_env());
@@ -199,10 +219,33 @@ fn test_system_prompt_describes_the_environment() {
         "Today's date: 2026-09-25",
         "Model: claude-test-model",
         "cargo-cache mounted at /home/sandbox/.cargo",
-        "MCP servers: exa, github",
+        "- MCP servers (their tools are named mcp__<server>__<tool>, and every description starts [server]):\n  - exa\n  - github — Repos, issues and pull requests.\n",
     ] {
         assert!(environment.contains(expected), "missing {expected:?} in: {environment}");
     }
+}
+
+/// D (SME-309): each server gets its own line, with the purpose it stated
+/// at `initialize` when one was captured; a server that never connected
+/// — or said nothing — shows its name alone.
+#[test]
+fn test_system_prompt_lists_each_mcp_server_with_its_purpose() {
+    let mut env = prompt_env();
+    env.mcp_servers = vec![
+        crate::mcp::PromptMcpServer {
+            name: "Github".to_string(),
+            purpose: Some("GitHub repositories, issues and pull requests.".to_string()),
+        },
+        crate::mcp::PromptMcpServer { name: "exa".to_string(), purpose: None },
+    ];
+    let prompt = system_prompt(&env);
+    assert!(
+        prompt.contains(
+            "- MCP servers (their tools are named mcp__<server>__<tool>, and every description \
+             starts [server]):\n  - Github — GitHub repositories, issues and pull requests.\n  - exa\n"
+        ),
+        "{prompt}"
+    );
 }
 
 #[test]
@@ -328,7 +371,11 @@ async fn test_prompt_environment_reads_volumes_and_mcp_servers(pool: PgPool) {
             },
         ]
     );
-    assert_eq!(env.mcp_servers, vec!["exa".to_string()]);
+    assert_eq!(
+        env.mcp_servers,
+        vec![crate::mcp::PromptMcpServer { name: "exa".to_string(), purpose: None }],
+        "a configured server never yet connected is listed name alone"
+    );
 }
 
 /// Every turn's request carries the system prompt built from that

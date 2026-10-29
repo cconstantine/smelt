@@ -65,3 +65,31 @@ async fn test_a_child_with_no_agent_row_is_refused_start_agent_without_running(p
         .expect("count");
     assert_eq!(grandchildren, 0, "the refused call made a conversation");
 }
+
+/// E (SME-309): the four tools a seat actually confused with MCP tools
+/// say who they belong to before saying what they do, and the message
+/// one rules out the tracker reading outright — a seat that still
+/// reaches for a comment tool has at least read that it isn't one.
+#[test]
+fn test_the_confused_natives_carry_their_smelt_label() {
+    let confused = ["message_agent", "finish", "ask_parent", "ask_user"];
+    let found: Vec<_> = crate::anthropic::tools::native_tool_definitions()
+        .into_iter()
+        .filter(|t| confused.contains(&t.name.as_str()))
+        .collect();
+    assert_eq!(found.len(), confused.len(), "all four are offered: {found:?}");
+    for def in &found {
+        assert!(
+            def.description.starts_with("smelt"),
+            "{} doesn't lead with its owner: {:?}",
+            def.name,
+            def.description
+        );
+    }
+    let message = found.iter().find(|t| t.name == "message_agent").expect("message_agent");
+    assert!(
+        message.description.contains("tracker"),
+        "message_agent must rule out the ticket-comment reading: {:?}",
+        message.description
+    );
+}

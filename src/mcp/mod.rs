@@ -141,6 +141,82 @@ struct Connection {
     service: Arc<RunningService<RoleClient, SmeltClientHandler>>,
     tools: Vec<McpTool>,
     stale: Arc<AtomicBool>,
+    /// What the server said it is, from its `initialize` handshake
+    /// (SME-309): `serverInfo.description`, else `title`, else none —
+    /// sanitized for the environment section by `purpose_line`.
+    purpose: Option<String>,
+}
+
+/// One configured server in the prompt's Environment section (SME-309):
+/// the config's name, and — once it has been connected — what the server
+/// itself said it's for. A server that never connected shows its name
+/// alone, today's line, never wrong.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PromptMcpServer {
+    pub name: String,
+    pub purpose: Option<String>,
+}
+
+/// One server's purpose as the Environment line shows it: control
+/// characters (which could break the line — the SME-271 guard's worry,
+/// on text the server writes) and runs of whitespace collapse to a single
+/// space, then the line is capped at 200 characters. Empty after that is
+/// none.
+fn purpose_line(raw: &str) -> Option<String> {
+    let mut line = String::new();
+    let mut in_space = true; // trims leading whitespace
+    for c in raw.chars() {
+        if c.is_control() || c == '\u{2028}' || c == '\u{2029}' || c == '\u{200b}' || c.is_whitespace() {
+            if !in_space {
+                line.push(' ');
+                in_space = true;
+            }
+        } else {
+            line.push(c);
+            in_space = false;
+        }
+    }
+    let line: String = line.trim().chars().take(200).collect();
+    (!line.is_empty()).then_some(line)
+}
+
+/// What `service`'s server said it is, at `initialize` (SME-309):
+/// `description` unless absent or blank, else `title` — sanitized, or
+/// none when neither carries a word. A present-but-empty `Some("")`
+/// description must not swallow the title fallback (review round 1).
+fn server_purpose(service: &RunningService<RoleClient, SmeltClientHandler>) -> Option<String> {
+    let peer = service.peer_info()?;
+    let info = peer.server_info.as_ref()?;
+    info.description
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .or(info.title.as_deref())
+        .and_then(purpose_line)
+}
+
+/// Each configured server for the prompt's Environment section: the
+/// config's name, and each one's captured purpose when its connection is
+/// live. Never connects — `prompt_environment` runs per turn and a
+/// connect waits up to `CONNECT_TIMEOUT` — so a server whose purpose
+/// hasn't been captured yet (never connected, or evicted) is listed name
+/// alone, as before SME-309.
+pub(crate) async fn prompt_servers(pool: &sqlx::PgPool) -> Vec<PromptMcpServer> {
+    let configs = match crate::db::list_mcp_server_configs(pool).await {
+        Ok(configs) => configs,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't list MCP servers for the system prompt");
+            Vec::new()
+        }
+    };
+    let registry = REGISTRY.lock().await;
+    configs
+        .into_iter()
+        .map(|config| PromptMcpServer {
+            purpose: registry.get(&config.id).and_then(|conn| conn.purpose.clone()),
+            name: config.name,
+        })
+        .collect()
 }
 
 /// One entry per configured server (`mcp_servers.id`), lazily connected on
@@ -411,10 +487,15 @@ async fn connect_unspanned(pool: &sqlx::PgPool, config: &McpServerConfig) -> Res
             ))
         })??;
 
+    // What the server said it's for, from its `initialize` handshake
+    // (SME-309) — the Environment section's other half.
+    let purpose = server_purpose(&service);
+
     Ok(Connection {
         service: Arc::new(service),
         tools,
         stale,
+        purpose,
     })
 }
 
