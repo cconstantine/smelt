@@ -141,7 +141,9 @@ resource "kubernetes_role_binding_v1" "park" {
 
 # The ceiling on `create_pod`'s per-pod memory_limit override. Only `max` is
 # set: a `cpu` entry here would hand every container a defaulted CPU limit and
-# request it can't be scheduled with (SME-77).
+# request it can't be scheduled with (SME-77). The `memory` max does the same:
+# a container with no memory of its own gets the ceiling as its request and
+# limit, so every container in these namespaces sets its own.
 resource "kubernetes_limit_range_v1" "sandbox_pod_max" {
   for_each = local.sandbox_namespaces
 

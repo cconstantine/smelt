@@ -117,6 +117,18 @@ resource "kubernetes_deployment_v1" "smelt" {
               done
               EOT
             ]
+
+            # Its own, so the namespace's LimitRange doesn't default it to the
+            # sandbox ceiling: a 64Gi request no node here can schedule.
+            resources {
+              requests = {
+                memory = "32Mi"
+              }
+
+              limits = {
+                memory = "64Mi"
+              }
+            }
           }
         }
 
