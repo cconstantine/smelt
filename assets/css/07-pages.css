@@ -87,7 +87,20 @@
     font-size: 12px;
 }
 
-.pod-stop {
+/* Stored volumes (SME-253): the section under the pods table. Its
+   table reuses .pods-table (and the phone rules for it); this is only
+   the section's own spacing. */
+.stored-volumes {
+    margin-top: 32px;
+}
+
+.stored-volumes h2 {
+    font-size: 17px;
+    margin: 0 0 8px;
+}
+
+.pod-stop,
+.storage-remove {
     padding: 4px 10px;
     border: 1px solid var(--danger);
     border-radius: 6px;
@@ -99,11 +112,13 @@
     white-space: nowrap;
 }
 
-.pod-stop:hover {
+.pod-stop:hover,
+.storage-remove:hover {
     background: var(--danger-bg);
 }
 
-.pod-stop.confirm {
+.pod-stop.confirm,
+.storage-remove.confirm {
     background: var(--danger);
     color: var(--surface);
 }
@@ -388,6 +403,23 @@
 .sandbox-repo-path {
     font-weight: 600;
     word-break: break-all;
+}
+
+/* The storage line and its two-step Remove button (SME-253). Stacked
+   column: beside an open todo panel the card gets narrow (SME-144's
+   lesson), so the text wrapping and the button taking its own row are
+   the design, not an overflow. */
+
+.sandbox-storage {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 8px 0;
+}
+
+.sandbox-storage-line {
+    font-size: 13px;
+    word-break: break-word;
 }
 
 .sandbox-repo-detail {

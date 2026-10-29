@@ -223,7 +223,8 @@ pub enum ConversationEvent {
 #[serde(tag = "type")]
 pub enum AppEvent {
     /// A pod was created or went away (stopped, crashed, or torn down with
-    /// its conversation). Carries nothing: listeners refetch.
+    /// its conversation), or a conversation's stored sandbox volumes were
+    /// removed (SME-253). Carries nothing: listeners refetch.
     PodsChanged,
     /// A model turn started or ended in some conversation. Carries
     /// nothing: listeners refetch `api::agents::get_conversation_tree`,

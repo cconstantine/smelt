@@ -36,6 +36,7 @@ use crate::api::browsing::{get_browsing_state, subscribe_browser_frames};
 #[cfg(feature = "web")]
 use crate::api::git::list_conversation_repos;
 use crate::api::git::{attach_repo, decide_repo_trust};
+use crate::api::pods::get_stored_storage;
 use crate::git::{RepoStatus, RepoSummary};
 use crate::browsing::BrowserInputEvent;
 // Only referenced by this module's own tests, which build their own
@@ -186,6 +187,23 @@ fn ChatPanel(
     let sandbox_pods = state.sandbox_pods();
     let browsing_session_open = state.browsing_session_open();
     let live = state.live();
+    // The open conversation's stored sandbox volumes (SME-253): what the
+    // panel shows and removes — claims are there whether or not a pod
+    // runs. Refetch rides `pods_changed`, which a removal's published
+    // `PodsChanged` bumps (live.rs's app-stream listener), so the panel
+    // needs no plumbing of its own.
+    let stored_storage = use_resource(move || {
+        let _ = pods_changed();
+        get_stored_storage()
+    });
+    let stored_volumes = move || match (selected(), stored_storage()) {
+        (Some(id), Some(Ok(rows))) => rows
+            .into_iter()
+            .find(|row| row.conversation_id == id)
+            .map(|row| row.volumes)
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
     // The server's own "not found", distinct from a failed load: the page
     // says so and offers no message box, instead of a send that can only
     // fail.
@@ -277,7 +295,7 @@ fn ChatPanel(
                 },
                 Some(_) => {
                     rsx! {
-                    if !sandbox_pods().is_empty() || !repos().is_empty() || !todos().is_empty() || browsing_session_open() {
+                    if !sandbox_pods().is_empty() || !repos().is_empty() || !todos().is_empty() || browsing_session_open() || !stored_volumes().is_empty() {
                         div { class: "side-panels-row",
                             if browsing_session_open() {
                                 BrowsingPanel {
@@ -291,10 +309,11 @@ fn ChatPanel(
                             if !todos().is_empty() {
                                 TodoPanel { state }
                             }
-                            if !sandbox_pods().is_empty() || !repos().is_empty() {
+                            if !sandbox_pods().is_empty() || !repos().is_empty() || !stored_volumes().is_empty() {
                                 SandboxPanel {
                                     selected,
                                     state,
+                                    stored_volumes: stored_volumes(),
                                     on_stop_pod: move |pod_id| request_pod_stop(pod_id),
                                 }
                             }

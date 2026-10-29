@@ -1,5 +1,33 @@
 use super::*;
 
+#[test]
+fn test_storage_line_names_both_claims_their_size_or_removal() {
+    use crate::api::pods::{StorageKind, StoredVolume};
+    let volume = |kind, size: Option<&str>, deleting| StoredVolume {
+        kind,
+        size: size.map(str::to_string),
+        deleting,
+    };
+    assert_eq!(
+        storage_line(&[
+            volume(StorageKind::Workspace, Some("20Gi"), false),
+            volume(StorageKind::Docker, Some("20Gi"), false),
+        ]),
+        "Sandbox storage: /workspace 20Gi \u{b7} Docker images 20Gi",
+        "the panel's line, however the two listed"
+    );
+    assert_eq!(
+        storage_line(&[volume(StorageKind::Docker, Some("20Gi"), true)]),
+        "Sandbox storage: Docker images removing\u{2026}",
+        "a claim being deleted reads removing, not its size"
+    );
+    assert_eq!(
+        storage_line(&[volume(StorageKind::Workspace, None, false)]),
+        "Sandbox storage: /workspace unknown size",
+        "a claim with no size on the object says so rather than going blank"
+    );
+}
+
 fn test_output_line(stream: &str, data: &str) -> SandboxOutputLine {
     SandboxOutputLine {
         stream: stream.to_string(),

@@ -97,6 +97,54 @@ pub struct PodUsage {
     pub cpu_millicores: u64,
 }
 
+/// One conversation's stored sandbox volumes on the Sandboxes page, and
+/// the conversation's sandbox panel (SME-253): present whether or not a
+/// pod runs — stopped conversations holding disk is the whole point.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct StoredStorage {
+    pub conversation_id: i64,
+    pub conversation_title: String,
+    pub volumes: Vec<StoredVolume>,
+}
+
+/// One of a conversation's two conversation claims.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct StoredVolume {
+    pub kind: StorageKind,
+    /// The claim's size as a Kubernetes quantity string (`"20Gi"`):
+    /// bound capacity, else the request. Under local-path both equal the
+    /// *request*, never usage — views label it "claim", never "used".
+    pub size: Option<String>,
+    /// The claim carries a deletion timestamp: it goes when its last
+    /// mounting pod does. Views read it "removing…".
+    pub deleting: bool,
+}
+
+/// Which claim of the pair, by name prefix.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageKind {
+    Workspace,
+    Docker,
+}
+
+/// What one run of `sandbox::remove_conversation_storage` did. Counts,
+/// not assertions: a halfway removal is a real state (a claim another
+/// server made between list and delete), and the view's refetch — driven
+/// by the `PodsChanged` the removal publishes — is what shows the rest.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageRemoval {
+    /// Whether a running sandbox pod was stopped first.
+    pub pod_stopped: bool,
+    /// How many of the conversation's language-server pods were deleted.
+    pub lsp_pods_stopped: u8,
+    /// How many of the two named claims were deleted here.
+    pub claims_deleted: u8,
+    /// How many were left behind (unlabelled, replaced, a failed
+    /// delete): the view will still show them.
+    pub claims_failed: u8,
+}
+
 /// A Kubernetes CPU quantity in nanocores: `"250m"`, `"2"` (cores),
 /// `"1203981n"` (nanocores, what metrics-server reports) or `"5u"`. A
 /// float, so fractional cores (`"0.5"`) and sums across containers keep
@@ -192,6 +240,88 @@ fn parse_pod_metrics(list: &serde_json::Value) -> std::collections::HashMap<Stri
             Some((name, PodUsage { memory_bytes, cpu_millicores }))
         })
         .collect()
+}
+
+/// Which claim of the conversation pair a claim name is lives in
+/// `sandbox::spec::conversation_claim_kind` — one decision, one place
+/// (SME-253 review 1, finding 5).
+///
+/// The stored-volumes view's rows: `claims` (already narrowed to this
+/// instance's conversation claims) grouped per conversation, `deleting`
+/// from the deletion timestamp, `size` from bound capacity else the
+/// request. Claims whose conversation label doesn't parse are dropped
+/// (nothing to group them under), as are conversations missing from
+/// `titles` — deleted between listing and this read, no row to title.
+/// Conversations sort by id, workspaces before dockers.
+#[cfg(feature = "server")]
+fn storage_rows(
+    claims: &[k8s_openapi::api::core::v1::PersistentVolumeClaim],
+    titles: &std::collections::HashMap<i64, String>,
+) -> Vec<StoredStorage> {
+    let mut by_id: std::collections::BTreeMap<i64, Vec<StoredVolume>> = Default::default();
+    for claim in claims {
+        let Some(kind) = claim.metadata.name.as_deref().and_then(crate::sandbox::conversation_claim_kind) else { continue };
+        let Some(value) = claim
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(crate::sandbox::CONVERSATION_LABEL))
+        else {
+            continue;
+        };
+        let Ok(conversation_id) = value.parse::<i64>() else { continue };
+        let size = claim
+            .status
+            .as_ref()
+            .and_then(|status| status.capacity.as_ref())
+            .and_then(|capacity| capacity.get("storage"))
+            .or_else(|| {
+                claim
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.resources.as_ref())
+                    .and_then(|resources| resources.requests.as_ref())
+                    .and_then(|requests| requests.get("storage"))
+            })
+            .map(|quantity| quantity.0.clone());
+        by_id.entry(conversation_id).or_default().push(StoredVolume {
+            kind,
+            size,
+            deleting: claim.metadata.deletion_timestamp.is_some(),
+        });
+    }
+    by_id
+        .into_iter()
+        .filter_map(|(conversation_id, mut volumes)| {
+            let conversation_title = titles.get(&conversation_id).cloned()?;
+            volumes.sort_by_key(|volume| matches!(volume.kind, StorageKind::Docker));
+            Some(StoredStorage { conversation_id, conversation_title, volumes })
+        })
+        .collect()
+}
+
+/// The claims and titles behind `get_stored_storage`. The list carries
+/// the startup sweep's selector — instance-scoped (SME-115), so a check
+/// server's list can never show or act on production's claims, or vice
+/// versa.
+#[cfg(feature = "server")]
+pub(crate) async fn stored_storage(pool: &sqlx::PgPool) -> Result<Vec<StoredStorage>, String> {
+    let instance = db::smelt_instance(pool).await.map_err(|e| e.to_string())?;
+    let client = crate::sandbox::kube_client().map_err(|e| e.to_string())?;
+    let selector = kube::api::ListParams::default()
+        .labels(&format!("{},{}={}", crate::sandbox::CONVERSATION_LABEL, crate::sandbox::INSTANCE_LABEL, instance.id));
+    let claims = crate::sandbox::pvc_api(&client)
+        .list(&selector)
+        .await
+        .map_err(|e| e.to_string())?
+        .items;
+    let titles = db::list_conversations(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|conversation| (conversation.id, conversation.title))
+        .collect();
+    Ok(storage_rows(&claims, &titles))
 }
 
 /// Whether a pod is doing anything. Busy while any of its terminals has a
@@ -332,6 +462,26 @@ pub async fn get_live_pod_conversations() -> ServerFnResult<Vec<i64>> {
     db::conversations_with_live_pods(db::get())
         .await
         .map_err(ServerFnError::new)
+}
+
+/// The Sandboxes page's stored-volumes rows (SME-253): which
+/// conversations hold sandbox disk — the /workspace and Docker-data
+/// claims — whether or not a pod runs, plus what the panel shows as its
+/// storage line.
+#[get("/api/storage")]
+pub async fn get_stored_storage() -> ServerFnResult<Vec<StoredStorage>> {
+    stored_storage(db::get()).await.map_err(ServerFnError::new)
+}
+
+/// Removes a conversation's sandbox volumes, keeping the conversation:
+/// see `sandbox::remove_conversation_storage`. A running pod is stopped
+/// first. The returned counts say what went and what was left; views
+/// refetch on the `PodsChanged` that publishes.
+#[post("/api/storage/{conversation_id}/remove")]
+pub async fn remove_stored_storage(conversation_id: i64) -> ServerFnResult<StorageRemoval> {
+    crate::sandbox::remove_conversation_storage(db::get(), conversation_id)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
 /// The always-open stream of app-wide events (`AppEvent`) for the sidebar
@@ -570,5 +720,127 @@ mod tests {
         assert_eq!(pod_activity(&row(1, 2, Some(3), 0)), PodActivity::IdleSince(at(3)), "last command");
         assert_eq!(pod_activity(&row(1, 4, Some(3), 0)), PodActivity::IdleSince(at(4)), "last message");
         assert_eq!(pod_activity(&row(5, 4, None, 0)), PodActivity::IdleSince(at(5)), "pod start");
+    }
+
+    /// One claim of the stored-volumes list, as the cluster's JSON would
+    /// have it: `conversation` labels it (as listing would), `capacity`
+    /// and `request` are the two size sources, `deleting` the timestamp.
+    #[cfg(feature = "server")]
+    fn stored_claim(
+        name: &str,
+        conversation: Option<&str>,
+        capacity: Option<&str>,
+        request: Option<&str>,
+        deleting: bool,
+    ) -> k8s_openapi::api::core::v1::PersistentVolumeClaim {
+        let mut metadata = serde_json::json!({
+            "name": name,
+            "labels": { "smelt/instance": "this-instance" },
+        });
+        if let Some(conversation) = conversation {
+            metadata.as_object_mut().expect("object")["labels"].as_object_mut().expect("labels")
+                .insert(crate::sandbox::CONVERSATION_LABEL.into(), conversation.into());
+        }
+        if deleting {
+            metadata.as_object_mut().expect("object")
+                .insert("deletionTimestamp".into(), "2026-10-01T00:00:00Z".into());
+        }
+        let spec = request.map(|request| serde_json::json!({ "resources": { "requests": { "storage": request } } }));
+        let status = capacity.map(|capacity| serde_json::json!({ "capacity": { "storage": capacity } }));
+        serde_json::from_value(serde_json::json!({
+            "metadata": metadata,
+            "spec": spec.unwrap_or_else(|| serde_json::json!({})),
+            "status": status.unwrap_or_else(|| serde_json::json!({})),
+        }))
+        .expect("claim")
+    }
+
+    #[test]
+    fn test_conversation_claim_kind_reads_the_generated_names() {
+        // Belt: the two names the specs generate are the two kinds, and
+        // every other claim's name is no kind at all — the generic
+        // volume's shares no prefix with these.
+        assert_eq!(crate::sandbox::conversation_claim_kind(&crate::sandbox::workspace_pvc_name(7)), Some(StorageKind::Workspace));
+        assert_eq!(crate::sandbox::conversation_claim_kind(&crate::sandbox::docker_pvc_name(7)), Some(StorageKind::Docker));
+        for name in ["sandbox-volume-7", "agent-volume-7", "sandbox-workspaces-7", "sandbox-docker", "workspace-7"] {
+            assert_eq!(crate::sandbox::conversation_claim_kind(name), None, "{name} is not the pair's");
+        }
+    }
+
+    #[test]
+    fn test_storage_rows_groups_a_conversations_two_claims() {
+        let titles = std::collections::HashMap::from([(7i64, "seat a".to_string())]);
+        let rows = storage_rows(
+            &[
+                stored_claim(&crate::sandbox::docker_pvc_name(7), Some("7"), None, Some("20Gi"), true),
+                stored_claim(&crate::sandbox::workspace_pvc_name(7), Some("7"), Some("20Gi"), None, false),
+            ],
+            &titles,
+        );
+        assert_eq!(
+            rows,
+            vec![StoredStorage {
+                conversation_id: 7,
+                conversation_title: "seat a".into(),
+                volumes: vec![
+                    StoredVolume { kind: StorageKind::Workspace, size: Some("20Gi".into()), deleting: false },
+                    StoredVolume { kind: StorageKind::Docker, size: Some("20Gi".into()), deleting: true },
+                ],
+            }],
+            "workspace first however they listed, docker's size from the request, its deleting flagged"
+        );
+    }
+
+    #[test]
+    fn test_storage_rows_show_bound_capacity_over_the_request_and_none_at_all() {
+        let titles = std::collections::HashMap::from([(7i64, "seat".to_string())]);
+        let rows = storage_rows(
+            &[
+                stored_claim(&crate::sandbox::workspace_pvc_name(7), Some("7"), Some("20Gi"), Some("1Gi"), false),
+                stored_claim(&crate::sandbox::docker_pvc_name(7), Some("7"), None, None, false),
+            ],
+            &titles,
+        );
+        assert_eq!(rows[0].volumes[0].size.as_deref(), Some("20Gi"), "bound capacity over request");
+        assert_eq!(rows[0].volumes[1].size, None, "neither source says nothing");
+    }
+
+    #[test]
+    fn test_storage_rows_drop_claims_of_no_known_conversation() {
+        let titles = std::collections::HashMap::from([(7i64, "seat".to_string())]);
+        let rows = storage_rows(
+            &[
+                // Its conversation row is gone (deleted while these listed).
+                stored_claim(&crate::sandbox::workspace_pvc_name(9), Some("9"), Some("20Gi"), None, false),
+                // A global sandbox volume: right label, not this pair's name.
+                stored_claim("sandbox-volume-7", Some("7"), Some("10Gi"), None, false),
+                // Its conversation label is no id.
+                stored_claim(&crate::sandbox::docker_pvc_name(7), Some("x"), None, Some("20Gi"), false),
+                // And one the list shouldn't have returned: no label at all.
+                stored_claim(&crate::sandbox::workspace_pvc_name(7), None, Some("20Gi"), None, false),
+            ],
+            &titles,
+        );
+        assert!(rows.is_empty(), "conversation 7 had only an unlabelled claim: {rows:?}");
+    }
+
+    #[test]
+    fn test_storage_rows_sort_conversations_by_id() {
+        let titles = std::collections::HashMap::from([
+            (9i64, "b".to_string()),
+            (7i64, "a".to_string()),
+        ]);
+        let rows = storage_rows(
+            &[
+                stored_claim(&crate::sandbox::workspace_pvc_name(9), Some("9"), None, None, false),
+                stored_claim(&crate::sandbox::workspace_pvc_name(7), Some("7"), None, None, false),
+            ],
+            &titles,
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.conversation_id).collect::<Vec<_>>(),
+            vec![7, 9],
+            "stable order for the page's rows"
+        );
     }
 }

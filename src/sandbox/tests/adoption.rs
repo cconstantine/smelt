@@ -335,7 +335,7 @@ async fn test_the_wait_for_old_pods_ignores_another_databases() {
     .expect("pod");
     pods.create(&PostParams::default(), &pod).await.expect("create pod");
     let foreign_ignored =
-        wait_for_conversation_pods_gone(&client, conversation_id, Duration::from_secs(3), TEST_INSTANCE).await;
+        wait_for_conversation_pods_gone(&client, conversation_id, Duration::from_secs(3), TEST_INSTANCE, &[]).await;
 
     // The same pod with no instance label: waited on.
     let unlabel = serde_json::json!({"metadata": {"labels": {INSTANCE_LABEL: null}}});
@@ -343,7 +343,7 @@ async fn test_the_wait_for_old_pods_ignores_another_databases() {
         .await
         .expect("drop the instance label");
     let unlabelled_waited =
-        wait_for_conversation_pods_gone(&client, conversation_id, Duration::from_secs(2), TEST_INSTANCE).await;
+        wait_for_conversation_pods_gone(&client, conversation_id, Duration::from_secs(2), TEST_INSTANCE, &[]).await;
 
     pods.delete(&foreign, &immediate_delete_params()).await.ok();
     assert!(foreign_ignored.is_ok(), "waited on another database's pod: {foreign_ignored:?}");

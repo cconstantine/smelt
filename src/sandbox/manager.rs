@@ -1,5 +1,6 @@
 //! The process-wide `SandboxManager` and each pod's lifecycle: create,
-//! start, terminate, stop, teardown, list, and volumes.
+//! start, terminate, stop, teardown, list, volumes, and a conversation's
+//! stored sandbox storage.
 
 use super::*;
 use k8s_openapi::api::core::v1::Event;
@@ -274,9 +275,11 @@ mod start;
 mod create;
 mod terminate;
 mod teardown;
+mod storage;
 
 pub use volumes::*;
 pub(in crate::sandbox) use start::*;
 pub use create::*;
 pub use terminate::*;
 pub use teardown::*;
+pub use storage::*;

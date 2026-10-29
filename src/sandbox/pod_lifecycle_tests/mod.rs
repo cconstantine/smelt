@@ -284,4 +284,5 @@ mod personas;
 mod commands_and_files;
 mod pods_and_terminals;
 mod starting;
+mod storage;
 mod volumes;
