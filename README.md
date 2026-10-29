@@ -39,7 +39,7 @@ Dark mode follows the system setting:
 
 ## Deploying
 
-smelt is one server binary plus a web bundle. It needs Postgres, a single-node k3s cluster that allows privileged pods (for the sandboxes), the sandbox image imported into that node, and headless Chrome. It must be built on Debian trixie x86_64 or in the repo's [Dockerfile](Dockerfile) image. [Deploying in docs/setup.md](docs/setup.md#deploying) has the requirements and the steps, from the build environment to the first model provider.
+smelt is one server binary plus a web bundle. It needs Postgres, a k3s cluster that allows privileged pods (for the sandboxes), the sandbox image on the nodes that host them — imported into one node, or pulled from GHCR — and headless Chrome. It must be built on Debian trixie x86_64 or in the repo's [Dockerfile](Dockerfile) image. [Deploying in docs/setup.md](docs/setup.md#deploying) has the requirements and the steps, from the build environment to the first model provider.
 
 Or pull the two images instead of building either: `.github/workflows/publish-images.yml` builds the server (with its web bundle and headless Chrome) and the sandbox agent from one commit and publishes them to GHCR. [Deploying from published images](docs/setup.md#deploying-from-published-images) says what a deployment sets to run them, including the pull policy sandbox pods need.
 
