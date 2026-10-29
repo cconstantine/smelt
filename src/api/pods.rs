@@ -100,7 +100,6 @@ pub struct PodUsage {
 /// One conversation's stored sandbox volumes on the Sandboxes page, and
 /// the conversation's sandbox panel (SME-253): present whether or not a
 /// pod runs — stopped conversations holding disk is the whole point.
-#[cfg_attr(not(feature = "server"), expect(dead_code, reason = "the browser side reads them from SME-253's UI commit; the server's list endpoint constructs them now"))]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct StoredStorage {
     pub conversation_id: i64,
@@ -133,7 +132,6 @@ pub enum StorageKind {
 /// not assertions: a halfway removal is a real state (a claim another
 /// server made between list and delete), and the view's refetch — driven
 /// by the `PodsChanged` the removal publishes — is what shows the rest.
-#[cfg_attr(not(feature = "server"), expect(dead_code, reason = "the browser side reads it from SME-253's UI commit; the remove endpoint returns it now"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageRemoval {
     /// Whether a running sandbox pod was stopped first.

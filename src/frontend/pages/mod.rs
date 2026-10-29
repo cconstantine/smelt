@@ -27,6 +27,13 @@ pub(crate) fn server_error_message(error: &ServerFnError) -> String {
     }
 }
 
+/// What removing a conversation's sandbox volumes costs (SME-253), in
+/// one place: the sandbox panel's and the Sandboxes page's Remove
+/// buttons carry the same sentence in their tooltips. It says what is
+/// lost and what stays — never "frees N GB" (the claims' capacity is the
+/// request, and what was on them is unmetered).
+pub(crate) const STORAGE_REMOVE_WARNING: &str = "Delete this conversation's sandbox volumes: everything in /workspace (files, checkouts, target directories) and its Docker images, build cache and volumes are lost. A running sandbox is stopped first. The conversation and its messages stay; the next sandbox gets fresh empty volumes.";
+
 /// A server function's error, or nothing: `p.error`, announced to screen
 /// readers when it appears.
 #[component]
