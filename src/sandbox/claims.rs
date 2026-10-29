@@ -431,6 +431,61 @@ pub(super) async fn delete_conversation_pvcs(client: &kube::Client, conversation
     }
 }
 
+/// What `remove_conversation_claim` did to one named claim (SME-253).
+pub(super) enum ClaimRemoval {
+    /// Ours, and the delete was accepted.
+    Deleted,
+    /// Already gone, or already being deleted.
+    AlreadyGone,
+    /// Still here and not ours to delete — unlabelled, no uid, or the
+    /// delete failed. Counted as failed: the caller says something still
+    /// holds the disk, and the panel will still show it.
+    Failed,
+    /// Another database's: left, and no failure of ours either.
+    Foreign,
+}
+
+/// The storage removal's delete of one named claim (SME-253), with the
+/// SME-115 guard: only ours is deleted, held to the uid it was read at,
+/// and a foreign claim that shares the name is never touched. Best-
+/// effort like the rest: what happened is returned as a count, not an
+/// error — a halfway removal is a real, reportable state.
+pub(super) async fn remove_conversation_claim(client: &kube::Client, name: &str, instance: &str) -> ClaimRemoval {
+    let claim = match pvc_api(client).get_opt(name).await {
+        // Already gone: as good as deleted.
+        Ok(None) => return ClaimRemoval::AlreadyGone,
+        // Already being deleted (its teardown, another removal): nothing
+        // to do, and nothing to log again (SME-117 review 1).
+        Ok(Some(claim)) if claim.metadata.deletion_timestamp.is_some() => return ClaimRemoval::AlreadyGone,
+        Ok(Some(claim)) => claim,
+        Err(e) => {
+            tracing::warn!(claim = %name, error = %e, "couldn't read a conversation's claim to remove its storage");
+            return ClaimRemoval::Failed;
+        }
+    };
+    match (ownership(&claim.metadata, instance), claim.metadata.uid) {
+        (Ownership::Ours, Some(uid)) => {
+            if delete_claim_if_unchanged(client, name, &uid).await {
+                ClaimRemoval::Deleted
+            } else {
+                ClaimRemoval::Failed
+            }
+        }
+        (Ownership::Ours, None) => {
+            tracing::warn!(claim = %name, "a claim with no uid; left alone");
+            ClaimRemoval::Failed
+        }
+        (Ownership::Unlabelled, _) => {
+            tracing::warn!(claim = %name, "left a claim with no smelt/instance label (made before SME-115)");
+            ClaimRemoval::Failed
+        }
+        (Ownership::Foreign, _) => {
+            tracing::info!(claim = %name, "left another smelt database's claim of the same name");
+            ClaimRemoval::Foreign
+        }
+    }
+}
+
 /// What startup and teardown log at info about what they delete (SME-117):
 /// a check server's log is the only record of what its sweep and
 /// teardowns did to the shared namespace. Real-cluster tests, in
