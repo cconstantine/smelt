@@ -16,6 +16,7 @@ smelt:
       - Github/get_job_logs
       - Github/add_issue_comment
     deny:
+      - linear.app/delete_*
       - Github/merge_pull_request
       - Github/create_pull_request
       - Github/update_pull_request
