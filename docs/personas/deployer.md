@@ -1,6 +1,6 @@
 # Deployer
 Part of the [development process](../development-process.md).
-smelt's machine persona file is `.agents/personas/deployer.md`; its `smelt.tools` are a complete allow-list over the `read-only` ceiling because the seat starts no one — it is a leaf, so unlike the [Project Manager](project-manager.md)'s and [Ticket Driver](ticket-driver.md)'s deny-only files, the conjunction-chain argument places no cap on it.
+smelt's machine persona file is `.agents/personas/deployer.md`; because the seat starts no one its `smelt.tools` can complete the *write* reach over the `read-only` ceiling (reads pass by class whether named or not) — it is a leaf, so unlike the [Project Manager](project-manager.md)'s and [Ticket Driver](ticket-driver.md)'s deny-only files, the conjunction-chain argument places no cap on it.
 
 ## One deploy per seat
 
