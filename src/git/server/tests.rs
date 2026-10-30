@@ -209,6 +209,41 @@ fn test_remote_key_refuses_what_isnt_a_url() {
     }
 }
 
+/// SME-283: a remote that differs from another only in characters a reader
+/// can't see must never be recorded at all — the same key is what trust
+/// decisions are remembered by. Every `plain_text` predicate character
+/// (SME-276's set: zero-widths, the soft hyphen, the BOM, tag characters,
+/// bidi controls, controls and C1s) is refused in every URL form, in the
+/// host and in the path.
+#[test]
+fn test_remote_key_refuses_a_url_hiding_or_reordering_characters() {
+    for c in [
+        '\u{200b}', '\u{ad}', '\u{feff}', '\u{e0041}', '\u{202e}', '\u{200e}', '\u{61c}', '\u{2066}', '\u{9b}',
+        '\u{7}', '\u{7f}', '\u{3164}', '\u{fe0f}',
+    ] {
+        for url in [
+            format!("git@github.com:o{c}r.git"),
+            format!("git@git{c}hub.com:o/r.git"),
+            format!("https://git{c}hub.com/o/r"),
+            format!("https://github.com/o{c}r"),
+            format!("file:///tmp/o{c}rigin.git"),
+        ] {
+            assert_eq!(remote_key(&url), None, "U+{:X}: {url:?}", c as u32);
+        }
+    }
+}
+
+/// SME-283 (pin): the refusal targets the invisible, not the non-ASCII —
+/// an accented or Japanese host name stays exactly as clonable and
+/// recordable as today (SME-271's line, kept allowed). The `https` host
+/// reads punycoded because `url::Url` applies IDNA — today's behaviour,
+/// pinned so the refusal can't quietly widen past the invisible.
+#[test]
+fn test_remote_key_still_accepts_plain_non_ascii_urls() {
+    assert_eq!(remote_key("git@例え.jp:o/r").as_deref(), Some("例え.jp/o/r"));
+    assert_eq!(remote_key("https://exämple.com/o/r").as_deref(), Some("xn--exmple-cua.com/o/r"));
+}
+
 #[test]
 fn test_default_checkout_dir_is_the_repo_name() {
     assert_eq!(default_checkout_dir("git@github.com:o/smelt.git").as_deref(), Some("smelt"));

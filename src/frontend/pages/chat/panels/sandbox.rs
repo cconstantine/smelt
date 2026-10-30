@@ -67,6 +67,14 @@ pub(in super::super) fn repo_error_shown(repo: &RepoSummary) -> Option<String> {
     repo.error.as_deref().map(|error| crate::git::plain_multiline_text(error))
 }
 
+/// The repo row's tooltip (SME-283): the recorded url through the same
+/// escape the row's branch and error already use — a row recorded
+/// before the fix can hold a remote that is another's invisible twin,
+/// and the tooltip is where the panel names it.
+pub(in super::super) fn repo_url_shown(repo: &RepoSummary) -> String {
+    crate::git::plain_multiline_text(&repo.url)
+}
+
 /// The sandbox panel's storage line (SME-253): `Sandbox storage:
 /// /workspace 20Gi · Docker images 20Gi`. A claim being deleted reads
 /// `removing…`; the size shown is the claim's capacity, which under
@@ -231,7 +239,7 @@ pub(in super::super) fn SandboxPanel(
                                 div {
                                     key: "{repo.id}",
                                     class: "sandbox-repo sandbox-repo-{repo_status_class(repo.status)}",
-                                    title: "{repo.url}",
+                                    title: "{repo_url_shown(&repo)}",
                                     code { class: "sandbox-repo-path", "{repo.path}" }
                                     {
                                         let detail = repo_detail(&repo);

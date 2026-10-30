@@ -5,7 +5,26 @@ use crate::api::git::{
     save_git_identity,
 };
 use crate::frontend::Route;
+use crate::frontend::pages::chat::shown_text::hidden_text_note;
 use crate::git::{GitIdentity, RepoTrustSummary, SshKeySummary};
+
+/// The trust list's showing of a recorded key (SME-283): the key is repo
+/// text the user reads at `/git`, and a row recorded before the fix can
+/// be another key's invisible twin — so the label goes through SME-276's
+/// escape after `remote_label`'s `file/` rewrite. `Forget` still sends
+/// the raw stored key: the decision is deleted by exact match, never by
+/// this showing.
+fn remote_shown(decision: &RepoTrustSummary) -> String {
+    crate::git::plain_multiline_text(&crate::git::remote_label(&decision.remote))
+}
+
+/// The hover notice for that showing (SME-283): the panel's pattern —
+/// a one-row list has no room for a `p.muted` line — in exactly
+/// `hidden_text_note`'s wording so the sinks can't drift.
+fn trust_row_notice(decision: &RepoTrustSummary) -> Option<String> {
+    let hidden = crate::git::hidden_characters(&decision.remote);
+    (hidden > 0).then(|| hidden_text_note(hidden))
+}
 
 /// Git settings (SME-32): the commit identity and the SSH keys every
 /// sandbox pod gets. A change reaches running pods straight away.
@@ -124,7 +143,13 @@ fn TrustSection(trust: Signal<Vec<RepoTrustSummary>>) -> Element {
                     for decision in trust() {
                         div { key: "{decision.remote}", class: "sandbox-volume-row",
                             div { class: "sandbox-volume-summary",
-                                span { class: "sandbox-volume-name", {crate::git::remote_label(&decision.remote)} }
+                                {
+                                    let shown = remote_shown(&decision);
+                                    match trust_row_notice(&decision) {
+                                        Some(notice) => rsx! { span { class: "sandbox-volume-name", title: "{notice}", "{shown}" } },
+                                        None => rsx! { span { class: "sandbox-volume-name", "{shown}" } },
+                                    }
+                                }
                                 span { class: "sandbox-volume-path", if decision.trusted { "Trusted" } else { "Not trusted" } }
                             }
                             button {
@@ -302,5 +327,35 @@ fn KeysSection(keys: Signal<Vec<SshKeySummary>>) -> Element {
             }
             }
         }
+    }
+}
+
+/// SME-283: the trust list shows a recorded key escaped — a key recorded
+/// before the fix can be another key's invisible twin — with the hover
+/// notice in the shared wording, and the `file/` rewrite keeps working
+/// through the escape. The first tests in this file, inline per the plan.
+#[cfg(all(test, feature = "server"))]
+mod shown_tests {
+    use super::*;
+
+    fn decision(remote: &str, trusted: bool) -> RepoTrustSummary {
+        RepoTrustSummary { remote: remote.to_string(), trusted }
+    }
+
+    #[test]
+    fn test_the_trust_list_shows_a_recorded_key_escaped_with_its_notice() {
+        let dirty = decision("git\u{200b}hub.com/o/r", true);
+        let shown = remote_shown(&dirty);
+        assert!(shown.contains("\\u{200b}"), "{shown}");
+        assert!(!shown.contains('\u{200b}'), "raw U+200B in {shown:?}");
+        assert_eq!(trust_row_notice(&dirty).as_deref(), Some(hidden_text_note(1).as_str()));
+
+        let plain = decision("github.com/o/r", true);
+        assert_eq!(remote_shown(&plain), "github.com/o/r");
+        assert_eq!(trust_row_notice(&plain), None);
+
+        let local = decision("file/tmp/x\u{202e}", false);
+        assert_eq!(remote_shown(&local), "file:///tmp/x\\u{202e}");
+        assert_eq!(trust_row_notice(&local).as_deref(), Some(hidden_text_note(1).as_str()));
     }
 }
