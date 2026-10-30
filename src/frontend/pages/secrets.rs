@@ -1,8 +1,9 @@
 //! The `/secrets` settings page (SME-242): the user's named secrets, the
 //! things a persona lists by name in `smelt.credentials` to hand one to
 //! the agent that runs under it. Write-only by design (Answer 2): a
-//! value is typed once and never shown again beyond `shown`'s capped
-//! prefix — there is no reveal control, because there is no reveal.
+//! value is typed in and never shown again beyond `shown`'s capped
+//! prefix — changing one means typing the new value, and there is no
+//! reveal control, because there is no reveal.
 
 use dioxus::prelude::*;
 
@@ -118,18 +119,52 @@ fn SecretAddForm(secrets: Signal<Vec<SecretSummary>>, action_error: Signal<Optio
 }
 
 /// The stored secrets: name, the display prefix the server computed
-/// (never re-derived here), age, and Delete.
+/// (never re-derived here), age, and the row's two controls — Change,
+/// which types a new value in place (the name is immutable, Trade-off
+/// 7, so the request carries the row's own name; renaming is delete
+/// and add), and Delete.
 #[component]
 fn SecretsList(secrets: Signal<Vec<SecretSummary>>, action_error: Signal<Option<String>>) -> Element {
     let mut secrets = secrets;
     let mut action_error = action_error;
     let mut pending_delete: Signal<Option<i64>> = use_signal(|| None);
+    let mut pending_change: Signal<Option<i64>> = use_signal(|| None);
+    let mut change_value: Signal<String> = use_signal(String::new);
     let confirm_delete = move |id: i64| {
         spawn(async move {
             match delete_secret(id).await {
                 Ok(()) => {
                     secrets.write().retain(|s| s.id != id);
                     pending_delete.set(None);
+                    action_error.set(None);
+                }
+                Err(e) => action_error.set(Some(super::server_error_message(&e))),
+            }
+        });
+    };
+    // The change path sends the row's existing name — read from the
+    // row itself at click time: the API demands a name on the id path
+    // and keeps the row's own (renaming is delete and add, Trade-off
+    // 7), so the request carries what the row is called and only the
+    // value changes. The value passes the server's own rule before
+    // submitting, the same courtesy the add form pays.
+    let confirm_change = move |id: i64| {
+        spawn(async move {
+            let value = change_value();
+            if let Some(e) = validate_secret_value(&value).err() {
+                action_error.set(Some(e));
+                return;
+            }
+            let Some(name) = secrets.read().iter().find(|s| s.id == id).map(|s| s.name.clone()) else {
+                return;
+            };
+            match save_secret(Some(id), name, value).await {
+                Ok(updated) => {
+                    if let Some(row) = secrets.write().iter_mut().find(|s| s.id == id) {
+                        *row = updated;
+                    }
+                    pending_change.set(None);
+                    change_value.set(String::new());
                     action_error.set(None);
                 }
                 Err(e) => action_error.set(Some(super::server_error_message(&e))),
@@ -153,6 +188,31 @@ fn SecretsList(secrets: Signal<Vec<SecretSummary>>, action_error: Signal<Option<
                                 span { class: "secret-created", "{secret.created_at.format(\"%Y-%m-%d\")}" }
                             }
                             div { class: "git-key-actions",
+                                if pending_change() == Some(secret.id) {
+                                    input {
+                                        class: "secret-change-input",
+                                        r#type: "password",
+                                        value: "{change_value}",
+                                        placeholder: "new value",
+                                        autocomplete: "new-password",
+                                        oninput: move |e| { change_value.set(e.value()); action_error.set(None); },
+                                    }
+                                    button {
+                                        class: "secret-change-confirm",
+                                        onclick: move |_| confirm_change(secret.id),
+                                        "Save"
+                                    }
+                                } else {
+                                    button {
+                                        class: "secret-change",
+                                        onclick: move |_| {
+                                            pending_change.set(Some(secret.id));
+                                            change_value.set(String::new());
+                                            action_error.set(None);
+                                        },
+                                        "Change"
+                                    }
+                                }
                                 if pending_delete() == Some(secret.id) {
                                     button {
                                         class: "secret-delete-confirm",

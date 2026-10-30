@@ -420,8 +420,9 @@ pub(super) async fn scenario_oauth_callback_error_link(t: &Scenario<'_>) {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// T12 (SME-242): the Secrets page adds a secret, lists only the server's
-/// display prefix — never the value — and deletes it; and a row fits 375px.
+/// T12 (SME-242): the Secrets page adds a secret, changes its value in
+/// place, lists only the server's display prefix — never the value —
+/// and deletes it; and a row fits 375px.
 pub(super) async fn scenario_secrets_page(t: &Scenario<'_>) {
     /// The server-rendered form accepts typing before hydration with no
     /// handlers attached, so type and read back until the field holds just
@@ -473,6 +474,41 @@ pub(super) async fn scenario_secrets_page(t: &Scenario<'_>) {
         .into_value()
         .expect("text");
     assert!(!body.contains(&value[6..]), "beyond the display prefix none of the value is on the page");
+
+    // Change the stored value in place: the row's change control sends
+    // the row's existing name on the id path (renaming is delete and
+    // add, Trade-off 7), the row stays one row, and after it the page
+    // shows the new display — with no trace of the old value's prefix.
+    let new_value = "renewed-scenario-secret-0123456789"; // 34 bytes: prefix "rene", 30 hidden
+    click_when_present(&page, ".secret-row .secret-change", Duration::from_secs(5)).await;
+    type_and_read_back(&page, ".secret-change-input", new_value).await;
+    click_when_present(&page, ".secret-row .secret-change-confirm", Duration::from_secs(5)).await;
+    let shown_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let (changed, shown_now) = loop {
+        let text: String = page
+            .evaluate("document.querySelector('.secret-row .secret-shown')?.textContent ?? ''")
+            .await
+            .expect("read the row")
+            .into_value()
+            .expect("a string");
+        if text == "rene… (34 bytes)" {
+            break (true, text);
+        }
+        if tokio::time::Instant::now() >= shown_deadline {
+            break (false, text);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(changed, "after the change the row shows the new display, not {shown_now:?}");
+    assert!(wait_for_count(&page, ".secret-row", 1, Duration::from_secs(5)).await, "a change keeps it one row");
+    let body: String = page
+        .evaluate("document.body.innerText")
+        .await
+        .expect("read the page")
+        .into_value()
+        .expect("text");
+    assert!(!body.contains("top-"), "the replaced value's old display prefix is gone from the page: {body}");
+    assert!(!body.contains(&new_value[4..]), "beyond the new display prefix none of the new value is on the page");
 
     // Delete is two-step: arm, then the named confirm.
     click_when_present(&page, ".secret-row .secret-delete", Duration::from_secs(5)).await;
