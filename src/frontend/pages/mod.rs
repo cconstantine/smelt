@@ -4,6 +4,7 @@ mod language_servers;
 mod mcp_servers;
 mod pods;
 mod providers;
+mod secrets;
 mod sandbox_volumes;
 
 pub use chat::Chat;
@@ -13,6 +14,7 @@ pub use mcp_servers::{McpServerEdit, McpServerNew, McpServersIndex};
 pub use pods::PodsIndex;
 pub(crate) use providers::ModelPicker;
 pub use providers::{ProviderEdit, ProviderNew, ProvidersIndex};
+pub use secrets::SecretsPage;
 pub use sandbox_volumes::{SandboxVolumeNew, SandboxVolumesIndex};
 
 use dioxus::prelude::*;

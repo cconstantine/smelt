@@ -7,6 +7,7 @@ pub mod mcp;
 pub mod pods;
 pub mod providers;
 pub mod questions;
+pub mod secrets;
 pub mod sandbox;
 pub mod sandbox_volumes;
 pub mod version;
