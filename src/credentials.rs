@@ -12,6 +12,13 @@ use sqlx::PgPool;
 #[cfg(test)]
 mod tests;
 
+/// The built-in credential every persona may list in
+/// `smelt.credentials`: the user's git SSH key (SME-242). No stored
+/// secret may take its name — that refusal belongs to secret creation,
+/// not to a persona listing it. This constant is Rule G's bit: the only
+/// member `agents.credentials` holds today.
+pub const CREDENTIAL_GIT_SSH: &str = "git-ssh";
+
 /// The shape of a credential name — the `validate_key_name` rule, since
 /// a name becomes a file name in a pod: 1 to 64 letters, digits, `-`
 /// and `_`. `git-ssh` is a credential name like any other; what refuses

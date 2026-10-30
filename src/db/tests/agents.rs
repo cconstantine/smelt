@@ -138,21 +138,34 @@ fn new_child(caller: i64, max_depth: i32) -> NewChild<'static> {
 }
 
 /// A conversation under `parent` with an `active` agent row at `depth`,
-/// rooted at `root`, storing `chain`: the stand-in for a started agent.
-async fn nested_agent(pool: &PgPool, parent: i64, root: i64, depth: i32, chain: Option<serde_json::Value>) -> i64 {
+/// rooted at `root`, storing `chain` and `credentials`: the stand-in
+/// for a started agent.
+async fn nested_agent(
+    pool: &PgPool,
+    parent: i64,
+    root: i64,
+    depth: i32,
+    chain: Option<serde_json::Value>,
+    credentials: Option<&[&str]>,
+) -> i64 {
     let child = sqlx::query_scalar::<_, i64>("INSERT INTO conversations (title, parent_id) VALUES ('n', $1) RETURNING id")
         .bind(parent)
         .fetch_one(pool)
         .await
         .expect("a conversation");
-    sqlx::query("INSERT INTO agents (conversation_id, root_id, depth, brief, state, rule_chain) VALUES ($1, $2, $3, 'b', 'active', $4)")
-        .bind(child)
-        .bind(root)
-        .bind(depth)
-        .bind(chain)
-        .execute(pool)
-        .await
-        .expect("an agent row");
+    let credentials: Option<Vec<String>> = credentials.map(|list| list.iter().map(|name| name.to_string()).collect());
+    sqlx::query(
+        "INSERT INTO agents (conversation_id, root_id, depth, brief, state, rule_chain, credentials)
+         VALUES ($1, $2, $3, 'b', 'active', $4, $5)",
+    )
+    .bind(child)
+    .bind(root)
+    .bind(depth)
+    .bind(chain)
+    .bind(credentials)
+    .execute(pool)
+    .await
+    .expect("an agent row");
     child
 }
 
@@ -167,11 +180,74 @@ async fn child_row(pool: &PgPool, id: i64) -> (i32, i64, Option<serde_json::Valu
     .expect("the agent row")
 }
 
+/// The `credentials` column as written — a `create_child` row's is
+/// never NULL, so this reads the array itself.
+async fn child_credentials(pool: &PgPool, id: i64) -> Vec<String> {
+    sqlx::query_scalar::<_, Vec<String>>("SELECT credentials FROM agents WHERE conversation_id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("the agent row")
+}
+
+/// `create_child` under a caller below the depth ceiling.
+async fn child_of(pool: &PgPool, caller: i64) -> i64 {
+    let CreateChild::Created { child, .. } = create_child(pool, &new_child(caller, 5)).await.expect("start") else {
+        panic!("a caller below the ceiling starts one");
+    };
+    child
+}
+
+/// SME-242 T4 (its `create_child` rows): the seed is Rule G's bit and
+/// nothing else — the parent's `git-ssh`, or Rule G's root answer for
+/// an agent-less caller — and a named secret's name never enters the
+/// column from above, the trap D2 exists to keep out.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_create_child_seeds_only_the_git_ssh_chain_bit(pool: PgPool) {
+    let root = test_conversation(&pool).await.id;
+    // An agent-less caller with no key stored: Rule G's root answer is
+    // "there is no key to grant", an empty bit.
+    let child = child_of(&pool, root).await;
+    assert_eq!(child_credentials(&pool, child).await, Vec::<String>::new(), "no key stored, nothing to pass");
+    // With a key stored, the same caller passes the bit — today's rule,
+    // every pod in the line has the key.
+    sqlx::query("INSERT INTO ssh_keys (name, public_key, private_key) VALUES ('id_ed25519', 'pub', 'priv')")
+        .execute(&pool)
+        .await
+        .expect("a key");
+    let child = child_of(&pool, root).await;
+    assert_eq!(child_credentials(&pool, child).await, vec!["git-ssh".to_string()], "a stored key passes the bit");
+    // An agent parent passes on its bit and nothing more.
+    let holder = nested_agent(&pool, root, root, 1, None, Some(&["git-ssh"])).await;
+    let child = child_of(&pool, holder).await;
+    assert_eq!(child_credentials(&pool, child).await, vec!["git-ssh".to_string()], "the bit nests");
+    // A parent narrowed away from `git-ssh` passes nothing down.
+    let narrowed = nested_agent(&pool, root, root, 1, None, Some(&[])).await;
+    let child = child_of(&pool, narrowed).await;
+    assert_eq!(child_credentials(&pool, child).await, Vec::<String>::new(), "an empty bit stays empty down the line");
+    // A pre-ticket parent — NULL column — reads granted, the same
+    // fall-open every other Rule G read uses, so an old line keeps the
+    // key rather than being stranded by the column's arrival.
+    let legacy = nested_agent(&pool, root, root, 1, None, None).await;
+    let child = child_of(&pool, legacy).await;
+    assert_eq!(child_credentials(&pool, child).await, vec!["git-ssh".to_string()], "NULL falls open");
+    // And the subset assertion that stops the trap: even a parent row
+    // somehow holding a secret name in this column — only a hand-written
+    // row can, the INSERT's comment forbids it — hands the child
+    // `git-ssh` alone. Secrets travel in the persona snapshot, never
+    // here, so no ancestor's list can narrow a descendant's.
+    let trap = nested_agent(&pool, root, root, 1, None, Some(&["git-ssh", "deep-key"])).await;
+    let child = child_of(&pool, trap).await;
+    let seeded = child_credentials(&pool, child).await;
+    assert_eq!(seeded, vec!["git-ssh".to_string()], "never a secret's name");
+    assert!(!seeded.contains(&"deep-key".to_string()));
+}
+
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_child_nests_depth_under_its_caller_and_inherits_root_and_chain(pool: PgPool) {
     let root = test_conversation(&pool).await.id;
     let chain = serde_json::json!([{"class": "read-only", "allow": [], "deny": ["x*"]}]);
-    let caller = nested_agent(&pool, root, root, 3, Some(chain.clone())).await;
+    let caller = nested_agent(&pool, root, root, 3, Some(chain.clone()), None).await;
     let CreateChild::Created { child, repo } = create_child(&pool, &new_child(caller, 5)).await.expect("start") else {
         panic!("a caller below the ceiling starts one");
     };
@@ -183,7 +259,7 @@ async fn test_create_child_nests_depth_under_its_caller_and_inherits_root_and_ch
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_child_refuses_only_at_the_depth_ceiling(pool: PgPool) {
     let root = test_conversation(&pool).await.id;
-    let caller = nested_agent(&pool, root, root, 5, None).await;
+    let caller = nested_agent(&pool, root, root, 5, None, None).await;
     let CreateChild::Refused { why, asked } = create_child(&pool, &new_child(caller, 5)).await.expect("start") else {
         panic!("a caller at the ceiling can't go deeper");
     };
