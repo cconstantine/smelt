@@ -34,6 +34,12 @@ pub async fn list_ssh_keys(pool: &PgPool) -> Result<Vec<SshKey>, sqlx::Error> {
         .await
 }
 
+/// Whether a key is stored at all — Rule G's root answer (SME-242): the
+/// one read that decides it asks existence, not the value.
+pub async fn ssh_key_stored(pool: &PgPool) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM ssh_keys)").fetch_one(pool).await
+}
+
 pub async fn delete_ssh_key(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM ssh_keys WHERE id = $1")
         .bind(id)

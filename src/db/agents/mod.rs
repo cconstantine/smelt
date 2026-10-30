@@ -60,6 +60,40 @@ pub enum RowLock {
     Update,
 }
 
+/// The row's `credentials` column (SME-242, D3), `git-ssh` only: it is
+/// Rule G's chain bit — a named secret's name never enters this column,
+/// so a descendant's set can never narrow by an ancestor's list.
+/// Outer `None` is no `agents` row (a Rule G root); inner `None` is the
+/// NULL a pre-ticket row carries, which every Rule G read takes as
+/// granted rather than stranding a conversation smelt wrote.
+pub async fn agent_credentials(pool: &PgPool, id: i64) -> Result<Option<Option<Vec<String>>>, sqlx::Error> {
+    sqlx::query_scalar::<_, Option<Vec<String>>>("SELECT credentials FROM agents WHERE conversation_id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// The credential names this conversation's persona snapshot lists
+/// (SME-242): the `credentials` key of `persona_settings`, written once
+/// at `complete_start` — the names are fixed for the conversation's
+/// life, which of them the store backs is read fresh. No row, no
+/// snapshot or no key all mean none. Whether each name is a stored
+/// secret is Rule S's store resolution, not this read.
+pub async fn persona_credential_names(pool: &PgPool, id: i64) -> Result<Vec<String>, sqlx::Error> {
+    let settings =
+        sqlx::query_scalar::<_, Option<serde_json::Value>>("SELECT persona_settings FROM agents WHERE conversation_id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(settings
+        .flatten()
+        .as_ref()
+        .and_then(|s| s.get("credentials"))
+        .and_then(|c| c.as_array())
+        .map(|list| list.iter().filter_map(|name| name.as_str().map(String::from)).collect())
+        .unwrap_or_default())
+}
+
 impl RowLock {
     fn sql(self) -> &'static str {
         match self {

@@ -92,6 +92,95 @@ fn git_config_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// Where this conversation's named-secret files live in a pod: one file
+/// per granted secret, named exactly what its persona listed (SME-242).
+/// Pruned by each install, like the keys directory, and off-limits to
+/// volume mounts like all of `/etc/smelt`.
+pub const POD_SECRETS_DIR: &str = "/etc/smelt/secrets";
+
+/// What one conversation's two credential rules answer right now
+/// (SME-242, D2 — stated as two rules so neither can inherit the
+/// other's narrowing). Both are pure reads, re-run at every install.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PodCredentials {
+    /// Rule G: the chain credential. A root gets it iff a key is
+    /// stored; an agent iff its `agents.credentials` bit says so (NULL
+    /// — a pre-ticket row — falls open to granted).
+    pub git_ssh: bool,
+    /// Rule S: the granted secret names — this conversation's own
+    /// persona's names that the store backs at this moment. Never an
+    /// ancestor's, never a persona-less conversation's, never the
+    /// root's. The values join at the file write, not here.
+    pub secrets: Vec<String>,
+}
+
+/// Rule G, read fresh (SME-242): `git-ssh` follows the chain —
+/// `create_child` seeded it from the parent's bit and `prepare` narrows
+/// it by the persona — and the root simply has it when a key is stored.
+async fn git_ssh_granted(pool: &PgPool, conversation: i64) -> Result<bool, sqlx::Error> {
+    match db::agent_credentials(pool, conversation).await? {
+        // No row is the user's own conversation: today's rule, the key
+        // if one is stored.
+        None => db::ssh_key_stored(pool).await,
+        // A pre-ticket row falls open: that conversation had the key
+        // before the column existed, and nothing here takes it away.
+        Some(None) => Ok(true),
+        Some(Some(list)) => Ok(list.iter().any(|name| name == CREDENTIAL_GIT_SSH)),
+    }
+}
+
+/// Rule S, read fresh (SME-242): granted iff this conversation's own
+/// persona snapshot lists the name and the store holds it now. A name
+/// unbacked at start becomes granted at the next install with no
+/// restart — the names are frozen, the backing is live.
+async fn granted_secret_names(pool: &PgPool, conversation: i64) -> Result<Vec<String>, sqlx::Error> {
+    let names = db::persona_credential_names(pool, conversation).await?;
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let stored = db::list_named_secrets(pool).await?;
+    Ok(names.into_iter().filter(|name| stored.iter().any(|secret| secret.name == *name)).collect())
+}
+
+/// The conversation's credential set, both rules asked separately
+/// (SME-242, D2). Every install calls this before reading any value;
+/// the prompt and the start report ask it too, so pod and prompt can
+/// disagree only for one install's worth of time (Trade-off 2).
+pub async fn for_conversation(pool: &PgPool, conversation: i64) -> Result<PodCredentials, sqlx::Error> {
+    Ok(PodCredentials {
+        git_ssh: git_ssh_granted(pool, conversation).await?,
+        secrets: granted_secret_names(pool, conversation).await?,
+    })
+}
+
+/// The files this conversation's pod gets: git's config and commit
+/// identity always, key files only under Rule G, and one file per
+/// granted secret under Rule S — mode 600, the name the persona listed.
+/// The decision is made before any value is read, and each value
+/// binds to its name, never to another conversation (state model).
+pub async fn pod_files(pool: &PgPool, conversation: i64) -> Result<Vec<PodFile>, sqlx::Error> {
+    let granted = for_conversation(pool, conversation).await?;
+    let keys = if granted.git_ssh {
+        db::list_ssh_keys(pool).await?.into_iter().map(|k| (k.name, k.private_key)).collect()
+    } else {
+        Vec::new()
+    };
+    let identity = db::get_git_identity(pool).await?;
+    let mut files = pod_git_files(&keys, &identity);
+    if !granted.secrets.is_empty() {
+        for secret in db::list_named_secrets(pool).await? {
+            if granted.secrets.iter().any(|name| *name == secret.name) {
+                files.push(PodFile {
+                    path: format!("{POD_SECRETS_DIR}/{}", secret.name),
+                    mode: 0o600,
+                    content: secret.value,
+                });
+            }
+        }
+    }
+    Ok(files)
+}
+
 /// Writes `files` into the pod's sandbox container, then prunes each of
 /// `prune_dirs` to the names kept in `files`, so a file deleted since the
 /// last install goes too.
@@ -179,54 +268,75 @@ pub(crate) async fn with_install_lock<F: std::future::Future>(install: F) -> F::
     install.await
 }
 
-/// Installs the stored keys and commit identity into pod `pod_id`.
+/// Installs this pod's conversation's credential files (SME-242): both
+/// rules are asked per conversation, so a key saved into the store
+/// reaches the conversations Rule G grants and not a persona-narrowed
+/// one, and a secret reaches the persona that named it. A pod with no
+/// row — gone mid-install — installs nothing rather than everything.
 pub async fn install_into_pod(pool: &PgPool, pod_id: i64) -> Result<(), String> {
     with_install_lock(async {
-        let keys = db::list_ssh_keys(pool).await.map_err(|e| e.to_string())?;
-        let identity = db::get_git_identity(pool).await.map_err(|e| e.to_string())?;
-        let keys: Vec<(String, String)> = keys.into_iter().map(|k| (k.name, k.private_key)).collect();
+        let conversation = db::sandbox_pod_conversation_id(pool, pod_id).await.map_err(|e| e.to_string())?;
+        let Some(conversation) = conversation else {
+            return Ok(()); // the pod is gone; there is no decision to install
+        };
+        let files = pod_files(pool, conversation).await.map_err(|e| e.to_string())?;
         // Bounded: every install waits on this lock, so a stalled exec
         // mustn't hold it.
         let shell = sandbox::PodShell::for_pod(pool, pod_id).await.map_err(|e| e.to_string())?;
-        let files = pod_git_files(&keys, &identity);
         let keys_dir = format!("{POD_GIT_DIR}/keys");
-        tokio::time::timeout(INSTALL_TIMEOUT, install_pod_files(&shell, &files, &[keys_dir.as_str()]))
+        tokio::time::timeout(
+            INSTALL_TIMEOUT,
+            install_pod_files(&shell, &files, &[keys_dir.as_str(), POD_SECRETS_DIR]),
+        )
         .await
-        .map_err(|_| format!("writing git files into the pod took over {}s", INSTALL_TIMEOUT.as_secs()))?
+        .map_err(|_| {
+            format!("writing credential files into the pod took over {}s", INSTALL_TIMEOUT.as_secs())
+        })?
         .map_err(|e| e.to_string())
     })
     .await
 }
 
-/// How long writing the git files into one pod may take.
+/// How long writing the credential files into one pod may take.
 const INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// A new pod's git files: nothing to write when there's no key and no
-/// identity, so a pod on an image without `/etc/smelt` still starts.
+/// A new pod's files: nothing to write when this conversation gets no
+/// key, no granted secret and has no identity — so a pod on an image
+/// without `/etc/smelt` still starts, and a store full of secrets is
+/// no "install everything" trigger for the root, whose Rule S is none
+/// (T5). A pod id naming no pod is likewise no attempt.
 pub async fn install_into_new_pod(pool: &PgPool, pod_id: i64) -> Result<(), String> {
-    let keys = db::list_ssh_keys(pool).await.map_err(|e| e.to_string())?;
+    let conversation = db::sandbox_pod_conversation_id(pool, pod_id).await.map_err(|e| e.to_string())?;
+    let Some(conversation) = conversation else {
+        return Ok(());
+    };
+    let granted = for_conversation(pool, conversation).await.map_err(|e| e.to_string())?;
+    let has_key = granted.git_ssh && db::ssh_key_stored(pool).await.map_err(|e| e.to_string())?;
     let identity = db::get_git_identity(pool).await.map_err(|e| e.to_string())?;
-    if keys.is_empty() && identity == GitIdentity::default() {
+    if !has_key && granted.secrets.is_empty() && identity == GitIdentity::default() {
         return Ok(());
     }
     install_into_pod(pool, pod_id).await
 }
 
-/// After a key or the identity changes: every live pod gets the new
-/// files, so a key added mid-conversation works without a new pod. A
-/// pod that can't be reached is logged and skipped; it may be starting
-/// (and installs for itself once running) or ending.
+/// After a key, the identity or a secret changes: every live pod gets
+/// the files its own conversation is granted — a key added mid-
+/// conversation works without a new pod, and a persona-narrowed one is
+/// never re-granted by the loop's blanket reach. A pod that can't be
+/// reached is logged and skipped (it may be starting or ending); it
+/// keeps its old files until its next create (Trade-off 2, today's
+/// behaviour).
 pub async fn install_into_live_pods(pool: &PgPool) {
     let pods = match db::list_live_pods(pool).await {
         Ok(pods) => pods,
         Err(e) => {
-            tracing::warn!(error = %e, "couldn't list live pods to install git files");
+            tracing::warn!(error = %e, "couldn't list live pods to install credentials");
             return;
         }
     };
     for pod in pods {
         if let Err(e) = install_into_pod(pool, pod.pod_id).await {
-            tracing::warn!(pod_id = pod.pod_id, error = %e, "couldn't install git files");
+            tracing::warn!(pod_id = pod.pod_id, error = %e, "couldn't install credentials");
         }
     }
 }
