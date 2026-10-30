@@ -29,6 +29,7 @@ fn prompt_env() -> PromptEnvironment {
         instructions: Vec::new(),
         persona_files: Default::default(),
         agent: None,
+        credentials: None,
     }
 }
 
@@ -579,4 +580,114 @@ fn test_system_prompt_only_names_real_tools() {
     assert!(named.len() > 10, "expected the prompt to name its tools, found {named:?}");
     let unknown: Vec<&&str> = named.iter().filter(|word| !tools.iter().any(|t| t == **word)).collect();
     assert!(unknown.is_empty(), "the system prompt names tools that don't exist: {unknown:?}");
+}
+
+/// SME-242, T9: D8's three lines. What the pod holds, by path; a child
+/// denied the git key, told plainly so it doesn't retry a doomed push;
+/// and a persona name no stored secret backs, named. A conversation with
+/// nothing to say by rule — the root, a persona-less agent with its
+/// chain's answer — gets no credential line at all.
+#[test]
+fn test_system_prompt_says_what_the_credentials_rules_answer() {
+    let mut env = prompt_env();
+    env.credentials = Some(crate::credentials::PromptCredentials {
+        granted: crate::credentials::PodCredentials {
+            git_ssh: true,
+            secrets: vec!["linear-api-key".to_string()],
+        },
+        key_name: Some("id_ed25519".to_string()),
+        unbacked: Vec::new(),
+    });
+    let prompt = system_prompt(&env);
+    assert!(
+        prompt.contains(
+            "- Credentials: git SSH key at /etc/smelt/keys/id_ed25519; secret linear-api-key \
+             at /etc/smelt/secrets/linear-api-key\n"
+        ),
+        "{prompt}"
+    );
+
+    // A secret without a key: the line stands on its own. And the root
+    // hears no "no git credential" — a user who stored no key is not a
+    // child told to have none.
+    let creds = env.credentials.as_mut().expect("creds");
+    creds.key_name = None;
+    creds.granted.git_ssh = false;
+    let prompt = system_prompt(&env);
+    assert!(
+        prompt.contains("- Credentials: secret linear-api-key at /etc/smelt/secrets/linear-api-key\n"),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("No git credential"), "{prompt}");
+
+    // A child whose set excludes git-ssh, and a name the store doesn't
+    // back: both silences broken.
+    env.agent = Some(AgentPrompt { id: 7, parent_id: 42, persona: None });
+    env.credentials.as_mut().expect("creds").unbacked = vec!["foo".to_string()];
+    let prompt = system_prompt(&env);
+    assert!(
+        prompt.contains(
+            "- No git credential: your persona's smelt.credentials doesn't list git-ssh (or your \
+             parent's chain doesn't have it), so /etc/smelt/keys is empty — git push and git fetch \
+             over SSH will fail; don't retry them."
+        ),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains(
+            "- Your persona lists credential `foo`, which isn't one of the user's stored secrets, \
+             so you don't have it."
+        ),
+        "{prompt}"
+    );
+
+    // Chain granted but nothing stored (the fall-open with no key): no
+    // path is invented and nothing else says a credential.
+    let mut quiet = prompt_env();
+    quiet.agent = Some(AgentPrompt { id: 7, parent_id: 42, persona: None });
+    quiet.credentials = Some(crate::credentials::PromptCredentials {
+        granted: crate::credentials::PodCredentials { git_ssh: true, secrets: Vec::new() },
+        key_name: None,
+        unbacked: Vec::new(),
+    });
+    assert!(!system_prompt(&quiet).contains("Credentials"), "nothing held, nothing said");
+}
+
+/// T9, the marker: a stored value — and even D7's capped display prefix —
+/// never reaches a prompt. The environment section names paths only, so
+/// the value and its first four characters are both absent from every
+/// prompt the gatherer and renderer together can build.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_environment_section_names_no_credential_value(pool: PgPool) {
+    let root = db::create_conversation(&pool).await.expect("a root").id;
+    sqlx::query("INSERT INTO named_secrets (name, value) VALUES ('linear-key', 'SECRET-VALUE-MUST-NOT-APPEAR')")
+        .execute(&pool)
+        .await
+        .expect("a stored secret");
+    let child =
+        sqlx::query_scalar::<_, i64>("INSERT INTO conversations (title, parent_id) VALUES ('c', $1) RETURNING id")
+            .bind(root)
+            .fetch_one(&pool)
+            .await
+            .expect("a child");
+    sqlx::query(
+        "INSERT INTO agents (conversation_id, root_id, depth, brief, state, credentials, persona_settings)
+         VALUES ($1, $1, 1, 'b', 'active', '{}', '{\"credentials\": [\"linear-key\", \"nope\"]}')",
+    )
+    .bind(child)
+    .execute(&pool)
+    .await
+    .expect("its agent row");
+
+    let prompt = system_prompt(&prompt_environment(&pool, child, "claude-test").await);
+    // All three lines are here, and they are all names and paths.
+    assert!(
+        prompt.contains("- Credentials: secret linear-key at /etc/smelt/secrets/linear-key\n"),
+        "the granted secret by path: {prompt}"
+    );
+    assert!(prompt.contains("credential `nope`, which isn't one of the user's stored secrets"), "{prompt}");
+    assert!(prompt.contains("- No git credential:"), "{prompt}");
+    for leaked in ["SECRET-VALUE-MUST-NOT-APPEAR", "SECR"] {
+        assert!(!prompt.contains(leaked), "{leaked} reached the prompt");
+    }
 }

@@ -272,6 +272,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "delete_names_its_agents", 60, Box::pin(scenario_delete_names_its_agents(&t))).await;
     run_scenario(&t, only, r, k, "agent_tree", 90, Box::pin(scenario_agent_tree(&t))).await;
     run_scenario(&t, only, r, k, "text_call_correction", 30, Box::pin(scenario_text_call_correction(&t))).await;
+    run_scenario(&t, only, r, k, "secrets_page", 60, Box::pin(scenario_secrets_page(&t))).await;
 
     let mut failures: Vec<String> = results
         .iter()

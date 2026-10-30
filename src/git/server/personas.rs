@@ -171,8 +171,12 @@ async fn remote_trust(pool: &PgPool, remote_key: &str) -> Result<Option<bool>, S
 /// absolute path; a file that doesn't parse, with its error; and, when
 /// the configured servers are known, a rule naming one of them by a name
 /// no longer configured (SME-241's report — an unknown server list
-/// reports nothing rather than accusing every pattern).
-fn persona_entry(dir: &str, file: PersonaFile, server_names: Option<&[String]>) -> Value {
+/// reports nothing rather than accusing every pattern). With the stored
+/// secrets known, likewise its `smelt.credentials`: the names shown as
+/// parsed, a note for each one the store doesn't back (SME-242, D6's
+/// first place) — and `git-ssh` never among them, since it's the chain's
+/// to grant and no listing can see a chain.
+fn persona_entry(dir: &str, file: PersonaFile, server_names: Option<&[String]>, secret_names: Option<&[String]>) -> Value {
     let full = format!("{}/{dir}/{}", crate::sandbox::WORKSPACE_DIR, file.path);
     match file.parsed {
         Ok(persona) => {
@@ -190,12 +194,40 @@ fn persona_entry(dir: &str, file: PersonaFile, server_names: Option<&[String]>) 
                     entry["rules"] = Value::String(note);
                 }
             }
+            if let Some(credentials) = persona.credentials {
+                entry["credentials"] = Value::Array(credentials.iter().map(|n| Value::String(n.clone())).collect());
+                if let Some(stored) = secret_names {
+                    let unbacked: Vec<String> = credentials
+                        .iter()
+                        .filter(|name| **name != crate::credentials::CREDENTIAL_GIT_SSH && !stored.iter().any(|s| s == *name))
+                        .cloned()
+                        .collect();
+                    if let Some(note) = unbacked_note(&unbacked) {
+                        entry["credentials_note"] = Value::String(note);
+                    }
+                }
+            }
             if let Some(model) = persona.model {
                 entry["model"] = Value::String(model);
             }
             entry
         }
         Err(error) => json!({"file": full, "error": error}),
+    }
+}
+
+/// The listing's note on unbacked credential names (SME-242, in
+/// `unmatched_note`'s style): the start's notice says these words of its
+/// child, here they stand of the entry they're attached to. An unknown
+/// store never gets here — the caller withholds the whole note.
+fn unbacked_note(names: &[String]) -> Option<String> {
+    match names.len() {
+        0 => None,
+        1 => Some(format!("`{}` isn't one of your stored secrets, so it grants nothing until you add it", names[0])),
+        _ => Some(format!(
+            "{} aren't among your stored secrets, so they grant nothing until you add them",
+            names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")
+        )),
     }
 }
 
@@ -216,6 +248,18 @@ pub(crate) async fn gated_listing(pool: &PgPool, reads: Vec<RepoPersonas>) -> Re
         Ok(configs) => Some(configs.into_iter().map(|config| config.name).collect()),
         Err(e) => {
             tracing::warn!(error = %e, "couldn't read the configured MCP servers; this listing reports no stale rule patterns");
+            None
+        }
+    };
+    // And the stored secret names, once likewise (SME-242): they make a
+    // persona's `smelt.credentials` names real or unbacked. A failed read
+    // says nothing for the same reason — it mustn't accuse every name of
+    // what it couldn't check — while the names themselves still show,
+    // being read from the persona file.
+    let secret_names: Option<Vec<String>> = match db::list_named_secrets(pool).await {
+        Ok(secrets) => Some(secrets.into_iter().map(|secret| secret.name).collect()),
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't read the stored secrets; this listing reports no unbacked credential names");
             None
         }
     };
@@ -242,8 +286,10 @@ pub(crate) async fn gated_listing(pool: &PgPool, reads: Vec<RepoPersonas>) -> Re
                     if files.is_empty() {
                         notes.push(format!("It has no persona files ({PERSONAS_DIR}*.md)."));
                     } else {
-                        let personas: Vec<Value> =
-                            files.into_iter().map(|f| persona_entry(&repo.dir, f, server_names.as_deref())).collect();
+                        let personas: Vec<Value> = files
+                            .into_iter()
+                            .map(|f| persona_entry(&repo.dir, f, server_names.as_deref(), secret_names.as_deref()))
+                            .collect();
                         any_persona |= personas.iter().any(|p| p.get("persona").is_some());
                         entry["personas"] = Value::Array(personas);
                     }

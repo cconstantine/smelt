@@ -31,6 +31,7 @@ fn test_a_full_persona_file_parses_with_its_body_as_written() {
                 .to_string(),
             model: Some("claude-opus-4-5".to_string()),
             tools: None,
+            credentials: None,
         }
     );
 }
@@ -75,11 +76,12 @@ fn test_an_unknown_top_level_field_is_refused_naming_it_and_its_line() {
 
 #[test]
 fn test_an_unknown_field_under_smelt_is_refused_naming_it() {
-    // `tools` is a real field now (SME-241); `credentials` is the next
-    // reserved key (SME-242), refused until its ticket lands.
-    let text = "---\nname: developer\ndescription: d\nsmelt:\n  credentials:\n    - git-ssh\n---\n";
+    // `tools` is a real field (SME-241) and `credentials` arrived with
+    // SME-242; `egress` is the next reserved key (SME-243), refused
+    // until its ticket lands.
+    let text = "---\nname: developer\ndescription: d\nsmelt:\n  egress:\n    - github.com\n---\n";
     let error = parse_err(DEV, text);
-    assert!(error.contains("smelt: unknown field `credentials`"), "{error}");
+    assert!(error.contains("smelt: unknown field `egress`"), "{error}");
     assert!(error.contains("line 5"), "the key is on the file's line 5: {error}");
 }
 
@@ -305,4 +307,44 @@ fn test_a_pattern_in_both_allow_and_deny_is_refused_naming_it() {
         DEV,
         "---\nname: developer\ndescription: d\nsmelt:\n  tools:\n    allow: [github/get_*]\n    deny: [github/*_pull_*]\n---\n",
     );
+}
+
+// --- T2 (SME-242): `smelt.credentials` ---
+
+/// A set may name the built-in and any stored secret's name; nothing
+/// consults the store here — an un-stored name parses fine and is
+/// reported at start and in `list_personas` instead (D6).
+#[test]
+fn test_credentials_parse_the_names_as_written() {
+    let persona = parse_ok(
+        DEV,
+        "---\nname: developer\ndescription: d\nsmelt:\n  credentials: [git-ssh, linear-key]\n---\nbody\n",
+    );
+    assert_eq!(persona.credentials, Some(vec!["git-ssh".to_string(), "linear-key".to_string()]));
+    // Absent means none, and so does the empty list: both grant nothing.
+    for (text, want) in [
+        ("---\nname: developer\ndescription: d\n---\nbody\n", None),
+        ("---\nname: developer\ndescription: d\nsmelt:\n  credentials: []\n---\nbody\n", Some(vec![])),
+    ] {
+        assert_eq!(parse_ok(DEV, text).credentials, want, "{text}");
+    }
+    // `credentials:` with no value is the empty list, like `smelt:` with
+    // no value is no settings at all.
+    let persona = parse_ok(DEV, "---\nname: developer\ndescription: d\nsmelt:\n  credentials:\n---\nbody\n");
+    assert!(persona.credentials.is_none_or(|list| list.is_empty()), "no value grants nothing");
+}
+
+/// A name a pod couldn't write as a file name — `../x`, a space, a `*`,
+/// or nothing at all — is a parse error naming the file, and the line
+/// serde reached it on.
+#[test]
+fn test_a_bad_credential_entry_is_a_parse_error_naming_the_file_and_line() {
+    for entry in ["../x", "has space", "star*", ""] {
+        let error = parse_err(
+            DEV,
+            &format!("---\nname: developer\ndescription: d\nsmelt:\n  credentials: [git-ssh, {entry:?}]\n---\nbody\n"),
+        );
+        assert!(error.contains(&format!("`{entry}`")), "{entry:?} should be quoted in: {error}");
+        assert!(error.contains("line"), "the error should name the line: {error}");
+    }
 }

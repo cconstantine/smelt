@@ -4,8 +4,8 @@ mod pages;
 use dioxus::prelude::*;
 use pages::{
     Chat, GitSettingsPage, LanguageServerEdit, LanguageServerNew, LanguageServersIndex, McpServerEdit,
-    McpServerNew, McpServersIndex, PodsIndex, ProviderEdit, ProviderNew, ProvidersIndex, SandboxVolumeNew,
-    SandboxVolumesIndex,
+    McpServerNew, McpServersIndex, PodsIndex, ProviderEdit, ProviderNew, ProvidersIndex, SecretsPage,
+    SandboxVolumeNew, SandboxVolumesIndex,
 };
 
 #[derive(Routable, Clone, PartialEq, Debug)]
@@ -28,6 +28,8 @@ pub(crate) enum Route {
     PodsRoute {},
     #[route("/git")]
     GitRoute {},
+    #[route("/secrets")]
+    SecretsRoute {},
     #[route("/language-servers")]
     LanguageServersRoute {},
     #[route("/language-servers/new")]
@@ -83,6 +85,11 @@ fn PodsRoute() -> Element {
 #[component]
 fn GitRoute() -> Element {
     rsx! { GitSettingsPage {} }
+}
+
+#[component]
+fn SecretsRoute() -> Element {
+    rsx! { SecretsPage {} }
 }
 
 #[component]

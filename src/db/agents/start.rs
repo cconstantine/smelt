@@ -65,8 +65,8 @@ pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChi
     .await?;
     let agent = match &caller {
         Some((None, _)) => Some(
-            sqlx::query_as::<_, (String, i32, i64, Option<serde_json::Value>)>(
-                "SELECT state, depth, root_id, rule_chain FROM agents WHERE conversation_id = $1",
+            sqlx::query_as::<_, (String, i32, i64, Option<serde_json::Value>, Option<Vec<String>>)>(
+                "SELECT state, depth, root_id, rule_chain, credentials FROM agents WHERE conversation_id = $1",
             )
             .bind(new.caller)
             .fetch_optional(&mut *tx)
@@ -79,12 +79,12 @@ pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChi
     let mut refused = match (&caller, agent.as_ref().map(Option::as_ref)) {
         (None, _) => Some(("this conversation no longer exists".to_string(), false)),
         (Some((Some(_), _)), _) => Some(("this conversation is being deleted".to_string(), false)),
-        (Some((None, _)), Some(Some((state, _, _, _)))) if state == AGENT_STOPPED => {
+        (Some((None, _)), Some(Some((state, _, _, _, _)))) if state == AGENT_STOPPED => {
             Some(("you were stopped, so you can't start an agent".to_string(), false))
         }
         // SME-241: depth replaces the root-only rule — an agent may start
         // one below it until `SMELT_AGENT_DEPTH` levels are used up.
-        (Some((None, _)), Some(Some((_, depth, _, _)))) if *depth >= new.max_depth => Some((format!(
+        (Some((None, _)), Some(Some((_, depth, _, _, _)))) if *depth >= new.max_depth => Some((format!(
             "start_agent can't go deeper than {} levels of agents (you're at depth {depth})",
             new.max_depth
         ), false)),
@@ -157,9 +157,35 @@ pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChi
     // A started agent nests under its own row: its depth plus one, its
     // root's root, its rule chain (SME-241). An agent-less root starts
     // the line: depth 1, itself the root, no chain.
-    let (depth, root, chain) = match agent.flatten() {
-        Some((_, depth, root, chain)) => (depth + 1, root, chain),
-        None => (1, new.caller, None),
+    //
+    // Its `credentials` is Rule G's seed (SME-242, D3): the parent's
+    // `git-ssh` bit passes down and nothing else does — a NULL column
+    // reads granted, like every other Rule G read, so a pre-ticket line
+    // keeps the key rather than stranding its children. An agent-less
+    // caller passes Rule G's root answer: the key, as every pod has
+    // today, if one is stored. The named-secret half of the credential
+    // set is not here at all — Rule S reads the child's own persona
+    // snapshot, so no secret name can ride this column down the tree.
+    let nested = agent.flatten();
+    let (depth, root, chain, credentials) = match nested {
+        Some((_, depth, root, chain, parent_credentials)) => {
+            let git_ssh = match &parent_credentials {
+                None => true,
+                Some(list) => list.iter().any(|name| name == crate::credentials::CREDENTIAL_GIT_SSH),
+            };
+            (depth + 1, root, chain, if git_ssh { vec![crate::credentials::CREDENTIAL_GIT_SSH.to_string()] } else { vec![] })
+        }
+        None => {
+            let has_key: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM ssh_keys)")
+                .fetch_one(&mut *tx)
+                .await?;
+            (
+                1,
+                new.caller,
+                None,
+                if has_key { vec![crate::credentials::CREDENTIAL_GIT_SSH.to_string()] } else { vec![] },
+            )
+        }
     };
     let (provider_id, model) = new.model.clone().unzip();
     let child = sqlx::query_scalar::<_, i64>(
@@ -171,9 +197,15 @@ pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChi
     .bind(model)
     .fetch_one(&mut *tx)
     .await?;
+    // D2's trap, stated at the one `INSERT` that could re-introduce it:
+    // `credentials` carries the chain bit computed above — the parent's
+    // `git-ssh` or nothing — and never a named secret's name. Copying
+    // the parent's secret names here, then intersecting at each read,
+    // would quietly re-introduce narrowing for secrets, which the user
+    // exempted (T4 asserts the subset; Rule S reads the snapshot).
     sqlx::query(
-        "INSERT INTO agents (conversation_id, root_id, depth, brief, persona_name, state, rule_chain)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        "INSERT INTO agents (conversation_id, root_id, depth, brief, persona_name, state, rule_chain, credentials)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(child)
     .bind(root)
@@ -182,6 +214,7 @@ pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChi
     .bind(new.persona_name)
     .bind(AGENT_STARTING)
     .bind(chain)
+    .bind(credentials)
     .execute(&mut *tx)
     .await?;
     let brief = [ContentBlock::Text { text: new.brief.to_string() }];

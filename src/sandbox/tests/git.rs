@@ -20,8 +20,9 @@ async fn test_git_files_reach_ssh_and_git_in_a_real_pod() {
             email: "ada@example.com".to_string(),
         };
         let files =
-            crate::git::pod_git_files(&[("test-key".to_string(), key.private_key.clone())], &identity);
-        crate::git::install_git_files(&shell, &files)
+            crate::credentials::pod_git_files(&[("test-key".to_string(), key.private_key.clone())], &identity);
+        let keys_dir = format!("{}/keys", crate::credentials::POD_GIT_DIR);
+        crate::credentials::install_pod_files(&shell, &files, &[keys_dir.as_str()])
             .await
             .expect("install git files");
 
@@ -71,7 +72,7 @@ async fn test_git_files_reach_ssh_and_git_in_a_real_pod() {
         ]);
         let reinstall = async {
             for _ in 0..3 {
-                crate::git::install_git_files(&shell, &files).await.expect("reinstall");
+                crate::credentials::install_pod_files(&shell, &files, &[keys_dir.as_str()]).await.expect("reinstall");
             }
         };
         let (watched, ()) = tokio::join!(watch, reinstall);
@@ -81,14 +82,16 @@ async fn test_git_files_reach_ssh_and_git_in_a_real_pod() {
         // A write that fails says why (SME-32 code review 7, finding 5).
         let locked = sandbox.exec(&["chmod", "500", "/etc/smelt/keys"]).await.expect("exec chmod");
         assert_eq!(locked.exit_code, 0);
-        let failed = crate::git::install_git_files(&shell, &files).await.expect_err("keys dir not writable");
+        let failed = crate::credentials::install_pod_files(&shell, &files, &[keys_dir.as_str()])
+            .await
+            .expect_err("keys dir not writable");
         assert!(failed.to_string().contains("Permission denied"), "{failed}");
         let unlocked = sandbox.exec(&["chmod", "700", "/etc/smelt/keys"]).await.expect("exec chmod");
         assert_eq!(unlocked.exit_code, 0);
 
         // The key is deleted: a reinstall without it removes the file.
-        let files = crate::git::pod_git_files(&[], &identity);
-        crate::git::install_git_files(&shell, &files)
+        let files = crate::credentials::pod_git_files(&[], &identity);
+        crate::credentials::install_pod_files(&shell, &files, &[keys_dir.as_str()])
             .await
             .expect("reinstall git files");
         let gone = sandbox

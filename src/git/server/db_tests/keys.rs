@@ -1,6 +1,7 @@
 //! SSH keys and the commit identity: creation, one-at-a-time, import, delete.
 
 use super::*;
+use crate::credentials::install_into_new_pod;
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_key_stores_it_and_returns_only_the_public_half(pool: PgPool) {
@@ -58,9 +59,22 @@ async fn test_import_key_stores_the_derived_public_half(pool: PgPool) {
 /// No key and no identity: a new pod is left alone (SME-32 code
 /// review 8, finding 2). Pod 999999 doesn't exist, and this test
 /// process has no cluster: any attempt to write would fail.
+/// SME-242 (T5) extends it: a store full of secrets changes neither
+/// answer — the unknown pod id resolves to no conversation rather than
+/// becoming an "install everything" attempt, and a real root pod with a
+/// secret stored but no key and no identity still has nothing to write
+/// (the root's Rule S is none, and the early return stands).
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_new_pod_gets_nothing_when_there_is_nothing_to_install(pool: PgPool) {
     install_into_new_pod(&pool, 999_999).await.expect("nothing to do");
+    sqlx::query("INSERT INTO named_secrets (name, value) VALUES ('linear-key', 'v')")
+        .execute(&pool)
+        .await
+        .expect("a secret");
+    install_into_new_pod(&pool, 999_999).await.expect("still nothing to do");
+    let root = db::create_conversation(&pool).await.expect("a conversation").id;
+    let pod = db::create_sandbox_pod(&pool, root).await.expect("a pod row").id;
+    install_into_new_pod(&pool, pod).await.expect("a root gets no secrets, and nothing else");
 }
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]

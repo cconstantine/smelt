@@ -213,6 +213,15 @@ async fn run_start(pool: &PgPool, child: i64, parent: i64, request: StartRequest
             return;
         }
     };
+    // The pod gets the decision before the child is `active` and its
+    // first turn woken (SME-242, D4): the key a persona excluded goes,
+    // the secrets it named come. A failure fails the start rather than
+    // waking a turn into a pod that doesn't match its grants; the exit
+    // tries again as the backstop for every other way out.
+    if let Err(error) = crate::credentials::reconcile_pod(pool, child, prepared.persona.as_ref()).await {
+        fail_start(pool, child, parent, &format!("couldn't write its credentials into its pod: {error}")).await;
+        return;
+    }
     #[cfg(test)]
     test_hooks::reach(test_hooks::BEFORE_START_DONE, parent).await;
     let label = label(child, prepared.persona.as_ref().and_then(|p| persona_label(&p.path)).as_deref());
@@ -272,7 +281,79 @@ async fn prepare(
     // A rule naming a server that isn't configured rules nothing: the
     // parent hears that too, on the notice channel (SME-241's report).
     let rules_notice = persona::rules_notice(pool, child, &snapshot).await;
-    Ok(Prepared { persona: Some(snapshot), model, parent_notice: one_notice([model_notice, rules_notice]) })
+    // The credentials notes before the narrowing, which is what makes
+    // a `git-ssh` ask denied (SME-242, D3's write 2 reads the column
+    // first). The narrowing itself is D3's: the column ∩ the persona's
+    // own list, and no persona means `prepare` never reaches here.
+    let credentials_notes = credentials_notes(pool, child, &snapshot).await;
+    let wants_git_ssh = crate::credentials::snapshot_credential_names(&snapshot)
+        .iter()
+        .any(|name| name == crate::credentials::CREDENTIAL_GIT_SSH);
+    db::narrow_agent_credentials(pool, child, wants_git_ssh)
+        .await
+        .map_err(|e| format!("couldn't narrow the agent's credentials: {e}"))?;
+    let mut notes = vec![model_notice, rules_notice];
+    notes.extend(credentials_notes.into_iter().map(Some));
+    Ok(Prepared { persona: Some(snapshot), model, parent_notice: one_notice(notes) })
+}
+
+/// What the child's persona asked of its credentials and this start
+/// cannot give, each said once to its parent on the notice channel
+/// (SME-242, D6's second place): a `git-ssh` the chain doesn't have —
+/// asked before `prepare` narrows, which is what makes the ask denied
+/// — and a name the store doesn't back, which is Rule S's only
+/// failure mode and is said of the store alone, never of an ancestor.
+/// A store that can't be read accuses no name (SME-241's precedent):
+/// the reconcile simply writes no file for it, and the next install
+/// will.
+pub(crate) async fn credentials_notes(pool: &PgPool, child: i64, snapshot: &db::PersonaSnapshot) -> Vec<String> {
+    let names = crate::credentials::snapshot_credential_names(snapshot);
+    let label = || label(child, crate::agents::persona_label(&snapshot.path).as_deref());
+    let wants_git_ssh = names.iter().any(|name| name == crate::credentials::CREDENTIAL_GIT_SSH);
+    let mut notes = Vec::new();
+    if wants_git_ssh && !chain_has_git_ssh(pool, child).await {
+        notes.push(format!(
+            "{}'s persona asks for `git-ssh`, which its parent's chain doesn't have, so it gets none",
+            label()
+        ));
+    }
+    let secrets: Vec<String> =
+        names.into_iter().filter(|name| name != crate::credentials::CREDENTIAL_GIT_SSH).collect();
+    if secrets.is_empty() {
+        return notes;
+    }
+    let stored: Vec<String> = match db::list_named_secrets(pool).await {
+        Ok(list) => list.into_iter().map(|secret| secret.name).collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't read the stored secrets for the agent's credentials note");
+            return notes;
+        }
+    };
+    for name in secrets {
+        if !stored.contains(&name) {
+            notes.push(format!(
+                "{}'s persona lists `{name}`, which isn't one of your stored secrets, so it gets none until you add it",
+                label()
+            ));
+        }
+    }
+    notes
+}
+
+/// Rule G's question while the column still holds the chain's answer,
+/// before `prepare` narrows it: does the chain grant `git-ssh`? A
+/// NULL column — a pre-ticket row — reads granted the way every Rule
+/// G read does; no row is no agent, and only a child with a persona
+/// gets here.
+async fn chain_has_git_ssh(pool: &PgPool, child: i64) -> bool {
+    match db::agent_credentials(pool, child).await {
+        Ok(Some(Some(list))) => list.iter().any(|name| name == crate::credentials::CREDENTIAL_GIT_SSH),
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(conversation_id = child, error = %e, "couldn't read the agent's chain bit for its credentials note");
+            true
+        }
+    }
 }
 
 /// One notice to the parent, whatever the start found to tell it: the
@@ -367,15 +448,29 @@ pub(crate) async fn end_start(pool: &PgPool, child: i64, done: bool) {
             Ok(_) => crate::git::publish_repos(pool, child).await,
             Err(e) => tracing::warn!(conversation_id = child, error = %e, "couldn't delete an agent's trust cards"),
         }
+        // D3's write 3, before the pod is reconciled under it: a start
+        // that never completed gives its chain bit back, so no way out
+        // leaves a resumable credential behind (Trade-off 4) and the
+        // reconcile below reads a column that already says `no key`.
+        if let Err(e) = db::clear_agent_credentials(pool, child).await {
+            tracing::warn!(conversation_id = child, error = %e, "couldn't clear a cut-off start's chain bit");
+        }
     }
-    drop_start_credentials(child).await;
+    drop_start_credentials(pool, child).await;
     #[cfg(test)]
     test_hooks::start_ended(child);
 }
 
-/// Removes the SSH key from a child that mustn't keep it. Every child
-/// keeps it until SME-242 says which mustn't (`agents.credentials`), as
-/// every pod does today; the exits that call this are built here.
-async fn drop_start_credentials(child: i64) {
-    let _ = child;
+/// SME-236's exit hook, wired to the decision by SME-242: writes the
+/// child's live pod whatever its rows say now — after `end_start`'s
+/// clearing, that is nothing, for a start that didn't complete, and
+/// the committed rows' own grant for one that did (the same install
+/// `run_start` just ran, so this is the backstop for the ways out
+/// that never reached it: failed, stopped, task dropped, the startup
+/// sweep). A no-op when the conversation has no live pod, the common
+/// case for an agent with no repo.
+async fn drop_start_credentials(pool: &PgPool, child: i64) {
+    if let Err(e) = crate::credentials::reconcile_pod(pool, child, None).await {
+        tracing::warn!(conversation_id = child, error = %e, "couldn't reconcile a start exit's credentials");
+    }
 }

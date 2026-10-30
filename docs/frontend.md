@@ -61,6 +61,7 @@ The routes (`Route` in `frontend/mod.rs`):
 | `/sandbox-volumes`, `/sandbox-volumes/new` | `SandboxVolumesIndex`, `SandboxVolumeNew` |
 | `/pods` | `PodsIndex` |
 | `/git` | `GitSettingsPage` |
+| `/secrets` | `SecretsPage` |
 | `/language-servers`, `/language-servers/new`, `/language-servers/:id` | `LanguageServersIndex`, `LanguageServerNew`, `LanguageServerEdit` |
 | `/:..segments` (anything else, including a non-numeric conversation id) | `NotFound`: "Page not found", with a link back |
 
@@ -91,7 +92,7 @@ This isn't just style — a plain prop threaded down from `Home`/`ConversationRo
 
 Components take the store (`state: Store<ConversationState>`) and read the fields they show through its lenses (`state.todos()`), so a write to one field re-renders only that field's readers. **Keep what changes often in a component of its own** (SME-57 (c)): a streamed delta re-renders `StreamingReply` and the once-a-second tick `WorkingLine`, the only readers of `streaming_reply` and `turn_elapsed`; `Transcript` re-renders when the messages change, and each message is a keyed `MessageView` over memoized tool maps, so it re-renders only when its own message or a map changes. Browser scenario `streaming_into_a_long_transcript` holds this: streaming into 300 messages costs at most 3x the script time of streaming into one (it was 5.1x when every delta re-rendered the transcript). **The store lends out one write at a time:** two lenses' `write()` guards held at once panic at runtime (`AlreadyBorrowedMut`), even for different fields, since both borrow the one store. Change the sandbox pods and terminals together through `change_sandbox_panel`; anywhere else, take one guard at a time.
 
-The sidebar links to the other pages: "MCP servers", "Sandboxes" (`/pods`), "Sandbox volumes", "Git" and "Language servers". The route and code say pods; the link and the page's heading say "Sandboxes". The Sandboxes page (`pages/pods.rs`):
+The sidebar links to the other pages: "MCP servers", "Sandboxes" (`/pods`), "Sandbox volumes", "Git", "Secrets" and "Language servers". The route and code say pods; the link and the page's heading say "Sandboxes". The Sandboxes page (`pages/pods.rs`):
 - lists every live sandbox with its conversation, status, uptime, activity (busy, or idle for how long), memory and CPU use against their limits, and terminal count, plus a line under the row for its language servers, if any;
 - has a Stop button per row, clicked once to arm and again to confirm;
 - refetches on `AppEvent::PodsChanged` (its own `subscribe_app_events` stream, through `use_pods_changed`) and every 30 seconds;

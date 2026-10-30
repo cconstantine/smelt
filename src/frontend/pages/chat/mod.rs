@@ -121,6 +121,7 @@ pub fn Chat() -> Element {
         Route::SandboxVolumesRoute {} => None,
         Route::PodsRoute {} => None,
         Route::GitRoute {} => None,
+        Route::SecretsRoute {} => None,
         Route::LanguageServersRoute {} => None,
         Route::LanguageServerNewRoute {} => None,
         Route::LanguageServerEditRoute { .. } => None,

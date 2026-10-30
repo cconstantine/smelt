@@ -73,6 +73,7 @@ mod repos;
 mod mcp;
 mod language_servers;
 mod providers;
+mod secrets;
 
 pub use agents::*;
 pub use conversations::*;
@@ -85,6 +86,7 @@ pub use repos::*;
 pub use mcp::*;
 pub use language_servers::*;
 pub use providers::*;
+pub use secrets::*;
 
 #[cfg(test)]
 mod tests;

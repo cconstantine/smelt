@@ -70,3 +70,4 @@ mod providers;
 mod instance;
 mod agents;
 mod agent_volumes;
+mod secrets;

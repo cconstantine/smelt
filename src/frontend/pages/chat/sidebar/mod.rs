@@ -204,6 +204,7 @@ pub(super) fn ConversationSidebar(
             Link { to: Route::PodsRoute {}, class: "pods-link", "Sandboxes" }
             Link { to: Route::SandboxVolumesRoute {}, class: "sandbox-volumes-link", "Sandbox volumes" }
             Link { to: Route::GitRoute {}, class: "sandbox-volumes-link git-link", "Git" }
+            Link { to: Route::SecretsRoute {}, class: "sandbox-volumes-link secrets-link", "Secrets" }
             Link { to: Route::LanguageServersRoute {}, class: "sandbox-volumes-link language-servers-link", "Language servers" }
             super::ErrorText { message: list_error() }
             super::ErrorText { message: action_error() }

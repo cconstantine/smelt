@@ -60,6 +60,89 @@ pub enum RowLock {
     Update,
 }
 
+/// The row's `credentials` column (SME-242, D3), `git-ssh` only: it is
+/// Rule G's chain bit — a named secret's name never enters this column,
+/// so a descendant's set can never narrow by an ancestor's list.
+/// Outer `None` is no `agents` row (a Rule G root); inner `None` is the
+/// NULL a pre-ticket row carries, which every Rule G read takes as
+/// granted rather than stranding a conversation smelt wrote.
+pub async fn agent_credentials(pool: &PgPool, id: i64) -> Result<Option<Option<Vec<String>>>, sqlx::Error> {
+    sqlx::query_scalar::<_, Option<Vec<String>>>("SELECT credentials FROM agents WHERE conversation_id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Narrow a starting child's chain bit (SME-242, D3's write 2): the
+/// column ∩ what the persona's own `credentials` lists — and since
+/// `git-ssh` is the column's only member, the intersection turns on
+/// whether the persona listed it. `wants_git_ssh` false, or a column
+/// already empty, gives `'{}'` (keeping, never granting); a NULL
+/// pre-ticket column reads granted the way every Rule G read does, so
+/// a persona that wants the key gets the bit written rather than the
+/// row stranded. Gated on `starting` like every write here: a child
+/// stopped mid-start is `end_start`'s clear to settle, not this.
+/// Says whether it wrote.
+pub async fn narrow_agent_credentials(pool: &PgPool, child: i64, wants_git_ssh: bool) -> Result<bool, sqlx::Error> {
+    let wrote = sqlx::query(
+        "UPDATE agents SET credentials =
+             CASE WHEN $2 AND COALESCE($3 = ANY(credentials), TRUE)
+                  THEN ARRAY[$3]::text[] ELSE '{}'::text[] END
+         WHERE conversation_id = $1 AND state = $4",
+    )
+    .bind(child)
+    .bind(wants_git_ssh)
+    .bind(crate::credentials::CREDENTIAL_GIT_SSH)
+    .bind(AGENT_STARTING)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(wrote == 1)
+}
+
+/// Empty a never-completed child's column (SME-242, D3's write 3):
+/// `end_start` calls this on every way out that didn't complete,
+/// before it reconciles the pod, so a failed or cut-off start leaves
+/// no resumable credential behind (Trade-off 4). The gate is the
+/// start's incompletion rather than a state — `started_at IS NULL` —
+/// and it has to be, because every way out has already moved the
+/// state by the time the exit runs: `fail_start` has made the row
+/// `failed`, a user's Stop `stopped`, and those rows are exactly the
+/// never-started ones to clear. `started_at` is written only by the
+/// start's done step, so once it is set no write here can reach a
+/// live conversation; a child stopped while starting keeps it null and
+/// can never become `active` (see `database.md`), so clearing it
+/// strands nothing. Says whether it wrote.
+pub async fn clear_agent_credentials(pool: &PgPool, child: i64) -> Result<bool, sqlx::Error> {
+    let wrote = sqlx::query("UPDATE agents SET credentials = '{}' WHERE conversation_id = $1 AND started_at IS NULL")
+        .bind(child)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(wrote == 1)
+}
+
+/// The credential names this conversation's persona snapshot lists
+/// (SME-242): the `credentials` key of `persona_settings`, written once
+/// at `complete_start` — the names are fixed for the conversation's
+/// life, which of them the store backs is read fresh. No row, no
+/// snapshot or no key all mean none. Whether each name is a stored
+/// secret is Rule S's store resolution, not this read.
+pub async fn persona_credential_names(pool: &PgPool, id: i64) -> Result<Vec<String>, sqlx::Error> {
+    let settings =
+        sqlx::query_scalar::<_, Option<serde_json::Value>>("SELECT persona_settings FROM agents WHERE conversation_id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(settings
+        .flatten()
+        .as_ref()
+        .and_then(|s| s.get("credentials"))
+        .and_then(|c| c.as_array())
+        .map(|list| list.iter().filter_map(|name| name.as_str().map(String::from)).collect())
+        .unwrap_or_default())
+}
+
 impl RowLock {
     fn sql(self) -> &'static str {
         match self {

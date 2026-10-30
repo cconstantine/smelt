@@ -312,6 +312,7 @@ async fn message_arrives(pool: &PgPool, conversation_id: i64, needle: &str, with
 
 mod crashes;
 mod create;
+mod credentials;
 mod repos;
 mod personas;
 mod commands_and_files;

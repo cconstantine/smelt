@@ -419,3 +419,117 @@ pub(super) async fn scenario_oauth_callback_error_link(t: &Scenario<'_>) {
     db::delete_mcp_server_config(pool, id).await.expect("delete the OAuth server");
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// T12 (SME-242): the Secrets page adds a secret, changes its value in
+/// place, lists only the server's display prefix — never the value —
+/// and deletes it; and a row fits 375px.
+pub(super) async fn scenario_secrets_page(t: &Scenario<'_>) {
+    /// The server-rendered form accepts typing before hydration with no
+    /// handlers attached, so type and read back until the field holds just
+    /// what was typed, the way the model picker's scenario does (SME-118).
+    async fn type_and_read_back(page: &chromiumoxide::Page, selector: &str, text: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let field = wait_for_element(page, selector, Duration::from_secs(5)).await;
+            field.focus().await.expect("focus the field");
+            page.evaluate(format!("document.querySelector('{selector}').select()"))
+                .await
+                .expect("select the old text");
+            field.type_str(text).await.expect("type");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let typed: String = page
+                .evaluate(format!("document.querySelector('{selector}')?.value ?? ''"))
+                .await
+                .expect("read the field")
+                .into_value()
+                .expect("a string");
+            if typed == text {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "the field {selector} never held just the typed text: {typed:?}");
+        }
+    }
+
+    let value = "top-scenario-secret-value-0123456789"; // 36 bytes: prefix "top-", 32 hidden
+    let name = unique_id("key");
+    let page = t.tab(t.url("secrets")).await;
+    wait_for_resource(&page, "/api/secrets").await;
+    type_and_read_back(&page, "#secret-name", &name).await;
+    type_and_read_back(&page, "#secret-value", value).await;
+    click_when_present(&page, ".secrets-add-form button[type=\"submit\"]", Duration::from_secs(5)).await;
+    assert!(wait_for_count(&page, ".secret-row", 1, Duration::from_secs(10)).await, "the added secret's row should appear");
+    let row: Vec<String> = page
+        .evaluate("(() => { const r = document.querySelector('.secret-row'); return [r.querySelector('.sandbox-volume-name').textContent, r.querySelector('.secret-shown').textContent]; })()")
+        .await
+        .expect("read the row")
+        .into_value()
+        .expect("two strings");
+    assert_eq!(row[0], name, "the row names the secret");
+    let shown = &row[1];
+    assert!(shown.starts_with("top-…") && shown.contains("(36 bytes)"), "the row shows the four-character display prefix and the exact byte length: {shown:?}");
+    let body: String = page
+        .evaluate("document.body.innerText")
+        .await
+        .expect("read the page")
+        .into_value()
+        .expect("text");
+    assert!(!body.contains(&value[6..]), "beyond the display prefix none of the value is on the page");
+
+    // Change the stored value in place: the row's change control sends
+    // the row's existing name on the id path (renaming is delete and
+    // add, Trade-off 7), the row stays one row, and after it the page
+    // shows the new display — with no trace of the old value's prefix.
+    let new_value = "renewed-scenario-secret-0123456789"; // 34 bytes: prefix "rene", 30 hidden
+    click_when_present(&page, ".secret-row .secret-change", Duration::from_secs(5)).await;
+    type_and_read_back(&page, ".secret-change-input", new_value).await;
+    click_when_present(&page, ".secret-row .secret-change-confirm", Duration::from_secs(5)).await;
+    let shown_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let (changed, shown_now) = loop {
+        let text: String = page
+            .evaluate("document.querySelector('.secret-row .secret-shown')?.textContent ?? ''")
+            .await
+            .expect("read the row")
+            .into_value()
+            .expect("a string");
+        if text == "rene… (34 bytes)" {
+            break (true, text);
+        }
+        if tokio::time::Instant::now() >= shown_deadline {
+            break (false, text);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(changed, "after the change the row shows the new display, not {shown_now:?}");
+    assert!(wait_for_count(&page, ".secret-row", 1, Duration::from_secs(5)).await, "a change keeps it one row");
+    let body: String = page
+        .evaluate("document.body.innerText")
+        .await
+        .expect("read the page")
+        .into_value()
+        .expect("text");
+    assert!(!body.contains("top-"), "the replaced value's old display prefix is gone from the page: {body}");
+    assert!(!body.contains(&new_value[4..]), "beyond the new display prefix none of the new value is on the page");
+
+    // Delete is two-step: arm, then the named confirm.
+    click_when_present(&page, ".secret-row .secret-delete", Duration::from_secs(5)).await;
+    click_when_present(&page, ".secret-row .secret-delete-confirm", Duration::from_secs(5)).await;
+    assert!(wait_for_count(&page, ".secret-row", 0, Duration::from_secs(10)).await, "the confirm removes the row");
+
+    // A seeded row at 375px: it renders, and the page doesn't scroll sideways.
+    let seeded = db::create_named_secret(t.pool, &unique_id("phone"), "phone-value-0123456789").await.expect("seed a secret");
+    page.execute(chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::new(375, 700, 2.0, true))
+        .await
+        .expect("emulate a phone");
+    page.reload().await.expect("reload at 375");
+    wait_for_resource(&page, "/api/secrets").await;
+    let rows_at_phone = wait_for_count(&page, ".secret-row", 1, Duration::from_secs(10)).await;
+    let overflow: f64 = page
+        .evaluate("document.documentElement.scrollWidth - document.documentElement.clientWidth")
+        .await
+        .expect("measure the sideways overflow")
+        .into_value()
+        .expect("a number");
+    db::delete_named_secret(t.pool, seeded.id).await.expect("delete the seeded secret");
+    assert!(rows_at_phone, "a secret's row should render at 375px");
+    assert!(overflow <= 1.0, "the Secrets page should not scroll sideways at 375px: {overflow}");
+}
