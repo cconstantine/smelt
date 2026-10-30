@@ -65,19 +65,29 @@ pub fn validate_secret_value(value: &str) -> Result<(), String> {
 }
 
 /// D7's display, computed at read and never stored: with `n` the byte
-/// length and `k = min(4, n − 8)` floored at 0, the first `k` characters
-/// and `… (n bytes)`, or just `(n bytes)` when nothing may show. Never
-/// more than four characters, and at least eight bytes of every value
-/// are never in it — the length is exact on purpose (it's what makes two
-/// rows tell apart; Trade-off 9 bounds what a pod could take from it).
+/// length and `k = min(4, n − 8)` floored at 0, the first `k` **bytes**
+/// (trimmed back to a character boundary, never a partial character)
+/// and `… (n bytes)`, or just `(n bytes)` when nothing may show. Bytes
+/// are the unit on purpose: a `k` counted in bytes but taken in
+/// characters could show four bytes per byte counted and leave the
+/// eight never-shown ones on display for a non-ASCII lead. Never more
+/// than four characters either, and at least eight bytes of every
+/// value are never in it — the length is exact on purpose (it's what
+/// makes two rows tell apart; Trade-off 9 bounds what a pod could take
+/// from it).
 #[cfg(feature = "server")]
 pub fn shown(value: &str) -> String {
     let n = value.len();
     let k = n.saturating_sub(8).min(4);
-    let head: String = value.chars().take(k).collect();
-    match k {
-        0 => format!("({n} bytes)"),
-        _ => format!("{head}… ({n} bytes)"),
+    let mut end = k;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let head = &value[..end];
+    if head.is_empty() {
+        format!("({n} bytes)")
+    } else {
+        format!("{head}… ({n} bytes)")
     }
 }
 

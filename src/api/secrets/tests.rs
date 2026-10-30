@@ -87,7 +87,25 @@ fn test_shown_shows_at_most_four_characters_and_hides_eight_bytes() {
     // 12: the cap of four, never the 5th.
     let v40 = "abcdefghijklmnopqrstuvwxyz01234567895678";
     assert_eq!(shown(v40), "abcd… (40 bytes)");
-    for (value, head_len) in [("0123456789a", 3), (v40, 4)] {
+    // A non-ASCII lead, counted in bytes: taking characters here could
+    // display four bytes for every character counted and leave the
+    // eight hidden bytes shown. `k` bytes are shown, never a partial
+    // character — so 16 bytes of four-byte characters show one
+    // character, not four.
+    let four_by_four = "😀😀😀😀"; // 16 bytes, 4 chars
+    assert_eq!(shown(four_by_four), "😀… (16 bytes)");
+    // Two-byte characters: `k` = 4 bytes lands on a boundary, so two
+    // characters show and 8 of the 12 bytes stay hidden.
+    let six_two = "éééééé"; // 12 bytes, 6 chars
+    assert_eq!(shown(six_two), "éé… (12 bytes)");
+    // A 3-byte character lead: `k` = 3 lands on its boundary and one
+    // character shows; a longer string whose `k` would cut a character
+    // trims back to the boundary instead of showing half of one.
+    let lead3 = format!("日{a}", a = "abcdefgh"); // 3 + 8 = 11 bytes, k = 3
+    assert_eq!(shown(&lead3), "日… (11 bytes)");
+    let cut_mid = format!("{s}{t}", s = "日本語", t = "abcd"); // 9 + 4 = 13 bytes, k = 4 cuts at 1
+    assert_eq!(shown(&cut_mid), "日… (13 bytes)");
+    for (value, head_len) in [("0123456789a", 3), (v40, 4), (four_by_four, 1), (six_two, 2), (lead3.as_str(), 1)] {
         let head: String = value.chars().take(head_len + 1).collect();
         assert!(!shown(value).contains(&head), "{head} reached the display of a {value:?}");
         let tail_start = value.len().saturating_sub(8);
