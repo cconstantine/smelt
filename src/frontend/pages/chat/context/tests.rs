@@ -131,6 +131,45 @@ mod detail_shown_tests {
         assert!(!html.contains('\u{200b}'), "raw U+200B in the html: {html}");
     }
 
+    /// SME-283: the line naming where a loaded file came from quotes the
+    /// repo's remote — a row recorded before the fix can hold one that is
+    /// another remote's invisible twin — so it shows through the same
+    /// escape as its panes, byte-identical apart from the escape.
+    #[test]
+    fn test_instructions_source_escapes_a_remote_hiding_characters() {
+        let doc = ProjectInstructions {
+            repo_url: "git\u{200b}hub.com/o/r".to_string(),
+            path: "/workspace/r/AGENTS.md".to_string(),
+            commit: Some("abc1234567".to_string()),
+            content: "Be kind.".to_string(),
+            file_bytes: 8,
+            truncated: false,
+        };
+        let line = instructions_source(&doc);
+        assert!(line.contains("\\u{200b}"), "{line}");
+        assert!(!line.contains('\u{200b}'), "raw U+200B in {line:?}");
+        assert_eq!(line, "git\\u{200b}hub.com/o/r at abc1234 \u{b7} 8 bytes");
+    }
+
+    /// The notice belongs to the remote alone: one hidden character in
+    /// the url is one character to the notice even with a path and commit
+    /// beside it, and a plain url gets no notice at all.
+    #[test]
+    fn test_instructions_source_notice_counts_only_the_remote() {
+        let doc = |url: &str| ProjectInstructions {
+            repo_url: url.to_string(),
+            path: "/workspace/r/AGENTS.md".to_string(),
+            commit: None,
+            content: String::new(),
+            file_bytes: 0,
+            truncated: false,
+        };
+        let html = dioxus::ssr::render_element(instructions_source_notice(&doc("git\u{200b}hub.com/o/r")));
+        assert!(html.contains("1 character"), "{html}");
+        let html = dioxus::ssr::render_element(instructions_source_notice(&doc("github.com/o/r")));
+        assert!(!html.contains("character"), "{html}");
+    }
+
     /// Review 1, finding 1 (SME-277): the tool's *name* is the same
     /// server-written text in the same pane, and it reached the html raw
     /// while its description and schema were escaped either side of it.

@@ -254,6 +254,32 @@ fn test_instructions_source_names_repo_commit_and_size() {
     );
 }
 
+/// SME-283: the panel tooltip shows the recorded url — a row recorded
+/// before the fix can hold a remote whose only difference from another is
+/// invisible — through SME-276's escape, like its branch and error; a
+/// plain url is unchanged (pin).
+#[test]
+fn test_repo_url_shown_escapes_a_remote_recorded_before_the_fix() {
+    let mut repo = RepoSummary {
+        id: 1,
+        url: "git\u{200b}hub.com/o/r".to_string(),
+        path: "/workspace/r".to_string(),
+        requested_branch: None,
+        branch: None,
+        commit: None,
+        status: RepoStatus::Ready,
+        error: None,
+        agents_files: vec![],
+        loaded_instructions: vec![],
+        trust_requests: vec![],
+    };
+    let shown = repo_url_shown(&repo);
+    assert!(shown.contains("\\u{200b}"), "{shown}");
+    assert!(!shown.contains('\u{200b}'), "raw U+200B in {shown:?}");
+    repo.url = "github.com/o/r".to_string();
+    assert_eq!(repo_url_shown(&repo), "github.com/o/r");
+}
+
 #[test]
 fn test_instructions_label_says_which_agents_md_files_are_loaded() {
     let mut repo = RepoSummary {

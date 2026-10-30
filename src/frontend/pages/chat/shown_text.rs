@@ -33,13 +33,15 @@ pub(super) fn shown_pre(content: &str, pre_class: Option<&'static str>) -> Eleme
 
 /// The notice's only wording, so the card, the context view and the
 /// sandbox panel can't drift apart (SME-277; SME-273 adds the panel).
-/// Singular/plural on `count`.
-pub(super) fn hidden_text_note(count: usize) -> String {
+/// Singular/plural on `count`. `pub(in super::super)` since SME-283:
+/// the `/git` trust list hovers this same wording, and a second copy
+/// of it is exactly the drift this function exists to prevent.
+pub(in super::super) fn hidden_text_note(count: usize) -> String {
     let word = if count == 1 { "character" } else { "characters" };
     format!("{count} {word} here render as nothing, or change how the text around them shows, so they are shown here escaped as \\u{{…}}. The escapes are this view's showing, not the text's: what is stored, and what the model reads, is exactly as it is.")
 }
 
-pub(super) fn hidden_text_notice(count: usize) -> Element {
+pub(in super::super) fn hidden_text_notice(count: usize) -> Element {
     let note = hidden_text_note(count);
     rsx! {
         p { class: "muted", "{note}" }
