@@ -3,7 +3,7 @@
 //! write-only (D7); every other reader is an install, a report or a
 //! Rule S resolution, and none of them binds a value to a conversation
 //! — the conversation binding is Rule G/Rule S's name set, decided
-//! before any value is read (docs/plans/sme-242.md, state model).
+//! before any value is read (SME-242, state model).
 //!
 //! The `name` is immutable (renaming is delete and add, Trade-off 7),
 //! and no read here ever truncates or derives from a value: the page's
