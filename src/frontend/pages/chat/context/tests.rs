@@ -170,6 +170,21 @@ mod detail_shown_tests {
         assert!(!html.contains("character"), "{html}");
     }
 
+    /// Review 1, F3: the two tests above call the helpers directly; this
+    /// one drives a dirty remote through the *real* render wiring, so the
+    /// file pane cannot drift to showing the line without the escape (or
+    /// drop the notice) and still pass. Content and prompt plain: the one
+    /// escape and the one notice asserted can only come from the remote.
+    #[test]
+    fn test_the_file_pane_shows_the_escaped_remote_and_its_notice() {
+        let mut snap = snapshot("plain file", Some("plain prompt"), vec![]);
+        snap.instructions[0].repo_url = "git\u{200b}hub.com/o/r".to_string();
+        let html = dioxus::ssr::render_element(render_context_detail_body(Some(&Ok(snap))));
+        assert!(html.contains("git\\u{200b}hub.com/o/r"), "the line shows the remote escaped: {html}");
+        assert_eq!(html.matches("1 character here").count(), 1, "one notice, for the remote: {html}");
+        assert!(!html.contains('\u{200b}'), "raw U+200B in the html: {html}");
+    }
+
     /// Review 1, finding 1 (SME-277): the tool's *name* is the same
     /// server-written text in the same pane, and it reached the html raw
     /// while its description and schema were escaped either side of it.
