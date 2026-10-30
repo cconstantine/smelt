@@ -293,7 +293,7 @@ pub(in crate::sandbox) async fn create_pod_attempt_unspanned(
             // command (SME-32). A pod without them would fail its first
             // push with a confusing ssh error, so a failure here is the
             // pod's failure.
-            if let Err(e) = crate::git::install_into_new_pod(pool, row.id).await {
+            if let Err(e) = crate::credentials::install_into_new_pod(pool, row.id).await {
                 let e = start_error(pool, row.id, SandboxError::GitSetup(e)).await;
                 let _ = manager.delete(sandbox).await;
                 let _ = db::terminate_sandbox_pod(pool, row.id).await;

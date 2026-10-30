@@ -325,13 +325,13 @@ fn test_model_volume_mount_path_refuses_reserved_directories() {
 }
 
 /// `/etc/smelt` is a literal in spec's reserved list, which keeps that module
-/// (test-only here) free of `crate::git` in production. It has to stay equal to the directory the pod's SSH
+/// (test-only here) free of `crate::credentials` in production. It has to stay equal to the directory the pod's SSH
 /// key is written into, or a model volume could carry that key onto a claim
 /// another conversation mounts (SME-239).
 #[test]
 fn test_reserved_git_dir_literal_is_pods_git_dir() {
     assert_eq!(
-        model_volume_mount_path(crate::git::POD_GIT_DIR).unwrap_err(),
+        model_volume_mount_path(crate::credentials::POD_GIT_DIR).unwrap_err(),
         "\"/etc/smelt\" is at or under \"/etc/smelt\", which a volume can't be mounted over",
         "POD_GIT_DIR moved; the reserved list has to move with it"
     );

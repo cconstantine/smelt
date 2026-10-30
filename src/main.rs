@@ -6,6 +6,8 @@ mod anthropic;
 mod api;
 mod browsing;
 #[cfg(feature = "server")]
+mod credentials;
+#[cfg(feature = "server")]
 mod db;
 #[cfg(feature = "server")]
 mod docker_net;

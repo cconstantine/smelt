@@ -1,6 +1,7 @@
 //! SSH keys and the commit identity: creation, one-at-a-time, import, delete.
 
 use super::*;
+use crate::credentials::install_into_new_pod;
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_key_stores_it_and_returns_only_the_public_half(pool: PgPool) {
