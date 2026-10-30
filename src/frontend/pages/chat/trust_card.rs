@@ -1,7 +1,7 @@
 //! The trust card a repo's AGENTS.md waits on (SME-32).
 
 use super::*;
-use super::shown_text::shown_pre;
+use super::shown_text::{hidden_text_notice, shown_pre};
 use crate::git::TrustRequest;
 
 /// One card per AGENTS.md waiting for the user's trust, and the last
@@ -29,40 +29,61 @@ pub(super) fn TrustCards(
     rsx! {
         // A repo's AGENTS.md waits for the user's trust before it
         // becomes instructions the model follows (SME-32).
+        // The question, its `aria_label` and, when the count is not zero,
+        // the notice line (SME-283): the remote being granted shows
+        // through the escape, and the decision it feeds stays the card's
+        // `request.hash`, never this showing.
         for (repo, request) in repos().into_iter().flat_map(|r| r.trust_requests.clone().into_iter().map(move |q| (r.clone(), q))) {
-            div { key: "trust-{request.id}", class: "trust-card", role: "group", aria_label: "Trust {repo.url}?",
-                p { class: "trust-card-question",
-                    "Trust "
-                    code { "{repo.url}" }
-                    "?"
-                }
-                {render_trust_card_body(&request)}
-                div { class: "trust-card-buttons",
-                    button {
-                        class: "trust-card-trust",
-                        r#type: "button",
-                        onclick: {
-                            let request_id = request.id;
-                            let shown_hash = request.hash.clone();
-                            move |_| decide(request_id, shown_hash.clone(), true)
-                        },
-                        "Trust"
-                    }
-                    button {
-                        class: "trust-card-decline",
-                        r#type: "button",
-                        onclick: {
-                            let request_id = request.id;
-                            let shown_hash = request.hash.clone();
-                            move |_| decide(request_id, shown_hash.clone(), false)
-                        },
-                        "Don't trust"
+            {
+                let url_shown = question_url_shown(&repo.url);
+                let hidden = crate::git::hidden_characters(&repo.url);
+                rsx! {
+                    div { key: "trust-{request.id}", class: "trust-card", role: "group", aria_label: "Trust {url_shown}?",
+                        p { class: "trust-card-question",
+                            "Trust "
+                            code { "{url_shown}" }
+                            "?"
+                        }
+                        if hidden > 0 {
+                            {hidden_text_notice(hidden)}
+                        }
+                        {render_trust_card_body(&request)}
+                        div { class: "trust-card-buttons",
+                            button {
+                                class: "trust-card-trust",
+                                r#type: "button",
+                                onclick: {
+                                    let request_id = request.id;
+                                    let shown_hash = request.hash.clone();
+                                    move |_| decide(request_id, shown_hash.clone(), true)
+                                },
+                                "Trust"
+                            }
+                            button {
+                                class: "trust-card-decline",
+                                r#type: "button",
+                                onclick: {
+                                    let request_id = request.id;
+                                    let shown_hash = request.hash.clone();
+                                    move |_| decide(request_id, shown_hash.clone(), false)
+                                },
+                                "Don't trust"
+                            }
+                        }
                     }
                 }
             }
         }
         ErrorText { message: repo_action_error() }
     }
+}
+
+/// The question line's remote (SME-283): a row recorded before the fix
+/// can hold a url that is another's invisible twin, and this is the
+/// moment of granting — it shows through SME-276's escape, like the
+/// card's preview does.
+fn question_url_shown(url: &str) -> String {
+    crate::git::plain_multiline_text(url)
 }
 
 /// The card's body, by card kind (SME-279): a repo card (no file) says
@@ -165,5 +186,19 @@ mod preview_tests {
         assert!(html.contains("trust-card-preview"), "{html}");
         assert!(html.contains("load this AGENTS.md"), "{html}");
         assert!(!html.contains("start an agent"), "{html}");
+    }
+
+    /// SME-283: the question line names the remote the user is about to
+    /// grant, and tag characters spelling "ob" inside it must reach it
+    /// escaped, never raw; a plain url reads byte-identically (pin: the
+    /// escape adds nothing where there is nothing to escape).
+    #[test]
+    fn test_the_trust_card_question_escapes_the_remote() {
+        let shown = question_url_shown("git\u{e006f}\u{e0062}hub.com/o/r");
+        assert!(shown.contains("\\u{e006f}") && shown.contains("\\u{e0062}"), "{shown}");
+        for c in ['\u{e006f}', '\u{e0062}'] {
+            assert!(!shown.contains(c), "raw U+{:X} in the question: {shown:?}", c as u32);
+        }
+        assert_eq!(question_url_shown("github.com/o/r"), "github.com/o/r");
     }
 }

@@ -6,15 +6,32 @@ use super::shown_text::{hidden_text_notice, shown_pre};
 /// Where a loaded `AGENTS.md` came from, for the context detail view.
 pub(super) fn instructions_source(doc: &crate::git::ProjectInstructions) -> String {
     let commit: String = doc.commit.as_deref().unwrap_or("").chars().take(7).collect();
+    // SME-283: the url is repo-row text, and a row recorded before the
+    // fix can hold an invisible twin — the same escape as the panes
+    // below, with `instructions_source_notice` counting alongside.
+    let url = crate::git::plain_multiline_text(&doc.repo_url);
     let origin = if commit.is_empty() {
-        doc.repo_url.clone()
+        url
     } else {
-        format!("{} at {commit}", doc.repo_url)
+        format!("{url} at {commit}")
     };
     if doc.truncated {
         format!("{origin} \u{b7} {} bytes, only the first 32 KiB loaded", doc.file_bytes)
     } else {
         format!("{origin} \u{b7} {} bytes", doc.file_bytes)
+    }
+}
+
+/// The notice for the line `instructions_source` shows (SME-283): the
+/// remote is repo-row text like the panes around it, and this counts
+/// only its hidden characters — the file and commit are plain by their
+/// own checks. `tool_notice`'s shape, beside the text it describes.
+pub(super) fn instructions_source_notice(doc: &crate::git::ProjectInstructions) -> Element {
+    let hidden = crate::git::hidden_characters(&doc.repo_url);
+    if hidden > 0 {
+        hidden_text_notice(hidden)
+    } else {
+        rsx! {}
     }
 }
 
@@ -207,6 +224,7 @@ pub(super) fn render_context_detail_body(detail: Option<&Result<ContextDetailSna
                             code { "{doc.path}" }
                             span { class: "muted", " {instructions_source(doc)}" }
                         }
+                        {instructions_source_notice(doc)}
                         {shown_pre(&doc.content, Some("context-detail-prompt"))}
                     }
                 }

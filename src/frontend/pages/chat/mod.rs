@@ -65,7 +65,9 @@ mod panels;
 mod live;
 mod question_card;
 mod repo_attach;
-mod shown_text;
+// `pub(super)` since SME-283: the `/git` page hovers `hidden_text_note`'s
+// wording on the trust list, from outside `chat`.
+pub(super) mod shown_text;
 mod sidebar;
 mod state;
 mod sticky;
