@@ -71,6 +71,19 @@ pub struct ClonedRepo {
     pub branch: String,
 }
 
+/// What to say about a url smelt won't clone (SME-283): quoted through
+/// SME-276's escape, so a user who pasted a poisoned url sees the
+/// characters that hid in it instead of a url that renders like a good
+/// one — and when it held any, a sentence naming why it reads wrong.
+fn unclonable_url(url: &str) -> String {
+    let shown = plain_multiline_text(url);
+    if hidden_characters(url) > 0 {
+        format!("{shown} isn't a git URL smelt can clone. It holds characters that render as nothing or reorder the text around them.")
+    } else {
+        format!("{shown} isn't a git URL smelt can clone.")
+    }
+}
+
 /// Clones `url` into `/workspace/<dir>` in the pod, at `branch`
 /// or the remote's default. The error is git's own output.
 pub async fn clone_into_pod(
@@ -80,7 +93,7 @@ pub async fn clone_into_pod(
     dir: &str,
 ) -> Result<ClonedRepo, String> {
     if parse_remote(url).is_none() {
-        return Err(format!("{url} isn't a git URL smelt can clone."));
+        return Err(unclonable_url(url));
     }
     let path = format!("{}/{dir}", crate::sandbox::WORKSPACE_DIR);
     let command = clone_command(url, branch, &path);
@@ -194,7 +207,7 @@ async fn plan_clone(
     branch: Option<&str>,
     dir: Option<&str>,
 ) -> Result<ClonePlan, String> {
-    let key = remote_key(url).ok_or_else(|| format!("{url} isn't a git URL smelt can clone."))?;
+    let key = remote_key(url).ok_or_else(|| unclonable_url(url))?;
     let named_dir = dir.map(str::trim).filter(|d| !d.is_empty());
     #[expect(clippy::expect_used, reason = "remote_key parsed the URL just above, so it has a default directory")]
     let dir = match named_dir {

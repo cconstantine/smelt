@@ -33,9 +33,19 @@ pub fn default_checkout_dir(url: &str) -> Option<String> {
 /// either end or a `.git` suffix; `file` as the host for a local path.
 /// Anything git would read as an option or a transport helper
 /// (`ext::…`) is refused, since the URL ends up on a command line.
+/// So is a URL holding any `not_plain` character (SME-283): this key is
+/// what trust decisions are remembered by, and two remotes differing
+/// only in characters a reader can't see would read as one — a refusal,
+/// not an escape, because showing an escape doesn't stop two rows being
+/// granted as each other.
 pub(super) fn parse_remote(url: &str) -> Option<(String, String)> {
     let url = url.trim();
-    if url.is_empty() || url.starts_with('-') || url.contains("::") || url.contains(char::is_whitespace) {
+    if url.is_empty()
+        || url.starts_with('-')
+        || url.contains("::")
+        || url.contains(char::is_whitespace)
+        || url.contains(not_plain)
+    {
         return None;
     }
     let (host, path) = if url.contains("://") {
