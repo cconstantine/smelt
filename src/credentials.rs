@@ -172,6 +172,44 @@ pub async fn for_conversation(pool: &PgPool, conversation: i64) -> Result<PodCre
     })
 }
 
+/// What this turn's environment section says about credentials (SME-242,
+/// D8): the granted set, plus the two things the lines name but the set
+/// doesn't hold — the stored key's name, whose path line 1 shows, and
+/// the persona's names the store doesn't back, which line 3 explains.
+/// Names and paths only, by construction: no value is ever read here.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PromptCredentials {
+    pub granted: PodCredentials,
+    /// The stored key's name when Rule G grants it and one is stored —
+    /// `/etc/smelt/keys/<name>` is where the model will find it.
+    pub key_name: Option<String>,
+    /// Names the persona lists that are not stored secrets right now —
+    /// never `git-ssh`, whose ask is Rule G's question, told by line 2.
+    pub unbacked: Vec<String>,
+}
+
+/// Gather `PromptCredentials` (D8), the same two rules the install asks,
+/// read fresh per turn.
+pub async fn for_prompt(pool: &PgPool, conversation: i64) -> Result<PromptCredentials, sqlx::Error> {
+    let granted = for_conversation(pool, conversation).await?;
+    let key_name = if granted.git_ssh {
+        db::list_ssh_keys(pool).await?.into_iter().next().map(|key| key.name)
+    } else {
+        None
+    };
+    let named = db::persona_credential_names(pool, conversation).await?;
+    let unbacked = if named.iter().any(|name| name != CREDENTIAL_GIT_SSH) {
+        let stored = db::list_named_secrets(pool).await?;
+        named
+            .into_iter()
+            .filter(|name| name != CREDENTIAL_GIT_SSH && !stored.iter().any(|secret| secret.name == *name))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(PromptCredentials { granted, key_name, unbacked })
+}
+
 /// The files this conversation's pod gets: git's config and commit
 /// identity always, key files only under Rule G, and one file per
 /// granted secret under Rule S — mode 600, the name the persona listed.

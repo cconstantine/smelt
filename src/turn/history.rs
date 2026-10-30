@@ -236,6 +236,11 @@ pub(crate) struct PromptEnvironment {
     pub persona_files: std::collections::BTreeMap<i64, Vec<String>>,
     /// Set when the conversation is a child agent (SME-236).
     pub agent: Option<AgentPrompt>,
+    /// What this conversation's two credential rules answer right now,
+    /// for the lines D8 adds (SME-242): names and paths only — no value
+    /// is ever read into the prompt. `None` means the read failed, and
+    /// the section says nothing.
+    pub credentials: Option<crate::credentials::PromptCredentials>,
 }
 
 /// One volume in the environment section (SME-239): a global volume from
@@ -329,11 +334,53 @@ pub(crate) fn system_prompt(env: &PromptEnvironment) -> String {
             prompt.push('\n');
         }
     }
+    prompt.push_str(&credentials_section(env));
     if let Some(persona) = env.agent.as_ref().and_then(|agent| agent.persona.as_ref()) {
         prompt.push_str(&persona_section(persona));
     }
     prompt.push_str(&crate::git::render_project_instructions(&env.instructions));
     prompt
+}
+
+/// The environment section's credential lines (SME-242, D8): what the
+/// pod holds, and the two silences it breaks — a child told to have no
+/// git key is told plainly, so it doesn't retry a doomed push, and a
+/// persona name the store doesn't back says so, so the model doesn't
+/// hunt for the file. A conversation with no secrets by rule (the root,
+/// a persona-less agent) gets no line about them; a failed read is
+/// `None`, and says nothing either. Paths only — a value is never near
+/// this function, let alone in its output (D7).
+fn credentials_section(env: &PromptEnvironment) -> String {
+    let Some(creds) = env.credentials.as_ref() else {
+        return String::new();
+    };
+    let mut section = String::new();
+    let mut holds = Vec::new();
+    if let Some(key) = &creds.key_name {
+        holds.push(format!("git SSH key at {}/keys/{key}", crate::credentials::POD_GIT_DIR));
+    }
+    holds.extend(creds.granted.secrets.iter().map(|name| {
+        format!("secret {name} at {}/{}", crate::credentials::POD_SECRETS_DIR, name)
+    }));
+    if !holds.is_empty() {
+        section.push_str(&format!("- Credentials: {}\n", holds.join("; ")));
+    }
+    // Only a child can be denied: the root without a key is simply a
+    // conversation whose user hasn't stored one, and it needs no line.
+    if env.agent.is_some() && !creds.granted.git_ssh {
+        section.push_str(
+            "- No git credential: your persona's smelt.credentials doesn't list git-ssh (or your \
+             parent's chain doesn't have it), so /etc/smelt/keys is empty — git push and git fetch \
+             over SSH will fail; don't retry them.\n",
+        );
+    }
+    for name in &creds.unbacked {
+        section.push_str(&format!(
+            "- Your persona lists credential `{name}`, which isn't one of the user's stored \
+             secrets, so you don't have it.\n"
+        ));
+    }
+    section
 }
 
 /// A child's persona in its system prompt (SME-236): what it is and where
@@ -433,6 +480,17 @@ pub(crate) async fn prompt_environment(
             None
         }
     };
+    // The credential lines (SME-242, D8): the two rules re-read per turn,
+    // names and paths only. A failed read drops the lines, as elsewhere
+    // here — and says nothing, rather than something wrong, about what
+    // the pod holds.
+    let credentials = match crate::credentials::for_prompt(pool, conversation_id).await {
+        Ok(creds) => Some(creds),
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't read the conversation's credentials for the system prompt");
+            None
+        }
+    };
     PromptEnvironment {
         conversation_id,
         date: chrono::Utc::now().date_naive(),
@@ -443,6 +501,7 @@ pub(crate) async fn prompt_environment(
         instructions,
         persona_files,
         agent,
+        credentials,
     }
 }
 
