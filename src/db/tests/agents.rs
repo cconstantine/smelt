@@ -243,6 +243,90 @@ async fn test_create_child_seeds_only_the_git_ssh_chain_bit(pool: PgPool) {
     assert!(!seeded.contains(&"deep-key".to_string()));
 }
 
+/// An agent row written by hand: `state`, the given column (NULL
+/// included) and whether its start completed (`started_at`) — the
+/// writers' subject, including states no start writes any more.
+async fn hand_row(
+    pool: &PgPool,
+    root: i64,
+    state: &str,
+    credentials: Option<&[&str]>,
+    started: bool,
+) -> i64 {
+    let id = sqlx::query_scalar::<_, i64>("INSERT INTO conversations (title, parent_id) VALUES ('h', $1) RETURNING id")
+        .bind(root)
+        .fetch_one(pool)
+        .await
+        .expect("a conversation");
+    let credentials: Option<Vec<String>> = credentials.map(|list| list.iter().map(|name| name.to_string()).collect());
+    sqlx::query(
+        "INSERT INTO agents (conversation_id, root_id, depth, brief, state, credentials, started_at)
+         VALUES ($1, $1, 1, 'b', $2, $3, CASE WHEN $4 THEN now() END)",
+    )
+    .bind(id)
+    .bind(state)
+    .bind(credentials)
+    .bind(started)
+    .execute(pool)
+    .await
+    .expect("an agent row");
+    id
+}
+
+/// SME-242 T4 (the two lifecycle writers): `narrow_agent_credentials`
+/// keeps the chain bit only if the persona lists `git-ssh` — writing a
+/// `starting` row and nothing else, and treating a NULL column as the
+/// granted fall-open every Rule G read uses — and
+/// `clear_agent_credentials` empties the column of a start that never
+/// completed, whatever state its exit left it in, while a completed
+/// start's row is never touched.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_narrow_and_clear_write_the_chain_bit_under_their_gates(pool: PgPool) {
+    let root = test_conversation(&pool).await.id;
+
+    // A starting child whose persona lists `git-ssh` keeps the bit its
+    // parent seeded.
+    let wanted = hand_row(&pool, root, "starting", Some(&["git-ssh"]), false).await;
+    assert!(narrow_agent_credentials(&pool, wanted, true).await.expect("narrow"), "a starting row is written");
+    assert_eq!(child_credentials(&pool, wanted).await, vec!["git-ssh".to_string()]);
+    // A NULL (pre-ticket) column reads granted, so narrowing a persona
+    // that wants the key writes the bit rather than stranding the row.
+    let legacy = hand_row(&pool, root, "starting", None, false).await;
+    narrow_agent_credentials(&pool, legacy, true).await.expect("narrow");
+    assert_eq!(child_credentials(&pool, legacy).await, vec!["git-ssh".to_string()], "NULL falls open");
+    // A persona that doesn't list it narrows it away — `credentials: []`
+    // and a bare persona alike.
+    let excluded = hand_row(&pool, root, "starting", Some(&["git-ssh"]), false).await;
+    narrow_agent_credentials(&pool, excluded, false).await.expect("narrow");
+    assert_eq!(child_credentials(&pool, excluded).await, Vec::<String>::new(), "narrowed away");
+    // An empty column stays empty however the persona asks: narrowing
+    // keeps, never grants.
+    let empty = hand_row(&pool, root, "starting", Some(&[]), false).await;
+    narrow_agent_credentials(&pool, empty, true).await.expect("narrow");
+    assert_eq!(child_credentials(&pool, empty).await, Vec::<String>::new(), "narrowing never grants");
+    // And a row that isn't `starting` is refused outright — every
+    // `agents` write here rides a state gate.
+    let done = hand_row(&pool, root, "active", Some(&["git-ssh"]), true).await;
+    assert!(!narrow_agent_credentials(&pool, done, false).await.expect("refused"), "not starting, not written");
+    assert_eq!(child_credentials(&pool, done).await, vec!["git-ssh".to_string()], "its column stands");
+
+    // The clearing writer, `end_start`'s safety write: a start that
+    // never completed gives its bit back however its exit left the
+    // state — cut off (`starting`), failed, or stopped mid-start — so
+    // no exit path can leave a resumable credential behind.
+    for state in ["starting", "failed", "stopped"] {
+        let cut_off = hand_row(&pool, root, state, Some(&["git-ssh"]), false).await;
+        assert!(clear_agent_credentials(&pool, cut_off).await.expect("clear"), "{state}");
+        assert_eq!(child_credentials(&pool, cut_off).await, Vec::<String>::new(), "a never-started child gives the bit back");
+    }
+    // A start that completed never gives it back: `started_at` says its
+    // model has run, and rewriting a live conversation's chain bit
+    // mid-life is nobody's business but its own start's.
+    let started = hand_row(&pool, root, "active", Some(&["git-ssh"]), true).await;
+    assert!(!clear_agent_credentials(&pool, started).await.expect("refused"), "started, not cleared");
+    assert_eq!(child_credentials(&pool, started).await, vec!["git-ssh".to_string()]);
+}
+
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_child_nests_depth_under_its_caller_and_inherits_root_and_chain(pool: PgPool) {
     let root = test_conversation(&pool).await.id;

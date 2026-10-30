@@ -135,6 +135,25 @@ async fn git_ssh_granted(pool: &PgPool, conversation: i64) -> Result<bool, sqlx:
 /// restart — the names are frozen, the backing is live.
 async fn granted_secret_names(pool: &PgPool, conversation: i64) -> Result<Vec<String>, sqlx::Error> {
     let names = db::persona_credential_names(pool, conversation).await?;
+    resolve_stored(pool, names).await
+}
+
+/// The credential names a persona snapshot lists — its
+/// `smelt.credentials` as `snapshot` saved it: `git-ssh` and stored-
+/// secret names alike (SME-242). The store resolution is
+/// `resolve_stored`, asked at every read.
+pub(crate) fn snapshot_credential_names(snapshot: &db::PersonaSnapshot) -> Vec<String> {
+    snapshot
+        .settings
+        .get("credentials")
+        .and_then(|c| c.as_array())
+        .map(|list| list.iter().filter_map(|name| name.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
+/// The names the store holds right now, in order: Rule S's store half,
+/// asked at every read (install, reconcile, the start's notice).
+async fn resolve_stored(pool: &PgPool, names: Vec<String>) -> Result<Vec<String>, sqlx::Error> {
     if names.is_empty() {
         return Ok(Vec::new());
     }
@@ -160,6 +179,14 @@ pub async fn for_conversation(pool: &PgPool, conversation: i64) -> Result<PodCre
 /// binds to its name, never to another conversation (state model).
 pub async fn pod_files(pool: &PgPool, conversation: i64) -> Result<Vec<PodFile>, sqlx::Error> {
     let granted = for_conversation(pool, conversation).await?;
+    files_for_granted(pool, &granted).await
+}
+
+/// The files behind a decided `granted`: the values join here and
+/// nowhere earlier. Read and write under one `with_install_lock` so a
+/// delete landing in between can't have its prune overwritten by the
+/// read of an install that started before it.
+async fn files_for_granted(pool: &PgPool, granted: &PodCredentials) -> Result<Vec<PodFile>, sqlx::Error> {
     let keys = if granted.git_ssh {
         db::list_ssh_keys(pool).await?.into_iter().map(|k| (k.name, k.private_key)).collect()
     } else {
@@ -280,19 +307,51 @@ pub async fn install_into_pod(pool: &PgPool, pod_id: i64) -> Result<(), String> 
             return Ok(()); // the pod is gone; there is no decision to install
         };
         let files = pod_files(pool, conversation).await.map_err(|e| e.to_string())?;
-        // Bounded: every install waits on this lock, so a stalled exec
-        // mustn't hold it.
-        let shell = sandbox::PodShell::for_pod(pool, pod_id).await.map_err(|e| e.to_string())?;
-        let keys_dir = format!("{POD_GIT_DIR}/keys");
-        tokio::time::timeout(
-            INSTALL_TIMEOUT,
-            install_pod_files(&shell, &files, &[keys_dir.as_str(), POD_SECRETS_DIR]),
-        )
+        write_pod_files(pool, pod_id, &files).await
+    })
+    .await
+}
+
+/// Writes `files` into `pod_id`'s sandbox container and prunes both
+/// credential directories to them. The caller holds `with_install_lock`
+/// across its reads and this write, so no install interleaves between
+/// a decision and its files.
+async fn write_pod_files(pool: &PgPool, pod_id: i64, files: &[PodFile]) -> Result<(), String> {
+    // Bounded: every install waits on this lock, so a stalled exec
+    // mustn't hold it.
+    let shell = sandbox::PodShell::for_pod(pool, pod_id).await.map_err(|e| e.to_string())?;
+    let keys_dir = format!("{POD_GIT_DIR}/keys");
+    tokio::time::timeout(INSTALL_TIMEOUT, install_pod_files(&shell, files, &[keys_dir.as_str(), POD_SECRETS_DIR]))
         .await
-        .map_err(|_| {
-            format!("writing credential files into the pod took over {}s", INSTALL_TIMEOUT.as_secs())
-        })?
+        .map_err(|_| format!("writing credential files into the pod took over {}s", INSTALL_TIMEOUT.as_secs()))?
         .map_err(|e| e.to_string())
+}
+
+/// Writes a starting child's decision into its live pod before its
+/// first turn (SME-242, D4): Rule G reads the column as `prepare`
+/// narrowed it; Rule S resolves `snapshot`'s names — the start's own
+/// snapshot, committed only by the done step, so during a start it is
+/// passed by hand — against the store as it is now. A no-op when the
+/// conversation has no live pod: an agent with no repo never starts
+/// one, the common case. Every way out of a start runs this as the
+/// backstop, the failed and stopped ones having had their column
+/// cleared first (`end_start`), which is what makes the pod end up
+/// with nothing.
+pub async fn reconcile_pod(pool: &PgPool, child: i64, snapshot: Option<&db::PersonaSnapshot>) -> Result<(), String> {
+    with_install_lock(async {
+        // Newest first should two ever coexist: an old pod is being
+        // torn down, the live one is the newest.
+        let Some(pod) = db::list_sandbox_pods(pool, child).await.map_err(|e| e.to_string())?.into_iter().next_back()
+        else {
+            return Ok(()); // no pod, nothing to reconcile
+        };
+        let secrets = match snapshot {
+            Some(snapshot) => resolve_stored(pool, snapshot_credential_names(snapshot)).await.map_err(|e| e.to_string())?,
+            None => granted_secret_names(pool, child).await.map_err(|e| e.to_string())?,
+        };
+        let granted = PodCredentials { git_ssh: git_ssh_granted(pool, child).await.map_err(|e| e.to_string())?, secrets };
+        let files = files_for_granted(pool, &granted).await.map_err(|e| e.to_string())?;
+        write_pod_files(pool, pod.id, &files).await
     })
     .await
 }

@@ -73,6 +73,55 @@ pub async fn agent_credentials(pool: &PgPool, id: i64) -> Result<Option<Option<V
         .await
 }
 
+/// Narrow a starting child's chain bit (SME-242, D3's write 2): the
+/// column ∩ what the persona's own `credentials` lists — and since
+/// `git-ssh` is the column's only member, the intersection turns on
+/// whether the persona listed it. `wants_git_ssh` false, or a column
+/// already empty, gives `'{}'` (keeping, never granting); a NULL
+/// pre-ticket column reads granted the way every Rule G read does, so
+/// a persona that wants the key gets the bit written rather than the
+/// row stranded. Gated on `starting` like every write here: a child
+/// stopped mid-start is `end_start`'s clear to settle, not this.
+/// Says whether it wrote.
+pub async fn narrow_agent_credentials(pool: &PgPool, child: i64, wants_git_ssh: bool) -> Result<bool, sqlx::Error> {
+    let wrote = sqlx::query(
+        "UPDATE agents SET credentials =
+             CASE WHEN $2 AND COALESCE($3 = ANY(credentials), TRUE)
+                  THEN ARRAY[$3]::text[] ELSE '{}'::text[] END
+         WHERE conversation_id = $1 AND state = $4",
+    )
+    .bind(child)
+    .bind(wants_git_ssh)
+    .bind(crate::credentials::CREDENTIAL_GIT_SSH)
+    .bind(AGENT_STARTING)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(wrote == 1)
+}
+
+/// Empty a never-completed child's column (SME-242, D3's write 3):
+/// `end_start` calls this on every way out that didn't complete,
+/// before it reconciles the pod, so a failed or cut-off start leaves
+/// no resumable credential behind (Trade-off 4). The gate is the
+/// start's incompletion rather than a state — `started_at IS NULL` —
+/// and it has to be, because every way out has already moved the
+/// state by the time the exit runs: `fail_start` has made the row
+/// `failed`, a user's Stop `stopped`, and those rows are exactly the
+/// never-started ones to clear. `started_at` is written only by the
+/// start's done step, so once it is set no write here can reach a
+/// live conversation; a child stopped while starting keeps it null and
+/// can never become `active` (see `database.md`), so clearing it
+/// strands nothing. Says whether it wrote.
+pub async fn clear_agent_credentials(pool: &PgPool, child: i64) -> Result<bool, sqlx::Error> {
+    let wrote = sqlx::query("UPDATE agents SET credentials = '{}' WHERE conversation_id = $1 AND started_at IS NULL")
+        .bind(child)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(wrote == 1)
+}
+
 /// The credential names this conversation's persona snapshot lists
 /// (SME-242): the `credentials` key of `persona_settings`, written once
 /// at `complete_start` — the names are fixed for the conversation's
