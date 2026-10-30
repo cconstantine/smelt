@@ -64,8 +64,14 @@ pub(crate) async fn snapshot(
         commit: repo.commit_sha.clone(),
         body,
         // `tools` rides along so the start can append it to the child's
-        // rule chain without re-reading the file (SME-241).
-        settings: serde_json::json!({ "model": persona.model, "tools": persona.tools }),
+        // rule chain without re-reading the file (SME-241);
+        // `credentials` so Rule S can grant this conversation's own
+        // secrets from the snapshot alone (SME-242).
+        settings: serde_json::json!({
+            "model": persona.model,
+            "tools": persona.tools,
+            "credentials": persona.credentials,
+        }),
     })
 }
 

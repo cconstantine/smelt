@@ -25,6 +25,10 @@ pub struct Persona {
     /// `smelt.tools`: the persona's tool rules, checked against the grammar
     /// (SME-241). `None` allows everything, as before the field existed.
     pub tools: Option<rules::ToolRules>,
+    /// `smelt.credentials`: the credential names this persona runs with
+    /// (SME-242). `None` — and `Some(vec![])` — mean none: a field that
+    /// is absent grants nothing, exactly as one that lists nothing.
+    pub credentials: Option<Vec<String>>,
 }
 
 /// The frontmatter. Claude Code's own keys (`tools`, `model`, ...) are
@@ -39,8 +43,8 @@ struct Frontmatter {
     smelt: Option<SmeltSettings>,
 }
 
-/// smelt's own settings. `tools` arrived with SME-241; later tickets add
-/// `credentials` (SME-242), `egress` (SME-243) and `limits` (SME-245).
+/// smelt's own settings. `credentials` arrived with SME-242; later tickets
+/// add `egress` (SME-243) and `limits` (SME-245).
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SmeltSettings {
@@ -48,6 +52,47 @@ struct SmeltSettings {
     model: Option<String>,
     #[serde(default)]
     tools: Option<rules::RawToolRules>,
+    #[serde(default)]
+    credentials: Option<RawCredentials>,
+}
+
+/// `smelt.credentials`: a list of credential names, each checked where
+/// it is read rather than after — so a bad entry is an error at the
+/// line the YAML parser stands on, like serde's own. A name that isn't
+/// a stored secret is not an error here (the store is the deployment's,
+/// not the repo's); it is reported at start and in `list_personas`
+/// instead (D6).
+#[derive(Debug)]
+struct RawCredentials(Vec<String>);
+
+struct CredentialsVisitor;
+
+impl<'de> serde::de::Visitor<'de> for CredentialsVisitor {
+    type Value = RawCredentials;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a list of credential names")
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut names = Vec::new();
+        while let Some(name) = seq.next_element::<String>()? {
+            if !crate::credentials::is_credential_name(&name) {
+                // serde_norway appends its location to this.
+                return Err(serde::de::Error::custom(format!(
+                    "`{name}` isn't a credential name: 1 to 64 letters, digits, - or _"
+                )));
+            }
+            names.push(name);
+        }
+        Ok(RawCredentials(names))
+    }
+}
+
+impl<'de> Deserialize<'de> for RawCredentials {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_seq(CredentialsVisitor)
+    }
 }
 
 /// The largest persona file: `AGENTS.md`'s cap, since it's read the same
@@ -118,12 +163,14 @@ pub fn parse(path: &str, text: &str, file_bytes: u64) -> Result<Persona, String>
         return Err(format!("{path}: `smelt.model` is empty: name a model, or leave it out."));
     }
     let tools = smelt.tools.map(|raw| rules::check(path, raw)).transpose()?;
+    let credentials = smelt.credentials.map(|raw| raw.0);
     Ok(Persona {
         name: front.name,
         description: front.description,
         instructions: body.to_string(),
         model,
         tools,
+        credentials,
     })
 }
 

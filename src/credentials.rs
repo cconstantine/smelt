@@ -12,6 +12,18 @@ use sqlx::PgPool;
 #[cfg(test)]
 mod tests;
 
+/// The shape of a credential name — the `validate_key_name` rule, since
+/// a name becomes a file name in a pod: 1 to 64 letters, digits, `-`
+/// and `_`. `git-ssh` is a credential name like any other; what refuses
+/// it is storing a secret under it (`validate_secret_name`, later).
+pub fn is_credential_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// Where smelt's git and SSH files live in a pod. The image makes it
 /// (owned by `sandbox`) and points `/etc/ssh/ssh_config.d/smelt.conf`
 /// and `/etc/gitconfig` at files in it, so nothing in the user's home

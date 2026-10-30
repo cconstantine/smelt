@@ -107,6 +107,7 @@ fn read_from(repo: db::ConversationRepo, marker: &str) -> RepoPersonas {
         instructions: format!("{marker}-body"),
         model: Some(format!("{marker}-model")),
         tools: None,
+        credentials: None,
     };
     RepoPersonas {
         repo,
