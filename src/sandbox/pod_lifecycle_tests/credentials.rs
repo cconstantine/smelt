@@ -374,9 +374,10 @@ async fn test_a_stored_secret_reaches_a_grandchild_no_ancestor_held(pool: PgPool
             .expect("a secret");
         let root = root_with_checkout(&pool, &client).await;
 
-        // The child, under `plain`: names nothing, so it narrows nothing
-        // away and holds the chain's key and no secrets — in particular
-        // not `deep-key`, which is stored while its pod lives.
+        // The child, under `plain`: a persona with no `credentials`
+        // field narrows the chain's key away (D3) and names no secret,
+        // so it holds neither — in particular not `deep-key`, which is
+        // stored while its pod lives.
         let child = start_child(&pool, root, Some("plain")).await;
         wait_for_state(&pool, child, "active").await;
         wait_start_ended(child).await;
