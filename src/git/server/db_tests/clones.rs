@@ -38,6 +38,28 @@ async fn test_a_clone_refusal_quotes_the_url_escaped_and_records_nothing(pool: P
     assert_eq!(trust_rows, 0, "no trust either");
 }
 
+/// SME-283 (review 1, F1): the refusal comes before the trust on the
+/// user's path too. `start_attach` trusts the named remote right after
+/// planning — a url that hides characters must be refused inside the
+/// plan, so a remote the user can't fully see is never granted trust,
+/// then recorded. Green-first pin: it fails if planning and trust ever
+/// swap order or the refusal skips this path.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_work_on_a_repo_refuses_a_dirty_url_before_trusting_it(pool: PgPool) {
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let failed = start_attach(&pool, conversation.id, "file:///tmp/o\u{200b}rigin.git", None, None)
+        .await
+        .expect_err("a url hiding a character is refused");
+    assert_eq!(failed.notices, Vec::new(), "nothing to notice: nothing was dropped");
+    assert!(failed.error.contains("\\u{200b}"), "the refusal is quoted escaped: {}", failed.error);
+    assert!(list_repos(&pool, conversation.id).await.expect("list").is_empty(), "no repo row");
+    let trust_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM repo_trust")
+        .fetch_one(&pool)
+        .await
+        .expect("trust count");
+    assert_eq!(trust_rows, 0, "no trust before the refusal");
+}
+
 /// SME-283 (review 1, F2): the dir-clash refusal is a fifth showing of a
 /// recorded remote — the row in the way is named, and a row recorded
 /// before the fix can hold one whose difference from another is invisible.
