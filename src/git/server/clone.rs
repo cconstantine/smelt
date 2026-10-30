@@ -235,9 +235,12 @@ async fn plan_clone(
         // removed what it made, so nothing there is the old repo's.
         Some(failed) if failed.status == "failed" => Some(failed.id),
         Some(other) => {
+            // The row in the way is a showing of a recorded remote too
+            // (SME-283 review 1, F2): a legacy row can hold one whose
+            // difference from another is invisible — quote it escaped.
             return Err(format!(
                 "/workspace/{dir} is already used by {}. Pick another directory.",
-                other.url
+                crate::git::plain_multiline_text(&other.url)
             ));
         }
         None => None,

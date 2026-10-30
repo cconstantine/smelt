@@ -38,6 +38,26 @@ async fn test_a_clone_refusal_quotes_the_url_escaped_and_records_nothing(pool: P
     assert_eq!(trust_rows, 0, "no trust either");
 }
 
+/// SME-283 (review 1, F2): the dir-clash refusal is a fifth showing of a
+/// recorded remote — the row in the way is named, and a row recorded
+/// before the fix can hold one whose difference from another is invisible.
+/// It quotes through the same escape; the raw codepoint never rides.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_dir_clash_refusal_quotes_the_other_row_escaped(pool: PgPool) {
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    // A legacy row: written straight to the db, as rows recorded before
+    // the refusal were — its url hides a character.
+    db::create_conversation_repo(&pool, conversation.id, "git\u{200b}hub.com/o/r", "git\u{200b}hub.com/o/r", None, "r")
+        .await
+        .expect("legacy row");
+    let err = clone_repo(&pool, conversation.id, "git@github.com:o/other.git", None, Some("r"))
+        .await
+        .expect_err("the directory is in use");
+    assert!(err.contains("already used by"), "{err}");
+    assert!(err.contains("\\u{200b}"), "the clash quotes the other remote escaped: {err}");
+    assert!(!err.contains('\u{200b}'), "the raw character is never quoted: {err:?}");
+}
+
 #[test]
 fn test_checkout_dirs_are_one_plain_name() {
     // A repo like `org/.github` gets its own name by default.
