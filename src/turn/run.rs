@@ -124,11 +124,11 @@ pub(super) fn run_turn_bounded<'a>(
             #[cfg(test)]
             test_hooks::after_turn_counted(conversation_id).await;
             // A send, an answer or a delivered notice brings the model
-            // something new: its end is pod activity (SME-78). A wake has
-            // neither, and its drains decide.
-            if new_message.is_some() || keep_error.is_some() {
-                set_activity_owed(conversation_id);
-            }
+            // something new: its end is pod activity (SME-78). Kept in this
+            // turn, not the conversation's shared state, which a turn ahead
+            // in the queue would take (review 1, B1). A wake has neither, and
+            // its drains decide, under the lock (`run_turn_body`).
+            let brought_something = new_message.is_some() || keep_error.is_some();
             // The turn's generation, once it holds the lock and has something
             // to tell the model (`run_turn_stoppable`).
             let mut generation = None;
@@ -165,9 +165,8 @@ pub(super) fn run_turn_bounded<'a>(
             // A child agent whose last turn ended without its report tells
             // its parent (SME-236), checked once this turn no longer counts.
             // Not after a stop, nor a wake that found nothing to do.
-            // Pod activity first, while the turn still holds its state: at
-            // its end, so a long turn counts from when it finished (SME-78).
-            if take_activity_owed(conversation_id) {
+            // At its end, so a long turn counts from when it finished (SME-78).
+            if brought_something {
                 crate::sandbox::note_activity(conversation_id);
             }
             drop(in_flight);
@@ -258,6 +257,9 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
         if new_message.is_some() {
             *generation = take_turn_generation(conversation_id, &lock);
         }
+        // What the drains mark from here on is this turn's: nothing a turn
+        // before it left (a panicked one) carries over (review 1, B2).
+        take_activity_owed(conversation_id);
         // The user's turn in an agent that finished while this queued
         // behind its last turn makes it active again, so it can report
         // again (SME-236 review 2). A parent's stop isn't undone.
@@ -304,6 +306,7 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
         // Stopped mid-turn: the body, and its hold on the lock, is gone.
         let stopped_by = *stop.borrow_and_update();
         let _turn = lock.lock().await;
+        note_drained_activity(conversation_id);
         end_stopped_turn(pool, conversation_id, stopped_by).await;
         Err(TurnFailure::Stopped)
     })
@@ -446,12 +449,23 @@ pub(super) fn run_turn_body<'a: 'b, 'b>(
         // Moved in, so the lock is held for as long as the turn runs.
         let _turn = turn_lock;
         let result = run_turn_steps(pool, conversation_id, &held, persisted, new_content, max_turns, generation).await;
+        note_drained_activity(conversation_id);
         if result.is_err() {
             clear_reply_in_progress(conversation_id);
             crate::events::publish(conversation_id, crate::events::ConversationEvent::ReplyReset {});
         }
         result
     })
+}
+
+/// Notes pod activity for what this turn's drains saved (an agent's message,
+/// a finished command's notice), taken while the turn still holds the lock,
+/// so a turn queued behind it can't take or clear it (SME-78 review 1).
+#[cfg(feature = "server")]
+fn note_drained_activity(conversation_id: i64) {
+    if take_activity_owed(conversation_id) {
+        crate::sandbox::note_activity(conversation_id);
+    }
 }
 
 /// `run_turn_body`'s steps: the loop that calls the model, runs the tools

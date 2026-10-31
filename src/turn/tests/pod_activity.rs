@@ -123,3 +123,106 @@ fn test_an_agents_environment_says_finish_stops_its_pod() {
     };
     assert!(system_prompt(&agent).contains(FINISH_LINE), "even with idle stops off");
 }
+
+/// A mock model whose replies each wait for a permit on `gate`; `seen` is
+/// notified as each request arrives.
+async fn gated_upstream(pool: &PgPool, gate: Arc<tokio::sync::Semaphore>, seen: Arc<tokio::sync::Notify>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let app = axum::Router::new().route(
+        "/v1/messages",
+        axum::routing::post(move || {
+            let (gate, seen) = (gate.clone(), seen.clone());
+            async move {
+                seen.notify_one();
+                gate.acquire().await.expect("the gate").forget();
+                ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], text_reply_body("ok"))
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    crate::providers::test_support::add_mock_provider(pool, addr).await;
+}
+
+/// SME-78 review 1 (B1): a user's send queued behind an idle-notice wake
+/// counts at its own end, and the wake ahead of it doesn't take its
+/// activity. Forced order: the wake holds the lock in its model call while
+/// the send is counted and queues; the wake ends; then the send runs.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_send_queued_behind_an_idle_notice_wake_counts_at_its_own_end(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation_id = fresh_conversation(&pool).await;
+    let pod = db::create_sandbox_pod(&pool, conversation_id).await.expect("pod");
+    let terminal = db::create_sandbox_terminal(&pool, pod.id).await.expect("terminal");
+    let command = format!("idle-queued-{conversation_id}");
+    db::create_terminal_command(&pool, conversation_id, terminal.id, &command, "npm run dev", 300)
+        .await
+        .expect("command");
+    sqlx::query("UPDATE terminal_commands SET created_at = now() - interval '10 minutes' WHERE command_id = $1")
+        .bind(&command)
+        .execute(&pool)
+        .await
+        .expect("leave it untouched for ten minutes");
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let seen = Arc::new(tokio::sync::Notify::new());
+    gated_upstream(&pool, gate.clone(), seen.clone()).await;
+    let within = std::time::Duration::from_secs(10);
+
+    let wake = tokio::spawn({
+        let pool = pool.clone();
+        async move { wake_conversation(&pool, conversation_id).await }
+    });
+    tokio::time::timeout(within, seen.notified()).await.expect("the wake calls the model");
+    // The send is counted while the wake holds the lock; let go, it marks
+    // what it brings and queues for the lock.
+    let (counted, go_on) = test_hooks::pause_after_turn_counted(conversation_id);
+    let send = tokio::spawn({
+        let pool = pool.clone();
+        async move { run_turn(&pool, conversation_id, hello()).await }
+    });
+    tokio::time::timeout(within, counted).await.expect("the send is counted").expect("hook");
+    let _ = go_on.send(());
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    gate.add_permits(1);
+    let woke = tokio::time::timeout(within, wake).await.expect("the wake ends").expect("join");
+    let noted_at_the_wakes_end = crate::sandbox::activity_noted(conversation_id);
+    gate.add_permits(1);
+    let sent = tokio::time::timeout(within, send).await.expect("the send ends").expect("join");
+
+    assert!(woke.is_ok() && sent.is_ok(), "{woke:?} {sent:?}");
+    assert!(!noted_at_the_wakes_end, "the idle-notice wake took the queued send's activity");
+    assert!(crate::sandbox::activity_noted(conversation_id), "the send's own end is activity");
+}
+
+/// SME-78 review 1 (B2): a flag a turn left behind (one that panicked
+/// before its end took it) doesn't make the next idle-notice wake count.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_stale_flag_from_an_earlier_turn_does_not_count(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation_id = fresh_conversation(&pool).await;
+    let pod = db::create_sandbox_pod(&pool, conversation_id).await.expect("pod");
+    let terminal = db::create_sandbox_terminal(&pool, pod.id).await.expect("terminal");
+    let command = format!("idle-stale-{conversation_id}");
+    db::create_terminal_command(&pool, conversation_id, terminal.id, &command, "npm run dev", 300)
+        .await
+        .expect("command");
+    sqlx::query("UPDATE terminal_commands SET created_at = now() - interval '10 minutes' WHERE command_id = $1")
+        .bind(&command)
+        .execute(&pool)
+        .await
+        .expect("leave it untouched for ten minutes");
+    start_mock_upstream(&pool, vec![text_reply_body("Still going.")]).await;
+    // The leftover: the conversation's state is held (a kept lock handle),
+    // so the flag survives with no turn running.
+    let held = crate::turn::conversation_lock(conversation_id);
+    set_activity_owed(conversation_id);
+
+    let saved = wake_conversation(&pool, conversation_id).await.expect("the wake runs");
+    drop(held);
+
+    assert!(saved.iter().any(|m| m.content.contains("is still running")), "{saved:?}");
+    assert!(!crate::sandbox::activity_noted(conversation_id), "a stale flag counted for an idle-notice wake");
+}
