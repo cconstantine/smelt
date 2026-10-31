@@ -119,7 +119,7 @@ async fn test_a_child_with_no_pod_finishes_with_no_stop_and_no_notice(pool: PgPo
     eventually("the child finished", || async { state(&pool, child).await.as_deref() == Some(db::AGENT_FINISHED) }).await;
     eventually("after_last_turn ran", || async { test_hooks::last_turns_checked(child) >= 1 }).await;
     assert_eq!(finish_notices(&pool, child).await, 0);
-    assert!(!crate::sandbox::stop_finished_agent_pod_with(&pool, child, |_| async { Ok(()) }).await, "nothing to stop");
+    assert!(!crate::sandbox::stop_finished_agent_pod_with(&pool, child, &crate::sandbox::ActivityNotes::default(), |_| async { Ok(()) }).await, "nothing to stop");
 }
 
 /// The stop wins: it holds the turn lock and has re-checked when the
@@ -169,7 +169,7 @@ async fn test_a_message_landing_before_the_stops_recheck_keeps_the_pod(pool: PgP
     let _ = outcome;
     assert_eq!(state(&pool, child).await.as_deref(), Some("active"), "the message woke it");
 
-    let stopped = crate::sandbox::stop_finished_agent_pod_with(&pool, child, |_| async { Ok(()) }).await;
+    let stopped = crate::sandbox::stop_finished_agent_pod_with(&pool, child, &crate::sandbox::ActivityNotes::default(), |_| async { Ok(()) }).await;
 
     assert!(!stopped, "the re-check read active and skipped");
     assert!(live(&pool, pod).await, "the woken child keeps its pod");
@@ -217,7 +217,7 @@ async fn test_the_finish_stop_waits_for_a_held_turn_lock(pool: PgPool) {
 
     let stop = tokio::spawn({
         let pool = pool.clone();
-        async move { crate::sandbox::stop_finished_agent_pod_with(&pool, child, |_| async { Ok(()) }).await }
+        async move { crate::sandbox::stop_finished_agent_pod_with(&pool, child, &crate::sandbox::ActivityNotes::default(), |_| async { Ok(()) }).await }
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!stop.is_finished(), "the stop waits for the lock");
@@ -228,4 +228,96 @@ async fn test_the_finish_stop_waits_for_a_held_turn_lock(pool: PgPool) {
     let stopped = tokio::time::timeout(Duration::from_secs(10), stop).await.expect("the stop ends").expect("join");
     assert!(stopped, "stopped once the lock was free");
     assert!(!live(&pool, pod).await);
+}
+
+/// A finished child's pod, finished ten minutes ago, as the stop's tests
+/// below need: `active_child`, a pod, then the finish, moved back.
+async fn finished_ten_minutes_ago(pool: &PgPool) -> (i64, i64) {
+    let root = db::create_conversation(pool).await.expect("create conversation").id;
+    let child = active_child(pool, root).await;
+    let pod = db::create_sandbox_pod(pool, child).await.expect("pod").id;
+    sqlx::query("UPDATE sandbox_pods SET created_at = created_at - interval '20 minutes' WHERE id = $1")
+        .bind(pod)
+        .execute(pool)
+        .await
+        .expect("an older pod");
+    sqlx::query("UPDATE agents SET state = 'finished', state_changed_at = now() - interval '10 minutes' WHERE conversation_id = $1")
+        .bind(child)
+        .execute(pool)
+        .await
+        .expect("finished ten minutes ago");
+    (child, pod)
+}
+
+/// SME-78 review 2 (R2-2): the finish stop flushes the conversation's note
+/// under its locks before the re-check, as the pass does: a preview the
+/// user opened in memory since the finish keeps the pod.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_finish_stop_flushes_before_its_recheck(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let (child, pod) = finished_ten_minutes_ago(&pool).await;
+    let notes = crate::sandbox::ActivityNotes::default();
+    notes.note(child);
+
+    let stopped = crate::sandbox::stop_finished_agent_pod_with(&pool, child, &notes, |_| async { Ok(()) }).await;
+
+    assert!(!stopped, "stopped on a stale last_active_at");
+    assert!(live(&pool, pod).await);
+    assert!(!notes.contains(child), "the note was flushed");
+}
+
+/// SME-78 review 2 (R2-2): a failed flush there skips the pod, as A1 made
+/// the pass do; the pass tries again.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_failed_flush_skips_the_finish_stop(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let (child, pod) = finished_ten_minutes_ago(&pool).await;
+    let notes = crate::sandbox::ActivityNotes::default();
+    notes.note(child);
+    notes.fail_next_flush();
+
+    let stopped = crate::sandbox::stop_finished_agent_pod_with(&pool, child, &notes, |_| async { Ok(()) }).await;
+
+    assert!(!stopped, "stopped on a clock the failed flush may have missed");
+    assert!(live(&pool, pod).await);
+    assert!(notes.contains(child), "the note is kept for the next flush");
+}
+
+/// SME-78 review 2 (R2-1 + R2-2), the backstop's whole path: a child
+/// finishes with a command running, which ends half an hour later. The
+/// real wake drains its notice and notes the activity, the finish stop at
+/// that wake's end flushes it, and its delete fails. The next pass still
+/// counts the pod as Finished, not idle, and stops it.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_left_running_commands_end_still_stops_the_pod_after_a_failed_delete(pool: PgPool) {
+    let (_, child, pod, ready) = finishing_child_with_pod(&pool).await;
+    let terminal = db::create_sandbox_terminal(&pool, pod).await.expect("terminal");
+    let command = format!("left-up-{child}");
+    db::create_terminal_command(&pool, child, terminal.id, &command, "python3 -m http.server", 0)
+        .await
+        .expect("a command left running");
+    ready.notify_one();
+    eventually("the child finished", || async { state(&pool, child).await.as_deref() == Some(db::AGENT_FINISHED) }).await;
+    eventually("its finish turn's check", || async { test_hooks::last_turns_checked(child) >= 1 }).await;
+    assert!(live(&pool, pod).await, "the running command keeps it");
+    // The finish was 40 minutes ago, and the command ends now.
+    for statement in [
+        "UPDATE agents SET state_changed_at = state_changed_at - interval '40 minutes' WHERE conversation_id = $1",
+        "UPDATE sandbox_pods SET created_at = created_at - interval '50 minutes' WHERE conversation_id = $1",
+        "UPDATE terminal_commands SET created_at = created_at - interval '45 minutes' WHERE conversation_id = $1",
+    ] {
+        sqlx::query(statement).bind(child).execute(&pool).await.expect("move the past back");
+    }
+    crate::sandbox::fake_delete::fail(pod);
+    db::mark_terminal_command_finished(&pool, &command, 130).await.expect("it ends");
+    crate::turn::notify(&pool, child, vec![crate::turn::Notice::Wake]);
+    eventually("the exit wake's check", || async { test_hooks::last_turns_checked(child) >= 2 }).await;
+    assert!(live(&pool, pod).await, "the finish stop's delete failed");
+
+    let stopped = crate::sandbox::stop_idle_pods_once_with(&pool, 60, &crate::sandbox::ActivityNotes::default(), |_| async {
+        Ok::<(), crate::sandbox::SandboxError>(())
+    })
+    .await;
+    assert_eq!(stopped, vec![pod], "the next pass stops it as Finished, not after the idle hour");
+    assert_eq!(finish_notices(&pool, child).await, 1, "with the finish notice");
 }

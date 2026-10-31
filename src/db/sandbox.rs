@@ -131,10 +131,12 @@ const FINISHED_GRACE_SECS: u64 = 2 * QUIET_STOP_PASS_SECS;
 
 /// Pod `p` is a `finished` agent's and nothing used it after the finish
 /// (SME-78 review 1, A2): it was started at or before the finish, no
-/// command started in it since, and its last note is no later than the
-/// finish plus `FINISHED_GRACE_SECS`. A command left running that ends
-/// after the finish doesn't count, so the backstop stops the pod once it
-/// does. A pod the user started or used after the finish (Work on a repo,
+/// command started in it since, and its last note is no later than
+/// `FINISHED_GRACE_SECS` after the later of the finish and the last end of
+/// a command that started before it (review 2, R2-1: that command's exit
+/// wake notes activity, flushed after its end). A command left running
+/// that ends after the finish doesn't count, so the backstop stops the pod
+/// once it does. A pod the user started or used after the finish (Work on a repo,
 /// a preview) falls back to the idle rule. The one copy of the rule, for
 /// the candidates and the re-check alike.
 fn pod_finished() -> String {
@@ -143,7 +145,11 @@ fn pod_finished() -> String {
            WHERE a.conversation_id = p.conversation_id AND a.state = 'finished' \
              AND p.created_at <= a.state_changed_at \
              AND (p.last_active_at IS NULL \
-                  OR p.last_active_at <= a.state_changed_at + make_interval(secs => {FINISHED_GRACE_SECS})) \
+                  OR p.last_active_at <= GREATEST(a.state_changed_at, \
+                         (SELECT MAX(tc.finished_at) FROM terminal_commands tc \
+                            JOIN sandbox_terminals t ON t.id = tc.terminal_id \
+                           WHERE t.pod_id = p.id AND tc.created_at <= a.state_changed_at)) \
+                     + make_interval(secs => {FINISHED_GRACE_SECS})) \
              AND NOT EXISTS (SELECT 1 FROM terminal_commands tc \
                   JOIN sandbox_terminals t ON t.id = tc.terminal_id \
                   WHERE t.pod_id = p.id AND tc.created_at > a.state_changed_at))"

@@ -600,3 +600,42 @@ async fn test_a_finished_agents_pod_used_after_the_finish_waits_for_the_idle_rul
     mark_terminal_command_finished(&pool, &id, 130).await.expect("it ends after the finish");
     assert!(finished(&pool, pod).await, "a command left running that ends after the finish");
 }
+
+/// SME-78 review 2 (R2-1): a command left running at the finish ends long
+/// after it; its exit wake's note, flushed after the command's end, is
+/// still part of the finish. The grace counts from the later of the finish
+/// and the last end of a command that started before it. A note well
+/// after that end is the user's, and falls back to the idle rule.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_finished_grace_counts_from_a_left_running_commands_end(pool: PgPool) {
+    let child = agent_conversation(&pool, "active").await;
+    let pod = create_sandbox_pod(&pool, child).await.expect("pod").id;
+    let terminal = create_sandbox_terminal(&pool, pod).await.expect("terminal");
+    let id = format!("left-up-{child}");
+    create_terminal_command(&pool, child, terminal.id, &id, "npm run dev", 0).await.expect("command");
+    age_pod(&pool, pod, 60).await;
+    mark_finished(&pool, child).await;
+    finished_ago(&pool, child, 40).await;
+    // It ends 30 minutes after the finish (ten minutes ago); its exit
+    // wake's note is flushed a minute after that.
+    sqlx::query("UPDATE terminal_commands SET status = 'finished', exit_code = 130, finished_at = now() - interval '10 minutes' WHERE command_id = $1")
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .expect("it ends");
+    sqlx::query("UPDATE sandbox_pods SET last_active_at = now() - interval '9 minutes' WHERE id = $1")
+        .bind(pod)
+        .execute(&pool)
+        .await
+        .expect("the exit wake's note");
+    assert!(
+        pod_still_stoppable(&pool, pod, QuietStopKind::Finished, 0).await.expect("re-check"),
+        "the exit wake's own note, a minute after the command's end"
+    );
+
+    flush_pod_activity(&pool, &[child]).await.expect("a preview now, ten minutes after the end");
+    assert!(
+        !pod_still_stoppable(&pool, pod, QuietStopKind::Finished, 0).await.expect("re-check"),
+        "a note well after the command's end is the user's"
+    );
+}

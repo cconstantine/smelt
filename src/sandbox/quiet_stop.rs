@@ -50,6 +50,33 @@ impl ActivityNotes {
         self.noted.lock().unwrap_or_else(|e| e.into_inner()).contains(&conversation_id)
     }
 
+    /// `flush` for `conversation_id`'s note alone, leaving the others for
+    /// the pass: the finish stop's, under its locks (SME-78 review 2).
+    pub(crate) async fn flush_conversation(&self, pool: &PgPool, conversation_id: i64) -> bool {
+        let noted = self.noted.lock().unwrap_or_else(|e| e.into_inner()).contains(&conversation_id);
+        if !noted {
+            return true;
+        }
+        #[cfg(test)]
+        let flushed = if self.fail_next_flush.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            Err(sqlx::Error::PoolTimedOut)
+        } else {
+            db::flush_pod_activity(pool, &[conversation_id]).await
+        };
+        #[cfg(not(test))]
+        let flushed = db::flush_pod_activity(pool, &[conversation_id]).await;
+        match flushed {
+            Ok(()) => {
+                self.noted.lock().unwrap_or_else(|e| e.into_inner()).remove(&conversation_id);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(conversation_id, error = %e, "couldn't record a pod's activity; kept for the next pass");
+                false
+            }
+        }
+    }
+
     /// Writes the notes to the database, and forgets them only once that
     /// succeeded: a failed flush keeps them for the next one. Whether it
     /// succeeded (nothing to write is success).
@@ -199,8 +226,8 @@ pub(crate) const QUIET_STOP_DELETE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The cluster's part of a quiet stop in production: the pod's delete.
 pub(in crate::sandbox) async fn cluster_delete(pool: &PgPool, pod_id: i64) -> Result<(), SandboxError> {
     #[cfg(test)]
-    if fake_delete::take(pod_id).await {
-        return Ok(());
+    if let Some(faked) = fake_delete::take(pod_id).await {
+        return faked;
     }
     Box::pin(delete_terminated_pod(pool, &get()?.client, pod_id)).await
 }
@@ -213,7 +240,9 @@ pub(crate) mod fake_delete {
     use std::sync::{LazyLock, Mutex};
     use tokio::sync::oneshot;
 
-    type Gate = Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>;
+    /// `None`: succeed at once; `Some(None)`: fail at once; `Some(Some(_))`:
+    /// wait at the gate, then succeed.
+    type Gate = Option<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>;
     static FAKES: LazyLock<Mutex<HashMap<i64, Gate>>> = LazyLock::new(Default::default);
 
     /// `pod_id`'s next delete succeeds at once.
@@ -221,27 +250,33 @@ pub(crate) mod fake_delete {
         FAKES.lock().unwrap_or_else(|e| e.into_inner()).insert(pod_id, None);
     }
 
+    /// `pod_id`'s next delete fails, as a cluster error would.
+    pub(crate) fn fail(pod_id: i64) {
+        FAKES.lock().unwrap_or_else(|e| e.into_inner()).insert(pod_id, Some(None));
+    }
+
     /// `pod_id`'s next delete waits: the first receiver fires once it's
     /// waiting, and sending on the second lets it succeed.
     pub(crate) fn hold(pod_id: i64) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (reached_tx, reached_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
-        FAKES.lock().unwrap_or_else(|e| e.into_inner()).insert(pod_id, Some((reached_tx, release_rx)));
+        FAKES.lock().unwrap_or_else(|e| e.into_inner()).insert(pod_id, Some(Some((reached_tx, release_rx))));
         (reached_rx, release_tx)
     }
 
-    /// Whether `pod_id`'s delete is faked, after waiting at its gate.
-    pub(super) async fn take(pod_id: i64) -> bool {
-        let fake = FAKES.lock().unwrap_or_else(|e| e.into_inner()).remove(&pod_id);
-        match fake {
-            None => false,
-            Some(None) => true,
+    /// `pod_id`'s faked delete's outcome, after waiting at its gate; `None`
+    /// when it isn't faked.
+    pub(super) async fn take(pod_id: i64) -> Option<Result<(), super::SandboxError>> {
+        let fake = FAKES.lock().unwrap_or_else(|e| e.into_inner()).remove(&pod_id)?;
+        Some(match fake {
+            None => Ok(()),
+            Some(None) => Err(super::SandboxError::StartFailed("a faked cluster failure".into())),
             Some(Some((reached, release))) => {
                 let _ = reached.send(());
                 let _ = release.await;
-                true
+                Ok(())
             }
-        }
+        })
     }
 }
 
@@ -403,7 +438,7 @@ pub(crate) async fn stop_candidate(
 /// backstop takes it once the command ends). No live pod — the seat ran
 /// `terminate_pod` itself — is a no-op.
 pub(crate) async fn stop_finished_agent_pod(pool: &PgPool, conversation_id: i64) -> bool {
-    stop_finished_agent_pod_with(pool, conversation_id, |pod_id| cluster_delete(pool, pod_id)).await
+    stop_finished_agent_pod_with(pool, conversation_id, &ACTIVITY, |pod_id| cluster_delete(pool, pod_id)).await
 }
 
 /// `stop_finished_agent_pod` with the cluster's delete passed in. Waits for
@@ -413,7 +448,12 @@ pub(crate) async fn stop_finished_agent_pod(pool: &PgPool, conversation_id: i64)
 /// before the re-check keeps the pod (the re-check skips); one after it
 /// finds the pod stopped, and its woken turn reads the notice, then the
 /// message, and starts a pod on the same claims if it needs one.
-pub(crate) async fn stop_finished_agent_pod_with<D, Fut>(pool: &PgPool, conversation_id: i64, delete: D) -> bool
+pub(crate) async fn stop_finished_agent_pod_with<D, Fut>(
+    pool: &PgPool,
+    conversation_id: i64,
+    notes: &ActivityNotes,
+    delete: D,
+) -> bool
 where
     D: FnOnce(i64) -> Fut,
     Fut: std::future::Future<Output = Result<(), SandboxError>>,
@@ -431,6 +471,11 @@ where
     let stop = crate::turn::between_turns(conversation_id, true, || async move {
         let start_lock = pod_start_lock(conversation_id);
         let _starting = start_lock.lock().await;
+        // Activity noted since the last pass counts before the re-check, as
+        // in the pass; a failed flush skips the pod (review 2, R2-2).
+        if !notes.flush_conversation(pool, conversation_id).await {
+            return false;
+        }
         match db::pod_still_stoppable(pool, pod_id, db::QuietStopKind::Finished, 0).await {
             Ok(true) => stop_locked(pool, pod_id, conversation_id, StopReason::Finished, delete(pod_id)).await,
             Ok(false) => false,
