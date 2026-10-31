@@ -79,7 +79,11 @@ async fn test_a_multi_line_value_round_trips_byte_for_byte(pool: PgPool) {
     let listed = list_named_secrets(pool).await.expect("list");
     for (name, value) in values {
         let found = listed.iter().find(|s| s.name == name).expect(name);
-        assert_eq!(found.value, *value, "{name} came back changed");
+        assert_eq!(found.value, *value, "{name} came back changed in the list");
+        // Every read path, both SELECTs: the CRLF row above all — the
+        // list alone would leave `get_named_secret` untried by it.
+        let got = get_named_secret(pool, found.id).await.expect("get").expect(name);
+        assert_eq!(got.value, *value, "{name} came back changed by id");
     }
 
     // The change path is the same story: whole bytes in, whole bytes back.
