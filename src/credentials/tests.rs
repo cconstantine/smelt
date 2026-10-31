@@ -212,3 +212,20 @@ async fn test_pod_files_follow_the_two_rules_separately(pool: PgPool) {
     assert!(file(&files, "/etc/smelt/gitconfig").is_some(), "the identity file is always written");
 }
 
+/// SME-334 T5: the store → serve pin. A stored multi-line secret
+/// reaches `PodFile.content` byte-equal, at mode 600 — saved through
+/// the real save path, so the tdd.md stub check bites here too: stub
+/// `create_named_secret` to flatten newlines and this row's content
+/// goes red. `install_pod_files`' `cat > "$1.new"` write has been
+/// byte-faithful since SME-242; with T3 and T4 this pins save → store
+/// → serve with no byte discretion anywhere in between.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_pod_files_hand_a_multi_line_secret_byte_equal(pool: PgPool) {
+    let value = "-----BEGIN OPENSSH PRIVATE KEY-----\n\nb3BlbnNzaC1rZXktdjEA\n-----END OPENSSH PRIVATE KEY-----\n";
+    crate::api::secrets::save_secret_of(&pool, None, "pem-key", value).await.expect("saved");
+    let holder = agent(&pool, Some(&[]), Some(&["pem-key"])).await;
+    let files = pod_files(&pool, holder).await.expect("pod files");
+    let secret = file(&files, "/etc/smelt/secrets/pem-key").expect("the secret file");
+    assert_eq!((secret.mode, secret.content.as_str()), (0o600, value), "byte-equal, at 600, exactly as stored");
+}
+
