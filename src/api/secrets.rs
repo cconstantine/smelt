@@ -2,8 +2,10 @@
 //! named secrets, which a persona lists by name in `smelt.credentials`.
 //! Write-only the way the ticket settled it (Answer 2): a value goes in
 //! and never comes out — what the browser sees is D7's `shown`, computed
-//! here at read and never stored — and every successful write reaches
-//! every live pod through the same install the keys use.
+//! here at read and never stored, and since SME-334 the row's `lines`
+//! count beside it, the same read-time-computed family — and every
+//! successful write reaches every live pod through the same install the
+//! keys use.
 //!
 //! The two validators sit out of `cfg(server)` on purpose: they are the
 //! words the page's form says before it submits, so they compile for
@@ -31,6 +33,10 @@ pub struct SecretSummary {
     /// The value's safe prefix: at most its first four characters with
     /// at least eight bytes always hidden, plus its byte length.
     pub shown: String,
+    /// The value's line count (SME-334) — D7's display now carries it,
+    /// beside the byte count, so a flattened secret can never sit
+    /// invisible: `line_count`'s arithmetic, never the value.
+    pub lines: usize,
 }
 
 /// The rule `named_secrets.name`'s CHECK spells, shared so the form
@@ -64,6 +70,23 @@ pub fn validate_secret_value(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The row's line count (SME-334), computed at read and never stored —
+/// the same read-time-derived family as `shown`, and just as value-blind:
+/// a count of line breaks, never a part of the value (D7). It is here
+/// because byte count cannot expose a paste-flattened secret (a newline
+/// turned into a space keeps the length); the line count is the smallest
+/// fact that tells the two apart. `str::lines`: a trailing newline adds
+/// no phantom line — a 47-line kubeconfig counts 47, the flattened one
+/// counts 1. Pure and outside `cfg(server)` like the two validators.
+/// Dead on the web build on purpose: the server computes the count, the
+/// page renders it verbatim and never recomputes (the same rule `shown`
+/// lives by), and the plan wants the arithmetic sitting with the
+/// validators, compilable on both targets.
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
+pub fn line_count(value: &str) -> usize {
+    value.lines().count()
+}
+
 /// D7's display, computed at read and never stored: with `n` the byte
 /// length and `k = min(4, n − 8)` floored at 0, the first `k` **bytes**
 /// (trimmed back to a character boundary, never a partial character)
@@ -74,7 +97,9 @@ pub fn validate_secret_value(value: &str) -> Result<(), String> {
 /// than four characters either, and at least eight bytes of every
 /// value are never in it — the length is exact on purpose (it's what
 /// makes two rows tell apart; Trade-off 9 bounds what a pod could take
-/// from it).
+/// from it). Since SME-334 the line count rides beside it as `lines`:
+/// byte length survives paste-flattening, line count does not, and the
+/// pair together is what makes the display honest.
 #[cfg(feature = "server")]
 pub fn shown(value: &str) -> String {
     let n = value.len();
@@ -100,6 +125,7 @@ impl From<db::NamedSecret> for SecretSummary {
             created_at: secret.created_at,
             updated_at: secret.updated_at,
             shown: shown(&secret.value),
+            lines: line_count(&secret.value),
         }
     }
 }
