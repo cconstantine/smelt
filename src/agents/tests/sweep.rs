@@ -60,14 +60,18 @@ async fn test_the_sweep_fails_a_start_a_restart_cut_off(pool: PgPool) {
     assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_FAILED));
     assert_eq!(cards(&pool, child).await, 0, "the cut-off start's card is deleted");
     assert_eq!(transcript(&pool, child).await, vec![("user".to_string(), text.clone())], "the child says why");
-    assert_eq!(
-        transcript(&pool, root).await,
-        vec![
-            ("user".to_string(), format!("Report from agent #{child}:\n\n{text}")),
-            ("assistant".to_string(), "Noted.".to_string()),
-        ],
-        "the parent gets the error as the report, and is woken"
-    );
+    // A wake's handle completes at the first delta and the turn is stored
+    // after it (the SME-204 ordering turn/wake.rs names), so the woken
+    // parent's transcript is polled, not snapshotted: under load "Noted."
+    // lands after the await returned — the wake family's CI reds, SME-336.
+    eventually("the parent gets the error as the report, and is woken", || async {
+        transcript(&pool, root).await
+            == vec![
+                ("user".to_string(), format!("Report from agent #{child}:\n\n{text}")),
+                ("assistant".to_string(), "Noted.".to_string()),
+            ]
+    })
+    .await;
 }
 
 /// A report queued before a restart: turn state is gone, the sweep wakes
@@ -100,13 +104,15 @@ async fn test_a_queued_report_survives_a_restart_and_a_stopped_recipient_is_not_
     for wake in startup_sweep(&pool).await {
         wake.await.expect("the wake");
     }
-    assert_eq!(
-        transcript(&pool, root).await,
-        vec![
-            ("user".to_string(), format!("Report from agent #{stopped}:\n\nBefore.")),
-            ("assistant".to_string(), "Noted.".to_string()),
-        ]
-    );
+    // The first-delta/stored-turn ordering again — poll, don't snapshot.
+    eventually("the parent gets the queued report and is woken", || async {
+        transcript(&pool, root).await
+            == vec![
+                ("user".to_string(), format!("Report from agent #{stopped}:\n\nBefore.")),
+                ("assistant".to_string(), "Noted.".to_string()),
+            ]
+    })
+    .await;
     assert_eq!(requests_for(&requests, Some(stopped)).len(), 0, "the stopped child isn't woken");
     let left = queued_to(&pool, stopped).await;
     assert!(left.len() == 1 && left[0].1.is_none(), "its notice waits: {left:?}");
