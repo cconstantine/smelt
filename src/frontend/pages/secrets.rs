@@ -48,6 +48,7 @@ pub fn SecretsPage() -> Element {
                 }
             }
             super::ErrorText { message: load_error() }
+            super::ErrorText { message: action_error() }
             if !loaded() {
                 p { class: "muted", "Loading..." }
             } else {
@@ -112,7 +113,6 @@ fn SecretAddForm(secrets: Signal<Vec<SecretSummary>>, action_error: Signal<Optio
                 textarea {
                     id: "secret-value",
                     class: "secret-value-input",
-                    required: true,
                     rows: 8,
                     spellcheck: "false",
                     placeholder: "Paste the whole credential — multi-line stays multi-line.",
