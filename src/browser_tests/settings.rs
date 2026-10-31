@@ -555,7 +555,7 @@ pub(super) async fn scenario_secrets_page(t: &Scenario<'_>) {
     // and none of the value may reach the page. Red on the unfixed
     // single-line input: its edit path replaces every newline with a
     // space — the exact flattening this ticket filed.
-    let yaml = "apiVersion: v1\nclusters:\n\nkind: list\n"; // 37 bytes: prefix "apiv…", 29 hidden
+    let yaml = "apiVersion: v1\nclusters:\n\nkind: list\n"; // 37 bytes: prefix "apiv…", 33 hidden
     let paste_name = unique_id("kube");
     type_and_read_back(&page, "#secret-name", &paste_name).await;
     let paste_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
