@@ -165,7 +165,51 @@ impl StopReason {
 
 /// The cluster's part of a quiet stop in production: the pod's delete.
 pub(in crate::sandbox) async fn cluster_delete(pool: &PgPool, pod_id: i64) -> Result<(), SandboxError> {
+    #[cfg(test)]
+    if fake_delete::take(pod_id).await {
+        return Ok(());
+    }
     Box::pin(delete_terminated_pod(pool, &get()?.client, pod_id)).await
+}
+
+/// A cluster delete that succeeds without a cluster, for the tests of the
+/// finish stop, which runs from `after_last_turn` with the real delete.
+#[cfg(test)]
+pub(crate) mod fake_delete {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    use tokio::sync::oneshot;
+
+    type Gate = Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>;
+    static FAKES: LazyLock<Mutex<HashMap<i64, Gate>>> = LazyLock::new(Default::default);
+
+    /// `pod_id`'s next delete succeeds at once.
+    pub(crate) fn succeed(pod_id: i64) {
+        FAKES.lock().unwrap_or_else(|e| e.into_inner()).insert(pod_id, None);
+    }
+
+    /// `pod_id`'s next delete waits: the first receiver fires once it's
+    /// waiting, and sending on the second lets it succeed.
+    pub(crate) fn hold(pod_id: i64) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        FAKES.lock().unwrap_or_else(|e| e.into_inner()).insert(pod_id, Some((reached_tx, release_rx)));
+        (reached_rx, release_tx)
+    }
+
+    /// Whether `pod_id`'s delete is faked, after waiting at its gate.
+    pub(super) async fn take(pod_id: i64) -> bool {
+        let fake = FAKES.lock().unwrap_or_else(|e| e.into_inner()).remove(&pod_id);
+        match fake {
+            None => false,
+            Some(None) => true,
+            Some(Some((reached, release))) => {
+                let _ = reached.send(());
+                let _ = release.await;
+                true
+            }
+        }
+    }
 }
 
 /// Stops `pod_id` quietly, called with its conversation's turn lock and
@@ -301,6 +345,52 @@ pub(crate) async fn stop_candidate(
             Ok(false) => false,
             Err(e) => {
                 tracing::warn!(pod_id, error = %e, "couldn't re-check a sandbox pod before stopping it");
+                false
+            }
+        }
+    });
+    stop.await.unwrap_or(false)
+}
+
+/// The finish stop: a sub-agent's turn ended with it `finished`
+/// (`agents::after_last_turn`), so its pod stops at once rather than after
+/// an hour, unless a command is still running (the next idle pass's
+/// backstop takes it once the command ends). No live pod — the seat ran
+/// `terminate_pod` itself — is a no-op.
+pub(crate) async fn stop_finished_agent_pod(pool: &PgPool, conversation_id: i64) -> bool {
+    stop_finished_agent_pod_with(pool, conversation_id, |pod_id| cluster_delete(pool, pod_id)).await
+}
+
+/// `stop_finished_agent_pod` with the cluster's delete passed in. Waits for
+/// the conversation's turn lock and then its start lock, the order a turn
+/// takes them, and re-checks under both. A `message_agent` racing it has
+/// one winner, decided by the turn lock: one that set the child `active`
+/// before the re-check keeps the pod (the re-check skips); one after it
+/// finds the pod stopped, and its woken turn reads the notice, then the
+/// message, and starts a pod on the same claims if it needs one.
+pub(crate) async fn stop_finished_agent_pod_with<D, Fut>(pool: &PgPool, conversation_id: i64, delete: D) -> bool
+where
+    D: FnOnce(i64) -> Fut,
+    Fut: std::future::Future<Output = Result<(), SandboxError>>,
+{
+    let pod_id = match db::list_sandbox_pods(pool, conversation_id).await {
+        Ok(pods) => match pods.first() {
+            Some(pod) => pod.id,
+            None => return false,
+        },
+        Err(e) => {
+            tracing::warn!(conversation_id, error = %e, "couldn't read a finished agent's pods; the idle pass will look again");
+            return false;
+        }
+    };
+    let stop = crate::turn::between_turns(conversation_id, true, || async move {
+        let start_lock = pod_start_lock(conversation_id);
+        let _starting = start_lock.lock().await;
+        match db::pod_still_stoppable(pool, pod_id, db::QuietStopKind::Finished, 0).await {
+            Ok(true) => stop_locked(pool, pod_id, conversation_id, StopReason::Finished, delete(pod_id)).await,
+            Ok(false) => false,
+            Err(e) => {
+                tracing::warn!(pod_id, error = %e, "couldn't re-check a finished agent's pod before stopping it");
                 false
             }
         }
