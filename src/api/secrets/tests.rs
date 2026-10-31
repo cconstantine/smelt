@@ -114,3 +114,23 @@ fn test_shown_shows_at_most_four_characters_and_hides_eight_bytes() {
     // The length is exact (it's what makes rows tell apart).
     assert!(shown(v40).contains("(40 bytes)"));
 }
+
+/// SME-334 T2: `lines` counts the value's lines — the smallest fact that
+/// separates a multi-line credential from a flattened one (paste-
+/// flattening turns each newline into a space and leaves the byte count
+/// intact, so `shown` can never tell the two apart). A trailing newline
+/// is not a phantom extra line on a 47-line kubeconfig.
+#[test]
+fn test_lines_counts_the_values_lines() {
+    assert_eq!(line_count("a"), 1);
+    assert_eq!(line_count("a\n"), 1, "a trailing newline adds no phantom line");
+    assert_eq!(line_count("a\n\nb"), 3, "a blank line is a line");
+    assert_eq!(line_count("\n"), 1);
+    // A value that *leads* with its newline — every YAML file pasted
+    // with its first line intact — still counts from the first break.
+    assert_eq!(line_count("\napiVersion: v1\nclusters:\n\nkind: list\n"), 5);
+    assert_eq!(line_count(""), 0, "nothing to store has no lines");
+    // `shown` stays byte-arithmetic with a leading newline: its first
+    // four bytes shown, the last eight still absent.
+    assert_eq!(shown("\nabcdefg1234"), "\nabc… (12 bytes)");
+}
