@@ -307,9 +307,9 @@ fn status_text(phase: Option<&str>, agent: Option<&AgentStatus>) -> String {
 /// threshold of `minutes` (`0`: idle stops off).
 fn idle_stop_note(minutes: u32) -> String {
     match minutes {
-        0 => "Idle sandboxes aren't stopped automatically; a finished agent's is.".to_string(),
+        0 => "Idle sandboxes aren't stopped automatically; a finished agent's is, unless a command is still running.".to_string(),
         minutes => format!(
-            "Sandboxes idle for {minutes} minutes with no command running are stopped, and a finished agent's at once; /workspace is kept."
+            "Sandboxes idle for {minutes} minutes with no command running are stopped, and a finished agent's at once unless a command is still running; /workspace is kept."
         ),
     }
 }
@@ -399,9 +399,12 @@ mod tests {
     fn test_the_idle_stop_note_says_what_is_stopped_automatically() {
         assert_eq!(
             idle_stop_note(60),
-            "Sandboxes idle for 60 minutes with no command running are stopped, and a finished agent's at once; /workspace is kept."
+            "Sandboxes idle for 60 minutes with no command running are stopped, and a finished agent's at once unless a command is still running; /workspace is kept."
         );
-        assert_eq!(idle_stop_note(0), "Idle sandboxes aren't stopped automatically; a finished agent's is.");
+        assert_eq!(
+            idle_stop_note(0),
+            "Idle sandboxes aren't stopped automatically; a finished agent's is, unless a command is still running."
+        );
     }
 
     #[test]
