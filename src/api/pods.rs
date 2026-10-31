@@ -324,30 +324,32 @@ pub(crate) async fn stored_storage(pool: &sqlx::PgPool) -> Result<Vec<StoredStor
     Ok(storage_rows(&claims, &titles))
 }
 
-/// Whether a pod is doing anything. Busy while any of its terminals has a
-/// command running; otherwise idle since its last sign of activity.
+/// Whether a pod is doing anything. Busy while a turn runs, a repo clones
+/// or any of its terminals has a command running — never stopped then
+/// (SME-78); otherwise idle since its last sign of activity.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum PodActivity {
     Busy,
     IdleSince(NaiveDateTime),
 }
 
-/// `row`'s activity: busy while a command runs, and otherwise idle since
-/// the latest of its last command finishing, its conversation's last
-/// message (which stands in for file and web tool calls, which leave no
-/// per-pod record), and the pod starting.
+/// `row`'s activity, by the same rule the idle stop uses: busy while the
+/// database says so (`POD_BUSY`) or the conversation's turn runs, and
+/// otherwise idle since `POD_IDLE_SINCE`. A new message doesn't count:
+/// SME-79's idle notices are messages (SME-78).
 #[cfg(feature = "server")]
 fn pod_activity(row: &db::LivePodRow) -> PodActivity {
-    if row.running_commands > 0 {
-        return PodActivity::Busy;
+    activity_of(row, crate::turn::turn_running(row.conversation_id))
+}
+
+/// `pod_activity` with the turn's state passed in, for the tests.
+#[cfg(feature = "server")]
+fn activity_of(row: &db::LivePodRow, turn_running: bool) -> PodActivity {
+    if row.busy || turn_running {
+        PodActivity::Busy
+    } else {
+        PodActivity::IdleSince(row.idle_since)
     }
-    #[expect(clippy::expect_used, reason = "the array's first element is always Some, so the max is too")]
-    let latest = [Some(row.created_at), Some(row.conversation_updated_at), row.last_command_finished_at]
-        .into_iter()
-        .flatten()
-        .max()
-        .expect("created_at is always present");
-    PodActivity::IdleSince(latest)
 }
 
 /// Every live pod, assembled from the database, each pod object in

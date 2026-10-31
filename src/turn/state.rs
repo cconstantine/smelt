@@ -469,6 +469,20 @@ pub(crate) fn busy_conversations() -> Vec<i64> {
         .collect()
 }
 
+/// A turn counted as in flight for `conversation_id` until it drops, for
+/// other modules' tests (SME-78's quiet stops skip a pod whose turn runs).
+#[cfg(test)]
+pub(crate) struct TestTurnInFlight {
+    _turn: TurnInFlight,
+}
+
+/// Counts a turn for `conversation_id` until the guard drops; see
+/// `TestTurnInFlight`.
+#[cfg(test)]
+pub(crate) fn count_a_test_turn(conversation_id: i64) -> TestTurnInFlight {
+    TestTurnInFlight { _turn: TurnInFlight::start(conversation_id) }
+}
+
 /// Whether `conversation_id` has a turn running or queued.
 pub(crate) fn turn_running(conversation_id: i64) -> bool {
     read_runtime(conversation_id, |runtime| runtime.turns_in_flight > 0).unwrap_or(false)

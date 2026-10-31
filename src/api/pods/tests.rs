@@ -7,16 +7,16 @@ fn at(hour: u32) -> NaiveDateTime {
         .expect("a valid time")
 }
 
-fn row(created: u32, message: u32, finished: Option<u32>, running: i64) -> db::LivePodRow {
+fn row(created: u32, idle_since: u32, busy: bool) -> db::LivePodRow {
     db::LivePodRow {
         pod_id: 1,
         conversation_id: 1,
         conversation_title: "t".to_string(),
-        conversation_updated_at: at(message),
         created_at: at(created),
         live_terminals: 1,
-        running_commands: running,
-        last_command_finished_at: finished.map(at),
+        running_commands: i64::from(busy),
+        idle_since: at(idle_since),
+        busy,
         observed_at: at(12),
     }
 }
@@ -195,15 +195,14 @@ fn test_parse_pod_metrics_sums_containers_and_skips_unparseable_pods() {
 }
 
 #[test]
-fn test_pod_activity_is_busy_while_a_command_runs() {
-    assert_eq!(pod_activity(&row(1, 2, Some(3), 1)), PodActivity::Busy);
+fn test_pod_activity_is_busy_while_the_database_says_so_or_a_turn_runs() {
+    assert_eq!(activity_of(&row(1, 3, true), false), PodActivity::Busy, "a command or a clone");
+    assert_eq!(activity_of(&row(1, 3, false), true), PodActivity::Busy, "a turn running");
 }
 
 #[test]
-fn test_pod_activity_is_idle_since_the_latest_sign_of_activity() {
-    assert_eq!(pod_activity(&row(1, 2, Some(3), 0)), PodActivity::IdleSince(at(3)), "last command");
-    assert_eq!(pod_activity(&row(1, 4, Some(3), 0)), PodActivity::IdleSince(at(4)), "last message");
-    assert_eq!(pod_activity(&row(5, 4, None, 0)), PodActivity::IdleSince(at(5)), "pod start");
+fn test_pod_activity_is_idle_since_the_databases_idle_since() {
+    assert_eq!(activity_of(&row(1, 3, false), false), PodActivity::IdleSince(at(3)));
 }
 
 /// One claim of the stored-volumes list, as the cluster's JSON would

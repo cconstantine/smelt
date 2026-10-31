@@ -66,7 +66,7 @@ pub(in crate::sandbox) async fn force_terminate_pod_with(
 /// The cluster's part of terminating `pod_id`: deletes its pod if it's
 /// still there and ours (SME-115). Another database's pod of that name,
 /// or one from before the fix, is left; its record is closed all the same.
-async fn delete_terminated_pod(pool: &PgPool, client: &kube::Client, pod_id: i64) -> Result<(), SandboxError> {
+pub(in crate::sandbox) async fn delete_terminated_pod(pool: &PgPool, client: &kube::Client, pod_id: i64) -> Result<(), SandboxError> {
     let instance = db::smelt_instance(pool).await.map_err(SandboxError::Db)?;
     let pods = pods_api(client);
     let name = pod_name(pod_id);

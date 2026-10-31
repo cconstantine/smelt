@@ -66,6 +66,9 @@ pub(super) async fn open_pod_port_with(
         check_reachable_port(port)?;
     }
     let pod_id = conversation_pod_id(pool, conversation_id).await?;
+    // A preview on a fresh connection, a fetch or a browsing load: the
+    // pod is in use (SME-78).
+    note_activity(conversation_id);
     let client = client()?;
     // Never into another database's pod of the same name (SME-115).
     let instance = db::smelt_instance(pool).await?;
