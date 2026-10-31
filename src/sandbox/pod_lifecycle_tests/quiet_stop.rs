@@ -4,9 +4,11 @@
 
 use super::*;
 
-/// The plan's real-pod test, with the review's assertions: a file in
-/// `/workspace` and an image in the Docker sidecar, a real idle pass with
-/// the real cluster delete, then `create_pod` for the same conversation.
+/// The plan's real-pod test, with the reviews' assertions: a file in
+/// `/workspace` and an image in the Docker sidecar; a real `sleep 600`
+/// keeping the pod through a pass, then interrupted with `send_signal`; a
+/// real idle pass with the real cluster delete; then `create_pod` for the
+/// same conversation.
 /// The image is imported from the pod's own files, as the Docker test's
 /// is, so nothing is pulled from a registry.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
@@ -32,12 +34,39 @@ async fn test_a_quiet_stop_keeps_the_workspace_and_dockers_images(pool: PgPool) 
         .expect("exec");
         assert!(made.exit_code == 0 && !made.stdout.trim().is_empty(), "the file and the image: {}{}", made.stdout, made.stderr);
 
-        // Idle for two hours, then one real pass with the real delete.
-        sqlx::query("UPDATE sandbox_pods SET created_at = created_at - interval '2 hours' WHERE id = $1")
-            .bind(pod)
-            .execute(&pool)
+        // A real command, running in the real agent: the pod is busy however
+        // long it's been idle (the user's answer 1; review 2, R2-5).
+        let terminal = create_terminal(&pool, conversation.id).await.expect("create_terminal");
+        let sleeper = format!("sleep-{}", conversation.id);
+        db::create_terminal_command(&pool, conversation.id, terminal, &sleeper, "sleep 600", 0)
             .await
-            .expect("age the pod");
+            .expect("create_terminal_command");
+        send_command(&pool, terminal, &sleeper, "sleep 600").await.expect("send_command");
+        let back_two_hours = |pod: i64| {
+            let pool = pool.clone();
+            async move {
+                for statement in [
+                    "UPDATE sandbox_pods SET created_at = created_at - interval '2 hours' WHERE id = $1",
+                    "UPDATE terminal_commands tc SET created_at = tc.created_at - interval '2 hours', \
+                            finished_at = tc.finished_at - interval '2 hours' \
+                       FROM sandbox_terminals t WHERE t.id = tc.terminal_id AND t.pod_id = $1",
+                ] {
+                    sqlx::query(statement).bind(pod).execute(&pool).await.expect("move the clock back");
+                }
+            }
+        };
+        back_two_hours(pod).await;
+        let kept = stop_idle_pods_once_with(&pool, 60, &ActivityNotes::default(), |id| cluster_delete(&pool, id)).await;
+        assert_eq!(kept, Vec::<i64>::new(), "a running `sleep 600` keeps the pod");
+        assert!(db::sandbox_pod_is_live(&pool, pod).await.expect("live?"));
+
+        // Interrupted, it ends; two hours on, one real pass with the real
+        // delete stops the pod.
+        send_signal(&pool, terminal, &sleeper, "INT").await.expect("send_signal");
+        let ended = poll_until_finished(&pool, &sleeper).await;
+        assert_ne!(ended.status, "running", "{ended:?}");
+        terminate_terminal(&pool, terminal).await.expect("terminate_terminal");
+        back_two_hours(pod).await;
         let stopped = stop_idle_pods_once_with(&pool, 60, &ActivityNotes::default(), |id| cluster_delete(&pool, id)).await;
         assert_eq!(stopped, vec![pod], "the pass stopped the pod");
         assert!(!db::sandbox_pod_is_live(&pool, pod).await.expect("live?"), "its row is closed");
