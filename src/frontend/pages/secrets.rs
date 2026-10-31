@@ -2,8 +2,12 @@
 //! things a persona lists by name in `smelt.credentials` to hand one to
 //! the agent that runs under it. Write-only by design (Answer 2): a
 //! value is typed in and never shown again beyond `shown`'s capped
-//! prefix — changing one means typing the new value, and there is no
-//! reveal control, because there is no reveal.
+//! prefix and `lines`' count — changing one means typing the new value,
+//! and there is no reveal control, because there is no reveal. Since
+//! SME-334 both value fields are plain textareas, as the git key box has
+//! always been: the single-line input the form used to hold could not
+//! carry a newline at all, and pastes lost one per line to the browser's
+//! edit path.
 
 use dioxus::prelude::*;
 
@@ -105,11 +109,14 @@ fn SecretAddForm(secrets: Signal<Vec<SecretSummary>>, action_error: Signal<Optio
                     oninput: move |e| { name.set(e.value()); action_error.set(None); },
                 }
                 label { r#for: "secret-value", "Value" }
-                input {
+                textarea {
                     id: "secret-value",
-                    r#type: "password",
+                    class: "secret-value-input",
+                    required: true,
+                    rows: 8,
+                    spellcheck: "false",
+                    placeholder: "Paste the whole credential — multi-line stays multi-line.",
                     value: "{value}",
-                    autocomplete: "new-password",
                     oninput: move |e| { value.set(e.value()); action_error.set(None); },
                 }
                 button { r#type: "submit", disabled: busy(), if busy() { "Adding..." } else { "Add" } }
@@ -190,12 +197,12 @@ fn SecretsList(secrets: Signal<Vec<SecretSummary>>, action_error: Signal<Option<
                             }
                             div { class: "git-key-actions",
                                 if pending_change() == Some(secret.id) {
-                                    input {
+                                    textarea {
                                         class: "secret-change-input",
-                                        r#type: "password",
+                                        rows: 4,
+                                        spellcheck: "false",
                                         value: "{change_value}",
                                         placeholder: "new value",
-                                        autocomplete: "new-password",
                                         oninput: move |e| { change_value.set(e.value()); action_error.set(None); },
                                     }
                                     button {
