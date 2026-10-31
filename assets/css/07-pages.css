@@ -327,7 +327,9 @@
     margin-top: 16px;
 }
 
-.git-private-key-input {
+.git-private-key-input,
+.secret-value-input,
+.secret-change-input {
     padding: 8px 12px;
     border: 1px solid var(--border-strong);
     border-radius: 8px;
@@ -336,6 +338,13 @@
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 12px;
     resize: vertical;
+}
+
+/* SME-334: the row's line count — one more bounded derived display,
+   the same read-time family as the byte count already shown. */
+.secret-lines {
+    color: var(--muted);
+    white-space: nowrap;
 }
 
 .git-key-form-buttons {
