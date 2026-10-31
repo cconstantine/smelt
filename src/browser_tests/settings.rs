@@ -515,6 +515,38 @@ pub(super) async fn scenario_secrets_page(t: &Scenario<'_>) {
     click_when_present(&page, ".secret-row .secret-delete-confirm", Duration::from_secs(5)).await;
     assert!(wait_for_count(&page, ".secret-row", 0, Duration::from_secs(10)).await, "the confirm removes the row");
 
+    // SME-334 review (finding 1): an empty value must be refused before
+    // sending, saying the server's rule — the voice SME-242's checklist
+    // clause promises. Two things hid it: a `required` attribute on the
+    // value field makes Chromium block the submit event itself (the native
+    // bubble shows, the page handler never runs), and the page only ever
+    // rendered load_error, so every action_error the handlers set — this
+    // refusal included — was said to an invisible signal. Red on either.
+    // Reload first: the value signal must start empty, and typing the name
+    // through the helper doubles as the hydration check.
+    page.reload().await.expect("reload the page");
+    wait_for_resource(&page, "/api/secrets").await;
+    type_and_read_back(&page, "#secret-name", &unique_id("empty")).await;
+    click_when_present(&page, ".secrets-add-form button[type=\"submit\"]", Duration::from_secs(5)).await;
+    let refused_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let refused = loop {
+        let text: String = page
+            .evaluate("document.body.innerText")
+            .await
+            .expect("read the page")
+            .into_value()
+            .expect("a string");
+        if text.contains("A secret value can't be empty.") {
+            break true;
+        }
+        if tokio::time::Instant::now() >= refused_deadline {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(refused, "an empty value is refused before sending, in the server's own words");
+    assert!(wait_for_count(&page, ".secret-row", 0, Duration::from_secs(5)).await, "the refused add stored nothing");
+
     // SME-334: the paste leg — the one automated test that watches the
     // control itself. A multi-line secret goes in the way a paste goes in
     // — the edit path, `execCommand('insertText')`, which is what the
