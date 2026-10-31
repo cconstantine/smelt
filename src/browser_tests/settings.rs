@@ -515,6 +515,65 @@ pub(super) async fn scenario_secrets_page(t: &Scenario<'_>) {
     click_when_present(&page, ".secret-row .secret-delete-confirm", Duration::from_secs(5)).await;
     assert!(wait_for_count(&page, ".secret-row", 0, Duration::from_secs(10)).await, "the confirm removes the row");
 
+    // SME-334: the paste leg — the one automated test that watches the
+    // control itself. A multi-line secret goes in the way a paste goes in
+    // — the edit path, `execCommand('insertText')`, which is what the
+    // browser's paste takes — and the field must hold every newline, the
+    // row must count them, `shown` must still hold the exact byte count,
+    // and none of the value may reach the page. Red on the unfixed
+    // single-line input: its edit path replaces every newline with a
+    // space — the exact flattening this ticket filed.
+    let yaml = "apiVersion: v1\nclusters:\n\nkind: list\n"; // 37 bytes: prefix "apiv…", 29 hidden
+    let paste_name = unique_id("kube");
+    type_and_read_back(&page, "#secret-name", &paste_name).await;
+    let paste_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let field = wait_for_element(&page, "#secret-value", Duration::from_secs(5)).await;
+        field.focus().await.expect("focus the value field");
+        page.evaluate("document.querySelector('#secret-value').select()")
+            .await
+            .expect("select the old text");
+        page.evaluate(format!(
+            "document.execCommand('insertText', false, \"{}\")",
+            yaml.replace('\n', "\\n")
+        ))
+        .await
+        .expect("paste multi-line text the way a paste does");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let pasted: String = page
+            .evaluate("document.querySelector('#secret-value')?.value ?? ''")
+            .await
+            .expect("read the field")
+            .into_value()
+            .expect("a string");
+        if pasted == yaml {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < paste_deadline, "the pasted newlines did not survive the field: {pasted:?}");
+    }
+    click_when_present(&page, ".secrets-add-form button[type=\"submit\"]", Duration::from_secs(5)).await;
+    assert!(wait_for_count(&page, ".secret-row", 1, Duration::from_secs(10)).await, "the pasted secret's row should appear");
+    let pasted_row: Vec<String> = page
+        .evaluate("(() => { const r = document.querySelector('.secret-row'); return [r.querySelector('.secret-shown').textContent, r.querySelector('.secret-lines')?.textContent ?? 'no .secret-lines', r.title]; })()")
+        .await
+        .expect("read the row")
+        .into_value()
+        .expect("three strings");
+    assert!(pasted_row[0].starts_with("apiV…") && pasted_row[0].contains("(37 bytes)"), "shown holds the exact byte count of the pasted value: {:?}", pasted_row[0]);
+    assert_eq!(pasted_row[1], "4 lines", "the row counts the pasted value's lines");
+    assert!(pasted_row[2].contains("4 lines"), "the row's title carries the count too: {}", pasted_row[2]);
+    let body: String = page
+        .evaluate("document.body.innerText")
+        .await
+        .expect("read the page")
+        .into_value()
+        .expect("text");
+    assert!(!body.contains(&yaml[4..]), "beyond the display prefix none of the pasted value is on the page");
+    // Two-step delete again, so the 375px leg below starts from none.
+    click_when_present(&page, ".secret-row .secret-delete", Duration::from_secs(5)).await;
+    click_when_present(&page, ".secret-row .secret-delete-confirm", Duration::from_secs(5)).await;
+    assert!(wait_for_count(&page, ".secret-row", 0, Duration::from_secs(10)).await, "the pasted secret's row deletes again");
+
     // A seeded row at 375px: it renders, and the page doesn't scroll sideways.
     let seeded = db::create_named_secret(t.pool, &unique_id("phone"), "phone-value-0123456789").await.expect("seed a secret");
     page.execute(chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::new(375, 700, 2.0, true))
