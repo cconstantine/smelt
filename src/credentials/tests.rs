@@ -212,3 +212,28 @@ async fn test_pod_files_follow_the_two_rules_separately(pool: PgPool) {
     assert!(file(&files, "/etc/smelt/gitconfig").is_some(), "the identity file is always written");
 }
 
+/// SME-334 T5: the store → serve pin. A stored multi-line secret
+/// reaches `PodFile.content` byte-equal, at mode 600 — saved through
+/// the real save path, so the tdd.md stub check bites here too: stub
+/// `create_named_secret` to flatten newlines and this row's content
+/// goes red. `install_pod_files`' `cat > "$1.new"` write has been
+/// byte-faithful since SME-242; with T3 and T4 this pins save → store
+/// → serve with no byte discretion anywhere in between. Two values:
+/// the PEM ending in `\n`, and one ending mid-line — only a tailless
+/// value tells a faithful serve apart from the git-key branch's own
+/// append-if-missing habit (`credentials.rs`'s keys), which a `\n`-
+/// ended value would let pass unnoticed.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_pod_files_hand_a_multi_line_secret_byte_equal(pool: PgPool) {
+    let value = "-----BEGIN OPENSSH PRIVATE KEY-----\n\nb3BlbnNzaC1rZXktdjEA\n-----END OPENSSH PRIVATE KEY-----\n";
+    let unended = "apiVersion: v1\nclusters";
+    crate::api::secrets::save_secret_of(&pool, None, "pem-key", value).await.expect("saved the PEM");
+    crate::api::secrets::save_secret_of(&pool, None, "no-tail", unended).await.expect("saved the tailless one");
+    let holder = agent(&pool, Some(&[]), Some(&["pem-key", "no-tail"])).await;
+    let files = pod_files(&pool, holder).await.expect("pod files");
+    let secret = file(&files, "/etc/smelt/secrets/pem-key").expect("the secret file");
+    assert_eq!((secret.mode, secret.content.as_str()), (0o600, value), "byte-equal, at 600, exactly as stored");
+    let tailless = file(&files, "/etc/smelt/secrets/no-tail").expect("the tailless secret file");
+    assert_eq!((tailless.mode, tailless.content.as_str()), (0o600, unended), "ends exactly where it was stored: no byte added, none dropped");
+}
+

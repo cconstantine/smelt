@@ -329,7 +329,28 @@ pub(super) async fn seed_user_message(pool: &sqlx::PgPool, conversation: i64, te
 }
 
 /// Types `text` into the page's message box and sends it.
+///
+/// Waits for the box to accept typing first: it is disabled while the
+/// model works in the conversation, and its last reply token can show
+/// before the turn's end event does — typing into the disabled box is
+/// silently dropped, Enter included (the CI flake on
+/// `attach_error_after_the_first_message`'s next send, SME-334 CI,
+/// the SME-336 wake family).
 pub(super) async fn send_from(page: &chromiumoxide::Page, text: &str) {
+    assert!(
+        wait_until(
+            || async {
+                page.evaluate(format!("document.querySelector({CHAT_INPUT:?})?.disabled == false"))
+                    .await
+                    .ok()
+                    .and_then(|v| v.into_value::<bool>().ok())
+                    == Some(true)
+            },
+            Duration::from_secs(10),
+        )
+        .await,
+        "the message box never accepted typing"
+    );
     let input = wait_for_element(page, CHAT_INPUT, Duration::from_secs(10)).await;
     input.focus().await.expect("focus the message box");
     input.type_str(text).await.expect("type a message");

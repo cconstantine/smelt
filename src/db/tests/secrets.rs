@@ -55,3 +55,41 @@ async fn test_the_schema_refuses_a_bad_name_and_the_built_in_name(pool: PgPool) 
     assert!(insert(pool, "ok-name", "").await.is_err(), "an empty value");
     assert!(list_named_secrets(pool).await.expect("list").is_empty(), "none of them landed");
 }
+
+/// SME-334 T4: the column's pin. Raw inserts holding `\n`, `\n\n`, a
+/// trailing `\n` and `\r\n` bytes read back byte-equal from every read
+/// path, and `set_named_secret_value` carries a multi-line replacement
+/// the same way. `TEXT` stores what it is given — this is what makes
+/// the store innocent and the form the only suspect. The `\r\n` row
+/// says the quiet part: smelt keeps CR bytes handed to it directly
+/// (the API path), and it is only the browser that rewrites CRLF to LF
+/// on the paste path (the plan's documented asymmetry).
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_multi_line_value_round_trips_byte_for_byte(pool: PgPool) {
+    let pool = &pool;
+    let values = [
+        ("lf-lines", "a\nb"),
+        ("blank-line", "a\n\nb"),
+        ("trailing-nl", "a\nb\n"),
+        ("crlf-lines", "a\r\nb\r\n"),
+    ];
+    for (name, value) in values {
+        insert(pool, name, value).await.expect("insert");
+    }
+    let listed = list_named_secrets(pool).await.expect("list");
+    for (name, value) in values {
+        let found = listed.iter().find(|s| s.name == name).expect(name);
+        assert_eq!(found.value, *value, "{name} came back changed in the list");
+        // Every read path, both SELECTs: the CRLF row above all — the
+        // list alone would leave `get_named_secret` untried by it.
+        let got = get_named_secret(pool, found.id).await.expect("get").expect(name);
+        assert_eq!(got.value, *value, "{name} came back changed by id");
+    }
+
+    // The change path is the same story: whole bytes in, whole bytes back.
+    let changed = listed.iter().find(|s| s.name == "trailing-nl").expect("row");
+    let replacement = "apiVersion: v1\nclusters:\n\nkind: list\n";
+    assert!(set_named_secret_value(pool, changed.id, replacement).await.expect("set"));
+    let again = get_named_secret(pool, changed.id).await.expect("get").expect("row after the change");
+    assert_eq!(again.value, replacement, "a multi-line replacement round-trips");
+}
