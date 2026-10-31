@@ -12,7 +12,7 @@ The Deployer runs exactly one deploy of one named SHA of `main`, per [homelab's 
 
 ## Stop-and-report, never apply past them
 
-Any touch outside `module.smelt.*`; any destroy or replace (`-/+`) — above all `kubernetes_stateful_set_v1.database`, `kubernetes_secret_v1.database`, `random_password.database` and `kubernetes_namespace_v1.park`: the first three lose smelt's database; any `Forbidden`; any state lock (wait and retry — never `-lock=false`, never `force-unlock`); a whoami mismatch; a missing image. Reporting goes to the starter and as a `Deployer finished:` comment on the ticket the deploy belongs to (the brief names it; the standing case is SME-326), the trail [rules.md](rules.md) requires.
+Any touch outside `module.smelt.*`; any destroy or replace (`-/+`) — above all `kubernetes_stateful_set_v1.database`, `kubernetes_secret_v1.database`, `random_password.database` and `kubernetes_namespace_v1.park`: a namespace replace cascades — all four lose smelt's database; any `Forbidden`; any state lock (wait and retry — never `-lock=false`, never `force-unlock`); a whoami mismatch; a missing image. Reporting goes to the starter and as a `Deployer finished:` comment on the ticket the deploy belongs to (the brief names it; the standing case is SME-326), the trail [rules.md](rules.md) requires.
 
 ## The due-condition brief is the go; the first run is the exception
 
