@@ -123,6 +123,18 @@ async fn user_stopped(pool: &PgPool, child: i64) {
 /// arriving just after the check wakes the child again, which is fine: the
 /// notice says the turn ended, not the work.
 pub(crate) async fn after_last_turn(pool: &PgPool, conversation_id: i64, failure: Option<String>) {
+    // A finished agent's turn ended with its report: its pod stops at once,
+    // unless a command still runs (SME-78). It didn't end "without a report".
+    match db::agent_state(pool, conversation_id).await {
+        Ok(Some(state)) if state == db::AGENT_FINISHED => {
+            #[cfg(test)]
+            let _checked = test_hooks::Checked(conversation_id);
+            crate::sandbox::stop_finished_agent_pod(pool, conversation_id).await;
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't read an agent's state after its turn"),
+    }
     let idle = db::idle_agent_without_report(pool, conversation_id).await;
     #[cfg(test)]
     let _checked = test_hooks::Checked(conversation_id);

@@ -138,6 +138,7 @@ pub fn PodsIndex() -> Element {
                     }
                 },
             }
+            IdleStopNote {}
             StoredVolumes { pods_changed, tick }
         }
     }
@@ -302,6 +303,27 @@ fn status_text(phase: Option<&str>, agent: Option<&AgentStatus>) -> String {
     }
 }
 
+/// The footnote's sentence on automatic stops (SME-78), for an idle
+/// threshold of `minutes` (`0`: idle stops off).
+fn idle_stop_note(minutes: u32) -> String {
+    match minutes {
+        0 => "Idle sandboxes aren't stopped automatically; a finished agent's is, unless a command is still running.".to_string(),
+        minutes => format!(
+            "Sandboxes idle for {minutes} minutes with no command running are stopped, and a finished agent's at once unless a command is still running; /workspace is kept."
+        ),
+    }
+}
+
+/// The footnote on automatic stops, once the server says what's in force.
+#[component]
+fn IdleStopNote() -> Element {
+    let minutes = use_resource(crate::api::sandbox::get_idle_stop_minutes);
+    match minutes() {
+        Some(Ok(minutes)) => rsx! { p { class: "muted pods-footnote", "{idle_stop_note(minutes)}" } },
+        _ => rsx! {},
+    }
+}
+
 /// Memory use against its limit: `512 MiB of 8Gi`, `unavailable of 8Gi`.
 fn memory_text(usage: Option<&PodUsage>, limit: Option<&str>) -> String {
     against_limit(usage.map(|u| format_bytes(u.memory_bytes)), limit)
@@ -371,6 +393,18 @@ mod tests {
         assert_eq!(format_age(12 * 60 + 5), "12m");
         assert_eq!(format_age(3 * 3600 + 5 * 60), "3h 5m");
         assert_eq!(format_age(2 * 86400 + 4 * 3600 + 59), "2d 4h");
+    }
+
+    #[test]
+    fn test_the_idle_stop_note_says_what_is_stopped_automatically() {
+        assert_eq!(
+            idle_stop_note(60),
+            "Sandboxes idle for 60 minutes with no command running are stopped, and a finished agent's at once unless a command is still running; /workspace is kept."
+        );
+        assert_eq!(
+            idle_stop_note(0),
+            "Idle sandboxes aren't stopped automatically; a finished agent's is, unless a command is still running."
+        );
     }
 
     #[test]

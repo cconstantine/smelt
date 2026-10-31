@@ -184,6 +184,9 @@ async fn start_up(dotenv_problem: Option<String>) -> tokio::net::TcpListener {
     // Tells the model about terminal commands it has left untouched
     // (SME-79): wakes, never stops. See `sandbox::watch_idle_commands`.
     tokio::spawn(sandbox::watch_idle_commands(pool.clone()));
+    // Stops idle pods with no command running, and finished agents' pods,
+    // quietly (SME-78). See `sandbox::stop_idle_pods`.
+    tokio::spawn(sandbox::stop_idle_pods(pool.clone()));
     // Clones the last run was in the middle of never finished (SME-32).
     match db::fail_unfinished_clones(pool, git::CLONE_INTERRUPTED).await {
         Ok(0) => {}

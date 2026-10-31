@@ -210,3 +210,10 @@ pub async fn get_sandbox_state(id: i64) -> ServerFnResult<SandboxSnapshot> {
 
     Ok(SandboxSnapshot { pods })
 }
+
+/// `SANDBOX_IDLE_STOP_MINUTES` as the server read it, `0` when idle stops
+/// are off, for the pods page's footnote (SME-78).
+#[get("/api/sandbox/idle-stop-minutes")]
+pub async fn get_idle_stop_minutes() -> ServerFnResult<u32> {
+    Ok(sandbox::idle_stop_minutes())
+}

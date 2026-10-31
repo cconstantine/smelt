@@ -461,3 +461,36 @@ fn test_repo_error_shown_escapes_a_remotes_error_as_the_model_sees_it() {
     repo.error = None;
     assert_eq!(repo_error_shown(&repo), None, "no error, no line");
 }
+
+/// SME-78: a quiet stop's notice reads as one short sentence, with the
+/// minutes in force, and doesn't fall into the crash branch.
+#[test]
+fn test_a_quiet_stop_notice_reads_as_a_sentence() {
+    let commands = HashMap::new();
+    let notice = |t: &str| system_notice(t, &commands);
+    assert_eq!(
+        notice("Sandbox pod 12 was stopped after 60 minutes with no activity and no command running. /workspace, Docker's images, build cache and volumes, and mounted volumes are kept; terminals, background processes and containers, installed packages and files elsewhere are gone. create_pod (or clone_repo) starts a new pod with /workspace as it was.").as_deref(),
+        Some("The sandbox stopped after 60 minutes idle; /workspace and Docker's data are kept")
+    );
+    assert_eq!(
+        notice("Sandbox pod 13 was stopped because you finished. /workspace, Docker's images, build cache and volumes, and mounted volumes are kept; terminals, background processes and containers, installed packages and files elsewhere are gone. If you're given more work, create_pod (or clone_repo) starts a new pod with /workspace as it was.").as_deref(),
+        Some("The sandbox stopped when this agent finished; /workspace and Docker's data are kept")
+    );
+}
+
+/// The texts smelt saves are the ones the transcript summarizes.
+#[cfg(feature = "server")]
+#[test]
+fn test_the_quiet_stop_notices_smelt_saves_are_summarized() {
+    let commands = HashMap::new();
+    let idle = crate::sandbox::StopReason::Idle { minutes: 3 }.notice(5);
+    assert_eq!(
+        system_notice(&idle, &commands).as_deref(),
+        Some("The sandbox stopped after 3 minutes idle; /workspace and Docker's data are kept")
+    );
+    let finished = crate::sandbox::StopReason::Finished.notice(5);
+    assert_eq!(
+        system_notice(&finished, &commands).as_deref(),
+        Some("The sandbox stopped when this agent finished; /workspace and Docker's data are kept")
+    );
+}

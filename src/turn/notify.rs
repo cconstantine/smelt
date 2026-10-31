@@ -189,6 +189,9 @@ pub(super) async fn drain_unnotified_terminal_commands(
         };
         pending_new_content.extend(notification_content);
         record_saved(conversation_id, persisted, saved);
+        // A command's end is news for the model, so the turn is pod
+        // activity (SME-78).
+        set_activity_owed(conversation_id);
     }
     Ok(())
 }
@@ -271,6 +274,8 @@ pub(super) async fn drain_agent_messages(
         };
         pending_new_content.extend(content);
         record_saved(conversation_id, persisted, saved);
+        // An agent's report or notice is news for the model (SME-78).
+        set_activity_owed(conversation_id);
     }
     Ok(())
 }

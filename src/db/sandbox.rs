@@ -57,41 +57,189 @@ pub struct LivePodRow {
     pub pod_id: i64,
     pub conversation_id: i64,
     pub conversation_title: String,
-    /// Bumped by every message, so it stands in for tool activity that
-    /// leaves no per-pod record.
-    pub conversation_updated_at: NaiveDateTime,
     pub created_at: NaiveDateTime,
     pub live_terminals: i64,
     pub running_commands: i64,
-    pub last_command_finished_at: Option<NaiveDateTime>,
+    /// The latest sign of activity the database holds (`POD_IDLE_SINCE`):
+    /// the pod starting, a flushed preview, dial or turn end, a command
+    /// starting or finishing (SME-78).
+    pub idle_since: NaiveDateTime,
+    /// A command running or a repo cloning (`POD_BUSY`): never stopped
+    /// while true. A running turn is in memory, checked by the caller.
+    pub busy: bool,
     /// The database's own `now()`, so ages are worked out on one clock.
     pub observed_at: NaiveDateTime,
 }
 
 /// Every live pod, oldest first — the pods view's rows.
 pub async fn list_live_pods(pool: &PgPool) -> Result<Vec<LivePodRow>, sqlx::Error> {
-    sqlx::query_as::<_, LivePodRow>(
+    sqlx::query_as::<_, LivePodRow>(&format!(
         "SELECT p.id AS pod_id,
                 p.conversation_id,
                 c.title AS conversation_title,
-                c.updated_at AS conversation_updated_at,
                 p.created_at,
                 (SELECT COUNT(*) FROM sandbox_terminals t
                   WHERE t.pod_id = p.id AND t.terminated_at IS NULL) AS live_terminals,
                 (SELECT COUNT(*) FROM terminal_commands tc
                    JOIN sandbox_terminals t ON t.id = tc.terminal_id
                   WHERE t.pod_id = p.id AND tc.status = 'running') AS running_commands,
-                (SELECT MAX(tc.finished_at) FROM terminal_commands tc
-                   JOIN sandbox_terminals t ON t.id = tc.terminal_id
-                  WHERE t.pod_id = p.id) AS last_command_finished_at,
+                {POD_IDLE_SINCE} AS idle_since,
+                {POD_BUSY} AS busy,
                 now()::timestamp AS observed_at
            FROM sandbox_pods p
            JOIN conversations c ON c.id = p.conversation_id
           WHERE p.terminated_at IS NULL
-          ORDER BY p.created_at ASC, p.id ASC",
-    )
+          ORDER BY p.created_at ASC, p.id ASC"
+    ))
     .fetch_all(pool)
     .await
+}
+
+// --- Quiet stops (SME-78) ---
+//
+// One rule, in three fragments shared by `/pods`, the idle pass's
+// candidates and the re-check under the locks, so the three can't
+// disagree. `sandbox_pods` must be aliased `p`.
+
+/// The latest sign of activity the database holds for pod `p`: its start,
+/// its last flushed note (`last_active_at`), and its commands' last start
+/// and last finish. `GREATEST` skips NULLs. A message is not in it: SME-79's
+/// idle notices are messages (the user's answer 2).
+const POD_IDLE_SINCE: &str = "GREATEST(p.created_at, p.last_active_at, \
+        (SELECT MAX(GREATEST(tc.created_at, tc.finished_at)) FROM terminal_commands tc \
+           JOIN sandbox_terminals t ON t.id = tc.terminal_id WHERE t.pod_id = p.id))";
+
+/// Pod `p` is busy, so never stopped: a repo cloning in its conversation,
+/// or any command running in its terminals, whatever its idle-notice
+/// setting (the user's answer 1). A running turn is in memory and checked
+/// in Rust.
+const POD_BUSY: &str = "(EXISTS (SELECT 1 FROM conversation_repos r \
+        WHERE r.conversation_id = p.conversation_id AND r.status = 'cloning') \
+     OR EXISTS (SELECT 1 FROM terminal_commands tc \
+        JOIN sandbox_terminals t ON t.id = tc.terminal_id \
+        WHERE t.pod_id = p.id AND tc.status = 'running'))";
+
+/// How often the idle pass (`sandbox::stop_idle_pods`) runs, in seconds.
+/// The pass's tick and `FINISHED_GRACE_SECS` are both derived from it.
+pub const QUIET_STOP_PASS_SECS: u64 = 60;
+
+/// How long after an agent's finish a flushed note (`last_active_at`)
+/// still counts as part of the finish: the finish turn's own end is noted
+/// after `state_changed_at`, and reaches the database at the next pass's
+/// flush, up to one pass later. Two passes covers both (SME-78 review 1, A2).
+const FINISHED_GRACE_SECS: u64 = 2 * QUIET_STOP_PASS_SECS;
+
+/// Pod `p` is a `finished` agent's and nothing used it after the finish
+/// (SME-78 review 1, A2): it was started at or before the finish, no
+/// command started in it since, and its last note is no later than
+/// `FINISHED_GRACE_SECS` after the later of the finish and the last end of
+/// a command that started before it (review 2, R2-1: that command's exit
+/// wake notes activity, flushed after its end). A command left running
+/// that ends after the finish doesn't count, so the backstop stops the pod
+/// once it does. A pod the user started or used after the finish (Work on a repo,
+/// a preview) falls back to the idle rule. The one copy of the rule, for
+/// the candidates and the re-check alike.
+fn pod_finished() -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM agents a \
+           WHERE a.conversation_id = p.conversation_id AND a.state = 'finished' \
+             AND p.created_at <= a.state_changed_at \
+             AND (p.last_active_at IS NULL \
+                  OR p.last_active_at <= GREATEST(a.state_changed_at, \
+                         (SELECT MAX(tc.finished_at) FROM terminal_commands tc \
+                            JOIN sandbox_terminals t ON t.id = tc.terminal_id \
+                           WHERE t.pod_id = p.id AND tc.created_at <= a.state_changed_at)) \
+                     + make_interval(secs => {FINISHED_GRACE_SECS})) \
+             AND NOT EXISTS (SELECT 1 FROM terminal_commands tc \
+                  JOIN sandbox_terminals t ON t.id = tc.terminal_id \
+                  WHERE t.pod_id = p.id AND tc.created_at > a.state_changed_at))"
+    )
+}
+
+/// Pod `p` has been idle for `$1` minutes or more; never when `$1` is 0.
+const POD_IDLE_PAST: &str = "($1 > 0 AND now() - {POD_IDLE_SINCE} >= make_interval(mins => $1))";
+
+fn pod_idle_past() -> String {
+    POD_IDLE_PAST.replace("{POD_IDLE_SINCE}", POD_IDLE_SINCE)
+}
+
+/// Why a pod is to be stopped quietly: idle past the threshold, or its
+/// conversation is a `finished` agent's (at any age).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuietStopKind {
+    Idle,
+    Finished,
+}
+
+/// Live pods that aren't busy and are either idle for `minutes` or more
+/// (none when `minutes` is 0) or a `finished` agent's, as
+/// `(pod_id, conversation_id, kind)`, oldest first. A finished agent's pod
+/// is `Finished` whatever its age.
+pub async fn quiet_stop_candidates(
+    pool: &PgPool,
+    minutes: u32,
+) -> Result<Vec<(i64, i64, QuietStopKind)>, sqlx::Error> {
+    let rows: Vec<(i64, i64, bool)> = sqlx::query_as(&format!(
+        "SELECT p.id, p.conversation_id, {finished} AS finished
+           FROM sandbox_pods p
+          WHERE p.terminated_at IS NULL AND NOT {POD_BUSY}
+            AND ({finished} OR {idle_past})
+          ORDER BY p.created_at ASC, p.id ASC",
+        finished = pod_finished(),
+        idle_past = pod_idle_past(),
+    ))
+    .bind(minutes_param(minutes))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(pod, conversation, finished)| {
+            (pod, conversation, if finished { QuietStopKind::Finished } else { QuietStopKind::Idle })
+        })
+        .collect())
+}
+
+/// `minutes` as the `INT` `make_interval(mins => …)` takes; the parser's
+/// week ceiling keeps it far inside the range.
+fn minutes_param(minutes: u32) -> i32 {
+    i32::try_from(minutes).unwrap_or(i32::MAX)
+}
+
+/// The re-check under the turn and start locks, in one statement: `pod_id`
+/// is live, not busy, and still stoppable for `kind` (idle past `minutes`,
+/// or its agent still `finished`).
+pub async fn pod_still_stoppable(
+    pool: &PgPool,
+    pod_id: i64,
+    kind: QuietStopKind,
+    minutes: u32,
+) -> Result<bool, sqlx::Error> {
+    let rule = match kind {
+        QuietStopKind::Idle => pod_idle_past(),
+        QuietStopKind::Finished => pod_finished(),
+    };
+    sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM sandbox_pods p
+          WHERE p.id = $2 AND p.terminated_at IS NULL AND NOT {POD_BUSY} AND {rule})"
+    ))
+    .bind(minutes_param(minutes))
+    .bind(pod_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// Stamps `last_active_at` with the database's `now()` on the live pods of
+/// `conversation_ids` — `note_activity`'s flush. Terminated pods are left
+/// alone.
+pub async fn flush_pod_activity(pool: &PgPool, conversation_ids: &[i64]) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE sandbox_pods SET last_active_at = now()
+          WHERE conversation_id = ANY($1) AND terminated_at IS NULL",
+    )
+    .bind(conversation_ids)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Live pods created more than `min_age_secs` seconds ago, by the

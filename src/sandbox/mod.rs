@@ -39,6 +39,7 @@ mod files;
 mod idle_notice;
 mod manager;
 mod ports;
+mod quiet_stop;
 mod spec;
 mod watch;
 
@@ -50,6 +51,7 @@ pub use self::files::*;
 pub(crate) use self::idle_notice::*;
 pub use self::manager::*;
 pub use self::ports::*;
+pub(crate) use self::quiet_stop::*;
 pub use self::spec::*;
 pub use self::watch::*;
 

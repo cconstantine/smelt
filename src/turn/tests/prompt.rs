@@ -9,7 +9,7 @@ fn test_chat_error_text_drops_the_server_function_wrapper() {
     );
 }
 
-fn prompt_env() -> PromptEnvironment {
+pub(super) fn prompt_env() -> PromptEnvironment {
     PromptEnvironment {
         conversation_id: 42,
         date: chrono::NaiveDate::from_ymd_opt(2026, 9, 25).expect("a valid date"),
@@ -30,6 +30,7 @@ fn prompt_env() -> PromptEnvironment {
         persona_files: Default::default(),
         agent: None,
         credentials: None,
+        idle_stop_minutes: Some(60),
     }
 }
 

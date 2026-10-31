@@ -86,6 +86,29 @@ async fn test_open_pod_port_without_a_live_pod_is_no_pod(pool: PgPool) {
     assert!(matches!(result, Err(TerminalError::NoPod)), "expected NoPod");
 }
 
+/// SME-78: a dial notes its pod as in use once the pod resolves, whether
+/// or not the connection then opens; `NoPod` notes nothing.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_dial_notes_activity_once_its_pod_resolves(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let no_pod = db::create_conversation(&pool).await.expect("conversation");
+    let none = open_pod_port_with(&pool, no_pod.id, PodHost::Localhost, 3000, || {
+        Err(SandboxError::StartFailed("no cluster here".into()))
+    })
+    .await;
+    assert!(matches!(none, Err(TerminalError::NoPod)));
+    assert!(!activity_noted(no_pod.id), "NoPod is no activity");
+
+    let with_pod = db::create_conversation(&pool).await.expect("conversation");
+    db::create_sandbox_pod(&pool, with_pod.id).await.expect("pod");
+    let dialled = open_pod_port_with(&pool, with_pod.id, PodHost::Localhost, 3000, || {
+        Err(SandboxError::StartFailed("no cluster here".into()))
+    })
+    .await;
+    assert!(dialled.is_err(), "the stand-in client fails");
+    assert!(activity_noted(with_pod.id), "the pod resolved, so it was in use");
+}
+
 /// DB-only: the sandbox agent's port is refused before anything is
 /// looked up, so no route can reach it.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]

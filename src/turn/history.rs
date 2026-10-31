@@ -241,6 +241,9 @@ pub(crate) struct PromptEnvironment {
     /// is ever read into the prompt. `None` means the read failed, and
     /// the section says nothing.
     pub credentials: Option<crate::credentials::PromptCredentials>,
+    /// `SANDBOX_IDLE_STOP_MINUTES` while idle stops are on; `None` at `0`
+    /// (SME-78).
+    pub idle_stop_minutes: Option<u32>,
 }
 
 /// One volume in the environment section (SME-239): a global volume from
@@ -282,6 +285,20 @@ pub(crate) fn system_prompt(env: &PromptEnvironment) -> String {
              asks it a question and waits for the answer. The user can also write to you.\n",
             agent.id, agent.parent_id
         ));
+    }
+    // When smelt stops the pod on its own (SME-78).
+    if let Some(minutes) = env.idle_stop_minutes {
+        prompt.push_str(&format!(
+            "- Your sandbox pod is stopped after {minutes} minutes with no activity and no command running; \
+             a running command keeps it, but a process left in the background (&, nohup, a detached container) doesn't. \
+             /workspace, Docker's data and volumes are kept.\n"
+        ));
+    }
+    if env.agent.is_some() {
+        prompt.push_str(
+            "- Your sandbox pod is stopped when you finish, unless a command is still running; \
+             /workspace and volumes are kept for if you're given more work.\n",
+        );
     }
     if !env.volumes.is_empty() {
         prompt.push_str("- Volumes (their contents survive the pod ending):\n");
@@ -502,6 +519,7 @@ pub(crate) async fn prompt_environment(
         persona_files,
         agent,
         credentials,
+        idle_stop_minutes: Some(crate::sandbox::idle_stop_minutes()).filter(|minutes| *minutes > 0),
     }
 }
 
