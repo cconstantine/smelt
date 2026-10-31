@@ -60,10 +60,12 @@ async fn test_the_sweep_fails_a_start_a_restart_cut_off(pool: PgPool) {
     assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_FAILED));
     assert_eq!(cards(&pool, child).await, 0, "the cut-off start's card is deleted");
     assert_eq!(transcript(&pool, child).await, vec![("user".to_string(), text.clone())], "the child says why");
-    // A wake's handle completes at the first delta and the turn is stored
-    // after it (the SME-204 ordering turn/wake.rs names), so the woken
-    // parent's transcript is polled, not snapshotted: under load "Noted."
-    // lands after the await returned — the wake family's CI reds, SME-336.
+    // The awaited wakes are only the ones startup_sweep made its own:
+    // fail_start wakes the parent too (start.rs:409), on a task whose
+    // handle no one gets, and the sweep's wake for the parent finds the
+    // report already drained by that task — ending while its turn still
+    // runs. So the woken parent's transcript is polled, not snapshotted:
+    // under load "Noted." lands after the awaits return — SME-336's reds.
     eventually("the parent gets the error as the report, and is woken", || async {
         transcript(&pool, root).await
             == vec![
