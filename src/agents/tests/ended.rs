@@ -84,6 +84,15 @@ async fn test_no_notice_when_the_child_waits_on_something_or_finished(pool: PgPo
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let asks = start_child(&pool, root, "Ask me.").await;
     let finishes = start_child(&pool, root, "Finish now.").await;
+    // The pause below is keyed by the parent, which all three share: taken
+    // while the first two starts were still running, it could stop one of
+    // them instead, and the pod row made below would then be seen by the
+    // third start's credential step, which fails without a cluster, so its
+    // turn never ran and the check below timed out (SME-324).
+    eventually("the first two starts end", || async {
+        test_hooks::starts_ended(asks) && test_hooks::starts_ended(finishes)
+    })
+    .await;
     // A command left running in this one before its first turn.
     let (reached, release) = test_hooks::pause(test_hooks::BEFORE_START_DONE, root);
     let commands = start_child(&pool, root, "Run things.").await;
