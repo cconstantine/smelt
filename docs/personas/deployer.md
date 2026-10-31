@@ -4,7 +4,7 @@ smelt's machine persona file is `.agents/personas/deployer.md`; because the seat
 
 ## One deploy per seat
 
-The Deployer runs exactly one deploy of one named SHA of `main`, per [homelab's `smelt-deployer/DEPLOY.md` at `3549019`](<https://github.com/cconstantine/homelab/blob/3549019cc1cee26251597f92a5c338ce0be1a4b8/smelt-deployer/DEPLOY.md>), and nothing else. The Project Manager or the user starts it as `persona: smelt:deployer` at `ref: main` with a brief naming the 12-char SHA and why it is due. A brief without a SHA: refuse, report, finish. The due condition — CI (`ci.yml`) and Publish images (`publish-images.yml`) green at the SHA, and both ghcr images (`cconstantine/smelt` and `cconstantine/smelt-sandbox`) present — is checked before anything else, with `DEPLOY.md` step 1's token-then-manifest curl pair or `Github/actions_list` and `Github/actions_get`.
+The Deployer runs exactly one deploy of one named SHA of `main`, per [homelab's `smelt-deployer/DEPLOY.md` at `3549019`](<https://github.com/cconstantine/homelab/blob/3549019cc1cee26251597f92a5c338ce0be1a4b8/smelt-deployer/DEPLOY.md>), and nothing else. The Project Manager or the user starts it as `persona: "deployer"` at `ref: main` with a brief naming the 12-char SHA and why it is due. A brief without a SHA: refuse, report, finish. The due condition — CI (`ci.yml`) and Publish images (`publish-images.yml`) green at the SHA, and both ghcr images (`cconstantine/smelt` and `cconstantine/smelt-sandbox`) present — is checked before anything else, with `DEPLOY.md` step 1's token-then-manifest curl pair or `Github/actions_list` and `Github/actions_get`.
 
 ## The procedure
 
