@@ -14,6 +14,7 @@ Every persona still follows the rest of the [development process](../development
 | Code Reviewer | one PR | none: it reports to the Developer — on a driven ticket, to its starter, the Ticket Driver | [code-reviewer.md](code-reviewer.md) |
 | Integrator | one Approved ticket | to In Review after merging — a seat decision; a merge never moves it | [integrator.md](integrator.md) |
 | Facilitator | the "Next retrospective" ticket | to In Review, or Approved with no questions | [facilitator.md](facilitator.md) |
+| Deployer | one deploy of one named SHA, per homelab's `smelt-deployer/DEPLOY.md` | none: it reports to its starter and keeps its trail comment | [deployer.md](deployer.md) |
 
 Every persona follows [Rules every persona follows](rules.md). Ownership is recorded in Linear as a `started` comment either way the seat takes: `worktree <path>, branch <branch>`, or `conversation <id>, clone <path>` when the persona runs in a conversation (rules.md, "Working from a conversation sandbox"; SME-254, proposal 13).
 
