@@ -1,15 +1,15 @@
 # SME-78 plan: stop sandbox pods automatically
 
-Revision of 2026-10-31. It replaces the plan cut at `e177c86` (2026-10-09), which the user approved on 2026-10-27, and folds in the 2026-10-27 "Additional scope". Ticket: [SME-78](https://linear.app/smelt-agent/issue/SME-78). Its Trade-offs to flag and Questions for the user are in the ticket, not here.
+Revision of 2026-10-31, updated the same day with the user's two answers. It replaces the plan cut at `e177c86` (2026-10-09), which the user approved on 2026-10-27, and folds in the 2026-10-27 "Additional scope". Ticket: [SME-78](https://linear.app/smelt-agent/issue/SME-78). Its Trade-offs to flag and Questions for the user are in the ticket, not here.
 
 **Branch:** `sme-78-stop-idle-pods`, worktree `~/smelt-worktrees/smelt-sme-78`, cut from `origin/main` at `e3869e4`.
 
 ## What changed since the approved plan
 
-* **SME-79 shipped as idle notices, not time limits** (PR #148, the user's 2026-10-15 rule "smelt must never stop a command on a timer"). There's no `time_limit_secs`, so the old `POD_BUSY` "command with a limit" clause and the `time_limit_seconds` edit are gone. Instead a model whose command goes untouched gets a notice every 5 minutes (`SANDBOX_IDLE_NOTICE_MINUTES`). Two consequences, each a question in the ticket:
-  * An idle *pod* stop ends whatever is still running in the pod. That's approved answer 2, but SME-79's notice and the system prompt now promise "smelt won't stop it"; the plan rewords both (question 1).
-  * Each notice is a message, which bumps `conversations.updated_at`, the old plan's activity signal: a forgotten dev server in a conversation the user hasn't stopped would draw a notice and a turn every 5 minutes and never be idle. The plan drops `updated_at` and counts turns by what started them (question 2).
-* **The decisions that stand,** from the 2026-10-27 approval: 60 minutes by default, `SANDBOX_IDLE_STOP_MINUTES`, `0` = off; a server with no limit doesn't keep its pod alive on its own (question 1 checks it against SME-79); an open tab isn't activity; the stop notice doesn't move the conversation in the sidebar.
+* **SME-79 shipped as idle notices, not time limits** (PR #148, the user's 2026-10-15 rule "smelt must never stop a command on a timer"). There's no `time_limit_secs`, so the old `POD_BUSY` "command with a limit" clause and the `time_limit_seconds` edit are gone. Instead a model whose command goes untouched gets a notice every 5 minutes (`SANDBOX_IDLE_NOTICE_MINUTES`). The user answered the two questions this raised (2026-10-31):
+  * **"Do not stop running commands."** A pod with any `running` terminal command is busy and is never stopped, whatever the command's `idle_notice_secs`. This holds for the idle stop, the finish stop and the pass's finished-agent backstop. Because no stop ever ends a command, SME-79's notice and the system prompt's "smelt never stops a command on its own" stay true and stay as they are.
+  * **"No":** SME-79's notices, the turns answering them and `touched_at` aren't pod activity. Each notice is a message, which bumps `conversations.updated_at`, the old plan's activity signal, so the plan drops `updated_at` and counts turns by what started them.
+* **The decisions that stand,** from the 2026-10-27 approval: 60 minutes by default, `SANDBOX_IDLE_STOP_MINUTES`, `0` = off; an open tab isn't activity; the stop notice doesn't move the conversation in the sidebar. The old answer 2 ("a server with no limit doesn't keep its pod alive on its own") is superseded by the user's 2026-10-31 answer 1: a running command keeps its pod.
 * **New scope:** a finished sub-agent's pod stops at once, at `finish` (below).
 * **File map:** remapped onto `src/db/`, `docs/setup/`, `docs/api/`, `docs/architecture/` (see Files).
 * **Merged since, checked for design changes:**
@@ -20,14 +20,14 @@ Revision of 2026-10-31. It replaces the plan cut at `e177c86` (2026-10-09), whic
 
 ## What and why
 
-1. **On idle.** Once a pod has gone `SANDBOX_IDLE_STOP_MINUTES` (default 60) with no activity, smelt stops it the way the user's Stop does, but quietly. `/workspace`, Docker's data (images, build cache, named volumes) and mounted volumes are kept, since they're claims. Running processes, terminals, installed packages and files elsewhere are lost. The model gets one saved notice and isn't woken.
-2. **At finish.** When a sub-agent's turn ends with it `finished`, smelt stops its pod at once, the same way, with its own notice. If the parent or the user writes to it again, its next `create_pod` (or `clone_repo`) starts a pod on the same claims, as today.
+1. **On idle.** Once a pod with no running command has gone `SANDBOX_IDLE_STOP_MINUTES` (default 60) with no activity, smelt stops it the way the user's Stop does, but quietly. `/workspace`, Docker's data (images, build cache, named volumes) and mounted volumes are kept, since they're claims. Idle terminals, background processes (`&`, `nohup`, detached containers), installed packages and files elsewhere are lost. The model gets one saved notice and isn't woken.
+2. **At finish.** When a sub-agent's turn ends with it `finished` and no command running, smelt stops its pod at once, the same way, with its own notice. If the parent or the user writes to it again, its next `create_pod` (or `clone_repo`) starts a pod on the same claims, as today.
 
 Activity is measured in the database, so a restart (`dx serve` restarts the dev server on every Rust edit) doesn't reset the clock.
 
 ## How comparable tools do it
 
-Checked for the 10-09 plan and unchanged: Codespaces (30 minutes; terminal input or output resets it, a shared port alone doesn't), Daytona (15 minutes; preview requests reset it, a fire-and-forget `npm run dev` doesn't), Coder (`b27e158`, `activitybump.go`: terminal, app and port traffic and an AI chat's heartbeat bump it, written at most once per 5% of the deadline) and E2B (a timeout the caller extends). All stop on idle and keep the disk; none counts a running server on its own.
+Checked for the 10-09 plan and unchanged: Codespaces (30 minutes; terminal input or output resets it, a shared port alone doesn't), Daytona (15 minutes; preview requests reset it, a fire-and-forget `npm run dev` doesn't), Coder (`b27e158`, `activitybump.go`: terminal, app and port traffic and an AI chat's heartbeat bump it, written at most once per 5% of the deadline) and E2B (a timeout the caller extends). All stop on idle and keep the disk. smelt goes further than any of them on the user's answer: a running command keeps the pod.
 
 ## What counts as activity
 
@@ -35,13 +35,13 @@ Checked for the 10-09 plan and unchanged: Codespaces (30 minutes; terminal input
 | -- | -- | -- |
 | A turn running or queued | **busy**: never stopped | `turn::turn_running`, and a stop needs the turn lock (State model) |
 | A repo cloning | **busy** | `conversation_repos.status = 'cloning'` for the conversation. "Work on a repo" clones outside any turn. |
+| Any running terminal command (a build, a dev server, a watcher, one with `idle_notice_seconds: 0`) | **busy** (the user's answer 1) | `terminal_commands.status = 'running'` under the pod's terminals. A process left in the background (`&`, `nohup`, `docker compose up -d`) isn't a running command and doesn't count. |
 | A turn that brought something new: the user's send, the user's answer, a delivered notice (`Notice::Deliver`), an agent's start brief | yes, at the turn's **end** | the turn's `activity_owed` flag (below), noted at its end |
 | A wake turn that drained an agent message (a report, a `message_agent`, smelt's notice about a child) or a finished or lost command's notice | yes, at the turn's end | the drains set the same flag |
-| A wake turn for an SME-79 idle notice only, and the model's reply in it | **no** (question 2) | `drain_idle_command_notices` sets no flag |
-| `terminal_commands.touched_at` (the model reading, checking, signalling or re-timing a command) | **no** (question 2) | not read. It's only written inside a turn, so a counted turn already counts; counting it alone would let a model answering idle notices keep the pod forever |
-| A command starting or finishing | yes | `MAX(terminal_commands.created_at)`, `MAX(finished_at)` for the pod's terminals. A command the model starts or signals in an idle-notice turn counts through these. |
-| Output from a running command | yes | the newest `terminal_events.created_at` of each running command, read through `idx_terminal_events_command_id (command_id, seq)` with `ORDER BY seq DESC LIMIT 1`, so a chatty log isn't scanned. A build that prints keeps the pod; a silent or hung command doesn't. (SME-79's notices ignore output by the user's choice; this is the pod clock, approved 10-27.) |
-| A running command on its own (a dev server, a watcher, one with `idle_notice_seconds: 0`) | **only through its output and its traffic** (question 1) | Daytona's and Codespaces' rule |
+| A wake turn for an SME-79 idle notice only, and the model's reply in it | **no** (the user's answer 2) | `drain_idle_command_notices` sets no flag. A notice exists only for a running command, which keeps the pod busy anyway, so this decides only that a notice turn doesn't restart the clock |
+| `terminal_commands.touched_at` (the model reading, checking, signalling or re-timing a command) | **no** (the user's answer 2) | not read. It's only written inside a turn, so a counted turn already counts. |
+| A command starting or finishing | yes | `MAX(terminal_commands.created_at)`, `MAX(finished_at)` for the pod's terminals, so the clock starts again from a command's end. A command the model starts or signals in an idle-notice turn counts through these. |
+| Output from a running command | not needed | the command keeps the pod busy anyway, and its finish counts |
 | Preview traffic and pod dials | yes | each preview request (`preview.rs`'s `handle`, after the fetch guard) and each successful `sandbox::open_pod_port_with` (previews on a fresh connection, `webfetch`, browsing sessions on `localhost` and container addresses) calls `sandbox::note_activity(conversation_id)` |
 | An open preview tab with no requests (an idle HMR websocket) | no | no requests, no new connections |
 | The user viewing the conversation (`subscriber_count`) | **no** (approved answer 3) | a tab left open is the usual forgotten pod |
@@ -66,7 +66,7 @@ Checked for the 10-09 plan and unchanged: Codespaces (30 minutes; terminal input
 
 1. No live pod (`db::list_sandbox_pods` is empty): return. This is the **no-op** for a seat that already ran `terminate_pod` (every Project Manager brief's teardown step since 2026-10-26).
 2. Take the conversation's turn lock and then its pod-start lock, **waiting** for each (the order a turn takes them, so it can't deadlock with one; `remove_conversation_storage` takes only the start lock).
-3. Re-check in one statement (`db::pod_still_stoppable`, below): the pod is live, the agent is still `finished`, no repo is cloning.
+3. Re-check in one statement (`db::pod_still_stoppable`, below): the pod is live, the agent is still `finished`, no repo is cloning and no command is running.
 4. Stop it quietly (below) with the finish notice.
 5. Release both locks, then `release_idle_turn_state` as `save_notice_between_turns` does.
 
@@ -76,11 +76,11 @@ Checked for the 10-09 plan and unchanged: Codespaces (30 minutes; terminal input
 * The message commits first: the wake's turn is counted at once, so either `turn_running` is already true when `run_turn_bounded`'s end checks it and no stop is spawned, or the stop's re-check reads `active` and skips. The woken turn keeps the pod.
 * In both cases the invariant holds. A conversation becomes `finished` only through `finish_agent`, inside a turn whose end comes back to this check, so no finished conversation keeps a pod past its last turn's end. The only gap is a turn that doesn't reach that spawn: one stopped by the user right after `finish`, or smelt dying between the commit and the stop. The idle pass's backstop covers it.
 
-**The backstop.** Each pass also takes every live pod of a `finished` agent that isn't busy, with no threshold. That catches the gaps above within a minute, and on the first deploy it stops the finished seats' pods already running.
+**The backstop.** Each pass also takes every live pod of a `finished` agent that isn't busy, with no threshold. That catches the gaps above within a minute, stops a finished agent's pod within a minute of its last running command ending, and on the first deploy stops the finished seats' pods already running.
 
 **Volumes (SME-239).** The stop deletes the pod, which unmounts `/workspace`, Docker's claim and every `sandbox-volume-<id>`. It never touches `agent_volumes`, `conversation_volume_mounts` or a claim. The creator's subtree delete still governs deletion. A reawakened child's next pod mounts what its mount rows say, as any new pod does.
 
-**Commands still running at finish** (a child that leaves a server up) are marked `lost` like any stop. Their "outcome is unknown" notices wait for the child's next turn, if there is one. Without the stop, SME-79's watch would keep waking a finished child about such a command (`agents::admits_notices` lets a `finished` agent's wakes in), and each wake runs a turn.
+**Commands still running at finish** (a child that leaves a server up) keep the pod, by the user's answer 1: the finish stop's re-check says no and the pod stays. Once the command ends (it exits, the child signals it in a woken turn, or the user stops the pod), the next pass's backstop stops the pod. Meanwhile SME-79's watch keeps waking the finished child about the command, as it does today (`agents::admits_notices` lets a `finished` agent's wakes in), and each wake runs a turn.
 
 **Not in scope:** a child that `stop_agent` stopped keeps its pod as the user's Stop leaves it, and its pod stops on idle (Trade-offs).
 
@@ -90,7 +90,7 @@ Checked for the 10-09 plan and unchanged: Codespaces (30 minutes; terminal input
 
 * `pub(crate) enum StopReason { Idle { minutes: u32 }, Finished }`.
 * `stop_locked(pool, pod_id, conversation_id, reason, terminate)`: called with both locks held after a re-check said yes.
-  1. `close_pod_terminals(pool, pod_id)` (running commands `lost`, terminals closed, each published).
+  1. `close_pod_terminals(pool, pod_id)`: closes the idle terminals, each published. The re-check said no command is running, and none can start while the turn lock is held, so nothing is marked `lost`.
   2. `terminate`, which is `force_terminate_pod` in production and a fake or failing one in tests (`terminate_pod_with`'s pattern). It publishes `SandboxPodUpdate { terminated: true }` and `PodsChanged` itself.
   3. If the conversation still exists, save the notice with `db::create_message_in_place` while still holding the turn lock, so it can't split a tool call from its result, then publish `MessagesAppended`. No `ConversationsChanged`: nothing in the sidebar moved.
   4. `tracing::info!(pod_id, conversation_id, reason, "stopped a sandbox pod quietly")`, ids only.
@@ -98,8 +98,8 @@ Checked for the 10-09 plan and unchanged: Codespaces (30 minutes; terminal input
 
 **Notices** (role `user` text, as every notice is):
 
-* Idle: `Sandbox pod <id> was stopped after <N> minutes with no activity. /workspace, Docker's images, build cache and volumes, and mounted volumes are kept; terminals, running processes (servers included), installed packages and files elsewhere are gone. create_pod (or clone_repo) starts a new pod with /workspace as it was.`
-* Finished: `Sandbox pod <id> was stopped because you finished. /workspace, Docker's images, build cache and volumes, and mounted volumes are kept; terminals, running processes, installed packages and files elsewhere are gone. If you're given more work, create_pod (or clone_repo) starts a new pod with /workspace as it was.`
+* Idle: `Sandbox pod <id> was stopped after <N> minutes with no activity and no command running. /workspace, Docker's images, build cache and volumes, and mounted volumes are kept; terminals, background processes and containers, installed packages and files elsewhere are gone. create_pod (or clone_repo) starts a new pod with /workspace as it was.`
+* Finished: `Sandbox pod <id> was stopped because you finished. /workspace, Docker's images, build cache and volumes, and mounted volumes are kept; terminals, background processes and containers, installed packages and files elsewhere are gone. If you're given more work, create_pod (or clone_repo) starts a new pod with /workspace as it was.`
 * Transcript (`src/frontend/pages/chat/transcript/text.rs`, a branch on `Sandbox pod ` + ` was stopped after ` / ` was stopped because you finished`, placed before the `stopped unexpectedly` branch): "The sandbox stopped after 60 minutes idle; /workspace and Docker's data are kept" and "The sandbox stopped when this agent finished; /workspace and Docker's data are kept".
 
 **`db::create_message_in_place`** (`src/db/conversations.rs`): `create_message_on`'s insert without the `UPDATE conversations` that bumps `updated_at` and auto-titles from a default title. A quiet notice therefore neither moves the row (approved answer 4) nor titles an untitled conversation with the notice text.
@@ -112,45 +112,44 @@ Checked for the 10-09 plan and unchanged: Codespaces (30 minutes; terminal input
 2. For each candidate:
    1. Skip it if `turn::turn_running`.
    2. `try_lock` the turn lock, then the start lock, and skip it if either is held. A skipped pod is tried again next pass.
-   3. **A running command whose agent isn't connected** (`agent_status(pod_id)` is `None`, as after a smelt restart): call `sandbox::try_reconnect(pool, pod_id)`, which flushes the agent's queued `unsent` output, and leave the pod for the next pass. A build that printed while smelt was down isn't stopped for looking silent.
-   4. Flush again, then `db::pod_still_stoppable(pod_id, reason, minutes)`. If it says no, release and move on.
-   5. `stop_locked`, then release both locks and `release_idle_turn_state`.
+   3. Flush again, then `db::pod_still_stoppable(pod_id, reason, minutes)`. If it says no, release and move on.
+   4. `stop_locked`, then release both locks and `release_idle_turn_state`.
 
 The lock helper goes in `src/turn/outside_turn.rs`: `pub(crate) async fn between_turns<T>(conversation_id, wait: bool, f) -> Option<T>`. It takes the turn lock (waiting, or `try_lock`), runs `f`, drops the lock, then frees idle turn state (SME-219's concern: a lock taken outside a turn leaves runtime state behind otherwise). The finish stop waits; the pass doesn't.
 
 **SQL, in `src/db/sandbox.rs`, one rule shared by `/pods`, the candidates and the re-check:**
 
-* `POD_IDLE_SINCE`: `GREATEST(p.created_at, p.last_active_at, last command start, last command finish, newest output of a running command)`, with `GREATEST` skipping NULLs.
-* `POD_BUSY`: `EXISTS (SELECT 1 FROM conversation_repos r WHERE r.conversation_id = p.conversation_id AND r.status = 'cloning')`. A running turn is in memory and checked in Rust.
+* `POD_IDLE_SINCE`: `GREATEST(p.created_at, p.last_active_at, last command start, last command finish)`, with `GREATEST` skipping NULLs.
+* `POD_BUSY`: a repo cloning (`EXISTS … conversation_repos r WHERE r.conversation_id = p.conversation_id AND r.status = 'cloning'`) or a command running (`EXISTS … terminal_commands tc JOIN sandbox_terminals t ON t.id = tc.terminal_id WHERE t.pod_id = p.id AND tc.status = 'running'`). A running turn is in memory and checked in Rust.
 * `POD_FINISHED`: `EXISTS (SELECT 1 FROM agents a WHERE a.conversation_id = p.conversation_id AND a.state = 'finished')`.
-* `list_live_pods` gains `idle_since` and `busy` on `LivePodRow` and drops `conversation_updated_at`, `running_commands` and `last_command_finished_at` once `pod_activity` stops reading them (check each with grep first).
+* `list_live_pods` gains `idle_since` and `busy` on `LivePodRow` and drops `conversation_updated_at` and `last_command_finished_at` once `pod_activity` stops reading them (check each with grep first).
 * `quiet_stop_candidates(minutes) -> Vec<(pod_id, conversation_id, StopReasonKind)>`, `pod_still_stoppable(pod_id, kind, minutes) -> bool` (both rules evaluated against `now()` in the statement), and `flush_pod_activity(&[i64])`.
 
 `src/db/sandbox.rs` is 28,816 bytes and gains about 4,000, all production code; its tests are in `src/db/tests/pods.rs`.
 
 ## `/pods` and the model's view
 
-* `api::pods::pod_activity` becomes `if row.busy || turn::turn_running(row.conversation_id) { Busy } else { IdleSince(row.idle_since) }`. A pod with a running command but no output or traffic now reads `idle …`, not `busy`. "idle 59m" means about a minute left.
-* The footnote on `/pods` (`src/frontend/pages/pods.rs`) adds "Sandboxes idle for 60 minutes are stopped, and a finished agent's at once; /workspace is kept." or, at `0`, "Idle sandboxes aren't stopped automatically; a finished agent's is." Its text comes from a new `get_idle_stop_minutes` server function (`src/api/sandbox.rs`). It sits under the table at every width, so there's no layout change.
-* **System prompt.** `src/turn/system_prompt.md`'s SME-79 bullet "…smelt never stops a command on its own." becomes "…smelt never stops a command on a timer of its own (the sandbox's idle stop, in the environment section, ends the whole pod)." `PromptEnvironment` (`src/turn/history.rs`) gains `idle_stop_minutes: Option<u32>`, and the Environment section adds, while it's on: `- Your sandbox pod is stopped after 60 minutes with no activity: your turns, commands starting or finishing, command output, and preview traffic count; the idle-command notices don't. A long silent job should print progress. /workspace, Docker's data and volumes are kept.` For an agent (`env.agent` is `Some`) it also adds `- Your sandbox pod is stopped when you finish; /workspace and volumes are kept for if you're given more work.`
-* **SME-79's notice** (`drain_idle_command_notices`, `src/turn/notify.rs`): "Nothing stopped it and smelt won't stop it." becomes, while idle stops are on, "Nothing stopped it and smelt won't stop the command itself, but the whole sandbox is stopped after <N> minutes with no activity, and these notices don't count." The transcript's summary reads only up to the `:`, so it's unchanged (its test still passes on the new text).
-* **Tool descriptions:** `run_terminal_command`'s `idle_notice_seconds` (`src/anthropic/tools/pods.rs`) adds "; a sandbox with no activity is still stopped after the time the environment section gives, so 0 doesn't keep a server alive", which is the redone `time_limit_seconds` edit. `finish` (`src/anthropic/tools/agents.rs`) adds "Your sandbox pod is stopped when you finish; /workspace and volumes are kept."
+* `api::pods::pod_activity` becomes `if row.busy || turn::turn_running(row.conversation_id) { Busy } else { IdleSince(row.idle_since) }`. A running command still reads `busy`, as today. "idle 59m" means about a minute left.
+* The footnote on `/pods` (`src/frontend/pages/pods.rs`) adds "Sandboxes idle for 60 minutes with no command running are stopped, and a finished agent's at once; /workspace is kept." or, at `0`, "Idle sandboxes aren't stopped automatically; a finished agent's is." Its text comes from a new `get_idle_stop_minutes` server function (`src/api/sandbox.rs`). It sits under the table at every width, so there's no layout change.
+* **System prompt.** `src/turn/system_prompt.md` is unchanged: its "smelt never stops a command on its own" stays true. `PromptEnvironment` (`src/turn/history.rs`) gains `idle_stop_minutes: Option<u32>`, and the Environment section adds, while it's on: `- Your sandbox pod is stopped after 60 minutes with no activity and no command running; a running command keeps it, but a process left in the background (&, nohup, a detached container) doesn't. /workspace, Docker's data and volumes are kept.` For an agent (`env.agent` is `Some`) it also adds `- Your sandbox pod is stopped when you finish, unless a command is still running; /workspace and volumes are kept for if you're given more work.`
+* **SME-79's notice** (`drain_idle_command_notices`) is unchanged: "smelt won't stop it" stays true.
+* **Tool descriptions:** `finish` (`src/anthropic/tools/agents.rs`) adds "Your sandbox pod is stopped when you finish, unless a command is still running; /workspace and volumes are kept." `idle_notice_seconds` is unchanged.
 
 ## State model
 
 **The record** is one `sandbox_pods` row, keyed by `pod_id`, plus its conversation's `agents.state` for the finish rule. The states:
 
-* **active**: live, busy or idle for less than the threshold
+* **active**: live, busy (a turn, a clone or a running command) or idle for less than the threshold
 * **idle**: live and idle past the threshold (computed)
-* **finished-live**: live, agent `finished` (computed)
+* **finished-live**: live, agent `finished`, not busy (computed); a finished agent's pod with a running command is **active** until the command ends
 * **terminated**: `terminated_at` set
 * **gone**: cascaded away with its conversation
 
 There's no stored "stopping" state: the re-check under both locks replaces the old plan's `idle_stopped_at` claim, and a stop that fails partway is re-evaluated on the next pass.
 
-| State \ event | Activity (counted turn ends, command, output, preview, dial) | Idle pass | `finish` turn ends | `message_agent` / user send to the child | Turn starts | User Stop / crash / watch close | Conversation deleted | smelt restarts | `create_pod` / `start_or_get_pod` |
+| State \ event | Activity (counted turn ends, command start or finish, preview, dial) | Idle pass | `finish` turn ends | `message_agent` / user send to the child | Turn starts | User Stop / crash / watch close | Conversation deleted | smelt restarts | `create_pod` / `start_or_get_pod` |
 | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |
-| active | stays active | not a candidate | → finished-live → finish stop | stays active | busy | terminated (own notice) | gone (teardown) | unchanged (clock in DB) | `create_pod` refused; `start_or_get` returns it |
+| active | stays active | not a candidate | → finished-live → finish stop (a running command keeps it active; the backstop takes it once the command ends) | stays active | busy | terminated (own notice) | gone (teardown) | unchanged (clock in DB) | `create_pod` refused; `start_or_get` returns it |
 | idle | → active (next flush, or the re-check's) | locks, re-check, stop → terminated; a lock held → skipped | (only from active) | its turn → active | busy; skipped | terminated | gone | first pass stops it | the start lock makes the pass skip; the clone is busy |
 | finished-live | ignored (no clock) | backstop: locks, re-check, stop | the finish stop waits for the locks, re-checks, stops | `active` → the re-check skips; after a stop, the woken turn finds no pod | busy; the stop waits | terminated; the finish stop no-ops | gone; re-check finds no row | backstop stops it | the stop waits for the start lock; a clone is busy → skip |
 | terminated | flush matches nothing | not a candidate | no-op | – | – | `NoPod` | gone | – | a new row, active |
@@ -167,8 +166,7 @@ There's no stored "stopping" state: the re-check under both locks replaces the o
 **Writers of the activity inputs:**
 
 * the turn's `activity_owed` flag: `run_turn_bounded`'s start (a send, an answer, a delivered notice), `drain_agent_messages`, `drain_unnotified_terminal_commands`; taken at `run_turn_bounded`'s end
-* `run_command`'s insert, the agent's `Exit` handler (`finished_at`), and `close_pod_terminals` (`lost`, no `finished_at`, so a stop isn't activity)
-* the agent's `Output` handler (`terminal_events`)
+* `run_command`'s insert (`created_at`, `status = 'running'`), the agent's `Exit` handler (`finished_at`), and the crash path's `close_pod_terminals` (`lost`, no `finished_at`); the quiet stop marks nothing `lost`
 * the clone status writers
 * `note_activity`'s callers: preview `handle`, `open_pod_port_with`, and the turn end
 * for the finish rule, `agents.state`: `finish_agent` (→ finished); `message_agent`, `reactivate_agent`, `reactivate_finished` (→ active); `stop_subtree` (→ stopped, which takes it out of the rule)
@@ -180,22 +178,22 @@ There's no stored "stopping" state: the re-check under both locks replaces the o
 * *Candidate read → re-check:* the activity in between is flushed before the re-check, which is one statement.
 * *Re-check → delete:* a turn can't start (the turn lock), and neither can a pod start, a clone's included (the start lock). What can still happen in those few hundred milliseconds:
   * A preview request or a browsing load dials the pod and fails as it goes. That needs a request at exactly minute 60 after an hour with none.
-  * A running command prints, and its output is lost with it.
+  * No command can start: `run_terminal_command` runs only inside a turn, and the stop holds the turn lock. So the re-check's "no command running" still holds at the delete, and no stop ends a command.
   * `message_agent` sets a finished child `active`: the stop goes ahead and the woken turn finds no pod (the stop wins).
   * The user's Stop: both tear down; each is idempotent, and two notices are possible.
 * *The conversation is deleted after the re-check:* the delete doesn't take the turn lock. Teardown and our delete each tolerate the other (404 is Ok). `create_message_in_place` would fail on the foreign key, so `stop_locked` checks `conversation_exists` first and treats a foreign-key error as gone (logged at debug).
 
 **Failure part-way:**
 
-* `close_pod_terminals` fails part-way: it's best-effort per terminal, as today. The commands it did mark stay `lost`, and the next pass re-evaluates a pod that still has no running command.
+* `close_pod_terminals` fails part-way: it's best-effort per terminal, as today, and the delete goes ahead.
 * The delete fails: the row stays live (re-registered), no notice is saved, and the next pass re-checks it. A finished child woken in between keeps its pod, with its terminals closed.
-* smelt dies between the delete and the notice: no notice (flagged). The model still gets `no such pod` and the lost-command notices.
+* smelt dies between the delete and the notice: no notice (flagged). The model still gets `no such pod` from its next terminal or file tool.
 * The flush fails: logged, and the set is kept for the next pass.
 * The re-check fails (a database error): logged, released, skipped.
 
 **A pod restart (crash):** the crash path terminates the row and notices, as today. Nothing of this feature lives in the pod.
 
-**Work already in flight:** the threshold is read once at startup, and a restart applies a new value to every live pod at the next pass, the time already idle included; the notice gives the minutes in force. A running turn is never interrupted. A running command ends only through a stop the rules above allow, and is then `lost`, as with any user Stop.
+**Work already in flight:** the threshold is read once at startup, and a restart applies a new value to every live pod at the next pass, the time already idle included; the notice gives the minutes in force. A running turn is never interrupted, and a running command is never ended by a quiet stop.
 
 **What each caller does in each state:**
 
@@ -206,10 +204,10 @@ There's no stored "stopping" state: the re-check under both locks replaces the o
 | `start_or_get_pod` (clone) | returns it | returns it; the pass skips while it holds the start lock | returns it; the finish stop waits for the lock, then the re-check sees `cloning` and skips | creates |
 | preview / browsing dial | connects, notes | connects, notes → active | connects (doesn't save it) | "no running sandbox" page / refused |
 | user Stop | stops | stops | stops; the finish stop then no-ops | `NoPod` |
-| `/pods` | busy or idle Xm | idle ≥ threshold, under a minute | idle, for seconds | not listed |
+| `/pods` | busy or idle Xm (a running command reads busy) | idle ≥ threshold, under a minute | idle, for seconds | not listed |
 | idle pass | skip | stop | stop (backstop) | skip |
 | finish stop | skip (re-check: not finished) | skip (re-check: not finished) | stop | no-op |
-| SME-79 watch | notices a running command | notices it; the notice doesn't count | notices it (a wake for a finished agent, as today) until the stop | nothing running |
+| SME-79 watch | notices a running command, which keeps the pod busy; the notice doesn't count | nothing running | nothing running | nothing running |
 | `remove_conversation_storage` | stops it itself | the same; it holds the start lock, so the pass skips | the same | removes the claims |
 
 ## Files
@@ -241,13 +239,11 @@ Checked against `git ls-files` at `e3869e4`. Sizes are now, against the 40,000-b
 | `src/frontend/pages/chat/tests/notices.rs` | 22,770 | their tests |
 | `src/turn/state.rs` | 26,344 | `activity_owed`, `set_activity_owed`, `take_activity_owed` |
 | `src/turn/run.rs` | 30,746 | about 5 lines in `run_turn_bounded`: set the flag at its start, take it at its end |
-| `src/turn/notify.rs` | 16,972 | the flag in two drains; SME-79's sentence |
+| `src/turn/notify.rs` | 16,972 | the flag in two drains |
 | `src/turn/outside_turn.rs` | 5,545 | `between_turns` |
 | `src/turn/history.rs` | 22,943 | `idle_stop_minutes`, the Environment lines |
-| `src/turn/system_prompt.md` | 11,055 | the reworded bullet |
 | `src/agents/queue.rs` | 7,202 | `after_last_turn` → `stop_finished_agent_pod` |
 | `src/anthropic/tools/agents.rs` | 10,036 | `finish`'s description |
-| `src/anthropic/tools/pods.rs` | 31,721 | one clause in `idle_notice_seconds`; no tests added |
 | `src/sandbox/mod.rs` | 18,123 | `mod quiet_stop; pub(crate) use self::quiet_stop::*;` |
 | `src/sandbox/ports.rs` | 7,038 | `note_activity` once the pod resolves (not on `NoPod`) |
 | `src/preview.rs` | 30,917 | `note_activity(conversation)` in `handle` after the guard; about 2 lines |
@@ -255,20 +251,20 @@ Checked against `git ls-files` at `e3869e4`. Sizes are now, against the 40,000-b
 | `src/main.rs` | 17,335 | spawn `sandbox::stop_idle_pods` after `watch_idle_commands` |
 | docs | | `docs/setup/environment.md` (16,284: the variable), `docs/database.md` (29,605: the column), `docs/api/events.md` (30,777: line 123's Activity bullet), `docs/api/agents.md` (18,867: finish stops the pod, the race), `docs/architecture/modules-sandbox.md` (26,347: a `quiet_stop.rs` row, the `pods.rs` row), `docs/architecture/modules-core.md` (19,589: startup order), `docs/current-state/index.md` (4,661: SME-78 out of the open goals), `docs/current-state/agents.md` (7,606), `docs/feature-checklist/sandbox.md` (15,413: rows and the hands-on check) |
 
-**Not touched:** the agent sources (`src/bin/sandbox_agent/`, `src/agent_protocol.rs`, `src/docker_net.rs`, `Cargo.toml`), so no image rebuild; `src/sandbox/manager/*`, `src/db/agents/*`, `src/sandbox/idle_notice.rs`.
+**Not touched:** the agent sources (`src/bin/sandbox_agent/`, `src/agent_protocol.rs`, `src/docker_net.rs`, `Cargo.toml`), so no image rebuild; `src/sandbox/manager/*`, `src/db/agents/*`, `src/sandbox/idle_notice.rs`, `src/turn/system_prompt.md`, `src/anthropic/tools/pods.rs`.
 
-**Callers that gain a need, by grep:** the `LivePodRow { … }` literals (the moved `api/pods` tests' `row()` helper, and any other `grep -rn "LivePodRow {" src`); `PromptEnvironment { … }` literals (`grep -rn "PromptEnvironment {" src`, `#[ignore]`d tests included); every reader of `conversation_updated_at`, `running_commands` and `last_command_finished_at` before they're dropped.
+**Callers that gain a need, by grep:** the `LivePodRow { … }` literals (the moved `api/pods` tests' `row()` helper, and any other `grep -rn "LivePodRow {" src`); `PromptEnvironment { … }` literals (`grep -rn "PromptEnvironment {" src`, `#[ignore]`d tests included); every reader of `conversation_updated_at` and `last_command_finished_at` before they're dropped.
 
 ## Tests (each seen red first; actual red recorded beside each prediction)
 
-* **db** (`src/db/tests/pods.rs`): each counted signal moves `idle_since` (pod start, `last_active_at`, command start and finish, a running command's newest output); a finished command's later events don't count past its `finished_at`; **a new message doesn't move it** (the SME-79 case; expected red today, since `pod_activity` reads `conversation_updated_at`); a cloning repo is busy and a running command isn't; candidates are idle past the threshold or a finished agent's at any age, never busy or terminated, and no idle ones at `minutes = 0`; `pod_still_stoppable` turns false after fresh activity, a clone starting, the agent going `active`, or a terminate; the flush writes only live pods. `src/db/tests/conversations.rs`: `create_message_in_place` leaves `updated_at` and a default title alone.
-* **turn** (`src/turn/tests/pod_activity.rs`): a user's turn notes activity at its end, not its start (a hook holds it mid-turn; expected red: there's no flag yet); a wake that drains only an idle notice notes nothing; one that drains an agent message or a finished command's notice does; the Environment lines (with the minutes, absent at `0`, the agent line only for an agent); SME-79's sentence, new while on and old at `0`.
-* **quiet stop** (`src/sandbox/tests/quiet_stop.rs`, fake terminate, back-dated timestamps): an idle pod is stopped (commands `lost`, terminals closed, one notice, `updated_at` unchanged, `SandboxPodUpdate { terminated: true }` and `PodsChanged`); skipped while `turn_running`, its turn lock or its start lock is held, and stopped next pass once free; activity noted between the candidate read and the re-check saves it; a failing delete saves no notice and the next pass stops it with exactly one; a conversation deleted after the re-check ends quietly; a user Stop first leaves nothing to do; at `0` an idle pod stays and a finished agent's still goes; env parsing (unset or empty → 60, `0` → off, `10081`, `-1`, junk → 60 with a warning); a running command on a disconnected agent reconnects and defers.
-* **finish** (`src/agents/tests/finish_stop.rs`, the agents tests' fake model): a child's `finish` stops its pod at the turn's end with the finish notice, its volume and mount rows untouched (expected red: `after_last_turn` returns without a stop); no pod (it ran `terminate_pod`) → no stop, notice or error; **stop first**: the test holds the child's turn lock, the stop queues on it, `message_agent` lands, release; the woken turn finds no pod, with the notice then the message in its history; **wake first**: `message_agent` commits before the turn's end, so no stop is spawned and the pod stays, and a wake landing between the spawn and the re-check reads `active` and skips; a turn stopped right after `finish` leaves the pod to the next pass, which stops it; a `stop_agent`-stopped child keeps its pod.
-* **sources and views:** a preview request notes its conversation (`src/preview/tests.rs`); `open_pod_port_with` notes on success, not on `NoPod` (the stand-in client tests in `src/sandbox/tests/guards.rs`); `pod_activity` (`src/api/pods/tests.rs`); both transcript summaries, and SME-79's unchanged on its new sentence (`notices.rs`).
-* **real pod** (`quiet_stop.rs`, under the cluster lock): a pod with `/workspace/kept.txt`, a pulled small image and `sleep 600`; back-date and run one pass with the real delete; the pod is gone, both claims stay, the command is `lost`, the notice saved; `create_pod` brings back `kept.txt` and the image (`docker image inspect`).
+* **db** (`src/db/tests/pods.rs`): each counted signal moves `idle_since` (pod start, `last_active_at`, command start, command finish); **a new message doesn't move it** (the SME-79 case; expected red today, since `pod_activity` reads `conversation_updated_at`); a cloning repo and a running command each make the pod busy, the command whatever its `idle_notice_secs` (`0` included); candidates are idle past the threshold or a finished agent's at any age, never busy or terminated, and no idle ones at `minutes = 0`; a finished agent's pod with a running command isn't a candidate, and is once the command finishes; `pod_still_stoppable` turns false after fresh activity, a clone starting, a command starting, the agent going `active`, or a terminate; the flush writes only live pods. `src/db/tests/conversations.rs`: `create_message_in_place` leaves `updated_at` and a default title alone.
+* **turn** (`src/turn/tests/pod_activity.rs`): a user's turn notes activity at its end, not its start (a hook holds it mid-turn; expected red: there's no flag yet); a wake that drains only an idle notice notes nothing; one that drains an agent message or a finished command's notice does; the Environment lines (with the minutes, absent at `0`, the agent line only for an agent).
+* **quiet stop** (`src/sandbox/tests/quiet_stop.rs`, fake terminate, back-dated timestamps): an idle pod with no running command is stopped (its idle terminals closed, no command marked `lost`, one notice, `updated_at` unchanged, `SandboxPodUpdate { terminated: true }` and `PodsChanged`); skipped while `turn_running`, its turn lock or its start lock is held, and stopped next pass once free; activity noted between the candidate read and the re-check saves it; a failing delete saves no notice and the next pass stops it with exactly one; a conversation deleted after the re-check ends quietly; a user Stop first leaves nothing to do; at `0` an idle pod stays and a finished agent's still goes; env parsing (unset or empty → 60, `0` → off, `10081`, `-1`, junk → 60 with a warning); a pod idle for hours with a running command is left, pass after pass, and is stopped by the first pass after the command finishes and the threshold passes from its `finished_at`.
+* **finish** (`src/agents/tests/finish_stop.rs`, the agents tests' fake model): a child's `finish` stops its pod at the turn's end with the finish notice, its volume and mount rows untouched (expected red: `after_last_turn` returns without a stop); a child that finishes with a command running keeps its pod, and the next pass after the command ends stops it; no pod (it ran `terminate_pod`) → no stop, notice or error; **stop first**: the test holds the child's turn lock, the stop queues on it, `message_agent` lands, release; the woken turn finds no pod, with the notice then the message in its history; **wake first**: `message_agent` commits before the turn's end, so no stop is spawned and the pod stays, and a wake landing between the spawn and the re-check reads `active` and skips; a turn stopped right after `finish` leaves the pod to the next pass, which stops it; a `stop_agent`-stopped child keeps its pod.
+* **sources and views:** a preview request notes its conversation (`src/preview/tests.rs`); `open_pod_port_with` notes on success, not on `NoPod` (the stand-in client tests in `src/sandbox/tests/guards.rs`); `pod_activity` (`src/api/pods/tests.rs`); both transcript summaries (`notices.rs`).
+* **real pod** (`quiet_stop.rs`, under the cluster lock): a pod with `/workspace/kept.txt`, a pulled small image and a running `sleep 600`; back-date and run one pass: the pod stays; `send_signal` INT, back-date the finish, run one pass with the real delete: the pod is gone, both claims stay, the notice saved; `create_pod` brings back `kept.txt` and the image (`docker image inspect`).
 
-**Which part each test needs:** the db "a message doesn't count" test needs only the SQL change. The turn tests need the flag. The finish tests need `after_last_turn`'s branch, and their race variants also need the waiting `between_turns`. A `try_lock`-only version fails "stop first". The pass's backstop test needs the candidates' finished clause, and fails with only the turn-end trigger in. The Developer checks each claim against a build with that part stubbed out.
+**Which part each test needs:** the db "a message doesn't count" test needs only the SQL change. The running-command tests need `POD_BUSY`'s command clause, in both the candidates and the re-check: with it only in the candidates, the "command starts between the read and the re-check" test fails. The turn tests need the flag. The finish tests need `after_last_turn`'s branch, and their race variants also need the waiting `between_turns`. A `try_lock`-only version fails "stop first". The pass's backstop test needs the candidates' finished clause, and fails with only the turn-end trigger in. The Developer checks each claim against a build with that part stubbed out.
 
 **Commits:** 1 the `api/pods` test move; 2 the `features.md` split; then the migration with the SQL and its tests; `note_activity` with its first callers (preview, dial) in the same commit as the pass that flushes it, since a set nobody flushes is dead code; the turn flag; the finish stop; the texts and docs. `stop_locked` has no caller until the pass or the finish stop exists, so it lands with the pass.
 
@@ -276,9 +272,9 @@ Checked against `git ls-files` at `e3869e4`. Sizes are now, against the 40,000-b
 
 A scratch database through `scripts/check-server`, from the rules' template file (`<scratchpad>/sme-78/hands-on.sh`), with `-- SANDBOX_IDLE_STOP_MINUTES=3 SANDBOX_IDLE_NOTICE_MINUTES=1` and previews moved off 8181 (rules.md). The floor is 1 minute plus a 60 s pass; 3 minutes leaves room to see SME-79's notices not counting.
 
-1. Ask the model to write `/workspace/kept.txt` and start `python3 -m http.server 8000`, then share a preview.
-2. Reload the preview every 30 s for 5 minutes: the pod stays up, though an idle notice arrives every minute.
-3. Stop reloading. Within about 4 minutes:
+1. Ask the model to write `/workspace/kept.txt` and start `python3 -m http.server 8000`, then share a preview. Open it once.
+2. Leave it alone for 6 minutes: an idle notice arrives every minute, `/pods` reads `busy`, and **the pod stays up** (the user's answer 1).
+3. Ask the model to interrupt the server with `send_signal`. Within about 4 minutes of its exit:
    * the transcript shows the idle line;
    * the sidebar dot and the `/pods` row go;
    * the conversation doesn't move in the sidebar;
