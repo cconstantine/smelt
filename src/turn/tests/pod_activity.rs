@@ -93,3 +93,33 @@ async fn test_a_wake_that_drains_an_agent_message_notes_activity(pool: PgPool) {
     assert!(saved.iter().any(|m| m.content.contains("All done.")), "the report was delivered: {saved:?}");
     assert!(crate::sandbox::activity_noted(conversation_id), "an agent's report is activity");
 }
+
+const IDLE_LINE: &str = "- Your sandbox pod is stopped after 60 minutes with no activity and no command running; \
+    a running command keeps it, but a process left in the background (&, nohup, a detached container) doesn't. \
+    /workspace, Docker's data and volumes are kept.\n";
+const FINISH_LINE: &str = "- Your sandbox pod is stopped when you finish, unless a command is still running; \
+    /workspace and volumes are kept for if you're given more work.\n";
+
+#[test]
+fn test_the_environment_says_when_the_pod_is_stopped_on_idle() {
+    let env = super::prompt::prompt_env();
+    let prompt = system_prompt(&env);
+    assert!(prompt.contains(IDLE_LINE), "{prompt}");
+    assert!(!prompt.contains(FINISH_LINE), "only an agent finishes: {prompt}");
+
+    let off = PromptEnvironment { idle_stop_minutes: None, ..super::prompt::prompt_env() };
+    assert!(!system_prompt(&off).contains("with no activity"), "no idle line while idle stops are off");
+
+    let three = PromptEnvironment { idle_stop_minutes: Some(3), ..super::prompt::prompt_env() };
+    assert!(system_prompt(&three).contains("stopped after 3 minutes with no activity"), "the minutes in force");
+}
+
+#[test]
+fn test_an_agents_environment_says_finish_stops_its_pod() {
+    let agent = PromptEnvironment {
+        agent: Some(AgentPrompt { id: 7, parent_id: 42, persona: None }),
+        idle_stop_minutes: None,
+        ..super::prompt::prompt_env()
+    };
+    assert!(system_prompt(&agent).contains(FINISH_LINE), "even with idle stops off");
+}
