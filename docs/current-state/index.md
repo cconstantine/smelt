@@ -6,6 +6,7 @@ session can edit one section without rewriting the others (SME-159). Read this
 one first; the sections are:
 
 * [features.md](features.md) — what the app and the agent do, feature by feature
+* [sandbox.md](sandbox.md) — the sandbox pod: its claims, files, terminals, Docker and previews
 * [agents.md](agents.md) — child agents: what a conversation's model hands off, and how it hears back
 * [bug-bashes.md](bug-bashes.md) — what each bug bash swept and fixed
 * [architecture.md](architecture.md) — how the code is laid out, short version;
