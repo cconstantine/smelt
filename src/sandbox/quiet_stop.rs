@@ -216,12 +216,23 @@ impl StopReason {
 /// How long a quiet stop waits for the cluster's part (reading the pod and
 /// deleting it) before giving up: it holds the conversation's turn lock, so
 /// a stalled API server mustn't hold the user's next message for kube-rs's
-/// own, much longer, timeouts (SME-78 review 1, A3). Shorter in tests,
-/// but long enough for a real cluster delete (the real-pod test).
-#[cfg(not(test))]
+/// own, much longer, timeouts (SME-78 review 1, A3). It bounds only the real
+/// cluster's delete (`cluster_delete`), never a delete a test passes in
+/// (review 2, R2-4).
 pub(crate) const QUIET_STOP_DELETE_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(test)]
-pub(crate) const QUIET_STOP_DELETE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `delete`, given up on after `limit` as a timeout error.
+pub(in crate::sandbox) async fn bounded(
+    delete: impl std::future::Future<Output = Result<(), SandboxError>>,
+    limit: Duration,
+) -> Result<(), SandboxError> {
+    tokio::time::timeout(limit, delete).await.unwrap_or_else(|_| {
+        Err(SandboxError::Timeout(Some(format!(
+            "the cluster didn't answer the pod's delete within {} s",
+            limit.as_secs_f32()
+        ))))
+    })
+}
 
 /// The cluster's part of a quiet stop in production: the pod's delete.
 pub(in crate::sandbox) async fn cluster_delete(pool: &PgPool, pod_id: i64) -> Result<(), SandboxError> {
@@ -229,7 +240,8 @@ pub(in crate::sandbox) async fn cluster_delete(pool: &PgPool, pod_id: i64) -> Re
     if let Some(faked) = fake_delete::take(pod_id).await {
         return faked;
     }
-    Box::pin(delete_terminated_pod(pool, &get()?.client, pod_id)).await
+    let client = get()?.client.clone();
+    bounded(Box::pin(delete_terminated_pod(pool, &client, pod_id)), QUIET_STOP_DELETE_TIMEOUT).await
 }
 
 /// A cluster delete that succeeds without a cluster, for the tests of the
@@ -296,14 +308,6 @@ pub(crate) async fn stop_locked(
     delete: impl std::future::Future<Output = Result<(), SandboxError>>,
 ) -> bool {
     close_pod_terminals(pool, pod_id).await;
-    let delete = async {
-        tokio::time::timeout(QUIET_STOP_DELETE_TIMEOUT, delete).await.unwrap_or_else(|_| {
-            Err(SandboxError::Timeout(Some(format!(
-                "the cluster didn't answer the pod's delete within {} s",
-                QUIET_STOP_DELETE_TIMEOUT.as_secs_f32()
-            ))))
-        })
-    };
     match terminate_pod_with(pool, pod_id, delete).await {
         Ok(Some(_)) => {}
         Ok(None) => return false,

@@ -292,17 +292,19 @@ async fn test_a_failed_flush_before_the_recheck_skips_the_pod(pool: PgPool) {
 }
 
 /// SME-78 review 1 (A3): a cluster delete that never answers (a stalled
-/// API server) is given up on after `QUIET_STOP_DELETE_TIMEOUT`, so the
+/// API server) is given up on after its limit (`QUIET_STOP_DELETE_TIMEOUT`
+/// in `cluster_delete`; this test's own short one, review 2 R2-4), so the
 /// turn lock isn't held for kube-rs's own timeouts. The pod is left live,
 /// with no notice, for the next pass.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stalled_delete_times_out_and_leaves_the_pod(pool: PgPool) {
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let (conversation, pod) = idle_pod(&pool, 90).await;
-    let stalled = std::future::pending::<Result<(), SandboxError>>();
+    let limit = std::time::Duration::from_millis(300);
+    let stalled = bounded(std::future::pending::<Result<(), SandboxError>>(), limit);
 
     let stopped = tokio::time::timeout(
-        QUIET_STOP_DELETE_TIMEOUT * 4,
+        limit * 20,
         stop_locked(&pool, pod, conversation, StopReason::Idle { minutes: 60 }, stalled),
     )
     .await
@@ -311,4 +313,22 @@ async fn test_a_stalled_delete_times_out_and_leaves_the_pod(pool: PgPool) {
     assert!(!stopped);
     assert!(live(&pool, pod).await, "the pod is left for the next pass");
     assert_eq!(notices_with(&pool, conversation, "was stopped after").await.len(), 0, "no notice");
+}
+
+/// SME-78 review 2 (R2-4): the cluster-delete timeout bounds only the real
+/// cluster's delete, so a test's own slow delete (held at a gate on a
+/// loaded gate, say) isn't cut off.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_slow_delete_passed_in_is_not_timed_out(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let (conversation, pod) = idle_pod(&pool, 90).await;
+    let slow = async {
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        Ok(())
+    };
+
+    let stopped = stop_locked(&pool, pod, conversation, StopReason::Idle { minutes: 60 }, slow).await;
+
+    assert!(stopped, "a delete given to stop_locked runs to its end");
+    assert!(!live(&pool, pod).await);
 }
