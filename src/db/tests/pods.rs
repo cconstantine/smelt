@@ -285,6 +285,16 @@ async fn agent_conversation(pool: &PgPool, state: &str) -> i64 {
     child
 }
 
+/// Marks the agent finished now, as `finish_agent` does: after its pod
+/// and commands began, the order a real child's finish comes in.
+async fn mark_finished(pool: &PgPool, conversation_id: i64) {
+    sqlx::query("UPDATE agents SET state = 'finished', state_changed_at = now() WHERE conversation_id = $1")
+        .bind(conversation_id)
+        .execute(pool)
+        .await
+        .expect("finish the agent");
+}
+
 async fn set_agent_state(pool: &PgPool, conversation_id: i64, state: &str) {
     sqlx::query("UPDATE agents SET state = $2 WHERE conversation_id = $1")
         .bind(conversation_id)
@@ -395,8 +405,9 @@ async fn test_candidates_are_idle_past_the_threshold_or_a_finished_agents_never_
     age_pod(&pool, gone_pod.id, 600).await;
     terminate_sandbox_pod(&pool, gone_pod.id).await.expect("terminate");
 
-    let finished = agent_conversation(&pool, "finished").await;
+    let finished = agent_conversation(&pool, "active").await;
     let finished_pod = create_sandbox_pod(&pool, finished).await.expect("pod");
+    mark_finished(&pool, finished).await;
 
     let active = agent_conversation(&pool, "active").await;
     let active_pod = create_sandbox_pod(&pool, active).await.expect("pod");
@@ -416,12 +427,13 @@ async fn test_candidates_are_idle_past_the_threshold_or_a_finished_agents_never_
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_finished_agents_pod_with_a_running_command_is_a_candidate_once_it_ends(pool: PgPool) {
-    let finished = agent_conversation(&pool, "finished").await;
+    let finished = agent_conversation(&pool, "active").await;
     let terminal = test_terminal(&pool, finished).await;
     let pod = sandbox_terminal_pod_id(&pool, terminal).await.expect("lookup").expect("pod");
     create_terminal_command(&pool, finished, terminal, "cmd-left-up", "python3 -m http.server", 300)
         .await
         .expect("command");
+    mark_finished(&pool, finished).await;
     assert_eq!(candidates(&pool, 60).await, vec![], "a running command keeps it (the user's answer 1)");
     mark_terminal_command_finished(&pool, "cmd-left-up", 130).await.expect("finish");
     assert_eq!(candidates(&pool, 60).await, vec![(pod, QuietStopKind::Finished)]);
@@ -472,8 +484,9 @@ async fn test_pod_still_stoppable_turns_false_on_each_change(pool: PgPool) {
     assert!(!pod_still_stoppable(&pool, pod, QuietStopKind::Idle, 0).await.expect("re-check"), "idle stops off");
 
     // Finished: the agent going active again.
-    let child = agent_conversation(&pool, "finished").await;
+    let child = agent_conversation(&pool, "active").await;
     let child_pod = create_sandbox_pod(&pool, child).await.expect("pod");
+    mark_finished(&pool, child).await;
     assert!(pod_still_stoppable(&pool, child_pod.id, QuietStopKind::Finished, 0).await.expect("re-check"));
     assert!(
         !pod_still_stoppable(&pool, child_pod.id, QuietStopKind::Idle, 60).await.expect("re-check"),
@@ -507,4 +520,83 @@ async fn test_flush_pod_activity_writes_only_live_pods(pool: PgPool) {
     assert_eq!(stamps[1].0, live.id);
     assert!(stamps[1].1.is_some(), "the live pod is stamped");
     assert_eq!(stamps[2], (untouched.id, None), "another conversation's pod");
+}
+
+/// Moves the agent's finish back `minutes`, as if it finished that long ago.
+async fn finished_ago(pool: &PgPool, conversation_id: i64, minutes: i64) {
+    sqlx::query("UPDATE agents SET state_changed_at = state_changed_at - make_interval(mins => $2::int) WHERE conversation_id = $1")
+        .bind(conversation_id)
+        .bind(minutes as i32)
+        .execute(pool)
+        .await
+        .expect("move the finish back");
+}
+
+/// SME-78 review 1 (A2): a finished agent's pod is stopped as Finished only
+/// if nothing used it after the finish. A pod started after it, a command
+/// started after it, or a note (a preview, a dial) more than the grace
+/// after it falls back to the idle rule. The finish turn's own note within
+/// the grace, and a command left running that finishes later (the
+/// backstop's case), don't count.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_finished_agents_pod_used_after_the_finish_waits_for_the_idle_rule(pool: PgPool) {
+    async fn finished_pod(pool: &PgPool) -> (i64, i64) {
+        let child = agent_conversation(pool, "active").await;
+        let pod = create_sandbox_pod(pool, child).await.expect("pod").id;
+        age_pod(pool, pod, 30).await;
+        mark_finished(pool, child).await;
+        finished_ago(pool, child, 10).await;
+        (child, pod)
+    }
+    async fn finished(pool: &PgPool, pod: i64) -> bool {
+        pod_still_stoppable(pool, pod, QuietStopKind::Finished, 0).await.expect("re-check")
+    }
+    let mine = |c: &[(i64, QuietStopKind)], pod: i64| c.iter().find(|(p, _)| *p == pod).map(|(_, k)| *k);
+
+    // A pod started after the finish: the user's "Work on a repo", say.
+    let child = agent_conversation(&pool, "active").await;
+    mark_finished(&pool, child).await;
+    finished_ago(&pool, child, 10).await;
+    let started_after = create_sandbox_pod(&pool, child).await.expect("pod").id;
+    assert!(!finished(&pool, started_after).await, "a pod started after the finish");
+    assert_eq!(mine(&candidates(&pool, 60).await, started_after), None, "and not idle yet");
+
+    // A command started after the finish.
+    let (child, commanded) = finished_pod(&pool).await;
+    let terminal = create_sandbox_terminal(&pool, commanded).await.expect("terminal");
+    let id = format!("after-finish-{child}");
+    create_terminal_command(&pool, child, terminal.id, &id, "true", 300).await.expect("command");
+    mark_terminal_command_finished(&pool, &id, 0).await.expect("finish");
+    assert!(!finished(&pool, commanded).await, "a command started after the finish");
+
+    // A note well after the finish (a preview): past the grace.
+    let (child, previewed) = finished_pod(&pool).await;
+    flush_pod_activity(&pool, &[child]).await.expect("flush");
+    assert!(!finished(&pool, previewed).await, "a preview ten minutes after the finish");
+    // ... and once it's idle past the threshold, it's an idle candidate.
+    age_pod(&pool, previewed, 61).await;
+    finished_ago(&pool, child, 61).await;
+    assert_eq!(mine(&candidates(&pool, 60).await, previewed), Some(QuietStopKind::Idle));
+
+    // The finish turn's own note, flushed within the grace: still Finished.
+    let (child, own_note) = finished_pod(&pool).await;
+    sqlx::query("UPDATE sandbox_pods SET last_active_at = (SELECT state_changed_at FROM agents WHERE conversation_id = $1) + interval '1 minute' WHERE id = $2")
+        .bind(child)
+        .bind(own_note)
+        .execute(&pool)
+        .await
+        .expect("a note a minute after the finish");
+    assert!(finished(&pool, own_note).await, "the finish turn's own note, inside the grace");
+    assert_eq!(mine(&candidates(&pool, 60).await, own_note), Some(QuietStopKind::Finished));
+
+    // A command started before the finish and ending after it: the backstop's case.
+    let child = agent_conversation(&pool, "active").await;
+    let pod = create_sandbox_pod(&pool, child).await.expect("pod").id;
+    let terminal = create_sandbox_terminal(&pool, pod).await.expect("terminal");
+    let id = format!("left-running-{child}");
+    create_terminal_command(&pool, child, terminal.id, &id, "npm run dev", 0).await.expect("command");
+    age_pod(&pool, pod, 30).await;
+    mark_finished(&pool, child).await;
+    mark_terminal_command_finished(&pool, &id, 130).await.expect("it ends after the finish");
+    assert!(finished(&pool, pod).await, "a command left running that ends after the finish");
 }

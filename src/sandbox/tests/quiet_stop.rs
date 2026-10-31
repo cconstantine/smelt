@@ -45,7 +45,8 @@ async fn age(pool: &PgPool, pod_id: i64, minutes: i64) {
     .expect("age its commands");
 }
 
-/// A finished agent's conversation, under a fresh parent.
+/// An agent's conversation, under a fresh parent: `active` until
+/// `mark_finished`, which a test calls once it has given it a pod.
 async fn finished_agent(pool: &PgPool) -> i64 {
     let parent = db::create_conversation(pool).await.expect("parent");
     let child = sqlx::query_scalar::<_, i64>("INSERT INTO conversations (title, parent_id) VALUES ('child', $1) RETURNING id")
@@ -53,13 +54,22 @@ async fn finished_agent(pool: &PgPool) -> i64 {
         .fetch_one(pool)
         .await
         .expect("a child row");
-    sqlx::query("INSERT INTO agents (conversation_id, root_id, depth, brief, state) VALUES ($1, $2, 1, 'b', 'finished')")
+    sqlx::query("INSERT INTO agents (conversation_id, root_id, depth, brief, state) VALUES ($1, $2, 1, 'b', 'active')")
         .bind(child)
         .bind(parent.id)
         .execute(pool)
         .await
         .expect("its agent row");
     child
+}
+
+/// Marks the agent finished now, after its pod, as a real finish comes.
+async fn mark_finished(pool: &PgPool, conversation_id: i64) {
+    sqlx::query("UPDATE agents SET state = 'finished', state_changed_at = now() WHERE conversation_id = $1")
+        .bind(conversation_id)
+        .execute(pool)
+        .await
+        .expect("finish the agent");
 }
 
 /// The texts of `conversation_id`'s messages that contain `needle`.
@@ -233,6 +243,7 @@ async fn test_at_zero_an_idle_pod_stays_and_a_finished_agents_pod_still_goes(poo
     let (_, idle) = idle_pod(&pool, 6000).await;
     let child = finished_agent(&pool).await;
     let child_pod = db::create_sandbox_pod(&pool, child).await.expect("pod");
+    mark_finished(&pool, child).await;
 
     assert_eq!(pass(&pool, 0).await, vec![child_pod.id], "the backstop, with idle stops off");
     assert!(live(&pool, idle).await, "idle stops are off");

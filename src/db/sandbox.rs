@@ -119,9 +119,36 @@ const POD_BUSY: &str = "(EXISTS (SELECT 1 FROM conversation_repos r \
         JOIN sandbox_terminals t ON t.id = tc.terminal_id \
         WHERE t.pod_id = p.id AND tc.status = 'running'))";
 
-/// Pod `p`'s conversation is a `finished` agent's.
-const POD_FINISHED: &str = "EXISTS (SELECT 1 FROM agents a \
-        WHERE a.conversation_id = p.conversation_id AND a.state = 'finished')";
+/// How often the idle pass (`sandbox::stop_idle_pods`) runs, in seconds.
+/// The pass's tick and `FINISHED_GRACE_SECS` are both derived from it.
+pub const QUIET_STOP_PASS_SECS: u64 = 60;
+
+/// How long after an agent's finish a flushed note (`last_active_at`)
+/// still counts as part of the finish: the finish turn's own end is noted
+/// after `state_changed_at`, and reaches the database at the next pass's
+/// flush, up to one pass later. Two passes covers both (SME-78 review 1, A2).
+const FINISHED_GRACE_SECS: u64 = 2 * QUIET_STOP_PASS_SECS;
+
+/// Pod `p` is a `finished` agent's and nothing used it after the finish
+/// (SME-78 review 1, A2): it was started at or before the finish, no
+/// command started in it since, and its last note is no later than the
+/// finish plus `FINISHED_GRACE_SECS`. A command left running that ends
+/// after the finish doesn't count, so the backstop stops the pod once it
+/// does. A pod the user started or used after the finish (Work on a repo,
+/// a preview) falls back to the idle rule. The one copy of the rule, for
+/// the candidates and the re-check alike.
+fn pod_finished() -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM agents a \
+           WHERE a.conversation_id = p.conversation_id AND a.state = 'finished' \
+             AND p.created_at <= a.state_changed_at \
+             AND (p.last_active_at IS NULL \
+                  OR p.last_active_at <= a.state_changed_at + make_interval(secs => {FINISHED_GRACE_SECS})) \
+             AND NOT EXISTS (SELECT 1 FROM terminal_commands tc \
+                  JOIN sandbox_terminals t ON t.id = tc.terminal_id \
+                  WHERE t.pod_id = p.id AND tc.created_at > a.state_changed_at))"
+    )
+}
 
 /// Pod `p` has been idle for `$1` minutes or more; never when `$1` is 0.
 const POD_IDLE_PAST: &str = "($1 > 0 AND now() - {POD_IDLE_SINCE} >= make_interval(mins => $1))";
@@ -147,11 +174,12 @@ pub async fn quiet_stop_candidates(
     minutes: u32,
 ) -> Result<Vec<(i64, i64, QuietStopKind)>, sqlx::Error> {
     let rows: Vec<(i64, i64, bool)> = sqlx::query_as(&format!(
-        "SELECT p.id, p.conversation_id, {POD_FINISHED} AS finished
+        "SELECT p.id, p.conversation_id, {finished} AS finished
            FROM sandbox_pods p
           WHERE p.terminated_at IS NULL AND NOT {POD_BUSY}
-            AND ({POD_FINISHED} OR {idle_past})
+            AND ({finished} OR {idle_past})
           ORDER BY p.created_at ASC, p.id ASC",
+        finished = pod_finished(),
         idle_past = pod_idle_past(),
     ))
     .bind(minutes_param(minutes))
@@ -182,7 +210,7 @@ pub async fn pod_still_stoppable(
 ) -> Result<bool, sqlx::Error> {
     let rule = match kind {
         QuietStopKind::Idle => pod_idle_past(),
-        QuietStopKind::Finished => POD_FINISHED.to_string(),
+        QuietStopKind::Finished => pod_finished(),
     };
     sqlx::query_scalar(&format!(
         "SELECT EXISTS (SELECT 1 FROM sandbox_pods p

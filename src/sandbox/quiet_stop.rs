@@ -308,7 +308,7 @@ async fn save_stop_notice(pool: &PgPool, pod_id: i64, conversation_id: i64, reas
 
 /// How often the idle pass runs: a pod stops between N and N+1 minutes
 /// after its last activity.
-const IDLE_STOP_TICK: Duration = Duration::from_secs(60);
+const IDLE_STOP_TICK: Duration = Duration::from_secs(db::QUIET_STOP_PASS_SECS);
 
 /// For as long as smelt runs, stops idle pods and finished agents' pods
 /// quietly, once a minute. Only a real server runs this (from `main`),

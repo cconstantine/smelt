@@ -158,7 +158,7 @@ async fn test_a_message_landing_before_the_stops_recheck_keeps_the_pod(pool: PgP
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let child = active_child(&pool, root).await;
     let pod = db::create_sandbox_pod(&pool, child).await.expect("pod").id;
-    sqlx::query("UPDATE agents SET state = 'finished' WHERE conversation_id = $1")
+    sqlx::query("UPDATE agents SET state = 'finished', state_changed_at = now() WHERE conversation_id = $1")
         .bind(child)
         .execute(&pool)
         .await
@@ -207,7 +207,7 @@ async fn test_the_finish_stop_waits_for_a_held_turn_lock(pool: PgPool) {
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let child = active_child(&pool, root).await;
     let pod = db::create_sandbox_pod(&pool, child).await.expect("pod").id;
-    sqlx::query("UPDATE agents SET state = 'finished' WHERE conversation_id = $1")
+    sqlx::query("UPDATE agents SET state = 'finished', state_changed_at = now() WHERE conversation_id = $1")
         .bind(child)
         .execute(&pool)
         .await
