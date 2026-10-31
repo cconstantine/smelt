@@ -50,10 +50,17 @@ async fn finish_notices(pool: &PgPool, child: i64) -> usize {
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_childs_finish_stops_its_pod_and_leaves_its_volumes(pool: PgPool) {
     let (root, child, pod, ready) = finishing_child_with_pod(&pool).await;
+    // A volume the root made and passed to the child, which mounts it
+    // (review 1, A5): the child's own mount row is the one a stop could touch.
     let mut conn = pool.acquire().await.expect("a connection");
-    db::create_agent_volume_with_owner_mount(&mut conn, root, "shared", "/mnt/shared").await.expect("a volume");
+    let volume = db::create_agent_volume_with_owner_mount(&mut conn, root, "shared", "/mnt/shared").await.expect("a volume");
     drop(conn);
-    let mounts_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_volume_mounts").fetch_one(&pool).await.expect("count");
+    sqlx::query("INSERT INTO conversation_volume_mounts (conversation_id, volume_id) VALUES ($1, $2)")
+        .bind(child)
+        .bind(volume.id)
+        .execute(&pool)
+        .await
+        .expect("the child mounts it");
     crate::sandbox::fake_delete::succeed(pod);
 
     ready.notify_one();
@@ -61,9 +68,18 @@ async fn test_a_childs_finish_stops_its_pod_and_leaves_its_volumes(pool: PgPool)
 
     assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_FINISHED));
     eventually("the notice is saved", || async { finish_notices(&pool, child).await == 1 }).await;
-    let volumes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_volumes").fetch_one(&pool).await.expect("count");
-    let mounts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_volume_mounts").fetch_one(&pool).await.expect("count");
-    assert_eq!((volumes, mounts), (1, mounts_before), "the stop touches no volume or mount row");
+    let volume_kept: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM agent_volumes WHERE id = $1)")
+        .bind(volume.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read");
+    let mounts: Vec<i64> = sqlx::query_scalar("SELECT conversation_id FROM conversation_volume_mounts WHERE volume_id = $1 ORDER BY conversation_id")
+        .bind(volume.id)
+        .fetch_all(&pool)
+        .await
+        .expect("read");
+    assert!(volume_kept, "the stop deleted the volume");
+    assert_eq!(mounts, vec![root, child], "the stop touches neither the owner's nor the child's mount row");
 }
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
