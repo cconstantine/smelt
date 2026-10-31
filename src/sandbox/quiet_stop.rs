@@ -186,6 +186,15 @@ impl StopReason {
     }
 }
 
+/// How long a quiet stop waits for the cluster's part (reading the pod and
+/// deleting it) before giving up: it holds the conversation's turn lock, so
+/// a stalled API server mustn't hold the user's next message for kube-rs's
+/// own, much longer, timeouts (SME-78 review 1, A3). Short in tests.
+#[cfg(not(test))]
+pub(crate) const QUIET_STOP_DELETE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+pub(crate) const QUIET_STOP_DELETE_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// The cluster's part of a quiet stop in production: the pod's delete.
 pub(in crate::sandbox) async fn cluster_delete(pool: &PgPool, pod_id: i64) -> Result<(), SandboxError> {
     #[cfg(test)]
@@ -251,6 +260,14 @@ pub(crate) async fn stop_locked(
     delete: impl std::future::Future<Output = Result<(), SandboxError>>,
 ) -> bool {
     close_pod_terminals(pool, pod_id).await;
+    let delete = async {
+        tokio::time::timeout(QUIET_STOP_DELETE_TIMEOUT, delete).await.unwrap_or_else(|_| {
+            Err(SandboxError::Timeout(Some(format!(
+                "the cluster didn't answer the pod's delete within {} s",
+                QUIET_STOP_DELETE_TIMEOUT.as_secs_f32()
+            ))))
+        })
+    };
     match terminate_pod_with(pool, pod_id, delete).await {
         Ok(Some(_)) => {}
         Ok(None) => return false,

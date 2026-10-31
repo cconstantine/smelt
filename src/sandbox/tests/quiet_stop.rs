@@ -279,3 +279,25 @@ async fn test_a_failed_flush_before_the_recheck_skips_the_pod(pool: PgPool) {
     assert!(notes.contains(conversation), "the note is kept for the next flush");
     assert_eq!(stop_idle_pods_once_with(&pool, 60, &notes, deleted).await, Vec::<i64>::new(), "the next pass flushes it");
 }
+
+/// SME-78 review 1 (A3): a cluster delete that never answers (a stalled
+/// API server) is given up on after `QUIET_STOP_DELETE_TIMEOUT`, so the
+/// turn lock isn't held for kube-rs's own timeouts. The pod is left live,
+/// with no notice, for the next pass.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_stalled_delete_times_out_and_leaves_the_pod(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let (conversation, pod) = idle_pod(&pool, 90).await;
+    let stalled = std::future::pending::<Result<(), SandboxError>>();
+
+    let stopped = tokio::time::timeout(
+        QUIET_STOP_DELETE_TIMEOUT * 4,
+        stop_locked(&pool, pod, conversation, StopReason::Idle { minutes: 60 }, stalled),
+    )
+    .await
+    .expect("the stop gives up on a stalled delete");
+
+    assert!(!stopped);
+    assert!(live(&pool, pod).await, "the pod is left for the next pass");
+    assert_eq!(notices_with(&pool, conversation, "was stopped after").await.len(), 0, "no notice");
+}
