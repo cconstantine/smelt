@@ -57,6 +57,12 @@ pub(super) struct ConversationRuntime {
     started_at: Option<std::time::Instant>,
     /// The last failed turn's error and the turn generation.
     kept: KeptTurnError,
+    /// A turn running now brought the model something new — the user's
+    /// send or answer, a delivered notice, an agent's message, a finished
+    /// command's notice — so its end is pod activity (SME-78). Set at the
+    /// turn's start and by the drains; taken at its end. An idle notice
+    /// alone doesn't set it (the user's answer 2).
+    activity_owed: bool,
 }
 
 impl ConversationRuntime {
@@ -467,6 +473,18 @@ pub(crate) fn busy_conversations() -> Vec<i64> {
         .filter(|(_, runtime)| runtime.turns_in_flight > 0)
         .map(|(id, _)| *id)
         .collect()
+}
+
+/// Marks `conversation_id`'s running turn as bringing something new
+/// (`ConversationRuntime::activity_owed`). Only while it has turn state,
+/// which a running turn always does.
+pub(super) fn set_activity_owed(conversation_id: i64) {
+    update_existing(conversation_id, |runtime| runtime.activity_owed = true);
+}
+
+/// Takes and clears `activity_owed`, at a turn's end.
+pub(super) fn take_activity_owed(conversation_id: i64) -> bool {
+    update_existing_with(conversation_id, |runtime| std::mem::take(&mut runtime.activity_owed)).unwrap_or(false)
 }
 
 /// A turn counted as in flight for `conversation_id` until it drops, for

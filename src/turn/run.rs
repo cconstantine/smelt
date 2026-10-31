@@ -123,6 +123,12 @@ pub(super) fn run_turn_bounded<'a>(
         crate::telemetry::in_span(span.clone(), async move {
             #[cfg(test)]
             test_hooks::after_turn_counted(conversation_id).await;
+            // A send, an answer or a delivered notice brings the model
+            // something new: its end is pod activity (SME-78). A wake has
+            // neither, and its drains decide.
+            if new_message.is_some() || keep_error.is_some() {
+                set_activity_owed(conversation_id);
+            }
             // The turn's generation, once it holds the lock and has something
             // to tell the model (`run_turn_stoppable`).
             let mut generation = None;
@@ -159,6 +165,11 @@ pub(super) fn run_turn_bounded<'a>(
             // A child agent whose last turn ended without its report tells
             // its parent (SME-236), checked once this turn no longer counts.
             // Not after a stop, nor a wake that found nothing to do.
+            // Pod activity first, while the turn still holds its state: at
+            // its end, so a long turn counts from when it finished (SME-78).
+            if take_activity_owed(conversation_id) {
+                crate::sandbox::note_activity(conversation_id);
+            }
             drop(in_flight);
             let ended = match &result {
                 Ok(saved) if saved.is_empty() => None,
