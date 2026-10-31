@@ -134,3 +134,27 @@ fn test_lines_counts_the_values_lines() {
     // four bytes shown, the last eight still absent.
     assert_eq!(shown("\nabcdefg1234"), "\nabc… (12 bytes)");
 }
+
+/// SME-334 T3: the save → store pin. A multi-line value handed to the
+/// save path reads back from `db::get_named_secret` **byte-equal** —
+/// every newline the textarea just preserved survives handler, bind
+/// and column — and the list body still shows nothing beyond D7's
+/// prefix (the marker line, and any interior line, absent). Today it
+/// passes; its job is tomorrow: one `trim` or `replace('\n', …)`
+/// inserted between this handler and the bind goes red here, on the
+/// first byte that moved (tdd.md's stub check, recorded at the commit).
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_multi_line_value_saves_byte_equal_and_leaks_nothing(pool: PgPool) {
+    let pool = &pool;
+    let value = "apiVersion: v1\nclusters:\n\nkind: list\nMARKER-7-not-a-real-secret-value\n";
+    let saved = save_secret_of(pool, None, "kube-ish", value).await.expect("saved");
+    assert_eq!(saved.lines, 5, "the row counts the pasted lines, trailing newline aside");
+    let stored = db::get_named_secret(pool, saved.id).await.expect("read").expect("the row");
+    assert_eq!(stored.value, value, "the bytes in are the bytes back");
+
+    let body = serde_json::to_string(&list_secrets_of(pool).await.expect("listed")).expect("json");
+    assert!(body.contains("apiV"), "the four-byte prefix shows: {body}");
+    for leaked in ["apiVersion", "clusters", "kind", marker(), "MARKE"] {
+        assert!(!body.contains(leaked), "{leaked} reached the list body: {body}");
+    }
+}
