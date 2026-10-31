@@ -28,33 +28,56 @@ use super::*;
 /// hot path writes nothing; the idle pass flushes it every minute, and
 /// again before each re-check. A restart loses at most one pass of notes.
 #[derive(Default)]
-pub(crate) struct ActivityNotes(StdMutex<HashSet<i64>>);
+pub(crate) struct ActivityNotes {
+    noted: StdMutex<HashSet<i64>>,
+    /// Makes the next flush fail as a database error would, for the tests.
+    #[cfg(test)]
+    fail_next_flush: std::sync::atomic::AtomicBool,
+}
 
 impl ActivityNotes {
     pub(crate) fn note(&self, conversation_id: i64) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).insert(conversation_id);
+        self.noted.lock().unwrap_or_else(|e| e.into_inner()).insert(conversation_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_flush(&self) {
+        self.fail_next_flush.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(test)]
     pub(crate) fn contains(&self, conversation_id: i64) -> bool {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).contains(&conversation_id)
+        self.noted.lock().unwrap_or_else(|e| e.into_inner()).contains(&conversation_id)
     }
 
     /// Writes the notes to the database, and forgets them only once that
-    /// succeeded: a failed flush keeps them for the next one.
-    pub(crate) async fn flush(&self, pool: &PgPool) {
-        let noted: Vec<i64> = self.0.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
+    /// succeeded: a failed flush keeps them for the next one. Whether it
+    /// succeeded (nothing to write is success).
+    pub(crate) async fn flush(&self, pool: &PgPool) -> bool {
+        let noted: Vec<i64> = self.noted.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
         if noted.is_empty() {
-            return;
+            return true;
         }
-        match db::flush_pod_activity(pool, &noted).await {
+        #[cfg(test)]
+        let flushed = if self.fail_next_flush.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            Err(sqlx::Error::PoolTimedOut)
+        } else {
+            db::flush_pod_activity(pool, &noted).await
+        };
+        #[cfg(not(test))]
+        let flushed = db::flush_pod_activity(pool, &noted).await;
+        match flushed {
             Ok(()) => {
-                let mut notes = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                let mut notes = self.noted.lock().unwrap_or_else(|e| e.into_inner());
                 for id in &noted {
                     notes.remove(id);
                 }
+                true
             }
-            Err(e) => tracing::warn!(error = %e, "couldn't record sandbox pod activity; kept for the next pass"),
+            Err(e) => {
+                tracing::warn!(error = %e, "couldn't record sandbox pod activity; kept for the next pass");
+                false
+            }
         }
     }
 }
@@ -339,7 +362,11 @@ pub(crate) async fn stop_candidate(
         if crate::turn::turn_running(conversation_id) {
             return false;
         }
-        notes.flush(pool).await;
+        // A failed flush may hide activity just noted: no stop on a stale
+        // clock this pass (review 1, A1).
+        if !notes.flush(pool).await {
+            return false;
+        }
         match db::pod_still_stoppable(pool, pod_id, reason.kind(), reason.minutes()).await {
             Ok(true) => stop_locked(pool, pod_id, conversation_id, reason, delete).await,
             Ok(false) => false,

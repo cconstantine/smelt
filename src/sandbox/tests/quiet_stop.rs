@@ -259,3 +259,23 @@ async fn test_a_running_command_keeps_its_pod_until_it_ends_and_the_threshold_pa
     age(&pool, pod, 61).await;
     assert_eq!(pass(&pool, 60).await, vec![pod], "the threshold passed from finished_at");
 }
+
+/// SME-78 review 1 (A1): a flush that fails under the locks skips the
+/// candidate for this pass, rather than stopping it on a `last_active_at`
+/// that misses the activity just noted. The next pass, its flush through,
+/// sees the activity and keeps the pod.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_failed_flush_before_the_recheck_skips_the_pod(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let (conversation, pod) = idle_pod(&pool, 90).await;
+    let notes = ActivityNotes::default();
+    notes.note(conversation);
+    notes.fail_next_flush();
+
+    let stopped = stop_candidate(&pool, &notes, pod, conversation, StopReason::Idle { minutes: 60 }, deleted(pod)).await;
+
+    assert!(!stopped, "stopped on a stale last_active_at");
+    assert!(live(&pool, pod).await);
+    assert!(notes.contains(conversation), "the note is kept for the next flush");
+    assert_eq!(stop_idle_pods_once_with(&pool, 60, &notes, deleted).await, Vec::<i64>::new(), "the next pass flushes it");
+}
