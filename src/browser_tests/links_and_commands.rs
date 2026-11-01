@@ -246,7 +246,7 @@ pub(super) async fn scenario_terminal_command_indicator(t: &Scenario<'_>) {
 
     // Long output, then a pause, then a failure. A subshell: a bare `exit`
     // would end the terminal's own shell.
-    run("for i in $(seq -w 1 200); do echo indicator-$i; done; sleep 6; (exit 3)", "cmd-long").await;
+    run("for i in $(seq -w 1 200); do echo indicator-$i; done; for i in $(seq 60); do [ -e /home/sandbox/.stop-indicator ] && break; sleep 0.1; done; (exit 3)", "cmd-long").await;
     assert!(wait_for_text(&page, "indicator-200", Duration::from_secs(30)).await, "the output should stream in");
     let pill = wait_for_pill(&page, "running", "task-terminal-command-running", Duration::from_secs(5)).await;
     let overflows: bool = page
@@ -261,6 +261,7 @@ pub(super) async fn scenario_terminal_command_indicator(t: &Scenario<'_>) {
     page.evaluate("document.querySelector('.task-terminal-body').scrollTop = 0").await.expect("scroll to the top");
     let pill = command_pill(&page).await;
     assert_eq!(pill["viewport"].as_bool(), Some(true), "scrolled to the top, the pill left the viewport: {pill}");
+    stop_trickling(t, conversation.id, "indicator").await;
     let pill = wait_for_pill(&page, "exit 3", "task-terminal-command-failed", Duration::from_secs(20)).await;
     assert!(pill["title"].as_str().is_some_and(|t| t.contains("exited with status 3")), "{pill}");
     heights.push(("exit 3", titlebar_height(&page).await));

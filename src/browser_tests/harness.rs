@@ -456,12 +456,24 @@ pub(super) struct MockUpstream {
     chunks_sent: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     open: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     reply_words: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    hurried: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Raises the mock's reply length for one scenario and puts the default
 /// back when it drops — including when the scenario fails, since every
 /// scenario in the run shares this one mock.
 pub(super) struct LongerReply(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+/// The mock sending without its 200ms pauses, until it drops (see
+/// `MockUpstream::hurry`) — including when the scenario fails, since every
+/// scenario in the run shares the mock.
+pub(super) struct Hurried(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for Hurried {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 impl Drop for LongerReply {
     fn drop(&mut self) {
@@ -489,12 +501,13 @@ impl MockUpstream {
         let open = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let reply_words =
             std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(DEFAULT_REPLY_WORDS));
-        let (sent, opened, words) = (chunks_sent.clone(), open.clone(), reply_words.clone());
+        let hurried = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (sent, opened, words, hurry) = (chunks_sent.clone(), open.clone(), reply_words.clone(), hurried.clone());
         let router = axum::Router::new().route(
             "/v1/messages",
             axum::routing::post(move || {
-                let (sent, opened, words) =
-                    (sent.clone(), opened.clone(), words.clone());
+                let (sent, opened, words, hurry) =
+                    (sent.clone(), opened.clone(), words.clone(), hurry.clone());
                 async move {
                     let mut chunks = vec![event("message_start", r#"{"type":"message_start"}"#)];
                     let words = words.load(std::sync::atomic::Ordering::SeqCst);
@@ -515,9 +528,11 @@ impl MockUpstream {
                     opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let reply = OpenReply(opened);
                     let body = futures_util::StreamExt::then(futures_util::stream::iter(chunks), move |chunk| {
-                        let sent = sent.clone();
+                        let (sent, hurry) = (sent.clone(), hurry.clone());
                         async move {
-                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            if !hurry.load(std::sync::atomic::Ordering::SeqCst) {
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                            }
                             sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             Ok::<_, std::io::Error>(chunk)
                         }
@@ -545,6 +560,7 @@ impl MockUpstream {
             chunks_sent,
             open,
             reply_words,
+            hurried,
         }
     }
 
@@ -561,6 +577,16 @@ impl MockUpstream {
         self.reply_words
             .store(words, std::sync::atomic::Ordering::SeqCst);
         LongerReply(self.reply_words.clone())
+    }
+
+    /// Send the rest of every open reply at once, and any reply started
+    /// while the returned guard lives: for a scenario whose long reply only
+    /// had to outlast something (a reload, a second tab) and which then only
+    /// waits for it to end (SME-341's speed pass). The reply still ends as
+    /// it would, and the turn with it.
+    pub(super) fn hurry(&self) -> Hurried {
+        self.hurried.store(true, std::sync::atomic::Ordering::SeqCst);
+        Hurried(self.hurried.clone())
     }
 
     pub(super) fn open(&self) -> usize {
@@ -675,4 +701,22 @@ pub(super) async fn find_leftovers(
         }
     }
     leftovers
+}
+
+/// Ends a command's pauses early: a scenario's command that has to keep
+/// running (or keep trickling output) while the scenario checks something
+/// skips its `sleep`s once `/home/sandbox/.stop-<name>` exists, and the
+/// scenario calls this once its checks are done. The command still ends the
+/// way it would have, without the scenario waiting out a fixed timer
+/// (SME-341's speed pass).
+pub(super) async fn stop_trickling(t: &Scenario<'_>, conversation_id: i64, name: &str) {
+    anthropic::tools::execute(
+        t.pool,
+        conversation_id,
+        &unique_id("stop-trickle"),
+        "write_file",
+        &serde_json::json!({"path": format!("/home/sandbox/.stop-{name}"), "content": ""}),
+    )
+    .await
+    .expect("write the burst's stop file");
 }

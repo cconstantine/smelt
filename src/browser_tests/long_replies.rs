@@ -124,7 +124,9 @@ pub(super) async fn scenario_working_line_timer_survives_a_reload(t: &Scenario<'
         after >= second_tab,
         "the timer started over with the reload: {before}s before it, {second_tab}s in a second tab opened mid-turn, {after}s after the reload"
     );
-    // The turn finishes as usual, and the line goes with it.
+    // The turn finishes as usual, and the line goes with it: the reply,
+    // which only had to outlast the reload, sends its rest at once.
+    let _hurried = t.mock.hurry();
     assert!(
         t.mock.wait_until_idle(Duration::from_secs(30)).await,
         "the reply never finished upstream"
