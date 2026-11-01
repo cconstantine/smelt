@@ -17,23 +17,60 @@ pub(crate) struct HeldDirectory {
     holding: Option<sqlx::Transaction<'static, sqlx::Postgres>>,
     /// The holding session's backend pid, for [`blocked_by`].
     pub(crate) pid: i32,
+    /// For [`HeldDirectory::fail_the_other_clone`].
+    pool: PgPool,
+    conversation: i64,
+    dir: String,
+    remote_key: String,
 }
 
 impl HeldDirectory {
     /// Commits the held row: an attach waiting on it fails with "already
     /// used by".
-    pub(crate) async fn commit(mut self) {
+    pub(crate) async fn commit(&mut self) {
         if let Some(holding) = self.holding.take() {
             holding.commit().await.expect("commit the other remote's repo");
         }
     }
+
+    /// Ends the other remote's clone, once the attach that waited on it
+    /// has answered (its "already used by" seen): sooner, the attach's
+    /// re-plan after its lost insert would find the directory free to
+    /// retry and fail another way. It ends the way a real one does: marked failed, as a restart
+    /// leaves a clone it cut off (`db::fail_unfinished_clones`). Left
+    /// cloning, its row would hold every later turn in its conversation at
+    /// `wait_for_clones` for the whole `CLONE_WAIT` (SME-319).
+    pub(crate) async fn fail_the_other_clone(&self) {
+        let failed = fail_clone(&self.pool, self.conversation, &self.dir, &self.remote_key)
+            .await
+            .expect("fail the other remote's clone");
+        assert_eq!(failed, 1, "the other remote's clone should be the one row failed");
+    }
+}
+
+/// Marks the hold's row failed if it's still cloning: how many rows it
+/// marked.
+async fn fail_clone(pool: &PgPool, conversation: i64, dir: &str, remote_key: &str) -> Result<u64, sqlx::Error> {
+    let done = sqlx::query(
+        "UPDATE conversation_repos SET status = 'failed', error = 'the other clone failed', updated_at = now()
+          WHERE conversation_id = $1 AND dir = $2 AND remote_key = $3 AND status = 'cloning'",
+    )
+    .bind(conversation)
+    .bind(dir)
+    .bind(remote_key)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected())
 }
 
 /// A hold dropped without [`HeldDirectory::commit`] (a scenario that failed
 /// or ran out of time) commits too, rather than rolling back: rolled back,
 /// it let the waiting attach go on to start a real sandbox and clone from
 /// GitHub (code review 1). Committed, the attach fails fast with "already
-/// used by", as when the scenario releases it.
+/// used by", as when the scenario releases it. Its clone stays cloning:
+/// failed, an attach that hadn't planned yet would retry the directory in
+/// place and clone from GitHub. Only the failed scenario's own
+/// conversation waits on it (SME-319 code review 1, L1).
 impl Drop for HeldDirectory {
     fn drop(&mut self) {
         if let Some(holding) = self.holding.take()
@@ -56,18 +93,19 @@ pub(crate) async fn hold_directory(pool: &PgPool, conversation: i64, dir: &str) 
         .fetch_one(&mut *holding)
         .await
         .expect("the holding session's pid");
+    let remote_key = format!("github.com/x/{dir}");
     sqlx::query(
         "INSERT INTO conversation_repos (conversation_id, url, remote_key, dir, status)
          VALUES ($1, $2, $3, $4, 'cloning')",
     )
     .bind(conversation)
-    .bind(format!("https://github.com/x/{dir}"))
-    .bind(format!("github.com/x/{dir}"))
+    .bind(format!("https://{remote_key}"))
+    .bind(&remote_key)
     .bind(dir)
     .execute(&mut *holding)
     .await
     .expect("hold the directory, uncommitted");
-    HeldDirectory { holding: Some(holding), pid }
+    HeldDirectory { holding: Some(holding), pid, pool: pool.clone(), conversation, dir: dir.to_string(), remote_key }
 }
 
 /// Sessions waiting on a lock backend `pid` holds.
@@ -117,8 +155,8 @@ mod tests {
     async fn test_blocked_by_counts_only_the_holds_own_waiters(pool: PgPool) {
         let _turn = ONE_AT_A_TIME.lock().await;
         let conversation = db::create_conversation(&pool).await.expect("conversation").id;
-        let held = hold_directory(&pool, conversation, "held").await;
-        let other = hold_directory(&pool, conversation, "other").await;
+        let mut held = hold_directory(&pool, conversation, "held").await;
+        let mut other = hold_directory(&pool, conversation, "other").await;
         let unrelated = spawn_insert(&pool, conversation, "other");
         assert!(waiters_or_finished(&pool, 1, &unrelated).await, "the unrelated insert never waited");
         assert_eq!(blocked_by(&pool, held.pid).await, 0, "a wait on another session's lock counted as the hold's");
@@ -134,6 +172,26 @@ mod tests {
         other.commit().await;
         conflicts(mine, "the insert at the held directory").await;
         conflicts(unrelated, "the unrelated insert").await;
+    }
+
+    /// SME-319: committed, the hold is another remote's clone that never
+    /// ends, and a turn in its conversation waits at `wait_for_clones` for
+    /// the whole `CLONE_WAIT`; once the scenario fails it, a turn goes on.
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+    async fn test_a_released_hold_holds_up_no_turn_once_its_clone_failed(pool: PgPool) {
+        let _turn = ONE_AT_A_TIME.lock().await;
+        let conversation = db::create_conversation(&pool).await.expect("conversation").id;
+        let mut held = hold_directory(&pool, conversation, "held").await;
+        held.commit().await;
+        assert!(
+            !wait_for_clones(&pool, conversation, Duration::from_millis(300)).await,
+            "a committed hold should read as a clone in progress"
+        );
+        held.fail_the_other_clone().await;
+        assert!(
+            wait_for_clones(&pool, conversation, Duration::from_millis(300)).await,
+            "a turn still waits on the hold's clone after it failed"
+        );
     }
 
     /// SME-263 code review 1: a scenario that fails or times out drops its
