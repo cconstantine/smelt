@@ -35,14 +35,17 @@ async fn clone_into_the_held_directory(page: &chromiumoxide::Page, pool: &sqlx::
 }
 
 /// Commits the held row and waits until nothing waits on it any more: the
-/// attach has failed with "already used by".
-async fn release(held: HeldDirectory, pool: &sqlx::PgPool) {
+/// attach has failed with "already used by". Then the other remote's clone
+/// fails too, as a real one ends: left cloning, it would hold the
+/// conversation's next turn at `wait_for_clones` (SME-319).
+async fn release(mut held: HeldDirectory, pool: &sqlx::PgPool) {
     let pid = held.pid;
     held.commit().await;
     assert!(
         wait_until(|| async { blocked_by(pool, pid).await == 0 }, Duration::from_secs(15)).await,
         "the attach still waits after the hold was committed"
     );
+    held.fail_the_other_clone(pool).await;
 }
 
 /// The Clone button's label and whether it's disabled.
@@ -120,6 +123,7 @@ pub(super) async fn scenario_attach_error_after_the_first_message(t: &Scenario<'
     let held = hold_directory(t.pool, c.id, &dir).await;
     clone_into_the_held_directory(&page, t.pool, &held, &dir).await;
 
+    let sent_before = t.mock.chunks_sent();
     send_from(&page, "first message while cloning").await;
     assert!(
         wait_for_count(&page, ".conversation-empty", 0, Duration::from_secs(10)).await,
@@ -135,8 +139,23 @@ pub(super) async fn scenario_attach_error_after_the_first_message(t: &Scenario<'
         "the attach's error should show as a line under the transcript"
     );
 
-    assert!(t.mock.wait_until_idle(Duration::from_secs(20)).await, "the first reply never finished upstream");
+    // The reply finished upstream: sent in full, not merely none open yet
+    // (the turn may start only once the hold is released).
+    assert!(
+        wait_until(
+            || async { t.mock.chunks_sent() >= sent_before + DEFAULT_REPLY_WORDS && t.mock.open() == 0 },
+            Duration::from_secs(20),
+        )
+        .await,
+        "the first reply never finished upstream"
+    );
     assert!(wait_for_text(&page, "zebra24", Duration::from_secs(10)).await, "the first reply should show");
+    // The message box waits while the turn ends; typed into before then,
+    // the second message would go nowhere (SME-319).
+    assert!(
+        wait_until(|| async { view_state(&page).await.input_enabled }, Duration::from_secs(10)).await,
+        "the message box never came back after the first reply"
+    );
     send_from(&page, "second message").await;
     assert!(
         wait_until(
