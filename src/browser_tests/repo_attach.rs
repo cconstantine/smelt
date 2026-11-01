@@ -35,17 +35,14 @@ async fn clone_into_the_held_directory(page: &chromiumoxide::Page, pool: &sqlx::
 }
 
 /// Commits the held row and waits until nothing waits on it any more: the
-/// attach has failed with "already used by". Then the other remote's clone
-/// fails too, as a real one ends: left cloning, it would hold the
-/// conversation's next turn at `wait_for_clones` (SME-319).
-async fn release(mut held: HeldDirectory, pool: &sqlx::PgPool) {
+/// attach has failed with "already used by".
+async fn release(held: &mut HeldDirectory, pool: &sqlx::PgPool) {
     let pid = held.pid;
     held.commit().await;
     assert!(
         wait_until(|| async { blocked_by(pool, pid).await == 0 }, Duration::from_secs(15)).await,
         "the attach still waits after the hold was committed"
     );
-    held.fail_the_other_clone(pool).await;
 }
 
 /// The Clone button's label and whether it's disabled.
@@ -77,7 +74,7 @@ pub(super) async fn scenario_attach_error_outlives_a_switch(t: &Scenario<'_>) {
     let page = t.tab(t.url(&format!("conversation/{}", a.id))).await;
     wait_for_live_client(&page, a.id).await;
     let dir = unique_id("sme263");
-    let held = hold_directory(t.pool, a.id, &dir).await;
+    let mut held = hold_directory(t.pool, a.id, &dir).await;
     clone_into_the_held_directory(&page, t.pool, &held, &dir).await;
 
     switch_to(&page, b.id).await;
@@ -90,7 +87,7 @@ pub(super) async fn scenario_attach_error_outlives_a_switch(t: &Scenario<'_>) {
     );
 
     switch_to(&page, b.id).await;
-    release(held, t.pool).await;
+    release(&mut held, t.pool).await;
     switch_to(&page, a.id).await;
     assert!(
         wait_for_text(&page, "already used by", Duration::from_secs(10)).await,
@@ -120,7 +117,7 @@ pub(super) async fn scenario_attach_error_after_the_first_message(t: &Scenario<'
     let page = t.tab(t.url(&format!("conversation/{}", c.id))).await;
     wait_for_live_client(&page, c.id).await;
     let dir = unique_id("sme263-first");
-    let held = hold_directory(t.pool, c.id, &dir).await;
+    let mut held = hold_directory(t.pool, c.id, &dir).await;
     clone_into_the_held_directory(&page, t.pool, &held, &dir).await;
 
     let sent_before = t.mock.chunks_sent();
@@ -129,7 +126,7 @@ pub(super) async fn scenario_attach_error_after_the_first_message(t: &Scenario<'
         wait_for_count(&page, ".conversation-empty", 0, Duration::from_secs(10)).await,
         "the first message should take the start screen down"
     );
-    release(held, t.pool).await;
+    release(&mut held, t.pool).await;
     assert!(
         wait_until(
             || async { page.evaluate(ATTACH_LINE).await.ok().and_then(|v| v.into_value::<bool>().ok()).unwrap_or(false) },
@@ -138,6 +135,9 @@ pub(super) async fn scenario_attach_error_after_the_first_message(t: &Scenario<'
         .await,
         "the attach's error should show as a line under the transcript"
     );
+    // The other remote's clone ends now the attach has answered: left
+    // cloning, it would hold the turn at `wait_for_clones` (SME-319).
+    held.fail_the_other_clone().await;
 
     // The reply finished upstream: sent in full, not merely none open yet
     // (the turn may start only once the hold is released).
