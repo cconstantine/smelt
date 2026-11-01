@@ -97,14 +97,7 @@ impl BrowserTestHarness {
                 .expect("test server error");
         });
 
-        // Same launcher as the app's shared browser, so this Chrome can't
-        // outlive the test process either.
-        // `smelt-http.test` reaches this server over plain HTTP from an
-        // origin that isn't a secure context, as a LAN address does
-        // (SME-105's copy fallback).
-        let browser = crate::headless_chrome::launch(&[format!("--host-resolver-rules=MAP {INSECURE_HOST} 127.0.0.1")])
-            .await
-            .expect("chrome-headless-shell should launch");
+        let browser = launch_browser().await;
 
         Self {
             browser,
@@ -117,12 +110,29 @@ impl BrowserTestHarness {
     /// Called explicitly at the end of the test rather than via `Drop`
     /// (which can't `.await`); the test runs its scenarios under
     /// `catch_unwind`, so this still runs when one fails.
+    /// A Chrome of its own for each further scenario lane (SME-341's speed
+    /// pass): tabs in different lanes never share a renderer, so one lane's
+    /// busy page can't throttle another's timers or frames.
+    pub(super) async fn another_browser(&self) -> Browser {
+        launch_browser().await
+    }
+
     pub(super) async fn shutdown(mut self) {
         let _ = self.browser.close().await;
 
         self.server_task.abort();
         self.preview_task.abort();
     }
+}
+
+/// Same launcher as the app's shared browser, so this Chrome can't outlive
+/// the test process either. `smelt-http.test` reaches the tier's server over
+/// plain HTTP from an origin that isn't a secure context, as a LAN address
+/// does (SME-105's copy fallback).
+async fn launch_browser() -> Browser {
+    crate::headless_chrome::launch(&[format!("--host-resolver-rules=MAP {INSECURE_HOST} 127.0.0.1")])
+        .await
+        .expect("chrome-headless-shell should launch")
 }
 
 /// Polls `document.body.innerText` for `needle` up to `timeout` — the same
@@ -438,174 +448,6 @@ pub(super) async fn click_conversation(page: &chromiumoxide::Page, id: i64) {
     }
 }
 
-/// A mock Anthropic upstream whose one reply streams 25 words
-/// (`zebra0`..`zebra24`) 200ms apart — slow enough to switch conversations
-/// mid-stream. The test saves it as a provider every conversation it
-/// creates uses (`MOCK_PROVIDER`). It counts what it has sent and which
-/// replies are still open, so a scenario can wait for a reply to have
-/// finished (or been cut off) upstream instead of sleeping for as long as a
-/// reply takes.
-pub(super) const DEFAULT_REPLY_WORDS: usize = 25;
-
-/// How long the mock's reply runs for: this many `content_block_delta`
-/// events, one every 200ms, so the default is about 5s. A scenario that
-/// needs the turn outlive a page reload, or two tabs, raises it (see
-/// `MockUpstream::longer_reply`).
-pub(super) struct MockUpstream {
-    pub(super) addr: std::net::SocketAddr,
-    chunks_sent: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    open: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    reply_words: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    hurried: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-
-/// Raises the mock's reply length for one scenario and puts the default
-/// back when it drops — including when the scenario fails, since every
-/// scenario in the run shares this one mock.
-pub(super) struct LongerReply(std::sync::Arc<std::sync::atomic::AtomicUsize>);
-
-/// The mock sending without its 200ms pauses, until it drops (see
-/// `MockUpstream::hurry`) — including when the scenario fails, since every
-/// scenario in the run shares the mock.
-pub(super) struct Hurried(std::sync::Arc<std::sync::atomic::AtomicBool>);
-
-impl Drop for Hurried {
-    fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-impl Drop for LongerReply {
-    fn drop(&mut self) {
-        self.0
-            .store(DEFAULT_REPLY_WORDS, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-/// Counts one open reply for as long as its body stream lives: the body is
-/// dropped when it ends or when the client hangs up (a stopped turn).
-pub(super) struct OpenReply(std::sync::Arc<std::sync::atomic::AtomicUsize>);
-
-impl Drop for OpenReply {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-impl MockUpstream {
-    pub(super) async fn start() -> Self {
-        fn event(name: &str, data: &str) -> String {
-            format!("event: {name}\ndata: {data}\n\n")
-        }
-        let chunks_sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let open = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let reply_words =
-            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(DEFAULT_REPLY_WORDS));
-        let hurried = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (sent, opened, words, hurry) = (chunks_sent.clone(), open.clone(), reply_words.clone(), hurried.clone());
-        let router = axum::Router::new().route(
-            "/v1/messages",
-            axum::routing::post(move || {
-                let (sent, opened, words, hurry) =
-                    (sent.clone(), opened.clone(), words.clone(), hurry.clone());
-                async move {
-                    let mut chunks = vec![event("message_start", r#"{"type":"message_start"}"#)];
-                    let words = words.load(std::sync::atomic::Ordering::SeqCst);
-                    for i in 0..words {
-                        chunks.push(event(
-                            "content_block_delta",
-                            &format!(
-                                r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"zebra{i} "}}}}"#
-                            ),
-                        ));
-                    }
-                    chunks.push(event("content_block_stop", r#"{"type":"content_block_stop","index":0}"#));
-                    chunks.push(event(
-                        "message_delta",
-                        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
-                    ));
-                    chunks.push(event("message_stop", r#"{"type":"message_stop"}"#));
-                    opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let reply = OpenReply(opened);
-                    let body = futures_util::StreamExt::then(futures_util::stream::iter(chunks), move |chunk| {
-                        let (sent, hurry) = (sent.clone(), hurry.clone());
-                        async move {
-                            if !hurry.load(std::sync::atomic::Ordering::SeqCst) {
-                                tokio::time::sleep(Duration::from_millis(200)).await;
-                            }
-                            sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            Ok::<_, std::io::Error>(chunk)
-                        }
-                    });
-                    let body = futures_util::StreamExt::map(body, move |chunk| {
-                        let _ = &reply;
-                        chunk
-                    });
-                    (
-                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                        axum::body::Body::from_stream(body),
-                    )
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind the mock upstream");
-        let addr = listener.local_addr().expect("mock upstream address");
-        tokio::spawn(async move {
-            axum::serve(listener, router).await.ok();
-        });
-        Self {
-            addr,
-            chunks_sent,
-            open,
-            reply_words,
-            hurried,
-        }
-    }
-
-    pub(super) fn chunks_sent(&self) -> usize {
-        self.chunks_sent.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Make the mock's reply `words` words long (200ms each) for as long
-    /// as the returned guard lives: 5s by default, which is not long
-    /// enough
-    /// for a scenario that reloads a page mid-turn or opens a second
-    /// tab into a running turn.
-    pub(super) fn longer_reply(&self, words: usize) -> LongerReply {
-        self.reply_words
-            .store(words, std::sync::atomic::Ordering::SeqCst);
-        LongerReply(self.reply_words.clone())
-    }
-
-    /// Send the rest of every open reply at once, and any reply started
-    /// while the returned guard lives: for a scenario whose long reply only
-    /// had to outlast something (a reload, a second tab) and which then only
-    /// waits for it to end (SME-341's speed pass). The reply still ends as
-    /// it would, and the turn with it.
-    pub(super) fn hurry(&self) -> Hurried {
-        self.hurried.store(true, std::sync::atomic::Ordering::SeqCst);
-        Hurried(self.hurried.clone())
-    }
-
-    pub(super) fn open(&self) -> usize {
-        self.open.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Waits until no reply is open upstream. False on timeout.
-    pub(super) async fn wait_until_idle(&self, timeout: Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
-        while self.open() > 0 {
-            if tokio::time::Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        true
-    }
-}
-
 pub(super) async fn wait_for_text_gone(page: &chromiumoxide::Page, needle: &str, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -626,7 +468,8 @@ pub(super) async fn wait_for_text_gone(page: &chromiumoxide::Page, needle: &str,
 /// creates runs on.
 pub(super) static MOCK_PROVIDER: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
 
-/// The model `MOCK_PROVIDER` serves (any name does: the mock ignores it).
+/// The model lane 0's conversations run on. Each lane of the mock (see
+/// `MockUpstream`) answers its own model name, and lane 0 answers this one.
 pub(super) const MOCK_MODEL: &str = "mock-model";
 
 /// How many times `page` has fetched the conversation list (the tree, since
@@ -642,11 +485,12 @@ pub(super) async fn list_requests(page: &chromiumoxide::Page) -> usize {
 pub(super) async fn new_conversation(
     pool: &sqlx::PgPool,
     created: &std::sync::Mutex<Vec<i64>>,
+    model: &str,
 ) -> crate::models::Conversation {
     let conversation = db::create_conversation(pool).await.expect("create conversation");
     created.lock().expect("the conversation list lock").push(conversation.id);
     let provider = *MOCK_PROVIDER.get().expect("the mock provider is saved first");
-    db::set_conversation_model(pool, conversation.id, provider, MOCK_MODEL)
+    db::set_conversation_model(pool, conversation.id, provider, model)
         .await
         .expect("put the conversation on the mock provider");
     conversation
