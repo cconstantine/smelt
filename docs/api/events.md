@@ -120,7 +120,7 @@ The `/pods` page subscribes directly, and so does a chat sidebar with no convers
 
 `get_pods` returns a `PodOverview` for every live pod:
 - **From the database** (`db::list_live_pods`): its conversation, start time, and live terminal count.
-- **Activity** (`pod_activity`): busy while any terminal has a running command; otherwise idle since the latest of the last command finishing, the conversation's last message, and the pod starting.
+- **Activity** (`pod_activity`): busy while a turn runs or is queued, a repo clones, or any terminal has a running command; otherwise idle since `db::list_live_pods`'s `idle_since`: the latest of the pod starting, its `last_active_at`, and its commands' last start and last finish. A message doesn't count (SME-79's idle notices are messages). It's the rule the idle stop uses (SME-78), so "idle 59m" means about a minute left at the default 60; the footnote says what's in force (`api::sandbox::get_idle_stop_minutes`).
 - **From Kubernetes:** the pod object's phase and limits (`sandbox::pod_details`), and live use from one metrics list (`sandbox::pod_metrics_list`, `metrics.k8s.io/v1beta1`).
   - Reading metrics needs `get`/`list` on `pods` in the `metrics.k8s.io` group (`k8s/smelt-park-rbac.yaml`). Without it, or if the metrics call fails for any other reason, every pod's `usage` is `None` and the rest of the view still works.
   - Quantities are parsed by `parse_cpu_nanocores`/`parse_memory_bytes`, and CPU is summed across containers in nanocores.

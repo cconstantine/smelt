@@ -11,6 +11,7 @@ mod ask_parent;
 mod credentials;
 mod delete;
 mod ended;
+mod finish_stop;
 mod list;
 mod messages;
 mod pause;

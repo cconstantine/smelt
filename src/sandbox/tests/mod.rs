@@ -217,3 +217,4 @@ mod teardown;
 mod adoption;
 mod image;
 mod idle_notice;
+mod quiet_stop;

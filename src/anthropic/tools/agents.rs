@@ -103,7 +103,9 @@ pub(super) fn tools() -> Vec<Registered> {
                          parent, the conversation \
                          that started you, as your final report, and your turn ends here. Say what you \
                          did, what you found and anything left undone; your parent reads only this. \
-                         Up to {} characters. The user may still write to you afterwards.",
+                         Up to {} characters. The user may still write to you afterwards. Your sandbox \
+                         pod is stopped when you finish, unless a command is still running; /workspace \
+                         and volumes are kept.",
                         crate::agents::MAX_REPORT_CHARS
                     ),
                     input_schema: serde_json::json!({

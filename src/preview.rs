@@ -470,6 +470,9 @@ mod server {
                  link from smelt instead.",
             );
         }
+        // Someone is using the preview: its pod isn't idle (SME-78). A
+        // request the guard refused doesn't count.
+        crate::sandbox::note_activity(conversation);
         // The dev server sees itself addressed as it would locally, so a
         // host check (Vite's, for one) accepts the request: `localhost`, or
         // the container's own address, as from a Linux host (SME-33).

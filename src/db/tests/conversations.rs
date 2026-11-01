@@ -344,3 +344,26 @@ async fn test_delete_nonexistent_conversation_is_a_no_op(pool: PgPool) {
         .await
         .expect("deleting a nonexistent conversation should not error");
 }
+
+/// SME-78: a quiet notice is saved without moving its conversation in the
+/// sidebar or titling an untitled one with the notice's text.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_create_message_in_place_leaves_updated_at_and_a_default_title(pool: PgPool) {
+    let conversation = create_conversation(&pool).await.expect("conversation");
+    sqlx::query("UPDATE conversations SET updated_at = updated_at - interval '1 hour' WHERE id = $1")
+        .bind(conversation.id)
+        .execute(&pool)
+        .await
+        .expect("age it");
+    let before = list_conversations(&pool).await.expect("read").into_iter().find(|c| c.id == conversation.id).expect("row");
+
+    let saved = create_message_in_place(&pool, conversation.id, "user", &[ContentBlock::Text { text: "Sandbox pod 7 was stopped".to_string() }])
+        .await
+        .expect("save it");
+
+    let after = list_conversations(&pool).await.expect("read").into_iter().find(|c| c.id == conversation.id).expect("row");
+    assert_eq!(after.updated_at, before.updated_at, "the sidebar order stays");
+    assert_eq!(after.title, before.title, "still the default title");
+    let messages = list_messages(&pool, conversation.id).await.expect("list");
+    assert_eq!(messages.iter().map(|m| m.id).collect::<Vec<_>>(), vec![saved.id], "the message is saved");
+}

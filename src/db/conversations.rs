@@ -60,18 +60,7 @@ pub(super) async fn create_message_on(
     role: &str,
     content: &[ContentBlock],
 ) -> Result<Message, sqlx::Error> {
-    #[expect(clippy::expect_used, reason = "a ContentBlock always serializes: its map keys are strings, and a serde_json::Value holds only finite numbers")]
-    let content_json = serde_json::to_string(content)
-        .expect("ContentBlock always serializes: no non-string map keys, no floats");
-
-    let message = sqlx::query_as::<_, Message>(
-        "INSERT INTO messages (conversation_id, role, content) VALUES ($1, $2, $3) RETURNING *",
-    )
-    .bind(conversation_id)
-    .bind(role)
-    .bind(&content_json)
-    .fetch_one(&mut *conn)
-    .await?;
+    let message = insert_message_on(&mut *conn, conversation_id, role, content).await?;
 
     // Bump updated_at so the sidebar can sort by recency; auto-title the
     // conversation from the first user message if it's still the default (in
@@ -93,6 +82,41 @@ pub(super) async fn create_message_on(
     .await?;
 
     Ok(message)
+}
+
+/// Saves a message without touching its conversation's row: `updated_at`
+/// stays, so the sidebar doesn't re-sort, and a default title isn't
+/// replaced by the message's text. For smelt's quiet notices, which aren't
+/// news (SME-78: a pod stopped on idle or at an agent's finish).
+pub async fn create_message_in_place(
+    pool: &PgPool,
+    conversation_id: i64,
+    role: &str,
+    content: &[ContentBlock],
+) -> Result<Message, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    insert_message_on(&mut conn, conversation_id, role, content).await
+}
+
+/// The `messages` insert alone, shared by `create_message_on` and
+/// `create_message_in_place`.
+async fn insert_message_on(
+    conn: &mut sqlx::PgConnection,
+    conversation_id: i64,
+    role: &str,
+    content: &[ContentBlock],
+) -> Result<Message, sqlx::Error> {
+    #[expect(clippy::expect_used, reason = "a ContentBlock always serializes: its map keys are strings, and a serde_json::Value holds only finite numbers")]
+    let content_json = serde_json::to_string(content)
+        .expect("ContentBlock always serializes: no non-string map keys, no floats");
+    sqlx::query_as::<_, Message>(
+        "INSERT INTO messages (conversation_id, role, content) VALUES ($1, $2, $3) RETURNING *",
+    )
+    .bind(conversation_id)
+    .bind(role)
+    .bind(&content_json)
+    .fetch_one(conn)
+    .await
 }
 
 pub async fn conversation_exists(pool: &PgPool, id: i64) -> Result<bool, sqlx::Error> {

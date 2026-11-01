@@ -257,3 +257,42 @@ fn test_a_template_whose_addresses_no_browser_accepts_is_refused() {
         assert!(PreviewTemplate::parse(good).is_ok(), "{good:?} should be accepted");
     }
 }
+
+/// SME-78: a preview request the guard lets through notes its
+/// conversation's pod as in use, even when the dial then fails; one the
+/// guard refuses notes nothing.
+#[tokio::test]
+async fn test_a_preview_request_notes_activity_and_a_refused_one_does_not() {
+    use crate::egress_proxy::{DialError, DialFuture, SandboxDial};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let template = PreviewTemplate::parse(&format!("http://{{port}}-{{conversation}}.preview.localhost:{}", addr.port()))
+        .expect("a template");
+    let dial_for: DialFor = std::sync::Arc::new(|_conversation| {
+        std::sync::Arc::new(|_host, _port| {
+            Box::pin(async { Err(DialError::from("no sandbox here".to_string())) }) as DialFuture
+        }) as SandboxDial
+    });
+    let server = tokio::spawn(serve(listener, template.clone(), dial_for, None));
+    let [used, refused] = [crate::id_alloc::FIXTURE_IDS.next_base(), crate::id_alloc::FIXTURE_IDS.next_base()];
+    let http = reqwest::Client::builder()
+        .resolve(&format!("8000-{used}.preview.localhost"), addr)
+        .resolve(&format!("8000-{refused}.preview.localhost"), addr)
+        .build()
+        .expect("a client");
+
+    let opened = http.get(template.url_for(used, PodHost::Localhost, 8000)).send().await.expect("a response");
+    let cross_site = http
+        .post(template.url_for(refused, PodHost::Localhost, 8000))
+        .header("origin", "https://elsewhere.example")
+        .header("sec-fetch-site", "cross-site")
+        .send()
+        .await
+        .expect("a response");
+    server.abort();
+
+    assert_ne!(opened.status(), reqwest::StatusCode::FORBIDDEN, "the guard let it through");
+    assert!(crate::sandbox::activity_noted(used), "a preview request is activity");
+    assert_eq!(cross_site.status(), reqwest::StatusCode::FORBIDDEN, "the guard refused it");
+    assert!(!crate::sandbox::activity_noted(refused), "a refused request is not");
+}

@@ -115,3 +115,27 @@ async fn after_turn_state_write(pool: &PgPool, conversation_id: i64, store: bool
         tracing::warn!(conversation_id, error = %e, "the check after a stop or an error didn't finish");
     }
 }
+
+/// Runs `f` holding `conversation_id`'s turn lock, outside any turn, then
+/// frees the turn state nothing holds any more (SME-219's concern: a lock
+/// taken outside a turn would otherwise leave its runtime entry behind).
+/// `wait` queues for the lock; otherwise a lock held or queued for gives
+/// `None` at once and `f` doesn't run. SME-78's quiet stops: the finish
+/// stop waits, the idle pass doesn't.
+pub(crate) async fn between_turns<T, F, Fut>(conversation_id: i64, wait: bool, f: F) -> Option<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let lock = conversation_lock(conversation_id);
+    let result = {
+        let guard = if wait { Some(lock.lock().await) } else { lock.try_lock().ok() };
+        match guard {
+            Some(_turn) => Some(f().await),
+            None => None,
+        }
+    };
+    drop(lock);
+    release_idle_turn_state(conversation_id);
+    result
+}

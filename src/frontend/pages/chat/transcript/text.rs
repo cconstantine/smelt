@@ -366,6 +366,17 @@ pub(in crate::frontend::pages::chat) fn system_notice(text: &str, commands: &Has
             return Some(format!("{} is still running, untouched for {quiet}", command(id)));
         }
     }
+    // A quiet stop (SME-78), before the crash branch.
+    if let Some(rest) = text.strip_prefix("Sandbox pod ") {
+        if let Some((_, tail)) = rest.split_once(" was stopped after ")
+            && let Some((minutes, _)) = tail.split_once(" minutes with no activity")
+        {
+            return Some(format!("The sandbox stopped after {minutes} minutes idle; /workspace and Docker's data are kept"));
+        }
+        if rest.contains(" was stopped because you finished") {
+            return Some("The sandbox stopped when this agent finished; /workspace and Docker's data are kept".to_string());
+        }
+    }
     if let Some(rest) = text.strip_prefix("Sandbox pod ")
         && let Some((_, tail)) = rest.split_once(" stopped unexpectedly")
     {
