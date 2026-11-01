@@ -281,6 +281,12 @@ async fn scenario_terminal_follow_after_switch_phone_width(t: &Scenario<'_>, con
     // conversation whose terminal has more output than fits, and the body
     // must show its last line, not its first.
     page.reload().await.expect("reload the page");
+    // The reload wiped the scroll recorder with the window. Re-arm it now —
+    // idempotent per page — so this leg's settle reports the scrolls it is
+    // really watching: after a reload `scroll events: []` was a guaranteed
+    // lie, the ring having died with the page until F3 re-installed it
+    // (SME-341: restores the instrument's truth, narrows nothing).
+    set_scroll_mark(&page, "sme108F2").await;
     wait_for_live_client(&page, conversation.id).await;
     assert!(
         wait_for_text(&page, &format!("terminal {terminal}"), Duration::from_secs(15)).await,

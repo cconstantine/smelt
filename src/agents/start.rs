@@ -209,7 +209,7 @@ async fn run_start(pool: &PgPool, child: i64, parent: i64, request: StartRequest
     let prepared = match prepare(pool, checkout.as_ref(), child, parent, request).await {
         Ok(prepared) => prepared,
         Err(error) => {
-            fail_start(pool, child, parent, &error).await;
+            let _ = fail_start(pool, child, parent, &error).await;
             return;
         }
     };
@@ -219,7 +219,7 @@ async fn run_start(pool: &PgPool, child: i64, parent: i64, request: StartRequest
     // waking a turn into a pod that doesn't match its grants; the exit
     // tries again as the backstop for every other way out.
     if let Err(error) = crate::credentials::reconcile_pod(pool, child, prepared.persona.as_ref()).await {
-        fail_start(pool, child, parent, &format!("couldn't write its credentials into its pod: {error}")).await;
+        let _ = fail_start(pool, child, parent, &format!("couldn't write its credentials into its pod: {error}")).await;
         return;
     }
     #[cfg(test)]
@@ -239,7 +239,9 @@ async fn run_start(pool: &PgPool, child: i64, parent: i64, request: StartRequest
             crate::turn::notify(pool, child, vec![crate::turn::Notice::Wake]);
         }
         Ok(false) => tracing::info!(conversation_id = child, "the agent was stopped or deleted during its start"),
-        Err(e) => fail_start(pool, child, parent, &format!("couldn't complete the start: {e}")).await,
+        Err(e) => {
+            let _ = fail_start(pool, child, parent, &format!("couldn't complete the start: {e}")).await;
+        }
     }
 }
 
@@ -399,18 +401,33 @@ async fn remote_trust(pool: &PgPool, remote_key: &str) -> Result<Option<bool>, S
 
 /// Ends a start that failed: the child `failed`, the error queued to its
 /// parent as its report and saved in its own transcript, then the parent
-/// woken. A child no longer starting (stopped or deleted meanwhile) gets
-/// nothing.
-pub(crate) async fn fail_start(pool: &PgPool, child: i64, parent: i64, error: &str) {
+/// woken — and that wake's handle returned, so whoever provoked the start
+/// can await it: the startup sweep collects every wake it provokes into the
+/// set its caller awaits (SME-341). The start's own callers drop it, as
+/// they always did. A child no longer starting (stopped or deleted
+/// meanwhile) gets nothing, and returns `None`.
+pub(crate) async fn fail_start(
+    pool: &PgPool,
+    child: i64,
+    parent: i64,
+    error: &str,
+) -> Option<tokio::task::JoinHandle<()>> {
     let label = label(child, None);
     let text = format!("{label}'s start failed: {error}");
     match db::fail_start(pool, child, parent, &label, &text).await {
         Ok(true) => {
-            crate::turn::notify(pool, parent, vec![crate::turn::Notice::Wake]);
+            let wake = crate::turn::notify(pool, parent, vec![crate::turn::Notice::Wake]);
             crate::events::publish_app(crate::events::AppEvent::ConversationsChanged);
+            Some(wake)
         }
-        Ok(false) => tracing::info!(conversation_id = child, "a failed start's agent was stopped or deleted meanwhile"),
-        Err(e) => tracing::warn!(conversation_id = child, error = %e, start_error = %error, "couldn't record a failed start"),
+        Ok(false) => {
+            tracing::info!(conversation_id = child, "a failed start's agent was stopped or deleted meanwhile");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(conversation_id = child, error = %e, start_error = %error, "couldn't record a failed start");
+            None
+        }
     }
 }
 

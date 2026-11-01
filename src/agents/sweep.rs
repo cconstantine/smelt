@@ -20,7 +20,13 @@ pub(crate) async fn startup_sweep(pool: &PgPool) -> Vec<tokio::task::JoinHandle<
     match db::starting_agents(pool).await {
         Ok(starting) => {
             for (child, parent) in starting {
-                fail_start(pool, child, parent, RESTARTED).await;
+                // The start failure's own wake belongs to the awaited set
+                // just like the ones below: the report is queued by
+                // `fail_start` itself, and the wake it hands back is what
+                // runs the parent's turn to deliver it (SME-341) — awaited
+                // only by its handle, never by luck of the queries below
+                // listing the same row first.
+                wakes.extend(fail_start(pool, child, parent, RESTARTED).await);
                 end_start(pool, child, false).await;
             }
         }
