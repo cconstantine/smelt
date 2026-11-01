@@ -382,11 +382,33 @@ fn TerminalBody(terminal: SandboxTerminalPanelEntry) -> Element {
             spawn(scroll_to_bottom(el));
         }
     }));
+    // SME-341: what the CI signature turned out to be — the bottom
+    // moving up off the view while the reader sat at it. The recorded
+    // flake reads scrollHeight unchanged, scrollTop unchanged, and
+    // clientHeight shrunk 761 to 700: exactly the 61 px the assert
+    // missed. No event follows such a reflow: a viewport-height change
+    // fires no scroll event, no content changed for the effect above to
+    // rerun on, and `scrolled` deliberately stays quiet on one (SME-108)
+    // — the follow had nothing to observe the move with. The box's own
+    // resize is that event (dioxus drives a ResizeObserver), so the
+    // follow listens, below on this element's `onresize`: while it is
+    // following, a resize re-clamps to the new bottom, whenever the
+    // layout settles — no window to lose a late settle to. The SME-108
+    // rule holds for the reader too: that handler fires only while
+    // stuck, so a resize alone never resumes a follow and never moves a
+    // reader who scrolled up to read.
     rsx! {
         div {
             class: "task-terminal-body",
             onmounted: move |evt| scroll.mounted(evt),
             onscroll: move |evt: Event<ScrollData>| scroll.scrolled(&evt.data()),
+            onresize: move |_: Event<ResizeData>| {
+                if scroll.is_stuck()
+                    && let Some(el) = scroll.el_untracked()
+                {
+                    spawn(scroll_to_bottom(el));
+                }
+            },
             if terminal.commands.is_empty() {
                 span { class: "task-terminal-empty", "no commands yet" }
             }
