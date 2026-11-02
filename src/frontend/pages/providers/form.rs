@@ -380,9 +380,13 @@ pub fn ProviderEdit(id: i64) -> Element {
                     ProviderModelsSection { id, refresh: models_refresh }
                     super::super::TwoStepButton {
                         armed: armed(),
-                        class: "mcp-delete-server",
+                        // The red two-step every other page's Delete is; the
+                        // consequence is its title, not its label, which a
+                        // two-step reserves the width of (SME-354 B25).
+                        class: "mcp-delete",
                         idle: "Delete provider",
-                        confirm: "Confirm delete? Its conversations take the default at their next turn, if there's still one",
+                        confirm: "Confirm delete?",
+                        title: Some("Its conversations take the default model at their next turn, if there's still one."),
                         on_arm: move |_| armed.set(true),
                         on_confirm: delete,
                     }
