@@ -72,6 +72,12 @@ const NAMESPACE: &str = "smelt-park-test";
 /// would have started under load.
 const DEFAULT_RUNNING_WAIT_TIMEOUT_SECS: u64 = 90;
 
+/// `SANDBOX_DOCKER_MEMORY_LIMIT`'s default (SME-33): sized so a seat's full
+/// gate stack fits under the Docker sidecar — its cargo builds, dind, k3s
+/// and postgres all count against it (SME-317). A limit, not a request: it
+/// reserves nothing (SME-77).
+const DEFAULT_DOCKER_MEMORY_LIMIT: &str = "48Gi";
+
 /// The Docker sidecar's startup probe: how many checks, how far apart.
 const DOCKER_STARTUP_PROBE_CHECKS: i32 = 60;
 const DOCKER_STARTUP_PROBE_PERIOD_SECS: i32 = 1;
