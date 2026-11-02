@@ -47,7 +47,7 @@ async fn test_the_pass_removes_the_claims_a_quiet_stop_kept(pool: PgPool) {
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
         let id = quiet_stopped_conversation(&pool, &client, "8 days").await;
 
-        let settled = remove_expired_storage_once_with(&pool, 7, |conversation_id| {
+        let settled = remove_expired_storage_once_with(&pool, 7, STORAGE_REMOVAL_TIMEOUT, |conversation_id| {
             remove_conversation_storage_locked(&pool, conversation_id)
         })
         .await;
@@ -59,7 +59,7 @@ async fn test_the_pass_removes_the_claims_a_quiet_stop_kept(pool: PgPool) {
         assert_eq!(notices.len(), 1, "one notice: {notices:?}");
         assert!(notices[0].contains("starts fresh with empty volumes"), "{}", notices[0]);
 
-        let settled = remove_expired_storage_once_with(&pool, 7, |conversation_id| {
+        let settled = remove_expired_storage_once_with(&pool, 7, STORAGE_REMOVAL_TIMEOUT, |conversation_id| {
             remove_conversation_storage_locked(&pool, conversation_id)
         })
         .await;
@@ -78,7 +78,7 @@ async fn test_storage_woken_within_the_grace_stands_until_due(pool: PgPool) {
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
         let id = quiet_stopped_conversation(&pool, &client, "1 day").await;
 
-        let settled = remove_expired_storage_once_with(&pool, 7, |conversation_id| {
+        let settled = remove_expired_storage_once_with(&pool, 7, STORAGE_REMOVAL_TIMEOUT, |conversation_id| {
             remove_conversation_storage_locked(&pool, conversation_id)
         })
         .await;
@@ -93,7 +93,7 @@ async fn test_storage_woken_within_the_grace_stands_until_due(pool: PgPool) {
             .execute(&pool)
             .await
             .expect("let the week pass");
-        let settled = remove_expired_storage_once_with(&pool, 7, |conversation_id| {
+        let settled = remove_expired_storage_once_with(&pool, 7, STORAGE_REMOVAL_TIMEOUT, |conversation_id| {
             remove_conversation_storage_locked(&pool, conversation_id)
         })
         .await;

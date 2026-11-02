@@ -61,6 +61,16 @@ pub(super) fn storage_removal_days_from(setting: Option<String>) -> u32 {
 /// noise.
 const STORAGE_REMOVAL_PASS_SECS: u64 = 3600;
 
+/// How long one conversation's removal may take before the pass gives up
+/// on it: like the quiet stop's delete, it runs holding that
+/// conversation's turn lock, so a stalled API server must not hold the
+/// user's next message for kube-rs's own, much longer, timeouts
+/// (SME-78 review 1, A3's shape; SME-345 review 1, F1). 90 s covers the
+/// bounded parts (the 30 s pod wait, the 5 s confirm, the deletes);
+/// giving up is retry-safe — `_locked` is re-entrant and the settle rules
+/// are written around the retry.
+pub(crate) const STORAGE_REMOVAL_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// For as long as smelt runs, once an hour, removes the storage of
 /// conversations quiet-stopped `days` or more ago (nothing at 0). Only a
 /// real server runs this (from `main`), never the browser-test harness.
@@ -69,7 +79,7 @@ pub async fn remove_expired_storage(pool: PgPool) {
     let days = storage_removal_days();
     loop {
         tokio::time::sleep(Duration::from_secs(STORAGE_REMOVAL_PASS_SECS)).await;
-        remove_expired_storage_once_with(&pool, days, |conversation_id| {
+        remove_expired_storage_once_with(&pool, days, STORAGE_REMOVAL_TIMEOUT, |conversation_id| {
             remove_conversation_storage_locked(&pool, conversation_id)
         })
         .await;
@@ -78,14 +88,17 @@ pub async fn remove_expired_storage(pool: PgPool) {
 
 /// One pass: for each due conversation — skipped while its turn runs or
 /// is queued, or while a start holds its lock — re-check under both locks
-/// and remove, then settle by the outcome: an error or a claim left
-/// behind keeps the mark, no notice, and the next pass retries from the
-/// top; claims gone settles with one notice (unless the removal stopped a
-/// live pod, which saved its own) and a cleared mark. The conversations
-/// it settled, for the tests.
+/// and remove, with each removal given up on past `removal_timeout` (F1's
+/// bound; a test's is shorter than production's), then settle by the
+/// outcome: an error, a claim left behind, or a removal given up on keeps
+/// the mark, no notice, and the next pass retries from the top; claims
+/// gone settles with one notice (unless the removal stopped a live pod,
+/// which saved its own) and a cleared mark. The conversations it settled,
+/// for the tests.
 pub(crate) async fn remove_expired_storage_once_with<R, Fut>(
     pool: &PgPool,
     days: u32,
+    removal_timeout: Duration,
     remove: R,
 ) -> Vec<i64>
 where
@@ -129,20 +142,28 @@ where
                     return false;
                 }
             }
-            match remove(conversation_id).await {
+            // F1: bounded — this runs holding the conversation's turn
+            // lock; a stall settles as nothing happened, and the next
+            // pass retries from the top.
+            let outcome = tokio::time::timeout(removal_timeout, remove(conversation_id)).await;
+            match outcome {
+                Err(_elapsed) => {
+                    tracing::warn!(conversation_id, secs = removal_timeout.as_secs(), "a storage-grace removal didn't finish in time; the next pass tries again");
+                    false
+                }
                 // A claim intact (SME-316's error-reads-as-Failed counts
                 // too): storage stands, no notice, and the next pass
                 // retries from the top — `_locked` re-handles gone pods
                 // and claims.
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::warn!(conversation_id, error = %e, "a storage-grace removal failed; the next pass tries again");
                     false
                 }
-                Ok(removal) if removal.claims_failed > 0 => {
+                Ok(Ok(removal)) if removal.claims_failed > 0 => {
                     tracing::warn!(conversation_id, ?removal, "a storage-grace removal left a claim behind; the next pass finishes it");
                     false
                 }
-                Ok(removal) => {
+                Ok(Ok(removal)) => {
                     // Claims gone: deleted now, already gone (the user
                     // removed the storage after the stop), or `Foreign`
                     // — retrying could never have helped. One notice,
