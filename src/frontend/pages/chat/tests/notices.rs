@@ -655,3 +655,33 @@ fn test_a_debug_literal_reads_back_to_its_text() {
     assert_eq!(debug_literal("\"a\" trailing"), None);
     assert_eq!(debug_literal("no quotes"), None);
 }
+
+/// SME-354 B20: four sandbox notices the server saves showed as the
+/// user's own black bubble, as if they had typed "Docker in sandbox pod
+/// … was restarted": the Docker restart, the storage removed after the
+/// grace, the storage the user removed, and a language server stopping.
+/// Each is a notice line now.
+#[test]
+fn test_the_sandboxs_own_notices_read_as_notices_not_the_users_words() {
+    let none = HashMap::new();
+    let docker = "Docker in sandbox pod 41 was restarted (OOMKilled), so the containers it was running have stopped. Images, terminals and /workspace are unaffected. Every container shares Docker's memory limit; a pod created with a larger docker_memory_limit gives them more.";
+    assert_eq!(
+        system_notice(docker, &none).as_deref(),
+        Some("Docker restarted (OOMKilled), so its containers stopped; images, terminals and /workspace are kept")
+    );
+    let grace = "Sandbox pod 41's storage was removed after 7 days stopped. /workspace and Docker's images, build cache and volumes are gone; repos cloned there need cloning again. The next sandbox starts fresh with empty volumes.";
+    assert_eq!(
+        system_notice(grace, &none).as_deref(),
+        Some("The sandbox's storage was removed after 7 days stopped; the next sandbox starts fresh")
+    );
+    let removed = "The user removed this conversation's sandbox storage: /workspace and the Docker images, build cache and volumes are gone. Repos there need cloning again; the next sandbox starts with fresh empty volumes.";
+    assert_eq!(
+        system_notice(removed, &none).as_deref(),
+        Some("You removed the sandbox's storage; the next sandbox starts fresh")
+    );
+    let lsp = "Language server rust-analyzer stopped (it ran out of memory). The sandbox is unaffected. start_language_server starts it again.";
+    assert_eq!(
+        system_notice(lsp, &none).as_deref(),
+        Some("Language server rust-analyzer stopped (it ran out of memory)")
+    );
+}

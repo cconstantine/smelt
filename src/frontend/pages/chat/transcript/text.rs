@@ -420,6 +420,29 @@ pub(in crate::frontend::pages::chat) fn system_notice(text: &str, commands: &Has
             .unwrap_or_default();
         return Some(format!("The sandbox stopped unexpectedly{reason}; its terminals are gone"));
     }
+    // The sandbox's other notices (SME-354 B20: they showed as the user's
+    // own bubble). Each is the sentence the server writes, cut to what the
+    // user needs; the model gets the whole of it.
+    if let Some(rest) = text.strip_prefix("Docker in sandbox pod ")
+        && let Some((head, _)) = rest.split_once(", so the containers it was running have stopped")
+    {
+        let why = head.split_once(" was restarted").map(|(_, why)| why).unwrap_or_default();
+        return Some(format!("Docker restarted{why}, so its containers stopped; images, terminals and /workspace are kept"));
+    }
+    if let Some(rest) = text.strip_prefix("Sandbox pod ")
+        && let Some((_, tail)) = rest.split_once("'s storage was removed after ")
+        && let Some((days, _)) = tail.split_once(" days stopped")
+    {
+        return Some(format!("The sandbox's storage was removed after {days} days stopped; the next sandbox starts fresh"));
+    }
+    if text.starts_with("The user removed this conversation's sandbox storage") {
+        return Some("You removed the sandbox's storage; the next sandbox starts fresh".to_string());
+    }
+    if let Some(rest) = text.strip_prefix("Language server ")
+        && let Some((head, _)) = rest.rsplit_once(". The sandbox is unaffected")
+    {
+        return Some(format!("Language server {head}"));
+    }
     if text == crate::api::chat::STOP_NOTICE {
         return Some("Stopped.".to_string());
     }
