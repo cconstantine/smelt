@@ -29,11 +29,24 @@ pub async fn remove_conversation_storage(
     pool: &PgPool,
     conversation_id: i64,
 ) -> Result<StorageRemoval, SandboxError> {
-    let manager = get()?;
     // One removal or one start at a time for this conversation, for the
     // whole body (review 1, finding 1).
     let start_lock = pod_start_lock(conversation_id);
     let _starting = start_lock.lock().await;
+    remove_conversation_storage_locked(pool, conversation_id).await
+}
+
+/// The whole body of `remove_conversation_storage`, for a caller that
+/// already holds the conversation's pod-start lock: SME-345's
+/// storage-grace pass, which takes the conversation's turn lock and then
+/// this start lock itself, in the order a turn takes them. Nothing here
+/// takes any lock of its own (the doc comment above), so running it
+/// under those cannot deadlock. Behaviour unchanged by the split.
+pub(in crate::sandbox) async fn remove_conversation_storage_locked(
+    pool: &PgPool,
+    conversation_id: i64,
+) -> Result<StorageRemoval, SandboxError> {
+    let manager = get()?;
     // Gone: its teardown owns its claims now, and a panel mid-delete
     // shouldn't error.
     if !db::conversation_exists(pool, conversation_id).await.map_err(SandboxError::Db)? {
