@@ -167,9 +167,11 @@ where
                     // Claims gone: deleted now, already gone (the user
                     // removed the storage after the stop), or `Foreign`
                     // — retrying could never have helped. One notice,
-                    // only when this removal deleted something and
-                    // stopping a live pod didn't already save one.
-                    if removal.claims_deleted > 0 && !removal.pod_stopped {
+                    // only when this removal deleted something, the
+                    // workspace itself went (F2: a `Foreign` workspace
+                    // stands, and its files' owner is another server),
+                    // and stopping a live pod didn't already save one.
+                    if removal.claims_deleted > 0 && removal.workspace_gone && !removal.pod_stopped {
                         save_removal_notice(pool, pod_id, conversation_id, days).await;
                     }
                     // If clearing fails the next pass re-removes as a

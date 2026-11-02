@@ -48,7 +48,7 @@ async fn removal_notices(pool: &PgPool, conversation_id: i64) -> Vec<String> {
 
 /// Both claims deleted, the pass's usual outcome.
 fn claims_gone() -> StorageRemoval {
-    StorageRemoval { claims_deleted: 2, ..Default::default() }
+    StorageRemoval { claims_deleted: 2, workspace_gone: true, ..Default::default() }
 }
 
 #[test]
@@ -201,7 +201,7 @@ async fn test_claims_already_gone_settle_quietly_and_once(pool: PgPool) {
 async fn test_a_removal_that_stopped_a_pod_saved_its_own_notice(pool: PgPool) {
     let (conversation, pod) = quiet_stopped_days_ago(&pool, 8).await;
     let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async {
-        Ok(StorageRemoval { pod_stopped: true, claims_deleted: 2, ..Default::default() })
+        Ok(StorageRemoval { pod_stopped: true, claims_deleted: 2, workspace_gone: true, ..Default::default() })
     })
     .await;
 
@@ -235,7 +235,7 @@ async fn test_zero_days_touches_nothing(pool: PgPool) {
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_removal_given_up_on_keeps_its_mark_and_the_pass_goes_on(pool: PgPool) {
     // The stalled one first: older marks sort first, so it is the pass's
-    // first candidate and the hour it sleeps for is the stall.
+    // first candidate and its ten-second sleep is the stall.
     let (stalled, stalled_pod) = quiet_stopped_days_ago(&pool, 9).await;
     let (on_time, on_time_pod) = quiet_stopped_days_ago(&pool, 8).await;
 
@@ -255,4 +255,23 @@ async fn test_a_removal_given_up_on_keeps_its_mark_and_the_pass_goes_on(pool: Pg
     assert!(mark_set(&pool, stalled_pod).await, "the stalled stop keeps its mark for the retry");
     assert!(!mark_set(&pool, on_time_pod).await, "and the next candidate settles");
     assert!(removal_notices(&pool, stalled).await.is_empty(), "a removal given up on claims nothing");
+}
+
+/// F2 (SME-345 review 1): a `Foreign` workspace stands — another
+/// instance's — while Docker's claim goes. One claim was deleted, so the
+/// counts alone would announce "repos cloned there need cloning again"
+/// over a workspace that is still there; the notice belongs to
+/// `workspace_gone`, and this case settles quietly — retry could never
+/// take a `Foreign` claim.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_foreign_workspace_stands_and_settles_quietly(pool: PgPool) {
+    let (conversation, pod) = quiet_stopped_days_ago(&pool, 8).await;
+    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async {
+        Ok(StorageRemoval { claims_deleted: 1, workspace_gone: false, ..Default::default() })
+    })
+    .await;
+
+    assert_eq!(settled, vec![conversation], "a standing Foreign claim settles the stop — retry could never take it");
+    assert!(!mark_set(&pool, pod).await, "settled once, like every settled stop");
+    assert!(removal_notices(&pool, conversation).await.is_empty(), "no notice sends the model off to re-clone over files that stand");
 }

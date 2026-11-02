@@ -235,6 +235,11 @@ pub(in crate::sandbox) async fn remove_conversation_storage_locked(
     if removal != StorageRemoval::default() {
         events::publish_app(events::AppEvent::PodsChanged);
     }
+    // Surfaced for the callers that read it (SME-345's pass, F2): the
+    // workspace claim's own outcome, which the counts alone can't tell
+    // — a `Foreign` workspace stands while Docker's claim goes. Set
+    // after the `!= default` check above, which compares the counts.
+    removal.workspace_gone = workspace_gone;
     // The record of what this server deleted (SME-117).
     tracing::info!(conversation_id, ?removal, "removed a conversation's sandbox storage");
     Ok(removal)
