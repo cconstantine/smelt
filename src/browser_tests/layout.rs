@@ -289,6 +289,8 @@ pub(super) async fn scenario_sidebar(t: &Scenario<'_>) {
     // A row to measure, even when this scenario runs alone.
     let conversation = t.conversation().await;
     seed_user_message(t.pool, conversation.id, "a sidebar row").await;
+    let other = t.conversation().await;
+    seed_user_message(t.pool, other.id, "another sidebar row").await;
     let page = t.tab(t.url("")).await;
     // And the sidebar's two-step Delete keeps its size when armed: the
     // armed label was bold, so it came out wider than the width the
@@ -303,7 +305,11 @@ pub(super) async fn scenario_sidebar(t: &Scenario<'_>) {
     assert_eq!(before.2, after.2, "arming the sidebar's Delete changed its width");
     // A title uses its row, and each row says how long ago the
     // conversation was active. Titles were cut at about 15 characters
-    // with most of the row empty (SME-41 D8).
+    // with most of the row empty (SME-41 D8). The row measured is one the
+    // pointer isn't on, since a hovered row trades its age for Delete:
+    // with this scenario's one conversation the only row was the one the
+    // Delete click above left the pointer on, so run first or alone the
+    // age read empty (SME-278). A second conversation gives it one.
     let row: Vec<String> = page
         .evaluate(
             "(() => { const item = document.querySelector('.conversation-item:not(:hover)') || document.querySelector('.conversation-item'); \
