@@ -141,8 +141,10 @@ fn test_a_later_turn_clears_a_turns_error_but_not_a_failed_send() {
 #[test]
 fn test_apply_event_a_turn_starting_clears_an_earlier_error() {
     with_state(|state| {
+        assert!(!*state.turn_state_known().peek(), "a fresh state doesn't know yet (SME-354 B17)");
         assert_eq!(apply_event(state, ConversationEvent::TurnState { running: true, elapsed: 0 }), EventEffect::TurnStarted);
         assert!(*state.turn_running().peek());
+        assert!(*state.turn_state_known().peek(), "a TurnState event tells it");
         assert_eq!(apply_event(state, ConversationEvent::TurnState { running: false, elapsed: 0 }), EventEffect::None);
     });
 }

@@ -16,9 +16,12 @@ pub(in super::super) fn todo_status_class(status: TodoStatus) -> &'static str {
 /// What the panel says over a list nobody is working on: with no turn
 /// running and items still open, the list is where the model left it, not
 /// work in progress (SME-123 DR7: a finished agent's list read as if it
-/// were still working). None while a turn runs or everything's done.
-pub(in super::super) fn todo_note(todos: &[TodoItem], turn_running: bool) -> Option<String> {
-    if turn_running {
+/// were still working). None while a turn runs, before the page knows
+/// whether one does (`turn_running` is `None`), or everything's done.
+pub(in super::super) fn todo_note(todos: &[TodoItem], turn_running: Option<bool>) -> Option<String> {
+    // Unknown until the turn's state is fetched (SME-354 B17): the list
+    // can arrive first, and a running turn's panel isn't idle.
+    if turn_running != Some(false) {
         return None;
     }
     match todos.iter().filter(|t| t.status != TodoStatus::Completed).count() {
@@ -34,7 +37,8 @@ pub(in super::super) fn TodoPanel(
     state: Store<ConversationState>,
 ) -> Element {
     let todos = state.todos();
-    let note = todo_note(&todos(), (state.turn_running())());
+    let known = (state.turn_state_known())();
+    let note = todo_note(&todos(), known.then(|| (state.turn_running())()));
     let class = if note.is_some() { "todo-panel todo-panel-idle" } else { "todo-panel" };
     rsx! {
         aside { class,
@@ -67,9 +71,18 @@ mod tests {
     #[test]
     fn test_an_open_list_with_no_turn_running_says_nobody_works_on_it() {
         let list = [todo(TodoStatus::InProgress), todo(TodoStatus::Pending), todo(TodoStatus::Completed)];
-        assert_eq!(todo_note(&list, false).as_deref(), Some("Not being worked on now: 2 still open."));
-        assert_eq!(todo_note(&list, true), None, "a running turn is working on it");
-        assert_eq!(todo_note(&[todo(TodoStatus::Completed)], false), None, "all done");
-        assert_eq!(todo_note(&[todo(TodoStatus::Pending)], false).as_deref(), Some("Not being worked on now: 1 still open."));
+        assert_eq!(todo_note(&list, Some(false)).as_deref(), Some("Not being worked on now: 2 still open."));
+        assert_eq!(todo_note(&list, Some(true)), None, "a running turn is working on it");
+        assert_eq!(todo_note(&[todo(TodoStatus::Completed)], Some(false)), None, "all done");
+        assert_eq!(todo_note(&[todo(TodoStatus::Pending)], Some(false)).as_deref(), Some("Not being worked on now: 1 still open."));
+    }
+
+    /// SME-354 B17: on load or a switch the list arrives before the turn's
+    /// state does, and a running turn's panel said "Not being worked on
+    /// now" until it did. Until the state is known, no idle note.
+    #[test]
+    fn test_an_open_list_says_nothing_until_the_turns_state_is_known() {
+        let list = [todo(TodoStatus::InProgress), todo(TodoStatus::Pending)];
+        assert_eq!(todo_note(&list, None), None);
     }
 }
