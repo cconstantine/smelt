@@ -289,7 +289,7 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
             .map_err(ServerFnError::new)?
         {
             forget_turn_generation(conversation_id);
-            return Err(ServerFnError::new("conversation not found").into());
+            return Err(crate::api::chat::conversation_not_found().into());
         }
         // Saved holding the lock and outside the stop's `select!`, so a
         // Stop can't land between the INSERT and the turn knowing it's
@@ -409,7 +409,7 @@ pub(crate) async fn start_turn(pool: PgPool, id: i64, content: String) -> Server
         .await
         .map_err(ServerFnError::new)?
     {
-        return Err(ServerFnError::new("conversation not found"));
+        return Err(crate::api::chat::conversation_not_found());
     }
     // Admitted before this returns, so a Stop sent after it ends this turn
     // (SME-216). The user writing again ends any pause from an earlier

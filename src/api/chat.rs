@@ -41,7 +41,7 @@ pub async fn get_messages(id: i64) -> ServerFnResult<Vec<Message>> {
         .await
         .map_err(ServerFnError::new)?
     {
-        return Err(ServerFnError::new("conversation not found"));
+        return Err(conversation_not_found());
     }
     db::list_messages(db::get(), id)
         .await
@@ -82,6 +82,15 @@ async fn delete_and_forget(pool: &PgPool, id: i64) -> Result<(), String> {
 #[get("/api/conversations/busy")]
 pub async fn get_busy_conversations() -> ServerFnResult<Vec<i64>> {
     Ok(busy_conversations())
+}
+
+/// The refusal for a conversation that doesn't exist, or was deleted: a
+/// 404, not the 500 a plain server error is served as (SME-354 B23: a
+/// tab left on a deleted conversation got 500s from its events, messages
+/// and repos). The page knows it by its message.
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
+pub fn conversation_not_found() -> ServerFnError {
+    ServerFnError::ServerError { message: "conversation not found".to_string(), code: 404, details: None }
 }
 
 /// The error a stopped turn ends with. Not server-only: the chat page
@@ -317,7 +326,7 @@ pub async fn get_conversation_model(id: i64) -> ServerFnResult<crate::providers:
     crate::providers::conversation_model(db::get(), id)
         .await
         .map_err(ServerFnError::new)?
-        .ok_or_else(|| ServerFnError::new("conversation not found"))
+        .ok_or_else(|| conversation_not_found())
 }
 
 /// The picker's choice: the conversation's turns run on this provider and
@@ -463,11 +472,11 @@ pub(crate) async fn open_conversation_events(
 ) -> ServerFnResult<impl futures_util::Stream<Item = Result<events::ConversationEvent, axum::BoxError>> + use<>> {
     let exists = || async { db::conversation_exists(pool, id).await.map_err(ServerFnError::new) };
     if !exists().await? {
-        return Err(ServerFnError::new("conversation not found"));
+        return Err(conversation_not_found());
     }
     let stream = conversation_event_stream(id);
     if !exists().await? {
-        return Err(ServerFnError::new("conversation not found"));
+        return Err(conversation_not_found());
     }
     Ok(stream)
 }

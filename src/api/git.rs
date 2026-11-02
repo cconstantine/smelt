@@ -90,6 +90,9 @@ fn deliver(pool: &sqlx::PgPool, notices: Vec<(i64, String)>) {
 /// The conversation's repos, for the sandbox panel.
 #[get("/api/conversations/{id}/repos")]
 pub async fn list_conversation_repos(id: i64) -> ServerFnResult<Vec<RepoSummary>> {
+    if !db::conversation_exists(db::get(), id).await.map_err(ServerFnError::new)? {
+        return Err(crate::api::chat::conversation_not_found());
+    }
     git::list_repos(db::get(), id).await.map_err(ServerFnError::new)
 }
 

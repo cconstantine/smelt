@@ -126,7 +126,15 @@ async fn test_a_stop_clears_the_reply_even_with_another_turn_in_flight(pool: PgP
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_subscribing_to_a_missing_conversation_is_refused(pool: PgPool) {
     let missing = 9_100_000_099;
-    assert!(open_conversation_events(&pool, missing).await.is_err());
+    // Refused as missing, a 404, not a server failure (SME-354 B23: a
+    // deleted conversation's tab got 500s).
+    match open_conversation_events(&pool, missing).await {
+        Err(ServerFnError::ServerError { message, code, .. }) => {
+            assert_eq!((message.as_str(), code), ("conversation not found", 404));
+        }
+        Err(other) => panic!("refused with the wrong error: {other:?}"),
+        Ok(_) => panic!("a missing conversation's stream opened"),
+    }
     assert!(!events::has_channel(missing), "a refused subscription leaves no channel");
 
     // An id no other test's database hands out: what this test hears on
