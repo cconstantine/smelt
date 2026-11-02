@@ -4,7 +4,7 @@ smelt's machine persona file is `.agents/personas/ticket-driver.md`; its `smelt.
 
 ## One driver per ticket
 
-When a ticket reaches **Todo** — plan approved, the user's questions answered — the Project Manager starts one Ticket Driver for it, and that agent owns the ticket from there to merged and closed (SME-306). It starts the seats its phases need — the **Developer**, the round-1 **Code Reviewers** and the round-2 reviewer, the **Integrator**, and a **Planner** if a revision round is asked for — steering each with a brief that points at the rules and names only the ticket facts, as the Project Manager's brief rule says; by persona where the repo carries persona files at the seat's ref.
+When a ticket reaches **Todo** — plan approved, the user's questions answered — the Project Manager starts one Ticket Driver for it, and that agent owns the ticket from there to merged and closed (SME-306). It starts the seats its phases need — the **Developer**, the round-1 **Code Reviewers** and the round-2 reviewer (only the driver starts reviewers, once the PR is final; the Developer's persona file denies `start_agent`, SME-338), the **Integrator**, and a **Planner** if a revision round is asked for — steering each with a brief that points at the rules and names only the ticket facts, as the Project Manager's brief rule says; by persona where the repo carries persona files at the seat's ref.
 
 It is the rung between the Project Manager and the work: the seats' parent, the only conversation above it is the Project Manager's, and it never talks to another ticket's seats — anything that touches another ticket's plan goes up to the Project Manager instead (that is how SME-255's sweep arm and SME-253's Terminating guard were kept from colliding silently).
 

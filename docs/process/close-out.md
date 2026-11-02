@@ -47,7 +47,7 @@ A retrospective looks at the whole development process, across every project, so
 
 ## Code review (after opening the PR)
 
-Every PR gets a code review once it's open, while CI runs, by a [Code Reviewer](../personas/code-reviewer.md) sub-agent started on the PR. It reads the whole diff for bugs, including security gaps, which a project's own tests are poorly placed to find because they were written with the same assumptions as the code.
+Every PR gets a code review once it's final (evidence done, main merged in, no TBDs), by a [Code Reviewer](../personas/code-reviewer.md) sub-agent started on the PR by the seat that dispatches the work: on a driven ticket its [Ticket Driver](../personas/ticket-driver.md), never the Developer (SME-338). It reads the whole diff for bugs, including security gaps, which a project's own tests are poorly placed to find because they were written with the same assumptions as the code.
 
 Don't run `/code-review` from the conversation that wrote the change: the skill forks that conversation, and its reviewer then inherits the author's assumptions and context, against the rule that sub-agents start fresh (see [Personas](../personas/README.md)). The Code Reviewer may run `/code-review <PR number>` itself, since its fork carries only the Code Reviewer's own brief; it still checks and reports each finding as its persona says. (SME-114)
 
