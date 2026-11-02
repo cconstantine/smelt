@@ -62,6 +62,40 @@ const CONNECT_TIMEOUT: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_secs(15)
 };
 
+/// `CONNECT_TIMEOUT` for `server_id`. A test build's 1 s keeps the tests of
+/// a server that never answers quick, but a test that holds its own
+/// provider back on purpose (to make two callers meet on one refresh)
+/// spends that budget waiting on itself, and under CI's load ran past it
+/// ("didn't answer within 1s", SME-341). Such a test gives its server the
+/// product's own budget (`test_support::give_product_budget`); every other
+/// server keeps the short one.
+pub(super) fn connect_timeout(server_id: i64) -> std::time::Duration {
+    #[cfg(test)]
+    if test_support::has_product_budget(server_id) {
+        return std::time::Duration::from_secs(15);
+    }
+    let _ = server_id;
+    CONNECT_TIMEOUT
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::collections::HashSet;
+    use std::sync::{LazyLock, Mutex};
+
+    static PRODUCT_BUDGET: LazyLock<Mutex<HashSet<i64>>> = LazyLock::new(Default::default);
+
+    /// `server_id` connects under the product's budget, not the test build's
+    /// 1 s (see `connect_timeout`).
+    pub(crate) fn give_product_budget(server_id: i64) {
+        PRODUCT_BUDGET.lock().unwrap_or_else(|e| e.into_inner()).insert(server_id);
+    }
+
+    pub(super) fn has_product_budget(server_id: i64) -> bool {
+        PRODUCT_BUDGET.lock().unwrap_or_else(|e| e.into_inner()).contains(&server_id)
+    }
+}
+
 /// After a failed connection, model calls skip the server for this long
 /// instead of trying (and waiting) again on every call. The status page
 /// still tries each time it's opened.
@@ -444,6 +478,7 @@ async fn connect_unspanned(pool: &sqlx::PgPool, config: &McpServerConfig) -> Res
         stale: stale.clone(),
     };
     let name = config.name.clone();
+    let timeout = connect_timeout(config.id);
     let (pool, config) = (pool.clone(), config.clone());
     let connecting = async move {
         // An OAuth server's requests go through rmcp's `AuthClient`, which
@@ -477,13 +512,13 @@ async fn connect_unspanned(pool: &sqlx::PgPool, config: &McpServerConfig) -> Res
     // Outside every span: rmcp's service loop keeps `Span::current()` for
     // as long as the connection is cached, which would hold the turn that
     // first connected, and its request, open (SME-137).
-    let (service, tools) = crate::telemetry::outside_spans(tokio::time::timeout(CONNECT_TIMEOUT, connecting))
+    let (service, tools) = crate::telemetry::outside_spans(tokio::time::timeout(timeout, connecting))
         .await
         .map_err(|_| {
             ConnectError::from(format!(
                 "MCP server {:?} didn't answer within {}s",
                 name,
-                CONNECT_TIMEOUT.as_secs()
+                timeout.as_secs()
             ))
         })??;
 
