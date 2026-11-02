@@ -30,14 +30,17 @@ pub(in crate::sandbox) fn running_wait_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// `SANDBOX_DOCKER_MEMORY_LIMIT`, default `"8Gi"` — see
+/// `SANDBOX_DOCKER_MEMORY_LIMIT`, default `"48Gi"` — see
 /// `default_memory_limit`. Nested containers count against it, not the
-/// sandbox container's limit.
+/// sandbox container's limit — and a seat's whole gate stack runs nested
+/// under this daemon (cargo builds, the dind service, k3s, postgres;
+/// SME-33): 48Gi is the size that fits it, after smaller ceilings
+/// OOM-restarted daemons mid-gate (SME-317).
 pub(in crate::sandbox) fn default_docker_memory_limit() -> String {
     std::env::var("SANDBOX_DOCKER_MEMORY_LIMIT")
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "8Gi".to_string())
+        .unwrap_or_else(|| "48Gi".to_string())
 }
 
 /// A container's resources (SME-77): a memory limit, an explicit zero

@@ -195,6 +195,16 @@ fn test_pod_limit_overrides_replace_only_the_limits_they_name() {
     assert_eq!(docker.storage, PodStorage::Conversation(7));
 }
 
+/// SME-317: the default Docker sidecar limit is pinned to `48Gi` because a
+/// seat's whole gate stack — the cargo builds, the nested `docker` dind,
+/// `k3s` and `postgres` containers — counts against it, and 8Gi OOM-killed
+/// daemons mid-gate. Change it only with the docs that state it
+/// (`docs/setup.md`, `docs/setup/environment.md`).
+#[test]
+fn test_default_docker_memory_limit_fits_a_full_gate_stack() {
+    assert_eq!(default_docker_memory_limit(), "48Gi");
+}
+
 /// SME-77: a limit with no request is copied into the request, so an
 /// idle pod reserved its whole 8Gi + 8Gi. Each container now asks for
 /// no memory and has no CPU request or limit at all.
