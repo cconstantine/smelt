@@ -31,6 +31,7 @@ pub(super) fn prompt_env() -> PromptEnvironment {
         agent: None,
         credentials: None,
         idle_stop_minutes: Some(60),
+        storage_removal_days: Some(7),
     }
 }
 

@@ -314,12 +314,28 @@ fn idle_stop_note(minutes: u32) -> String {
     }
 }
 
-/// The footnote on automatic stops, once the server says what's in force.
+/// The footnote's sentence on automatic storage removal (SME-345), for a
+/// grace of `days` (`0`: removal off). It says whose storage goes and
+/// whose doesn't — a quiet stop's does, a Stop's never does.
+fn storage_removal_note(days: u32) -> String {
+    match days {
+        0 => "Storage is never removed automatically.".to_string(),
+        days => format!(
+            "Storage a quietly stopped sandbox keeps is removed {days} days after the stop; a sandbox you stopped keeps it until you remove it."
+        ),
+    }
+}
+
+/// The footnote on automatic stops and what becomes of the storage they
+/// keep, once the server says what's in force.
 #[component]
 fn IdleStopNote() -> Element {
     let minutes = use_resource(crate::api::sandbox::get_idle_stop_minutes);
-    match minutes() {
-        Some(Ok(minutes)) => rsx! { p { class: "muted pods-footnote", "{idle_stop_note(minutes)}" } },
+    let days = use_resource(crate::api::sandbox::get_storage_removal_days);
+    match (minutes(), days()) {
+        (Some(Ok(minutes)), Some(Ok(days))) => rsx! {
+            p { class: "muted pods-footnote", "{idle_stop_note(minutes)} {storage_removal_note(days)}" }
+        },
         _ => rsx! {},
     }
 }
@@ -405,6 +421,15 @@ mod tests {
             idle_stop_note(0),
             "Idle sandboxes aren't stopped automatically; a finished agent's is, unless a command is still running."
         );
+    }
+
+    #[test]
+    fn test_the_storage_removal_note_says_whose_storage_goes() {
+        assert_eq!(
+            storage_removal_note(7),
+            "Storage a quietly stopped sandbox keeps is removed 7 days after the stop; a sandbox you stopped keeps it until you remove it."
+        );
+        assert_eq!(storage_removal_note(0), "Storage is never removed automatically.");
     }
 
     #[test]

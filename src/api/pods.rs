@@ -143,6 +143,11 @@ pub struct StorageRemoval {
     /// How many were left behind (unlabelled, replaced, a failed
     /// delete): the view will still show them.
     pub claims_failed: u8,
+    /// Whether the workspace claim went — deleted or already gone.
+    /// `false` when it stands (Foreign, or a failed delete), and then no
+    /// notice may tell the model its files are gone and its repos need
+    /// cloning again (SME-253 review 1, finding 2; SME-345 review 1, F2).
+    pub workspace_gone: bool,
 }
 
 /// A Kubernetes CPU quantity in nanocores: `"250m"`, `"2"` (cores),

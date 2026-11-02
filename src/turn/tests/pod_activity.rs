@@ -124,6 +124,21 @@ fn test_an_agents_environment_says_finish_stops_its_pod() {
     assert!(system_prompt(&agent).contains(FINISH_LINE), "even with idle stops off");
 }
 
+const STORAGE_LINE: &str = "- A sandbox stopped by idle or finish loses its storage 7 days later unless it starts again; \
+    the next sandbox then starts fresh.\n";
+
+#[test]
+fn test_the_environment_says_when_a_quiet_stop_loses_its_storage() {
+    let env = super::prompt::prompt_env();
+    assert!(system_prompt(&env).contains(STORAGE_LINE), "{}", system_prompt(&env));
+
+    let off = PromptEnvironment { storage_removal_days: None, ..super::prompt::prompt_env() };
+    assert!(!system_prompt(&off).contains("loses its storage"), "no line while automatic removal is off");
+
+    let thirty = PromptEnvironment { storage_removal_days: Some(30), ..super::prompt::prompt_env() };
+    assert!(system_prompt(&thirty).contains("storage 30 days later"), "the days in force");
+}
+
 /// A mock model whose replies each wait for a permit on `gate`; `seen` is
 /// notified as each request arrives.
 async fn gated_upstream(pool: &PgPool, gate: Arc<tokio::sync::Semaphore>, seen: Arc<tokio::sync::Notify>) {

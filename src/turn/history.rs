@@ -244,6 +244,10 @@ pub(crate) struct PromptEnvironment {
     /// `SANDBOX_IDLE_STOP_MINUTES` while idle stops are on; `None` at `0`
     /// (SME-78).
     pub idle_stop_minutes: Option<u32>,
+    /// `SANDBOX_STORAGE_REMOVAL_DAYS` while automatic removal is on;
+    /// `None` at `0` (SME-345). What it describes is storage a quiet stop
+    /// kept, so the line speaks for both quiet kinds.
+    pub storage_removal_days: Option<u32>,
 }
 
 /// One volume in the environment section (SME-239): a global volume from
@@ -299,6 +303,13 @@ pub(crate) fn system_prompt(env: &PromptEnvironment) -> String {
             "- Your sandbox pod is stopped when you finish, unless a command is still running; \
              /workspace and volumes are kept for if you're given more work.\n",
         );
+    }
+    // When smelt removes what those quiet stops kept (SME-345).
+    if let Some(days) = env.storage_removal_days {
+        prompt.push_str(&format!(
+            "- A sandbox stopped by idle or finish loses its storage {days} days later unless it starts again; \
+             the next sandbox then starts fresh.\n"
+        ));
     }
     if !env.volumes.is_empty() {
         prompt.push_str("- Volumes (their contents survive the pod ending):\n");
@@ -520,6 +531,7 @@ pub(crate) async fn prompt_environment(
         agent,
         credentials,
         idle_stop_minutes: Some(crate::sandbox::idle_stop_minutes()).filter(|minutes| *minutes > 0),
+        storage_removal_days: Some(crate::sandbox::storage_removal_days()).filter(|days| *days > 0),
     }
 }
 

@@ -217,3 +217,10 @@ pub async fn get_sandbox_state(id: i64) -> ServerFnResult<SandboxSnapshot> {
 pub async fn get_idle_stop_minutes() -> ServerFnResult<u32> {
     Ok(sandbox::idle_stop_minutes())
 }
+
+/// `SANDBOX_STORAGE_REMOVAL_DAYS` as the server read it, `0` when
+/// automatic removal is off, for the pods page's footnote (SME-345).
+#[get("/api/sandbox/storage-removal-days")]
+pub async fn get_storage_removal_days() -> ServerFnResult<u32> {
+    Ok(sandbox::storage_removal_days())
+}

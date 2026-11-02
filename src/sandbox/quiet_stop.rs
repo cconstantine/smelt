@@ -317,6 +317,12 @@ pub(crate) async fn stop_locked(
         }
     }
     tracing::info!(pod_id, conversation_id, ?reason, "stopped a sandbox pod quietly");
+    // SME-345: the row now carries the clock the storage-grace pass runs
+    // from. A failed stamp is conservative — this stop's storage is kept,
+    // never wrongly removed — so the stop stands and only warns.
+    if let Err(e) = db::mark_pod_quietly_stopped(pool, pod_id).await {
+        tracing::warn!(pod_id, conversation_id, error = %e, "couldn't stamp a quiet stop; its storage will not be swept");
+    }
     save_stop_notice(pool, pod_id, conversation_id, reason).await;
     true
 }

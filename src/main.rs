@@ -187,6 +187,9 @@ async fn start_up(dotenv_problem: Option<String>) -> tokio::net::TcpListener {
     // Stops idle pods with no command running, and finished agents' pods,
     // quietly (SME-78). See `sandbox::stop_idle_pods`.
     tokio::spawn(sandbox::stop_idle_pods(pool.clone()));
+    // Removes what those quiet stops kept, once the grace has passed
+    // (SME-345). See `sandbox::remove_expired_storage`.
+    tokio::spawn(sandbox::remove_expired_storage(pool.clone()));
     // Clones the last run was in the middle of never finished (SME-32).
     match db::fail_unfinished_clones(pool, git::CLONE_INTERRUPTED).await {
         Ok(0) => {}
