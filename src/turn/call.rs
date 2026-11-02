@@ -37,7 +37,10 @@ pub(super) const TOOL_CALL_PARSE_RETRIES: usize = 2;
 /// between one turn's calls (the ticket's Evidence: every switch
 /// re-prefills the prompt), and the turn's own calls are told to send
 /// through it (`anthropic::stream::SlotPolicy::Held`) rather than
-/// queueing behind the slot they already hold.
+/// queueing behind the slot they already hold. The one exception is a
+/// tool pass while the turn's own agents are live on the same provider
+/// (`yield_to_own_agents`, SME-354 B6): they get the slot until the turn's
+/// next call.
 ///
 /// `refresh` re-checks the pool at each loop iteration: a **resized**
 /// limit keeps this very slot (the pool resized in place; review 2's math
@@ -98,6 +101,25 @@ impl TurnSlot {
             // Assigning after the await: the old slot, if any, is given
             // up once the current pool's is in hand (or confirmed gone).
             *self = Self::take(turn_model, self.recorded).await;
+        }
+    }
+
+    /// Gives the slot up for the tool pass about to run when an agent under
+    /// this conversation is `starting` or `active` on the same provider
+    /// (SME-354 B6): otherwise the turn's own agents wait for its whole
+    /// turn, where before SME-343 they ran between its calls. The next
+    /// iteration's `refresh` takes a slot again before the next call,
+    /// behind a child already queued (the pool's semaphore is first come,
+    /// first served). With no such agent the slot is kept, so a lone
+    /// turn's cache stays warm (SME-343); a failed lookup keeps it too.
+    pub(super) async fn yield_to_own_agents(&mut self, pool: &PgPool, conversation_id: i64, provider_id: i64) {
+        if self.slot.is_none() {
+            return;
+        }
+        match db::live_agent_under_on_provider(pool, conversation_id, provider_id).await {
+            Ok(true) => self.slot = None,
+            Ok(false) => {}
+            Err(e) => tracing::warn!(conversation_id, "couldn't check for agents to give the slot to: {e}"),
         }
     }
 
