@@ -200,18 +200,20 @@ fn test_pod_limit_overrides_replace_only_the_limits_they_name() {
 /// `k3s` and `postgres` containers — counts against it, and 8Gi OOM-killed
 /// daemons mid-gate. The pin is on the const, not on the resolved
 /// `default_docker_memory_limit()`: CI sets `SANDBOX_DOCKER_MEMORY_LIMIT`
-/// small to fit the runner (a deployment setting a test never asserts
-/// through), the same reason the pull-policy test asserts against
-/// `default_image_pull_policy()`. Change it only with the docs that state
-/// it (`docs/setup.md`, `docs/setup/environment.md`).
+/// small to fit the runner, and a test that pins a value can only pin what
+/// no env var can change. The sibling test that does assert through the
+/// function (`test_pod_limit_overrides_replace_only_the_limits_they_name`)
+/// compares against the function itself, never a literal, so it holds under
+/// any override. Change the value only with the docs that state it
+/// (`docs/setup.md`, `docs/setup/environment.md`).
 #[test]
 fn test_default_docker_memory_limit_fits_a_full_gate_stack() {
     assert_eq!(DEFAULT_DOCKER_MEMORY_LIMIT, "48Gi");
 }
 
 /// SME-77: a limit with no request is copied into the request, so an
-/// idle pod reserved its whole 8Gi + 8Gi. Each container now asks for
-/// no memory and has no CPU request or limit at all.
+/// idle pod reserved its whole limit — the 8Gi + 8Gi of the day. Each
+/// container now asks for no memory and has no CPU request or limit at all.
 #[test]
 fn test_pod_spec_reserves_nothing_and_limits_only_memory() {
     let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], &[], TEST_INSTANCE);
