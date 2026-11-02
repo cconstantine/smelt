@@ -8,7 +8,7 @@
 //! own (`summary`), answers them in arrival order from a list of bodies, and
 //! holds every request until the test releases it — the same shape as
 //! `anthropic::stream::tests::limiter`'s, and the reason each test names its
-//! provider ids uniquely (9162000311–317: the pools are process-wide by
+//! provider ids uniquely (9162000311–318: the pools are process-wide by
 //! provider id, and 9162000301/302 are `providers/tests/server_tests/llama`'s).
 
 use super::*;
@@ -523,4 +523,62 @@ async fn test_clearing_a_limit_mid_turn_releases_the_held_slot(pool: PgPool) {
     let chats: Vec<_> = spans.iter().filter(|span| span.name.starts_with("chat ")).collect();
     assert_eq!(chats.len(), 2, "both of the turn's calls: {spans:?}");
     assert!(chats.iter().all(|chat| records(chat, "smelt.slot_wait_ms") == 0), "the calls record no wait of their own");
+}
+
+/// T10: clearing a limit and re-setting it mid-turn makes the turn give up
+/// its held slot and take the new pool's at its refresh — but the turn
+/// span's `smelt.slot_wait_ms` lands exactly once: a span keeps every value
+/// an attribute is given (`anthropic::stream`'s "Each once"), so a re-take
+/// re-recording would land the field twice. Red before the fix: the
+/// clear-then-set re-take records a second time.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_clearing_and_resetting_a_limit_mid_turn_records_the_wait_once(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let (addr, gate) = start_slot_gate(vec![
+        GateResponse::Sse(unknown_tool_call_body("Thinking.", "no_such_tool_343")),
+        GateResponse::Sse(text_reply_body("Done.")),
+    ])
+    .await;
+    let (provider, a, _b) = slot_provider_and_conversations(&pool, addr, 9_162_000_318, Some(1)).await;
+
+    let (result, spans) = crate::telemetry::capture_spans(async move {
+        let (reached, resume) = test_hooks::pause_after_reply_saved(a);
+        let turn = tokio::spawn({
+            let pool = pool.clone();
+            async move { run_turn(&pool, a, call_message("a")).await }
+        });
+        gate.wait_for_arrivals(1).await;
+        gate.release_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), reached)
+            .await
+            .expect("A's first reply is saved")
+            .expect("hook");
+
+        // Clear and re-set while the turn is paused between its calls: its
+        // next refresh finds a replaced pool and must re-take — a free slot,
+        // no wait — without recording a second one.
+        save_limit(&pool, &provider, None).await;
+        save_limit(&pool, &provider, Some(1)).await;
+        drop(resume);
+
+        gate.wait_for_arrivals(2).await; // A's second call goes on the new pool's slot
+        gate.release_one(); // A's final reply
+        tokio::time::timeout(std::time::Duration::from_secs(30), turn)
+            .await
+            .expect("the turn ends")
+            .expect("join")
+    })
+    .await;
+    result.expect("the turn succeeds");
+
+    let turns: Vec<_> = spans.iter().filter(|span| span.name == "turn").collect();
+    let [turn] = turns.as_slice() else { panic!("one turn span: {spans:?}") };
+    let records = |span: &opentelemetry_sdk::trace::SpanData, key: &str| {
+        span.attributes.iter().filter(|kv| kv.key.as_str() == key).count()
+    };
+    assert_eq!(
+        records(turn, "smelt.slot_wait_ms"),
+        1,
+        "the turn's one wait survives a replaced pool: recorded once"
+    );
 }

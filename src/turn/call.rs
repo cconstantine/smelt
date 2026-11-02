@@ -48,6 +48,11 @@ pub(super) const TOOL_CALL_PARSE_RETRIES: usize = 2;
 #[cfg(feature = "server")]
 pub(super) struct TurnSlot {
     slot: Option<crate::providers::limiter::Slot>,
+    /// Whether this turn's one wait has landed on the turn span: a span
+    /// keeps every value an attribute is given (`anthropic::stream`'s
+    /// "Each once"), so a refresh's re-take must not record a second one
+    /// (T10).
+    recorded: bool,
 }
 
 #[cfg(feature = "server")]
@@ -57,20 +62,31 @@ impl TurnSlot {
     /// (SME-162 review 2) — on the caller's span: `run_turn_steps` calls
     /// this in the turn's span, and its calls record none of their own.
     pub(super) async fn acquire(turn_model: &crate::providers::TurnModel) -> Self {
-        let (slot, waited) = match turn_model.endpoint.slot().await {
-            Some((slot, waited)) => (slot, waited),
-            None => return Self { slot: None },
+        Self::take(turn_model, false).await
+    }
+
+    /// `recorded` says this turn's wait is already on the span — a
+    /// refresh's re-take of a replaced pool then takes its slot without
+    /// recording again; a turn that never had a pool to record behind
+    /// (unlimited, now limited) records its first here.
+    async fn take(turn_model: &crate::providers::TurnModel, recorded: bool) -> Self {
+        let Some((slot, waited)) = turn_model.endpoint.slot().await else {
+            return Self { slot: None, recorded };
         };
-        let waited = i64::try_from(waited.as_millis()).unwrap_or(i64::MAX);
-        tracing::Span::current().record("smelt.slot_wait_ms", waited);
-        Self { slot }
+        if !recorded {
+            let waited = i64::try_from(waited.as_millis()).unwrap_or(i64::MAX);
+            tracing::Span::current().record("smelt.slot_wait_ms", waited);
+        }
+        Self { slot, recorded: true }
     }
 
     /// Re-checks the provider's pool (T6, T7): keep holding the current
     /// pool's slot, or give this turn's slot over to what's now there —
-    /// including none, in either direction. A re-take records its wait on
-    /// the turn span like the first acquire's; the common paths (resized
-    /// pool, cleared limit) wait not at all (T7).
+    /// including none, in either direction. A re-take records nothing new:
+    /// the turn's one wait is its first acquire's, once on the span (T10);
+    /// the paths a refresh walks (resized, cleared, replaced) wait not at
+    /// all in the tests, and a replaced pool's re-take rides the same held
+    /// rules as the first acquire.
     pub(super) async fn refresh(&mut self, turn_model: &crate::providers::TurnModel) {
         let pool = crate::providers::limiter::current(turn_model.provider_id);
         let keep = match (&self.slot, &pool) {
@@ -81,7 +97,7 @@ impl TurnSlot {
         if !keep {
             // Assigning after the await: the old slot, if any, is given
             // up once the current pool's is in hand (or confirmed gone).
-            *self = Self::acquire(turn_model).await;
+            *self = Self::take(turn_model, self.recorded).await;
         }
     }
 
