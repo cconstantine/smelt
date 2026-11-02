@@ -81,9 +81,11 @@ pub(in crate::sandbox) async fn remove_conversation_storage_locked(
     // `SandboxPodUpdate { terminated }` and `PodsChanged` itself.
     // `stop_pod_for_user` is deliberately not called: its "user stopped
     // pod" notice would double with the removal notice below.
+    // Its terminals close only once the pod's delete worked (SME-354
+    // B12): a failed one leaves the pod running, terminals and all.
     for row in db::list_sandbox_pods(pool, conversation_id).await.map_err(SandboxError::Db)? {
-        close_pod_terminals(pool, row.id).await;
         force_terminate_pod(pool, row.id).await?;
+        close_pod_terminals(pool, row.id).await;
         removal.pod_stopped = true;
     }
     // Its language-server pods mount the workspace claim too; their

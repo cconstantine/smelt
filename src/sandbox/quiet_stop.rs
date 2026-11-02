@@ -293,11 +293,11 @@ pub(crate) mod fake_delete {
 }
 
 /// Stops `pod_id` quietly, called with its conversation's turn lock and
-/// start lock held after a re-check said yes. Closes its terminals (none
-/// has a command running: the re-check said so, and none can start while
-/// the turn lock is held), runs `delete` and closes the row through
-/// `terminate_pod_as` (which publishes the pod's end and `PodsChanged`),
-/// then saves the notice in place, still under the turn lock, so it can't
+/// start lock held after a re-check said yes. Runs `delete` and closes
+/// the row through `terminate_pod_as` (which publishes the pod's end and
+/// `PodsChanged`), closes its terminals once that worked (none has a
+/// command running: the re-check said so, and none can start while the
+/// turn lock is held), then saves the notice in place, still under the turn lock, so it can't
 /// split a tool call from its result. A failed delete saves nothing and
 /// leaves the row live for the next pass. Whether the pod was stopped.
 pub(crate) async fn stop_locked(
@@ -307,7 +307,6 @@ pub(crate) async fn stop_locked(
     reason: StopReason,
     delete: impl std::future::Future<Output = Result<(), SandboxError>>,
 ) -> bool {
-    close_pod_terminals(pool, pod_id).await;
     // Closes the row and stamps the mark in one statement, and only a row
     // still live: a user's Stop takes neither lock, and one that ended the
     // row first leaves nothing here to mark or tell (SME-354 B3).
@@ -322,6 +321,9 @@ pub(crate) async fn stop_locked(
             return false;
         }
     }
+    // Only now the pod is known gone (SME-354 B12): a failed delete leaves
+    // it running, and its terminals with it.
+    close_pod_terminals(pool, pod_id).await;
     // SME-345: the row now carries the clock the storage-grace pass runs
     // from, stamped by the close itself.
     tracing::info!(pod_id, conversation_id, ?reason, "stopped a sandbox pod quietly");

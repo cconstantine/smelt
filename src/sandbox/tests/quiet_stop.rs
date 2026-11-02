@@ -432,3 +432,38 @@ async fn test_a_quiet_stop_inside_a_users_stop_leaves_the_mark_cleared(pool: PgP
     assert!(!live(&pool, pod).await);
     assert!(quiet_stop_mark(&pool, pod).await.is_none(), "the user's Stop cleared the mark");
 }
+
+/// SME-354 B12: a quiet stop whose delete fails leaves the pod running,
+/// so it leaves its terminals open too: they're closed only once the
+/// termination has worked.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_quiet_stop_whose_delete_fails_leaves_its_terminals_open(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let (conversation, pod) = idle_pod(&pool, 90).await;
+    let terminal = db::create_sandbox_terminal(&pool, pod).await.expect("terminal");
+
+    let stopped = stop_locked(&pool, pod, conversation, StopReason::Idle { minutes: 60 }, delete_fails(pod)).await;
+
+    assert!(!stopped);
+    assert!(live(&pool, pod).await, "the pod's row stays live");
+    let open: Vec<i64> = db::list_sandbox_terminals_for_pod(&pool, pod).await.expect("terminals").into_iter().map(|t| t.id).collect();
+    assert_eq!(open, vec![terminal.id], "the running pod keeps its terminal");
+}
+
+/// SME-354 B12, remove-storage's side: a removal whose pod delete fails
+/// (here the cluster can't be reached) leaves that pod running with its
+/// terminals open.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_removal_whose_pod_delete_fails_leaves_its_terminals_open(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    crate::sandbox::test_support::use_unreachable_test_manager();
+    let (conversation, pod) = idle_pod(&pool, 0).await;
+    let terminal = db::create_sandbox_terminal(&pool, pod).await.expect("terminal");
+
+    let removal = remove_conversation_storage_locked(&pool, conversation).await;
+
+    assert!(removal.is_err(), "the pod's delete couldn't reach the cluster: {removal:?}");
+    assert!(live(&pool, pod).await, "the pod's row stays live");
+    let open: Vec<i64> = db::list_sandbox_terminals_for_pod(&pool, pod).await.expect("terminals").into_iter().map(|t| t.id).collect();
+    assert_eq!(open, vec![terminal.id], "the running pod keeps its terminal");
+}
