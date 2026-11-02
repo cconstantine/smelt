@@ -344,8 +344,10 @@ fn ConversationRow(
                 },
                 "{row.node.title}"
             }
+            // Each mark says what it means, to a pointer and a screen
+            // reader (SME-123 DR14).
             if row.node.busy {
-                span { class: "conversation-busy", title: "Working" }
+                span { class: "conversation-busy", role: "img", title: "Working", aria_label: "Working" }
             }
             if row.node.waiting_for_user {
                 span { class: "conversation-waiting", title: "Waiting for your answer", "?" }
@@ -355,7 +357,7 @@ fn ConversationRow(
                 n => format!("{n} agents under it are waiting for you"),
             })}
             if live_pod {
-                span { class: "live-pod-dot", title: "sandbox pod running" }
+                span { class: "live-pod-dot", role: "img", title: "Sandbox running", aria_label: "Sandbox running" }
             }
             if let Some(age) = age {
                 span { class: "conversation-age", "{age}" }

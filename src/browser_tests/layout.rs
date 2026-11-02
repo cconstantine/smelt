@@ -63,6 +63,15 @@ pub(super) async fn scenario_pods(t: &Scenario<'_>) {
         wait_for_count(&sidebar_tab, &dot, 1, Duration::from_secs(10)).await,
         "the sidebar should mark a conversation whose pod started, without a reload"
     );
+    // The dot says what it means, to a pointer and a screen reader
+    // (SME-123 DR14: an unlabelled green dot).
+    let label: String = sidebar_tab
+        .evaluate(format!("(() => {{ const d = document.querySelector({dot:?}); return d.getAttribute('aria-label') + '|' + d.title; }})()"))
+        .await
+        .expect("read the dot")
+        .into_value()
+        .expect("text");
+    assert_eq!(label, "Sandbox running|Sandbox running");
 
     // On the conversation's own page, Stop comes before the full-width
     // red Remove volumes it sat under (SME-123 DR10), and Remove volumes
