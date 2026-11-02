@@ -298,6 +298,10 @@ async fn test_a_sign_in_that_cannot_be_refreshed_is_reported_as_expired(pool: sq
 async fn test_the_status_check_and_a_tool_call_share_one_refresh(pool: sqlx::PgPool) {
     let mock = oauth_http::spawn().await;
     let server = oauth_http::create_server(&pool, &mock, None).await;
+    // The provider is held back below until both callers are waiting: the
+    // test's own doing, not a slow provider, so its server isn't held to
+    // the test build's 1 s (SME-341: CI run 41381589266).
+    crate::mcp::test_support::give_product_budget(server.id);
     oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
     oauth_http::age_token(&pool, server.id).await;
     let config = oauth_http::config(&pool, server.id).await;
