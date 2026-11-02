@@ -64,6 +64,20 @@ pub(super) async fn scenario_pods(t: &Scenario<'_>) {
         "the sidebar should mark a conversation whose pod started, without a reload"
     );
 
+    // On the conversation's own page, Stop comes before the full-width
+    // red Remove volumes it sat under (SME-123 DR10), and Remove volumes
+    // is the quieter control.
+    let panel_tab = t.tab(t.url(&format!("conversation/{}", with_pod.id))).await;
+    wait_for_live_client(&panel_tab, with_pod.id).await;
+    wait_for_element(&panel_tab, ".sandbox-pod .pod-stop", Duration::from_secs(20)).await;
+    wait_for_element(&panel_tab, ".sandbox-storage .storage-remove", Duration::from_secs(20)).await;
+    let stop_box = element_box(&panel_tab, ".sandbox-pod .pod-stop").await;
+    let remove_box = element_box(&panel_tab, ".sandbox-storage .storage-remove").await;
+    let panel_box = element_box(&panel_tab, ".sandbox-storage").await;
+    assert!(stop_box.1 < remove_box.1, "Stop sandbox should come before Remove volumes: {stop_box:?} {remove_box:?}");
+    assert!(remove_box.2 * 2 < panel_box.2, "Remove volumes shouldn't span the panel: {remove_box:?} in {panel_box:?}");
+    panel_tab.close().await.expect("close the tab");
+
     let pods_page = t.tab(t.url("pods")).await;
     wait_for_resource(&pods_page, "/api/pods").await;
     let row = format!("tr[data-pod-id=\"{pod_id}\"]");
