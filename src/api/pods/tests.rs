@@ -269,6 +269,8 @@ fn test_storage_rows_groups_a_conversations_two_claims() {
                 StoredVolume { kind: StorageKind::Workspace, size: Some("20Gi".into()), deleting: false },
                 StoredVolume { kind: StorageKind::Docker, size: Some("20Gi".into()), deleting: true },
             ],
+            stopped: None,
+            observed_at: chrono::NaiveDateTime::default(),
         }],
         "workspace first however they listed, docker's size from the request, its deleting flagged"
     );

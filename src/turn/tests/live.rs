@@ -110,7 +110,8 @@ async fn test_a_sent_turn_publishes_its_failure(pool: PgPool) {
     start_mock_upstream_failing_n_times(&pool, 0, None).await;
     let mut rx = events::subscribe(failing.id);
     start_turn(pool.clone(), failing.id, "hi".to_string()).await.expect("send");
-    let error = next_turn_error(&mut rx).await.expect("a TurnError");
+    assert_eq!(next_turn_error(&mut rx).await.as_deref(), Some(TURN_FAILED_NOTED), "a TurnError");
+    let error = last_failure_reason(&pool, failing.id).await.expect("the conversation says why");
     assert!(error.contains("error parsing tool call"), "got: {error}");
 
     let stopped = db::create_conversation_with_id(&pool, 9_100_000_013)
@@ -137,9 +138,20 @@ async fn test_a_turn_error_is_still_there_after_a_reload(pool: PgPool) {
     start_mock_upstream_failing_n_times(&pool, 0, None).await;
     let mut rx = events::subscribe(conversation.id);
     start_turn(pool.clone(), conversation.id, "hi".to_string()).await.expect("send");
-    next_turn_error(&mut rx).await.expect("a TurnError");
-    let kept = last_turn_error(conversation.id).expect("the error is kept");
-    assert!(kept.contains("error parsing tool call"), "got: {kept}");
+    // SME-123 DR3: the error was a red line that went when the next turn
+    // started, and wasn't in the transcript. It's saved there as a
+    // notice, and the event and the reconnect pull say only that it was.
+    assert_eq!(next_turn_error(&mut rx).await.as_deref(), Some(TURN_FAILED_NOTED));
+    assert_eq!(last_turn_error(conversation.id).as_deref(), Some(TURN_FAILED_NOTED), "kept for a reload");
+    let messages = db::list_messages(&pool, conversation.id).await.expect("messages");
+    let last = messages.last().expect("a message");
+    let blocks: Vec<anthropic::ContentBlock> = serde_json::from_str(&last.content).expect("blocks");
+    let text = match blocks.first() {
+        Some(anthropic::ContentBlock::Text { text }) => text.clone(),
+        other => panic!("the last message isn't a notice: {other:?}"),
+    };
+    let reason = crate::api::chat::parse_failure_notice(&text).expect("the last message is the failure notice");
+    assert!(reason.contains("error parsing tool call"), "the notice says why: {reason}");
 
     start_hanging_mock_upstream(&pool).await;
     start_turn(pool.clone(), conversation.id, "again".to_string()).await.expect("send");

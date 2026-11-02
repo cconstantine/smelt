@@ -89,6 +89,32 @@ fn test_a_refusal_notice_says_the_provider_stopped_the_reply() {
     );
 }
 
+/// SME-123 DR3: a failed turn's notice says what happened in plain words
+/// and what to do, and round-trips.
+#[test]
+fn test_a_failure_notice_says_what_failed_and_what_to_do() {
+    use crate::api::chat::{failure_notice, parse_failure_notice};
+    let provider = failure_notice("model provider error 400 Bad Request: MOCK-FAILURE");
+    assert_eq!(parse_failure_notice(&provider), Some("model provider error 400 Bad Request: MOCK-FAILURE"));
+    assert_eq!(
+        system_notice(&provider, &HashMap::new()).as_deref(),
+        Some("The model's provider answered with an error (400 Bad Request: MOCK-FAILURE). Check it under Model providers, then send again.")
+    );
+    assert_eq!(
+        system_notice(&failure_notice("conversation not found"), &HashMap::new()).as_deref(),
+        Some("The turn failed: conversation not found. Send again to retry.")
+    );
+    // Review 1 L3: one period, and no second "send again".
+    assert_eq!(
+        system_notice(&failure_notice("Nothing to talk to."), &HashMap::new()).as_deref(),
+        Some("The turn failed: Nothing to talk to. Send again to retry.")
+    );
+    assert_eq!(
+        system_notice(&failure_notice("No model is chosen. Choose one, then send again."), &HashMap::new()).as_deref(),
+        Some("The turn failed: No model is chosen. Choose one, then send again.")
+    );
+}
+
 /// SME-126: a notice for a reply cut off in the middle of a tool call
 /// names the call, for the model and in the chat, and round-trips; a
 /// notice saved before SME-126 still parses and reads as it did.
@@ -111,6 +137,24 @@ fn test_a_cut_off_notice_names_the_call_it_was_cut_in() {
     assert_eq!(parse_cut_off_notice(old), Some((8_192, ReplyLimit::HalfWindow, None)));
     assert_eq!(parse_cut_off_notice(&format!("{old} It stopped in the middle of a call to ``, which was dropped and not run.")), None);
     assert_eq!(parse_cut_off_notice(&format!("{old} And more.")), None);
+}
+
+/// SME-123 DR6: a long or multi-line command was repeated whole in its
+/// notice, four lines of centred grey; the notice keeps its first line,
+/// cut at 60 characters.
+#[test]
+fn test_a_long_command_is_cut_short_in_its_notice() {
+    let long = "cd /workspace/smelt && git diff --stat && echo \"--- proof: changed paths ---\" && git diff --name-only";
+    let commands = HashMap::from([
+        ("long".to_string(), long.to_string()),
+        ("lines".to_string(), "set -e\npython3 -m pytest -q".to_string()),
+    ]);
+    let shown = system_notice("Terminal command long finished: exit code 0.", &commands).expect("a notice");
+    assert_eq!(shown, "`cd /workspace/smelt && git diff --stat && echo \"--- proof: c\u{2026}` finished (exit code 0)");
+    assert_eq!(
+        system_notice("Terminal command lines finished: exit code 1.", &commands).as_deref(),
+        Some("`set -e \u{2026}` finished (exit code 1)")
+    );
 }
 
 #[test]
@@ -181,7 +225,8 @@ fn test_an_idle_notice_splits_at_its_own_marker() {
     let commands = HashMap::from([("abc123".to_string(), line.clone())]);
     assert_eq!(
         system_notice(&notice, &commands).as_deref(),
-        Some(format!("`{line}` is still running, untouched for 5 minutes")).as_deref(),
+        // The command shows cut at 60 characters (SME-123 DR6).
+        Some(format!("`{}\u{2026}` is still running, untouched for 5 minutes", line.chars().take(60).collect::<String>())).as_deref(),
         "cut at the notice's own marker, not at the one inside the quoted command"
     );
     // An unknown command id still falls back like every other notice's.
@@ -492,5 +537,47 @@ fn test_the_quiet_stop_notices_smelt_saves_are_summarized() {
     assert_eq!(
         system_notice(&finished, &commands).as_deref(),
         Some("The sandbox stopped when this agent finished; /workspace and Docker's data are kept")
+    );
+}
+
+/// SME-123 DR6: half the transcript was Thinking rows, one beside every
+/// tool call. Beside a call or a reply, thinking shows only when asked
+/// for; a reply that is only thinking still shows it.
+#[test]
+fn test_thinking_beside_a_call_shows_only_when_asked_for() {
+    use crate::frontend::pages::chat::transcript::shown_blocks;
+    let thinking = ContentBlock::Thinking { thinking: "hmm".to_string(), signature: String::new() };
+    let call = ContentBlock::ToolUse { id: "t1".to_string(), name: "read_file".to_string(), input: serde_json::json!({}) };
+    let both = vec![thinking.clone(), call.clone()];
+    assert_eq!(shown_blocks("assistant", &both, false), vec![1]);
+    assert_eq!(shown_blocks("assistant", &both, true), vec![0, 1]);
+    assert_eq!(shown_blocks("assistant", &[thinking.clone()], false), vec![0], "only thinking: shown");
+    assert_eq!(shown_blocks("user", &[call], false), vec![0]);
+}
+
+/// SME-123 DR13: the answered record listed the questions, then the
+/// answers as the model got them ("2. Notes: they wrote: \"…\""). Each
+/// answer now sits under its question, in the user's words.
+#[test]
+fn test_an_answered_question_pairs_each_answer_with_its_question() {
+    use crate::frontend::pages::chat::transcript::answered_pairs;
+    let questions = vec!["Which database?".to_string(), "Anything else?".to_string(), "Which ones?".to_string()];
+    let lines = vec![
+        "1. Database: Postgres".to_string(),
+        "2. Notes: they wrote: \"Keep it small.\"".to_string(),
+        "3. Pick: A, B; they also wrote: \"and C\"".to_string(),
+    ];
+    assert_eq!(
+        answered_pairs(&questions, &lines),
+        vec![
+            (Some("Which database?".to_string()), "Postgres".to_string()),
+            (Some("Anything else?".to_string()), "\u{201c}Keep it small.\u{201d}".to_string()),
+            (Some("Which ones?".to_string()), "A, B \u{2014} \u{201c}and C\u{201d}".to_string()),
+        ]
+    );
+    // Written instead: one line, under no question.
+    assert_eq!(
+        answered_pairs(&questions, &["Not answered: you wrote a message instead.".to_string()]),
+        vec![(None, "Not answered: you wrote a message instead.".to_string())]
     );
 }

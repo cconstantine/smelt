@@ -1,19 +1,26 @@
 /* --- Pods (SME-26) --- */
 
-.pods-link,
-.sandbox-volumes-link {
+/* The sidebar's settings links: one compact block of two columns
+   (SME-123 DR4), not a full-width button each. */
+.settings-links {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 2px 8px;
+    padding: 6px 0;
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+}
+
+.settings-link {
     display: block;
-    padding: 8px 10px;
-    border-radius: 8px;
+    padding: 4px 6px;
+    border-radius: 6px;
     color: var(--text-2);
     font-size: 13px;
     text-decoration: none;
-    text-align: center;
-    border: 1px solid var(--border);
 }
 
-.pods-link:hover,
-.sandbox-volumes-link:hover {
+.settings-link:hover {
     background: var(--subtle);
     color: var(--ink);
 }
@@ -27,8 +34,10 @@
     background: #1baf7a;
 }
 
+/* The width every settings page has (SME-123 DR15); its tables' cells
+   wrap to fit. */
 .pods-page {
-    max-width: 1100px;
+    max-width: 720px;
     margin: 0 auto;
     padding: 32px 24px 64px;
 }
@@ -422,6 +431,7 @@
 .sandbox-storage {
     display: flex;
     flex-direction: column;
+    align-items: flex-start;
     gap: 6px;
     margin: 8px 0;
 }
@@ -610,9 +620,11 @@
     overflow-wrap: anywhere;
 }
 
+/* Options in equal columns: a short one was narrower than its
+   neighbours (SME-123 DR13). */
 .question-card-options {
-    display: flex;
-    flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
     gap: 8px;
     margin-bottom: 8px;
 }
@@ -633,8 +645,11 @@
     cursor: pointer;
 }
 
+/* Hover shades an option; only a chosen one gets the accent border, so
+   the option under the pointer never reads as already picked (SME-123
+   DR13). */
 .question-option:hover:not(:disabled) {
-    border-color: var(--accent);
+    background: var(--subtle);
 }
 
 .question-option.chosen {
@@ -878,9 +893,13 @@
 .providers-spend .mcp-server-row {
     gap: 4px;
 }
+/* The cost line under a model's numbers: the same size as them, not
+   larger ("No price for this model, so tokens only." outweighed the
+   figures it qualified, SME-123 DR12). */
 .providers-spend-cost {
     font-variant-numeric: tabular-nums;
-    white-space: nowrap;
+    font-size: 13px;
+    color: var(--text-2);
 }
 /* SME-106: the checkbox sits beside its label, like the MCP form's radios. */
 .mcp-add-form label.provider-checkbox {
@@ -1019,4 +1038,42 @@
         margin: 0 16px;
         max-width: none;
     }
+}
+
+/* On a phone the stored volumes are cards, a row each, not a table that
+   scrolls sideways (SME-123 DR9). */
+@media (max-width: 720px) {
+    .storage-table,
+    .storage-table tbody,
+    .storage-table tr,
+    .storage-table td {
+        display: block;
+        width: 100%;
+    }
+
+    .storage-table thead {
+        display: none;
+    }
+
+    .storage-table tr {
+        padding: 10px 0;
+        border-bottom: 1px solid var(--border);
+    }
+
+    .storage-table td {
+        padding: 2px 0;
+        border: none;
+    }
+
+    .storage-table td[data-label]::before {
+        content: attr(data-label) ": ";
+        color: var(--muted);
+    }
+}
+
+/* The default provider's row names its model at the row's detail size
+   (SME-123 DR2). */
+.provider-default-model {
+    font-size: 13px;
+    color: var(--text-2);
 }

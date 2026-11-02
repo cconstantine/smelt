@@ -217,3 +217,60 @@ async fn test_setting_a_model_checks_it_and_tells_the_tabs(pool: PgPool) {
     assert_eq!(set.model.as_deref(), Some("m1"), "trimmed");
     assert!(received(&mut events, &crate::events::ConversationEvent::ModelChanged {}), "tabs are told");
 }
+
+/// SME-123 DR2: a first run reached "No model is chosen for this
+/// conversation" after adding its only provider, with a model id to type.
+/// The first provider added makes its first tool-capable model the
+/// default; a later one leaves the default alone.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_first_provider_added_makes_its_first_model_the_default(pool: PgPool) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let app = axum::Router::new().route("/v1/models", axum::routing::get(|| async {
+        ([(axum::http::header::CONTENT_TYPE, "application/json")],
+         r#"{"data":[{"id":"first-model","max_input_tokens":100000},{"id":"second-model","max_input_tokens":100000}],"has_more":false}"#)
+    }));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    let mut first = input("first", &format!("http://{addr}"), "k");
+    first.kind = ProviderKind::Other;
+    let created = create_provider(&pool, first).await.expect("create");
+    // Set in the background once the listing lands (review 1 L1).
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let chosen = loop {
+        if let Some(chosen) = default_model(&pool).await.expect("read") {
+            break chosen;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no default was set");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!((chosen.provider_id, chosen.model.as_str()), (created.id, "first-model"));
+    let mut second = input("second", &format!("http://{addr}"), "k");
+    second.kind = ProviderKind::Other;
+    create_provider(&pool, second).await.expect("create the second");
+    let still = default_model(&pool).await.expect("read").expect("still set");
+    assert_eq!(still.provider_id, created.id, "a later provider leaves the default alone");
+}
+
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_first_provider_that_lists_nothing_leaves_no_default(pool: PgPool) {
+    // The defaulting itself, awaited, not the save's background task: a
+    // wait on it couldn't tell "ran and set nothing" from "hasn't run"
+    // (review 2 L3).
+    let gone = db::create_inference_provider(&pool, "gone", "other", "http://127.0.0.1:1", "bearer", "k", false, None, true, None)
+        .await
+        .expect("create");
+    default_to_first_model(pool.clone(), gone).await;
+    assert_eq!(default_model(&pool).await.expect("read"), None);
+}
+
+/// Review 1 L1: the background default never overwrites one set while
+/// the listing was out.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_setting_the_default_only_if_unset_keeps_a_users_choice(pool: PgPool) {
+    let p = provider(&pool, "p", "api_key").await;
+    assert!(db::set_default_model_if_unset(&pool, p.id, "first").await.expect("set"));
+    assert!(!db::set_default_model_if_unset(&pool, p.id, "second").await.expect("left"));
+    assert_eq!(default_model(&pool).await.expect("read").map(|c| c.model), Some("first".to_string()));
+}

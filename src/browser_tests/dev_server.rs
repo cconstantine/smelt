@@ -439,6 +439,15 @@ pub(super) async fn scenario_ask_user_card(t: &Scenario<'_>) {
         );
         assert!(wait_for_count(page, ".question-option", 2, Duration::from_secs(5)).await, "with its two options");
     }
+    // Its options are as wide as each other: a short one was narrower than
+    // its neighbour (SME-123 DR13).
+    let widths: Vec<f64> = first
+        .evaluate("Array.from(document.querySelectorAll('.question-option')).map(o => Math.round(o.getBoundingClientRect().width))")
+        .await
+        .expect("measure the options")
+        .into_value()
+        .expect("numbers");
+    assert!(widths.windows(2).all(|w| (w[0] - w[1]).abs() <= 1.0), "the options' widths differ: {widths:?}");
     let mark = format!("[data-conversation-id='{}'] .conversation-waiting", asking.id);
     assert!(wait_for_count(&first, &mark, 1, Duration::from_secs(10)).await, "the sidebar marks it waiting");
 
@@ -454,9 +463,13 @@ pub(super) async fn scenario_ask_user_card(t: &Scenario<'_>) {
             wait_for_count(page, ".question-card", 0, Duration::from_secs(10)).await,
             "answering takes the card away from every tab"
         );
+        // The answer, under its question (SME-123 DR13), not the
+        // model's numbered line.
         assert!(
-            wait_for_text(page, "1. Delete: Yes (Recommended)", Duration::from_secs(10)).await,
-            "the call shows the answer the model got"
+            wait_for_count(page, ".question-answered-answer", 1, Duration::from_secs(10)).await
+                && wait_for_text(page, "Yes (Recommended)", Duration::from_secs(10)).await
+                && !wait_for_text(page, "1. Delete:", Duration::from_millis(300)).await,
+            "the call shows the answer, under its question"
         );
     }
     assert!(wait_for_count(&first, &mark, 0, Duration::from_secs(10)).await, "the mark clears");

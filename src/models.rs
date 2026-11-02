@@ -36,11 +36,38 @@ pub struct ConversationSpend {
 
 /// "1 model call", "2 model calls" (SME-106).
 pub fn calls_text(calls: i64) -> String {
-    if calls == 1 { "1 model call".to_string() } else { format!("{calls} model calls") }
+    if calls == 1 { "1 model call".to_string() } else { format!("{} model calls", grouped(calls)) }
+}
+
+/// `n` with its thousands grouped, `1,596,324,709`: run together, token
+/// counts and windows were hard to read (SME-123 DR11).
+pub fn grouped(n: i64) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    if n < 0 {
+        out.push('-');
+    }
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[cfg(test)]
 mod calls_text_tests {
+    #[test]
+    fn test_numbers_are_grouped_by_thousands() {
+        assert_eq!(super::grouped(0), "0");
+        assert_eq!(super::grouped(999), "999");
+        assert_eq!(super::grouped(262_144), "262,144");
+        assert_eq!(super::grouped(1_596_324_709), "1,596,324,709");
+        assert_eq!(super::grouped(-12_345), "-12,345");
+        assert_eq!(super::calls_text(12_490), "12,490 model calls", "SME-123 DR11");
+    }
+
     #[test]
     fn test_one_call_is_singular_and_others_plural() {
         assert_eq!(super::calls_text(1), "1 model call");

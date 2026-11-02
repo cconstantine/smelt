@@ -53,7 +53,7 @@ async fn scenario_copy_reply_placement_and_indicator(later: i64, page: &chromium
     assert_eq!(
         facts["buttons"],
         serde_json::json!([
-            { "reply": reply_id, "label": "Copy reply (2 parts)", "title": "Copy this reply's 2 outlined parts as Markdown", "type": "button", "inFooter": true, "nested": false, "streaming": false },
+            { "reply": reply_id, "label": "Copy whole reply", "title": "Copy this reply's text, from all 2 of its messages, as Markdown", "type": "button", "inFooter": true, "nested": false, "streaming": false },
             { "reply": later_id, "label": "Copy reply", "title": "Copy this reply as Markdown", "type": "button", "inFooter": true, "nested": false, "streaming": false },
         ]),
         "{facts}"
@@ -91,8 +91,8 @@ async fn scenario_copy_reply_copying(t: &Scenario<'_>, conversation: &crate::mod
     page.move_mouse(chromiumoxide::layout::Point::new(5.0, 5.0)).await.expect("point away");
     wait_for_outlined(&page, &[part_one, "Todos"], Duration::from_secs(1)).await;
     assert_eq!(
-        wait_for_copy_label(&page, reply, "Copy reply (2 parts)", Duration::from_secs(4)).await,
-        "Copy reply (2 parts)",
+        wait_for_copy_label(&page, reply, "Copy whole reply", Duration::from_secs(4)).await,
+        "Copy whole reply",
         "the label goes back after a moment"
     );
     wait_for_outlined(&page, &[], Duration::from_secs(3)).await;
@@ -199,8 +199,8 @@ async fn scenario_copy_reply_copying(t: &Scenario<'_>, conversation: &crate::mod
     // leaves and "Copied" is over, the outline goes (code review 1, L2).
     insecure.move_mouse(chromiumoxide::layout::Point::new(5.0, 5.0)).await.expect("point away");
     assert_eq!(
-        wait_for_copy_label(&insecure, reply, "Copy reply (2 parts)", Duration::from_secs(4)).await,
-        "Copy reply (2 parts)"
+        wait_for_copy_label(&insecure, reply, "Copy whole reply", Duration::from_secs(4)).await,
+        "Copy whole reply"
     );
     if let Err(why) = outlined_within(&insecure, &[], Duration::from_secs(2)).await {
         problems.push(format!("the outline stayed after a plain-HTTP copy: {why}"));
@@ -290,8 +290,8 @@ async fn scenario_copy_reply_phone_width(t: &Scenario<'_>, page: &chromiumoxide:
     } else {
         wait_for_outlined(&page, &[part_one, "Todos"], Duration::from_secs(1)).await;
         assert_eq!(
-            wait_for_copy_label(&page, reply, "Copy reply (2 parts)", Duration::from_secs(4)).await,
-            "Copy reply (2 parts)"
+            wait_for_copy_label(&page, reply, "Copy whole reply", Duration::from_secs(4)).await,
+            "Copy whole reply"
         );
         if let Err(why) = outlined_within(&page, &[], Duration::from_secs(2)).await {
             problems.push(format!("the outline stayed after a tap: {why}"));
@@ -346,8 +346,8 @@ async fn scenario_copy_reply_while_written(t: &Scenario<'_>, problems: &mut Vec<
     publish(streaming.id, ConversationEvent::TurnState { running: false, elapsed: 0 });
     assert!(wait_for_count(&live, ".reply-copy", 2, Duration::from_secs(10)).await, "the button shows once the turn ends");
     assert_eq!(
-        wait_for_copy_label(&live, finished_id, "Copy reply (2 parts)", Duration::from_secs(5)).await,
-        "Copy reply (2 parts)",
+        wait_for_copy_label(&live, finished_id, "Copy whole reply", Duration::from_secs(5)).await,
+        "Copy whole reply",
         "on the reply's last part, covering both"
     );
 

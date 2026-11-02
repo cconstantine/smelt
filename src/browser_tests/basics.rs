@@ -181,7 +181,7 @@ pub(super) async fn scenario_context_usage(t: &Scenario<'_>) {
     assert!(
         wait_for_text(
             &context_page,
-            "Tokens — input: 40000, output: 10000",
+            "Last call — input: 40,000, output: 10,000",
             Duration::from_secs(5)
         )
         .await,

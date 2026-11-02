@@ -133,7 +133,9 @@ async fn test_corrections_are_bounded_and_end_in_a_visible_error(pool: PgPool) {
     })
     .await
     .expect("a TurnError within 10 s");
-    assert!(published.contains("4 times in a row") && published.contains(EVIDENCE_TOOL), "{published}");
+    assert_eq!(published, TURN_FAILED_NOTED);
+    let reason = last_failure_reason(&pool, sent.id).await.expect("the conversation says why");
+    assert!(reason.contains("4 times in a row") && reason.contains(EVIDENCE_TOOL), "{reason}");
 }
 
 /// A4: a real call resets the streak: three corrections after it don't

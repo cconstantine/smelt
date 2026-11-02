@@ -9,6 +9,11 @@ use super::*;
 pub(crate) enum TurnFailure {
     Stopped,
     Failed(ServerFnError),
+    /// A user's turn that failed with `reason`, its failure notice saved in
+    /// the conversation while the turn still held the lock (SME-123 DR3,
+    /// review 1 M1: saved after it, a turn queued behind could save its own
+    /// message first, and the notice landed under the newer message).
+    Noted { reason: String },
 }
 
 impl TurnFailure {
@@ -18,6 +23,7 @@ impl TurnFailure {
         match self {
             TurnFailure::Stopped => TURN_STOPPED.to_string(),
             TurnFailure::Failed(e) => chat_error_text(e),
+            TurnFailure::Noted { .. } => TURN_FAILED_NOTED.to_string(),
         }
     }
 }
@@ -27,6 +33,7 @@ impl std::fmt::Display for TurnFailure {
         match self {
             TurnFailure::Stopped => f.write_str(TURN_STOPPED),
             TurnFailure::Failed(e) => e.fmt(f),
+            TurnFailure::Noted { reason } => f.write_str(reason),
         }
     }
 }

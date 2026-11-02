@@ -288,15 +288,16 @@ fn finish_reply(parts: &mut HashMap<i64, ReplyPart>, reply: Vec<(i64, usize, &st
     }
 }
 
-/// A reply's Copy button label: how many bubbles it copies, when that's
-/// more than the one it sits in.
+/// A reply's Copy button label: "whole" when it copies more than the
+/// bubble it sits in. "Copy reply (16 parts)" didn't say what a part was
+/// (SME-123 DR16); the title says how many messages.
 pub(in crate::frontend::pages::chat) fn reply_copy_label(parts: usize) -> String {
-    if parts > 1 { format!("Copy reply ({parts} parts)") } else { "Copy reply".to_string() }
+    if parts > 1 { "Copy whole reply".to_string() } else { "Copy reply".to_string() }
 }
 
 pub(in crate::frontend::pages::chat) fn reply_copy_title(parts: usize) -> String {
     if parts > 1 {
-        format!("Copy this reply's {parts} outlined parts as Markdown")
+        format!("Copy this reply's text, from all {parts} of its messages, as Markdown")
     } else {
         "Copy this reply as Markdown".to_string()
     }
@@ -332,6 +333,38 @@ pub(in crate::frontend::pages::chat) fn reply_is_only_thinking(role: &str, block
         && blocks.iter().all(|b| matches!(b, ContentBlock::Thinking { .. }))
 }
 
+/// The indexes of `blocks` the transcript shows. Thinking beside a tool
+/// call or a reply shows only when `show_thinking` asks for it: one
+/// beside every call made half the transcript Thinking rows (SME-123
+/// DR6). A reply that is only thinking shows it either way.
+pub(in crate::frontend::pages::chat) fn shown_blocks(role: &str, blocks: &[ContentBlock], show_thinking: bool) -> Vec<usize> {
+    let keep_thinking = show_thinking || reply_is_only_thinking(role, blocks);
+    blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| keep_thinking || !matches!(b, ContentBlock::Thinking { .. }))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// A command as a notice names it: its first line, cut at 60 characters,
+/// with an ellipsis for what's left out (SME-123 DR6: a long command was
+/// repeated whole, four lines of centred grey).
+fn short_command(line: &str) -> String {
+    const SHOWN: usize = 60;
+    let mut lines = line.lines();
+    let first = lines.next().unwrap_or_default().trim_end();
+    let more_lines = lines.next().is_some();
+    if first.chars().count() > SHOWN {
+        let cut: String = first.chars().take(SHOWN).collect();
+        format!("{cut}\u{2026}")
+    } else if more_lines {
+        format!("{first} \u{2026}")
+    } else {
+        first.to_string()
+    }
+}
+
 /// A notice smelt saved into the conversation for the model (a command
 /// finishing, the sandbox stopping), as the
 /// short sentence the chat shows in place of a user bubble, without
@@ -340,7 +373,7 @@ pub(in crate::frontend::pages::chat) fn reply_is_only_thinking(role: &str, block
 /// command's id to the command line, from `terminal_commands_by_id`.
 pub(in crate::frontend::pages::chat) fn system_notice(text: &str, commands: &HashMap<String, String>) -> Option<String> {
     let command = |id: &str| match commands.get(id) {
-        Some(line) => format!("`{line}`"),
+        Some(line) => format!("`{}`", short_command(line)),
         None => "A command".to_string(),
     };
     // Each split is at the *last* occurrence of smelt's own marker: a
@@ -398,6 +431,18 @@ pub(in crate::frontend::pages::chat) fn system_notice(text: &str, commands: &Has
             limit.reason(),
             limit.hint()
         ));
+    }
+    if let Some(reason) = crate::api::chat::parse_failure_notice(text) {
+        return Some(match reason.strip_prefix("model provider error ") {
+            Some(detail) => format!(
+                "The model's provider answered with an error ({}). Check it under Model providers, then send again.",
+                detail.trim_end_matches('.')
+            ),
+            // A reason that already says to send again isn't told twice
+            // (review 1 L3: "…then send again.. Send again to retry.").
+            None if reason.to_lowercase().contains("send again") => format!("The turn failed: {reason}"),
+            None => format!("The turn failed: {}. Send again to retry.", reason.trim_end_matches('.')),
+        });
     }
     if let Some(cut_call) = crate::api::chat::parse_refusal_notice(text) {
         let call = cut_call.map(|name| format!(" in the middle of a `{name}` call, which didn't run")).unwrap_or_default();
@@ -510,4 +555,40 @@ pub(in crate::frontend::pages::chat) fn answered_lines(result: &str) -> Vec<Stri
         Some(rest) => rest.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect(),
         None => vec!["Not answered: you wrote a message instead.".to_string()],
     }
+}
+
+/// An answered `ask_user`'s record, each answer under its question
+/// (SME-123 DR13): the answer lines the model got ("2. Notes: they wrote:
+/// \"…\"") said in the user's words, against the question at the same
+/// place. A line with no number (the user wrote instead) stands alone.
+pub(in crate::frontend::pages::chat) fn answered_pairs(questions: &[String], lines: &[String]) -> Vec<(Option<String>, String)> {
+    lines
+        .iter()
+        .map(|line| {
+            let numbered = line
+                .split_once(". ")
+                .and_then(|(n, rest)| n.parse::<usize>().ok().map(|n| (n, rest)))
+                .and_then(|(n, rest)| rest.split_once(": ").map(|(_, answer)| (n, answer)));
+            match numbered {
+                Some((n, answer)) => (questions.get(n.wrapping_sub(1)).cloned(), users_words(answer)),
+                None => (None, line.clone()),
+            }
+        })
+        .collect()
+}
+
+/// An answer as the model got it, in the user's words: `they wrote:
+/// "x"` is the quote alone, and `A; they also wrote: "x"` is `A — "x"`.
+fn users_words(answer: &str) -> String {
+    let quote = |text: &str| {
+        let inner = text.trim().trim_matches('"');
+        format!("\u{201c}{inner}\u{201d}")
+    };
+    if let Some(text) = answer.strip_prefix("they wrote: ") {
+        return quote(text);
+    }
+    if let Some((chosen, text)) = answer.split_once("; they also wrote: ") {
+        return format!("{chosen} \u{2014} {}", quote(text));
+    }
+    answer.to_string()
 }

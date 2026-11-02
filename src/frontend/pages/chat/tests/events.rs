@@ -319,7 +319,23 @@ fn test_apply_event_turn_error_is_kept_but_a_stop_is_not() {
             EventEffect::None,
             "a stop shows as its saved notice instead"
         );
+        assert_eq!(
+            apply_event(state, ConversationEvent::TurnError { message: crate::api::chat::TURN_FAILED_NOTED.to_string() }),
+            EventEffect::None,
+            "a failure the conversation notes shows as its notice instead (SME-123 DR3)"
+        );
     });
+}
+
+/// SME-123 DR3: the reconnect pull keeps no line for a noted failure
+/// either.
+#[test]
+fn test_a_noted_failure_from_the_reconnect_pull_shows_no_error_line() {
+    let mut errors = ChatErrors::default();
+    errors.set_turn_error(4, crate::api::chat::TURN_FAILED_NOTED.to_string());
+    assert_eq!(errors.lines.get(&4), None);
+    errors.set_turn_error(4, "overloaded".to_string());
+    assert_eq!(errors.lines.get(&4).map(String::as_str), Some("overloaded"));
 }
 
 #[test]

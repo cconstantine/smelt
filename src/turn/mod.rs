@@ -8,7 +8,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
-use crate::api::chat::{STOP_NOTICE, TURN_STOPPED, chat_error_text};
+use crate::api::chat::{STOP_NOTICE, TURN_FAILED_NOTED, TURN_STOPPED, chat_error_text};
 use crate::models::Message;
 use crate::{anthropic, db};
 

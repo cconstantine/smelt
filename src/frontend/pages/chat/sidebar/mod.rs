@@ -7,7 +7,7 @@ use crate::api::agents::{ConversationNode, get_conversation_tree};
 
 mod tree;
 
-use tree::{TreeRow, build_tree, unfold_to};
+use tree::{TreeRow, build_tree, settled_parents, unfold_to};
 
 /// How long ago a conversation was last active, as the sidebar shows it:
 /// one unit, `now`, `5m`, `3h`, `2d`, `3w` (SME-41 D8).
@@ -26,6 +26,10 @@ pub(super) fn short_age(seconds: i64) -> String {
 /// `Chat`, so a sidebar signal reset on every move between them (SME-246
 /// review 1). Per tab, like any signal; a reload unfolds everything.
 static FOLDED: GlobalSignal<HashSet<i64>> = Signal::global(HashSet::new);
+/// The parents the sidebar has folded by itself, or the user has folded or
+/// unfolded: each folds on its own once at most, so a tree the user opened
+/// stays open (SME-123 DR1).
+static FOLD_DECIDED: GlobalSignal<HashSet<i64>> = Signal::global(HashSet::new);
 
 #[component]
 pub(super) fn ConversationSidebar(
@@ -109,6 +113,7 @@ pub(super) fn ConversationSidebar(
         if let Some(result) = initial_conversations() {
             match result {
                 Ok(list) => {
+                    fold_settled_trees(&list, *selected.peek());
                     conversations.set(list);
                     list_error.set(None);
                 }
@@ -199,13 +204,17 @@ pub(super) fn ConversationSidebar(
             // server render (SME-269).
             "data-app-live": app_live().then_some("true"),
             button { class: "new-conversation", onclick: move |e| { open_on_phone.set(false); new_conversation(e) }, "New conversation" }
-            Link { to: Route::ProvidersRoute {}, class: "sandbox-volumes-link providers-link", "Model providers" }
-            Link { to: Route::McpServersRoute {}, class: "mcp-servers-link", "MCP servers" }
-            Link { to: Route::PodsRoute {}, class: "pods-link", "Sandboxes" }
-            Link { to: Route::SandboxVolumesRoute {}, class: "sandbox-volumes-link", "Sandbox volumes" }
-            Link { to: Route::GitRoute {}, class: "sandbox-volumes-link git-link", "Git" }
-            Link { to: Route::SecretsRoute {}, class: "sandbox-volumes-link secrets-link", "Secrets" }
-            Link { to: Route::LanguageServersRoute {}, class: "sandbox-volumes-link language-servers-link", "Language servers" }
+            // Settings, as one compact block: seven full-width buttons took
+            // about 400px above the conversations (SME-123 DR4).
+            nav { class: "settings-links", aria_label: "Settings",
+                Link { to: Route::ProvidersRoute {}, class: "settings-link providers-link", "Model providers" }
+                Link { to: Route::McpServersRoute {}, class: "settings-link mcp-servers-link", "MCP servers" }
+                Link { to: Route::PodsRoute {}, class: "settings-link pods-link", "Sandboxes" }
+                Link { to: Route::SandboxVolumesRoute {}, class: "settings-link sandbox-volumes-link", "Sandbox volumes" }
+                Link { to: Route::GitRoute {}, class: "settings-link git-link", "Git" }
+                Link { to: Route::SecretsRoute {}, class: "settings-link secrets-link", "Secrets" }
+                Link { to: Route::LanguageServersRoute {}, class: "settings-link language-servers-link", "Language servers" }
+            }
             super::ErrorText { message: list_error() }
             super::ErrorText { message: action_error() }
             if !loaded() {
@@ -225,6 +234,7 @@ pub(super) fn ConversationSidebar(
                             on_open: move |id| open_conversation(id),
                             on_delete: move |id| request_delete(id),
                             on_toggle: move |id| {
+                                FOLD_DECIDED.write().insert(id);
                                 let mut folded = collapsed.write();
                                 if !folded.remove(&id) {
                                     folded.insert(id);
@@ -238,6 +248,34 @@ pub(super) fn ConversationSidebar(
             }
         }
     }
+}
+
+/// Folds each settled agent tree the first time the list shows it settled
+/// (`tree::settled_parents`), except above the open conversation: its
+/// row has to show.
+fn fold_settled_trees(nodes: &[ConversationNode], open: Option<i64>) {
+    // The open conversation and its ancestors stay open: folding the tree
+    // the user is looking at, on a refetch, hid its rows (review 1 L2).
+    let mut keep_open: HashSet<i64> = open.into_iter().collect();
+    let parents: std::collections::HashMap<i64, Option<i64>> = nodes.iter().map(|n| (n.id, n.parent_id)).collect();
+    let mut at = open.and_then(|id| parents.get(&id).copied().flatten());
+    while let Some(id) = at {
+        if !keep_open.insert(id) {
+            break;
+        }
+        at = parents.get(&id).copied().flatten();
+    }
+    let undecided: Vec<i64> = settled_parents(nodes)
+        .into_iter()
+        .filter(|id| !FOLD_DECIDED.peek().contains(id))
+        .collect();
+    if undecided.is_empty() {
+        return;
+    }
+    // A tree the user has seen open stays open: deciding it here keeps it
+    // from folding later, once they've moved on (review 1 L2).
+    FOLD_DECIDED.write().extend(undecided.iter().copied());
+    FOLDED.write().extend(undecided.into_iter().filter(|id| !keep_open.contains(id)));
 }
 
 /// One row of the list: a conversation, indented under its parent, with
@@ -310,8 +348,10 @@ fn ConversationRow(
                 },
                 "{row.node.title}"
             }
+            // Each mark says what it means, to a pointer and a screen
+            // reader (SME-123 DR14).
             if row.node.busy {
-                span { class: "conversation-busy", title: "Working" }
+                span { class: "conversation-busy", role: "img", title: "Working", aria_label: "Working" }
             }
             if row.node.waiting_for_user {
                 span { class: "conversation-waiting", title: "Waiting for your answer", "?" }
@@ -321,7 +361,7 @@ fn ConversationRow(
                 n => format!("{n} agents under it are waiting for you"),
             })}
             if live_pod {
-                span { class: "live-pod-dot", title: "sandbox pod running" }
+                span { class: "live-pod-dot", role: "img", title: "Sandbox running", aria_label: "Sandbox running" }
             }
             if let Some(age) = age {
                 span { class: "conversation-age", "{age}" }
@@ -335,6 +375,7 @@ fn ConversationRow(
                 on_confirm: move |_| on_delete.call(id),
             }
             {agent_meta(&row.node)}
+            {tree_summary(&row)}
         }
     }
 }
@@ -370,6 +411,28 @@ fn agent_meta(node: &ConversationNode) -> Element {
             if let Some(persona) = node.persona.as_deref() {
                 span { class: "agent-meta-sep", aria_hidden: "true", " \u{b7} " }
                 span { class: "agent-persona", "{persona}" }
+            }
+        }
+    }
+}
+
+/// A parent conversation's second line, when it isn't an agent itself:
+/// how many agents it has and how many are working (SME-123 DR1: a root
+/// row said nothing of the tree under it).
+fn tree_summary(row: &TreeRow) -> Element {
+    if row.node.status.is_some() || row.agents_under == 0 {
+        return rsx! {};
+    }
+    let agents = match row.agents_under {
+        1 => "1 agent".to_string(),
+        n => format!("{n} agents"),
+    };
+    rsx! {
+        div { class: "conversation-agent-meta conversation-tree-summary",
+            span { "{agents}" }
+            if row.busy_under > 0 {
+                span { class: "agent-meta-sep", aria_hidden: "true", " \u{b7} " }
+                span { class: "agent-status status-running", "{row.busy_under} working" }
             }
         }
     }
@@ -416,6 +479,29 @@ mod tests {
         assert!(html.contains(">smelt:developer<"), "{html}");
         assert!(html.contains(r#"class="agent-status status-waiting-for-the-user">waiting for the user<"#), "{html}");
         assert!(html.find("waiting for the user") < html.find("smelt:developer"), "the status comes first: {html}");
+    }
+
+    #[test]
+    fn test_a_parent_row_says_how_many_agents_it_has_and_how_many_work() {
+        let parent = tree::build_tree(
+            &[node_of(1, None, false), node_of(2, Some(1), true), node_of(3, Some(1), false)],
+            &HashSet::new(),
+        );
+        let html = dioxus::ssr::render_element(tree_summary(&parent[0]));
+        assert!(html.contains(">2 agents<") && html.contains(">1 working<"), "{html}");
+        let idle = tree::build_tree(&[node_of(1, None, false), node_of(2, Some(1), false)], &HashSet::new());
+        let html = dioxus::ssr::render_element(tree_summary(&idle[0]));
+        assert!(html.contains(">1 agent<") && !html.contains("working"), "{html}");
+        let html = dioxus::ssr::render_element(tree_summary(&idle[1]));
+        assert!(html.is_empty(), "no agents, no line: {html}");
+    }
+
+    fn node_of(id: i64, parent_id: Option<i64>, busy: bool) -> ConversationNode {
+        let mut node = agent(id, parent_id.unwrap_or(0), None, "running");
+        node.parent_id = parent_id;
+        node.status = None;
+        node.busy = busy;
+        node
     }
 
     #[test]

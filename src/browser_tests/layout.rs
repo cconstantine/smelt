@@ -63,9 +63,36 @@ pub(super) async fn scenario_pods(t: &Scenario<'_>) {
         wait_for_count(&sidebar_tab, &dot, 1, Duration::from_secs(10)).await,
         "the sidebar should mark a conversation whose pod started, without a reload"
     );
+    // The dot says what it means, to a pointer and a screen reader
+    // (SME-123 DR14: an unlabelled green dot).
+    let label: String = sidebar_tab
+        .evaluate(format!("(() => {{ const d = document.querySelector({dot:?}); return d.getAttribute('aria-label') + '|' + d.title; }})()"))
+        .await
+        .expect("read the dot")
+        .into_value()
+        .expect("text");
+    assert_eq!(label, "Sandbox running|Sandbox running");
+
+    // On the conversation's own page, Stop comes before the full-width
+    // red Remove volumes it sat under (SME-123 DR10), and Remove volumes
+    // is the quieter control.
+    let panel_tab = t.tab(t.url(&format!("conversation/{}", with_pod.id))).await;
+    wait_for_live_client(&panel_tab, with_pod.id).await;
+    wait_for_element(&panel_tab, ".sandbox-pod .pod-stop", Duration::from_secs(20)).await;
+    wait_for_element(&panel_tab, ".sandbox-storage .storage-remove", Duration::from_secs(20)).await;
+    let stop_box = element_box(&panel_tab, ".sandbox-pod .pod-stop").await;
+    let remove_box = element_box(&panel_tab, ".sandbox-storage .storage-remove").await;
+    let panel_box = element_box(&panel_tab, ".sandbox-storage").await;
+    assert!(stop_box.1 < remove_box.1, "Stop sandbox should come before Remove volumes: {stop_box:?} {remove_box:?}");
+    assert!(remove_box.2 * 2 < panel_box.2, "Remove volumes shouldn't span the panel: {remove_box:?} in {panel_box:?}");
+    panel_tab.close().await.expect("close the tab");
 
     let pods_page = t.tab(t.url("pods")).await;
     wait_for_resource(&pods_page, "/api/pods").await;
+    // The same width as every other settings page: it was 1,100px to their
+    // 720, so its left edge jumped (SME-123 DR15).
+    let page_box = element_box(&pods_page, ".pods-page").await;
+    assert!(page_box.2 <= 720, "the Sandboxes page is {}px wide", page_box.2);
     let row = format!("tr[data-pod-id=\"{pod_id}\"]");
     assert!(
         wait_for_count(&pods_page, &row, 1, Duration::from_secs(10)).await,
@@ -289,6 +316,8 @@ pub(super) async fn scenario_sidebar(t: &Scenario<'_>) {
     // A row to measure, even when this scenario runs alone.
     let conversation = t.conversation().await;
     seed_user_message(t.pool, conversation.id, "a sidebar row").await;
+    let other = t.conversation().await;
+    seed_user_message(t.pool, other.id, "another sidebar row").await;
     let page = t.tab(t.url("")).await;
     // And the sidebar's two-step Delete keeps its size when armed: the
     // armed label was bold, so it came out wider than the width the
@@ -303,7 +332,11 @@ pub(super) async fn scenario_sidebar(t: &Scenario<'_>) {
     assert_eq!(before.2, after.2, "arming the sidebar's Delete changed its width");
     // A title uses its row, and each row says how long ago the
     // conversation was active. Titles were cut at about 15 characters
-    // with most of the row empty (SME-41 D8).
+    // with most of the row empty (SME-41 D8). The row measured is one the
+    // pointer isn't on, since a hovered row trades its age for Delete:
+    // with this scenario's one conversation the only row was the one the
+    // Delete click above left the pointer on, so run first or alone the
+    // age read empty (SME-278). A second conversation gives it one.
     let row: Vec<String> = page
         .evaluate(
             "(() => { const item = document.querySelector('.conversation-item:not(:hover)') || document.querySelector('.conversation-item'); \
@@ -331,6 +364,16 @@ pub(super) async fn scenario_sidebar(t: &Scenario<'_>) {
         .into_value()
         .expect("text");
     assert!(links.contains("Sandboxes") && !links.contains("Pods"), "sidebar links: {links}");
+    // The settings links are one compact block: seven full-width buttons
+    // took about 400px above the conversations on every page (SME-123 DR4).
+    let settings = element_box(&page, ".sidebar .settings-links").await;
+    assert!(settings.3 <= 130, "the settings links take {}px of the sidebar", settings.3);
+    // With nothing open, the page offers a way on: a new conversation,
+    // not just "Select or start a conversation" (SME-123 DR4).
+    assert!(
+        wait_for_count(&page, ".empty-state .empty-new-conversation", 1, Duration::from_secs(10)).await,
+        "the empty page offers a new conversation"
+    );
     click_when_present(&page, ".sidebar a[href='/sandbox-volumes']", Duration::from_secs(10)).await;
     assert!(
         wait_for_text(&page, "Sandbox volumes", Duration::from_secs(10)).await,
@@ -344,6 +387,28 @@ pub(super) async fn scenario_sidebar(t: &Scenario<'_>) {
 /// this also checks the tag is there.
 pub(super) async fn scenario_phone_width(t: &Scenario<'_>) {
     let phone_conversation = t.conversation().await;
+    // An edit to a long path and a long command, as an agent's transcript
+    // has them: their names ran past a phone's screen (SME-123 DR15).
+    let long_path = "/workspace/smelt/src/frontend/pages/chat/transcript/a_rather_long_module_name.rs";
+    db::create_message(
+        t.pool,
+        phone_conversation.id,
+        "assistant",
+        &[
+            anthropic::ContentBlock::ToolUse {
+                id: "toolu_phone_edit".to_string(),
+                name: "edit_file".to_string(),
+                input: serde_json::json!({"path": long_path, "old_string": "a", "new_string": "b"}),
+            },
+            anthropic::ContentBlock::ToolUse {
+                id: "toolu_phone_read".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": long_path}),
+            },
+        ],
+    )
+    .await
+    .expect("seed the calls");
     let page = t.tab("about:blank").await;
     page.execute(
         chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::new(390, 844, 2.0, true),
@@ -368,6 +433,17 @@ pub(super) async fn scenario_phone_width(t: &Scenario<'_>) {
     assert!(layout[1] >= 300.0, "the messages are too narrow on a phone: {layout:?}");
     assert!(layout[2] >= 200.0, "the message box is too narrow on a phone: {layout:?}");
     assert!(layout[3] <= 0.0, "the page scrolls sideways on a phone: {layout:?}");
+    wait_for_element(&page, ".file-edit-diff", Duration::from_secs(10)).await;
+    let past_edge: Vec<String> = page
+        .evaluate(
+            "Array.from(document.querySelectorAll('.messages *')).filter(e => e.getBoundingClientRect().right > innerWidth + 1) \
+             .map(e => e.tagName.toLowerCase() + '.' + e.className + ' ' + Math.round(e.getBoundingClientRect().right))",
+        )
+        .await
+        .expect("measure the transcript")
+        .into_value()
+        .expect("strings");
+    assert!(past_edge.is_empty(), "transcript elements run past a phone's screen: {past_edge:?}");
     // The conversation comes first: the list is folded behind a
     // button, and the chat sits above the side panels. The list and
     // the sandbox panel used to push the transcript to the bottom of
@@ -399,6 +475,22 @@ pub(super) async fn scenario_phone_width(t: &Scenario<'_>) {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     assert!(list_shown, "the button should open the conversation list");
+    // Every settings page and form fits a phone: Add an MCP server's header
+    // row ran 148px past the screen (SME-123 DR8).
+    for path in ["mcp-servers/new", "providers/new", "language-servers/new", "sandbox-volumes/new", "git", "secrets", "pods"] {
+        page.goto(t.url(path)).await.expect("open a settings page");
+        wait_for_element(&page, "h1", Duration::from_secs(10)).await;
+        // Measured once its lists have loaded, not on the server-rendered
+        // header alone (review 1 L6).
+        assert!(wait_for_text_gone(&page, "Loading", Duration::from_secs(10)).await, "/{path} never finished loading");
+        let over: f64 = page
+            .evaluate("document.documentElement.scrollWidth - document.documentElement.clientWidth")
+            .await
+            .expect("measure the page")
+            .into_value()
+            .expect("a number");
+        assert!(over <= 0.0, "/{path} scrolls sideways on a phone, by {over}px");
+    }
 }
 
 /// Scenario 18: a conversation created in one tab shows up in another tab's

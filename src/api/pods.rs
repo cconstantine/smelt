@@ -105,6 +105,22 @@ pub struct StoredStorage {
     pub conversation_id: i64,
     pub conversation_title: String,
     pub volumes: Vec<StoredVolume>,
+    /// When its sandbox last stopped, if it has (SME-123 DR9).
+    #[serde(default)]
+    pub stopped: Option<PodStop>,
+    /// The server's clock when the row was read, which `stopped` is
+    /// measured against, as a pod's `observed_at` is.
+    #[serde(default)]
+    pub observed_at: NaiveDateTime,
+}
+
+/// When a conversation's sandbox stopped, and whether smelt stopped it
+/// quietly (idle, or an agent's finish): that storage is removed after
+/// the grace period; storage a Stop left is kept (SME-345).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PodStop {
+    pub at: NaiveDateTime,
+    pub quiet: bool,
 }
 
 /// One of a conversation's two conversation claims.
@@ -300,7 +316,13 @@ fn storage_rows(
         .filter_map(|(conversation_id, mut volumes)| {
             let conversation_title = titles.get(&conversation_id).cloned()?;
             volumes.sort_by_key(|volume| matches!(volume.kind, StorageKind::Docker));
-            Some(StoredStorage { conversation_id, conversation_title, volumes })
+            Some(StoredStorage {
+                conversation_id,
+                conversation_title,
+                volumes,
+                stopped: None,
+                observed_at: NaiveDateTime::default(),
+            })
         })
         .collect()
 }
@@ -326,7 +348,16 @@ pub(crate) async fn stored_storage(pool: &sqlx::PgPool) -> Result<Vec<StoredStor
         .into_iter()
         .map(|conversation| (conversation.id, conversation.title))
         .collect();
-    Ok(storage_rows(&claims, &titles))
+    let stops = db::last_pod_stops(pool).await.map_err(|e| e.to_string())?;
+    let mut rows = storage_rows(&claims, &titles);
+    let observed_at = chrono::Utc::now().naive_utc();
+    for row in &mut rows {
+        row.observed_at = observed_at;
+        row.stopped = stops
+            .get(&row.conversation_id)
+            .map(|(at, quiet)| PodStop { at: quiet.unwrap_or(*at), quiet: quiet.is_some() });
+    }
+    Ok(rows)
 }
 
 /// Whether a pod is doing anything. Busy while a turn runs, a repo clones

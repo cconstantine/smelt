@@ -266,27 +266,6 @@ pub(in super::super) fn SandboxPanel(
                             }
                         }
                     }
-            // Sandbox storage (SME-253): the two claims outlive the pod,
-            // so this sits above the pod blocks and shows with no pod —
-            // a stopped conversation still holding disk is the whole
-            // point of the control.
-            if !stored_volumes.is_empty() {
-                div { class: "sandbox-storage",
-                    div { class: "sandbox-storage-line", title: "{STORAGE_REMOVE_WARNING}",
-                        "{storage_line(&stored_volumes)}"
-                    }
-                    super::TwoStepButton {
-                        armed: pending_storage_remove(),
-                        class: "storage-remove",
-                        idle: "Remove volumes",
-                        confirm: "Confirm remove?",
-                        title: Some(STORAGE_REMOVE_WARNING),
-                        on_arm: move |_| pending_storage_remove.set(true),
-                        on_confirm: move |_| confirm_storage_removal(),
-                    }
-                    super::ErrorText { message: storage_remove_error() }
-                }
-            }
             // A conversation has at most one live pod (see
             // SME-11's "One pod
             // per conversation") — straight through, no tab
@@ -360,6 +339,28 @@ pub(in super::super) fn SandboxPanel(
                             }
                         }
                     }
+                }
+            }
+            // Sandbox storage (SME-253): the two claims outlive the pod, so
+            // this shows with no pod too — a stopped conversation still
+            // holding disk is the whole point of the control. Below the pod
+            // blocks, so their Stop comes first: a running sandbox showed
+            // the full-width red Remove volumes over it (SME-123 DR10).
+            if !stored_volumes.is_empty() {
+                div { class: "sandbox-storage",
+                    div { class: "sandbox-storage-line", title: "{STORAGE_REMOVE_WARNING}",
+                        "{storage_line(&stored_volumes)}"
+                    }
+                    super::TwoStepButton {
+                        armed: pending_storage_remove(),
+                        class: "storage-remove",
+                        idle: "Remove volumes",
+                        confirm: "Confirm remove?",
+                        title: Some(STORAGE_REMOVE_WARNING),
+                        on_arm: move |_| pending_storage_remove.set(true),
+                        on_confirm: move |_| confirm_storage_removal(),
+                    }
+                    super::ErrorText { message: storage_remove_error() }
                 }
             }
         }

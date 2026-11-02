@@ -27,19 +27,66 @@ pub async fn list_messages(
     .await
 }
 
-/// Plain-text stand-in for the conversation title, extracted from a message's
-/// `Text` blocks only (`ToolUse`/`ToolResult` blocks carry nothing sensible
-/// to show as a title). Concatenates every `Text` block since a message is
-/// modeled as content *blocks*, not necessarily a single one.
-fn title_candidate(content: &[ContentBlock]) -> String {
-    content
+/// The longest title a conversation gets from its first message.
+pub(super) const TITLE_CHARS: usize = 60;
+
+/// The titles a first message suggests, for the user's own conversation
+/// and for an agent's: its `Text` blocks (`ToolUse`/`ToolResult` blocks
+/// carry nothing sensible to show), read by `title_from_text`.
+fn title_candidates(content: &[ContentBlock]) -> (String, String) {
+    let text = content
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    (title_from_text(&text, false), title_from_text(&text, true))
+}
+
+/// A short, plain title for a message (SME-123 DR1): its first non-blank
+/// line, markdown marks dropped, whitespace collapsed, and cut at a word
+/// with an ellipsis past `TITLE_CHARS`. For an agent's brief (`brief`),
+/// which opens "You are the **Ticket Driver for SME-345** (Linear, …" as
+/// every brief does, the line's first bold phrase, the part that tells two
+/// apart. Not for the user's own message: "Fix the **login** page" isn't
+/// titled "login" (review 1 M2).
+pub fn title_from_text(text: &str, brief: bool) -> String {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default();
+    let chosen = if brief { bold_phrase(line).unwrap_or(line) } else { line };
+    let plain: String = chosen
+        .trim_start_matches(['#', '>', ' '])
+        .replace("**", "")
+        .replace("__", "")
+        .replace('`', "");
+    let words: Vec<&str> = plain.split_whitespace().collect();
+    let mut title = String::new();
+    for word in &words {
+        let next = if title.is_empty() { word.chars().count() } else { title.chars().count() + 1 + word.chars().count() };
+        if next > TITLE_CHARS {
+            if title.is_empty() {
+                // One word longer than a title: cut it.
+                title = word.chars().take(TITLE_CHARS - 1).collect();
+            }
+            title.push('\u{2026}');
+            return title;
+        }
+        if !title.is_empty() {
+            title.push(' ');
+        }
+        title.push_str(word);
+    }
+    title
+}
+
+/// The text of the first `**bold**` span in `line`, if it has one with
+/// something in it.
+fn bold_phrase(line: &str) -> Option<&str> {
+    let start = line.find("**")? + 2;
+    let end = start + line[start..].find("**")?;
+    let phrase = line[start..end].trim();
+    (!phrase.is_empty()).then_some(phrase)
 }
 
 pub async fn create_message(
@@ -61,6 +108,7 @@ pub(super) async fn create_message_on(
     content: &[ContentBlock],
 ) -> Result<Message, sqlx::Error> {
     let message = insert_message_on(&mut *conn, conversation_id, role, content).await?;
+    let (own_title, brief_title) = title_candidates(content);
 
     // Bump updated_at so the sidebar can sort by recency; auto-title the
     // conversation from the first user message if it's still the default (in
@@ -69,15 +117,18 @@ pub(super) async fn create_message_on(
         "UPDATE conversations
          SET updated_at = now(),
              title = CASE
-                 WHEN lower(title) = lower($1) AND $2 = 'user' THEN left($3, 60)
+                 WHEN lower(title) <> lower($1) OR $2 <> 'user' THEN title
+                 WHEN parent_id IS NOT NULL AND $5 <> '' THEN $5
+                 WHEN $3 <> '' THEN $3
                  ELSE title
              END
          WHERE id = $4",
     )
     .bind(DEFAULT_TITLE)
     .bind(role)
-    .bind(title_candidate(content))
+    .bind(&own_title)
     .bind(conversation_id)
+    .bind(&brief_title)
     .execute(&mut *conn)
     .await?;
 
@@ -281,4 +332,43 @@ pub async fn create_conversation_with_id(pool: &PgPool, id: i64) -> Result<Conve
     .bind(id)
     .fetch_one(pool)
     .await
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::{TITLE_CHARS, title_from_text};
+
+    #[test]
+    fn test_an_agent_brief_is_titled_by_its_first_bold_phrase() {
+        let brief = "You are the **Ticket Driver for SME-345** (Linear, team Smelt Agent): **Remove volumes**.\n\nMore.";
+        assert_eq!(title_from_text(brief, true), "Ticket Driver for SME-345");
+    }
+
+    #[test]
+    fn test_without_bold_the_first_line_is_the_title_with_its_marks_dropped() {
+        assert_eq!(title_from_text("\n\n## Fix the `login` page\nsecond line", true), "Fix the login page");
+        assert_eq!(title_from_text("hello   there", false), "hello there");
+    }
+
+    #[test]
+    fn test_a_long_title_is_cut_at_a_word_with_an_ellipsis() {
+        let title = title_from_text("Following the development process in the repo, start working on the ticket now please", false);
+        assert!(title.ends_with('\u{2026}'), "{title}");
+        assert!(title.chars().count() <= TITLE_CHARS + 1, "{title}");
+        assert!(title.starts_with("Following the development process in the repo, start"), "cut at a word: {title}");
+        let one_word = title_from_text(&"x".repeat(100), false);
+        assert_eq!(one_word.chars().count(), TITLE_CHARS);
+    }
+
+    #[test]
+    fn test_the_users_own_message_keeps_its_line_however_it_bolds() {
+        assert_eq!(title_from_text("Fix the **login** page bug", false), "Fix the login page bug");
+        assert_eq!(title_from_text("Fix the **login** page bug", true), "login");
+    }
+
+    #[test]
+    fn test_an_unclosed_or_empty_bold_falls_back_to_the_line() {
+        assert_eq!(title_from_text("a **b", true), "a b");
+        assert_eq!(title_from_text("a **** b", true), "a b");
+    }
 }
