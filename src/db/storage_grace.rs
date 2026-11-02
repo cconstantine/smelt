@@ -116,3 +116,23 @@ pub(crate) mod fake_clear {
 fn days_param(days: u32) -> i32 {
     i32::try_from(days).unwrap_or(i32::MAX)
 }
+
+/// When each conversation's sandbox last stopped, and the quiet stop's
+/// mark if that stop was one (SME-123 DR9: the stored volumes said
+/// neither): its latest pod row, if that row has ended. Keyed by
+/// conversation; a conversation whose latest pod is live has no entry.
+pub async fn last_pod_stops(
+    pool: &PgPool,
+) -> Result<std::collections::HashMap<i64, (chrono::NaiveDateTime, Option<chrono::NaiveDateTime>)>, sqlx::Error> {
+    let rows: Vec<(i64, chrono::NaiveDateTime, Option<chrono::NaiveDateTime>)> = sqlx::query_as(
+        "SELECT DISTINCT ON (conversation_id) conversation_id, terminated_at, quietly_stopped_at
+           FROM sandbox_pods
+          ORDER BY conversation_id, id DESC",
+    )
+    .fetch_all(pool)
+    .await
+    .map(|rows: Vec<(i64, Option<chrono::NaiveDateTime>, Option<chrono::NaiveDateTime>)>| {
+        rows.into_iter().filter_map(|(id, ended, quiet)| ended.map(|ended| (id, ended, quiet))).collect()
+    })?;
+    Ok(rows.into_iter().map(|(id, ended, quiet)| (id, (ended, quiet))).collect())
+}

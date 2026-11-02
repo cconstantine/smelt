@@ -1030,3 +1030,34 @@
         max-width: none;
     }
 }
+
+/* On a phone the stored volumes are cards, a row each, not a table that
+   scrolls sideways (SME-123 DR9). */
+@media (max-width: 720px) {
+    .storage-table,
+    .storage-table tbody,
+    .storage-table tr,
+    .storage-table td {
+        display: block;
+        width: 100%;
+    }
+
+    .storage-table thead {
+        display: none;
+    }
+
+    .storage-table tr {
+        padding: 10px 0;
+        border-bottom: 1px solid var(--border);
+    }
+
+    .storage-table td {
+        padding: 2px 0;
+        border: none;
+    }
+
+    .storage-table td[data-label]::before {
+        content: attr(data-label) ": ";
+        color: var(--muted);
+    }
+}

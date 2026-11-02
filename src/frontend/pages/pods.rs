@@ -86,7 +86,7 @@ pub fn PodsIndex() -> Element {
             match fetched() {
                 None => rsx! { p { class: "muted", "Loading..." } },
                 Some(Err(e)) => rsx! { super::ErrorText { message: Some(super::server_error_message(&e)) } },
-                Some(Ok(pods)) if pods.is_empty() => rsx! { p { class: "muted", "No pods are running." } },
+                Some(Ok(pods)) if pods.is_empty() => rsx! { p { class: "muted", "No sandboxes are running." } },
                 Some(Ok(pods)) => rsx! {
                     table { class: "pods-table",
                         thead {
@@ -157,6 +157,11 @@ fn StoredVolumes(pods_changed: Signal<u64>, tick: Signal<u64>) -> Element {
         let _ = (pods_changed(), tick());
         get_stored_storage()
     });
+    let grace_days = use_resource(crate::api::sandbox::get_storage_removal_days);
+    let grace_days = match grace_days() {
+        Some(Ok(days)) => days,
+        _ => 0,
+    };
     let mut pending_remove: Signal<Option<i64>> = use_signal(|| None);
     let mut remove_error: Signal<Option<String>> = use_signal(|| None);
     let mut confirm_remove = move |conversation_id: i64| {
@@ -183,6 +188,7 @@ fn StoredVolumes(pods_changed: Signal<u64>, tick: Signal<u64>) -> Element {
                         thead {
                             tr {
                                 th { "Conversation" }
+                                th { "Stopped" }
                                 th { "/workspace" }
                                 th { "Docker" }
                                 th {}
@@ -191,11 +197,12 @@ fn StoredVolumes(pods_changed: Signal<u64>, tick: Signal<u64>) -> Element {
                         tbody {
                             for row in rows {
                                 tr { key: "{row.conversation_id}", "data-storage-conversation": "{row.conversation_id}",
-                                    td {
+                                    td { class: "storage-conversation",
                                         Link { to: Route::ConversationRoute { id: row.conversation_id }, "{row.conversation_title}" }
                                     }
-                                    td { "{volume_cell_text(&row, StorageKind::Workspace)}" }
-                                    td { "{volume_cell_text(&row, StorageKind::Docker)}" }
+                                    td { class: "storage-stopped", "data-label": "Stopped", "{stopped_text(row.stopped.as_ref(), grace_days, row.observed_at)}" }
+                                    td { "data-label": "/workspace", "{volume_cell_text(&row, StorageKind::Workspace)}" }
+                                    td { "data-label": "Docker", "{volume_cell_text(&row, StorageKind::Docker)}" }
                                     td {
                                         super::TwoStepButton {
                                             armed: pending_remove() == Some(row.conversation_id),
@@ -215,6 +222,28 @@ fn StoredVolumes(pods_changed: Signal<u64>, tick: Signal<u64>) -> Element {
             }
         }
     }
+}
+
+/// When a row's sandbox stopped and what becomes of its storage
+/// (SME-123 DR9): a quiet stop's goes `grace_days` after it (SME-345), a
+/// Stop's, or any with removal off, stays until removed here. Empty with
+/// no stop on record.
+fn stopped_text(stop: Option<&crate::api::pods::PodStop>, grace_days: u32, now: NaiveDateTime) -> String {
+    let Some(stop) = stop else {
+        return String::new();
+    };
+    let elapsed = age_seconds(stop.at, now);
+    let fate = if stop.quiet && grace_days > 0 {
+        let left_days = (i64::from(grace_days) * 86_400 - elapsed + 86_399) / 86_400;
+        match left_days {
+            ..=0 => "removed within the hour".to_string(),
+            1 => "removed in 1 day".to_string(),
+            n => format!("removed in {n} days"),
+        }
+    } else {
+        "kept until you remove it".to_string()
+    };
+    format!("stopped {} ago \u{b7} {fate}", format_age(elapsed))
 }
 
 /// A stored-volumes cell: the claim's size (`"20Gi"` — its capacity,
@@ -468,6 +497,8 @@ mod tests {
             conversation_id: 7,
             conversation_title: "seat".to_string(),
             volumes,
+            stopped: None,
+            observed_at: chrono::NaiveDateTime::default(),
         };
         let both = row(vec![
             volume(StorageKind::Workspace, Some("20Gi"), false),
@@ -481,5 +512,19 @@ mod tests {
         let half = row(vec![volume(StorageKind::Workspace, None, false)]);
         assert_eq!(volume_cell_text(&half, StorageKind::Workspace), "stored");
         assert_eq!(volume_cell_text(&half, StorageKind::Docker), "none");
+    }
+
+    #[test]
+    fn test_a_rows_stop_says_when_and_what_becomes_of_its_storage() {
+        use crate::api::pods::PodStop;
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 11, 10).expect("date").and_hms_opt(12, 0, 0).expect("time");
+        let days_ago = |d: i64| now - chrono::Duration::days(d);
+        let quiet = PodStop { at: days_ago(3), quiet: true };
+        assert_eq!(stopped_text(Some(&quiet), 7, now), "stopped 3d 0h ago \u{b7} removed in 4 days");
+        assert_eq!(stopped_text(Some(&PodStop { at: days_ago(6), quiet: true }), 7, now), "stopped 6d 0h ago \u{b7} removed in 1 day");
+        assert_eq!(stopped_text(Some(&PodStop { at: days_ago(8), quiet: true }), 7, now), "stopped 8d 0h ago \u{b7} removed within the hour");
+        assert_eq!(stopped_text(Some(&quiet), 0, now), "stopped 3d 0h ago \u{b7} kept until you remove it");
+        assert_eq!(stopped_text(Some(&PodStop { at: days_ago(3), quiet: false }), 7, now), "stopped 3d 0h ago \u{b7} kept until you remove it");
+        assert_eq!(stopped_text(None, 7, now), "");
     }
 }

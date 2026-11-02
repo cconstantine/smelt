@@ -142,3 +142,29 @@ async fn test_quietly_stopped_at_is_added_nullable_with_no_default(pool: PgPool)
     assert_eq!(nullable, "YES", "NULL for rows the upgrade didn't write");
     assert_eq!(default, None, "no default that could stamp a row retroactively");
 }
+
+/// SME-123 DR9: the Sandboxes page's stored volumes say when each
+/// conversation's sandbox stopped and whether that was a quiet stop: its
+/// latest pod row, once that row has ended. A live pod, and a
+/// conversation that never had one, give nothing.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_each_conversations_last_stop_is_its_latest_ended_pod(pool: PgPool) {
+    let quiet = create_conversation(&pool).await.expect("conversation");
+    let old = create_sandbox_pod(&pool, quiet.id).await.expect("pod");
+    terminate_sandbox_pod(&pool, old.id).await.expect("end it");
+    let latest = create_sandbox_pod(&pool, quiet.id).await.expect("pod");
+    mark_pod_quietly_stopped(&pool, latest.id).await.expect("mark it");
+    terminate_sandbox_pod(&pool, latest.id).await.expect("end it");
+
+    let stopped_by_user = create_conversation(&pool).await.expect("conversation");
+    let pod = create_sandbox_pod(&pool, stopped_by_user.id).await.expect("pod");
+    terminate_sandbox_pod(&pool, pod.id).await.expect("end it");
+
+    let live = create_conversation(&pool).await.expect("conversation");
+    create_sandbox_pod(&pool, live.id).await.expect("a live pod");
+
+    let stops = last_pod_stops(&pool).await.expect("read");
+    assert!(stops.get(&quiet.id).is_some_and(|(_, quiet_stop)| quiet_stop.is_some()), "{stops:?}");
+    assert!(stops.get(&stopped_by_user.id).is_some_and(|(_, quiet_stop)| quiet_stop.is_none()), "{stops:?}");
+    assert!(!stops.contains_key(&live.id), "a live pod hasn't stopped: {stops:?}");
+}
