@@ -117,6 +117,7 @@ pub(super) fn run_turn_bounded<'a>(
             provider_id = Empty,
             turn.steps = Empty,
             turn.stopped = Empty,
+            smelt.slot_wait_ms = Empty,
             otel.status_code = Empty,
             otel.status_description = Empty,
         );
@@ -504,6 +505,9 @@ fn run_turn_steps<'a: 'b, 'b>(
         // they survive a turn that can't run) and then kept: a model or
         // provider changed mid-turn applies from the next turn (SME-72).
         let mut resolved_model: Option<crate::providers::TurnModel> = None;
+        // The request slot this turn holds on its model's provider once
+        // that model is resolved, and holds to the end (SME-343).
+        let mut turn_slot: Option<crate::turn::call::TurnSlot> = None;
 
         // A repo the user just attached may still be cloning; its AGENTS.md
         // belongs in this turn's system prompt (SME-32). Bounded: past it,
@@ -570,6 +574,19 @@ fn run_turn_steps<'a: 'b, 'b>(
                     .map_err(ServerFnError::new)?,
             };
             let turn_model = &*resolved_model.insert(turn_model);
+            // Take the provider's request slot before this turn's first
+            // model call, and re-check the pool every iteration after
+            // that: a limit saved (or cleared) mid-turn applies here, at
+            // the turn's next call (SME-343). Held — not re-taken — by
+            // every call and compaction below until this turn ends.
+            let slot = match &mut turn_slot {
+                Some(slot) => slot,
+                slot @ None => {
+                    let acquired = TurnSlot::acquire(turn_model).await;
+                    slot.insert(acquired)
+                }
+            };
+            slot.refresh(turn_model).await;
             if steps.count == 0 {
                 steps.span.record("model", turn_model.model.as_str());
                 steps.span.record("provider_id", turn_model.provider_id);
@@ -588,7 +605,7 @@ fn run_turn_steps<'a: 'b, 'b>(
                 estimate_tokens(&pending_new_content),
                 turn_model.context_window,
             ) {
-                compact_conversation(pool, conversation_id, turn_model).await?;
+                compact_conversation(pool, conversation_id, turn_model, slot.held()).await?;
                 // The last usage measured the history just summarized: the
                 // reply budget below estimates the new one instead.
                 last_known_usage = None;
@@ -598,7 +615,7 @@ fn run_turn_steps<'a: 'b, 'b>(
                 build_request(pool, conversation_id, turn_model, last_known_usage.as_ref(), &pending_new_content)
                     .await?;
             let offered: Vec<String> = request.tools.iter().map(|tool| tool.name.clone()).collect();
-            let (turn, recorder) = call_model(pool, conversation_id, turn_model, &mut request).await?;
+            let (turn, recorder) = call_model(pool, conversation_id, turn_model, &mut request, slot.held()).await?;
             save_reply(pool, conversation_id, &turn, &mut persisted).await?;
             #[cfg(test)]
             test_hooks::after_reply_saved(conversation_id).await;

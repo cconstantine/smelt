@@ -1,21 +1,33 @@
 //! How many model requests each provider is sent at once (SME-162).
 //!
 //! A provider with a max concurrent requests has a pool of that many
-//! slots, kept here by provider id. A model call looks its provider's
-//! pool up when it starts (`Endpoint::slot`, `anthropic::stream`) and
-//! holds a slot from before it sends until it ends, so a request over the
-//! limit waits in smelt instead of queueing, silently, on a busy server
-//! until it times out. The pools are in memory, set from the column and
-//! the server's report (`resolved_max`) by whatever changes either, and by
-//! every endpoint build, so a restart rebuilds them as they're used.
+//! slots, kept here by provider id. A running turn looks its provider's
+//! pool up at its first model call (`turn::call::TurnSlot`) and holds a
+//! slot from then until the turn ends; every call the turn makes after
+//! that — retries, tool passes, compaction's own summarization — sends
+//! through it (`anthropic::stream::SlotPolicy::Held`) rather than taking
+//! one of its own, so a one-slot server is never switched to another
+//! conversation between one turn's calls (SME-343: every switch re-prefills
+//! the prompt) and a request over the limit waits in smelt instead of
+//! queueing, silently, on a busy server until it times out. A raw call
+//! outside a turn takes one per call, holding from before it sends until
+//! it ends (`SlotPolicy::PerCall`). The pools are in memory, set from the
+//! column and the server's report (`resolved_max`) by whatever changes
+//! either, and by every endpoint build, so a restart rebuilds them as
+//! they're used.
 //!
-//! A change of limit applies from each running turn's next model call,
-//! not its next turn (SME-162 review 1), and resizes the provider's pool
-//! in place (review 2): raised, it frees the new slots; lowered, it takes
-//! back the free ones and, for the rest, the next ones its running calls
-//! give back. So a change never lets more requests in than the new limit,
-//! counting the ones already running. Only clearing the limit closes the
-//! pool, which lets the calls waiting on it go.
+//! A change of limit applies from each running turn's next call, not its
+//! next turn (SME-162 review 1): the turn re-checks its pool at every loop
+//! iteration (`TurnSlot::refresh`) — a limit newly set, it takes one at
+//! that call; a cleared one, it gives its slot up and goes; a pool closed
+//! and replaced (or forgotten), it gives that slot up for the current
+//! pool's. A change resizes the provider's pool in place (review 2):
+//! raised, it frees the new slots; lowered, it takes back the free ones
+//! and, for the rest, the next ones running calls give back — a turn-held
+//! slot through a resize it keeps, what the lowered limit owes of it taken
+//! back at the turn's end. So a change never lets more requests in than
+//! the new limit, counting the ones already running. Only clearing the
+//! limit closes the pool, which lets the calls waiting on it go.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -94,6 +106,18 @@ impl Drop for Slot {
         {
             permit.forget();
         }
+    }
+}
+
+impl Slot {
+    /// Whether this slot was taken from `pool` (SME-343). A turn holding
+    /// a slot across its model calls tells a **resized** pool (the same
+    /// `Pool`, resized in place — keep holding: review 2's math takes
+    /// lowered limits back as slots free) from one that was **closed and
+    /// replaced** (a new `Arc` — the held slot belongs to the old limit
+    /// and is given up).
+    pub fn from_pool(&self, pool: &Arc<Pool>) -> bool {
+        Arc::ptr_eq(&self.pool, pool)
     }
 }
 

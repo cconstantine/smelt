@@ -26,7 +26,7 @@ async fn run_metered(body: &'static str) -> (Result<StreamedTurn, String>, Usage
         chat_template_kwargs: None,
     };
     let meter = UsageMeter::default();
-    let result = stream_anthropic_message_metered(&test_endpoint(addr), &request, |_| {}, &meter).await;
+    let result = stream_anthropic_message_metered(&test_endpoint(addr), &request, |_| {}, &meter, SlotPolicy::PerCall).await;
     (result, meter)
 }
 

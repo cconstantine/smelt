@@ -44,8 +44,10 @@ impl Endpoint {
     /// cleared) sends it on at once, or to the pool set since. A wait past
     /// `SLOW_SLOT_WAIT` is logged once, naming the host only. `None` when
     /// the provider has no limit; otherwise the slot, if it ended with one,
-    /// and how long it waited (review 2: either way).
-    pub(super) async fn slot(&self) -> Option<(Option<crate::providers::limiter::Slot>, std::time::Duration)> {
+    /// and how long it waited (review 2: either way). Also the turn
+    /// layer's way in (SME-343): `turn::call::TurnSlot::acquire` holds one
+    /// of these for a whole turn.
+    pub(crate) async fn slot(&self) -> Option<(Option<crate::providers::limiter::Slot>, std::time::Duration)> {
         let provider_id = self.slots_of?;
         let mut pool = crate::providers::limiter::current(provider_id)?;
         let started = tokio::time::Instant::now();
