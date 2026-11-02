@@ -37,8 +37,10 @@
     background: #1baf7a;
 }
 
+/* The width every settings page has (SME-123 DR15); its tables' cells
+   wrap to fit. */
 .pods-page {
-    max-width: 1100px;
+    max-width: 720px;
     margin: 0 auto;
     padding: 32px 24px 64px;
 }

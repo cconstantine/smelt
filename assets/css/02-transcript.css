@@ -277,6 +277,8 @@
 .tool-call-header,
 .tool-result-header {
     display: flex;
+    flex-wrap: wrap;
+    min-width: 0;
     align-items: center;
     gap: 6px;
     font-size: 13px;
@@ -294,6 +296,8 @@
     line-height: 1;
 }
 
+/* A long path breaks rather than running off a phone's screen (SME-123
+   DR15). */
 .tool-call-name {
     font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
     font-size: 12px;
@@ -301,6 +305,8 @@
     padding: 1px 6px;
     border-radius: 4px;
     color: var(--ink);
+    min-width: 0;
+    overflow-wrap: anywhere;
 }
 
 .tool-result-content {

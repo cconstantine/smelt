@@ -89,6 +89,10 @@ pub(super) async fn scenario_pods(t: &Scenario<'_>) {
 
     let pods_page = t.tab(t.url("pods")).await;
     wait_for_resource(&pods_page, "/api/pods").await;
+    // The same width as every other settings page: it was 1,100px to their
+    // 720, so its left edge jumped (SME-123 DR15).
+    let page_box = element_box(&pods_page, ".pods-page").await;
+    assert!(page_box.2 <= 720, "the Sandboxes page is {}px wide", page_box.2);
     let row = format!("tr[data-pod-id=\"{pod_id}\"]");
     assert!(
         wait_for_count(&pods_page, &row, 1, Duration::from_secs(10)).await,
@@ -383,6 +387,28 @@ pub(super) async fn scenario_sidebar(t: &Scenario<'_>) {
 /// this also checks the tag is there.
 pub(super) async fn scenario_phone_width(t: &Scenario<'_>) {
     let phone_conversation = t.conversation().await;
+    // An edit to a long path and a long command, as an agent's transcript
+    // has them: their names ran past a phone's screen (SME-123 DR15).
+    let long_path = "/workspace/smelt/src/frontend/pages/chat/transcript/a_rather_long_module_name.rs";
+    db::create_message(
+        t.pool,
+        phone_conversation.id,
+        "assistant",
+        &[
+            anthropic::ContentBlock::ToolUse {
+                id: "toolu_phone_edit".to_string(),
+                name: "edit_file".to_string(),
+                input: serde_json::json!({"path": long_path, "old_string": "a", "new_string": "b"}),
+            },
+            anthropic::ContentBlock::ToolUse {
+                id: "toolu_phone_read".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": long_path}),
+            },
+        ],
+    )
+    .await
+    .expect("seed the calls");
     let page = t.tab("about:blank").await;
     page.execute(
         chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::new(390, 844, 2.0, true),
@@ -407,6 +433,17 @@ pub(super) async fn scenario_phone_width(t: &Scenario<'_>) {
     assert!(layout[1] >= 300.0, "the messages are too narrow on a phone: {layout:?}");
     assert!(layout[2] >= 200.0, "the message box is too narrow on a phone: {layout:?}");
     assert!(layout[3] <= 0.0, "the page scrolls sideways on a phone: {layout:?}");
+    wait_for_element(&page, ".file-edit-diff", Duration::from_secs(10)).await;
+    let past_edge: Vec<String> = page
+        .evaluate(
+            "Array.from(document.querySelectorAll('.messages *')).filter(e => e.getBoundingClientRect().right > innerWidth + 1) \
+             .map(e => e.tagName.toLowerCase() + '.' + e.className + ' ' + Math.round(e.getBoundingClientRect().right))",
+        )
+        .await
+        .expect("measure the transcript")
+        .into_value()
+        .expect("strings");
+    assert!(past_edge.is_empty(), "transcript elements run past a phone's screen: {past_edge:?}");
     // The conversation comes first: the list is folded behind a
     // button, and the chat sits above the side panels. The list and
     // the sandbox panel used to push the transcript to the bottom of
