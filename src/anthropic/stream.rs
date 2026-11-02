@@ -483,7 +483,30 @@ pub async fn stream_anthropic_message(
     request: &CreateMessageRequest,
     on_delta: impl FnMut(&str),
 ) -> Result<StreamedTurn, String> {
-    stream_anthropic_message_metered(endpoint, request, on_delta, &UsageMeter::default()).await
+    stream_anthropic_message_metered(endpoint, request, on_delta, &UsageMeter::default(), SlotPolicy::PerCall).await
+}
+
+/// How a model call gets its place in the provider's request pool
+/// (SME-162, SME-343). Every caller says which it is, explicitly.
+#[derive(Clone, Copy)]
+pub enum SlotPolicy<'a> {
+    /// Take and hold a slot for this call: SME-162's behavior, for raw
+    /// calls and any caller not holding a turn's slot.
+    #[cfg_attr(not(test), allow(dead_code, reason = "every in-turn site holds the turn's slot and passes Held; this is the raw-caller policy the test wrapper and any future out-of-turn caller use"))]
+    PerCall,
+    /// The caller already holds this endpoint's provider's slot for its
+    /// turn (`None` when that provider has no limit): send without
+    /// acquiring, and record no `smelt.slot_wait_ms` — the wait, if any,
+    /// was the turn's, recorded on the turn's span. A second in-turn call
+    /// site on a limited provider passes this same held slot rather than
+    /// releasing and re-acquiring: a one-slot pool deadlocks otherwise.
+    Held(
+        #[expect(
+            dead_code,
+            reason = "the reference is the point, never its value: holding it borrowed is what proves the caller's slot outlives this call, and the call itself never needs the slot"
+        )]
+        Option<&'a crate::providers::limiter::Slot>,
+    ),
 }
 
 /// Stream a message from the real Anthropic API, calling `on_delta` for each
@@ -503,6 +526,7 @@ pub async fn stream_anthropic_message_metered(
     request: &CreateMessageRequest,
     on_delta: impl FnMut(&str),
     meter: &UsageMeter,
+    slot: SlotPolicy<'_>,
 ) -> Result<StreamedTurn, String> {
     use tracing::field::Empty;
     let span = tracing::info_span!(
@@ -529,7 +553,7 @@ pub async fn stream_anthropic_message_metered(
     }
     crate::telemetry::in_span(span.clone(), async move {
         let mut tries = Tries { retries: 0, binding: binding_for(endpoint, request) };
-        let result = stream_message(endpoint, request, on_delta, &mut tries, meter).await;
+        let result = stream_message(endpoint, request, on_delta, &mut tries, meter, slot).await;
         // Each once: a span keeps every value an attribute is given.
         span.record("smelt.retries", tries.retries as i64);
         span.record("smelt.binding", tracing::field::debug(tries.binding));
@@ -571,10 +595,17 @@ async fn stream_message(
     mut on_delta: impl FnMut(&str),
     tries: &mut Tries,
     meter: &UsageMeter,
+    slot: SlotPolicy<'_>,
 ) -> Result<StreamedTurn, String> {
-    // Held through the retries and the whole stream (SME-162); the wait
-    // for it is on the span, apart from the model's time (review 1).
-    let (_slot, waited) = endpoint.slot().await.unzip();
+    // SME-162: a per-call takes its own slot and holds it through the
+    // retries and the whole stream; the wait for it is on the span, apart
+    // from the model's time (review 1). SME-343: a held call sends without
+    // acquiring, and records no wait — the turn it belongs to is its
+    // holder, and any wait it stood in is the turn's, on the turn's span.
+    let (_slot, waited) = match slot {
+        SlotPolicy::PerCall => endpoint.slot().await.unzip(),
+        SlotPolicy::Held(_) => (None, None),
+    };
     if let Some(waited) = waited {
         let waited = i64::try_from(waited.as_millis()).unwrap_or(i64::MAX);
         tracing::Span::current().record("smelt.slot_wait_ms", waited);

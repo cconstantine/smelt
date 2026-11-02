@@ -151,7 +151,13 @@ async fn test_a_compaction_is_a_span_with_its_model_call_under_it(pool: PgPool) 
         .await
         .expect("the mock is the default");
     let (result, spans) =
-        crate::telemetry::capture_spans(compact_conversation(&pool, conversation.id, &turn_model)).await;
+        crate::telemetry::capture_spans(compact_conversation(
+            &pool,
+            conversation.id,
+            &turn_model,
+            anthropic::stream::SlotPolicy::PerCall,
+        ))
+        .await;
     result.expect("compaction");
     let compactions = spans_named(&spans, "compaction");
     let [compaction] = compactions.as_slice() else { panic!("one compaction span: {spans:?}") };

@@ -395,6 +395,7 @@ pub(super) async fn compact_conversation(
     pool: &PgPool,
     conversation_id: i64,
     turn_model: &crate::providers::TurnModel,
+    slot: anthropic::stream::SlotPolicy<'_>,
 ) -> ServerFnResult<()> {
     use tracing::field::Empty;
     // Its model call is its child (SME-137).
@@ -405,7 +406,7 @@ pub(super) async fn compact_conversation(
         otel.status_description = Empty,
     );
     crate::telemetry::in_span(span.clone(), async move {
-        let result = compact(pool, conversation_id, turn_model).await;
+        let result = compact(pool, conversation_id, turn_model, slot).await;
         if let Err(e) = &result {
             crate::telemetry::mark_error(&span, &e.to_string());
         }
@@ -419,6 +420,7 @@ async fn compact(
     pool: &PgPool,
     conversation_id: i64,
     turn_model: &crate::providers::TurnModel,
+    slot: anthropic::stream::SlotPolicy<'_>,
 ) -> ServerFnResult<()> {
     let messages = db::list_messages(pool, conversation_id)
         .await
@@ -469,6 +471,7 @@ async fn compact(
         &summarization_request,
         &mut discard_deltas,
         recorder.meter(),
+        slot,
     )
     .await
     .map_err(ServerFnError::new)?;

@@ -462,3 +462,112 @@ async fn test_a_wait_ended_by_clearing_the_limit_is_on_the_span() {
     };
     assert!((250..5_000).contains(&waited), "waited {waited} ms");
 }
+
+// --- SME-343: a turn's held slot through the stream layer ---
+
+/// A call through `stream_anthropic_message_metered` with the turn's held
+/// slot: the task first takes the provider's only slot — standing for the
+/// turn holding it — and passes it as `Held(Some(..))`, the way a turn's
+/// own calls do.
+fn held_call(endpoint: &Endpoint, model: &'static str, id: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<StreamedTurn, String>> + Send>> {
+    let endpoint = endpoint.clone();
+    let request = CreateMessageRequest {
+        model: model.to_string(),
+        max_tokens: 100,
+        system: None,
+        messages: vec![],
+        stream: true,
+        tools: vec![],
+        thinking: None,
+        prompt_caching: false,
+        output_config: None,
+        chat_template_kwargs: None,
+    };
+    Box::pin(async move {
+        let slot = crate::providers::limiter::current(id)
+            .expect("a pool")
+            .try_acquire()
+            .expect("the only slot");
+        stream_anthropic_message_metered(&endpoint, &request, |_| {}, &UsageMeter::default(), SlotPolicy::Held(Some(&slot))).await
+    })
+}
+
+/// T8: a call whose turn already holds the provider's only slot sends at
+/// once — it sends without acquiring and takes no second slot, where the
+/// pool has none to give.
+#[tokio::test]
+async fn test_a_held_slot_sends_at_once_with_the_only_slot_taken() {
+    let (addr, upstream) = start_gated_upstream(None, false).await;
+    let id = 9_162_000_119;
+    let endpoint = limited(addr, id, Some(1));
+    let pool = crate::providers::limiter::current(id).expect("a pool");
+    let task = tokio::spawn(held_call(&endpoint, "a", id));
+    // Red on the per-call stream: the call blocks in `endpoint.slot()`
+    // waiting for the slot its own task holds, and never arrives.
+    upstream.wait_for_arrivals(1).await;
+    assert_eq!(pool.available_permits(), 0, "a Held call takes no slot of its own");
+    upstream.release_one();
+    finished(task).await;
+    assert_eq!(pool.available_permits(), 1, "the held slot came back with the turn");
+}
+
+/// T8: `Held(None)` — a turn on a provider with no limit — sends at once.
+#[tokio::test]
+async fn test_a_held_none_call_sends_at_once() {
+    let (addr, upstream) = start_gated_upstream(None, false).await;
+    let endpoint = limited(addr, 9_162_000_120, None);
+    let task = tokio::spawn({
+        let endpoint = endpoint.clone();
+        async move {
+            let request = CreateMessageRequest {
+                model: "b".to_string(),
+                max_tokens: 100,
+                system: None,
+                messages: vec![],
+                stream: true,
+                tools: vec![],
+                thinking: None,
+                prompt_caching: false,
+                output_config: None,
+                chat_template_kwargs: None,
+            };
+            stream_anthropic_message_metered(&endpoint, &request, |_| {}, &UsageMeter::default(), SlotPolicy::Held(None)).await
+        }
+    });
+    upstream.wait_for_arrivals(1).await;
+    upstream.release_one();
+    finished(task).await;
+}
+
+/// T8: `PerCall` is unchanged — it waits behind a slot held elsewhere,
+/// exactly as SME-162 built it.
+#[tokio::test]
+async fn test_a_per_call_call_still_waits_behind_a_held_slot() {
+    let (addr, upstream) = start_gated_upstream(None, false).await;
+    let id = 9_162_000_121;
+    let endpoint = limited(addr, id, Some(1));
+    let held = crate::providers::limiter::current(id).expect("a pool").try_acquire().expect("the only slot");
+    let task = tokio::spawn(call(&endpoint, "a"));
+    tokio::time::sleep(SETTLE).await;
+    assert!(upstream.arrivals().is_empty(), "a per-call call waits for the slot");
+    drop(held);
+    upstream.wait_for_arrivals(1).await;
+    upstream.release_one();
+    finished(task).await;
+}
+
+/// T8: a held call records no `smelt.slot_wait_ms` on its own span — the
+/// wait, if any, was the turn's, recorded on the turn's span (mirrors
+/// `test_a_calls_wait_for_a_slot_is_on_its_span`).
+#[tokio::test]
+async fn test_a_held_call_records_no_slot_wait_on_its_span() {
+    let (addr, upstream) = start_gated_upstream(None, false).await;
+    upstream.release.add_permits(10);
+    let id = 9_162_000_122;
+    let endpoint = limited(addr, id, Some(1));
+    let (result, spans) = crate::telemetry::capture_spans(held_call(&endpoint, "a", id)).await;
+    result.expect("the call succeeds");
+    let chats = chat_spans(&spans);
+    let [span] = chats.as_slice() else { panic!("one chat span: {spans:?}") };
+    assert_eq!(span_attribute(span, "smelt.slot_wait_ms"), None, "the turn's wait isn't the call's");
+}
