@@ -254,3 +254,12 @@ fn test_reply_parts_a_cut_off_or_stop_after_tool_results_ends_the_reply() {
         vec![(2, 0, "Working.".to_string(), 1), (6, 0, "After the stop.".to_string(), 1)]
     );
 }
+
+/// SME-123 DR16: the label said "(16 parts)" without saying what a part
+/// was.
+#[test]
+fn test_a_reply_of_several_messages_copies_as_a_whole_reply() {
+    assert_eq!(reply_copy_label(1), "Copy reply");
+    assert_eq!(reply_copy_label(16), "Copy whole reply");
+    assert_eq!(reply_copy_title(16), "Copy this reply's text, from all 16 of its messages, as Markdown");
+}

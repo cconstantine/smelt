@@ -288,15 +288,16 @@ fn finish_reply(parts: &mut HashMap<i64, ReplyPart>, reply: Vec<(i64, usize, &st
     }
 }
 
-/// A reply's Copy button label: how many bubbles it copies, when that's
-/// more than the one it sits in.
+/// A reply's Copy button label: "whole" when it copies more than the
+/// bubble it sits in. "Copy reply (16 parts)" didn't say what a part was
+/// (SME-123 DR16); the title says how many messages.
 pub(in crate::frontend::pages::chat) fn reply_copy_label(parts: usize) -> String {
-    if parts > 1 { format!("Copy reply ({parts} parts)") } else { "Copy reply".to_string() }
+    if parts > 1 { "Copy whole reply".to_string() } else { "Copy reply".to_string() }
 }
 
 pub(in crate::frontend::pages::chat) fn reply_copy_title(parts: usize) -> String {
     if parts > 1 {
-        format!("Copy this reply's {parts} outlined parts as Markdown")
+        format!("Copy this reply's text, from all {parts} of its messages, as Markdown")
     } else {
         "Copy this reply as Markdown".to_string()
     }
