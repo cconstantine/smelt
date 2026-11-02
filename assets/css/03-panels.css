@@ -523,3 +523,20 @@
     transition: border-color 100ms ease, box-shadow 100ms ease;
 }
 
+
+/* A list nobody is working on now (SME-123 DR7): its note says so, and
+   an "in progress" item stops looking active. */
+.todo-note {
+    margin: 0 0 8px;
+    font-size: 12px;
+    color: var(--muted);
+}
+
+.todo-panel-idle .todo-item-in-progress .todo-item-content {
+    font-weight: normal;
+}
+
+.todo-panel-idle .todo-item-in-progress .todo-item-marker {
+    border-color: var(--border);
+    background: none;
+}
