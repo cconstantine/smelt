@@ -693,3 +693,45 @@ async fn test_an_error_cut_off_mid_check_still_forgets_a_deleted_conversation(po
 
     wait_until("the cut-off error's check forgets the conversation", || !has_turn_state(conversation_id)).await;
 }
+
+/// SME-123 DR3, review 1 M1: a user's failed turn saves its failure
+/// notice while it still holds the lock, so the notice comes before the
+/// message of a send queued behind it. Saved after the lock went, the
+/// queued turn could save its message first and the notice land under it.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_failure_notice_comes_before_a_send_queued_behind_it(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+    start_failing_then_answering_mock_upstream(&pool, 1).await;
+    let (reached, release) = test_hooks::pause_after_message_saved(conversation_id);
+    start_turn(pool.clone(), conversation_id, "please".to_string()).await.expect("send");
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached)
+        .await
+        .expect("the user's turn saves its message")
+        .expect("hook");
+    start_turn(pool.clone(), conversation_id, "again".to_string()).await.expect("send again");
+    wait_until("the second send is queued", || turns_in_flight(conversation_id) == 2).await;
+    let _ = release.send(());
+    wait_until("both turns end", || !turn_running(conversation_id) && turns_in_flight(conversation_id) == 0).await;
+
+    let texts: Vec<String> = db::list_messages(&pool, conversation_id)
+        .await
+        .expect("messages")
+        .into_iter()
+        .filter_map(|m| {
+            let blocks: Vec<anthropic::ContentBlock> = serde_json::from_str(&m.content).ok()?;
+            blocks.into_iter().find_map(|b| match b {
+                anthropic::ContentBlock::Text { text } if m.role == "user" => Some(text),
+                _ => None,
+            })
+        })
+        .collect();
+    let please = texts.iter().position(|t| t == "please").expect("the first send");
+    let notice = texts
+        .iter()
+        .position(|t| crate::api::chat::parse_failure_notice(t).is_some())
+        .expect("the failure notice");
+    let again = texts.iter().position(|t| t == "again").expect("the queued send");
+    assert!(please < notice && notice < again, "the notice belongs between the two sends: {texts:?}");
+}
