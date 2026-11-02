@@ -370,13 +370,27 @@ async fn test_create_message_in_place_leaves_updated_at_and_a_default_title(pool
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_brief_titles_its_conversation_by_its_bold_phrase(pool: PgPool) {
+    let parent = create_conversation(&pool).await.expect("create the parent");
     let conversation = create_conversation(&pool).await.expect("create");
+    sqlx::query("UPDATE conversations SET parent_id = $1 WHERE id = $2")
+        .bind(parent.id)
+        .bind(conversation.id)
+        .execute(&pool)
+        .await
+        .expect("make it an agent");
     let brief = "You are the **Planner seat on SME-9** (Linear, team Smelt Agent). Plan it.";
     create_message(&pool, conversation.id, "user", &[crate::anthropic::ContentBlock::Text { text: brief.to_string() }])
         .await
         .expect("message");
     let titled = list_conversations(&pool).await.expect("list").into_iter().find(|c| c.id == conversation.id).expect("found");
     assert_eq!(titled.title, "Planner seat on SME-9");
+    // The user's own conversation keeps its line, bold marks dropped
+    // (review 1 M2).
+    create_message(&pool, parent.id, "user", &[crate::anthropic::ContentBlock::Text { text: "Fix the **login** page".to_string() }])
+        .await
+        .expect("message");
+    let own = list_conversations(&pool).await.expect("list").into_iter().find(|c| c.id == parent.id).expect("found");
+    assert_eq!(own.title, "Fix the login page");
 }
 
 /// The SME-123 DR1 migration, run again over titles saved the old way.
@@ -387,10 +401,15 @@ async fn test_the_title_migration_tidies_titles_saved_with_markdown(pool: PgPool
         ("You are the **Developer seat for a very long ticket name that", "You are the Developer seat for a very long ticket name that"),
         ("fix the build", "fix the build"),
     ];
+    let parent: i64 = sqlx::query_scalar("INSERT INTO conversations (title) VALUES ('Fix the **login** page') RETURNING id")
+        .fetch_one(&pool)
+        .await
+        .expect("insert the user's own");
     let mut ids = Vec::new();
     for (saved, _) in cases {
-        let id: i64 = sqlx::query_scalar("INSERT INTO conversations (title) VALUES ($1) RETURNING id")
+        let id: i64 = sqlx::query_scalar("INSERT INTO conversations (title, parent_id) VALUES ($1, $2) RETURNING id")
             .bind(saved)
+            .bind(parent)
             .fetch_one(&pool)
             .await
             .expect("insert");
@@ -400,6 +419,8 @@ async fn test_the_title_migration_tidies_titles_saved_with_markdown(pool: PgPool
         .execute(&pool)
         .await
         .expect("run the migration");
+    let own: String = sqlx::query_scalar("SELECT title FROM conversations WHERE id = $1").bind(parent).fetch_one(&pool).await.expect("title");
+    assert_eq!(own, "Fix the login page", "the user's own title keeps its words (review 1 M2)");
     for (id, (_, want)) in ids.into_iter().zip(cases) {
         let title: String = sqlx::query_scalar("SELECT title FROM conversations WHERE id = $1").bind(id).fetch_one(&pool).await.expect("title");
         assert_eq!(title, want);
