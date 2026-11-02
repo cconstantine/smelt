@@ -3,7 +3,13 @@ description: >
   What both CI jobs test against: docker-compose.yml's postgres, docker and
   k3s, with the build caches and this commit's sandbox image, on the job's
   own ARC runner. Sets UID/GID, COMPOSE_FILE, the CI_* cache dirs and
-  SANDBOX_IMAGE for the steps after it.
+  SANDBOX_IMAGE for the steps after it. With `full: false`, only the dev
+  image and the caches, for a job that runs something in the `smelt`
+  service with no database or cluster (`docker compose run --no-deps`).
+inputs:
+  full:
+    description: Start postgres, docker-in-docker and k3s, bootstrap k3s and deliver the sandbox image (the default), or stop after the dev image.
+    default: "true"
 runs:
   using: composite
   steps:
@@ -73,10 +79,12 @@ runs:
       run: docker compose build smelt
 
     - name: Start service dependencies (postgres, docker-in-docker, k3s)
+      if: inputs.full == 'true'
       shell: bash
       run: docker compose up -d postgres docker k3s
 
     - name: Bootstrap k3s (applies RBAC, writes kubeconfig for sandbox tests)
+      if: inputs.full == 'true'
       shell: bash
       run: docker compose up --exit-code-from k3s-bootstrap k3s-bootstrap
 
@@ -93,10 +101,12 @@ runs:
     # their pods from it through SANDBOX_IMAGE, as scripts/check.sh does
     # locally. `:latest` isn't imported: nothing here uses it.
     - name: Sandbox image for this commit
+      if: inputs.full == 'true'
       shell: bash
       run: echo "SANDBOX_IMAGE=$(scripts/sandbox-image-ref)" >> "$GITHUB_ENV"
 
     - name: Build and deliver the sandbox image
+      if: inputs.full == 'true'
       shell: bash
       run: |
         docker compose run --rm \

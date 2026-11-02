@@ -32,7 +32,76 @@ permissions:
   contents: read
 
 jobs:
+  # Whether the change touches anything but docs (SME-341). A change to
+  # Markdown files and docs/ alone runs no test it could break, so
+  # `server` and `browser` don't run for it, and `docs` runs the repo lints
+  # instead, which do read docs: the size ceiling, links, persona files.
+  # Anything else, any manual run, or a range that can't be read counts as
+  # code. `server` and `browser` then run as before.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Does the change touch anything but docs?
+        id: diff
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          case "$EVENT" in
+            pull_request) base=$(git merge-base "$PR_BASE" "$PR_HEAD" 2>/dev/null); head=$PR_HEAD ;;
+            push) base=$PUSH_BEFORE; head=$PUSH_AFTER ;;
+            *) base=; head= ;;
+          esac
+          code=true
+          if [ -n "$base" ] && [ -n "$head" ] && changed=$(git diff --name-only "$base" "$head" 2>/dev/null) && [ -n "$changed" ]; then
+            if ! printf '%s\n' "$changed" | grep -qvE '(\.md$|^docs/)'; then
+              code=false
+            fi
+            printf 'changed:\n%s\n' "$changed"
+          fi
+          echo "code: $code"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+  # The repo lints alone, for a docs-only change: the `smelt` service with
+  # no database or cluster, on the server runner's warm caches.
+  docs:
+    needs: changes
+    if: needs.changes.outputs.code != 'true'
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || 'arc-runner-smelt-amd64' }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: The dev image and the build caches
+        uses: ./.github/actions/start-stack
+        with:
+          full: "false"
+
+      - name: The repo lints (file ceiling, links, personas)
+        run: |
+          docker compose run --rm --no-deps \
+            smelt scripts/with-cluster-lock cargo test --features server repo_lints
+
+      - name: Stop the compose stack
+        if: always()
+        uses: ./.github/actions/stop-stack
+
   server:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || 'arc-runner-smelt-amd64' }}
     timeout-minutes: 60
     steps:
@@ -119,6 +188,8 @@ jobs:
         uses: ./.github/actions/stop-stack
 
   browser:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || 'arc-runner-smelt-amd64-browser' }}
     timeout-minutes: 60
     steps:

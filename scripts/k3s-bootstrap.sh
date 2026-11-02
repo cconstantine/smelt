@@ -81,11 +81,13 @@ echo "wrote $OUT_KUBECONFIG"
 # storage. Patched on each `compose up`, since k3s may put its own manifest
 # back on a restart.
 PROVISIONER_ARGS='["--worker-threads=16","--kube-client-qps=50","--kube-client-burst=100"]'
-# Only a speed tweak, so nothing in it may hold up or fail the bootstrap
-# (the kubeconfig above is what `smelt` waits for): a bounded wait for the
-# deployment, and a warning, never an exit, when a step fails (SME-341
-# review). Each step checks its own status, since `set -e` doesn't apply
-# inside a function called with `||`.
+# Only a speed tweak, so it never fails the bootstrap that `smelt` waits
+# for, and its waits are bounded: on a broken cluster the deployment wait
+# (120 s), the rollout (90 s) and an undo's rollout (90 s) can still put
+# `smelt`'s start off by about 5 minutes, then warn (SME-341 review). Each
+# step checks its own status, since `set -e` doesn't apply inside a
+# function called with `||`. Returns 1 when the provisioner is left as k3s
+# set it up, 2 when an undo failed and its state isn't known.
 tune_provisioner() {
     echo "waiting for the local-path provisioner..."
     waited=0
@@ -103,8 +105,11 @@ tune_provisioner() {
         return 0
     fi
     echo "the local-path provisioner didn't come up with $PROVISIONER_ARGS; rolling it back"
-    kctl -n kube-system rollout undo deployment local-path-provisioner || return 1
-    kctl -n kube-system rollout status deployment local-path-provisioner --timeout=90s || return 1
+    kctl -n kube-system rollout undo deployment local-path-provisioner || return 2
+    kctl -n kube-system rollout status deployment local-path-provisioner --timeout=90s || return 2
     return 1
 }
-tune_provisioner || echo "warning: the local-path provisioner is left as k3s set it up; the pod tests' claims bind slower" >&2
+tune_provisioner || case $? in
+    2) echo "warning: rolling the local-path provisioner back failed; check it (kubectl -n kube-system get deployment local-path-provisioner)" >&2 ;;
+    *) echo "warning: the local-path provisioner is left as k3s set it up; the pod tests' claims bind slower" >&2 ;;
+esac

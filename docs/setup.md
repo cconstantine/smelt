@@ -177,6 +177,14 @@ last one's output. A pull request from a fork runs on GitHub's
 `ubuntu-latest` instead, which has no such volume, so it builds everything
 from scratch.
 
+**A change to docs alone doesn't run the tests** (SME-341). A first job,
+`changes`, compares the change's files: when every one is Markdown or under
+`docs/`, `server` and `browser` are skipped, and a `docs` job runs only the
+repo lints (`cargo test --features server repo_lints`: the size ceiling,
+links and persona files, which do read docs), in the `smelt` service with no
+database or cluster (`start-stack` with `full: false`). Anything else, a
+manual run, or a range it can't read runs everything, as before.
+
 ## Deploying
 
 Running smelt for real, outside the dev stack. The [README](../README.md#deploying) has a summary; this is the full guide.
