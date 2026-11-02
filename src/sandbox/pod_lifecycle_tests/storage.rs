@@ -64,7 +64,15 @@ async fn test_a_terminating_claim_is_not_reused_by_the_next_pod(pool: PgPool) {
             },
             "spec": {
                 "restartPolicy": "Never",
-                "containers": [{"name": "sandbox", "image": "smelt.invalid/none:0"}],
+                // A request of its own: given none, the namespace's
+                // LimitRange (max only, 64Gi) makes the default request
+                // 64Gi too, which no test node has, so the holder was never
+                // scheduled and never held the claim (SME-341).
+                "containers": [{
+                    "name": "sandbox",
+                    "image": "smelt.invalid/none:0",
+                    "resources": {"requests": {"memory": "16Mi"}, "limits": {"memory": "16Mi"}},
+                }],
                 "volumes": [{"name": "workspace", "persistentVolumeClaim": {"claimName": name}}],
             },
         }))
@@ -76,6 +84,23 @@ async fn test_a_terminating_claim_is_not_reused_by_the_next_pod(pool: PgPool) {
             .metadata
             .name
             .expect("a created pod's name");
+        // Protection counts only a scheduled pod as using a claim, and this
+        // claim binds (and the holder gets its node) only once the
+        // provisioner has made its volume. Deleted before that, nothing held
+        // it: the claim read Terminating only until the protection
+        // controller let it go, and the read below lost that race in CI
+        // ("read the claim back: ... not found", SME-341).
+        let scheduled = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let pod = pods_api(&client).get(&holder_name).await.expect("read the holder pod");
+                if pod.spec.and_then(|s| s.node_name).is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await;
+        assert!(scheduled.is_ok(), "the holder pod was never scheduled, so it couldn't hold the claim");
 
         pvc_api(&client).delete(&name, &DeleteParams::default()).await.expect("delete the claim");
         let doomed_now = pvc_api(&client).get(&name).await.expect("read the claim back");
@@ -274,7 +299,15 @@ async fn test_removal_stops_the_conversations_language_server_pods_and_frees_the
             },
             "spec": {
                 "restartPolicy": "Never",
-                "containers": [{"name": "sandbox", "image": "smelt.invalid/none:0"}],
+                // A request of its own: given none, the namespace's
+                // LimitRange (max only, 64Gi) makes the default request
+                // 64Gi too, which no test node has, so the holder was never
+                // scheduled and never held the claim (SME-341).
+                "containers": [{
+                    "name": "sandbox",
+                    "image": "smelt.invalid/none:0",
+                    "resources": {"requests": {"memory": "16Mi"}, "limits": {"memory": "16Mi"}},
+                }],
                 "volumes": [{"name": "workspace", "persistentVolumeClaim": {"claimName": name}}],
             },
         }))
