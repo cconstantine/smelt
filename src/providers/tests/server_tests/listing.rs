@@ -236,7 +236,15 @@ async fn test_the_first_provider_added_makes_its_first_model_the_default(pool: P
     let mut first = input("first", &format!("http://{addr}"), "k");
     first.kind = ProviderKind::Other;
     let created = create_provider(&pool, first).await.expect("create");
-    let chosen = default_model(&pool).await.expect("read").expect("a default was set");
+    // Set in the background once the listing lands (review 1 L1).
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let chosen = loop {
+        if let Some(chosen) = default_model(&pool).await.expect("read") {
+            break chosen;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no default was set");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
     assert_eq!((chosen.provider_id, chosen.model.as_str()), (created.id, "first-model"));
     let mut second = input("second", &format!("http://{addr}"), "k");
     second.kind = ProviderKind::Other;
@@ -250,5 +258,16 @@ async fn test_a_first_provider_that_lists_nothing_leaves_no_default(pool: PgPool
     let mut gone = input("gone", "http://127.0.0.1:1", "k");
     gone.kind = ProviderKind::Other;
     create_provider(&pool, gone).await.expect("saved even unreachable");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert_eq!(default_model(&pool).await.expect("read"), None);
+}
+
+/// Review 1 L1: the background default never overwrites one set while
+/// the listing was out.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_setting_the_default_only_if_unset_keeps_a_users_choice(pool: PgPool) {
+    let p = provider(&pool, "p", "api_key").await;
+    assert!(db::set_default_model_if_unset(&pool, p.id, "first").await.expect("set"));
+    assert!(!db::set_default_model_if_unset(&pool, p.id, "second").await.expect("left"));
+    assert_eq!(default_model(&pool).await.expect("read").map(|c| c.model), Some("first".to_string()));
 }

@@ -98,21 +98,21 @@ pub(super) fn ModelChooser(
             None => None,
         }
     });
-    // With nothing chosen yet, the provider's first listed model is
-    // filled in, so choosing takes one click rather than a typed id
-    // (SME-123 DR2). A model already there, or typed, is left alone.
-    use_effect(move || {
-        if let Some(Some(Ok(listed))) = listing()
-            && model.peek().is_empty()
-            && let Some(first) = suggestion_order(listed.models).into_iter().next()
-        {
-            model.set(first.id);
-        }
-    });
+    // With nothing typed, the provider's first listed model is the
+    // placeholder and what choosing takes, so it's one click rather than a
+    // typed id (SME-123 DR2). Not filled in: the browser would filter the
+    // suggestions down to it (review 1 L5).
+    let first_listed = match listing() {
+        Some(Some(Ok(listed))) => suggestion_order(listed.models).into_iter().next().map(|m| m.id),
+        _ => None,
+    };
     let list_id = format!("model-suggestions-{}", provider().unwrap_or_default());
+    let placeholder = first_listed.clone().unwrap_or_else(|| "Model id".to_string());
     let choose = move |event: Event<FormData>| {
         event.prevent_default();
-        let (Some(id), chosen) = (provider(), model().trim().to_string()) else {
+        let typed = model().trim().to_string();
+        let chosen = if typed.is_empty() { first_listed.clone().unwrap_or_default() } else { typed };
+        let Some(id) = provider() else {
             return;
         };
         if !chosen.is_empty() {
@@ -137,7 +137,7 @@ pub(super) fn ModelChooser(
                 r#type: "text",
                 aria_label: "Model",
                 list: "{list_id}",
-                placeholder: "Model id",
+                placeholder: "{placeholder}",
                 autocomplete: "off",
                 spellcheck: "false",
                 value: "{model}",

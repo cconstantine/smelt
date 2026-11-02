@@ -473,7 +473,9 @@ pub async fn create_provider(pool: &PgPool, input: ProviderInput) -> Result<Prov
     .await
     .map_err(|e| save_error(&input.name, e))?;
     limiter::set(provider.id, provider.updated_at, resolved_max(&provider));
-    default_to_first_model(pool, &provider).await;
+    // In the background: the save doesn't wait on a listing, which a slow
+    // or not-yet-started server could take its time over (review 1 L1).
+    tokio::spawn(default_to_first_model(pool.clone(), provider.clone()));
     providers_changed();
     Ok(provider.into())
 }
@@ -483,19 +485,23 @@ pub async fn create_provider(pool: &PgPool, input: ProviderInput) -> Result<Prov
 /// (SME-123 DR2: it stopped at "No model is chosen for this conversation",
 /// with a model id to type). A listing that fails, or lists nothing usable,
 /// leaves the default unset, as before; it's never an error for the save.
-async fn default_to_first_model(pool: &PgPool, provider: &db::InferenceProvider) {
-    if !matches!(db::get_default_model(pool).await, Ok(None)) {
+/// The default is set only if still unset when the listing lands, so one
+/// the user set meanwhile stays (review 1 L1).
+async fn default_to_first_model(pool: PgPool, provider: db::InferenceProvider) {
+    if !matches!(db::get_default_model(&pool).await, Ok(None)) {
         return;
     }
     let kind = ProviderKind::parse(&provider.kind).unwrap_or(ProviderKind::Other);
-    let Ok(listed) = crate::anthropic::models::list_models(kind, &endpoint(provider)).await else {
+    let Ok(listed) = crate::anthropic::models::list_models(kind, &endpoint(&provider)).await else {
         return;
     };
     let Some(first) = listed.iter().find(|m| m.details.tools != Some(false)) else {
         return;
     };
-    if let Err(e) = db::set_default_model(pool, provider.id, &first.id).await {
-        tracing::warn!(provider = provider.id, error = %e, "couldn't make the first listed model the default");
+    match db::set_default_model_if_unset(&pool, provider.id, &first.id).await {
+        Ok(true) => providers_changed(),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(provider = provider.id, error = %e, "couldn't make the first listed model the default"),
     }
 }
 

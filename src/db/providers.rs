@@ -334,6 +334,22 @@ pub async fn get_default_model(pool: &PgPool) -> Result<Option<(i64, String)>, s
     })
 }
 
+/// Sets the default to `provider_id`/`model` only if none is set, in one
+/// statement: a default the user sets meanwhile wins (SME-123 review 1
+/// L1). Whether it set it.
+pub async fn set_default_model_if_unset(pool: &PgPool, provider_id: i64, model: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO inference_settings (default_provider_id, default_model) VALUES ($1, $2)
+         ON CONFLICT (id) DO UPDATE SET default_provider_id = $1, default_model = $2
+         WHERE inference_settings.default_model IS NULL OR inference_settings.default_provider_id IS NULL",
+    )
+    .bind(provider_id)
+    .bind(model)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn set_default_model(
     pool: &PgPool,
     provider_id: i64,

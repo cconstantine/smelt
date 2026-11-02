@@ -480,6 +480,9 @@ pub(super) async fn scenario_phone_width(t: &Scenario<'_>) {
     for path in ["mcp-servers/new", "providers/new", "language-servers/new", "sandbox-volumes/new", "git", "secrets", "pods"] {
         page.goto(t.url(path)).await.expect("open a settings page");
         wait_for_element(&page, "h1", Duration::from_secs(10)).await;
+        // Measured once its lists have loaded, not on the server-rendered
+        // header alone (review 1 L6).
+        assert!(wait_for_text_gone(&page, "Loading", Duration::from_secs(10)).await, "/{path} never finished loading");
         let over: f64 = page
             .evaluate("document.documentElement.scrollWidth - document.documentElement.clientWidth")
             .await

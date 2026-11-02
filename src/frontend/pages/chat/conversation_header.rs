@@ -36,10 +36,13 @@ pub(super) fn ConversationHeader(
     selected: Memo<Option<i64>>,
     conversations_changed: Signal<u64>,
     turns_changed: Signal<u64>,
+    questions_changed: Signal<u64>,
 ) -> Element {
     let tree = use_resource(move || {
         let _ = conversations_changed();
         let _ = turns_changed();
+        // A question waiting changes an agent's status (review 1 L8).
+        let _ = questions_changed();
         get_conversation_tree()
     });
     let info = match (&*tree.read(), selected()) {

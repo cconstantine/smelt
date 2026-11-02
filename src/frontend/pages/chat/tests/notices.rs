@@ -104,6 +104,15 @@ fn test_a_failure_notice_says_what_failed_and_what_to_do() {
         system_notice(&failure_notice("conversation not found"), &HashMap::new()).as_deref(),
         Some("The turn failed: conversation not found. Send again to retry.")
     );
+    // Review 1 L3: one period, and no second "send again".
+    assert_eq!(
+        system_notice(&failure_notice("Nothing to talk to."), &HashMap::new()).as_deref(),
+        Some("The turn failed: Nothing to talk to. Send again to retry.")
+    );
+    assert_eq!(
+        system_notice(&failure_notice("No model is chosen. Choose one, then send again."), &HashMap::new()).as_deref(),
+        Some("The turn failed: No model is chosen. Choose one, then send again.")
+    );
 }
 
 /// SME-126: a notice for a reply cut off in the middle of a tool call

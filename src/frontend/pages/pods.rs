@@ -157,10 +157,12 @@ fn StoredVolumes(pods_changed: Signal<u64>, tick: Signal<u64>) -> Element {
         let _ = (pods_changed(), tick());
         get_stored_storage()
     });
+    // Unknown until it loads, and then no fate is shown: assuming 0 read a
+    // quiet stop as "kept" (review 1 L4).
     let grace_days = use_resource(crate::api::sandbox::get_storage_removal_days);
     let grace_days = match grace_days() {
-        Some(Ok(days)) => days,
-        _ => 0,
+        Some(Ok(days)) => Some(days),
+        _ => None,
     };
     let mut pending_remove: Signal<Option<i64>> = use_signal(|| None);
     let mut remove_error: Signal<Option<String>> = use_signal(|| None);
@@ -228,11 +230,14 @@ fn StoredVolumes(pods_changed: Signal<u64>, tick: Signal<u64>) -> Element {
 /// (SME-123 DR9): a quiet stop's goes `grace_days` after it (SME-345), a
 /// Stop's, or any with removal off, stays until removed here. Empty with
 /// no stop on record.
-fn stopped_text(stop: Option<&crate::api::pods::PodStop>, grace_days: u32, now: NaiveDateTime) -> String {
+fn stopped_text(stop: Option<&crate::api::pods::PodStop>, grace_days: Option<u32>, now: NaiveDateTime) -> String {
     let Some(stop) = stop else {
         return String::new();
     };
     let elapsed = age_seconds(stop.at, now);
+    let Some(grace_days) = grace_days else {
+        return format!("stopped {} ago", format_age(elapsed));
+    };
     let fate = if stop.quiet && grace_days > 0 {
         let left_days = (i64::from(grace_days) * 86_400 - elapsed + 86_399) / 86_400;
         match left_days {
@@ -520,11 +525,12 @@ mod tests {
         let now = chrono::NaiveDate::from_ymd_opt(2026, 11, 10).expect("date").and_hms_opt(12, 0, 0).expect("time");
         let days_ago = |d: i64| now - chrono::Duration::days(d);
         let quiet = PodStop { at: days_ago(3), quiet: true };
-        assert_eq!(stopped_text(Some(&quiet), 7, now), "stopped 3d 0h ago \u{b7} removed in 4 days");
-        assert_eq!(stopped_text(Some(&PodStop { at: days_ago(6), quiet: true }), 7, now), "stopped 6d 0h ago \u{b7} removed in 1 day");
-        assert_eq!(stopped_text(Some(&PodStop { at: days_ago(8), quiet: true }), 7, now), "stopped 8d 0h ago \u{b7} removed within the hour");
-        assert_eq!(stopped_text(Some(&quiet), 0, now), "stopped 3d 0h ago \u{b7} kept until you remove it");
-        assert_eq!(stopped_text(Some(&PodStop { at: days_ago(3), quiet: false }), 7, now), "stopped 3d 0h ago \u{b7} kept until you remove it");
-        assert_eq!(stopped_text(None, 7, now), "");
+        assert_eq!(stopped_text(Some(&quiet), Some(7), now), "stopped 3d 0h ago \u{b7} removed in 4 days");
+        assert_eq!(stopped_text(Some(&PodStop { at: days_ago(6), quiet: true }), Some(7), now), "stopped 6d 0h ago \u{b7} removed in 1 day");
+        assert_eq!(stopped_text(Some(&PodStop { at: days_ago(8), quiet: true }), Some(7), now), "stopped 8d 0h ago \u{b7} removed within the hour");
+        assert_eq!(stopped_text(Some(&quiet), Some(0), now), "stopped 3d 0h ago \u{b7} kept until you remove it");
+        assert_eq!(stopped_text(Some(&PodStop { at: days_ago(3), quiet: false }), Some(7), now), "stopped 3d 0h ago \u{b7} kept until you remove it");
+        assert_eq!(stopped_text(None, Some(7), now), "");
+        assert_eq!(stopped_text(Some(&quiet), None, now), "stopped 3d 0h ago", "no fate until the grace is known");
     }
 }

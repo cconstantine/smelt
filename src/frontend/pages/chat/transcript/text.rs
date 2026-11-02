@@ -435,9 +435,13 @@ pub(in crate::frontend::pages::chat) fn system_notice(text: &str, commands: &Has
     if let Some(reason) = crate::api::chat::parse_failure_notice(text) {
         return Some(match reason.strip_prefix("model provider error ") {
             Some(detail) => format!(
-                "The model's provider answered with an error ({detail}). Check it under Model providers, then send again."
+                "The model's provider answered with an error ({}). Check it under Model providers, then send again.",
+                detail.trim_end_matches('.')
             ),
-            None => format!("The turn failed: {reason}. Send again to retry."),
+            // A reason that already says to send again isn't told twice
+            // (review 1 L3: "…then send again.. Send again to retry.").
+            None if reason.to_lowercase().contains("send again") => format!("The turn failed: {reason}"),
+            None => format!("The turn failed: {}. Send again to retry.", reason.trim_end_matches('.')),
         });
     }
     if let Some(cut_call) = crate::api::chat::parse_refusal_notice(text) {

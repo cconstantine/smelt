@@ -323,7 +323,7 @@ fn ChatPanel(
                         }
                     }
                     div { class: "chat-main",
-                        conversation_header::ConversationHeader { selected, conversations_changed, turns_changed }
+                        conversation_header::ConversationHeader { selected, conversations_changed, turns_changed, questions_changed }
                         AgentsWaitingBanner { selected, conversations_changed, questions_changed }
                         ContextUsage {
                             selected,

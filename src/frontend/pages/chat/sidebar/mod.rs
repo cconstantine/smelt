@@ -254,7 +254,9 @@ pub(super) fn ConversationSidebar(
 /// (`tree::settled_parents`), except above the open conversation: its
 /// row has to show.
 fn fold_settled_trees(nodes: &[ConversationNode], open: Option<i64>) {
-    let mut keep_open = HashSet::new();
+    // The open conversation and its ancestors stay open: folding the tree
+    // the user is looking at, on a refetch, hid its rows (review 1 L2).
+    let mut keep_open: HashSet<i64> = open.into_iter().collect();
     let parents: std::collections::HashMap<i64, Option<i64>> = nodes.iter().map(|n| (n.id, n.parent_id)).collect();
     let mut at = open.and_then(|id| parents.get(&id).copied().flatten());
     while let Some(id) = at {
@@ -263,15 +265,17 @@ fn fold_settled_trees(nodes: &[ConversationNode], open: Option<i64>) {
         }
         at = parents.get(&id).copied().flatten();
     }
-    let fresh: Vec<i64> = settled_parents(nodes)
+    let undecided: Vec<i64> = settled_parents(nodes)
         .into_iter()
-        .filter(|id| !keep_open.contains(id) && !FOLD_DECIDED.peek().contains(id))
+        .filter(|id| !FOLD_DECIDED.peek().contains(id))
         .collect();
-    if fresh.is_empty() {
+    if undecided.is_empty() {
         return;
     }
-    FOLD_DECIDED.write().extend(fresh.iter().copied());
-    FOLDED.write().extend(fresh);
+    // A tree the user has seen open stays open: deciding it here keeps it
+    // from folding later, once they've moved on (review 1 L2).
+    FOLD_DECIDED.write().extend(undecided.iter().copied());
+    FOLDED.write().extend(undecided.into_iter().filter(|id| !keep_open.contains(id)));
 }
 
 /// One row of the list: a conversation, indented under its parent, with
