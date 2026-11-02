@@ -332,3 +332,30 @@ async fn test_a_slow_delete_passed_in_is_not_timed_out(pool: PgPool) {
     assert!(stopped, "a delete given to stop_locked runs to its end");
     assert!(!live(&pool, pod).await);
 }
+
+async fn quiet_stop_mark(pool: &PgPool, pod: i64) -> Option<chrono::NaiveDateTime> {
+    sqlx::query_scalar("SELECT quietly_stopped_at FROM sandbox_pods WHERE id = $1")
+        .bind(pod)
+        .fetch_one(pool)
+        .await
+        .expect("read quietly_stopped_at")
+}
+
+/// SME-345: the row a quiet stop closes carries the clock the
+/// storage-grace pass runs from. A pod ended any other way — a user's
+/// Stop or the model's `terminate_pod`, both through
+/// `terminate_pod_with` — keeps NULL, so only a quiet stop is ever swept.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_quiet_stop_stamps_the_row_and_other_ends_do_not(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+
+    // Both quiet kinds go through `stop_locked`, so the idle pass covers
+    // the stamp; the finish stop's own notice tests cover its path.
+    let (_, pod) = idle_pod(&pool, 90).await;
+    assert_eq!(pass(&pool, 60).await, vec![pod]);
+    assert!(quiet_stop_mark(&pool, pod).await.is_some(), "the quiet stop stamped the row");
+
+    let (_, stopped) = idle_pod(&pool, 90).await;
+    terminate_pod_with(&pool, stopped, deleted(stopped)).await.expect("the user's stop");
+    assert!(quiet_stop_mark(&pool, stopped).await.is_none(), "a Stop through terminate_pod_with leaves NULL");
+}
