@@ -42,12 +42,46 @@ pub async fn terminate_sandbox_pod(
     pool: &PgPool,
     pod_id: i64,
 ) -> Result<Option<SandboxPod>, sqlx::Error> {
-    sqlx::query_as::<_, SandboxPod>(
-        "UPDATE sandbox_pods SET terminated_at = now() WHERE id = $1 RETURNING *",
-    )
-    .bind(pod_id)
-    .fetch_optional(pool)
-    .await
+    terminate_sandbox_pod_as(pool, pod_id, PodEnd::Plain).await
+}
+
+/// How a pod's row is closed (SME-354 B3). A user's Stop takes neither
+/// the turn lock nor the start lock, so it can land inside a quiet stop
+/// that has already re-checked; these make either order settle on the
+/// user's intent, which is to keep the storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PodEnd {
+    /// The model's `terminate_pod`, a lost pod, a removal: as
+    /// `terminate_sandbox_pod`.
+    Plain,
+    /// A quiet stop: closes only a row still live, stamping
+    /// `quietly_stopped_at` in the same statement. `None` for a row
+    /// already ended, which the quiet stop reads as "already stopped".
+    Quiet,
+    /// The user's Stop: closes the row (keeping an earlier end's time)
+    /// and clears any quiet stop's mark, so the storage-grace pass never
+    /// removes storage the Stop keeps.
+    ByUser,
+}
+
+/// `terminate_sandbox_pod`, closing the row the way `end` says.
+pub async fn terminate_sandbox_pod_as(
+    pool: &PgPool,
+    pod_id: i64,
+    end: PodEnd,
+) -> Result<Option<SandboxPod>, sqlx::Error> {
+    let sql = match end {
+        PodEnd::Plain => "UPDATE sandbox_pods SET terminated_at = now() WHERE id = $1 RETURNING *",
+        PodEnd::Quiet => {
+            "UPDATE sandbox_pods SET terminated_at = now(), quietly_stopped_at = now()
+              WHERE id = $1 AND terminated_at IS NULL RETURNING *"
+        }
+        PodEnd::ByUser => {
+            "UPDATE sandbox_pods SET terminated_at = COALESCE(terminated_at, now()), quietly_stopped_at = NULL
+              WHERE id = $1 RETURNING *"
+        }
+    };
+    sqlx::query_as::<_, SandboxPod>(sql).bind(pod_id).fetch_optional(pool).await
 }
 
 /// One live pod, across every conversation, with what the pods view needs

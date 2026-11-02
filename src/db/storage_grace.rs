@@ -9,10 +9,12 @@ use super::*;
 // live ones. `sandbox_pods` must be aliased `p`.
 
 /// Stamps `pod_id`'s row as ended by a quiet stop, so the storage-grace
-/// pass can count its grace from that moment. Only
-/// `quiet_stop::stop_locked` calls it: every other end — a user's Stop,
-/// the model's `terminate_pod`, a lost pod — leaves NULL, and only the
-/// pass clears it again.
+/// pass can count its grace from that moment: the tests' setup. A real
+/// quiet stop stamps it in the statement that closes the row
+/// (`terminate_sandbox_pod_as`'s `PodEnd::Quiet`, SME-354 B3); every
+/// other end — the model's `terminate_pod`, a lost pod — leaves NULL, a
+/// user's Stop clears it, and otherwise only the pass clears it again.
+#[cfg(test)]
 pub async fn mark_pod_quietly_stopped(pool: &PgPool, pod_id: i64) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE sandbox_pods SET quietly_stopped_at = now() WHERE id = $1")
         .bind(pod_id)
