@@ -190,7 +190,7 @@ async fn scenario_terminal_follow_after_switch_rapid_switches(t: &Scenario<'_>, 
         &rapid_id,
         "run_terminal_command",
         &serde_json::json!({"terminal_id": terminal,
-            "command": "for i in $(seq -w 1 400); do echo \"rapid-$i\"; sleep 0.05; done"}),
+            "command": "for i in $(seq -w 1 400); do echo \"rapid-$i\"; [ -e /home/sandbox/.stop-rapid ] || sleep 0.05; done"}),
     )
     .await
     .expect("run_terminal_command for the rapid switches");
@@ -211,6 +211,7 @@ async fn scenario_terminal_follow_after_switch_rapid_switches(t: &Scenario<'_>, 
         terminal_scroll_facts(&page).await
     );
     assert_never_painted_at_top(&page, "sme108E").await;
+    stop_trickling(t, conversation.id, "rapid").await;
     assert!(
         wait_for_text(&page, "rapid-400", Duration::from_secs(40)).await,
         "the rapid command should finish"
@@ -261,7 +262,7 @@ async fn scenario_terminal_follow_after_switch_phone_width(t: &Scenario<'_>, con
         &burst_id,
         "run_terminal_command",
         &serde_json::json!({"terminal_id": terminal,
-            "command": "for i in $(seq -w 1 300); do echo \\\"mid-$i\\\"; sleep 0.02; done"}),
+            "command": "for i in $(seq -w 1 300); do echo \\\"mid-$i\\\"; [ -e /home/sandbox/.stop-mid ] || sleep 0.02; done"}),
     )
     .await
     .expect("start the mid-burst command");
@@ -274,6 +275,7 @@ async fn scenario_terminal_follow_after_switch_phone_width(t: &Scenario<'_>, con
     )
     .await
     .expect("widen the window mid-burst");
+    stop_trickling(t, conversation.id, "mid").await;
     wait_command_finished(t.pool, terminal).await;
     settle_terminal_bottom(&page, 8).await;
 
@@ -310,7 +312,7 @@ async fn scenario_terminal_follow_after_switch_phone_width(t: &Scenario<'_>, con
         &phone_id,
         "run_terminal_command",
         &serde_json::json!({"terminal_id": terminal,
-            "command": "for i in $(seq -w 1 200); do echo \\\"phone-$i\\\"; sleep 0.04; done"}),
+            "command": "for i in $(seq -w 1 200); do echo \\\"phone-$i\\\"; [ -e /home/sandbox/.stop-phone ] || sleep 0.04; done"}),
     )
     .await
     .expect("run_terminal_command for the phone-width switch");
@@ -334,6 +336,7 @@ async fn scenario_terminal_follow_after_switch_phone_width(t: &Scenario<'_>, con
         terminal_scroll_facts(&page).await
     );
     assert_never_painted_at_top(&page, "sme108F").await;
+    stop_trickling(t, conversation.id, "phone").await;
     assert!(
         wait_for_text(&page, "phone-200", Duration::from_secs(40)).await,
         "the phone-width command should finish"
@@ -393,7 +396,7 @@ async fn scenario_terminal_follow_after_switch_scrolled_up(t: &Scenario<'_>, con
         &stream_id,
         "run_terminal_command",
         &serde_json::json!({"terminal_id": terminal,
-            "command": "for i in $(seq -w 1 100); do echo \\\"stream-$i\\\"; sleep 0.1; done"}),
+            "command": "for i in $(seq -w 1 100); do echo \\\"stream-$i\\\"; [ -e /home/sandbox/.stop-stream ] || sleep 0.1; done"}),
     )
     .await
     .expect("run_terminal_command to stream while the user reads");
@@ -417,6 +420,7 @@ async fn scenario_terminal_follow_after_switch_scrolled_up(t: &Scenario<'_>, con
     .expect("scroll back to the bottom");
     tokio::time::sleep(Duration::from_millis(500)).await;
     settle_terminal_bottom(&page, 8).await;
+    stop_trickling(t, conversation.id, "stream").await;
     assert!(
         wait_for_text(&page, "stream-100", Duration::from_secs(60)).await,
         "the streaming command should finish"
@@ -456,7 +460,7 @@ async fn scenario_terminal_follow_after_switch_clamped_by_a_resize(t: &Scenario<
         &restick_id,
         "run_terminal_command",
         &serde_json::json!({"terminal_id": terminal,
-            "command": "for i in $(seq -w 1 100); do echo \\\"restick-$i\\\"; sleep 0.2; done"}),
+            "command": "for i in $(seq -w 1 100); do echo \\\"restick-$i\\\"; [ -e /home/sandbox/.stop-restick ] || sleep 0.2; done"}),
     )
     .await
     .expect("run_terminal_command for the re-stick check");
@@ -555,6 +559,7 @@ async fn scenario_terminal_follow_after_switch_clamped_by_a_resize(t: &Scenario<
     .await
     .expect("scroll back to the bottom");
     settle_terminal_bottom(&page, 8).await;
+    stop_trickling(t, conversation.id, "restick").await;
     assert!(
         wait_for_text(&page, "restick-100", Duration::from_secs(60)).await,
         "the re-stick command should finish"

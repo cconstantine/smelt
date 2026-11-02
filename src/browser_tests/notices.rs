@@ -79,7 +79,7 @@ pub(super) async fn scenario_cut_off_in_a_call(t: &Scenario<'_>) {
     )
     .await;
     let mock = *MOCK_PROVIDER.get().expect("the mock provider");
-    db::set_conversation_model(t.pool, conversation.id, mock, MOCK_MODEL)
+    db::set_conversation_model(t.pool, conversation.id, mock, &t.mock.model)
         .await
         .expect("put the conversation back");
     db::delete_inference_provider(t.pool, provider.id).await.expect("delete the cut-off provider");

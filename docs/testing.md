@@ -106,6 +106,8 @@ scripts/cluster-test --features server -- --exact sandbox::tests::manager::test_
 
 A name filter matches every test whose path contains it, and several filters are OR'd, so a filter meant for one unit test can also pick up real-cluster tests (on SME-85, `test_a_` matched a claims test that creates pods). To run one test, name it with `--exact` and its full path.
 
+**Looking past the `park` account:** the tests' kubeconfig is the `park` service account's, which can't read `kube-system` (the `local-path` provisioner and its helper pods) or storage classes. On the host, `scripts/k3s-admin-kubeconfig` writes this stack's k3s admin kubeconfig to `target/k3s-admin.yaml`, gitignored, with its server set to `https://k3s:6443`, for a session in the `smelt` service to read. It's cluster-admin on the local test cluster only.
+
 **A real-cluster test runs only this way, by exact name through `scripts/cluster-test`** (see [process/tdd.md](process/tdd.md#testing-rules)): on SME-115 a substring filter run outside the lock picked up a new test whose unfixed form was the bug being fixed, and it marked another run's claims in `smelt-park-test` for deletion.
 
 **A module with both pure and real-cluster tests keeps the real-cluster ones in a `cluster` submodule** (as `sweep::tests::cluster::…` does), so a filter on the pure tests' path can't reach them. On SME-134 the filter `sweep::tests::test_the_sweep_`, meant for the pure tests, also ran four real-cluster sweep tests outside the lock.

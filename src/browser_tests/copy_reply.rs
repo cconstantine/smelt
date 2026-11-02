@@ -206,8 +206,7 @@ async fn scenario_copy_reply_copying(t: &Scenario<'_>, conversation: &crate::mod
         problems.push(format!("the outline stayed after a plain-HTTP copy: {why}"));
     }
     // What reached the real clipboard, read from the secure origin.
-    t.harness
-        .browser
+    t.browser
         .execute(
             chromiumoxide::cdp::browser_protocol::browser::GrantPermissionsParams::builder()
                 .permission(chromiumoxide::cdp::browser_protocol::browser::PermissionType::ClipboardReadWrite)
@@ -231,9 +230,10 @@ async fn scenario_copy_reply_copying(t: &Scenario<'_>, conversation: &crate::mod
 
 /// At phone width: the button stays in its bubble, and a tap or a touch copies.
 async fn scenario_copy_reply_phone_width(t: &Scenario<'_>, page: &chromiumoxide::Page, part_one: &str, problems: &mut Vec<String>, reply: i64) {
-    // The tier's browser is shared: later scenarios get no clipboard access.
-    t.harness
-        .browser
+    // The lane's Chrome is shared by its later scenarios: they get no
+    // clipboard access. This scenario's own lane's, where the grant was
+    // (SME-341: in another lane the read was denied).
+    t.browser
         .execute(chromiumoxide::cdp::browser_protocol::browser::ResetPermissionsParams::default())
         .await
         .expect("reset the permissions");

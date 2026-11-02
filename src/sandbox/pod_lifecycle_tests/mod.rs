@@ -79,10 +79,14 @@ async fn test_two_harness_moves_in_one_database_name_distinct_objects(pool: PgPo
 }
 
 /// How many of these tests run their scenarios at once. Each starts a pod
-/// or more, with a Docker sidecar each; a dozen starting together on one
-/// node took longer than a pod start may (90 s), failing these and the
-/// other real-cluster tests alike. CI runs four tests at a time anyway.
-static SCENARIOS_AT_ONCE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+/// or more, with a Docker sidecar and claims each. A dozen starting together
+/// once took longer than a pod start may (90 s): what held them was the
+/// local-path provisioner's own API client, throttled to 5 requests a
+/// second, which `scripts/k3s-bootstrap.sh` now raises (SME-341). With that,
+/// pod starts took a median 7 s at four, 9 s at eight and 13 s at sixteen,
+/// and the module 161, 99 and 77 s. Eight keeps a start well inside its
+/// limit on a busier node.
+static SCENARIOS_AT_ONCE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
 /// Runs `scenario` for at most `limit`, then deletes everything the test's
 /// database made in the cluster, whether it passed, failed or ran out of

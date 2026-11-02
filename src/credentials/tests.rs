@@ -7,7 +7,7 @@ async fn test_an_install_that_read_old_keys_cant_write_over_a_newer_one() {
     // after it started, and quickly.
     let a = {
         let installed = installed.clone();
-        tokio::spawn(with_install_lock(async move {
+        tokio::spawn(with_install_lock(1, async move {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             installed.lock().expect("log").push("old");
         }))
@@ -15,13 +15,31 @@ async fn test_an_install_that_read_old_keys_cant_write_over_a_newer_one() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let b = {
         let installed = installed.clone();
-        tokio::spawn(with_install_lock(async move {
+        tokio::spawn(with_install_lock(1, async move {
             installed.lock().expect("log").push("new");
         }))
     };
     a.await.expect("a");
     b.await.expect("b");
     assert_eq!(installed.lock().expect("log").last(), Some(&"new"), "the pod ends with the newest keys");
+}
+
+/// SME-341: the lock is a conversation's, so an install into another
+/// conversation's pod doesn't wait for one in progress. One lock for every
+/// pod made a key or secret change write to each live pod in turn.
+#[tokio::test]
+async fn test_an_install_into_another_conversation_doesnt_wait() {
+    let (held, release) = tokio::sync::oneshot::channel::<()>();
+    let (started, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let slow = tokio::spawn(with_install_lock(2_000_001, async move {
+        let _ = started.send(());
+        let _ = release.await;
+    }));
+    started_rx.await.expect("the first install started");
+    let other = tokio::time::timeout(std::time::Duration::from_secs(5), with_install_lock(2_000_002, async { "done" })).await;
+    assert_eq!(other, Ok("done"), "an install into another conversation's pod waited for the first");
+    let _ = held.send(());
+    slow.await.expect("the first install");
 }
 
 fn file<'a>(files: &'a [PodFile], path: &str) -> Option<&'a PodFile> {

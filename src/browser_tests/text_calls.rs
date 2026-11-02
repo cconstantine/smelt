@@ -76,7 +76,7 @@ pub(super) async fn scenario_text_call_correction(t: &Scenario<'_>) {
     )
     .await;
     let mock = *MOCK_PROVIDER.get().expect("the mock provider");
-    db::set_conversation_model(t.pool, conversation.id, mock, MOCK_MODEL)
+    db::set_conversation_model(t.pool, conversation.id, mock, &t.mock.model)
         .await
         .expect("put the conversation back");
     db::delete_inference_provider(t.pool, provider.id).await.expect("delete the text-call provider");

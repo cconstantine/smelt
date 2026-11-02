@@ -12,8 +12,9 @@
 //! Postgres + k3s cluster reachable the same way every other real-cluster
 //! test in this codebase already assumes.
 //!
-//! One `#[tokio::test]`, sharing one browser/server/`MANAGER` instance for
-//! its whole duration — more than one `#[tokio::test]` here touching
+//! One `#[tokio::test]`, sharing one server and `MANAGER` instance for its
+//! whole duration (each scenario lane has a Chrome of its own, see
+//! `run_lanes`) — more than one `#[tokio::test]` here touching
 //! `sandbox::init()`/`db::init()` would risk the same
 //! `OnceLock`-across-separate-runtimes hazard `docs/testing.md` documents
 //! for `PgPool`, the same reasoning `sandbox-terminal`'s own real-cluster
@@ -46,6 +47,9 @@ use crate::{anthropic, db, sandbox};
 struct Scenario<'a> {
     pool: &'a sqlx::PgPool,
     harness: &'a BrowserTestHarness,
+    /// The lane's own Chrome (see `run_lanes`).
+    browser: &'a Browser,
+    /// The lane's own share of the mock: its model, and its replies' counts.
     mock: &'a MockUpstream,
     created: &'a std::sync::Mutex<Vec<i64>>,
     tabs: std::sync::Mutex<Vec<chromiumoxide::Page>>,
@@ -61,7 +65,6 @@ impl Scenario<'_> {
     async fn tab(&self, url: impl Into<String>) -> chromiumoxide::Page {
         let url: String = url.into();
         let page = self
-            .harness
             .browser
             .new_page(url.as_str())
             .await
@@ -72,7 +75,7 @@ impl Scenario<'_> {
 
     /// A new conversation on the mock model, removed at the end of the run.
     async fn conversation(&self) -> crate::models::Conversation {
-        new_conversation(self.pool, self.created).await
+        new_conversation(self.pool, self.created, &self.mock.model).await
     }
 
     /// Closes every tab the scenario opened. A tab it already closed itself
@@ -88,30 +91,41 @@ impl Scenario<'_> {
 /// One scenario's outcome: how long it took, or why it failed.
 type ScenarioResult = (&'static str, Result<Duration, String>);
 
-/// Runs one scenario, unless `only` names others: under its own time limit
-/// and `catch_unwind`, so a failure or a hang ends that scenario alone, and
-/// its tabs are closed whatever happened.
-async fn run_scenario(
-    t: &Scenario<'_>,
-    only: Option<&[String]>,
-    results: &mut Vec<ScenarioResult>,
-    known: &mut Vec<&'static str>,
+/// A scenario, boxed: the biggest scenarios' futures don't fit the test
+/// thread's stack inline (SME-90 hit it when every scenario was one future).
+type ScenarioFn = for<'a, 'b> fn(&'a Scenario<'b>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>;
+
+/// Whether a scenario runs beside others (SME-341's speed pass), or alone,
+/// after every lane has finished: one that reads what the whole app holds
+/// (every provider, pod, secret or conversation row), where another lane's
+/// would show up mid-scenario.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Runs {
+    Beside,
+    Alone,
+}
+
+struct Entry {
     name: &'static str,
     limit_secs: u64,
-    // Boxed by the caller: the biggest scenarios' futures don't fit the
-    // test thread's stack inline (SME-90 hit it when every scenario was one
-    // future).
-    scenario: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>>,
-) {
-    known.push(name);
-    if only.is_some_and(|only| !only.iter().any(|n| n == name)) {
-        return;
-    }
+    runs: Runs,
+    run: ScenarioFn,
+}
+
+fn entry(name: &'static str, limit_secs: u64, runs: Runs, run: ScenarioFn) -> Entry {
+    Entry { name, limit_secs, runs, run }
+}
+
+/// Runs one scenario under its own time limit and `catch_unwind`, so a
+/// failure or a hang ends that scenario alone, and its tabs are closed
+/// whatever happened.
+async fn run_scenario(t: &Scenario<'_>, results: &std::sync::Mutex<Vec<ScenarioResult>>, e: &Entry) {
+    let (name, limit_secs) = (e.name, e.limit_secs);
     eprintln!("browser tier: {name} ...");
     let started = tokio::time::Instant::now();
     let outcome = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(tokio::time::timeout(
         Duration::from_secs(limit_secs),
-        scenario,
+        (e.run)(t),
     )))
     .await;
     t.close_tabs().await;
@@ -128,7 +142,131 @@ async fn run_scenario(
         Ok(took) => eprintln!("browser tier: {name} ok ({:.1} s)", took.as_secs_f64()),
         Err(why) => eprintln!("browser tier: {name} FAILED: {why}"),
     }
-    results.push((name, result));
+    results.lock().expect("the results lock").push((name, result));
+}
+
+/// Runs `entries`: those that run beside others across every lane, each
+/// lane taking the next from one queue (longest limit first, so the long
+/// ones don't start last), then those that run alone, one at a time, once
+/// the lanes are done.
+async fn run_lanes(lanes: &[Scenario<'_>], entries: Vec<&Entry>) -> Vec<ScenarioResult> {
+    let results = std::sync::Mutex::new(Vec::new());
+    let (mut beside, alone): (Vec<&Entry>, Vec<&Entry>) = entries.into_iter().partition(|e| e.runs == Runs::Beside);
+    beside.sort_by_key(|e| std::cmp::Reverse(e.limit_secs));
+    let queue = std::sync::Mutex::new(std::collections::VecDeque::from(beside));
+    let results_ref = &results;
+    let queue_ref = &queue;
+    futures_util::future::join_all(lanes.iter().map(|t| async move {
+        loop {
+            let next = queue_ref.lock().expect("the queue lock").pop_front();
+            let Some(e) = next else { break };
+            run_scenario(t, results_ref, e).await;
+        }
+    }))
+    .await;
+    for e in alone {
+        run_scenario(&lanes[0], &results, e).await;
+    }
+    results.into_inner().expect("the results lock")
+}
+
+/// Every scenario: its name (for `SMELT_BROWSER_SCENARIOS` and the report),
+/// its time limit, and whether it can run beside others (`Runs`).
+fn scenarios() -> Vec<Entry> {
+    vec![
+        entry("terminals", 120, Runs::Beside, |t| Box::pin(scenario_terminals(t))),
+        entry("context_usage", 60, Runs::Beside, |t| Box::pin(scenario_context_usage(t))),
+        entry("compaction_divider", 60, Runs::Beside, |t| Box::pin(scenario_compaction_divider(t))),
+        entry("todo_panel", 60, Runs::Beside, |t| Box::pin(scenario_todo_panel(t))),
+        entry("reply_stays_in_its_conversation", 60, Runs::Beside, |t| Box::pin(scenario_reply_stays_in_its_conversation(t))),
+        entry("unrequested_reply", 60, Runs::Beside, |t| Box::pin(scenario_unrequested_reply(t))),
+        entry("missing_conversation", 30, Runs::Beside, |t| Box::pin(scenario_missing_conversation(t))),
+        entry("notification_failure_stays", 60, Runs::Beside, |t| Box::pin(scenario_notification_failure_stays(t))),
+        entry("pods", 120, Runs::Alone, |t| Box::pin(scenario_pods(t))),
+        entry("stop_a_turn", 60, Runs::Beside, |t| Box::pin(scenario_stop_a_turn(t))),
+        entry("reply_on_conversation_stream", 60, Runs::Beside, |t| Box::pin(scenario_reply_on_conversation_stream(t))),
+        entry("busy_session_layout", 120, Runs::Beside, |t| Box::pin(scenario_busy_session_layout(t))),
+        entry("sidebar", 30, Runs::Alone, |t| Box::pin(scenario_sidebar(t))),
+        // 90s, not 60: two Home tabs hydrate, then a 30s wait for the new row and
+        // 10s for each disappearance. All of them return early — the hop is about a
+        // second on a quiet pod — but a limit that fails a working run reads as
+        // infrastructure (the same reasoning as switch_shows_no_start_screen's).
+        entry("conversations_appear_live", 90, Runs::Alone, |t| Box::pin(scenario_conversations_appear_live(t))),
+        entry("phone_width", 30, Runs::Beside, |t| Box::pin(scenario_phone_width(t))),
+        entry("not_found", 30, Runs::Beside, |t| Box::pin(scenario_not_found(t))),
+        entry("tool_rows", 30, Runs::Beside, |t| Box::pin(scenario_tool_rows(t))),
+        entry("dark_mode", 30, Runs::Beside, |t| Box::pin(scenario_dark_mode(t))),
+        entry("forms", 30, Runs::Alone, |t| Box::pin(scenario_forms(t))),
+        entry("empty_conversation", 30, Runs::Beside, |t| Box::pin(scenario_empty_conversation(t))),
+        entry("sandbox_dev_server", 300, Runs::Beside, |t| Box::pin(scenario_sandbox_dev_server(t))),
+        entry("agents_md_trust", 180, Runs::Beside, |t| Box::pin(scenario_agents_md_trust(t))),
+        // 90s, not 60: one tab hydrates, then the card's five waits and the
+        // Trust hop. Every wait returns early on a working run — the bound is
+        // only so a broken one reads as itself, not as infrastructure.
+        entry("repo_trust_card", 90, Runs::Beside, |t| Box::pin(scenario_repo_trust_card(t))),
+        entry("switch_resets_context_detail", 30, Runs::Beside, |t| Box::pin(scenario_switch_resets_context_detail(t))),
+        entry("model_picker", 60, Runs::Alone, |t| Box::pin(scenario_model_picker(t))),
+        entry("oauth_headers", 30, Runs::Alone, |t| Box::pin(scenario_oauth_headers(t))),
+        entry("oauth_sign_in_expired", 30, Runs::Alone, |t| Box::pin(scenario_oauth_sign_in_expired(t))),
+        entry("stale_bundle", 60, Runs::Alone, |t| Box::pin(scenario_stale_bundle(t))),
+        entry("transcript_scroll", 60, Runs::Beside, |t| Box::pin(scenario_transcript_scroll(t))),
+        // Alone: it clicks conversation rows over and over, at phone width
+        // too, and other lanes' conversations arriving in the same sidebar
+        // moved its row out from under the click ("covered by P", SME-341).
+        entry("terminal_follow_after_switch", 180, Runs::Alone, |t| Box::pin(scenario_terminal_follow_after_switch(t))),
+        entry("context_from_the_keyboard", 60, Runs::Beside, |t| Box::pin(scenario_context_from_the_keyboard(t))),
+        entry("address_bar_after_session_closes", 90, Runs::Beside, |t| Box::pin(scenario_address_bar_after_session_closes(t))),
+        // Alone: its "the new message should reload the conversation list"
+        // counts list requests, and another lane's activity reloads it too,
+        // so beside others it could pass without the message's (SME-341
+        // review).
+        entry("error_text", 60, Runs::Alone, |t| Box::pin(scenario_error_text(t))),
+        entry("settings_two_step", 60, Runs::Alone, |t| Box::pin(scenario_settings_two_step(t))),
+        entry("pointer_keeps_text_still", 120, Runs::Beside, |t| Box::pin(scenario_pointer_keeps_text_still(t))),
+        entry("ask_user_card", 60, Runs::Beside, |t| Box::pin(scenario_ask_user_card(t))),
+        entry("markdown_reply", 60, Runs::Beside, |t| Box::pin(scenario_markdown_reply(t))),
+        entry("markdown_streaming", 60, Runs::Beside, |t| Box::pin(scenario_markdown_streaming(t))),
+        entry("markdown_deep_code", 240, Runs::Beside, |t| Box::pin(scenario_markdown_deep_code(t))),
+        entry("copy_reply", 120, Runs::Beside, |t| Box::pin(scenario_copy_reply(t))),
+        entry("markdown_late_image", 90, Runs::Beside, |t| Box::pin(scenario_markdown_late_image(t))),
+        entry("markdown_long_reply", 90, Runs::Beside, |t| Box::pin(scenario_markdown_long_reply(t))),
+        entry("streaming_into_a_long_transcript", 120, Runs::Beside, |t| Box::pin(scenario_streaming_into_a_long_transcript(t))),
+        entry("unreadable_message", 30, Runs::Beside, |t| Box::pin(scenario_unreadable_message(t))),
+        entry("cut_off_notice", 30, Runs::Alone, |t| Box::pin(scenario_cut_off_notice(t))),
+        entry("cut_off_in_a_call", 30, Runs::Alone, |t| Box::pin(scenario_cut_off_in_a_call(t))),
+        entry("llama_cpp_provider", 60, Runs::Alone, |t| Box::pin(scenario_llama_cpp_provider(t))),
+        entry("chat_errors_are_alerts", 30, Runs::Beside, |t| Box::pin(scenario_chat_errors_are_alerts(t))),
+        entry("message_box_label", 30, Runs::Beside, |t| Box::pin(scenario_message_box_label(t))),
+        entry("conversation_rows_by_keyboard", 60, Runs::Alone, |t| Box::pin(scenario_conversation_rows_by_keyboard(t))),
+        entry("markdown_bare_urls", 60, Runs::Beside, |t| Box::pin(scenario_markdown_bare_urls(t))),
+        entry("markdown_bare_urls_streaming", 60, Runs::Beside, |t| Box::pin(scenario_markdown_bare_urls_streaming(t))),
+        entry("markdown_link_bidi_isolated", 60, Runs::Beside, |t| Box::pin(scenario_markdown_link_bidi_isolated(t))),
+        entry("terminal_command_indicator", 180, Runs::Beside, |t| Box::pin(scenario_terminal_command_indicator(t))),
+        entry("turn_error_clears_on_a_later_turn", 30, Runs::Beside, |t| Box::pin(scenario_turn_error_clears_on_a_later_turn(t))),
+        entry("deleted_in_another_tab", 60, Runs::Beside, |t| Box::pin(scenario_deleted_in_another_tab(t))),
+        entry("working_line_timer_survives_a_reload", 60, Runs::Beside, |t| Box::pin(scenario_working_line_timer_survives_a_reload(t))),
+        entry("oauth_callback_error_link", 60, Runs::Alone, |t| Box::pin(scenario_oauth_callback_error_link(t))),
+        // 60s, not 30: the scenario creates three conversations, hydrates, then
+        // waits on five of its own 10s timeouts across four switches. They return
+        // early when things are fast, but a slow run legitimately spends most of
+        // that passing every step, so 30s can fail a working run and have it read
+        // as an infrastructure failure (code review 2).
+        entry("switch_shows_no_start_screen", 60, Runs::Beside, |t| Box::pin(scenario_switch_shows_no_start_screen(t))),
+        entry("attach_error_outlives_a_switch", 60, Runs::Beside, |t| Box::pin(scenario_attach_error_outlives_a_switch(t))),
+        entry("attach_error_after_the_first_message", 60, Runs::Beside, |t| Box::pin(scenario_attach_error_after_the_first_message(t))),
+        entry("delete_names_its_agents", 60, Runs::Alone, |t| Box::pin(scenario_delete_names_its_agents(t))),
+        entry("agent_tree", 90, Runs::Alone, |t| Box::pin(scenario_agent_tree(t))),
+        entry("text_call_correction", 30, Runs::Alone, |t| Box::pin(scenario_text_call_correction(t))),
+        entry("secrets_page", 60, Runs::Alone, |t| Box::pin(scenario_secrets_page(t))),
+    ]
+}
+
+/// `SMELT_BROWSER_LANES`: how many scenarios run side by side, each lane
+/// with its own Chrome and its own share of the mock. 3 by default, the
+/// browser job's reserved cores; 1 runs them all one at a time, in the
+/// order `scenarios` lists them.
+fn lane_count() -> usize {
+    std::env::var("SMELT_BROWSER_LANES").ok().and_then(|v| v.trim().parse().ok()).filter(|n| *n >= 1).unwrap_or(3)
 }
 
 /// `SMELT_BROWSER_SCENARIOS`: a comma-separated list of scenario names to
@@ -166,13 +304,17 @@ async fn test_end_to_end_browser_scenarios() {
     let harness = BrowserTestHarness::start().await;
     // The model every conversation the test creates runs on: a provider of
     // the test's own, so the dev database's providers and default are left
-    // alone (SME-72). Removed with the conversations at the end.
-    let mock = MockUpstream::start().await;
+    // alone (SME-72). Removed with the conversations at the end. One
+    // provider, with a model per lane.
+    let lane_count = lane_count();
+    let models: Vec<String> =
+        (0..lane_count).map(|i| if i == 0 { MOCK_MODEL.to_string() } else { format!("{MOCK_MODEL}-lane-{i}") }).collect();
+    let mocks = MockUpstream::start(&models).await;
     let mock_provider = db::create_inference_provider(
         pool,
         &format!("browser tier mock {}", std::process::id()),
         "anthropic",
-        &format!("http://{}", mock.addr),
+        &format!("http://{}", mocks[0].addr),
         "api_key",
         "test-key",
         false,
@@ -183,96 +325,40 @@ async fn test_end_to_end_browser_scenarios() {
     .await
     .expect("save the mock provider");
     MOCK_PROVIDER.set(mock_provider.id).expect("the mock provider is set once");
+    let mut browsers = Vec::new();
+    for _ in 1..lane_count {
+        browsers.push(harness.another_browser().await);
+    }
     // Every conversation a scenario creates, so they (and their sandbox
     // pods) can be removed afterwards — this runs against a real database
     // and cluster, so leftovers show up in the app's own sidebar and pile
     // up pods until new ones stop starting.
     let created = std::sync::Mutex::new(Vec::new());
-    let t = Scenario { pool, harness: &harness, mock: &mock, created: &created, tabs: std::sync::Mutex::new(Vec::new()) };
+    let lanes: Vec<Scenario> = (0..lane_count)
+        .map(|i| Scenario {
+            pool,
+            harness: &harness,
+            browser: if i == 0 { &harness.browser } else { &browsers[i - 1] },
+            mock: &mocks[i],
+            created: &created,
+            tabs: std::sync::Mutex::new(Vec::new()),
+        })
+        .collect();
 
     let only = selected_scenarios();
     let only = only.as_deref();
-    let mut results = Vec::new();
-    let mut known = Vec::new();
-    let r = &mut results;
-    let k = &mut known;
-    run_scenario(&t, only, r, k, "terminals", 120, Box::pin(scenario_terminals(&t))).await;
-    run_scenario(&t, only, r, k, "context_usage", 60, Box::pin(scenario_context_usage(&t))).await;
-    run_scenario(&t, only, r, k, "compaction_divider", 60, Box::pin(scenario_compaction_divider(&t))).await;
-    run_scenario(&t, only, r, k, "todo_panel", 60, Box::pin(scenario_todo_panel(&t))).await;
-    run_scenario(&t, only, r, k, "reply_stays_in_its_conversation", 60, Box::pin(scenario_reply_stays_in_its_conversation(&t))).await;
-    run_scenario(&t, only, r, k, "unrequested_reply", 60, Box::pin(scenario_unrequested_reply(&t))).await;
-    run_scenario(&t, only, r, k, "missing_conversation", 30, Box::pin(scenario_missing_conversation(&t))).await;
-    run_scenario(&t, only, r, k, "notification_failure_stays", 60, Box::pin(scenario_notification_failure_stays(&t))).await;
-    run_scenario(&t, only, r, k, "pods", 120, Box::pin(scenario_pods(&t))).await;
-    run_scenario(&t, only, r, k, "stop_a_turn", 60, Box::pin(scenario_stop_a_turn(&t))).await;
-    run_scenario(&t, only, r, k, "reply_on_conversation_stream", 60, Box::pin(scenario_reply_on_conversation_stream(&t))).await;
-    run_scenario(&t, only, r, k, "busy_session_layout", 120, Box::pin(scenario_busy_session_layout(&t))).await;
-    run_scenario(&t, only, r, k, "sidebar", 30, Box::pin(scenario_sidebar(&t))).await;
-    // 90s, not 60: two Home tabs hydrate, then a 30s wait for the new row and
-    // 10s for each disappearance. All of them return early — the hop is about a
-    // second on a quiet pod — but a limit that fails a working run reads as
-    // infrastructure (the same reasoning as switch_shows_no_start_screen's).
-    run_scenario(&t, only, r, k, "conversations_appear_live", 90, Box::pin(scenario_conversations_appear_live(&t))).await;
-    run_scenario(&t, only, r, k, "phone_width", 30, Box::pin(scenario_phone_width(&t))).await;
-    run_scenario(&t, only, r, k, "not_found", 30, Box::pin(scenario_not_found(&t))).await;
-    run_scenario(&t, only, r, k, "tool_rows", 30, Box::pin(scenario_tool_rows(&t))).await;
-    run_scenario(&t, only, r, k, "dark_mode", 30, Box::pin(scenario_dark_mode(&t))).await;
-    run_scenario(&t, only, r, k, "forms", 30, Box::pin(scenario_forms(&t))).await;
-    run_scenario(&t, only, r, k, "empty_conversation", 30, Box::pin(scenario_empty_conversation(&t))).await;
-    run_scenario(&t, only, r, k, "sandbox_dev_server", 300, Box::pin(scenario_sandbox_dev_server(&t))).await;
-    run_scenario(&t, only, r, k, "agents_md_trust", 180, Box::pin(scenario_agents_md_trust(&t))).await;
-    // 90s, not 60: one tab hydrates, then the card's five waits and the
-    // Trust hop. Every wait returns early on a working run — the bound is
-    // only so a broken one reads as itself, not as infrastructure.
-    run_scenario(&t, only, r, k, "repo_trust_card", 90, Box::pin(scenario_repo_trust_card(&t))).await;
-    run_scenario(&t, only, r, k, "switch_resets_context_detail", 30, Box::pin(scenario_switch_resets_context_detail(&t))).await;
-    run_scenario(&t, only, r, k, "model_picker", 60, Box::pin(scenario_model_picker(&t))).await;
-    run_scenario(&t, only, r, k, "oauth_headers", 30, Box::pin(scenario_oauth_headers(&t))).await;
-    run_scenario(&t, only, r, k, "oauth_sign_in_expired", 30, Box::pin(scenario_oauth_sign_in_expired(&t))).await;
-    run_scenario(&t, only, r, k, "stale_bundle", 60, Box::pin(scenario_stale_bundle(&t))).await;
-    run_scenario(&t, only, r, k, "transcript_scroll", 60, Box::pin(scenario_transcript_scroll(&t))).await;
-    run_scenario(&t, only, r, k, "terminal_follow_after_switch", 180, Box::pin(scenario_terminal_follow_after_switch(&t))).await;
-    run_scenario(&t, only, r, k, "context_from_the_keyboard", 60, Box::pin(scenario_context_from_the_keyboard(&t))).await;
-    run_scenario(&t, only, r, k, "address_bar_after_session_closes", 90, Box::pin(scenario_address_bar_after_session_closes(&t))).await;
-    run_scenario(&t, only, r, k, "error_text", 60, Box::pin(scenario_error_text(&t))).await;
-    run_scenario(&t, only, r, k, "settings_two_step", 60, Box::pin(scenario_settings_two_step(&t))).await;
-    run_scenario(&t, only, r, k, "pointer_keeps_text_still", 120, Box::pin(scenario_pointer_keeps_text_still(&t))).await;
-    run_scenario(&t, only, r, k, "ask_user_card", 60, Box::pin(scenario_ask_user_card(&t))).await;
-    run_scenario(&t, only, r, k, "markdown_reply", 60, Box::pin(scenario_markdown_reply(&t))).await;
-    run_scenario(&t, only, r, k, "markdown_streaming", 60, Box::pin(scenario_markdown_streaming(&t))).await;
-    run_scenario(&t, only, r, k, "markdown_deep_code", 240, Box::pin(scenario_markdown_deep_code(&t))).await;
-    run_scenario(&t, only, r, k, "copy_reply", 120, Box::pin(scenario_copy_reply(&t))).await;
-    run_scenario(&t, only, r, k, "markdown_late_image", 90, Box::pin(scenario_markdown_late_image(&t))).await;
-    run_scenario(&t, only, r, k, "markdown_long_reply", 90, Box::pin(scenario_markdown_long_reply(&t))).await;
-    run_scenario(&t, only, r, k, "streaming_into_a_long_transcript", 120, Box::pin(scenario_streaming_into_a_long_transcript(&t))).await;
-    run_scenario(&t, only, r, k, "unreadable_message", 30, Box::pin(scenario_unreadable_message(&t))).await;
-    run_scenario(&t, only, r, k, "cut_off_notice", 30, Box::pin(scenario_cut_off_notice(&t))).await;
-    run_scenario(&t, only, r, k, "cut_off_in_a_call", 30, Box::pin(scenario_cut_off_in_a_call(&t))).await;
-    run_scenario(&t, only, r, k, "llama_cpp_provider", 60, Box::pin(scenario_llama_cpp_provider(&t))).await;
-    run_scenario(&t, only, r, k, "chat_errors_are_alerts", 30, Box::pin(scenario_chat_errors_are_alerts(&t))).await;
-    run_scenario(&t, only, r, k, "message_box_label", 30, Box::pin(scenario_message_box_label(&t))).await;
-    run_scenario(&t, only, r, k, "conversation_rows_by_keyboard", 60, Box::pin(scenario_conversation_rows_by_keyboard(&t))).await;
-    run_scenario(&t, only, r, k, "markdown_bare_urls", 60, Box::pin(scenario_markdown_bare_urls(&t))).await;
-    run_scenario(&t, only, r, k, "markdown_bare_urls_streaming", 60, Box::pin(scenario_markdown_bare_urls_streaming(&t))).await;
-    run_scenario(&t, only, r, k, "markdown_link_bidi_isolated", 60, Box::pin(scenario_markdown_link_bidi_isolated(&t))).await;
-    run_scenario(&t, only, r, k, "terminal_command_indicator", 180, Box::pin(scenario_terminal_command_indicator(&t))).await;
-    run_scenario(&t, only, r, k, "turn_error_clears_on_a_later_turn", 30, Box::pin(scenario_turn_error_clears_on_a_later_turn(&t))).await;
-    run_scenario(&t, only, r, k, "deleted_in_another_tab", 60, Box::pin(scenario_deleted_in_another_tab(&t))).await;
-    run_scenario(&t, only, r, k, "working_line_timer_survives_a_reload", 60, Box::pin(scenario_working_line_timer_survives_a_reload(&t))).await;
-    run_scenario(&t, only, r, k, "oauth_callback_error_link", 60, Box::pin(scenario_oauth_callback_error_link(&t))).await;
-    // 60s, not 30: the scenario creates three conversations, hydrates, then
-    // waits on five of its own 10s timeouts across four switches. They return
-    // early when things are fast, but a slow run legitimately spends most of
-    // that passing every step, so 30s can fail a working run and have it read
-    // as an infrastructure failure (code review 2).
-    run_scenario(&t, only, r, k, "switch_shows_no_start_screen", 60, Box::pin(scenario_switch_shows_no_start_screen(&t))).await;
-    run_scenario(&t, only, r, k, "attach_error_outlives_a_switch", 60, Box::pin(scenario_attach_error_outlives_a_switch(&t))).await;
-    run_scenario(&t, only, r, k, "attach_error_after_the_first_message", 60, Box::pin(scenario_attach_error_after_the_first_message(&t))).await;
-    run_scenario(&t, only, r, k, "delete_names_its_agents", 60, Box::pin(scenario_delete_names_its_agents(&t))).await;
-    run_scenario(&t, only, r, k, "agent_tree", 90, Box::pin(scenario_agent_tree(&t))).await;
-    run_scenario(&t, only, r, k, "text_call_correction", 30, Box::pin(scenario_text_call_correction(&t))).await;
-    run_scenario(&t, only, r, k, "secrets_page", 60, Box::pin(scenario_secrets_page(&t))).await;
+    let all = scenarios();
+    let entries: Vec<&Entry> = all.iter().filter(|e| only.is_none_or(|only| only.iter().any(|n| n == e.name))).collect();
+    let results = if lane_count == 1 {
+        let results = std::sync::Mutex::new(Vec::new());
+        for e in entries {
+            run_scenario(&lanes[0], &results, e).await;
+        }
+        results.into_inner().expect("the results lock")
+    } else {
+        run_lanes(&lanes, entries).await
+    };
+    let known: Vec<&'static str> = all.iter().map(|e| e.name).collect();
 
     let mut failures: Vec<String> = results
         .iter()
@@ -290,7 +376,10 @@ async fn test_end_to_end_browser_scenarios() {
     // runtimes. Once the harness shuts down, using one either fails ("A
     // Tokio 1.x context was found, but it is being shutdown", "runtime
     // dropped the dispatch task") or hangs forever (SME-39).
-    drop(t);
+    drop(lanes);
+    for mut browser in browsers {
+        let _ = browser.close().await;
+    }
     let created = created.into_inner().expect("the conversation list lock");
     let pod_ids = sandbox_pod_ids(pool, &created).await;
     remove_conversations(pool, &created).await;
@@ -313,6 +402,7 @@ async fn test_end_to_end_browser_scenarios() {
 }
 
 mod harness;
+mod mock;
 mod basics;
 mod layout;
 mod pages;
@@ -331,6 +421,7 @@ mod agents;
 mod text_calls;
 
 use harness::*;
+use mock::*;
 use basics::*;
 use layout::*;
 use pages::*;

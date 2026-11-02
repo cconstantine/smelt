@@ -35,7 +35,7 @@ pub(super) async fn scenario_model_picker(t: &Scenario<'_>) {
     let second_tab = t.tab(t.url(&format!("conversation/{}", picking.id))).await;
     wait_for_live_client(&first_tab, picking.id).await;
     wait_for_live_client(&second_tab, picking.id).await;
-    let current = format!("{provider_name} \u{b7} {MOCK_MODEL}");
+    let current = format!("{provider_name} \u{b7} {}", t.mock.model);
     for tab in [&first_tab, &second_tab] {
         assert!(
             wait_for_text(tab, &current, Duration::from_secs(10)).await,

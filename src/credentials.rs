@@ -324,12 +324,21 @@ pub async fn install_pod_files(
     Ok(())
 }
 
-/// Runs `install` (read the keys, then write them into a pod) with no
-/// other install in between, so an install that read the keys before a
-/// change can't write them over one that read them after.
-pub(crate) async fn with_install_lock<F: std::future::Future>(install: F) -> F::Output {
-    static INSTALLING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _held = INSTALLING.lock().await;
+/// Runs `install` (read the keys, then write them into `conversation`'s
+/// pod) with no other install into that conversation's pod in between, so
+/// an install that read the keys before a change can't write them over one
+/// that read them after. Only installs into the same pod can do that, so
+/// other conversations' installs go on meanwhile: one lock for all of them
+/// made a key or secret change write to every live pod in turn (SME-341).
+/// Keyed by conversation, not pod, as `reconcile_pod` finds its pod under
+/// the lock; a pod's conversation never changes. The map keeps an entry per
+/// conversation that has ever installed, a few bytes each, which a
+/// single-user app's conversation count makes fine.
+pub(crate) async fn with_install_lock<F: std::future::Future>(conversation: i64, install: F) -> F::Output {
+    static INSTALLING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
+        std::sync::LazyLock::new(Default::default);
+    let lock = INSTALLING.lock().unwrap_or_else(|e| e.into_inner()).entry(conversation).or_default().clone();
+    let _held = lock.lock().await;
     install.await
 }
 
@@ -339,11 +348,13 @@ pub(crate) async fn with_install_lock<F: std::future::Future>(install: F) -> F::
 /// one, and a secret reaches the persona that named it. A pod with no
 /// row — gone mid-install — installs nothing rather than everything.
 pub async fn install_into_pod(pool: &PgPool, pod_id: i64) -> Result<(), String> {
-    with_install_lock(async {
-        let conversation = db::sandbox_pod_conversation_id(pool, pod_id).await.map_err(|e| e.to_string())?;
-        let Some(conversation) = conversation else {
-            return Ok(()); // the pod is gone; there is no decision to install
-        };
+    // Read before the lock, which is the conversation's: a pod's
+    // conversation never changes.
+    let conversation = db::sandbox_pod_conversation_id(pool, pod_id).await.map_err(|e| e.to_string())?;
+    let Some(conversation) = conversation else {
+        return Ok(()); // the pod is gone; there is no decision to install
+    };
+    with_install_lock(conversation, async {
         let files = pod_files(pool, conversation).await.map_err(|e| e.to_string())?;
         write_pod_files(pool, pod_id, &files).await
     })
@@ -355,8 +366,8 @@ pub async fn install_into_pod(pool: &PgPool, pod_id: i64) -> Result<(), String> 
 /// across its reads and this write, so no install interleaves between
 /// a decision and its files.
 async fn write_pod_files(pool: &PgPool, pod_id: i64, files: &[PodFile]) -> Result<(), String> {
-    // Bounded: every install waits on this lock, so a stalled exec
-    // mustn't hold it.
+    // Bounded: every install into this conversation's pod waits on its
+    // lock, so a stalled exec mustn't hold it.
     let shell = sandbox::PodShell::for_pod(pool, pod_id).await.map_err(|e| e.to_string())?;
     let keys_dir = format!("{POD_GIT_DIR}/keys");
     tokio::time::timeout(INSTALL_TIMEOUT, install_pod_files(&shell, files, &[keys_dir.as_str(), POD_SECRETS_DIR]))
@@ -376,7 +387,7 @@ async fn write_pod_files(pool: &PgPool, pod_id: i64, files: &[PodFile]) -> Resul
 /// cleared first (`end_start`), which is what makes the pod end up
 /// with nothing.
 pub async fn reconcile_pod(pool: &PgPool, child: i64, snapshot: Option<&db::PersonaSnapshot>) -> Result<(), String> {
-    with_install_lock(async {
+    with_install_lock(child, async {
         // Newest first should two ever coexist: an old pod is being
         // torn down, the live one is the newest.
         let Some(pod) = db::list_sandbox_pods(pool, child).await.map_err(|e| e.to_string())?.into_iter().next_back()
@@ -431,9 +442,18 @@ pub async fn install_into_live_pods(pool: &PgPool) {
             return;
         }
     };
-    for pod in pods {
+    // Side by side, a few at a time: one pod after another made a save wait
+    // on every live pod in turn, about 1.3 s each under load, and with eight
+    // live pods the secrets page sat on "Adding..." for 11 s (SME-341).
+    // Each conversation's install takes only its own lock, and the caller
+    // still answers once they're all done.
+    futures_util::StreamExt::for_each_concurrent(futures_util::stream::iter(pods), INSTALLS_AT_ONCE, |pod| async move {
         if let Err(e) = install_into_pod(pool, pod.pod_id).await {
             tracing::warn!(pod_id = pod.pod_id, error = %e, "couldn't install credentials");
         }
-    }
+    })
+    .await;
 }
+
+/// How many live pods `install_into_live_pods` writes to at once.
+const INSTALLS_AT_ONCE: usize = 8;
