@@ -186,7 +186,7 @@ links and persona files, which do read docs), in the `smelt` service with no
 database or cluster (`start-stack` with `full: false`). Anything else, a
 manual run, or a range it can't read runs everything, as before.
 
-**It also runs every night on `main`**, with nothing changed, so a test that has gone flaky or slow shows up there rather than on an unrelated PR. Each job ends with a report on its test run's own time against a budget, and its slowest tests (`scripts/ci-test-report`; see [testing.md](testing.md#keeping-the-suite-fast-and-green)).
+**Each job that runs tests ends with a report** on its test run's own time against a budget, and its slowest tests (`scripts/ci-test-report`; see [testing.md](testing.md#keeping-the-suite-fast-and-green)).
 
 ## Deploying
 

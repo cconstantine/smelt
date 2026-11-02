@@ -23,15 +23,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-  # Every night on main, with nothing changed: a test that has gone flaky
-  # or slow shows up here, not first on someone's unrelated PR (SME-341).
-  schedule:
-    - cron: "17 9 * * *"
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  # Only a PR's newer push cancels its older run: on main, a merge's run
-  # and the nightly one each finish (SME-341 review).
+  # Only a PR's newer push cancels its older run. On main the running run
+  # finishes, and a newer one waits (replacing any already waiting).
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -44,7 +40,7 @@ jobs:
   # parse with the product's own parser). Not every .md: src/turn/
   # system_prompt.md is compiled into the binary, and any src/ change moves
   # the build id. A docs-only change runs `docs` (the repo lints) instead of
-  # `server` and `browser`. Anything else, a manual or nightly run, or a
+  # `server` and `browser`. Anything else, a manual run, or a
   # range that can't be read counts as code, and runs everything.
   changes:
     runs-on: ubuntu-latest
