@@ -63,7 +63,7 @@ async fn test_the_schema_refuses_a_bad_name_and_the_built_in_name(pool: PgPool) 
 /// the store innocent and the form the only suspect. The `\r\n` row
 /// says the quiet part: smelt keeps CR bytes handed to it directly
 /// (the API path), and it is only the browser that rewrites CRLF to LF
-/// on the paste path (the plan's documented asymmetry).
+/// on the paste path (an asymmetry SME-334 keeps on purpose).
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_multi_line_value_round_trips_byte_for_byte(pool: PgPool) {
     let pool = &pool;

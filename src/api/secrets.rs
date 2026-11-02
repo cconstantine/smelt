@@ -80,8 +80,8 @@ pub fn validate_secret_value(value: &str) -> Result<(), String> {
 /// counts 1. Pure and outside `cfg(server)` like the two validators.
 /// Dead on the web build on purpose: the server computes the count, the
 /// page renders it verbatim and never recomputes (the same rule `shown`
-/// lives by), and the plan wants the arithmetic sitting with the
-/// validators, compilable on both targets.
+/// lives by), and the arithmetic sits with the validators so it compiles
+/// on both targets (SME-334).
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 pub fn line_count(value: &str) -> usize {
     value.lines().count()

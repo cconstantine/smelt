@@ -332,10 +332,10 @@ pub(super) async fn seed_user_message(pool: &sqlx::PgPool, conversation: i64, te
 ///
 /// Waits for the box to accept typing first: it is disabled while the
 /// model works in the conversation, and its last reply token can show
-/// before the turn's end event does — typing into the disabled box is
-/// silently dropped, Enter included (the CI flake on
-/// `attach_error_after_the_first_message`'s next send, SME-334 CI,
-/// the SME-336 wake family).
+/// before the turn's end event does, so typing into the disabled box is
+/// silently dropped, Enter included. A guard for every caller; SME-319
+/// added the same wait inside `attach_error_after_the_first_message`,
+/// where it was first seen.
 pub(super) async fn send_from(page: &chromiumoxide::Page, text: &str) {
     assert!(
         wait_until(

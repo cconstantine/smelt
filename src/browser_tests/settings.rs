@@ -526,26 +526,17 @@ pub(super) async fn scenario_secrets_page(t: &Scenario<'_>) {
     // through the helper doubles as the hydration check.
     page.reload().await.expect("reload the page");
     wait_for_resource(&page, "/api/secrets").await;
-    type_and_read_back(&page, "#secret-name", &unique_id("empty")).await;
+    let empty_name = unique_id("empty");
+    type_and_read_back(&page, "#secret-name", &empty_name).await;
     click_when_present(&page, ".secrets-add-form button[type=\"submit\"]", Duration::from_secs(5)).await;
-    let refused_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let refused = loop {
-        let text: String = page
-            .evaluate("document.body.innerText")
-            .await
-            .expect("read the page")
-            .into_value()
-            .expect("a string");
-        if text.contains("A secret value can't be empty.") {
-            break true;
-        }
-        if tokio::time::Instant::now() >= refused_deadline {
-            break false;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
-    assert!(refused, "an empty value is refused before sending, in the server's own words");
-    assert!(wait_for_count(&page, ".secret-row", 0, Duration::from_secs(5)).await, "the refused add stored nothing");
+    assert!(
+        wait_for_text(&page, "A secret value can't be empty.", Duration::from_secs(5)).await,
+        "an empty value is refused before sending, in the server's own words"
+    );
+    // The store, not the row count: the count was already 0, so it could
+    // not tell a late row from none.
+    let stored = crate::db::list_named_secrets(t.pool).await.expect("list the secrets");
+    assert!(!stored.iter().any(|s| s.name == empty_name), "the refused add stored nothing");
 
     // SME-334: the paste leg — the one automated test that watches the
     // control itself. A multi-line secret goes in the way a paste goes in
@@ -600,7 +591,11 @@ pub(super) async fn scenario_secrets_page(t: &Scenario<'_>) {
         .expect("read the page")
         .into_value()
         .expect("text");
-    assert!(!body.contains(&yaml[4..]), "beyond the display prefix none of the pasted value is on the page");
+    // Line by line: innerText folds the page's whitespace, so a leaked
+    // multi-line value would never match the value whole.
+    for leaked in ["Version: v1", "clusters:", "kind: list"] {
+        assert!(!body.contains(leaked), "beyond the display prefix none of the pasted value is on the page: {leaked:?}");
+    }
     // Two-step delete again, so the 375px leg below starts from none.
     click_when_present(&page, ".secret-row .secret-delete", Duration::from_secs(5)).await;
     click_when_present(&page, ".secret-row .secret-delete-confirm", Duration::from_secs(5)).await;
