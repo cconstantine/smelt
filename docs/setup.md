@@ -177,6 +177,17 @@ last one's output. A pull request from a fork runs on GitHub's
 `ubuntu-latest` instead, which has no such volume, so it builds everything
 from scratch.
 
+**A change to docs alone doesn't run the tests** (SME-341). A first job,
+`changes`, compares the change's files: when every one is under `docs/`, a
+top-level `*.md` or a `.agents/**/*.md` (never `src/`, whose Markdown the
+build can compile in), `server` and `browser` are skipped, and a `docs` job runs only the
+repo lints (`cargo test --features server repo_lints`: the size ceiling,
+links and persona files, which do read docs), in the `smelt` service with no
+database or cluster (`start-stack` with `full: false`). Anything else, a
+manual run, or a range it can't read runs everything, as before.
+
+**It also runs every night on `main`**, with nothing changed, so a test that has gone flaky or slow shows up there rather than on an unrelated PR. Each job ends with a report on its test run's own time against a budget, and its slowest tests (`scripts/ci-test-report`; see [testing.md](testing.md#keeping-the-suite-fast-and-green)).
+
 ## Deploying
 
 Running smelt for real, outside the dev stack. The [README](../README.md#deploying) has a summary; this is the full guide.

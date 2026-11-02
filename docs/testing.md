@@ -146,6 +146,15 @@ Most logic lives behind the `server` feature; plain `cargo test` compiles but sk
 
 `mcp::tests::client::test_live_exa_search_through_smelt_mcp_client` checks the built-in Exa MCP server against the real service: smelt's own MCP client connects keylessly, sees only `web_search_exa`, and gets results back. It needs the internet and depends on Exa's unpublished free limits, so it's `#[ignore]`d **and** skips unless `SMELT_LIVE_EXA=1` is set. CI's browser job runs every ignored test, and this one shouldn't depend on Exa there. It's a `#[sqlx::test]`, since a connect reads its server's row (SME-167), so run it under the cluster lock: `SMELT_LIVE_EXA=1 scripts/cluster-test --features server -- --ignored --exact mcp::tests::client::test_live_exa_search_through_smelt_mcp_client`. See [Definition of done](process/done.md) for the full two-target check.
 
+## Keeping the suite fast and green
+
+SME-341 spent two days getting a branch that changes nothing back to a first-attempt green, and halving CI's time. These keep it there.
+
+- **A red that the change can't explain is a ticket, never a re-run.** A red on `main`, on the nightly run (`ci.yml`'s `schedule`, every day with nothing changed), or on a PR whose diff can't reach the failing test gets a Test reliability ticket with its signature: the test, the assert, the message, and the run. It's fixed at the mechanism, never by `#[ignore]`, a deletion, or a timeout that happens to survive (SME-329's green-only rule). Find the mechanism before the fix: a diagnostic in a scratch copy, the failing state recorded, and, where the bug is a missing wait or guard, a mutant that removes it and turns the test red.
+- **The suite has a time budget.** Each CI job that runs tests (`server`, `browser`) reports its test run's own time against a budget in its summary: server 600 s, browser 480 s (`scripts/ci-test-report`; about 270–350 s and 220 s at SME-341's close). Over budget is a warning, not a red, since a red for a slow pass would be a flake of its own. The same summary lists the server tests libtest saw run over 60 s and the browser tier's ten slowest scenarios. A new entry there, or a warning, is a ticket too.
+- **A test waits on the state it needs, never a fixed timer or an earlier step's side effect.** The flakes SME-341 fixed were each a wait on the wrong thing: a reply's chunks counted before it opened, a message typed into a disabled box, a claim "held" by a pod that could never be scheduled (a container with no resources gets the namespace LimitRange's 64Gi max as its request), a lock shared by two tests' conversation 1. A test that builds its own pod spec gives it a small request; a test that needs ids no other test uses takes them from `id_alloc::FIXTURE_IDS`.
+- **Slow is usually waiting, not work.** Before parallelising, find what's being waited on: SME-341's pod tests were throttled by the test cluster's own volume provisioner (`scripts/k3s-bootstrap.sh`), not by CPU. `scripts/k3s-admin-kubeconfig` shows what the `park` account can't.
+
 ## Browser verification
 
 In [testing/browser.md](testing/browser.md).

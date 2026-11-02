@@ -172,10 +172,9 @@ async fn fake_agent(pod_id: i64, greeting: Greeting, dial_delay: Duration) -> Fa
 /// here see a start under way and answer `NoPod` (SME-341: CI run
 /// 41366729038, "connects: NoPod").
 async fn pod_row(pool: &PgPool) -> (i64, i64) {
-    static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-    let unique = (std::process::id() as i64 % 10_000) * 1_000_000
-        + NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        + 5_000_000_000;
+    // From the fixture band, the source of hand-picked ids
+    // (docs/testing.md): no other test's ids meet it (SME-341 review).
+    let unique = crate::id_alloc::FIXTURE_IDS.next_base();
     sqlx::query("SELECT setval(pg_get_serial_sequence('sandbox_pods', 'id'), $1)")
         .bind(unique)
         .execute(pool)

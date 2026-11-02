@@ -23,16 +23,96 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  # Every night on main, with nothing changed: a test that has gone flaky
+  # or slow shows up here, not first on someone's unrelated PR (SME-341).
+  schedule:
+    - cron: "17 9 * * *"
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Only a PR's newer push cancels its older run: on main, a merge's run
+  # and the nightly one each finish (SME-341 review).
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
+  # Whether the change touches anything but docs (SME-341). Docs are what
+  # no build compiles in and no test reads but the repo lints: docs/, the
+  # top-level *.md, and .agents/**/*.md (persona files, which the lints
+  # parse with the product's own parser). Not every .md: src/turn/
+  # system_prompt.md is compiled into the binary, and any src/ change moves
+  # the build id. A docs-only change runs `docs` (the repo lints) instead of
+  # `server` and `browser`. Anything else, a manual or nightly run, or a
+  # range that can't be read counts as code, and runs everything.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Does the change touch anything but docs?
+        id: diff
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          case "$EVENT" in
+            pull_request) base=$(git merge-base "$PR_BASE" "$PR_HEAD" 2>/dev/null) || base=; head=$PR_HEAD ;;
+            push) base=$PUSH_BEFORE; head=$PUSH_AFTER ;;
+            *) base=; head= ;;
+          esac
+          code=true
+          # --no-renames: a file moved into docs/ still lists the path it
+          # left. A here-string, not a pipe: with pipefail, `grep -q`
+          # leaving early made printf's SIGPIPE read as "docs only".
+          if [ -n "$base" ] && [ -n "$head" ] && changed=$(git diff --name-only --no-renames "$base" "$head" 2>/dev/null) && [ -n "$changed" ]; then
+            if ! grep -qvE '^(docs/.*|[^/]+\.md|\.agents/.*\.md)$' <<<"$changed"; then
+              code=false
+            fi
+            printf 'changed:\n%s\n' "$changed"
+          fi
+          echo "code: $code"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+  # The repo lints alone, for a docs-only change: the `smelt` service with
+  # no database or cluster, on the server runner's warm caches.
+  docs:
+    needs: changes
+    if: needs.changes.outputs.code != 'true'
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || 'arc-runner-smelt-amd64' }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: The dev image and the build caches
+        uses: ./.github/actions/start-stack
+        with:
+          full: "false"
+
+      - name: The repo lints (file ceiling, links, personas)
+        run: |
+          docker compose run --rm --no-deps \
+            smelt scripts/with-cluster-lock cargo test --features server repo_lints
+
+      - name: Stop the compose stack
+        if: always()
+        uses: ./.github/actions/stop-stack
+
   server:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || 'arc-runner-smelt-amd64' }}
     timeout-minutes: 60
     steps:
@@ -68,12 +148,19 @@ jobs:
       # lock, so it never waits.
       - name: cargo test --features server
         run: |
+          # The step's result is the tests', not tee's.
+          set -o pipefail
           docker compose run --rm \
             -e SANDBOX_RUNNING_WAIT_TIMEOUT_SECS=120 \
             -e SANDBOX_MEMORY_LIMIT=128Mi \
             -e SANDBOX_DOCKER_MEMORY_LIMIT=256Mi \
             -e SANDBOX_IMAGE \
-            smelt scripts/with-cluster-lock cargo test --features server
+            smelt scripts/with-cluster-lock cargo test --features server \
+            2>&1 | tee "$RUNNER_TEMP/server-tests.log"
+
+      - name: Server test time and slow tests
+        if: always()
+        run: scripts/ci-test-report "$RUNNER_TEMP/server-tests.log" server 600
 
       - name: Dump sandbox pod diagnostics on failure
         if: failure()
@@ -119,6 +206,8 @@ jobs:
         uses: ./.github/actions/stop-stack
 
   browser:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || 'arc-runner-smelt-amd64-browser' }}
     timeout-minutes: 60
     steps:
@@ -159,12 +248,20 @@ jobs:
       # apply here too.
       - name: Browser tests (src/browser_tests/)
         run: |
+          # The step's result is the tests', not tee's.
+          set -o pipefail
           docker compose run --rm \
             -e SANDBOX_RUNNING_WAIT_TIMEOUT_SECS=120 \
             -e SANDBOX_MEMORY_LIMIT=128Mi \
             -e SANDBOX_DOCKER_MEMORY_LIMIT=256Mi \
             -e SANDBOX_IMAGE \
-            smelt scripts/with-cluster-lock cargo test --features "server browser-test" -- --ignored --test-threads=1
+            -e RUST_TEST_NOCAPTURE=1 \
+            smelt scripts/with-cluster-lock cargo test --features "server browser-test" -- --ignored --test-threads=1 \
+            2>&1 | tee "$RUNNER_TEMP/browser-tests.log"
+
+      - name: Browser test time and slowest scenarios
+        if: always()
+        run: scripts/ci-test-report "$RUNNER_TEMP/browser-tests.log" browser 480
 
       - name: Dump sandbox pod diagnostics on failure (browser tests)
         if: failure()

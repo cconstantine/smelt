@@ -59,8 +59,12 @@ pub async fn ensure_default_servers(pool: &sqlx::PgPool) {
 const CONNECT_TIMEOUT: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_secs(1)
 } else {
-    std::time::Duration::from_secs(15)
+    PRODUCT_CONNECT_TIMEOUT
 };
+
+/// The product's connect budget, which `CONNECT_TIMEOUT` is outside a test
+/// build, and which a test may give one of its servers (`connect_timeout`).
+const PRODUCT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// `CONNECT_TIMEOUT` for `server_id`. A test build's 1 s keeps the tests of
 /// a server that never answers quick, but a test that holds its own
@@ -72,7 +76,7 @@ const CONNECT_TIMEOUT: std::time::Duration = if cfg!(test) {
 pub(super) fn connect_timeout(server_id: i64) -> std::time::Duration {
     #[cfg(test)]
     if test_support::has_product_budget(server_id) {
-        return std::time::Duration::from_secs(15);
+        return PRODUCT_CONNECT_TIMEOUT;
     }
     let _ = server_id;
     CONNECT_TIMEOUT

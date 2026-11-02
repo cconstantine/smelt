@@ -36,7 +36,12 @@ fn captured_logs() -> &'static Arc<StdMutex<Vec<u8>>> {
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_another_tests_pod_start_doesnt_turn_a_reconnect_away(pool: PgPool) {
     let other_tests_start = pod_start_lock(1);
-    let _held = other_tests_start.lock().await;
+    // Bounded: another test may be starting a pod for its conversation 1
+    // right now, which takes a moment, but one that kept the lock would
+    // otherwise hang this test forever (SME-341 review).
+    let _held = tokio::time::timeout(Duration::from_secs(30), other_tests_start.lock())
+        .await
+        .expect("conversation 1's start lock came free");
     let (_, pod_id) = pod_row(&pool).await;
     let _agent = fake_agent(pod_id, current(), Duration::ZERO).await;
     reconnect_if_needed(&pool, pod_id).await.expect("connects");

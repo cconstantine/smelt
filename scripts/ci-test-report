@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# CI's report on a test step's time (SME-341: keep the suite from going
+# slow again without anyone noticing):
+#
+#   scripts/ci-test-report LOG LABEL BUDGET_SECS
+#
+# Reads LOG, the step's output, and reports, to stdout and to the job's
+# summary ($GITHUB_STEP_SUMMARY, when set):
+# - the test run's own time, the largest "finished in N s" in LOG, so a
+#   cold build doesn't count; past BUDGET_SECS it's a `::warning`, never a
+#   failure, as a red for a slow-but-passing run would be a flake of its own;
+# - the tests libtest says ran over 60 s ("has been running for over 60
+#   seconds"), and the browser tier's ten slowest scenarios ("browser tier:
+#   NAME ok (N s)", printed when the run sets RUST_TEST_NOCAPTURE=1).
+#
+# Always exits 0: the test step's own result is what passes or fails a job.
+set -uo pipefail
+
+if [ $# -ne 3 ]; then
+    echo "usage: scripts/ci-test-report LOG LABEL BUDGET_SECS (nothing reported)"
+    exit 0
+fi
+log=$1
+label=$2
+budget=$3
+
+if [ ! -s "$log" ]; then
+    echo "ci-test-report: no output at $log, nothing to report"
+    exit 0
+fi
+
+secs=$(grep -o 'finished in [0-9.]*s' "$log" | grep -o '[0-9.]*' | sort -n | tail -1)
+slow=$(grep -o "test [A-Za-z0-9_:]* has been running for over 60 seconds" "$log" | sed 's/^test //; s/ has been.*//' | sort -u)
+scenarios=$(grep -o 'browser tier: [a-z0-9_]* ok ([0-9.]* s)' "$log" \
+    | sed -E 's/browser tier: ([a-z0-9_]+) ok \(([0-9.]+) s\)/\2 \1/' | sort -rn | head -10)
+
+report=$(
+    echo "### $label: test time"
+    if [ -n "$secs" ]; then
+        printf '%s s of a %s s budget\n' "${secs%.*}" "$budget"
+    else
+        echo "no \"finished in\" line (the run didn't get that far)"
+    fi
+    if [ -n "$slow" ]; then
+        echo
+        echo "Tests over 60 s:"
+        printf '%s\n' "$slow" | sed 's/^/- /'
+    fi
+    if [ -n "$scenarios" ]; then
+        echo
+        echo "Slowest scenarios:"
+        printf '%s\n' "$scenarios" | awk '{printf "- %s: %s s\n", $2, $1}'
+    fi
+)
+printf '%s\n' "$report"
+if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    printf '%s\n\n' "$report" >> "$GITHUB_STEP_SUMMARY"
+fi
+
+if [ -n "$secs" ] && [ "${secs%.*}" -gt "$budget" ]; then
+    echo "::warning title=$label is over its time budget::the $label tests took ${secs%.*} s, over their ${budget} s budget (docs/testing.md, \"Keeping the suite fast and green\")"
+fi
+exit 0
