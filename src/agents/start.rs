@@ -360,6 +360,14 @@ pub(crate) async fn credentials_notes(pool: &PgPool, child: i64, snapshot: &db::
             "{}'s persona asks for `git-ssh`, which its parent's chain doesn't have, so it gets none",
             label()
         ));
+    } else if wants_git_ssh && !key_stored(pool).await {
+        // Granted, but nothing to grant yet (SME-354 B11): the store is
+        // short, not the chain, and the next install after a key is
+        // added writes it.
+        notes.push(format!(
+            "{}'s persona asks for `git-ssh`, but no SSH key is stored, so it has none until you add one",
+            label()
+        ));
     }
     let secrets: Vec<String> =
         names.into_iter().filter(|name| name != crate::credentials::CREDENTIAL_GIT_SSH).collect();
@@ -398,6 +406,15 @@ async fn chain_has_git_ssh(pool: &PgPool, child: i64) -> bool {
             true
         }
     }
+}
+
+/// Whether an SSH key is stored, for the credentials note: a store that
+/// can't be read accuses nothing, as for the secrets.
+async fn key_stored(pool: &PgPool) -> bool {
+    db::ssh_key_stored(pool).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "couldn't read whether an SSH key is stored for the agent's credentials note");
+        true
+    })
 }
 
 /// One notice to the parent, whatever the start found to tell it: the

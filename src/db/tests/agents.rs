@@ -205,12 +205,9 @@ async fn child_of(pool: &PgPool, caller: i64) -> i64 {
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_child_seeds_only_the_git_ssh_chain_bit(pool: PgPool) {
     let root = test_conversation(&pool).await.id;
-    // An agent-less caller with no key stored: Rule G's root answer is
-    // "there is no key to grant", an empty bit.
-    let child = child_of(&pool, root).await;
-    assert_eq!(child_credentials(&pool, child).await, Vec::<String>::new(), "no key stored, nothing to pass");
-    // With a key stored, the same caller passes the bit — today's rule,
-    // every pod in the line has the key.
+    // An agent-less caller passes the bit, key stored or not (SME-354
+    // B11: the install decides) — today's rule, every pod in the line
+    // has the key once one is stored.
     sqlx::query("INSERT INTO ssh_keys (name, public_key, private_key) VALUES ('id_ed25519', 'pub', 'priv')")
         .execute(&pool)
         .await
@@ -379,4 +376,15 @@ async fn test_create_child_refuses_a_parented_conversation_with_no_agent_row(poo
         .await
         .expect("count");
     assert_eq!(children, 0, "the refusal wrote nothing");
+}
+
+/// SME-354 B11: an agent-less caller's child carries the `git-ssh` bit
+/// whether or not a key is stored now: Rule G's root answer is decided
+/// at each install (the key, if stored), so a key added after the child
+/// started still reaches it.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_roots_child_carries_the_git_ssh_bit_before_any_key_is_stored(pool: PgPool) {
+    let root = test_conversation(&pool).await.id;
+    let child = child_of(&pool, root).await;
+    assert_eq!(child_credentials(&pool, child).await, vec!["git-ssh".to_string()], "the install decides, not the start");
 }

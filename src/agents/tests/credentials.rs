@@ -48,6 +48,10 @@ async fn test_the_notice_names_the_credentials_the_start_cannot_give(pool: PgPoo
         .execute(&pool)
         .await
         .expect("a stored secret");
+    sqlx::query("INSERT INTO ssh_keys (name, public_key, private_key) VALUES ('id_ed25519', 'pub', 'priv')")
+        .execute(&pool)
+        .await
+        .expect("a stored key");
 
     // A persona whose every name is granted: nothing to report.
     let child = starting_child(&pool, root, &["git-ssh", "linear-key"]).await;
@@ -97,4 +101,19 @@ async fn test_the_notice_names_the_credentials_the_start_cannot_give(pool: PgPoo
     // and Rule S names nothing — says nothing either.
     let child = starting_child(&pool, root, &[]).await;
     assert!(credentials_notes(&pool, child, &persona_snapshot(None)).await.is_empty(), "no key, no notes");
+}
+
+/// SME-354 B11: a `git-ssh` ask the chain grants but no stored key can
+/// back says so, and blames no ancestor.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_git_ssh_ask_with_no_key_stored_says_no_key_is_stored(pool: PgPool) {
+    let root = db::create_conversation(&pool).await.expect("a root").id;
+    let child = starting_child(&pool, root, &["git-ssh"]).await;
+    let notes = credentials_notes(&pool, child, &persona_snapshot(Some(&["git-ssh"]))).await;
+    assert_eq!(
+        notes,
+        vec![format!(
+            "agent #{child} (smelt:driver)'s persona asks for `git-ssh`, but no SSH key is stored, so it has none until you add one"
+        )]
+    );
 }
