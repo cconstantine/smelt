@@ -476,3 +476,13 @@
     text-align: center;
 }
 
+
+/* The system prompt, folded under the context view's summary (SME-123
+   DR11); its heading is the toggle. */
+.context-detail-system summary {
+    cursor: pointer;
+}
+
+.context-detail-system summary h4 {
+    display: inline;
+}

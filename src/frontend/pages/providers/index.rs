@@ -120,8 +120,9 @@ pub fn ProvidersIndex() -> Element {
                                     div { class: "mcp-server-summary",
                                         span { class: "mcp-server-name", "{model_spend_label(&row)}" }
                                         span { class: "mcp-server-url",
-                                            "{crate::models::calls_text(row.calls)} \u{b7} input {row.input_tokens} uncached, {row.cache_creation_input_tokens} written, "
-                                            "{row.cache_read_input_tokens} read \u{b7} output {row.output_tokens}"
+                                            "{crate::models::calls_text(row.calls)} \u{b7} input {crate::models::grouped(row.input_tokens)} uncached, "
+                                            "{crate::models::grouped(row.cache_creation_input_tokens)} written, "
+                                            "{crate::models::grouped(row.cache_read_input_tokens)} read \u{b7} output {crate::models::grouped(row.output_tokens)}"
                                         }
                                     }
                                     span { class: "providers-spend-cost",

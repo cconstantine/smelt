@@ -215,37 +215,19 @@ pub(super) fn render_context_detail_body(detail: Option<&Result<ContextDetailSna
             ErrorText { message: Some(format!("Couldn't load the context: {}. Close it and open it again to retry.", reason.trim_end())) }
         },
         Some(Ok(detail)) => rsx! {
-            if !detail.instructions.is_empty() {
-                h4 { class: "context-detail-heading", "Project instructions ({detail.instructions.len()})" }
-                p { class: "muted", "AGENTS.md files from this conversation's repos, sent with every turn as part of the system prompt below." }
-                for doc in &detail.instructions {
-                    details { class: "context-detail-instructions",
-                        summary {
-                            code { "{doc.path}" }
-                            span { class: "muted", " {instructions_source(doc)}" }
-                        }
-                        {instructions_source_notice(doc)}
-                        {shown_pre(&doc.content, Some("context-detail-prompt"))}
-                    }
-                }
-            }
-            h4 { class: "context-detail-heading", "System prompt" }
-            if let Some(system) = &detail.system {
-                // Its own line breaks and headings, not one
-                // run-together paragraph (SME-41 D7).
-                {shown_pre(system, Some("context-detail-prompt"))}
-            } else {
-                p { class: "muted", "None set." }
-            }
-            p { "Messages: {detail.message_count}" }
+            // The summary first, the prompt folded under it: the dialog
+            // opened on the system prompt, with what it's for below the
+            // fold (SME-123 DR11).
             if let Some(usage) = &detail.usage {
-                p {
-                    "Tokens — input: {usage.input_tokens}, output: {usage.output_tokens}, "
-                    "cache creation: {usage.cache_creation_input_tokens}, cache read: {usage.cache_read_input_tokens}"
-                }
                 {render_context_meter(&context_usage_breakdown(usage, detail.context_window))}
             }
-            p { "Context window: {detail.context_window}" }
+            p { "Context window: {crate::models::grouped(i64::from(detail.context_window))} tokens \u{b7} {crate::models::grouped(detail.message_count as i64)} messages" }
+            if let Some(usage) = &detail.usage {
+                p {
+                    "Last call \u{2014} input: {crate::models::grouped(usage.input_tokens)}, output: {crate::models::grouped(usage.output_tokens)}, "
+                    "cache creation: {crate::models::grouped(usage.cache_creation_input_tokens)}, cache read: {crate::models::grouped(usage.cache_read_input_tokens)}"
+                }
+            }
             h4 { class: "context-detail-heading", "Spent so far" }
             p { "{spend_cost_text(&detail.spend)}" }
             // The group line (SME-244): an agent's always shows it — it
@@ -262,9 +244,9 @@ pub(super) fn render_context_detail_body(detail: Option<&Result<ContextDetailSna
             }
             if detail.spend.calls > 0 {
                 p {
-                    "{crate::models::calls_text(detail.spend.calls)} — uncached input: {detail.spend.input_tokens}, "
-                    "cache write: {detail.spend.cache_creation_input_tokens}, cache read: {detail.spend.cache_read_input_tokens}, "
-                    "output: {detail.spend.output_tokens}"
+                    "{crate::models::calls_text(detail.spend.calls)} \u{2014} uncached input: {crate::models::grouped(detail.spend.input_tokens)}, "
+                    "cache write: {crate::models::grouped(detail.spend.cache_creation_input_tokens)}, cache read: {crate::models::grouped(detail.spend.cache_read_input_tokens)}, "
+                    "output: {crate::models::grouped(detail.spend.output_tokens)}"
                 }
                 p { class: "muted",
                     "A stopped or failed call is counted with what it used before it ended, estimated where the provider "
@@ -274,6 +256,30 @@ pub(super) fn render_context_detail_body(detail: Option<&Result<ContextDetailSna
                     if let Some(at) = detail.prices_as_of {
                         {format!(" Prices as of {} UTC.", at.format("%Y-%m-%d %H:%M"))}
                     }
+                }
+            }
+            if !detail.instructions.is_empty() {
+                h4 { class: "context-detail-heading", "Project instructions ({detail.instructions.len()})" }
+                p { class: "muted", "AGENTS.md files from this conversation's repos, sent with every turn as part of the system prompt below." }
+                for doc in &detail.instructions {
+                    details { class: "context-detail-instructions",
+                        summary {
+                            code { "{doc.path}" }
+                            span { class: "muted", " {instructions_source(doc)}" }
+                        }
+                        {instructions_source_notice(doc)}
+                        {shown_pre(&doc.content, Some("context-detail-prompt"))}
+                    }
+                }
+            }
+            details { class: "context-detail-system",
+                summary { h4 { class: "context-detail-heading", "System prompt" } }
+                if let Some(system) = &detail.system {
+                    // Its own line breaks and headings, not one
+                    // run-together paragraph (SME-41 D7).
+                    {shown_pre(system, Some("context-detail-prompt"))}
+                } else {
+                    p { class: "muted", "None set." }
                 }
             }
             h4 { "Tools ({detail.tools.len()})" }

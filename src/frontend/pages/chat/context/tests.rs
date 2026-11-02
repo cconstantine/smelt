@@ -371,3 +371,39 @@ mod group_spend_tests {
         assert!(html.contains("$0.50, plus 1 call with no price"), "{html}");
     }
 }
+
+/// SME-123 DR11: the dialog opened on the system prompt, its summary under
+/// it, and its numbers ran together ("262144"). The summary comes first,
+/// the prompt is folded, and numbers are grouped.
+mod summary_first_tests {
+    use super::*;
+    use crate::api::chat::ContextDetailSnapshot;
+
+    #[test]
+    fn test_the_summary_comes_before_the_prompt_and_its_numbers_are_grouped() {
+        let detail = ContextDetailSnapshot {
+            system: Some("You are smelt.".to_string()),
+            instructions: vec![],
+            tools: vec![],
+            message_count: 1265,
+            usage: Some(crate::anthropic::TokenUsage {
+                input_tokens: 40_000,
+                output_tokens: 1_039,
+                cache_creation_input_tokens: 165,
+                cache_read_input_tokens: 108_972,
+            }),
+            context_window: 262_144,
+            spend: Default::default(),
+            prices_as_of: None,
+            group_spend: Default::default(),
+            group_root_title: None,
+        };
+        let html = dioxus::ssr::render_element(render_context_detail_body(Some(&Ok(detail))));
+        assert!(html.contains("262,144"), "{html}");
+        assert!(html.contains("input: 40,000") && html.contains("cache read: 108,972") && html.contains("1,265"), "{html}");
+        let window = html.find("Context window").expect("the window");
+        let prompt = html.find("System prompt").expect("the prompt");
+        assert!(window < prompt, "the summary comes first: {html}");
+        assert!(html.contains("<details class=\"context-detail-system\""), "the prompt is folded: {html}");
+    }
+}
