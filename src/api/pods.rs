@@ -348,9 +348,9 @@ pub(crate) async fn stored_storage(pool: &sqlx::PgPool) -> Result<Vec<StoredStor
         .into_iter()
         .map(|conversation| (conversation.id, conversation.title))
         .collect();
-    let stops = db::last_pod_stops(pool).await.map_err(|e| e.to_string())?;
+    // The database's own clock: the stops are its timestamps (SME-354 B14).
+    let (stops, observed_at) = db::last_pod_stops(pool).await.map_err(|e| e.to_string())?;
     let mut rows = storage_rows(&claims, &titles);
-    let observed_at = chrono::Utc::now().naive_utc();
     for row in &mut rows {
         row.observed_at = observed_at;
         row.stopped = stops
