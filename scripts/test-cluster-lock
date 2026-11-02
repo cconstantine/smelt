@@ -100,8 +100,12 @@ for sig in KILL TERM; do
     for _ in $(seq 1 50); do [ -s "$grandchild_pid" ] && break; sleep 0.1; done
     kill -"$sig" "$holder"
     wait "$holder" 2>/dev/null
+    # Liveness is read after the lock reads free, not before: the command
+    # ends by itself, and read the other way round its ending between the
+    # two reads looked like an early release (SME-303, SME-260).
     while alive "$child_pid" || alive "$grandchild_pid"; do
-        lock_is_free && { fail "with-cluster-lock: after $sig to its holder, the lock came free while the command still ran"; break; }
+        lock_is_free && { alive "$child_pid" || alive "$grandchild_pid"; } &&
+            { fail "with-cluster-lock: after $sig to its holder, the lock came free while the command still ran"; break; }
         sleep 0.1
     done
     for f in "$child_pid" "$grandchild_pid"; do alive "$f" && kill "$(cat "$f")"; done

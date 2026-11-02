@@ -2,8 +2,12 @@
 //! things a persona lists by name in `smelt.credentials` to hand one to
 //! the agent that runs under it. Write-only by design (Answer 2): a
 //! value is typed in and never shown again beyond `shown`'s capped
-//! prefix — changing one means typing the new value, and there is no
-//! reveal control, because there is no reveal.
+//! prefix and `lines`' count — changing one means typing the new value,
+//! and there is no reveal control, because there is no reveal. Since
+//! SME-334 both value fields are plain textareas, as the git key box has
+//! always been: the single-line input the form used to hold could not
+//! carry a newline at all, and pastes lost one per line to the browser's
+//! edit path.
 
 use dioxus::prelude::*;
 
@@ -44,6 +48,7 @@ pub fn SecretsPage() -> Element {
                 }
             }
             super::ErrorText { message: load_error() }
+            super::ErrorText { message: action_error() }
             if !loaded() {
                 p { class: "muted", "Loading..." }
             } else {
@@ -105,11 +110,13 @@ fn SecretAddForm(secrets: Signal<Vec<SecretSummary>>, action_error: Signal<Optio
                     oninput: move |e| { name.set(e.value()); action_error.set(None); },
                 }
                 label { r#for: "secret-value", "Value" }
-                input {
+                textarea {
                     id: "secret-value",
-                    r#type: "password",
+                    class: "secret-value-input",
+                    rows: 8,
+                    spellcheck: "false",
+                    placeholder: "Paste the whole credential — multi-line stays multi-line.",
                     value: "{value}",
-                    autocomplete: "new-password",
                     oninput: move |e| { value.set(e.value()); action_error.set(None); },
                 }
                 button { r#type: "submit", disabled: busy(), if busy() { "Adding..." } else { "Add" } }
@@ -185,16 +192,17 @@ fn SecretsList(secrets: Signal<Vec<SecretSummary>>, action_error: Signal<Option<
                             div { class: "sandbox-volume-summary",
                                 span { class: "sandbox-volume-name", "{secret.name}" }
                                 span { class: "sandbox-volume-path secret-shown", "{secret.shown}" }
+                                span { class: "secret-lines", "{lines_shown(secret.lines)}" }
                                 span { class: "secret-created", "{secret.created_at.format(\"%Y-%m-%d\")}" }
                             }
                             div { class: "git-key-actions",
                                 if pending_change() == Some(secret.id) {
-                                    input {
+                                    textarea {
                                         class: "secret-change-input",
-                                        r#type: "password",
+                                        rows: 4,
+                                        spellcheck: "false",
                                         value: "{change_value}",
                                         placeholder: "new value",
-                                        autocomplete: "new-password",
                                         oninput: move |e| { change_value.set(e.value()); action_error.set(None); },
                                     }
                                     button {
@@ -244,14 +252,23 @@ fn pre_submit_error(name: &str, value: &str) -> Option<String> {
 
 /// A row's title text: the full name — never truncated, however long —
 /// then the server's display (`shown` rendered verbatim, never
-/// recomputed here) and the age.
+/// recomputed here) with its line count beside it (SME-334) and the
+/// age.
 fn secret_row(secret: &SecretSummary) -> String {
     format!(
-        "{} — {} — added {}",
+        "{} — {} · {} — added {}",
         secret.name,
         secret.shown,
+        lines_shown(secret.lines),
         secret.created_at.format("%Y-%m-%d")
     )
+}
+
+/// The row's line-count display (SME-334): the number and the word
+/// agreeing — `1 line`, `47 lines`. A count, like `shown`'s byte
+/// length: never a part of the value.
+fn lines_shown(lines: usize) -> String {
+    format!("{lines} {}", if lines == 1 { "line" } else { "lines" })
 }
 
 #[cfg(test)]
@@ -270,16 +287,23 @@ mod tests {
         // What the server's `shown` computes for an 8-byte value — at
         // least 8 hidden means none of it shows. The row renders it
         // verbatim.
-        let row = secret_row(&SecretSummary {
+        let one_line = SecretSummary {
             id: 1,
             name: name.clone(),
             created_at: chrono::NaiveDate::from_ymd_opt(2026, 10, 30).expect("a date").and_time(chrono::NaiveTime::MIN),
             updated_at: chrono::NaiveDate::from_ymd_opt(2026, 10, 30).expect("a date").and_time(chrono::NaiveTime::MIN),
             shown: "(8 bytes)".to_string(),
-        });
+            lines: 1,
+        };
+        let row = secret_row(&one_line);
         assert!(row.contains(&name), "the name is not truncated: {row}");
         assert!(row.contains("(8 bytes)"), "the server's display verbatim: {row}");
+        assert!(row.contains("1 line"), "the row's title carries the line count, singular: {row}");
         assert!(!row.contains(eight), "no value characters reached the row: {row}");
+        // The plural, for anything but one (a 47-line kubeconfig).
+        let many = SecretSummary { lines: 47, ..one_line.clone() };
+        let row_many = secret_row(&many);
+        assert!(row_many.contains("47 lines"), "the count reads as a count: {row_many}");
     }
 
     /// T11: the pre-submit check says the server's words — empty value,
@@ -295,5 +319,9 @@ mod tests {
         );
         assert_eq!(pre_submit_error("linear-key", "").as_deref(), validate_secret_value("").err().as_deref());
         assert!(pre_submit_error("linear-key", "secret-value").is_none());
+        // SME-334: a multi-line value is the server's business — and the
+        // server takes it, byte-exact. The form must not grow its own
+        // newline-aversion to out-early the server's rule.
+        assert!(pre_submit_error("k", "a\nb").is_none());
     }
 }
