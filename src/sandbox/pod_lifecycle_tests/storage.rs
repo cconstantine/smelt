@@ -307,12 +307,19 @@ async fn test_removal_stops_the_conversations_language_server_pods_and_frees_the
             },
             "spec": {
                 "restartPolicy": "Never",
-                // Running, and slow to go: `sleep` as PID 1 ignores SIGTERM, so
-                // a delete takes the whole grace period, and a removal that
-                // didn't wait for it would return while it's still there
-                // (SME-341 review). A request of its own, as the namespace's
-                // LimitRange would otherwise make it 64Gi.
-                "containers": [{"name": "sleep", "image": OWN_SANDBOX_IMAGE, "command": ["sleep", "3600"], "imagePullPolicy": "IfNotPresent", "resources": {"requests": {"memory": "32Mi", "cpu": "10m"}, "limits": {"memory": "256Mi"}}}],
+                // Running, and slow to go: it takes SIGTERM 5 s before it
+                // exits, so a removal that didn't wait for it would return
+                // while it's still there (SME-341 review), and one that does
+                // waits about 5 s, well inside its 30 s. A request of its
+                // own, as the namespace's LimitRange would otherwise make it
+                // 64Gi.
+                "containers": [{
+                    "name": "sleep",
+                    "image": default_sandbox_image(),
+                    "imagePullPolicy": default_image_pull_policy(),
+                    "command": ["sh", "-c", "trap 'sleep 5; exit 0' TERM; sleep 3600 & wait"],
+                    "resources": {"requests": {"memory": "32Mi", "cpu": "10m"}, "limits": {"memory": "256Mi"}},
+                }],
                 "volumes": [{"name": "workspace", "persistentVolumeClaim": {"claimName": name}}],
             },
         }))
