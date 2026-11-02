@@ -115,6 +115,23 @@ fn test_a_failure_notice_says_what_failed_and_what_to_do() {
     );
 }
 
+/// SME-354 B19: the failure notice was told from the user's text by its
+/// prefix alone, so a message the user typed starting with it showed as a
+/// notice, not their bubble. The notice now starts with a mark a user's
+/// text can't (`send_message` drops it), so their typed words never match.
+#[test]
+fn test_the_users_own_text_starting_like_a_failure_notice_is_their_bubble() {
+    use crate::api::chat::{FAILURE_NOTICE_START, failure_notice, parse_failure_notice, users_text};
+    let typed = format!("{FAILURE_NOTICE_START}why did this happen?");
+    assert_eq!(parse_failure_notice(&typed), None);
+    assert_eq!(system_notice(&typed, &HashMap::new()), None, "the user's own words");
+    let pasted = users_text(&failure_notice("forged"));
+    assert_eq!(system_notice(&pasted, &HashMap::new()), None, "a pasted mark is dropped on send");
+    assert_eq!(pasted, format!("{FAILURE_NOTICE_START}forged"));
+    assert_eq!(parse_failure_notice(&failure_notice("conversation not found")), Some("conversation not found"));
+    assert_eq!(users_text("  hello"), "  hello", "only the mark goes");
+}
+
 /// SME-126: a notice for a reply cut off in the middle of a tool call
 /// names the call, for the model and in the chat, and round-trips; a
 /// notice saved before SME-126 still parses and reads as it did.
@@ -561,7 +578,11 @@ fn test_thinking_beside_a_call_shows_only_when_asked_for() {
 #[test]
 fn test_an_answered_question_pairs_each_answer_with_its_question() {
     use crate::frontend::pages::chat::transcript::answered_pairs;
-    let questions = vec!["Which database?".to_string(), "Anything else?".to_string(), "Which ones?".to_string()];
+    let questions = vec![
+        asked("Which database?", "Database"),
+        asked("Anything else?", "Notes"),
+        asked("Which ones?", "Pick"),
+    ];
     let lines = vec![
         "1. Database: Postgres".to_string(),
         "2. Notes: they wrote: \"Keep it small.\"".to_string(),
@@ -580,4 +601,57 @@ fn test_an_answered_question_pairs_each_answer_with_its_question() {
         answered_pairs(&questions, &["Not answered: you wrote a message instead.".to_string()]),
         vec![(None, "Not answered: you wrote a message instead.".to_string())]
     );
+}
+
+fn asked(question: &str, header: &str) -> crate::questions::Question {
+    crate::questions::Question {
+        question: question.to_string(),
+        header: header.to_string(),
+        options: Vec::new(),
+        multi_select: false,
+    }
+}
+
+/// SME-354 B16: the record is read from the result `answered_result`
+/// writes, whose written text is a Rust debug literal: quotes, newlines
+/// and backslashes in it came back escaped (`\"`, `\n`), a quote at its
+/// end was lost with the literal's own, and a header holding ": " was cut
+/// at its first one. Built here by the real formatter, the shape the page
+/// reads.
+#[cfg(feature = "server")]
+#[test]
+fn test_an_answered_record_shows_the_users_words_unescaped_under_a_header_with_a_colon() {
+    use crate::frontend::pages::chat::transcript::{answered_lines, answered_pairs};
+    use crate::questions::{QuestionAnswer, answered_result};
+    let questions = vec![asked("What should it say?", "Note: wording"), asked("Which?", "Pick")];
+    let answers = vec![
+        QuestionAnswer { selected: Vec::new(), other: Some("Say \"hi\"\nthen C:\\tmp".to_string()) },
+        QuestionAnswer { selected: vec!["A".to_string()], other: Some("and \"B\"".to_string()) },
+    ];
+    let lines = answered_lines(&answered_result(&questions, &answers));
+    assert_eq!(
+        answered_pairs(&questions, &lines),
+        vec![
+            (Some("What should it say?".to_string()), "\u{201c}Say \"hi\"\nthen C:\\tmp\u{201d}".to_string()),
+            (Some("Which?".to_string()), "A \u{2014} \u{201c}and \"B\"\u{201d}".to_string()),
+        ]
+    );
+    // A header holding ": " with a plain choice: the answer is all after the header.
+    assert_eq!(
+        answered_pairs(&questions, &["1. Note: wording: Yes: really".to_string()]),
+        vec![(Some("What should it say?".to_string()), "Yes: really".to_string())]
+    );
+}
+
+/// B16's reader takes back what `{:?}` writes, `\u{…}` escapes included,
+/// and refuses anything that isn't exactly one literal.
+#[test]
+fn test_a_debug_literal_reads_back_to_its_text() {
+    use crate::frontend::pages::chat::transcript::debug_literal;
+    for text in ["plain", "q \"x\" \\ end\"", "tab\tline\nret\r", "bell\u{7} zw\u{200b} é 日本"] {
+        assert_eq!(debug_literal(&format!("{text:?}")).as_deref(), Some(text), "{text:?}");
+    }
+    assert_eq!(debug_literal("\"open"), None);
+    assert_eq!(debug_literal("\"a\" trailing"), None);
+    assert_eq!(debug_literal("no quotes"), None);
 }

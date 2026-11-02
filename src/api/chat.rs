@@ -99,22 +99,37 @@ pub const STOP_NOTICE: &str = "The user stopped this turn before it finished. Do
 /// it shows no error line for this (SME-123 DR3). Not server-only.
 pub const TURN_FAILED_NOTED: &str = "the turn failed; the conversation says why";
 
-/// How a failure notice starts. Saved in the conversation when a turn the
-/// user sent or answered fails, so the failure stays in the transcript
-/// after the next turn (it was a line that went when that one started),
-/// and the model knows the request before it wasn't done (SME-123 DR3).
+/// How a failure notice's words start. Saved in the conversation when a
+/// turn the user sent or answered fails, so the failure stays in the
+/// transcript after the next turn (it was a line that went when that one
+/// started), and the model knows the request before it wasn't done
+/// (SME-123 DR3).
 pub const FAILURE_NOTICE_START: &str = "The last turn failed before it finished: ";
+
+/// The mark a failure notice starts with, before its words: U+2063
+/// INVISIBLE SEPARATOR, which `users_text` drops from the start of what the
+/// user sends, so text they type (or paste) starting with the notice's
+/// words is never taken for one (SME-354 B19). Notices saved before the
+/// mark gained it in a migration (`20261103135400_mark_failure_notices`).
+pub const NOTICE_MARK: char = '\u{2063}';
 
 /// The failure notice for a turn that failed with `reason`. The server
 /// writes it; the page only reads one.
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 pub fn failure_notice(reason: &str) -> String {
-    format!("{FAILURE_NOTICE_START}{reason}")
+    format!("{NOTICE_MARK}{FAILURE_NOTICE_START}{reason}")
 }
 
 /// The reason in a failure notice, or None if `text` isn't one.
 pub fn parse_failure_notice(text: &str) -> Option<&str> {
-    text.strip_prefix(FAILURE_NOTICE_START)
+    text.strip_prefix(NOTICE_MARK)?.strip_prefix(FAILURE_NOTICE_START)
+}
+
+/// A message as the user sent it, without `NOTICE_MARK`s at its start:
+/// only smelt's own notices begin with one.
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
+pub fn users_text(text: &str) -> String {
+    text.trim_start_matches(NOTICE_MARK).to_string()
 }
 
 /// What bound a reply's budget (SME-111), which a cut-off notice names

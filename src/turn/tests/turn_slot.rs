@@ -8,7 +8,7 @@
 //! own (`summary`), answers them in arrival order from a list of bodies, and
 //! holds every request until the test releases it — the same shape as
 //! `anthropic::stream::tests::limiter`'s, and the reason each test names its
-//! provider ids uniquely (9162000311–318: the pools are process-wide by
+//! provider ids uniquely (9162000311–319: the pools are process-wide by
 //! provider id, and 9162000301/302 are `providers/tests/server_tests/llama`'s).
 
 use super::*;
@@ -581,4 +581,70 @@ async fn test_clearing_and_resetting_a_limit_mid_turn_records_the_wait_once(pool
         1,
         "the turn's one wait survives a replaced pool: recorded once"
     );
+}
+
+/// SME-354 B6: a parent's turn gives its slot up across a tool pass while
+/// one of its own agents on the same provider is live, and takes it again
+/// before its next call — so the child, queued on the slot, makes its call
+/// between the parent's two, and finishes before the parent's turn ends.
+/// Red before the fix: the parent holds the slot through the tool pass
+/// (SME-343), the child's call reaches the server only after the parent's
+/// whole turn ends. T1 is the other side: a stranger (no child) still waits.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_parents_turn_lets_its_own_agent_call_between_its_calls(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let (addr, gate) = start_slot_gate(vec![
+        GateResponse::Sse(unknown_tool_call_body("Thinking.", "no_such_tool_354")),
+        GateResponse::Sse(text_reply_body("Child done.")),
+        GateResponse::Sse(text_reply_body("Parent done.")),
+    ])
+    .await;
+    let (_provider, a, b) = slot_provider_and_conversations(&pool, addr, 9_162_000_319, Some(1)).await;
+    // B is A's own agent, active, on A's provider.
+    sqlx::query("UPDATE conversations SET parent_id = $1 WHERE id = $2")
+        .bind(a)
+        .bind(b)
+        .execute(&pool)
+        .await
+        .expect("B under A");
+    sqlx::query("INSERT INTO agents (conversation_id, root_id, depth, brief, state, started_at) VALUES ($1, $2, 1, 'b', 'active', now())")
+        .bind(b)
+        .bind(a)
+        .execute(&pool)
+        .await
+        .expect("B's agent row");
+
+    // A pauses between its first reply and its tool pass, holding the slot.
+    let (reached, resume) = test_hooks::pause_after_reply_saved(a);
+    let turn_a = tokio::spawn({
+        let pool = pool.clone();
+        async move { run_turn(&pool, a, call_message("a")).await }
+    });
+    gate.wait_for_arrivals(1).await;
+    gate.release_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached)
+        .await
+        .expect("A's first reply is saved")
+        .expect("hook");
+
+    // The child queues on the slot A holds.
+    let turn_b = tokio::spawn({
+        let pool = pool.clone();
+        async move { run_turn(&pool, b, call_message("b")).await }
+    });
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(gate.arrivals(), ["a"], "the child waits while A's call holds the slot");
+
+    drop(resume); // A's tool pass: its slot goes to the queued child
+    gate.wait_for_arrivals(2).await;
+    assert_eq!(gate.arrivals()[..2], ["a", "b"], "the child's call went between A's two");
+    gate.release_one(); // the child's reply
+    finished(turn_b).await;
+    assert!(!turn_a.is_finished(), "the child finished while A's turn still waits on its next call");
+
+    gate.wait_for_arrivals(3).await;
+    assert_eq!(gate.arrivals()[2], "a", "A took the slot back for its next call");
+    gate.release_one(); // A's final reply
+    finished(turn_a).await;
+    assert_eq!(gate.peak.load(Ordering::SeqCst), 1, "the slot never double-handed");
 }

@@ -35,6 +35,11 @@ pub(super) struct ConversationState {
     /// Whether the server has a turn running (or queued) here, whoever
     /// started it (`ConversationEvent::TurnState`).
     pub(super) turn_running: bool,
+    /// Whether `turn_running` has been told yet, by the (re)connect pull's
+    /// `get_turn_state` or a `TurnState` event: until then it's only the
+    /// default, and the todo panel says nothing about whether the list is
+    /// worked on (SME-354 B17).
+    pub(super) turn_state_known: bool,
     /// Seconds the current turn has been running, for the "Working…"
     /// line: the server's clock, from the busy spell's start — set from
     /// `ConversationEvent::TurnState` and the reconnect pull, and ticked
@@ -244,6 +249,7 @@ pub(super) fn apply_event(state: Store<ConversationState>, event: ConversationEv
         ConversationEvent::QuestionUpdate { question } => state.pending_question().set(question),
         ConversationEvent::TurnState { running, elapsed } => {
             state.turn_running().set(running);
+            state.turn_state_known().set(true);
             // SME-160: the timer shows the turn's age on the server's
             // clock, not this tab's own.
             state.turn_elapsed().set(elapsed);

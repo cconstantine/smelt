@@ -110,6 +110,7 @@ pub(super) fn use_conversation_events(
     let mut load_error = state.load_error();
     let mut streaming_reply = state.streaming_reply();
     let mut turn_running = state.turn_running();
+    let mut turn_state_known = state.turn_state_known();
     let mut turn_elapsed = state.turn_elapsed();
     let mut todos = state.todos();
     let mut pending_question = state.pending_question();
@@ -185,6 +186,7 @@ pub(super) fn use_conversation_events(
                     }
                     if let Ok((running, elapsed)) = get_turn_state(id).await {
                         turn_running.set(running);
+                        turn_state_known.set(true);
                         // SME-160: the turn's real age from the
                         // server's clock, so a reload mid-turn shows
                         // it counting on rather than from 0s.

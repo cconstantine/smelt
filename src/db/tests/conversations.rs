@@ -426,3 +426,43 @@ async fn test_the_title_migration_tidies_titles_saved_with_markdown(pool: PgPool
         assert_eq!(title, want);
     }
 }
+
+/// SME-354 B19's migration: a failure notice saved before the mark gains
+/// it, so it still shows as a notice; nothing else changes, and a second
+/// run changes nothing more.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_failure_notice_migration_marks_the_notices_saved_before_it(pool: PgPool) {
+    use crate::anthropic::ContentBlock;
+    let conversation = create_conversation(&pool).await.expect("conversation");
+    let legacy = format!("{}model provider error 500", crate::api::chat::FAILURE_NOTICE_START);
+    let text = |t: &str| vec![ContentBlock::Text { text: t.to_string() }];
+    let notice = create_message(&pool, conversation.id, "user", &text(&legacy)).await.expect("legacy notice");
+    let other = create_message(&pool, conversation.id, "user", &text("hello")).await.expect("plain text");
+    let reply = create_message(&pool, conversation.id, "assistant", &text(&legacy)).await.expect("a reply quoting it");
+    for _ in 0..2 {
+        sqlx::raw_sql(include_str!("../../../migrations/20261103135400_mark_failure_notices.sql"))
+            .execute(&pool)
+            .await
+            .expect("run the migration");
+    }
+    let saved = |id: i64| {
+        let pool = pool.clone();
+        async move {
+            let content: String =
+                sqlx::query_scalar("SELECT content FROM messages WHERE id = $1").bind(id).fetch_one(&pool).await.expect("content");
+            let blocks: Vec<ContentBlock> = serde_json::from_str(&content).expect("still JSON blocks");
+            match blocks.as_slice() {
+                [ContentBlock::Text { text }] => text.clone(),
+                other => panic!("one text block: {other:?}"),
+            }
+        }
+    };
+    assert_eq!(
+        crate::api::chat::parse_failure_notice(&saved(notice.id).await),
+        Some("model provider error 500"),
+        "the old notice still reads as one"
+    );
+    assert_eq!(saved(notice.id).await, crate::api::chat::failure_notice("model provider error 500"), "marked once");
+    assert_eq!(saved(other.id).await, "hello");
+    assert_eq!(saved(reply.id).await, legacy, "only the user role's notices");
+}

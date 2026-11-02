@@ -171,6 +171,7 @@ fn test_conversation_state_starts_empty() {
         load_error,
         streaming_reply,
         turn_running,
+        turn_state_known,
         turn_elapsed,
         notification_delivery_error,
         todos,
@@ -202,6 +203,7 @@ fn test_conversation_state_starts_empty() {
     assert!(load_error.is_none(), "load_error");
     assert!(streaming_reply.is_none(), "streaming_reply");
     assert!(!turn_running, "turn_running");
+    assert!(!turn_state_known, "turn_state_known");
     assert_eq!(turn_elapsed, 0, "turn_elapsed");
     assert!(notification_delivery_error.is_none(), "notification_delivery_error");
     assert!(todos.is_empty(), "todos");

@@ -129,7 +129,11 @@ fn descendants<'a>(
 /// waiting for the user: their trees fold away by themselves, so a list
 /// of finished agent work doesn't bury the user's own conversations
 /// (SME-123 DR1: 182 rows, all unfolded, on the deployed instance).
+/// A tree still getting going isn't settled either (SME-354 B15): an agent
+/// still starting or waiting on its parent's answer, or a parent with a
+/// turn running — it would fold before its work began, and stay folded.
 pub(super) fn settled_parents(nodes: &[ConversationNode]) -> Vec<i64> {
+    let busy: HashSet<i64> = nodes.iter().filter(|n| n.busy).map(|n| n.id).collect();
     let ids: HashSet<i64> = nodes.iter().map(|n| n.id).collect();
     let mut children: HashMap<i64, Vec<&ConversationNode>> = HashMap::new();
     for node in nodes {
@@ -140,8 +144,18 @@ pub(super) fn settled_parents(nodes: &[ConversationNode]) -> Vec<i64> {
     children
         .keys()
         .copied()
-        .filter(|id| descendants(*id, &children, &mut HashSet::new()).iter().all(|n| !n.busy && !n.waiting_for_user))
+        .filter(|id| !busy.contains(id))
+        .filter(|id| descendants(*id, &children, &mut HashSet::new()).iter().all(|n| !unsettled(n)))
         .collect()
+}
+
+/// Whether an agent keeps its tree open: working, waiting for the user,
+/// still starting, or waiting on its parent's answer (`agents::status`'s
+/// words, as the node carries them).
+fn unsettled(node: &ConversationNode) -> bool {
+    node.busy
+        || node.waiting_for_user
+        || matches!(node.status.as_deref(), Some("starting" | "waiting for its parent"))
 }
 
 /// How many of `id`'s descendants wait for the user.
@@ -294,6 +308,30 @@ mod tests {
         settled.sort_unstable();
         // 1 and 2 are settled; 4 has a busy agent; 6 and 7 have one waiting; 9 has no agents.
         assert_eq!(settled, vec![1, 2]);
+    }
+
+    fn with_status(mut n: ConversationNode, status: &str) -> ConversationNode {
+        n.status = Some(status.to_string());
+        n
+    }
+
+    /// SME-354 B15: a tree still getting going isn't settled — a child
+    /// still starting, one waiting on its parent's answer, or a parent with
+    /// a turn of its own running — so it doesn't fold away (for the tab's
+    /// life) before the work in it began.
+    #[test]
+    fn test_a_starting_child_a_child_waiting_on_its_parent_or_a_busy_parent_keeps_the_tree_open() {
+        let list = vec![
+            node(1, None),
+            with_status(node(2, Some(1)), "starting"),
+            node(3, None),
+            with_status(node(4, Some(3)), "waiting for its parent"),
+            busy(node(5, None)),
+            with_status(node(6, Some(5)), "finished"),
+            node(7, None),
+            with_status(node(8, Some(7)), "finished"),
+        ];
+        assert_eq!(settled_parents(&list), vec![7], "only the tree with nothing left to do folds");
     }
 
     #[test]
