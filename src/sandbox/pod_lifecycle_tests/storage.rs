@@ -35,9 +35,29 @@ async fn wait_holder_mounting(client: &kube::Client, holder: &str, claim: &str) 
     assert!(protected.is_ok(), "{claim} never gained the pvc-protection finalizer while {holder} mounted it");
 }
 
+/// Waits for `holder` to be scheduled, for a holder whose container never
+/// starts (an image that doesn't exist): protection counts a pod as using
+/// a claim once it has a node, Running or not, and with a claim that binds
+/// on its first consumer that's only once the provisioner has made its
+/// volume. Before it, a delete of the claim (or of the pod) finishes at
+/// once, and a test of what holds the claim proves nothing (SME-341).
+async fn wait_holder_scheduled(client: &kube::Client, holder: &str) {
+    let scheduled = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let pod = pods_api(client).get(holder).await.expect("read the holder pod");
+            if pod.spec.and_then(|s| s.node_name).is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await;
+    assert!(scheduled.is_ok(), "{holder} was never scheduled, so it couldn't hold its claim");
+}
+
 /// SME-253: a claim already being deleted is never mounted by the next
-/// pod. A holder pod (one that never starts, so nothing real is mounted)
-/// keeps a deleted claim alive with a `deletion_timestamp` — the doomed
+/// pod. A scheduled holder pod (its container never starts, so nothing
+/// runs on the volume) keeps a deleted claim alive with a `deletion_timestamp` — the doomed
 /// volume would fall out from under any pod started onto it. Starting a
 /// pod over it waits the claim out and creates a fresh one; the holder is
 /// freed midway so the wait ends, as it does in the real race.
@@ -84,23 +104,11 @@ async fn test_a_terminating_claim_is_not_reused_by_the_next_pod(pool: PgPool) {
             .metadata
             .name
             .expect("a created pod's name");
-        // Protection counts only a scheduled pod as using a claim, and this
-        // claim binds (and the holder gets its node) only once the
-        // provisioner has made its volume. Deleted before that, nothing held
-        // it: the claim read Terminating only until the protection
-        // controller let it go, and the read below lost that race in CI
-        // ("read the claim back: ... not found", SME-341).
-        let scheduled = tokio::time::timeout(Duration::from_secs(60), async {
-            loop {
-                let pod = pods_api(&client).get(&holder_name).await.expect("read the holder pod");
-                if pod.spec.and_then(|s| s.node_name).is_some() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        })
-        .await;
-        assert!(scheduled.is_ok(), "the holder pod was never scheduled, so it couldn't hold the claim");
+        // Deleted before the holder is scheduled, nothing held the claim:
+        // it read Terminating only until the protection controller let it
+        // go, and the read below lost that race in CI ("read the claim
+        // back: ... not found", SME-341).
+        wait_holder_scheduled(&client, &holder_name).await;
 
         pvc_api(&client).delete(&name, &DeleteParams::default()).await.expect("delete the claim");
         let doomed_now = pvc_api(&client).get(&name).await.expect("read the claim back");
@@ -299,23 +307,31 @@ async fn test_removal_stops_the_conversations_language_server_pods_and_frees_the
             },
             "spec": {
                 "restartPolicy": "Never",
-                // A request of its own: given none, the namespace's
-                // LimitRange (max only, 64Gi) makes the default request
-                // 64Gi too, which no test node has, so the holder was never
-                // scheduled and never held the claim (SME-341).
-                "containers": [{
-                    "name": "sandbox",
-                    "image": "smelt.invalid/none:0",
-                    "resources": {"requests": {"memory": "16Mi"}, "limits": {"memory": "16Mi"}},
-                }],
+                // Running, and slow to go: `sleep` as PID 1 ignores SIGTERM, so
+                // a delete takes the whole grace period, and a removal that
+                // didn't wait for it would return while it's still there
+                // (SME-341 review). A request of its own, as the namespace's
+                // LimitRange would otherwise make it 64Gi.
+                "containers": [{"name": "sleep", "image": OWN_SANDBOX_IMAGE, "command": ["sleep", "3600"], "imagePullPolicy": "IfNotPresent", "resources": {"requests": {"memory": "32Mi", "cpu": "10m"}, "limits": {"memory": "256Mi"}}}],
                 "volumes": [{"name": "workspace", "persistentVolumeClaim": {"claimName": name}}],
             },
         }))
         .expect("pod");
         pods_api(&client).create(&PostParams::default(), &holder).await.expect("create the LSP holder");
+        // Mounting first, so the pod holds the claim; one not yet there is
+        // deleted at once, waited for or not (SME-341 review).
+        let holder_name = format!("lsp-holder-{id}");
+        wait_holder_mounting(&client, &holder_name, &name).await;
 
         let removal = remove_conversation_storage(&pool, id).await.expect("remove_conversation_storage");
         assert_eq!(removal.lsp_pods_stopped, 1, "the conversation's language-server pod was deleted");
+        // Removal waits for the pod to be gone before it goes on: by the
+        // time it returns, the pod is. A removal that only asked for the
+        // delete returns while the pod is still terminating.
+        assert!(
+            pods_api(&client).get_opt(&holder_name).await.expect("look for the LSP holder").is_none(),
+            "removal returned before the language-server pod mounting the claim was gone"
+        );
         assert!(!removal.pod_stopped, "no sandbox pod row existed");
 
         let gone = tokio::time::timeout(Duration::from_secs(60), async {
