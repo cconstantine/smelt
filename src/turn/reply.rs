@@ -188,6 +188,17 @@ pub(super) async fn run_tools(
         if let anthropic::ContentBlock::ToolUse { id, name, input } = block
             && is_question(name)
         {
+            // The chain speaks first, as for every other tool (SME-354
+            // B9): a question it denies is refused even when the model
+            // calls it unoffered.
+            if let Err(denied) = anthropic::tools::question_allowed(pool, conversation_id, name, input).await {
+                result_blocks.push(anthropic::ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: denied,
+                    is_error: Some(true),
+                });
+                continue;
+            }
             let refused = match asked {
                 Some(first) if first == name && name == crate::questions::ASK_USER => {
                     "ask one set of questions at a time: put them all in one ask_user call".to_string()

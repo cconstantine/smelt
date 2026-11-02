@@ -339,6 +339,21 @@ mod server {
         crate::personas::rules::RuleChain::try_from_stored(stored).map_err(refused)
     }
 
+    /// Whether this conversation's chain lets it call the question tool
+    /// `name` (`ask_user`, `ask_parent`), which the turn handles itself
+    /// rather than through `execute` (SME-354 B9): the same check, at the
+    /// tool's class for this input, and the same refusal as any denied
+    /// tool's.
+    pub async fn question_allowed(pool: &PgPool, conversation_id: i64, name: &str, input: &Value) -> Result<(), String> {
+        let Target::Native(registered) = resolve(pool, name).await? else {
+            return Err(format!("unknown tool: {name}"));
+        };
+        let class = registered.tool.class.of_call(input);
+        call_rule_chain(pool, conversation_id, name)
+            .await?
+            .allows_at(crate::personas::rules::ToolRef::Native(name), class)
+    }
+
     /// Refuses a call to a tool this conversation isn't offered (SME-236),
     /// read from the database rather than from what was offered.
     async fn offered_to(pool: &PgPool, conversation_id: i64, name: &str, offer: super::Offer) -> Result<(), String> {
@@ -480,6 +495,8 @@ mod server {
 
 #[cfg(feature = "server")]
 pub use server::execute;
+#[cfg(feature = "server")]
+pub use server::question_allowed;
 // Test-only: `turn`'s tests read the native tool names.
 #[cfg(all(feature = "server", test))]
 pub use server::native_tool_definitions;
