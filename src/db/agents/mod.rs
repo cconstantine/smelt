@@ -325,8 +325,34 @@ async fn subtree_ids(conn: &mut sqlx::PgConnection, id: i64) -> Result<Vec<i64>,
     Ok(ids)
 }
 
+/// Locks `id` and every conversation under it `FOR NO KEY UPDATE`, the
+/// mode `create_child` takes on its caller, and returns their ids as
+/// `subtree_ids` does (SME-354 B1). A `create_child` by any of them that
+/// held its row first has committed by the time the lock is granted, so
+/// the subtree is read again under the locks until nothing new appears;
+/// one that comes later waits for the caller's commit and sees its
+/// writes (`stopped`, `deleting_at`). A new child's id is larger than
+/// every row already locked, so the rows are still taken in ascending id.
+pub(super) async fn lock_subtree(conn: &mut sqlx::PgConnection, id: i64) -> Result<Vec<i64>, sqlx::Error> {
+    let mut locked: Vec<i64> = Vec::new();
+    loop {
+        let subtree = subtree_ids(&mut *conn, id).await?;
+        let new: Vec<(i64, RowLock)> = subtree
+            .iter()
+            .filter(|row| !locked.contains(row))
+            .map(|row| (*row, RowLock::NoKeyUpdate))
+            .collect();
+        if new.is_empty() {
+            return Ok(subtree);
+        }
+        lock_conversations(&mut *conn, &new).await?;
+        locked.extend(new.iter().map(|(row, _)| *row));
+    }
+}
+
 /// `stop_agent`'s transaction: `id`, one of `caller`'s children, and its
-/// whole subtree set `stopped`, the rows locked in ascending id first. The
+/// whole subtree set `stopped`, the rows locked in ascending id first
+/// (`lock_subtree`, so a grandchild being made meanwhile is in it). The
 /// caller stops their turns after the commit (state first, SME-217's order).
 pub async fn stop_subtree(pool: &PgPool, caller: i64, id: i64) -> Result<StopSubtree, sqlx::Error> {
     let mut tx = pool.begin().await?;
@@ -341,9 +367,7 @@ pub async fn stop_subtree(pool: &PgPool, caller: i64, id: i64) -> Result<StopSub
     if !is_child {
         return Ok(StopSubtree::NotYourChild);
     }
-    let subtree = subtree_ids(&mut tx, id).await?;
-    let locks: Vec<(i64, RowLock)> = subtree.iter().map(|id| (*id, RowLock::KeyShare)).collect();
-    lock_conversations(&mut tx, &locks).await?;
+    let subtree = lock_subtree(&mut tx, id).await?;
     let state = sqlx::query_scalar::<_, String>("SELECT state FROM agents WHERE conversation_id = $1")
         .bind(id)
         .fetch_optional(&mut *tx)

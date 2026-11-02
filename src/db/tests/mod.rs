@@ -69,6 +69,7 @@ mod usage;
 mod providers;
 mod instance;
 mod agents;
+mod agent_races;
 mod agent_volumes;
 mod secrets;
 mod storage_grace;

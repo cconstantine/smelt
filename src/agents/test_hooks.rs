@@ -95,6 +95,10 @@ pub const DELETE_LOCKED: &str = "delete_locked";
 /// memory and before it writes it.
 pub const STORE_PAUSE_READ: &str = "store_pause_read";
 
+/// `create_child` by caller `id`, holding its row's lock with every
+/// check passed (its state read), before it writes the child.
+pub const CREATE_CHILD_LOCKED: &str = "create_child_locked";
+
 /// `finish` by child `id`, after its state's update and before its report.
 pub const FINISH_UPDATED: &str = "finish_updated";
 

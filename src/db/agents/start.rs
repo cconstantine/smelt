@@ -187,6 +187,8 @@ pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChi
             )
         }
     };
+    #[cfg(test)]
+    crate::agents::test_hooks::reach(crate::agents::test_hooks::CREATE_CHILD_LOCKED, new.caller).await;
     let (provider_id, model) = new.model.clone().unzip();
     let child = sqlx::query_scalar::<_, i64>(
         "INSERT INTO conversations (title, parent_id, provider_id, model) VALUES ($1, $2, $3, $4) RETURNING id",

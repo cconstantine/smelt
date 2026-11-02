@@ -43,7 +43,9 @@ pub async fn mark_subtree_deleting(pool: &PgPool, id: i64) -> Result<Option<Dele
     else {
         return Ok(None);
     };
-    let subtree = subtree_ids(&mut tx, id).await?;
+    // Every row in the subtree too, not just the root: a `create_child`
+    // by an agent below the root locks only its own row (SME-354 B1).
+    let subtree = lock_subtree(&mut tx, id).await?;
     sqlx::query("UPDATE conversations SET deleting_at = now() WHERE id = ANY($1)")
         .bind(&subtree)
         .execute(&mut *tx)
