@@ -51,7 +51,21 @@ pub(super) fn ConversationHeader(
     };
     rsx! {
         div { class: "conversation-header",
-            h1 { class: "conversation-header-title", title: "{info.title}", "{info.title}" }
+            div { class: "conversation-header-top",
+                h1 { class: "conversation-header-title", title: "{info.title}", "{info.title}" }
+                // Thinking beside tool calls and replies is hidden unless
+                // asked for (SME-123 DR6).
+                button {
+                    class: "conversation-thinking-toggle",
+                    r#type: "button",
+                    aria_pressed: "{super::transcript::SHOW_THINKING()}",
+                    onclick: move |_| {
+                        let shown = *super::transcript::SHOW_THINKING.peek();
+                        *super::transcript::SHOW_THINKING.write() = !shown;
+                    },
+                    if super::transcript::SHOW_THINKING() { "Hide thinking" } else { "Show thinking" }
+                }
+            }
             if info.meta.is_some() || info.parent.is_some() {
                 div { class: "conversation-header-meta",
                     if let Some(meta) = info.meta {

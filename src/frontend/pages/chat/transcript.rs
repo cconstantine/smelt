@@ -274,11 +274,12 @@ pub(super) fn MessageView(
     match message.blocks() {
         Ok(blocks) => {
             let thinking_open = reply_is_only_thinking(&message.role, &blocks);
+            let shown = shown_blocks(&message.role, &blocks, SHOW_THINKING());
             let tool_names = tool_names.read();
             let tool_results = tool_results.read();
             let commands = commands.read();
             rsx! {
-                for (i , block) in blocks.iter().enumerate() {
+                for (i , block) in shown.iter().map(|&i| (i, &blocks[i])) {
                     {render_block_element(message.id, i, &message.role, message.created_at, tz_offset_minutes, block, &tool_names, &tool_results, &commands, thinking_open, on_media_load, reply_part.as_ref(), lit_reply)}
                 }
             }
@@ -507,5 +508,9 @@ pub(super) fn Transcript(
 }
 
 mod text;
+
+/// Whether the transcript shows thinking beside tool calls and replies, in
+/// this tab (SME-123 DR6). Off: it made half the rows.
+pub(in crate::frontend::pages::chat) static SHOW_THINKING: GlobalSignal<bool> = Signal::global(|| false);
 
 pub(in crate::frontend::pages::chat) use text::*;

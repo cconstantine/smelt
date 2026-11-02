@@ -130,6 +130,24 @@ fn test_a_cut_off_notice_names_the_call_it_was_cut_in() {
     assert_eq!(parse_cut_off_notice(&format!("{old} And more.")), None);
 }
 
+/// SME-123 DR6: a long or multi-line command was repeated whole in its
+/// notice, four lines of centred grey; the notice keeps its first line,
+/// cut at 60 characters.
+#[test]
+fn test_a_long_command_is_cut_short_in_its_notice() {
+    let long = "cd /workspace/smelt && git diff --stat && echo \"--- proof: changed paths ---\" && git diff --name-only";
+    let commands = HashMap::from([
+        ("long".to_string(), long.to_string()),
+        ("lines".to_string(), "set -e\npython3 -m pytest -q".to_string()),
+    ]);
+    let shown = system_notice("Terminal command long finished: exit code 0.", &commands).expect("a notice");
+    assert_eq!(shown, "`cd /workspace/smelt && git diff --stat && echo \"--- proof: c\u{2026}` finished (exit code 0)");
+    assert_eq!(
+        system_notice("Terminal command lines finished: exit code 1.", &commands).as_deref(),
+        Some("`set -e \u{2026}` finished (exit code 1)")
+    );
+}
+
 #[test]
 fn test_system_notices_read_as_short_sentences() {
     let commands = HashMap::from([("abc123".to_string(), "python3 primes.py".to_string())]);
@@ -198,7 +216,8 @@ fn test_an_idle_notice_splits_at_its_own_marker() {
     let commands = HashMap::from([("abc123".to_string(), line.clone())]);
     assert_eq!(
         system_notice(&notice, &commands).as_deref(),
-        Some(format!("`{line}` is still running, untouched for 5 minutes")).as_deref(),
+        // The command shows cut at 60 characters (SME-123 DR6).
+        Some(format!("`{}\u{2026}` is still running, untouched for 5 minutes", line.chars().take(60).collect::<String>())).as_deref(),
         "cut at the notice's own marker, not at the one inside the quoted command"
     );
     // An unknown command id still falls back like every other notice's.
@@ -510,4 +529,19 @@ fn test_the_quiet_stop_notices_smelt_saves_are_summarized() {
         system_notice(&finished, &commands).as_deref(),
         Some("The sandbox stopped when this agent finished; /workspace and Docker's data are kept")
     );
+}
+
+/// SME-123 DR6: half the transcript was Thinking rows, one beside every
+/// tool call. Beside a call or a reply, thinking shows only when asked
+/// for; a reply that is only thinking still shows it.
+#[test]
+fn test_thinking_beside_a_call_shows_only_when_asked_for() {
+    use crate::frontend::pages::chat::transcript::shown_blocks;
+    let thinking = ContentBlock::Thinking { thinking: "hmm".to_string(), signature: String::new() };
+    let call = ContentBlock::ToolUse { id: "t1".to_string(), name: "read_file".to_string(), input: serde_json::json!({}) };
+    let both = vec![thinking.clone(), call.clone()];
+    assert_eq!(shown_blocks("assistant", &both, false), vec![1]);
+    assert_eq!(shown_blocks("assistant", &both, true), vec![0, 1]);
+    assert_eq!(shown_blocks("assistant", &[thinking.clone()], false), vec![0], "only thinking: shown");
+    assert_eq!(shown_blocks("user", &[call], false), vec![0]);
 }

@@ -498,3 +498,26 @@ body {
         padding: 8px 12px 4px;
     }
 }
+
+.conversation-header-top {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    min-width: 0;
+}
+
+.conversation-header-top .conversation-header-title {
+    flex: 1;
+    min-width: 0;
+}
+
+.conversation-thinking-toggle {
+    flex-shrink: 0;
+    padding: 2px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: none;
+    color: var(--text-2);
+    font-size: 12px;
+    cursor: pointer;
+}

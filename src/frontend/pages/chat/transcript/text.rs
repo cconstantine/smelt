@@ -332,6 +332,38 @@ pub(in crate::frontend::pages::chat) fn reply_is_only_thinking(role: &str, block
         && blocks.iter().all(|b| matches!(b, ContentBlock::Thinking { .. }))
 }
 
+/// The indexes of `blocks` the transcript shows. Thinking beside a tool
+/// call or a reply shows only when `show_thinking` asks for it: one
+/// beside every call made half the transcript Thinking rows (SME-123
+/// DR6). A reply that is only thinking shows it either way.
+pub(in crate::frontend::pages::chat) fn shown_blocks(role: &str, blocks: &[ContentBlock], show_thinking: bool) -> Vec<usize> {
+    let keep_thinking = show_thinking || reply_is_only_thinking(role, blocks);
+    blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| keep_thinking || !matches!(b, ContentBlock::Thinking { .. }))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// A command as a notice names it: its first line, cut at 60 characters,
+/// with an ellipsis for what's left out (SME-123 DR6: a long command was
+/// repeated whole, four lines of centred grey).
+fn short_command(line: &str) -> String {
+    const SHOWN: usize = 60;
+    let mut lines = line.lines();
+    let first = lines.next().unwrap_or_default().trim_end();
+    let more_lines = lines.next().is_some();
+    if first.chars().count() > SHOWN {
+        let cut: String = first.chars().take(SHOWN).collect();
+        format!("{cut}\u{2026}")
+    } else if more_lines {
+        format!("{first} \u{2026}")
+    } else {
+        first.to_string()
+    }
+}
+
 /// A notice smelt saved into the conversation for the model (a command
 /// finishing, the sandbox stopping), as the
 /// short sentence the chat shows in place of a user bubble, without
@@ -340,7 +372,7 @@ pub(in crate::frontend::pages::chat) fn reply_is_only_thinking(role: &str, block
 /// command's id to the command line, from `terminal_commands_by_id`.
 pub(in crate::frontend::pages::chat) fn system_notice(text: &str, commands: &HashMap<String, String>) -> Option<String> {
     let command = |id: &str| match commands.get(id) {
-        Some(line) => format!("`{line}`"),
+        Some(line) => format!("`{}`", short_command(line)),
         None => "A command".to_string(),
     };
     // Each split is at the *last* occurrence of smelt's own marker: a
