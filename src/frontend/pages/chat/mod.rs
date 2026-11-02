@@ -303,7 +303,7 @@ fn ChatPanel(
                 None => rsx! { empty_home::EmptyHome {} },
                 Some(_) => {
                     rsx! {
-                    if !sandbox_pods().is_empty() || !repos().is_empty() || !todos().is_empty() || browsing_session_open() || !stored_volumes().is_empty() {
+                    if !conversation_missing() && (!sandbox_pods().is_empty() || !repos().is_empty() || !todos().is_empty() || browsing_session_open() || !stored_volumes().is_empty()) {
                         div { class: "side-panels-row",
                             if browsing_session_open() {
                                 BrowsingPanel {
@@ -328,7 +328,12 @@ fn ChatPanel(
                         }
                     }
                     div { class: "chat-main",
-                        conversation_header::ConversationHeader { selected, nodes: conversation_nodes }
+                        // A conversation deleted elsewhere keeps neither its
+                        // header nor its side panels (SME-354 B24: its sandbox
+                        // panel's Remove volumes stayed up).
+                        if !conversation_missing() {
+                            conversation_header::ConversationHeader { selected, nodes: conversation_nodes }
+                        }
                         AgentsWaitingBanner { selected, conversations_changed, questions_changed }
                         ContextUsage {
                             selected,
