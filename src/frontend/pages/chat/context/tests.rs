@@ -344,6 +344,22 @@ mod group_spend_tests {
         dioxus::ssr::render_element(render_context_detail_body(Some(&Ok(detail))))
     }
 
+    /// SME-354 B21: on an unpriced model the group line said only "No
+    /// price for this model…": the group's calls and tokens appeared
+    /// nowhere, and the conversation's own count printed under the group
+    /// line as if it were the group's.
+    #[test]
+    fn test_an_unpriced_groups_line_carries_its_own_counts_after_the_conversations() {
+        let own = ConversationSpend { calls: 3, unpriced_calls: 3, input_tokens: 100, output_tokens: 10, ..ConversationSpend::default() };
+        let group = ConversationSpend { calls: 27, unpriced_calls: 27, input_tokens: 9_000, output_tokens: 900, ..ConversationSpend::default() };
+        let html = render(detail(own, group, Some("Build the thing")));
+        assert!(html.contains("27 model calls"), "the group's own call count: {html}");
+        assert!(html.contains("9,000"), "the group's own tokens: {html}");
+        let own_line = html.find("3 model calls").expect("the conversation's own count");
+        let group_line = html.find("group:").expect("the group line");
+        assert!(own_line < group_line, "the conversation's own count comes before the group's: {html}");
+    }
+
     #[test]
     fn test_an_agents_context_view_shows_its_groups_spend_under_the_root_title() {
         let html = render(detail(spend(1, Some(1.0), 0), spend(2, Some(5.0), 0), Some("Build the thing")));
