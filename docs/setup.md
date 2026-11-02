@@ -180,8 +180,8 @@ from scratch.
 **A change to docs alone doesn't run the tests** (SME-341). A first job,
 `changes`, compares the change's files: when every one is under `docs/`, a
 top-level `*.md` or a `.agents/**/*.md` (never `src/`, whose Markdown the
-build can compile in), `server` and `browser` are skipped, and a `docs` job runs only the
-repo lints (`cargo test --features server repo_lints`: the size ceiling,
+build can compile in), `server` and `browser` are skipped, and a `docs`
+job runs only the repo lints (`cargo test --features server repo_lints`: the size ceiling,
 links and persona files, which do read docs), in the `smelt` service with no
 database or cluster (`start-stack` with `full: false`). Anything else, a
 manual run, or a range it can't read runs everything, as before.
