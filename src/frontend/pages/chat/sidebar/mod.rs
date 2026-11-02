@@ -204,13 +204,17 @@ pub(super) fn ConversationSidebar(
             // server render (SME-269).
             "data-app-live": app_live().then_some("true"),
             button { class: "new-conversation", onclick: move |e| { open_on_phone.set(false); new_conversation(e) }, "New conversation" }
-            Link { to: Route::ProvidersRoute {}, class: "sandbox-volumes-link providers-link", "Model providers" }
-            Link { to: Route::McpServersRoute {}, class: "mcp-servers-link", "MCP servers" }
-            Link { to: Route::PodsRoute {}, class: "pods-link", "Sandboxes" }
-            Link { to: Route::SandboxVolumesRoute {}, class: "sandbox-volumes-link", "Sandbox volumes" }
-            Link { to: Route::GitRoute {}, class: "sandbox-volumes-link git-link", "Git" }
-            Link { to: Route::SecretsRoute {}, class: "sandbox-volumes-link secrets-link", "Secrets" }
-            Link { to: Route::LanguageServersRoute {}, class: "sandbox-volumes-link language-servers-link", "Language servers" }
+            // Settings, as one compact block: seven full-width buttons took
+            // about 400px above the conversations (SME-123 DR4).
+            nav { class: "settings-links", aria_label: "Settings",
+                Link { to: Route::ProvidersRoute {}, class: "settings-link providers-link", "Model providers" }
+                Link { to: Route::McpServersRoute {}, class: "settings-link mcp-servers-link", "MCP servers" }
+                Link { to: Route::PodsRoute {}, class: "settings-link pods-link", "Sandboxes" }
+                Link { to: Route::SandboxVolumesRoute {}, class: "settings-link sandbox-volumes-link", "Sandbox volumes" }
+                Link { to: Route::GitRoute {}, class: "settings-link git-link", "Git" }
+                Link { to: Route::SecretsRoute {}, class: "settings-link secrets-link", "Secrets" }
+                Link { to: Route::LanguageServersRoute {}, class: "settings-link language-servers-link", "Language servers" }
+            }
             super::ErrorText { message: list_error() }
             super::ErrorText { message: action_error() }
             if !loaded() {

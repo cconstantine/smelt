@@ -337,6 +337,16 @@ pub(super) async fn scenario_sidebar(t: &Scenario<'_>) {
         .into_value()
         .expect("text");
     assert!(links.contains("Sandboxes") && !links.contains("Pods"), "sidebar links: {links}");
+    // The settings links are one compact block: seven full-width buttons
+    // took about 400px above the conversations on every page (SME-123 DR4).
+    let settings = element_box(&page, ".sidebar .settings-links").await;
+    assert!(settings.3 <= 130, "the settings links take {}px of the sidebar", settings.3);
+    // With nothing open, the page offers a way on: a new conversation,
+    // not just "Select or start a conversation" (SME-123 DR4).
+    assert!(
+        wait_for_count(&page, ".empty-state .empty-new-conversation", 1, Duration::from_secs(10)).await,
+        "the empty page offers a new conversation"
+    );
     click_when_present(&page, ".sidebar a[href='/sandbox-volumes']", Duration::from_secs(10)).await;
     assert!(
         wait_for_text(&page, "Sandbox volumes", Duration::from_secs(10)).await,

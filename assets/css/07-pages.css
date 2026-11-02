@@ -1,19 +1,29 @@
 /* --- Pods (SME-26) --- */
 
-.pods-link,
-.sandbox-volumes-link {
+/* The sidebar's settings links: one compact block of two columns
+   (SME-123 DR4), not a full-width button each. */
+.settings-links {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 2px 8px;
+    padding: 6px 0;
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+}
+
+.settings-link {
     display: block;
-    padding: 8px 10px;
-    border-radius: 8px;
+    padding: 4px 6px;
+    border-radius: 6px;
     color: var(--text-2);
     font-size: 13px;
     text-decoration: none;
-    text-align: center;
-    border: 1px solid var(--border);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
-.pods-link:hover,
-.sandbox-volumes-link:hover {
+.settings-link:hover {
     background: var(--subtle);
     color: var(--ink);
 }

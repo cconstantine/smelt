@@ -58,6 +58,7 @@ use crate::models::Message;
 mod actions;
 mod agents_waiting;
 mod composer;
+mod empty_home;
 mod context;
 mod follow;
 mod model_setup;
@@ -293,9 +294,7 @@ fn ChatPanel(
             "data-live": live().map(|(id, _)| id.to_string()),
             "data-live-pulls": live().map(|(_, pulls)| pulls.to_string()),
             match selected() {
-                None => rsx! {
-                    div { class: "empty-state", "Select or start a conversation" }
-                },
+                None => rsx! { empty_home::EmptyHome {} },
                 Some(_) => {
                     rsx! {
                     if !sandbox_pods().is_empty() || !repos().is_empty() || !todos().is_empty() || browsing_session_open() || !stored_volumes().is_empty() {

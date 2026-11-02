@@ -125,22 +125,6 @@
     word-break: break-word;
 }
 
-.mcp-servers-link {
-    display: block;
-    padding: 8px 10px;
-    border-radius: 8px;
-    color: var(--text-2);
-    font-size: 13px;
-    text-decoration: none;
-    text-align: center;
-    border: 1px solid var(--border);
-}
-
-.mcp-servers-link:hover {
-    background: var(--subtle);
-    color: var(--ink);
-}
-
 .mcp-servers-page {
     max-width: 720px;
     margin: 0 auto;
