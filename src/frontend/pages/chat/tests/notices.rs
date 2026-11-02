@@ -89,6 +89,23 @@ fn test_a_refusal_notice_says_the_provider_stopped_the_reply() {
     );
 }
 
+/// SME-123 DR3: a failed turn's notice says what happened in plain words
+/// and what to do, and round-trips.
+#[test]
+fn test_a_failure_notice_says_what_failed_and_what_to_do() {
+    use crate::api::chat::{failure_notice, parse_failure_notice};
+    let provider = failure_notice("model provider error 400 Bad Request: MOCK-FAILURE");
+    assert_eq!(parse_failure_notice(&provider), Some("model provider error 400 Bad Request: MOCK-FAILURE"));
+    assert_eq!(
+        system_notice(&provider, &HashMap::new()).as_deref(),
+        Some("The model's provider answered with an error (400 Bad Request: MOCK-FAILURE). Check it under Model providers, then send again.")
+    );
+    assert_eq!(
+        system_notice(&failure_notice("conversation not found"), &HashMap::new()).as_deref(),
+        Some("The turn failed: conversation not found. Send again to retry.")
+    );
+}
+
 /// SME-126: a notice for a reply cut off in the middle of a tool call
 /// names the call, for the model and in the chat, and round-trips; a
 /// notice saved before SME-126 still parses and reads as it did.

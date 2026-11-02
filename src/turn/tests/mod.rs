@@ -374,3 +374,16 @@ mod queue_order;
 mod text_calls;
 mod pod_activity;
 mod turn_slot;
+
+/// The reason in conversation `id`'s last failure notice (SME-123 DR3),
+/// where a user's failed turn now says why.
+pub(super) async fn last_failure_reason(pool: &PgPool, id: i64) -> Option<String> {
+    let messages = db::list_messages(pool, id).await.expect("messages");
+    messages.iter().rev().find_map(|m| {
+        let blocks: Vec<anthropic::ContentBlock> = serde_json::from_str(&m.content).ok()?;
+        blocks.iter().find_map(|b| match b {
+            anthropic::ContentBlock::Text { text } => crate::api::chat::parse_failure_notice(text).map(str::to_string),
+            _ => None,
+        })
+    })
+}

@@ -399,6 +399,14 @@ pub(in crate::frontend::pages::chat) fn system_notice(text: &str, commands: &Has
             limit.hint()
         ));
     }
+    if let Some(reason) = crate::api::chat::parse_failure_notice(text) {
+        return Some(match reason.strip_prefix("model provider error ") {
+            Some(detail) => format!(
+                "The model's provider answered with an error ({detail}). Check it under Model providers, then send again."
+            ),
+            None => format!("The turn failed: {reason}. Send again to retry."),
+        });
+    }
     if let Some(cut_call) = crate::api::chat::parse_refusal_notice(text) {
         let call = cut_call.map(|name| format!(" in the middle of a `{name}` call, which didn't run")).unwrap_or_default();
         return Some(format!("The model's provider stopped this reply (a refusal){call}."));

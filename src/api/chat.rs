@@ -94,6 +94,27 @@ pub const TURN_STOPPED: &str = "stopped by the user";
 /// Not server-only: the chat page shows it as "Stopped.".
 pub const STOP_NOTICE: &str = "The user stopped this turn before it finished. Don't carry on with what it asked unless they ask again.";
 
+/// The error a user's failed turn ends with once the conversation holds
+/// its failure notice (`failure_notice`): the page shows the notice, so
+/// it shows no error line for this (SME-123 DR3). Not server-only.
+pub const TURN_FAILED_NOTED: &str = "the turn failed; the conversation says why";
+
+/// How a failure notice starts. Saved in the conversation when a turn the
+/// user sent or answered fails, so the failure stays in the transcript
+/// after the next turn (it was a line that went when that one started),
+/// and the model knows the request before it wasn't done (SME-123 DR3).
+pub const FAILURE_NOTICE_START: &str = "The last turn failed before it finished: ";
+
+/// The failure notice for a turn that failed with `reason`.
+pub fn failure_notice(reason: &str) -> String {
+    format!("{FAILURE_NOTICE_START}{reason}")
+}
+
+/// The reason in a failure notice, or None if `text` isn't one.
+pub fn parse_failure_notice(text: &str) -> Option<&str> {
+    text.strip_prefix(FAILURE_NOTICE_START)
+}
+
 /// What bound a reply's budget (SME-111), which a cut-off notice names
 /// along with the setting to raise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

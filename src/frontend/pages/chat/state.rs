@@ -147,6 +147,12 @@ impl ChatErrors {
     #[cfg(any(feature = "web", test))]
     /// A turn's error, from `TurnError` or the reconnect pull.
     pub(super) fn set_turn_error(&mut self, id: i64, message: String) {
+        // A failure the conversation notes shows as its notice, not as a
+        // line here too (SME-123 DR3).
+        if message == crate::api::chat::TURN_FAILED_NOTED {
+            self.clear_turn_error(id);
+            return;
+        }
         self.lines.insert(id, message);
         self.turn.insert(id);
     }
@@ -252,7 +258,8 @@ pub(super) fn apply_event(state: Store<ConversationState>, event: ConversationEv
             apply_reply_delta(&mut state.streaming_reply().write(), offset, &text);
         }
         // A stop shows as its saved notice instead.
-        ConversationEvent::TurnError { message } if message != crate::api::chat::TURN_STOPPED => {
+        ConversationEvent::TurnError { message }
+            if message != crate::api::chat::TURN_STOPPED && message != crate::api::chat::TURN_FAILED_NOTED => {
             return EventEffect::TurnError(message);
         }
         ConversationEvent::TurnError { .. } => {}

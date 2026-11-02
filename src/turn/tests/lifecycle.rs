@@ -316,10 +316,11 @@ async fn test_a_wake_queued_behind_a_failing_turn_keeps_its_error(pool: PgPool) 
         .expect("a wake with nothing to do succeeds");
     assert!(woke.is_empty(), "the wake had nothing to do: {woke:?}");
     wait_until("the user's turn ends", || !turn_running(conversation_id)).await;
+    assert_eq!(last_turn_error(conversation_id).as_deref(), Some(TURN_FAILED_NOTED), "the user's error isn't kept");
     assert!(
-        last_turn_error(conversation_id).is_some_and(|e| e.contains("the user's turn failed")),
-        "the user's error isn't kept: {:?}",
-        last_turn_error(conversation_id)
+        last_failure_reason(&pool, conversation_id).await.is_some_and(|e| e.contains("the user's turn failed")),
+        "the conversation doesn't say why: {:?}",
+        last_failure_reason(&pool, conversation_id).await
     );
     assert_eq!(requests.load(Ordering::SeqCst), 1, "the wake called the model");
 }
@@ -494,10 +495,11 @@ async fn test_an_answer_turn_with_nothing_to_do_keeps_the_kept_error(pool: PgPoo
 
     wait_until("both end", || !turn_running(conversation_id)).await;
     assert_eq!(counter.load(Ordering::SeqCst), 2, "M called the model once and A not at all");
+    assert_eq!(last_turn_error(conversation_id).as_deref(), Some(TURN_FAILED_NOTED), "the user's error isn't kept");
     assert!(
-        last_turn_error(conversation_id).is_some_and(|e| e.contains("the user's turn failed")),
-        "the user's error isn't kept: {:?}",
-        last_turn_error(conversation_id)
+        last_failure_reason(&pool, conversation_id).await.is_some_and(|e| e.contains("the user's turn failed")),
+        "the conversation doesn't say why: {:?}",
+        last_failure_reason(&pool, conversation_id).await
     );
 }
 

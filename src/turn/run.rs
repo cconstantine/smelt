@@ -147,14 +147,6 @@ pub(super) fn run_turn_bounded<'a>(
                 &mut generation,
             )
             .await;
-            // Kept for a tab that reconnects, unless a newer turn has started
-            // since this one did: its outcome is the one to show (SME-91).
-            if let Some(generation) = generation.or(keep_error)
-                && keep_error.is_some()
-                && let Err(TurnFailure::Failed(e)) = &result
-            {
-                keep_turn_error(conversation_id, generation, chat_error_text(e));
-            }
             // A stop is the user's choice, not a failure.
             match &result {
                 Ok(_) => {}
@@ -162,6 +154,31 @@ pub(super) fn run_turn_bounded<'a>(
                     span.record("turn.stopped", true);
                 }
                 Err(TurnFailure::Failed(e)) => crate::telemetry::mark_error(&span, &e.to_string()),
+            }
+            // A user's turn that failed says why in the conversation, where
+            // the next turn doesn't take it away (SME-123 DR3); its error is
+            // then only that it was noted. Kept for a tab that reconnects,
+            // unless a newer turn has started since this one did: its outcome
+            // is the one to show (SME-91).
+            // Its own words, for a parent's report below.
+            let failed_with = match &result {
+                Err(TurnFailure::Failed(e)) => Some(chat_error_text(e)),
+                _ => None,
+            };
+            let mut result = result;
+            if let Some(generation) = generation.or(keep_error)
+                && keep_error.is_some()
+                && let Err(TurnFailure::Failed(e)) = &result
+            {
+                let reason = chat_error_text(e);
+                let shown = if note_failure(pool, conversation_id, &reason).await {
+                    let shown = TURN_FAILED_NOTED.to_string();
+                    result = Err(TurnFailure::Failed(ServerFnError::new(shown.clone())));
+                    shown
+                } else {
+                    reason
+                };
+                keep_turn_error(conversation_id, generation, shown);
             }
             // A child agent whose last turn ended without its report tells
             // its parent (SME-236), checked once this turn no longer counts.
@@ -174,7 +191,7 @@ pub(super) fn run_turn_bounded<'a>(
             let ended = match &result {
                 Ok(saved) if saved.is_empty() => None,
                 Ok(_) => Some(None),
-                Err(TurnFailure::Failed(e)) => Some(Some(chat_error_text(e))),
+                Err(TurnFailure::Failed(_)) => Some(failed_with),
                 Err(TurnFailure::Stopped) => None,
             };
             if let Some(failure) = ended
@@ -340,6 +357,24 @@ pub(super) async fn end_stopped_turn(pool: &PgPool, conversation_id: i64, stoppe
     clear_reply_in_progress(conversation_id);
     crate::events::publish(conversation_id, crate::events::ConversationEvent::ReplyReset {});
     record_stop(pool, conversation_id, stopped_by).await;
+}
+
+/// Saves the failure notice for a user's turn that failed with `reason`
+/// (`api::chat::failure_notice`). Whether it was saved: if not, the page
+/// still shows the error itself.
+#[cfg(feature = "server")]
+async fn note_failure(pool: &PgPool, conversation_id: i64, reason: &str) -> bool {
+    let notice = [anthropic::ContentBlock::Text { text: crate::api::chat::failure_notice(reason) }];
+    match db::create_message(pool, conversation_id, "user", &notice).await {
+        Ok(saved) => {
+            record_saved(conversation_id, &mut Vec::new(), saved);
+            true
+        }
+        Err(e) => {
+            tracing::warn!(conversation_id, error = %e, "couldn't note a failed turn");
+            false
+        }
+    }
 }
 
 /// Notes in the conversation that the user stopped it (`STOP_NOTICE`),
