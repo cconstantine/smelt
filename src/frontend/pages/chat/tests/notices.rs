@@ -545,3 +545,30 @@ fn test_thinking_beside_a_call_shows_only_when_asked_for() {
     assert_eq!(shown_blocks("assistant", &[thinking.clone()], false), vec![0], "only thinking: shown");
     assert_eq!(shown_blocks("user", &[call], false), vec![0]);
 }
+
+/// SME-123 DR13: the answered record listed the questions, then the
+/// answers as the model got them ("2. Notes: they wrote: \"…\""). Each
+/// answer now sits under its question, in the user's words.
+#[test]
+fn test_an_answered_question_pairs_each_answer_with_its_question() {
+    use crate::frontend::pages::chat::transcript::answered_pairs;
+    let questions = vec!["Which database?".to_string(), "Anything else?".to_string(), "Which ones?".to_string()];
+    let lines = vec![
+        "1. Database: Postgres".to_string(),
+        "2. Notes: they wrote: \"Keep it small.\"".to_string(),
+        "3. Pick: A, B; they also wrote: \"and C\"".to_string(),
+    ];
+    assert_eq!(
+        answered_pairs(&questions, &lines),
+        vec![
+            (Some("Which database?".to_string()), "Postgres".to_string()),
+            (Some("Anything else?".to_string()), "\u{201c}Keep it small.\u{201d}".to_string()),
+            (Some("Which ones?".to_string()), "A, B \u{2014} \u{201c}and C\u{201d}".to_string()),
+        ]
+    );
+    // Written instead: one line, under no question.
+    assert_eq!(
+        answered_pairs(&questions, &["Not answered: you wrote a message instead.".to_string()]),
+        vec![(None, "Not answered: you wrote a message instead.".to_string())]
+    );
+}

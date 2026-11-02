@@ -621,9 +621,11 @@
     overflow-wrap: anywhere;
 }
 
+/* Options in equal columns: a short one was narrower than its
+   neighbours (SME-123 DR13). */
 .question-card-options {
-    display: flex;
-    flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
     gap: 8px;
     margin-bottom: 8px;
 }
@@ -644,8 +646,11 @@
     cursor: pointer;
 }
 
+/* Hover shades an option; only a chosen one gets the accent border, so
+   the option under the pointer never reads as already picked (SME-123
+   DR13). */
 .question-option:hover:not(:disabled) {
-    border-color: var(--accent);
+    background: var(--subtle);
 }
 
 .question-option.chosen {

@@ -551,3 +551,39 @@ pub(in crate::frontend::pages::chat) fn answered_lines(result: &str) -> Vec<Stri
         None => vec!["Not answered: you wrote a message instead.".to_string()],
     }
 }
+
+/// An answered `ask_user`'s record, each answer under its question
+/// (SME-123 DR13): the answer lines the model got ("2. Notes: they wrote:
+/// \"…\"") said in the user's words, against the question at the same
+/// place. A line with no number (the user wrote instead) stands alone.
+pub(in crate::frontend::pages::chat) fn answered_pairs(questions: &[String], lines: &[String]) -> Vec<(Option<String>, String)> {
+    lines
+        .iter()
+        .map(|line| {
+            let numbered = line
+                .split_once(". ")
+                .and_then(|(n, rest)| n.parse::<usize>().ok().map(|n| (n, rest)))
+                .and_then(|(n, rest)| rest.split_once(": ").map(|(_, answer)| (n, answer)));
+            match numbered {
+                Some((n, answer)) => (questions.get(n.wrapping_sub(1)).cloned(), users_words(answer)),
+                None => (None, line.clone()),
+            }
+        })
+        .collect()
+}
+
+/// An answer as the model got it, in the user's words: `they wrote:
+/// "x"` is the quote alone, and `A; they also wrote: "x"` is `A — "x"`.
+fn users_words(answer: &str) -> String {
+    let quote = |text: &str| {
+        let inner = text.trim().trim_matches('"');
+        format!("\u{201c}{inner}\u{201d}")
+    };
+    if let Some(text) = answer.strip_prefix("they wrote: ") {
+        return quote(text);
+    }
+    if let Some((chosen, text)) = answer.split_once("; they also wrote: ") {
+        return format!("{chosen} \u{2014} {}", quote(text));
+    }
+    answer.to_string()
+}

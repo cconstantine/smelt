@@ -166,11 +166,13 @@ pub(super) fn render_block_element(
                                 span { "Asked" }
                                 span { class: "timestamp", "{timestamp}" }
                             }
-                            for (i , question) in questions.iter().enumerate() {
-                                p { key: "q{i}", class: "question-answered-question", "{question}" }
-                            }
-                            for (i , line) in answer.iter().enumerate() {
-                                p { key: "a{i}", class: "question-answered-answer", "{line}" }
+                            for (i , (question, answer)) in answered_pairs(&questions, &answer).into_iter().enumerate() {
+                                div { key: "{i}", class: "question-answered-pair",
+                                    if let Some(question) = question {
+                                        p { class: "question-answered-question", "{question}" }
+                                    }
+                                    p { class: "question-answered-answer", "{answer}" }
+                                }
                             }
                         }
                     }
