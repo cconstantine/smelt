@@ -43,7 +43,7 @@ pub fn ProvidersIndex() -> Element {
                 Link { to: Route::Home {}, class: "mcp-back-link", "\u{2190} Back to conversations" }
                 h1 { "Model providers" }
                 p { class: "muted",
-                    "Where the model runs: Anthropic, an Ollama server, or any other server with an Anthropic-compatible /v1/messages. Each conversation can use a different one."
+                    "Where the model runs: Anthropic, a llama.cpp or Ollama server, or any other server with an Anthropic-compatible /v1/messages. Each conversation can use a different one."
                 }
                 Link { to: Route::ProviderNewRoute {}, class: "mcp-new-server-link", "+ Add a provider" }
             }
@@ -95,10 +95,7 @@ pub fn ProvidersIndex() -> Element {
                                     }
                                 }
                                 span { class: "mcp-status mcp-status-not-connected provider-key-hint",
-                                    match &provider.secret_hint {
-                                        Some(hint) => format!("Key {hint}"),
-                                        None => "Key set".to_string(),
-                                    }
+                                    "{key_badge(provider.secret_hint.as_deref())}"
                                 }
                             }
                         }
@@ -160,5 +157,15 @@ mod spend_label_tests {
         };
         assert_eq!(model_spend_label(&row(Some("Anthropic"))), "Anthropic \u{b7} m");
         assert_eq!(model_spend_label(&row(None)), "m (deleted provider)");
+    }
+}
+
+/// A provider row's key badge, the same words either way (SME-123 DR12:
+/// rows read "Key set" or "Key …5ENp"): a short key's ending isn't shown,
+/// since four characters of it would be most of it.
+pub(super) fn key_badge(hint: Option<&str>) -> String {
+    match hint {
+        Some(hint) => format!("Key saved {hint}"),
+        None => "Key saved".to_string(),
     }
 }

@@ -889,9 +889,13 @@
 .providers-spend .mcp-server-row {
     gap: 4px;
 }
+/* The cost line under a model's numbers: the same size as them, not
+   larger ("No price for this model, so tokens only." outweighed the
+   figures it qualified, SME-123 DR12). */
 .providers-spend-cost {
     font-variant-numeric: tabular-nums;
-    white-space: nowrap;
+    font-size: 13px;
+    color: var(--text-2);
 }
 /* SME-106: the checkbox sits beside its label, like the MCP form's radios. */
 .mcp-add-form label.provider-checkbox {

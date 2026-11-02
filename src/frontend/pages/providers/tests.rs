@@ -137,3 +137,12 @@ fn test_max_concurrent_requests_reads_blank_zero_and_a_count() {
         assert!(refused.contains("Max concurrent requests"), "{refused}");
     }
 }
+
+/// SME-123 DR12: every row's key badge says the same thing, with the
+/// ending where there's one to show.
+#[test]
+fn test_a_key_badge_reads_the_same_with_or_without_its_ending() {
+    use super::key_badge;
+    assert_eq!(key_badge(Some("\u{2026}5ENp")), "Key saved \u{2026}5ENp");
+    assert_eq!(key_badge(None), "Key saved");
+}
