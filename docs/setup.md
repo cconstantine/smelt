@@ -112,13 +112,19 @@ and then the cluster-backed tests fall to CI. What this seat is, in practice —
 
 Three things trip a conversation sandbox's stack (SME-257's retrospective, proposal 2):
 
-- **Building the sandbox image needs memory.** The build runs in the pod's
-  Docker sidecar, whose limit is `SANDBOX_DOCKER_MEMORY_LIMIT` (8 Gi by
-  default) unless `create_pod`'s `docker_memory_limit` raises it, up to the
-  namespace's `LimitRange` ceiling. One of SME-226's builds went through at 24 Gi;
-  another was OOM-killed twice before 48 Gi let it through, and each kill showed
-  in the build log as an apt or network error, not as memory. Create the pod with
-  `docker_memory_limit: "48Gi"` when it will build the image.
+- **The pod's Docker sidecar has to hold the whole gate stack.** The cargo
+  builds, the nested `docker` dind service, `k3s` and `postgres` all run under
+  that daemon, so they all count against `SANDBOX_DOCKER_MEMORY_LIMIT` — 48 Gi
+  by default since SME-317, sized for a seat's full `scripts/check.sh` — unless
+  `create_pod`'s `docker_memory_limit` overrides it, up to the namespace's
+  `LimitRange` ceiling. A too-small sidecar does not fail as memory: a gate
+  dies mid-build with `rc=125` and `error waiting for container: unexpected
+  EOF`, an image build with what looks like an apt or network error, and the
+  seat may instead see its "Docker restarted" notice — all the same event, the
+  sidecar OOM-restarting. (History: at the old 8 Gi default this killed daemons
+  on the SME-255, SME-253 and SME-343 seats; one of SME-226's image builds went
+  through at 24 Gi and another was OOM-killed twice before 48 Gi let it
+  through.)
 - **Rebuild the sandbox image after a merge that changes the agent's
   sources** (a merge of `origin/main` into the branch included), before the
   next gate: the gate's pods run the image named after the sources
