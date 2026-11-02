@@ -183,10 +183,12 @@ pub(in crate::sandbox) async fn stop_pod_for_user_with(
     if !live {
         return Err(TerminalError::NoPod);
     }
-    let (conversation_id, _) = close_pod_terminals(pool, pod_id).await;
     // Clears a quiet stop's mark should one have closed the row since
     // the check above (SME-354 B3): the Stop keeps the storage.
     terminate_pod_as(pool, pod_id, db::PodEnd::ByUser, delete).await?;
+    // Only once the delete worked (SME-354 B12, review 1 L2): a failed
+    // one leaves the pod running, terminals and all.
+    let (conversation_id, _) = close_pod_terminals(pool, pod_id).await;
     if let Some(conversation_id) = conversation_id {
         let notice = format!(
             "The user stopped sandbox pod {pod_id}. Its terminals, and any files outside /workspace and mounted volumes, are gone. Create a new pod if you need one."

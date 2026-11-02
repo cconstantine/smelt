@@ -91,6 +91,34 @@ pub async fn start_storage_removal(pool: &PgPool, pod_id: i64) -> Result<bool, s
     .map(|earlier| earlier.unwrap_or(false))
 }
 
+/// Forgets this mark's recorded attempt (SME-354 review 1, M1), for the
+/// two outcomes that leave nothing for a retry to announce: an attempt
+/// that failed before deleting anything, and one whose notice is about
+/// to be saved. Done before the notice, a retry after a failed clear
+/// finds no earlier attempt and settles quietly, so the stop keeps its
+/// one notice.
+pub async fn forget_storage_removal_attempt(pool: &PgPool, pod_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE sandbox_pods SET storage_removal_started_at = NULL WHERE id = $1")
+        .bind(pod_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Settles every quiet stop of `conversation_id` (SME-354 review 1, M1):
+/// the user removed its storage, so the grace pass has nothing left to
+/// remove, and must not later read the claims' absence as its own work.
+pub async fn clear_conversation_quiet_stop_marks(pool: &PgPool, conversation_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE sandbox_pods SET quietly_stopped_at = NULL, storage_removal_started_at = NULL
+          WHERE conversation_id = $1 AND (quietly_stopped_at IS NOT NULL OR storage_removal_started_at IS NOT NULL)",
+    )
+    .bind(conversation_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Clears the mark once the pass has settled the stop: the claims are
 /// gone (or were never there), so the row never qualifies again and a
 /// later quiet stop — of the newer row a pickup starts — stamps its own

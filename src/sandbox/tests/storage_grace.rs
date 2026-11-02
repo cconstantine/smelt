@@ -46,6 +46,13 @@ async fn removal_notices(pool: &PgPool, conversation_id: i64) -> Vec<String> {
         .collect()
 }
 
+/// What the real removal returns when both claims were already gone: the
+/// workspace counts as gone (`ClaimRemoval::AlreadyGone`), nothing was
+/// deleted, no pod stopped (SME-354 review 1, M1: `default()` isn't it).
+fn claims_already_gone() -> StorageRemoval {
+    StorageRemoval { workspace_gone: true, ..Default::default() }
+}
+
 /// Both claims deleted, the pass's usual outcome.
 fn claims_gone() -> StorageRemoval {
     StorageRemoval { claims_deleted: 2, workspace_gone: true, ..Default::default() }
@@ -173,7 +180,7 @@ async fn test_claims_already_gone_settle_quietly_and_once(pool: PgPool) {
 
     let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, move |_conversation: i64| {
         counted.fetch_add(1, Ordering::SeqCst);
-        async { Ok(StorageRemoval::default()) }
+        async { Ok(claims_already_gone()) }
     })
     .await;
 
@@ -185,7 +192,7 @@ async fn test_claims_already_gone_settle_quietly_and_once(pool: PgPool) {
         let calls = calls.clone();
         move |_conversation| {
             calls.fetch_add(1, Ordering::SeqCst);
-            async { Ok(StorageRemoval::default()) }
+            async { Ok(claims_already_gone()) }
         }
     })
     .await;
@@ -295,7 +302,7 @@ async fn test_a_failed_clear_still_leaves_exactly_one_notice(pool: PgPool) {
 
     // The next pass: still due, and the removal now finds nothing left —
     // the no-op that settles quietly.
-    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async { Ok(StorageRemoval::default()) }).await;
+    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async { Ok(claims_already_gone()) }).await;
     assert_eq!(settled, vec![conversation], "the retry settles the stop");
     assert!(!mark_set(&pool, pod).await, "and the mark finally clears");
     assert_eq!(removal_notices(&pool, conversation).await.len(), 1, "and exactly one notice was ever saved");
@@ -319,9 +326,57 @@ async fn test_a_removal_that_timed_out_after_deleting_the_claims_is_noticed_on_i
     assert!(mark_set(&pool, pod).await, "the mark stays for the retry");
     assert!(removal_notices(&pool, conversation).await.is_empty(), "nothing said yet");
 
-    let already_gone = StorageRemoval { workspace_gone: true, ..Default::default() };
-    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, move |_conversation| async move { Ok(already_gone) }).await;
+    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async { Ok(claims_already_gone()) }).await;
     assert_eq!(settled, vec![conversation]);
     assert!(!mark_set(&pool, pod).await);
     assert_eq!(removal_notices(&pool, conversation).await.len(), 1, "the stop's storage went, and the model is told once");
+}
+
+/// SME-354 review 1, M1: an attempt that failed before deleting anything
+/// earns no notice. The user removes the storage before the retry (the
+/// removal's own notice is theirs, saved only for a live pod); the retry
+/// finds the claims gone and settles quietly.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_failed_attempt_then_claims_gone_settles_without_a_notice(pool: PgPool) {
+    let (conversation, pod) = quiet_stopped_days_ago(&pool, 8).await;
+    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async {
+        Err(SandboxError::StartFailed("the API server is down".into()))
+    })
+    .await;
+    assert_eq!(settled, Vec::<i64>::new());
+    assert!(mark_set(&pool, pod).await, "the mark is kept for the retry");
+
+    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async { Ok(claims_already_gone()) }).await;
+    assert_eq!(settled, vec![conversation], "the retry settles the stop");
+    assert!(!mark_set(&pool, pod).await);
+    assert!(removal_notices(&pool, conversation).await.is_empty(), "the pass removed nothing, and says nothing");
+}
+
+/// SME-354 review 1, M1: an attempt given up on that may have deleted
+/// nothing, then the user's own removal: that removal settles the
+/// conversation's quiet stops, so no later pass claims it.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_users_removal_settles_a_stop_the_pass_gave_up_on(pool: PgPool) {
+    let (conversation, pod) = quiet_stopped_days_ago(&pool, 8).await;
+    let settled = remove_expired_storage_once_with(&pool, 7, Duration::from_millis(200), |_conversation| async {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        Ok(claims_gone())
+    })
+    .await;
+    assert_eq!(settled, Vec::<i64>::new(), "given up on: nothing settles");
+
+    // What `remove_conversation_storage` runs after the user's removal.
+    db::clear_conversation_quiet_stop_marks(&pool, conversation).await.expect("settle the quiet stops");
+    assert!(!mark_set(&pool, pod).await, "the user's removal settles the stop");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, move |_conversation: i64| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        async { Ok(claims_already_gone()) }
+    })
+    .await;
+    assert_eq!(settled, Vec::<i64>::new(), "nothing is due any more");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(removal_notices(&pool, conversation).await.is_empty(), "and the pass claims no removal");
 }

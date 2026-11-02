@@ -200,6 +200,13 @@ async fn test_removing_a_stopped_conversations_storage_leaves_no_claims(pool: Pg
         let id = conversation.id;
         create_pod(&pool, id, PodLimitOverrides::default()).await.expect("create_pod");
         terminate_pod(&pool, id).await.expect("terminate_pod");
+        // As a quiet stop leaves it, an attempt of the grace pass's
+        // recorded too (SME-354 review 1, M1).
+        sqlx::query("UPDATE sandbox_pods SET quietly_stopped_at = now(), storage_removal_started_at = now() WHERE conversation_id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("quiet-stop mark");
         let names = [workspace_pvc_name(id), docker_pvc_name(id)];
         // Stopping frees no disk: both claims stay until removed.
         for name in &names {
@@ -210,6 +217,15 @@ async fn test_removing_a_stopped_conversations_storage_leaves_no_claims(pool: Pg
         assert!(!removal.pod_stopped, "no live pod to stop");
         assert_eq!((removal.claims_deleted, removal.claims_failed), (2, 0), "{removal:?}");
         assert!(claims_gone(&client, &names).await, "a stopped conversation's removal leaves no claims");
+        let marks: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sandbox_pods WHERE conversation_id = $1
+               AND (quietly_stopped_at IS NOT NULL OR storage_removal_started_at IS NOT NULL)",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("read the marks");
+        assert_eq!(marks, 0, "the user's removal settles the grace pass's quiet stop");
     })
     .await;
 }

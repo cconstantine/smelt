@@ -200,7 +200,6 @@ pub(super) async fn scenario_settings_two_step(t: &Scenario<'_>) {
         "the MCP server should be deleted"
     );
 
-
     let server = db::create_language_server(
         pool,
         &crate::models::LanguageServerConfig {
@@ -239,8 +238,6 @@ pub(super) async fn scenario_settings_two_step(t: &Scenario<'_>) {
     );
 }
 
-/// Clicks a two-step button at `selector` once (it must arm: `confirm`
-/// class, a "Confirm" label) and again (to confirm).
 /// The page's Delete is the shared red two-step (`.mcp-delete`), not
 /// wider than a button needs (SME-354 B25).
 async fn assert_red_two_step(page: &chromiumoxide::Page) {
@@ -249,6 +246,8 @@ async fn assert_red_two_step(page: &chromiumoxide::Page) {
     assert!(width < 260, "the Delete is {width}px wide");
 }
 
+/// Clicks a two-step button at `selector` once (it must arm: `confirm`
+/// class, a "Confirm" label) and again (to confirm).
 pub(super) async fn two_step_delete(page: &chromiumoxide::Page, selector: &str) {
     wait_for_stable(page, selector, tokio::time::Instant::now() + Duration::from_secs(10)).await;
     click_when_present(page, selector, Duration::from_secs(5)).await;

@@ -467,3 +467,19 @@ async fn test_a_removal_whose_pod_delete_fails_leaves_its_terminals_open(pool: P
     let open: Vec<i64> = db::list_sandbox_terminals_for_pod(&pool, pod).await.expect("terminals").into_iter().map(|t| t.id).collect();
     assert_eq!(open, vec![terminal.id], "the running pod keeps its terminal");
 }
+
+/// SME-354 review 1, L2: the user's Stop too — a delete that fails
+/// leaves the pod running and its terminals open.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_users_stop_whose_delete_fails_leaves_its_terminals_open(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let (_conversation, pod) = idle_pod(&pool, 0).await;
+    let terminal = db::create_sandbox_terminal(&pool, pod).await.expect("terminal");
+
+    let stop = stop_pod_for_user_with(&pool, pod, delete_fails(pod)).await;
+
+    assert!(stop.is_err(), "the delete failed: {stop:?}");
+    assert!(live(&pool, pod).await, "the pod's row stays live");
+    let open: Vec<i64> = db::list_sandbox_terminals_for_pod(&pool, pod).await.expect("terminals").into_iter().map(|t| t.id).collect();
+    assert_eq!(open, vec![terminal.id], "the running pod keeps its terminal");
+}

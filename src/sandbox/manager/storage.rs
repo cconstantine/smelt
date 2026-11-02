@@ -42,7 +42,17 @@ pub async fn remove_conversation_storage(
         // the whole body (review 1, finding 1).
         let start_lock = pod_start_lock(conversation_id);
         let _starting = start_lock.lock().await;
-        Box::pin(remove_conversation_storage_locked(&pool, conversation_id)).await
+        let removal = Box::pin(remove_conversation_storage_locked(&pool, conversation_id)).await?;
+        // The user's removal settles the grace pass's quiet stops too
+        // (SME-354 review 1, M1): nothing is left for it to remove, and
+        // a pass finding the claims gone must not announce this removal
+        // as its own. A claim left behind keeps the marks for the pass.
+        if removal.claims_failed == 0 {
+            if let Err(e) = db::clear_conversation_quiet_stop_marks(&pool, conversation_id).await {
+                tracing::warn!(conversation_id, error = %e, "couldn't settle the conversation's quiet stops after a storage removal");
+            }
+        }
+        Ok(removal)
     }))
     .await
     .unwrap_or_else(|e| Err(SandboxError::StartFailed(format!("removing the sandbox storage failed: {e}"))))
