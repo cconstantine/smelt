@@ -96,3 +96,15 @@ async fn test_delete_key_and_save_identity(pool: PgPool) {
     assert!(save_identity(&pool, &bad).await.is_err());
     assert_eq!(db::get_git_identity(&pool).await.expect("get"), identity);
 }
+
+/// SME-354 B5: deleting the key with a live pod it can't reach says how
+/// many sandboxes may still hold it.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_deleting_the_key_counts_the_live_pods_it_couldnt_reach(pool: PgPool) {
+    crate::sandbox::test_support::use_unreachable_test_manager();
+    let key = create_key(&pool, "github").await.expect("create key");
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    db::create_sandbox_pod(&pool, conversation.id).await.expect("a live pod row");
+    assert_eq!(delete_key(&pool, key.id).await.expect("delete"), Some(1));
+    assert!(db::list_ssh_keys(&pool).await.expect("list").is_empty());
+}

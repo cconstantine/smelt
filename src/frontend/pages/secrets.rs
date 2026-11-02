@@ -12,7 +12,8 @@
 use dioxus::prelude::*;
 
 use crate::api::secrets::{
-    delete_secret, list_secrets, save_secret, validate_secret_name, validate_secret_value, SecretSummary,
+    delete_secret, list_secrets, save_secret, unpruned_sandboxes_notice, validate_secret_name, validate_secret_value,
+    SecretSummary,
 };
 use crate::frontend::Route;
 
@@ -140,10 +141,10 @@ fn SecretsList(secrets: Signal<Vec<SecretSummary>>, action_error: Signal<Option<
     let confirm_delete = move |id: i64| {
         spawn(async move {
             match delete_secret(id).await {
-                Ok(()) => {
+                Ok(unpruned) => {
                     secrets.write().retain(|s| s.id != id);
                     pending_delete.set(None);
-                    action_error.set(None);
+                    action_error.set(unpruned.map(unpruned_sandboxes_notice));
                 }
                 Err(e) => action_error.set(Some(super::server_error_message(&e))),
             }

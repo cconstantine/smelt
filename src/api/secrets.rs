@@ -21,6 +21,14 @@ use crate::{credentials, db};
 #[cfg(feature = "server")]
 use sqlx::PgPool;
 
+/// What the Secrets and Git pages say after a delete that couldn't reach
+/// `pods` running sandboxes (SME-354 B5): the deleted file may still be
+/// in them until they stop. Out of `cfg(server)`: the page says it.
+pub fn unpruned_sandboxes_notice(pods: u32) -> String {
+    let sandboxes = if pods == 1 { "1 running sandbox".to_string() } else { format!("{pods} running sandboxes") };
+    format!("Deleted, but couldn't remove it from {sandboxes}; stop them to be sure.")
+}
+
 /// One row of the page: name, dates, and D7's capped display. There is
 /// no field a value could sit in, and no endpoint reveals one — the
 /// type is the promise (D7, Answer 2).
@@ -146,9 +154,10 @@ pub async fn save_secret(id: Option<i64>, name: String, value: String) -> Server
     save_secret_of(db::get(), id, &name, &value).await.map_err(ServerFnError::new)
 }
 
-/// Removes a secret; its file goes from every live pod with it.
+/// Removes a secret; its file goes from every live pod with it. How many
+/// running sandboxes it couldn't be removed from, if any (SME-354 B5).
 #[post("/api/secrets/delete")]
-pub async fn delete_secret(id: i64) -> ServerFnResult<()> {
+pub async fn delete_secret(id: i64) -> ServerFnResult<Option<u32>> {
     delete_secret_of(db::get(), id).await.map_err(ServerFnError::new)
 }
 
@@ -189,10 +198,9 @@ pub(crate) async fn save_secret_of(pool: &PgPool, id: Option<i64>, name: &str, v
 }
 
 #[cfg(feature = "server")]
-pub(crate) async fn delete_secret_of(pool: &PgPool, id: i64) -> Result<(), String> {
+pub(crate) async fn delete_secret_of(pool: &PgPool, id: i64) -> Result<Option<u32>, String> {
     db::delete_named_secret(pool, id).await.map_err(|e| e.to_string())?;
-    credentials::install_into_live_pods(pool).await;
-    Ok(())
+    Ok(credentials::prune_live_pods(pool).await)
 }
 
 #[cfg(all(test, feature = "server"))]

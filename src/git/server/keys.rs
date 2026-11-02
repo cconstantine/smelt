@@ -137,11 +137,11 @@ async fn refuse_a_second_key(pool: &PgPool) -> Result<(), String> {
     }
 }
 
-/// Deletes a key and removes it from every live pod.
-pub async fn delete_key(pool: &PgPool, id: i64) -> Result<(), String> {
+/// Deletes a key and removes it from every live pod. How many live pods
+/// it couldn't be removed from, if any (SME-354 B5): the page says so.
+pub async fn delete_key(pool: &PgPool, id: i64) -> Result<Option<u32>, String> {
     db::delete_ssh_key(pool, id).await.map_err(|e| e.to_string())?;
-    crate::credentials::install_into_live_pods(pool).await;
-    Ok(())
+    Ok(crate::credentials::prune_live_pods(pool).await)
 }
 
 /// Saves the commit identity, and installs it into every live pod.
