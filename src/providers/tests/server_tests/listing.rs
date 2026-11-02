@@ -217,3 +217,38 @@ async fn test_setting_a_model_checks_it_and_tells_the_tabs(pool: PgPool) {
     assert_eq!(set.model.as_deref(), Some("m1"), "trimmed");
     assert!(received(&mut events, &crate::events::ConversationEvent::ModelChanged {}), "tabs are told");
 }
+
+/// SME-123 DR2: a first run reached "No model is chosen for this
+/// conversation" after adding its only provider, with a model id to type.
+/// The first provider added makes its first tool-capable model the
+/// default; a later one leaves the default alone.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_first_provider_added_makes_its_first_model_the_default(pool: PgPool) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let app = axum::Router::new().route("/v1/models", axum::routing::get(|| async {
+        ([(axum::http::header::CONTENT_TYPE, "application/json")],
+         r#"{"data":[{"id":"first-model","max_input_tokens":100000},{"id":"second-model","max_input_tokens":100000}],"has_more":false}"#)
+    }));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    let mut first = input("first", &format!("http://{addr}"), "k");
+    first.kind = ProviderKind::Other;
+    let created = create_provider(&pool, first).await.expect("create");
+    let chosen = default_model(&pool).await.expect("read").expect("a default was set");
+    assert_eq!((chosen.provider_id, chosen.model.as_str()), (created.id, "first-model"));
+    let mut second = input("second", &format!("http://{addr}"), "k");
+    second.kind = ProviderKind::Other;
+    create_provider(&pool, second).await.expect("create the second");
+    let still = default_model(&pool).await.expect("read").expect("still set");
+    assert_eq!(still.provider_id, created.id, "a later provider leaves the default alone");
+}
+
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_first_provider_that_lists_nothing_leaves_no_default(pool: PgPool) {
+    let mut gone = input("gone", "http://127.0.0.1:1", "k");
+    gone.kind = ProviderKind::Other;
+    create_provider(&pool, gone).await.expect("saved even unreachable");
+    assert_eq!(default_model(&pool).await.expect("read"), None);
+}

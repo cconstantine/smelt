@@ -473,8 +473,30 @@ pub async fn create_provider(pool: &PgPool, input: ProviderInput) -> Result<Prov
     .await
     .map_err(|e| save_error(&input.name, e))?;
     limiter::set(provider.id, provider.updated_at, resolved_max(&provider));
+    default_to_first_model(pool, &provider).await;
     providers_changed();
     Ok(provider.into())
+}
+
+/// With no default model yet, makes the first model `provider` lists that
+/// can call tools the default, so a first run reaches a chat that sends
+/// (SME-123 DR2: it stopped at "No model is chosen for this conversation",
+/// with a model id to type). A listing that fails, or lists nothing usable,
+/// leaves the default unset, as before; it's never an error for the save.
+async fn default_to_first_model(pool: &PgPool, provider: &db::InferenceProvider) {
+    if !matches!(db::get_default_model(pool).await, Ok(None)) {
+        return;
+    }
+    let kind = ProviderKind::parse(&provider.kind).unwrap_or(ProviderKind::Other);
+    let Ok(listed) = crate::anthropic::models::list_models(kind, &endpoint(provider)).await else {
+        return;
+    };
+    let Some(first) = listed.iter().find(|m| m.details.tools != Some(false)) else {
+        return;
+    };
+    if let Err(e) = db::set_default_model(pool, provider.id, &first.id).await {
+        tracing::warn!(provider = provider.id, error = %e, "couldn't make the first listed model the default");
+    }
 }
 
 /// Saves an edit; an empty secret keeps the stored one.

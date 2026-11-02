@@ -90,6 +90,9 @@ pub fn ProvidersIndex() -> Element {
                                 div { class: "mcp-server-summary",
                                     span { class: "mcp-server-name", "{provider.name}" }
                                     span { class: "mcp-server-url", "{provider.kind.label()} \u{b7} {provider.base_url}" }
+                                    if let Some(model) = current_default.as_ref().filter(|c| c.provider_id == provider.id).map(|c| c.model.clone()) {
+                                        span { class: "provider-default-model", "Default model: {model}" }
+                                    }
                                 }
                                 span { class: "mcp-status mcp-status-not-connected provider-key-hint",
                                     match &provider.secret_hint {

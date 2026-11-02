@@ -98,6 +98,17 @@ pub(super) fn ModelChooser(
             None => None,
         }
     });
+    // With nothing chosen yet, the provider's first listed model is
+    // filled in, so choosing takes one click rather than a typed id
+    // (SME-123 DR2). A model already there, or typed, is left alone.
+    use_effect(move || {
+        if let Some(Some(Ok(listed))) = listing()
+            && model.peek().is_empty()
+            && let Some(first) = suggestion_order(listed.models).into_iter().next()
+        {
+            model.set(first.id);
+        }
+    });
     let list_id = format!("model-suggestions-{}", provider().unwrap_or_default());
     let choose = move |event: Event<FormData>| {
         event.prevent_default();
