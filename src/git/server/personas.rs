@@ -334,7 +334,7 @@ pub(crate) async fn gated_listing(pool: &PgPool, reads: Vec<RepoPersonas>) -> Re
     let mut told = json!({"repos": repos});
     if any_persona {
         told["note"] = Value::String(
-            "A persona is named <repo dir>:<name>. It is used by starting an agent with it, which isn't available yet."
+            "A persona is named <repo dir>:<name>. Start an agent that works as one with start_agent's persona parameter."
                 .to_string(),
         );
     }
