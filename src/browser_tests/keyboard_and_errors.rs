@@ -354,13 +354,14 @@ pub(super) async fn scenario_error_text(t: &Scenario<'_>) {
         wait_for_count(&sidebar, &format!(".conversation-item[data-conversation-id='{}']", deleted.id), 0, Duration::from_secs(10)).await,
         "the second delete should go through"
     );
-    let still_shown: bool = sidebar
-        .evaluate("!!document.querySelector('.sidebar-body > .error')")
-        .await
-        .expect("look for the sidebar error")
-        .into_value()
-        .expect("bool");
-    assert!(!still_shown, "a later success should clear the sidebar's error");
+    // The row can go first: the delete announces itself to every tab, and
+    // that list reload can land before the delete's own reply, which is
+    // what clears the error. So wait for the error to go rather than read it
+    // once (SME-341: CI run 41394052871).
+    assert!(
+        wait_for_count(&sidebar, ".sidebar-body > .error", 0, Duration::from_secs(10)).await,
+        "a later success should clear the sidebar's error"
+    );
 
     // The same on a settings page: a failed volume delete's error goes once
     // another delete succeeds (SME-81 review 2).
