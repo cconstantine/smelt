@@ -164,8 +164,13 @@ async fn fake_agent(pod_id: i64, greeting: Greeting, dial_delay: Duration) -> Fa
     FakeAgent { connections, dials }
 }
 
-/// A conversation and a live pod row for it, with a pod id no other
-/// test uses (the registry and the fake dialers are keyed by pod id).
+/// A conversation and a live pod row for it, with ids no other test uses:
+/// the registry and the fake dialers are keyed by pod id, and the start
+/// lock a reconnect checks (`start_under_way_for_pod`) by conversation id.
+/// With the conversation numbered from 1 in the test's own database,
+/// another test starting a pod for its conversation 1 made a reconnect
+/// here see a start under way and answer `NoPod` (SME-341: CI run
+/// 41366729038, "connects: NoPod").
 async fn pod_row(pool: &PgPool) -> (i64, i64) {
     static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
     let unique = (std::process::id() as i64 % 10_000) * 1_000_000
@@ -176,6 +181,11 @@ async fn pod_row(pool: &PgPool) -> (i64, i64) {
         .execute(pool)
         .await
         .expect("move the pod id sequence");
+    sqlx::query("SELECT setval(pg_get_serial_sequence('conversations', 'id'), $1)")
+        .bind(unique)
+        .execute(pool)
+        .await
+        .expect("move the conversation id sequence");
     let conversation = db::create_conversation(pool).await.expect("conversation");
     let pod = db::create_sandbox_pod(pool, conversation.id).await.expect("pod row");
     (conversation.id, pod.id)

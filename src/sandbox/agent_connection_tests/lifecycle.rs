@@ -27,6 +27,21 @@ fn captured_logs() -> &'static Arc<StdMutex<Vec<u8>>> {
     })
 }
 
+/// SME-341: another test starting a pod for its own conversation 1 (each
+/// test's database numbers conversations from 1) holds that conversation's
+/// start lock, which is process-wide. A reconnect here checks it, so with
+/// `pod_row`'s conversation numbered 1 too it saw a start under way and
+/// answered `NoPod` (CI run 41366729038). `pod_row` gives the conversation
+/// an id no other test uses, as it does the pod.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_another_tests_pod_start_doesnt_turn_a_reconnect_away(pool: PgPool) {
+    let other_tests_start = pod_start_lock(1);
+    let _held = other_tests_start.lock().await;
+    let (_, pod_id) = pod_row(&pool).await;
+    let _agent = fake_agent(pod_id, current(), Duration::ZERO).await;
+    reconnect_if_needed(&pool, pod_id).await.expect("connects");
+}
+
 /// The agent's protocol error quotes serde's message, which can quote
 /// the request it couldn't read (a `write_file`'s content). smelt logs
 /// that it happened, not the text.
