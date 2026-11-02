@@ -87,7 +87,8 @@ async fn stored_grant(pool: &sqlx::PgPool, server_id: i64) -> Option<serde_json:
 }
 
 pub(super) async fn check_sign_in(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<(), CheckError> {
-    let token = tokio::time::timeout(CONNECT_TIMEOUT, async {
+    let timeout = connect_timeout(config.id);
+    let token = tokio::time::timeout(timeout, async {
         let client = oauth_client(pool, config)
             .await
             .map_err(CheckError::Unreachable)?;
@@ -132,7 +133,7 @@ pub(super) async fn check_sign_in(pool: &sqlx::PgPool, config: &McpServerConfig)
         CheckError::Unreachable(format!(
             "MCP server {:?}'s OAuth provider didn't answer within {}s",
             config.name,
-            CONNECT_TIMEOUT.as_secs()
+            timeout.as_secs()
         ))
     })?;
     if let Err(CheckError::SignInExpired(_)) = &token {
