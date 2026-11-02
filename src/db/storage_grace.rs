@@ -76,11 +76,39 @@ pub async fn storage_removal_still_due(pool: &PgPool, pod_id: i64, days: u32) ->
 /// later quiet stop — of the newer row a pickup starts — stamps its own
 /// clock.
 pub async fn clear_pod_quiet_stop_mark(pool: &PgPool, pod_id: i64) -> Result<(), sqlx::Error> {
+    #[cfg(test)]
+    if let Some(result) = fake_clear::take(pod_id) {
+        return result;
+    }
     sqlx::query("UPDATE sandbox_pods SET quietly_stopped_at = NULL WHERE id = $1")
         .bind(pod_id)
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// A clear that fails without a database failure, for the pass's test
+/// that a failed clear still leaves one notice per stop (SME-345 review
+/// 1, F4). Armed per pod id, the quiet stop's `fake_delete` shape
+/// without its gate — this failure needs no pause, only one.
+#[cfg(test)]
+pub(crate) mod fake_clear {
+    use std::collections::HashSet;
+    use std::sync::{LazyLock, Mutex};
+
+    static PODS: LazyLock<Mutex<HashSet<i64>>> = LazyLock::new(Default::default);
+
+    /// The next clear of `pod_id` fails; the one after it is real.
+    pub(crate) fn fail_next(pod_id: i64) {
+        PODS.lock().unwrap_or_else(|e| e.into_inner()).insert(pod_id);
+    }
+
+    pub(crate) fn take(pod_id: i64) -> Option<Result<(), sqlx::Error>> {
+        PODS.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&pod_id)
+            .then(|| Err(sqlx::Error::PoolClosed))
+    }
 }
 
 /// `days` as the `INT` `make_interval(days => …)` takes; the setting's

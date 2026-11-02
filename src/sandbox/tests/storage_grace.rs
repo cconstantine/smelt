@@ -238,7 +238,7 @@ async fn test_zero_days_touches_nothing(pool: PgPool) {
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_removal_given_up_on_keeps_its_mark_and_the_pass_goes_on(pool: PgPool) {
     // The stalled one first: older marks sort first, so it is the pass's
-    // first candidate and its ten-second sleep is the stall.
+    // first candidate and the hour it sleeps for is the stall.
     let (stalled, stalled_pod) = quiet_stopped_days_ago(&pool, 9).await;
     let (on_time, on_time_pod) = quiet_stopped_days_ago(&pool, 8).await;
 
@@ -277,4 +277,26 @@ async fn test_a_foreign_workspace_stands_and_settles_quietly(pool: PgPool) {
     assert_eq!(settled, vec![conversation], "a standing Foreign claim settles the stop — retry could never take it");
     assert!(!mark_set(&pool, pod).await, "settled once, like every settled stop");
     assert!(removal_notices(&pool, conversation).await.is_empty(), "no notice sends the model off to re-clone over files that stand");
+}
+
+/// F4 (SME-345 review 1): pins the comment's claim on the failed clear —
+/// the notice is already saved when the clear fails, the mark is kept,
+/// and the next pass settles the stop over the no-op removal without
+/// announcing it a second time. One notice per stop, across the failure.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_failed_clear_still_leaves_exactly_one_notice(pool: PgPool) {
+    let (conversation, pod) = quiet_stopped_days_ago(&pool, 8).await;
+    db::fake_clear::fail_next(pod);
+
+    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async { Ok(claims_gone()) }).await;
+    assert_eq!(settled, Vec::<i64>::new(), "a failed clear settles nothing");
+    assert!(mark_set(&pool, pod).await, "the mark is kept for the retry");
+    assert_eq!(removal_notices(&pool, conversation).await.len(), 1, "the removal happened, and it was announced once");
+
+    // The next pass: still due, and the removal now finds nothing left —
+    // the no-op that settles quietly.
+    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async { Ok(StorageRemoval::default()) }).await;
+    assert_eq!(settled, vec![conversation], "the retry settles the stop");
+    assert!(!mark_set(&pool, pod).await, "and the mark finally clears");
+    assert_eq!(removal_notices(&pool, conversation).await.len(), 1, "and exactly one notice was ever saved");
 }
