@@ -16,9 +16,13 @@
 # Always exits 0: the test step's own result is what passes or fails a job.
 set -uo pipefail
 
-log=${1:?usage: scripts/ci-test-report LOG LABEL BUDGET_SECS}
-label=${2:?usage: scripts/ci-test-report LOG LABEL BUDGET_SECS}
-budget=${3:?usage: scripts/ci-test-report LOG LABEL BUDGET_SECS}
+if [ $# -ne 3 ]; then
+    echo "usage: scripts/ci-test-report LOG LABEL BUDGET_SECS (nothing reported)"
+    exit 0
+fi
+log=$1
+label=$2
+budget=$3
 
 if [ ! -s "$log" ]; then
     echo "ci-test-report: no output at $log, nothing to report"

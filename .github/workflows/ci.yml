@@ -30,18 +30,22 @@ on:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Only a PR's newer push cancels its older run: on main, a merge's run
+  # and the nightly one each finish (SME-341 review).
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
-  # Whether the change touches anything but docs (SME-341). A change to
-  # Markdown files and docs/ alone runs no test it could break, so
-  # `server` and `browser` don't run for it, and `docs` runs the repo lints
-  # instead, which do read docs: the size ceiling, links, persona files.
-  # Anything else, any manual run, or a range that can't be read counts as
-  # code. `server` and `browser` then run as before.
+  # Whether the change touches anything but docs (SME-341). Docs are what
+  # no build compiles in and no test reads but the repo lints: docs/, the
+  # top-level *.md, and .agents/**/*.md (persona files, which the lints
+  # parse with the product's own parser). Not every .md: src/turn/
+  # system_prompt.md is compiled into the binary, and any src/ change moves
+  # the build id. A docs-only change runs `docs` (the repo lints) instead of
+  # `server` and `browser`. Anything else, a manual or nightly run, or a
+  # range that can't be read counts as code, and runs everything.
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -64,13 +68,16 @@ jobs:
           PUSH_AFTER: ${{ github.sha }}
         run: |
           case "$EVENT" in
-            pull_request) base=$(git merge-base "$PR_BASE" "$PR_HEAD" 2>/dev/null); head=$PR_HEAD ;;
+            pull_request) base=$(git merge-base "$PR_BASE" "$PR_HEAD" 2>/dev/null) || base=; head=$PR_HEAD ;;
             push) base=$PUSH_BEFORE; head=$PUSH_AFTER ;;
             *) base=; head= ;;
           esac
           code=true
-          if [ -n "$base" ] && [ -n "$head" ] && changed=$(git diff --name-only "$base" "$head" 2>/dev/null) && [ -n "$changed" ]; then
-            if ! printf '%s\n' "$changed" | grep -qvE '(\.md$|^docs/)'; then
+          # --no-renames: a file moved into docs/ still lists the path it
+          # left. A here-string, not a pipe: with pipefail, `grep -q`
+          # leaving early made printf's SIGPIPE read as "docs only".
+          if [ -n "$base" ] && [ -n "$head" ] && changed=$(git diff --name-only --no-renames "$base" "$head" 2>/dev/null) && [ -n "$changed" ]; then
+            if ! grep -qvE '^(docs/.*|[^/]+\.md|\.agents/.*\.md)$' <<<"$changed"; then
               code=false
             fi
             printf 'changed:\n%s\n' "$changed"

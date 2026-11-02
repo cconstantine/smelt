@@ -89,24 +89,26 @@ PROVISIONER_ARGS='["--worker-threads=16","--kube-client-qps=50","--kube-client-b
 # function called with `||`. Returns 1 when the provisioner is left as k3s
 # set it up, 2 when an undo failed and its state isn't known.
 tune_provisioner() {
+    # Every API call bounded too, so the step's worst case holds.
+    tkctl() { kctl --request-timeout=15s "$@"; }
     echo "waiting for the local-path provisioner..."
     waited=0
-    until kctl -n kube-system get deployment local-path-provisioner >/dev/null 2>&1; do
+    until tkctl -n kube-system get deployment local-path-provisioner >/dev/null 2>&1; do
         waited=$((waited + 2))
         [ "$waited" -lt 120 ] || { echo "no local-path provisioner after 120 s"; return 1; }
         sleep 2
     done
-    current=$(kctl -n kube-system get deployment local-path-provisioner -o jsonpath='{.spec.template.spec.containers[0].args}') || return 1
+    current=$(tkctl -n kube-system get deployment local-path-provisioner -o jsonpath='{.spec.template.spec.containers[0].args}') || return 1
     [ "$current" = "$PROVISIONER_ARGS" ] && return 0
-    kctl -n kube-system patch deployment local-path-provisioner --type=json \
+    tkctl -n kube-system patch deployment local-path-provisioner --type=json \
         -p "[{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/args\",\"value\":$PROVISIONER_ARGS}]" || return 1
-    if kctl -n kube-system rollout status deployment local-path-provisioner --timeout=90s; then
+    if tkctl -n kube-system rollout status deployment local-path-provisioner --timeout=90s; then
         echo "local-path provisioner: $PROVISIONER_ARGS"
         return 0
     fi
     echo "the local-path provisioner didn't come up with $PROVISIONER_ARGS; rolling it back"
-    kctl -n kube-system rollout undo deployment local-path-provisioner || return 2
-    kctl -n kube-system rollout status deployment local-path-provisioner --timeout=90s || return 2
+    tkctl -n kube-system rollout undo deployment local-path-provisioner || return 2
+    tkctl -n kube-system rollout status deployment local-path-provisioner --timeout=90s || return 2
     return 1
 }
 tune_provisioner || case $? in
