@@ -193,10 +193,13 @@ async fn test_claims_already_gone_settle_quietly_and_once(pool: PgPool) {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
-/// The race the pass can actually meet: a start queued behind the locks
-/// at candidate time, stopped by the removal itself. `remove_conversation_storage_locked`
-/// saved its own notice for it, so the pass suppresses its own — one
-/// notice, no surprise pair.
+/// Defense-in-depth, not a race the pass can meet (SME-345 review 1, F3):
+/// while any pod of the conversation is live that row is the newest, and
+/// `still_due` — run under the start lock — demands the marked row be the
+/// newest, so the removal the pass runs finds no live pod to stop. Should
+/// some future change make it reachable, `pod_stopped: true` means the
+/// removal stopped the pod and saved its own notice, so the pass
+/// suppresses its own — one notice, no surprise pair.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_removal_that_stopped_a_pod_saved_its_own_notice(pool: PgPool) {
     let (conversation, pod) = quiet_stopped_days_ago(&pool, 8).await;
