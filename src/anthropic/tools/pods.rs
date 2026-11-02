@@ -31,13 +31,14 @@ fn pod_tools() -> Vec<Tool> {
                                Returns the new pod's id. A terminal can't be created until a \
                                pod exists. memory_limit optionally overrides the \
                                deployment's default memory limit for just this one pod (e.g. \
-                               memory_limit: \"4Gi\" for a memory-heavy task) — plain Kubernetes \
+                               memory_limit: \"16Gi\" for a memory-heavy task) — plain Kubernetes \
                                quantity strings, rejected by Kubernetes itself (as an error from \
                                this call) if malformed or over the deployment's configured \
                                ceiling. docker_memory_limit does the same for the \
                                pod's Docker daemon, whose containers share its limit, not the \
-                               sandbox's (e.g. docker_memory_limit: \"12Gi\" for a big compose \
-                               stack)."
+                               sandbox's — the default fits a seat's full gate stack \
+                               (cargo builds, dind, k3s and postgres), so raise it only for an \
+                               unusually large stack."
                     .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",

@@ -30,14 +30,16 @@ pub(in crate::sandbox) fn running_wait_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// `SANDBOX_DOCKER_MEMORY_LIMIT`, default `"8Gi"` — see
-/// `default_memory_limit`. Nested containers count against it, not the
-/// sandbox container's limit.
+/// `SANDBOX_DOCKER_MEMORY_LIMIT`, default `DEFAULT_DOCKER_MEMORY_LIMIT` —
+/// same pattern as `default_memory_limit`. Nested containers count against
+/// this daemon's limit, not the sandbox container's (SME-33). See
+/// `DEFAULT_DOCKER_MEMORY_LIMIT` for why the default is what it is, and
+/// docs/setup.md.
 pub(in crate::sandbox) fn default_docker_memory_limit() -> String {
     std::env::var("SANDBOX_DOCKER_MEMORY_LIMIT")
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "8Gi".to_string())
+        .unwrap_or_else(|| DEFAULT_DOCKER_MEMORY_LIMIT.to_string())
 }
 
 /// A container's resources (SME-77): a memory limit, an explicit zero
