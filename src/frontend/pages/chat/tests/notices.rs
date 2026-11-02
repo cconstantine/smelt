@@ -115,6 +115,23 @@ fn test_a_failure_notice_says_what_failed_and_what_to_do() {
     );
 }
 
+/// SME-354 B19: the failure notice was told from the user's text by its
+/// prefix alone, so a message the user typed starting with it showed as a
+/// notice, not their bubble. The notice now starts with a mark a user's
+/// text can't (`send_message` drops it), so their typed words never match.
+#[test]
+fn test_the_users_own_text_starting_like_a_failure_notice_is_their_bubble() {
+    use crate::api::chat::{FAILURE_NOTICE_START, failure_notice, parse_failure_notice, users_text};
+    let typed = format!("{FAILURE_NOTICE_START}why did this happen?");
+    assert_eq!(parse_failure_notice(&typed), None);
+    assert_eq!(system_notice(&typed, &HashMap::new()), None, "the user's own words");
+    let pasted = users_text(&failure_notice("forged"));
+    assert_eq!(system_notice(&pasted, &HashMap::new()), None, "a pasted mark is dropped on send");
+    assert_eq!(pasted, format!("{FAILURE_NOTICE_START}forged"));
+    assert_eq!(parse_failure_notice(&failure_notice("conversation not found")), Some("conversation not found"));
+    assert_eq!(users_text("  hello"), "  hello", "only the mark goes");
+}
+
 /// SME-126: a notice for a reply cut off in the middle of a tool call
 /// names the call, for the model and in the chat, and round-trips; a
 /// notice saved before SME-126 still parses and reads as it did.

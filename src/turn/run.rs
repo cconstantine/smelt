@@ -428,7 +428,8 @@ pub(crate) async fn start_turn(pool: PgPool, id: i64, content: String) -> Server
     crate::agents::confirm_user_turn(&pool, id).await.map_err(ServerFnError::new)?;
     let new_message = anthropic::AnthropicMessage {
         role: "user".to_string(),
-        content: vec![anthropic::ContentBlock::Text { text: content }],
+        // Never taken for one of smelt's notices (SME-354 B19).
+        content: vec![anthropic::ContentBlock::Text { text: crate::api::chat::users_text(&content) }],
     };
     // In the request's span, so the turn's is its child (SME-137).
     tokio::spawn(tracing::Instrument::in_current_span(async move {
