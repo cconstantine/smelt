@@ -239,6 +239,25 @@ pub(super) async fn scenario_agent_tree(t: &Scenario<'_>) {
         Duration::from_secs(10),
     )
     .await;
+    // The open agent's page says which conversation it is, and the one
+    // that started it (SME-123 DR5).
+    assert!(
+        wait_for_count(
+            &page,
+            &format!(".conversation-header .conversation-header-parent a[href$='/conversation/{developer}']"),
+            1,
+            Duration::from_secs(10),
+        )
+        .await,
+        "the header doesn't link the agent's parent"
+    );
+    let meta: String = page
+        .evaluate("document.querySelector('.conversation-header-meta')?.innerText ?? ''")
+        .await
+        .expect("read the header")
+        .into_value()
+        .expect("text");
+    assert!(meta.contains("waiting for the user"), "the header names the agent's status: {meta}");
     // Folding the open agent's grandparent then holds through the next
     // refetch of the tree (review 2): the unfold is once per opening.
     click_when_present(&page, &caret, Duration::from_secs(5)).await;

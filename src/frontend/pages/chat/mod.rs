@@ -58,6 +58,7 @@ use crate::models::Message;
 mod actions;
 mod agents_waiting;
 mod composer;
+mod conversation_header;
 mod empty_home;
 mod context;
 mod follow;
@@ -322,6 +323,7 @@ fn ChatPanel(
                         }
                     }
                     div { class: "chat-main",
+                        conversation_header::ConversationHeader { selected, conversations_changed, turns_changed }
                         AgentsWaitingBanner { selected, conversations_changed, questions_changed }
                         ContextUsage {
                             selected,
