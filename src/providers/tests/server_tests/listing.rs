@@ -255,10 +255,13 @@ async fn test_the_first_provider_added_makes_its_first_model_the_default(pool: P
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_first_provider_that_lists_nothing_leaves_no_default(pool: PgPool) {
-    let mut gone = input("gone", "http://127.0.0.1:1", "k");
-    gone.kind = ProviderKind::Other;
-    create_provider(&pool, gone).await.expect("saved even unreachable");
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // The defaulting itself, awaited, not the save's background task: a
+    // wait on it couldn't tell "ran and set nothing" from "hasn't run"
+    // (review 2 L3).
+    let gone = db::create_inference_provider(&pool, "gone", "other", "http://127.0.0.1:1", "bearer", "k", false, None, true, None)
+        .await
+        .expect("create");
+    default_to_first_model(pool.clone(), gone).await;
     assert_eq!(default_model(&pool).await.expect("read"), None);
 }
 

@@ -489,7 +489,10 @@ pub(super) fn run_turn_body<'a: 'b, 'b>(
         crate::events::publish(conversation_id, crate::events::ConversationEvent::ReplyReset {});
         // A user's turn says why it failed in the conversation, saved here,
         // still holding the lock, so it lands before anything a turn queued
-        // behind this one saves (SME-123 DR3, review 1 M1).
+        // behind this one saves (SME-123 DR3, review 1 M1). A Stop landing
+        // during this one insert drops it with the body: the turn then ends
+        // as stopped, with the stop's own notice, which is what the user
+        // asked for (review 2 L1, accepted).
         if users_turn {
             let reason = chat_error_text(&e);
             if note_failure(pool, conversation_id, &reason).await {

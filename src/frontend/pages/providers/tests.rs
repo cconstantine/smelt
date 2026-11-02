@@ -146,3 +146,14 @@ fn test_a_key_badge_reads_the_same_with_or_without_its_ending() {
     assert_eq!(key_badge(Some("\u{2026}5ENp")), "Key saved \u{2026}5ENp");
     assert_eq!(key_badge(None), "Key saved");
 }
+
+/// SME-123 review 2 M1: with nothing typed, choosing takes the first
+/// listed model (the placeholder); with nothing listed either, nothing.
+#[test]
+fn test_an_empty_model_field_chooses_the_first_listed_model() {
+    use super::picker::model_to_choose;
+    assert_eq!(model_to_choose("", Some("first")), Some("first".to_string()));
+    assert_eq!(model_to_choose("  ", Some("first")), Some("first".to_string()));
+    assert_eq!(model_to_choose(" typed ", Some("first")), Some("typed".to_string()));
+    assert_eq!(model_to_choose("", None), None);
+}

@@ -475,7 +475,7 @@ pub async fn create_provider(pool: &PgPool, input: ProviderInput) -> Result<Prov
     limiter::set(provider.id, provider.updated_at, resolved_max(&provider));
     // In the background: the save doesn't wait on a listing, which a slow
     // or not-yet-started server could take its time over (review 1 L1).
-    tokio::spawn(default_to_first_model(pool.clone(), provider.clone()));
+    tokio::spawn(tracing::Instrument::in_current_span(default_to_first_model(pool.clone(), provider.clone())));
     providers_changed();
     Ok(provider.into())
 }
@@ -486,8 +486,9 @@ pub async fn create_provider(pool: &PgPool, input: ProviderInput) -> Result<Prov
 /// with a model id to type). A listing that fails, or lists nothing usable,
 /// leaves the default unset, as before; it's never an error for the save.
 /// The default is set only if still unset when the listing lands, so one
-/// the user set meanwhile stays (review 1 L1).
-async fn default_to_first_model(pool: PgPool, provider: db::InferenceProvider) {
+/// the user set meanwhile stays (review 1 L1). With two providers added
+/// at once, the first whose listing lands is the one (review 2 L2).
+pub(crate) async fn default_to_first_model(pool: PgPool, provider: db::InferenceProvider) {
     if !matches!(db::get_default_model(&pool).await, Ok(None)) {
         return;
     }

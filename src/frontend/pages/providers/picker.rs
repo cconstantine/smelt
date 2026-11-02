@@ -77,6 +77,15 @@ pub(super) fn suggestion_order(mut models: Vec<ModelInfo>) -> Vec<ModelInfo> {
     models
 }
 
+/// What choosing takes: the typed id, or with nothing typed the provider's
+/// first listed model, the field's placeholder (SME-123 DR2; review 2 M1:
+/// the button stayed disabled with the field empty, so the placeholder
+/// couldn't be chosen). None leaves the button disabled.
+pub(super) fn model_to_choose(typed: &str, first_listed: Option<&str>) -> Option<String> {
+    let typed = typed.trim();
+    if typed.is_empty() { first_listed.map(str::to_string) } else { Some(typed.to_string()) }
+}
+
 /// Chooses a provider and a model: the provider's listed models are
 /// suggestions for a field that also takes an id typed by hand, for when
 /// the listing fails or lacks it. Calls `on_choose` with the choice.
@@ -108,14 +117,10 @@ pub(super) fn ModelChooser(
     };
     let list_id = format!("model-suggestions-{}", provider().unwrap_or_default());
     let placeholder = first_listed.clone().unwrap_or_else(|| "Model id".to_string());
+    let first_for_button = first_listed.clone();
     let choose = move |event: Event<FormData>| {
         event.prevent_default();
-        let typed = model().trim().to_string();
-        let chosen = if typed.is_empty() { first_listed.clone().unwrap_or_default() } else { typed };
-        let Some(id) = provider() else {
-            return;
-        };
-        if !chosen.is_empty() {
+        if let (Some(id), Some(chosen)) = (provider(), model_to_choose(&model(), first_listed.as_deref())) {
             on_choose.call((id, chosen));
         }
     };
@@ -154,7 +159,7 @@ pub(super) fn ModelChooser(
                     }
                 }
             }
-            button { r#type: "submit", disabled: model().trim().is_empty() || provider().is_none(), "{choose_label}" }
+            button { r#type: "submit", disabled: model_to_choose(&model(), first_for_button.as_deref()).is_none() || provider().is_none(), "{choose_label}" }
             if let Some(cancel) = on_cancel {
                 button { r#type: "button", class: "model-chooser-cancel", onclick: move |_| cancel.call(()), "Cancel" }
             }
