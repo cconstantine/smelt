@@ -380,3 +380,45 @@ async fn test_the_users_removal_settles_a_stop_the_pass_gave_up_on(pool: PgPool)
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(removal_notices(&pool, conversation).await.is_empty(), "and the pass claims no removal");
 }
+
+/// SME-354 review 2, M1: an attempt given up on after deleting the claims
+/// (B13), then one that errors before the claim loop: the error doesn't
+/// erase the first attempt's record, and the retry finding the claims
+/// gone still sends the stop's one notice.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_error_after_a_timed_out_removal_keeps_its_notice(pool: PgPool) {
+    let (conversation, pod) = quiet_stopped_days_ago(&pool, 8).await;
+    let settled = remove_expired_storage_once_with(&pool, 7, Duration::from_millis(200), |_conversation| async {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        Ok(claims_gone())
+    })
+    .await;
+    assert_eq!(settled, Vec::<i64>::new(), "given up on: nothing settles");
+
+    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async {
+        Err(SandboxError::StartFailed("the API server is down".into()))
+    })
+    .await;
+    assert_eq!(settled, Vec::<i64>::new());
+
+    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async { Ok(claims_already_gone()) }).await;
+    assert_eq!(settled, vec![conversation]);
+    assert_eq!(removal_notices(&pool, conversation).await.len(), 1, "the first attempt's removal is still told, once");
+}
+
+/// SME-354 review 2, L1: a first attempt that finds the claims already
+/// gone (someone else removed them), whose clear fails: the retry claims
+/// no removal either.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_failed_clear_over_claims_already_gone_sends_no_notice(pool: PgPool) {
+    let (conversation, pod) = quiet_stopped_days_ago(&pool, 8).await;
+    db::fake_clear::fail_next(pod);
+
+    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async { Ok(claims_already_gone()) }).await;
+    assert_eq!(settled, Vec::<i64>::new(), "a failed clear settles nothing");
+    assert!(mark_set(&pool, pod).await);
+
+    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async { Ok(claims_already_gone()) }).await;
+    assert_eq!(settled, vec![conversation], "the retry settles the stop");
+    assert!(removal_notices(&pool, conversation).await.is_empty(), "the pass removed nothing, and never says it did");
+}

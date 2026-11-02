@@ -169,9 +169,13 @@ where
                     // Every error returns before the claim loop: this
                     // attempt deleted nothing, so a retry finding the
                     // claims gone (the user removed them meanwhile) must
-                    // not credit it (SME-354 review 1, M1).
-                    if let Err(e) = db::forget_storage_removal_attempt(pool, pod_id).await {
-                        tracing::warn!(pod_id, error = %e, "couldn't forget a failed storage-grace attempt");
+                    // not credit it (SME-354 review 1, M1) — unless an
+                    // earlier attempt of this mark, given up on, may have
+                    // deleted them (B13): that record stands (review 2).
+                    if !tried_before {
+                        if let Err(e) = db::forget_storage_removal_attempt(pool, pod_id).await {
+                            tracing::warn!(pod_id, error = %e, "couldn't forget a failed storage-grace attempt");
+                        }
                     }
                     false
                 }
@@ -191,15 +195,17 @@ where
                     // server), and stopping a live pod didn't already
                     // save one.
                     let deleted = removal.claims_deleted > 0 || tried_before;
+                    // Settled whatever the outcome, so the attempt is
+                    // forgotten first (review 1, M1; review 2, L1):
+                    // should the clear below fail, the retry finds the
+                    // claims gone and no earlier attempt, and settles
+                    // with no notice — no second one, and none for a
+                    // removal this pass didn't do.
+                    if let Err(e) = db::forget_storage_removal_attempt(pool, pod_id).await {
+                        tracing::warn!(pod_id, error = %e, "couldn't forget a storage-grace attempt; the next pass settles it again");
+                        return false;
+                    }
                     if deleted && removal.workspace_gone && !removal.pod_stopped {
-                        // The attempt is forgotten first (review 1, M1):
-                        // should the clear below fail, the retry finds
-                        // the claims gone and no earlier attempt, and
-                        // settles without a second notice.
-                        if let Err(e) = db::forget_storage_removal_attempt(pool, pod_id).await {
-                            tracing::warn!(pod_id, error = %e, "couldn't forget a storage-grace attempt; the next pass sends its notice");
-                            return false;
-                        }
                         save_removal_notice(pool, pod_id, conversation_id, days).await;
                     }
                     // If clearing fails the next pass re-removes as a

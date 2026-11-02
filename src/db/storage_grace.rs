@@ -13,7 +13,8 @@ use super::*;
 /// quiet stop stamps it in the statement that closes the row
 /// (`terminate_sandbox_pod_as`'s `PodEnd::Quiet`, SME-354 B3); every
 /// other end — the model's `terminate_pod`, a lost pod — leaves NULL, a
-/// user's Stop clears it, and otherwise only the pass clears it again.
+/// user's Stop clears it, so does the user's storage removal (SME-354
+/// review 1, M1), and otherwise only the pass clears it again.
 #[cfg(test)]
 pub async fn mark_pod_quietly_stopped(pool: &PgPool, pod_id: i64) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE sandbox_pods SET quietly_stopped_at = now() WHERE id = $1")
@@ -92,11 +93,11 @@ pub async fn start_storage_removal(pool: &PgPool, pod_id: i64) -> Result<bool, s
 }
 
 /// Forgets this mark's recorded attempt (SME-354 review 1, M1), for the
-/// two outcomes that leave nothing for a retry to announce: an attempt
-/// that failed before deleting anything, and one whose notice is about
-/// to be saved. Done before the notice, a retry after a failed clear
-/// finds no earlier attempt and settles quietly, so the stop keeps its
-/// one notice.
+/// two outcomes that leave nothing for a retry to announce: a first
+/// attempt that failed before deleting anything (a later one leaves an
+/// earlier attempt's record standing), and a settled one, before its
+/// notice and clear. A retry after a failed clear then finds no earlier
+/// attempt and settles quietly, so the stop keeps its one notice.
 pub async fn forget_storage_removal_attempt(pool: &PgPool, pod_id: i64) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE sandbox_pods SET storage_removal_started_at = NULL WHERE id = $1")
         .bind(pod_id)
