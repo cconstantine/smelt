@@ -141,7 +141,7 @@ pub(super) async fn scenario_agent_tree(t: &Scenario<'_>) {
     let row = |id: i64, depth: usize, meta: &str, count: &str| format!("{id}|{depth}|{meta}|{count}");
     let dev_meta = format!("idle \u{b7} {long_dir}:developer");
     let expanded = vec![
-        row(root.id, 0, "", "?1"),
+        row(root.id, 0, "3 agents", "?1"),
         row(developer, 1, &dev_meta, "?1"),
         row(grandchild, 2, "waiting for the user", ""),
         row(asks_parent, 1, "waiting for its parent", ""),
@@ -182,7 +182,7 @@ pub(super) async fn scenario_agent_tree(t: &Scenario<'_>) {
         // Folding the parent hides its agents and keeps the count.
         let caret = format!(".conversation-item[data-conversation-id='{}'] .tree-caret", root.id);
         click_when_present(&page, &caret, Duration::from_secs(5)).await;
-        wait_for_tree(&page, &ids, &[row(root.id, 0, "", "?1")], &format!("{width}px, folded")).await;
+        wait_for_tree(&page, &ids, &[row(root.id, 0, "3 agents", "?1")], &format!("{width}px, folded")).await;
         let expanded_attr: String = page
             .evaluate(format!("document.querySelector({caret:?}).getAttribute('aria-expanded')"))
             .await
@@ -202,10 +202,10 @@ pub(super) async fn scenario_agent_tree(t: &Scenario<'_>) {
     wait_for_tree(&page, &ids, &expanded, "on Home").await;
     let caret = format!(".conversation-item[data-conversation-id='{}'] .tree-caret", root.id);
     click_when_present(&page, &caret, Duration::from_secs(5)).await;
-    wait_for_tree(&page, &ids, &[row(root.id, 0, "", "?1")], "folded on Home").await;
+    wait_for_tree(&page, &ids, &[row(root.id, 0, "3 agents", "?1")], "folded on Home").await;
     click_conversation(&page, root.id).await;
     wait_for_live_client(&page, root.id).await;
-    wait_for_tree(&page, &ids, &[row(root.id, 0, "", "?1")], "still folded on the parent's page").await;
+    wait_for_tree(&page, &ids, &[row(root.id, 0, "3 agents", "?1")], "still folded on the parent's page").await;
     page.close().await.expect("close the tab");
 
     // Live: the developer agent asks the user, and an open tab's tree and
@@ -216,7 +216,7 @@ pub(super) async fn scenario_agent_tree(t: &Scenario<'_>) {
     seed_question(t.pool, developer, "user").await;
     crate::events::publish_app(crate::events::AppEvent::QuestionsChanged);
     let live = vec![
-        row(root.id, 0, "", "?2"),
+        row(root.id, 0, "3 agents", "?2"),
         row(developer, 1, &format!("waiting for the user \u{b7} {long_dir}:developer"), "?1"),
         row(grandchild, 2, "waiting for the user", ""),
         row(asks_parent, 1, "waiting for its parent", ""),
@@ -230,7 +230,7 @@ pub(super) async fn scenario_agent_tree(t: &Scenario<'_>) {
     // open, though its grandparent was folded (review 1, finding 3).
     let caret = format!(".conversation-item[data-conversation-id='{}'] .tree-caret", root.id);
     click_when_present(&page, &caret, Duration::from_secs(5)).await;
-    wait_for_tree(&page, &ids, &[row(root.id, 0, "", "?2")], "folded before the link").await;
+    wait_for_tree(&page, &ids, &[row(root.id, 0, "3 agents", "?2")], "folded before the link").await;
     click_when_present(&page, &format!(".agents-waiting-link[href$='/conversation/{grandchild}']"), Duration::from_secs(5)).await;
     wait_for_live_client(&page, grandchild).await;
     wait_for_element(
@@ -242,7 +242,7 @@ pub(super) async fn scenario_agent_tree(t: &Scenario<'_>) {
     // Folding the open agent's grandparent then holds through the next
     // refetch of the tree (review 2): the unfold is once per opening.
     click_when_present(&page, &caret, Duration::from_secs(5)).await;
-    wait_for_tree(&page, &ids, &[row(root.id, 0, "", "?2")], "folded above the open agent").await;
+    wait_for_tree(&page, &ids, &[row(root.id, 0, "3 agents", "?2")], "folded above the open agent").await;
     let fetches = list_requests(&page).await;
     crate::events::publish_app(crate::events::AppEvent::TurnsChanged);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -251,5 +251,5 @@ pub(super) async fn scenario_agent_tree(t: &Scenario<'_>) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(tree_rows(&page, &ids).await, vec![row(root.id, 0, "", "?2")], "the fold sprang open on a refetch");
+    assert_eq!(tree_rows(&page, &ids).await, vec![row(root.id, 0, "3 agents", "?2")], "the fold sprang open on a refetch");
 }

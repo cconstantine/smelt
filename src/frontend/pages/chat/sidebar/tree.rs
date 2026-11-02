@@ -22,6 +22,10 @@ pub(super) struct TreeRow {
     /// How many conversations under it, at any depth, wait for the user:
     /// the mark that finds a waiting agent from its parent, folded or not.
     pub waiting_under: usize,
+    /// How many agents it has under it, at any depth (SME-123 DR1).
+    pub agents_under: usize,
+    /// How many of those are working now.
+    pub busy_under: usize,
 }
 
 impl TreeRow {
@@ -94,12 +98,50 @@ fn push_subtree(
         has_children: !under.is_empty(),
         collapsed: is_collapsed,
         waiting_under: waiting_under(node.id, children, &mut HashSet::new()),
+        agents_under: descendants(node.id, children, &mut HashSet::new()).len(),
+        busy_under: descendants(node.id, children, &mut HashSet::new()).iter().filter(|n| n.busy).count(),
     });
     if !is_collapsed {
         for child in under {
             push_subtree(child, depth + 1, children, collapsed, placed, rows);
         }
     }
+}
+
+/// Every conversation under `id`, at any depth.
+fn descendants<'a>(
+    id: i64,
+    children: &HashMap<i64, Vec<&'a ConversationNode>>,
+    seen: &mut HashSet<i64>,
+) -> Vec<&'a ConversationNode> {
+    if !seen.insert(id) {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    for child in children.get(&id).map(Vec::as_slice).unwrap_or_default() {
+        found.push(*child);
+        found.extend(descendants(child.id, children, seen));
+    }
+    found
+}
+
+/// The conversations with agents under them none of which is working or
+/// waiting for the user: their trees fold away by themselves, so a list
+/// of finished agent work doesn't bury the user's own conversations
+/// (SME-123 DR1: 182 rows, all unfolded, on the deployed instance).
+pub(super) fn settled_parents(nodes: &[ConversationNode]) -> Vec<i64> {
+    let ids: HashSet<i64> = nodes.iter().map(|n| n.id).collect();
+    let mut children: HashMap<i64, Vec<&ConversationNode>> = HashMap::new();
+    for node in nodes {
+        if let Some(parent) = node.parent_id.filter(|p| ids.contains(p) && *p != node.id) {
+            children.entry(parent).or_default().push(node);
+        }
+    }
+    children
+        .keys()
+        .copied()
+        .filter(|id| descendants(*id, &children, &mut HashSet::new()).iter().all(|n| !n.busy && !n.waiting_for_user))
+        .collect()
 }
 
 /// How many of `id`'s descendants wait for the user.
@@ -228,5 +270,37 @@ mod tests {
         let list = vec![node(1, Some(2)), node(2, Some(1)), node(3, None)];
         let rows = build_tree(&list, &HashSet::new());
         assert_eq!(shape(&rows), vec![(3, 0)], "a cycle has no root to reach it from");
+    }
+
+    fn busy(mut n: ConversationNode) -> ConversationNode {
+        n.busy = true;
+        n
+    }
+
+    #[test]
+    fn test_only_parents_with_nothing_working_or_waiting_under_them_fold_on_their_own() {
+        let list = vec![
+            node(1, None),
+            node(2, Some(1)),
+            node(3, Some(2)),
+            node(4, None),
+            busy(node(5, Some(4))),
+            node(6, None),
+            node(7, Some(6)),
+            waiting(node(8, Some(7))),
+            node(9, None),
+        ];
+        let mut settled = settled_parents(&list);
+        settled.sort_unstable();
+        // 1 and 2 are settled; 4 has a busy agent; 6 and 7 have one waiting; 9 has no agents.
+        assert_eq!(settled, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_a_parent_row_counts_its_agents_and_the_ones_working() {
+        let list = vec![node(1, None), busy(node(2, Some(1))), node(3, Some(2)), busy(node(4, Some(3))), node(5, None)];
+        let rows = build_tree(&list, &HashSet::from([1]));
+        assert_eq!((rows[0].agents_under, rows[0].busy_under), (3, 2), "every depth, folded or not");
+        assert_eq!((rows[1].agents_under, rows[1].busy_under), (0, 0), "no agents under it");
     }
 }
