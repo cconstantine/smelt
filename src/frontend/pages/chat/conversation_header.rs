@@ -4,7 +4,7 @@
 //! on a phone, with the list folded away, there was none.
 
 use super::*;
-use crate::api::agents::{ConversationNode, get_conversation_tree};
+use crate::api::agents::ConversationNode;
 
 /// What the header shows for one conversation.
 #[derive(Clone, Debug, PartialEq)]
@@ -17,7 +17,7 @@ pub(super) struct HeaderInfo {
 }
 
 /// The header for conversation `id`, from the conversation list; None
-/// while the list doesn't have it.
+/// while the list doesn't have it (the header is then its toggle alone).
 pub(super) fn header_info(nodes: &[ConversationNode], id: i64) -> Option<HeaderInfo> {
     let node = nodes.iter().find(|n| n.id == id)?;
     let meta = node.status.as_deref().map(|status| match node.persona.as_deref() {
@@ -34,28 +34,20 @@ pub(super) fn header_info(nodes: &[ConversationNode], id: i64) -> Option<HeaderI
 #[component]
 pub(super) fn ConversationHeader(
     selected: Memo<Option<i64>>,
-    conversations_changed: Signal<u64>,
-    turns_changed: Signal<u64>,
-    questions_changed: Signal<u64>,
+    nodes: Signal<Vec<ConversationNode>>,
 ) -> Element {
-    let tree = use_resource(move || {
-        let _ = conversations_changed();
-        let _ = turns_changed();
-        // A question waiting changes an agent's status (review 1 L8).
-        let _ = questions_changed();
-        get_conversation_tree()
-    });
-    let info = match (&*tree.read(), selected()) {
-        (Some(Ok(nodes)), Some(id)) => header_info(nodes, id),
-        _ => None,
-    };
-    let Some(info) = info else {
-        return rsx! {};
+    // Without the tree (not fetched yet, or a row it doesn't have yet) the
+    // header is the toggle alone: thinking can be shown from the start
+    // (SME-354 B18).
+    let info = selected().and_then(|id| header_info(&nodes.read(), id));
+    let (title, meta, parent) = match info {
+        Some(info) => (info.title, info.meta, info.parent),
+        None => (String::new(), None, None),
     };
     rsx! {
         div { class: "conversation-header",
             div { class: "conversation-header-top",
-                h1 { class: "conversation-header-title", title: "{info.title}", "{info.title}" }
+                h1 { class: "conversation-header-title", title: "{title}", "{title}" }
                 // Thinking beside tool calls and replies is hidden unless
                 // asked for (SME-123 DR6).
                 button {
@@ -69,12 +61,12 @@ pub(super) fn ConversationHeader(
                     if super::transcript::SHOW_THINKING() { "Hide thinking" } else { "Show thinking" }
                 }
             }
-            if info.meta.is_some() || info.parent.is_some() {
+            if meta.is_some() || parent.is_some() {
                 div { class: "conversation-header-meta",
-                    if let Some(meta) = info.meta {
+                    if let Some(meta) = meta {
                         span { "{meta}" }
                     }
-                    if let Some((parent_id, parent_title)) = info.parent {
+                    if let Some((parent_id, parent_title)) = parent {
                         span { class: "conversation-header-parent",
                             "part of "
                             Link { to: Route::ConversationRoute { id: parent_id }, "{parent_title}" }
@@ -103,6 +95,23 @@ mod tests {
             busy: false,
             waiting_for_user: false,
         }
+    }
+
+    /// SME-354 B18: "Show thinking" lived only in a header that rendered
+    /// nothing until the conversation tree loaded. With the tree not in
+    /// yet (or without the open conversation), the toggle still shows.
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_the_thinking_toggle_shows_before_the_tree_has_the_conversation() {
+        fn app() -> Element {
+            let selected = use_memo(|| Some(7));
+            let nodes = use_signal(Vec::new);
+            rsx! { ConversationHeader { selected, nodes } }
+        }
+        let mut dom = VirtualDom::new(app);
+        dom.rebuild_in_place();
+        let html = dioxus::ssr::render(&dom);
+        assert!(html.contains("Show thinking"), "{html}");
     }
 
     #[test]

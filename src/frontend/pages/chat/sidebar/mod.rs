@@ -34,6 +34,8 @@ static FOLD_DECIDED: GlobalSignal<HashSet<i64>> = Signal::global(HashSet::new);
 #[component]
 pub(super) fn ConversationSidebar(
     selected: Memo<Option<i64>>,
+    /// The tree as last fetched, shared with the conversation header.
+    conversations: Signal<Vec<ConversationNode>>,
     conversations_changed: Signal<u64>,
     pods_changed: Signal<u64>,
     turns_changed: Signal<u64>,
@@ -58,7 +60,7 @@ pub(super) fn ConversationSidebar(
         let _ = questions_changed();
         get_conversation_tree()
     });
-    let mut conversations: Signal<Vec<ConversationNode>> = use_signal(Vec::new);
+    let mut conversations = conversations;
     let mut loaded = use_signal(|| false);
     // Why the list couldn't load, and why the last New conversation or
     // Delete failed. Each is cleared by its own next success: the list
