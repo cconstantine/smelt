@@ -23,6 +23,10 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  # Every night on main, with nothing changed: a test that has gone flaky
+  # or slow shows up here, not first on someone's unrelated PR (SME-341).
+  schedule:
+    - cron: "17 9 * * *"
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -137,12 +141,19 @@ jobs:
       # lock, so it never waits.
       - name: cargo test --features server
         run: |
+          # The step's result is the tests', not tee's.
+          set -o pipefail
           docker compose run --rm \
             -e SANDBOX_RUNNING_WAIT_TIMEOUT_SECS=120 \
             -e SANDBOX_MEMORY_LIMIT=128Mi \
             -e SANDBOX_DOCKER_MEMORY_LIMIT=256Mi \
             -e SANDBOX_IMAGE \
-            smelt scripts/with-cluster-lock cargo test --features server
+            smelt scripts/with-cluster-lock cargo test --features server \
+            2>&1 | tee "$RUNNER_TEMP/server-tests.log"
+
+      - name: Server test time and slow tests
+        if: always()
+        run: scripts/ci-test-report "$RUNNER_TEMP/server-tests.log" server 600
 
       - name: Dump sandbox pod diagnostics on failure
         if: failure()
@@ -230,12 +241,20 @@ jobs:
       # apply here too.
       - name: Browser tests (src/browser_tests/)
         run: |
+          # The step's result is the tests', not tee's.
+          set -o pipefail
           docker compose run --rm \
             -e SANDBOX_RUNNING_WAIT_TIMEOUT_SECS=120 \
             -e SANDBOX_MEMORY_LIMIT=128Mi \
             -e SANDBOX_DOCKER_MEMORY_LIMIT=256Mi \
             -e SANDBOX_IMAGE \
-            smelt scripts/with-cluster-lock cargo test --features "server browser-test" -- --ignored --test-threads=1
+            -e RUST_TEST_NOCAPTURE=1 \
+            smelt scripts/with-cluster-lock cargo test --features "server browser-test" -- --ignored --test-threads=1 \
+            2>&1 | tee "$RUNNER_TEMP/browser-tests.log"
+
+      - name: Browser test time and slowest scenarios
+        if: always()
+        run: scripts/ci-test-report "$RUNNER_TEMP/browser-tests.log" browser 480
 
       - name: Dump sandbox pod diagnostics on failure (browser tests)
         if: failure()
