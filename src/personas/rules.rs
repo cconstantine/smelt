@@ -158,21 +158,25 @@ impl RuleChain {
     /// The stored column: absent or NULL is the empty chain — allow-all,
     /// the user's own conversation as today. JSON that won't read as
     /// entries is possible only if the store was corrupted behind smelt's
-    /// back (it's written by typed serde): fall open with a warning, the
-    /// same way the call path reads, so offer and call stay a consistent
-    /// pair rather than offering tools whose calls are refused.
+    /// back (it's written by typed serde): the offer path falls open with
+    /// a warning, so a bad store hides no tools; the call path reads it
+    /// with `try_from_stored` and refuses the call instead (SME-354 B10).
     pub(crate) fn from_stored(stored: Option<serde_json::Value>) -> RuleChain {
-        let entries = match stored
+        RuleChain::try_from_stored(stored).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "an agents.rule_chain value won't read as tool rules; its tools are offered unruled");
+            RuleChain::default()
+        })
+    }
+
+    /// The stored column, read strictly: the call path's (SME-354 B10),
+    /// which refuses a call rather than run it unruled. Absent or NULL is
+    /// still the empty chain.
+    pub(crate) fn try_from_stored(stored: Option<serde_json::Value>) -> Result<RuleChain, String> {
+        stored
             .map(serde_json::from_value::<Vec<ToolRules>>)
             .transpose()
-        {
-            Ok(entries) => entries.unwrap_or_default(),
-            Err(e) => {
-                tracing::warn!(error = %e, "an agents.rule_chain value won't read as tool rules; its conversation is left unruled");
-                Vec::new()
-            }
-        };
-        RuleChain(entries)
+            .map(|entries| RuleChain(entries.unwrap_or_default()))
+            .map_err(|e| format!("the stored rules won't read: {e}"))
     }
 
     /// Whether the tool may be called at `class`: every entry must allow

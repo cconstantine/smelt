@@ -295,7 +295,7 @@ mod server {
                 // the chain travels in as the check `call_tool_classed`
                 // consults before it sends; the class is recorded either
                 // way, allowed or refused.
-                let chain = call_rule_chain(pool, conversation_id).await;
+                let chain = call_rule_chain(pool, conversation_id, name).await?;
                 crate::mcp::call_tool_classed(pool, &config, tool, input.clone(), |class| {
                     record(class);
                     chain.allows_at(crate::personas::rules::ToolRef::Mcp { server: &config.name, tool }, class)
@@ -307,12 +307,12 @@ mod server {
                 record(class);
                 // SME-241: the conversation's stored chain speaks before the
                 // tool runs — a refusal names the rule and no side effect
-                // happened. A chain it doesn't have (no agent row), can't
-                // read, or can't parse falls open with a warning, exactly
-                // like the offer path: offer and call stay a consistent
-                // pair, and a bad store strands no tools (SME-241's plan,
-                // threat model).
-                let chain = call_rule_chain(pool, conversation_id).await;
+                // happened. No chain (no agent row) is allow-all; one that
+                // can't be read or parsed refuses the call (SME-354 B10),
+                // while the offer path still falls open: a bad store then
+                // shows tools whose calls say why they're refused, rather
+                // than running tools the chain may deny.
+                let chain = call_rule_chain(pool, conversation_id, name).await?;
                 chain.allows_at(crate::personas::rules::ToolRef::Native(name), class)?;
                 if registered.offer != super::Offer::All {
                     offered_to(pool, conversation_id, name, registered.offer).await?;
@@ -323,16 +323,20 @@ mod server {
     }
 
     /// The conversation's stored rule chain as the call path reads it
-    /// (SME-241): absent, unreadable or unparseable falls open with a
-    /// warning, the same pair `tool_definitions` offers by.
-    async fn call_rule_chain(pool: &PgPool, conversation_id: i64) -> crate::personas::rules::RuleChain {
-        match crate::db::agent_rule_chain(pool, conversation_id).await {
-            Ok(stored) => crate::personas::rules::RuleChain::from_stored(stored),
-            Err(e) => {
-                tracing::warn!(conversation_id, error = %e, "couldn't read the conversation's rule chain; its tools are unruled this call");
-                crate::personas::rules::RuleChain::default()
-            }
-        }
+    /// (SME-241): absent is allow-all; unreadable or unparseable refuses
+    /// the call to `name` (SME-354 B10: fails closed, where the offer
+    /// path falls open).
+    async fn call_rule_chain(
+        pool: &PgPool,
+        conversation_id: i64,
+        name: &str,
+    ) -> Result<crate::personas::rules::RuleChain, String> {
+        let refused = |e: String| {
+            tracing::warn!(conversation_id, error = %e, tool = name, "couldn't read the conversation's rule chain; the call is refused");
+            format!("couldn't read this conversation's tool rules, so {name} is refused: {e}")
+        };
+        let stored = crate::db::agent_rule_chain(pool, conversation_id).await.map_err(|e| refused(e.to_string()))?;
+        crate::personas::rules::RuleChain::try_from_stored(stored).map_err(refused)
     }
 
     /// Refuses a call to a tool this conversation isn't offered (SME-236),
