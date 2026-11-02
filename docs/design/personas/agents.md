@@ -37,7 +37,7 @@ The `agents` row is separate from `conversations` so the user's own conversation
 | `stop_agent(id)` | any conversation | Stops one of its own children and everything under it ([Stop](#stop-stop_agent-and-the-user)). Refuses any other id. |
 | `message_agent(to, text)` | a conversation with a parent or children | `to` is `parent` or one of its own children's ids. Queues the message and wakes the recipient. Refuses anyone else (siblings go through the parent). |
 | `ask_parent(question)` | a child | Records a question to its parent and ends its turn; the parent's next `message_agent` to it answers it and wakes it. |
-| `finish(report)` | a child | Its final report: queued to the parent, the child's state becomes `finished`, and its turn ends. |
+| `finish(report)` | a child | Its final report: queued to the parent, the child's state becomes `finished`, and its turn ends. Refused while an agent of its own is `starting` or `active`, or a report from one is unread (SME-354 B2): their reports would reach a finished agent that sends nothing on. |
 
 A conversation without a parent isn't offered `ask_parent` or `finish`. Until SME-241's rules, only a conversation without a parent is offered `start_agent` (so SME-236 ships with depth 1 and no persona field for it); from SME-241 on, `start_agent` is a tool like any other under a persona's rules, plus the depth limit. There's no separate `may_start_agents` field: one mechanism, not two.
 

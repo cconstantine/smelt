@@ -240,3 +240,42 @@ async fn test_a_users_message_queued_behind_a_finish_can_finish_again(pool: PgPo
     assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_FINISHED));
     eventually("every turn is over", || async { !crate::turn::turn_running(root) }).await;
 }
+
+/// SME-354 B2: a child can't `finish` while an agent of its own still
+/// runs, nor while a report from one hasn't reached it: once finished,
+/// it would send that report on to no one.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_finish_is_refused_while_the_callers_own_agents_run(pool: PgPool) {
+    setup(&pool, vec![text_reply("Thanks.")]).await;
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    let child = active_child(&pool, root).await;
+    let grandchild = active_child(&pool, child).await;
+    let input = serde_json::json!({"report": "Done."});
+
+    let refused = crate::anthropic::tools::execute(&pool, child, "toolu_f1", "finish", &input).await;
+    assert_eq!(
+        refused,
+        Err(format!(
+            "you can't finish while your own agents still run: agent #{grandchild} (active). Wait for their \
+             reports, or stop them with stop_agent, then finish"
+        ))
+    );
+    assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_ACTIVE), "the refusal changed nothing");
+
+    // Its agent finishes; the report is queued and not yet read.
+    let queued = db::finish_agent(&pool, grandchild, &format!("agent #{grandchild}"), "Sub-report.").await.expect("finish");
+    assert_eq!(queued, db::Finish::Queued { parent: child });
+    let refused = crate::anthropic::tools::execute(&pool, child, "toolu_f2", "finish", &input).await;
+    assert_eq!(refused, Err("a message arrived since your last step; read it, then finish".to_string()));
+    assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_ACTIVE));
+
+    // Read, it may finish.
+    sqlx::query("UPDATE agent_messages SET delivered_at = now() WHERE to_conversation_id = $1")
+        .bind(child)
+        .execute(&pool)
+        .await
+        .expect("mark it read");
+    let finished = crate::anthropic::tools::execute(&pool, child, "toolu_f3", "finish", &input).await;
+    assert!(finished.as_deref().is_ok_and(|r| r.contains("Your report was sent")), "{finished:?}");
+    eventually("the parent's turns are over", || async { !crate::turn::turn_running(root) }).await;
+}

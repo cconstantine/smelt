@@ -232,8 +232,13 @@ pub enum Finish {
     /// agent or is gone.
     NotActive(Option<String>),
     /// A message to the child is still unread (SME-238): it reads it
-    /// first, or it would be `finished` with no way to report on it.
+    /// first, or it would be `finished` with no way to report on it. A
+    /// report from one of its own agents counts too (SME-354 B2).
     MessageWaiting,
+    /// Agents of its own are still `starting` or `active` (SME-354 B2):
+    /// their ids and states, in ascending id. Their reports would reach
+    /// a finished agent, whose turn sends nothing on.
+    AgentsRunning(Vec<(i64, String)>),
 }
 
 /// `finish`'s transaction: the child `finished` and its report queued to
@@ -270,6 +275,23 @@ pub async fn finish_agent(pool: &PgPool, child: i64, label: &str, report: &str) 
             .await?;
         return Ok(Finish::NotActive(state));
     }
+    // Its own agents still running would report to a finished agent,
+    // which sends nothing on (SME-354 B2): it waits for them or stops
+    // them first. One of them finishing at the same moment is read
+    // here still `active` (not yet committed) or `finished` with its
+    // report queued (committed), which the unread check below refuses.
+    let running = sqlx::query_as::<_, (i64, String)>(
+        "SELECT a.conversation_id, a.state FROM agents a JOIN conversations c ON c.id = a.conversation_id
+         WHERE c.parent_id = $1 AND a.state IN ($2, $3) ORDER BY a.conversation_id",
+    )
+    .bind(child)
+    .bind(AGENT_STARTING)
+    .bind(AGENT_ACTIVE)
+    .fetch_all(&mut *tx)
+    .await?;
+    if !running.is_empty() {
+        return Ok(Finish::AgentsRunning(running));
+    }
     // A statement after the update got the row: a `message_agent` that
     // held it first has committed, and its row is seen (SME-238).
     if unread_by(&mut tx, child).await? {
@@ -280,18 +302,19 @@ pub async fn finish_agent(pool: &PgPool, child: i64, label: &str, report: &str) 
     Ok(Finish::Queued { parent })
 }
 
-/// Whether a message or a question to `child` is still undelivered, or
-/// an answer to its own question is still untaken, on the caller's
-/// transaction.
+/// Whether a message, a question or (SME-354 B2) a report from one of
+/// its own agents to `child` is still undelivered, or an answer to its
+/// own question is still untaken, on the caller's transaction.
 async fn unread_by(conn: &mut sqlx::PgConnection, child: i64) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT 1 FROM agent_messages
-                        WHERE to_conversation_id = $1 AND delivered_at IS NULL AND kind IN ($2, $3))
+                        WHERE to_conversation_id = $1 AND delivered_at IS NULL AND kind IN ($2, $3, $4))
              OR EXISTS (SELECT 1 FROM pending_questions WHERE conversation_id = $1 AND answer IS NOT NULL)",
     )
     .bind(child)
     .bind(KIND_MESSAGE)
     .bind(KIND_QUESTION)
+    .bind(KIND_REPORT)
     .fetch_one(&mut *conn)
     .await
 }
