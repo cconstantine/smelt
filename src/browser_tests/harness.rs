@@ -107,9 +107,6 @@ impl BrowserTestHarness {
         }
     }
 
-    /// Called explicitly at the end of the test rather than via `Drop`
-    /// (which can't `.await`); the test runs its scenarios under
-    /// `catch_unwind`, so this still runs when one fails.
     /// A Chrome of its own for each further scenario lane (SME-341's speed
     /// pass): tabs in different lanes never share a renderer, so one lane's
     /// busy page can't throttle another's timers or frames.
@@ -117,6 +114,9 @@ impl BrowserTestHarness {
         launch_browser().await
     }
 
+    /// Called explicitly at the end of the test rather than via `Drop`
+    /// (which can't `.await`); the test runs its scenarios under
+    /// `catch_unwind`, so this still runs when one fails.
     pub(super) async fn shutdown(mut self) {
         let _ = self.browser.close().await;
 

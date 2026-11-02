@@ -12,8 +12,9 @@
 //! Postgres + k3s cluster reachable the same way every other real-cluster
 //! test in this codebase already assumes.
 //!
-//! One `#[tokio::test]`, sharing one browser/server/`MANAGER` instance for
-//! its whole duration — more than one `#[tokio::test]` here touching
+//! One `#[tokio::test]`, sharing one server and `MANAGER` instance for its
+//! whole duration (each scenario lane has a Chrome of its own, see
+//! `run_lanes`) — more than one `#[tokio::test]` here touching
 //! `sandbox::init()`/`db::init()` would risk the same
 //! `OnceLock`-across-separate-runtimes hazard `docs/testing.md` documents
 //! for `PgPool`, the same reasoning `sandbox-terminal`'s own real-cluster
@@ -215,7 +216,11 @@ fn scenarios() -> Vec<Entry> {
         entry("terminal_follow_after_switch", 180, Runs::Alone, |t| Box::pin(scenario_terminal_follow_after_switch(t))),
         entry("context_from_the_keyboard", 60, Runs::Beside, |t| Box::pin(scenario_context_from_the_keyboard(t))),
         entry("address_bar_after_session_closes", 90, Runs::Beside, |t| Box::pin(scenario_address_bar_after_session_closes(t))),
-        entry("error_text", 60, Runs::Beside, |t| Box::pin(scenario_error_text(t))),
+        // Alone: its "the new message should reload the conversation list"
+        // counts list requests, and another lane's activity reloads it too,
+        // so beside others it could pass without the message's (SME-341
+        // review).
+        entry("error_text", 60, Runs::Alone, |t| Box::pin(scenario_error_text(t))),
         entry("settings_two_step", 60, Runs::Alone, |t| Box::pin(scenario_settings_two_step(t))),
         entry("pointer_keeps_text_still", 120, Runs::Beside, |t| Box::pin(scenario_pointer_keeps_text_still(t))),
         entry("ask_user_card", 60, Runs::Beside, |t| Box::pin(scenario_ask_user_card(t))),

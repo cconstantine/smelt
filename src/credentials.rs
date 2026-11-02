@@ -331,7 +331,9 @@ pub async fn install_pod_files(
 /// other conversations' installs go on meanwhile: one lock for all of them
 /// made a key or secret change write to every live pod in turn (SME-341).
 /// Keyed by conversation, not pod, as `reconcile_pod` finds its pod under
-/// the lock; a pod's conversation never changes.
+/// the lock; a pod's conversation never changes. The map keeps an entry per
+/// conversation that has ever installed, a few bytes each, which a
+/// single-user app's conversation count makes fine.
 pub(crate) async fn with_install_lock<F: std::future::Future>(conversation: i64, install: F) -> F::Output {
     static INSTALLING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
         std::sync::LazyLock::new(Default::default);
@@ -364,8 +366,8 @@ pub async fn install_into_pod(pool: &PgPool, pod_id: i64) -> Result<(), String> 
 /// across its reads and this write, so no install interleaves between
 /// a decision and its files.
 async fn write_pod_files(pool: &PgPool, pod_id: i64, files: &[PodFile]) -> Result<(), String> {
-    // Bounded: every install waits on this lock, so a stalled exec
-    // mustn't hold it.
+    // Bounded: every install into this conversation's pod waits on its
+    // lock, so a stalled exec mustn't hold it.
     let shell = sandbox::PodShell::for_pod(pool, pod_id).await.map_err(|e| e.to_string())?;
     let keys_dir = format!("{POD_GIT_DIR}/keys");
     tokio::time::timeout(INSTALL_TIMEOUT, install_pod_files(&shell, files, &[keys_dir.as_str(), POD_SECRETS_DIR]))
