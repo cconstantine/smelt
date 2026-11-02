@@ -73,6 +73,24 @@ pub async fn storage_removal_still_due(pool: &PgPool, pod_id: i64, days: u32) ->
     .await
 }
 
+/// Records that the pass is about to try removing `pod_id`'s mark's
+/// storage (SME-354 B13), keeping the first attempt's time. Whether an
+/// earlier attempt of this mark was already recorded: one given up on may
+/// have deleted the claims, so a retry finding them gone still sends the
+/// stop's notice.
+pub async fn start_storage_removal(pool: &PgPool, pod_id: i64) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "WITH old AS (SELECT storage_removal_started_at AS at FROM sandbox_pods WHERE id = $1)
+         UPDATE sandbox_pods p SET storage_removal_started_at = COALESCE(old.at, now())
+           FROM old WHERE p.id = $1
+         RETURNING old.at IS NOT NULL",
+    )
+    .bind(pod_id)
+    .fetch_optional(pool)
+    .await
+    .map(|earlier| earlier.unwrap_or(false))
+}
+
 /// Clears the mark once the pass has settled the stop: the claims are
 /// gone (or were never there), so the row never qualifies again and a
 /// later quiet stop — of the newer row a pickup starts — stamps its own
@@ -82,7 +100,7 @@ pub async fn clear_pod_quiet_stop_mark(pool: &PgPool, pod_id: i64) -> Result<(),
     if let Some(result) = fake_clear::take(pod_id) {
         return result;
     }
-    sqlx::query("UPDATE sandbox_pods SET quietly_stopped_at = NULL WHERE id = $1")
+    sqlx::query("UPDATE sandbox_pods SET quietly_stopped_at = NULL, storage_removal_started_at = NULL WHERE id = $1")
         .bind(pod_id)
         .execute(pool)
         .await?;
