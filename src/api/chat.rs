@@ -105,7 +105,9 @@ pub const TURN_FAILED_NOTED: &str = "the turn failed; the conversation says why"
 /// and the model knows the request before it wasn't done (SME-123 DR3).
 pub const FAILURE_NOTICE_START: &str = "The last turn failed before it finished: ";
 
-/// The failure notice for a turn that failed with `reason`.
+/// The failure notice for a turn that failed with `reason`. The server
+/// writes it; the page only reads one.
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
 pub fn failure_notice(reason: &str) -> String {
     format!("{FAILURE_NOTICE_START}{reason}")
 }
