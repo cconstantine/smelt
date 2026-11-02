@@ -109,11 +109,15 @@
 
 .mcp-header-row {
     display: flex;
+    flex-wrap: wrap;
     gap: 8px;
 }
 
+/* An input's default size kept the row 148px past a phone's screen
+   (SME-123 DR8): the fields shrink, and wrap below 140px each. */
 .mcp-header-row input {
-    flex: 1;
+    flex: 1 1 140px;
+    min-width: 0;
 }
 
 .mcp-header-existing-name {

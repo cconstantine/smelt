@@ -415,6 +415,19 @@ pub(super) async fn scenario_phone_width(t: &Scenario<'_>) {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     assert!(list_shown, "the button should open the conversation list");
+    // Every settings page and form fits a phone: Add an MCP server's header
+    // row ran 148px past the screen (SME-123 DR8).
+    for path in ["mcp-servers/new", "providers/new", "language-servers/new", "sandbox-volumes/new", "git", "secrets", "pods"] {
+        page.goto(t.url(path)).await.expect("open a settings page");
+        wait_for_element(&page, "h1", Duration::from_secs(10)).await;
+        let over: f64 = page
+            .evaluate("document.documentElement.scrollWidth - document.documentElement.clientWidth")
+            .await
+            .expect("measure the page")
+            .into_value()
+            .expect("a number");
+        assert!(over <= 0.0, "/{path} scrolls sideways on a phone, by {over}px");
+    }
 }
 
 /// Scenario 18: a conversation created in one tab shows up in another tab's
