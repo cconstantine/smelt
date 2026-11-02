@@ -150,7 +150,7 @@ For a conversation in a group. "Queued" is an `agent_messages` row; "wake" is `N
 
 **Defaults** when no persona sets them, which also govern the usual group (its root is the user's own conversation, which has no persona): agents at once 4, depth 2, no budget, as deployment settings (`SMELT_AGENTS_AT_ONCE`, `SMELT_AGENT_DEPTH`, `SMELT_GROUP_BUDGET_USD`). A persona's `smelt.limits` apply to the subtree under it and combine with its ancestors' by taking the smaller. The budget can overshoot by the cost of the calls already in flight when it's reached (each member's check passed before any of them recorded): at most one call per running member.
 
-**The provider's own limit (SME-162)** is a slot per model call (`src/providers/limiter.rs`: held "from before it sends until it ends"). A parent waiting on its children holds no slot: `start_agent` returns at once, and a parent waits by ending its turn, not inside a call. So a child queued on a slot can't deadlock a parent waiting on it, and "agents at once" counts live agents, not slots. A child queued on a slot shows as running.
+**The provider's own limit (SME-162, SME-343)** is a slot held by a whole running turn (`src/providers/limiter.rs`: its first model call takes one, and every call the turn makes — retries, tool passes, compaction's — sends through it until the turn ends). A parent waiting on its children holds no slot: `start_agent` returns at once, and a parent waits by ending its turn, not inside a call. So a child queued on a slot can't deadlock a parent waiting on it, and "agents at once" counts live agents, not slots. A child queued on a slot shows as running.
 
 ## SME-38
 
