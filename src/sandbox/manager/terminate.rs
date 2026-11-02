@@ -160,12 +160,23 @@ pub(in crate::sandbox) async fn terminate_pod_with(
     pod_id: i64,
     delete: impl std::future::Future<Output = Result<(), SandboxError>>,
 ) -> Result<Option<db::SandboxPod>, SandboxError> {
+    terminate_pod_as(pool, pod_id, db::PodEnd::Plain, delete).await
+}
+
+/// `terminate_pod_with`, closing the row the way `end` says (SME-354 B3):
+/// `None` also when a quiet stop finds the row already ended.
+pub(in crate::sandbox) async fn terminate_pod_as(
+    pool: &PgPool,
+    pod_id: i64,
+    end: db::PodEnd,
+    delete: impl std::future::Future<Output = Result<(), SandboxError>>,
+) -> Result<Option<db::SandboxPod>, SandboxError> {
     deregister(pod_id);
     // The pod stays running and its row live if either step fails, so it
     // must stay reachable too.
     let closed = async {
         delete.await?;
-        db::terminate_sandbox_pod(pool, pod_id).await.map_err(SandboxError::Db)
+        db::terminate_sandbox_pod_as(pool, pod_id, end).await.map_err(SandboxError::Db)
     }
     .await;
     if closed.is_err() {

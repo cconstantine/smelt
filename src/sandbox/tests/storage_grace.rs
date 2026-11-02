@@ -300,3 +300,28 @@ async fn test_a_failed_clear_still_leaves_exactly_one_notice(pool: PgPool) {
     assert!(!mark_set(&pool, pod).await, "and the mark finally clears");
     assert_eq!(removal_notices(&pool, conversation).await.len(), 1, "and exactly one notice was ever saved");
 }
+
+/// SME-354 B13: a removal given up on after it deleted the claims, then
+/// retried, still says so once. The retry finds the claims already gone
+/// (nothing deleted this time); the notice comes from this mark's earlier
+/// attempt, recorded before it ran, not from the retry's count.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_removal_that_timed_out_after_deleting_the_claims_is_noticed_on_its_retry(pool: PgPool) {
+    let (conversation, pod) = quiet_stopped_days_ago(&pool, 8).await;
+
+    // The claims go, then the cluster stalls past the bound.
+    let settled = remove_expired_storage_once_with(&pool, 7, Duration::from_millis(200), |_conversation| async {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        Ok(claims_gone())
+    })
+    .await;
+    assert_eq!(settled, Vec::<i64>::new(), "given up on: nothing settles");
+    assert!(mark_set(&pool, pod).await, "the mark stays for the retry");
+    assert!(removal_notices(&pool, conversation).await.is_empty(), "nothing said yet");
+
+    let already_gone = StorageRemoval { workspace_gone: true, ..Default::default() };
+    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, move |_conversation| async move { Ok(already_gone) }).await;
+    assert_eq!(settled, vec![conversation]);
+    assert!(!mark_set(&pool, pod).await);
+    assert_eq!(removal_notices(&pool, conversation).await.len(), 1, "the stop's storage went, and the model is told once");
+}

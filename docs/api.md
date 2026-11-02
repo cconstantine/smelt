@@ -141,11 +141,11 @@ In [api/events.md](api/events.md#the-browsing-panels-own-live-channel).
 | `get_git_settings` | `GET /api/git` | the `/git` page: commit identity, SSH keys (public halves), trust decisions |
 | `save_git_identity` | `POST /api/git/identity` | commit name and email; reaches running pods at once |
 | `generate_ssh_key` / `import_ssh_key` | `POST /api/git/keys`, `POST /api/git/keys/import` | a new ed25519 key, or a pasted unencrypted OpenSSH private key; installed in running pods at once |
-| `delete_ssh_key` | `DELETE /api/git/keys/{id}` | removed from running pods at once |
+| `delete_ssh_key` | `DELETE /api/git/keys/{id}` | removed from running pods at once; returns how many running pods it couldn't be removed from, if any, and the Git page says so (SME-354 B5) |
 | `forget_repo_trust` | `POST /api/git/trust/forget` | the user is asked again next time the remote is cloned |
 | `list_secrets` (`api::secrets`) | `GET /api/secrets` | the `/secrets` page: `SecretSummary` rows — id, name, dates, `shown`, D7's display prefix (at most four leading characters of the value, at least eight bytes always hidden, plus the byte length), and the value's line count as `lines` since SME-334 — all computed at read; no value ever leaves this endpoint (SME-242) |
 | `save_secret` (`api::secrets`) | `POST /api/secrets/save` | `id` null creates (a fresh name — `git-ssh` refused; 1–65,536 bytes, refused empty), `id` set replaces that row's value only (names are immutable); every successful save runs the live-pod install |
-| `delete_secret` (`api::secrets`) | `POST /api/secrets/delete` | removes the row and runs the install, so granted pods lose the file at once |
+| `delete_secret` (`api::secrets`) | `POST /api/secrets/delete` | removes the row and runs the install, so granted pods lose the file at once; returns how many running pods it couldn't be removed from, if any, and the Secrets page says so (SME-354 B5) |
 | `list_language_servers` / `get_language_server` | `GET /api/language-servers`, `GET /api/language-servers/{id}` | the Language servers page (SME-35) |
 | `create_language_server` / `update_language_server` | `POST /api/language-servers`, `POST /api/language-servers/{id}` | validated; a rename or disable stops the server's pods |
 | `delete_language_server` | `DELETE /api/language-servers/{id}` | stops its pods everywhere |

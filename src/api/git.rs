@@ -239,8 +239,10 @@ pub async fn import_ssh_key(name: String, private_key: String) -> ServerFnResult
         .map_err(ServerFnError::new)
 }
 
+/// Deletes the key; how many running sandboxes it couldn't be removed
+/// from, if any (SME-354 B5).
 #[delete("/api/git/keys/{id}")]
-pub async fn delete_ssh_key(id: i64) -> ServerFnResult<()> {
+pub async fn delete_ssh_key(id: i64) -> ServerFnResult<Option<u32>> {
     git::delete_key(db::get(), id)
         .await
         .map_err(ServerFnError::new)

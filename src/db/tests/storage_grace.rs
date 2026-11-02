@@ -163,8 +163,40 @@ async fn test_each_conversations_last_stop_is_its_latest_ended_pod(pool: PgPool)
     let live = create_conversation(&pool).await.expect("conversation");
     create_sandbox_pod(&pool, live.id).await.expect("a live pod");
 
-    let stops = last_pod_stops(&pool).await.expect("read");
+    let (stops, _) = last_pod_stops(&pool).await.expect("read");
     assert!(stops.get(&quiet.id).is_some_and(|(_, quiet_stop)| quiet_stop.is_some()), "{stops:?}");
     assert!(stops.get(&stopped_by_user.id).is_some_and(|(_, quiet_stop)| quiet_stop.is_none()), "{stops:?}");
     assert!(!stops.contains_key(&live.id), "a live pod hasn't stopped: {stops:?}");
+}
+
+/// SME-354 B14: a stop's age is measured on the database's clock, the one
+/// its `terminated_at` was written on. The connection's time zone puts
+/// that clock 14 hours from the server's UTC, so a mixed reading is off
+/// by hours rather than by a drift too small to see.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_stops_come_with_the_databases_own_clock(pool: PgPool) {
+    // Set after connecting: sqlx sends `TimeZone=UTC` at startup, which
+    // overrides a `-c timezone` given in the connect options.
+    let shifted = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::Executor::execute(conn, "SET TIME ZONE 'Pacific/Kiritimati'").await?;
+                Ok(())
+            })
+        })
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .expect("a +14 pool");
+    let offset: String = sqlx::query_scalar("SELECT current_setting('TimeZone')").fetch_one(&shifted).await.expect("tz");
+    assert_eq!(offset, "Pacific/Kiritimati", "the session's clock is 14 hours from UTC");
+    let conversation = create_conversation(&shifted).await.expect("conversation");
+    let pod = create_sandbox_pod(&shifted, conversation.id).await.expect("pod");
+    terminate_sandbox_pod(&shifted, pod.id).await.expect("end it");
+
+    let (stops, observed_at) = last_pod_stops(&shifted).await.expect("read");
+    let (stopped, _) = stops.get(&conversation.id).copied().expect("its stop");
+    let age = observed_at - stopped;
+    assert!(age >= chrono::Duration::zero() && age < chrono::Duration::minutes(1), "stopped {stopped}, observed {observed_at}: {age}");
+    shifted.close().await;
 }
