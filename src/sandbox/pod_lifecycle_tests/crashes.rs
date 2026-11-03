@@ -107,13 +107,13 @@ async fn test_stopping_a_pod_for_the_user_closes_everything_and_says_so(pool: Pg
 
 /// SME-26, SME-33, SME-77: the pods view shows a busy pod's conversation,
 /// status, limits (the sandbox's and the Docker sidecar's memory added up,
-/// no CPU limit), terminals and activity, and its live usage from the
-/// metrics API, which smelt's RBAC lets it read. The read itself is real;
-/// the pod's sample is the test's (SME-206): metrics-server served nothing
-/// for minutes at a time under the suite's load, and its sampling isn't
-/// smelt's to test.
+/// no CPU limit), terminals and activity, and the usage the metrics API
+/// reports for it, which smelt's RBAC lets it read. Neither half waits on
+/// metrics-server (SME-206): it served nothing for minutes at a time under
+/// the suite's load, and its sampling isn't smelt's to test. The RBAC is
+/// asked of the API server itself, and the pod's sample is the test's.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_the_pods_view_shows_a_busy_pods_limits_and_live_usage(pool: PgPool) {
+async fn test_the_pods_view_shows_a_busy_pods_limits_and_its_usage(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
         let conversation = db::create_conversation(&pool).await.expect("create conversation");
@@ -136,9 +136,31 @@ async fn test_the_pods_view_shows_a_busy_pods_limits_and_live_usage(pool: PgPool
         assert_eq!(overview.cpu_limit, None, "sandbox pods have no CPU limit (SME-77)");
         assert_eq!(overview.terminals, 1);
         assert_eq!(overview.activity, crate::api::pods::PodActivity::Busy, "a command is running");
-        // The metrics API answers (smelt's RBAC reaches it) whether or not
-        // metrics-server has anything to serve at the moment.
-        crate::sandbox::pod_metrics_list().await.expect("the metrics API answers");
+        // smelt may list its namespace's pod metrics: asked of the API
+        // server, which answers whether or not metrics-server is up.
+        let review = kube::Api::<k8s_openapi::api::authorization::v1::SelfSubjectAccessReview>::all(client.clone())
+            .create(
+                &kube::api::PostParams::default(),
+                &k8s_openapi::api::authorization::v1::SelfSubjectAccessReview {
+                    spec: k8s_openapi::api::authorization::v1::SelfSubjectAccessReviewSpec {
+                        resource_attributes: Some(k8s_openapi::api::authorization::v1::ResourceAttributes {
+                            group: Some("metrics.k8s.io".to_string()),
+                            resource: Some("pods".to_string()),
+                            verb: Some("list".to_string()),
+                            namespace: Some(NAMESPACE.to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("an access review");
+        assert!(
+            review.status.is_some_and(|status| status.allowed),
+            "smelt's RBAC lets it list pod metrics in {NAMESPACE}"
+        );
         crate::sandbox::manager::sampled_metrics::sample(&pod_name(pod), "1203981n", "52Mi");
         let overviews = crate::api::pods::pod_overviews(&pool).await.expect("pod_overviews");
         let usage = overviews.iter().find(|o| o.pod_id == pod).and_then(|o| o.usage.clone());
