@@ -67,3 +67,12 @@ fn test_list_personas_points_at_start_agent_which_takes_its_scoped_name() {
     assert!(persona.contains("<repo dir>:<name>") && persona.contains("smelt:developer"), "{persona}");
 }
 
+/// SME-368: the system prompt's persona line stopped saying nothing can be
+/// started with a persona, and names start_agent instead.
+#[test]
+fn test_the_system_prompt_says_start_agent_takes_a_persona() {
+    let prompt = include_str!("../../../../turn/system_prompt.md");
+    assert!(!prompt.contains("Nothing can be started with a persona"), "the stale line is still there");
+    assert!(prompt.contains("start_agent can start an agent under one, by that name."), "the persona line names start_agent");
+}
+
