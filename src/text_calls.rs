@@ -432,6 +432,48 @@ fn server_and_words(name: &str) -> (Option<&str>, std::collections::BTreeSet<Str
     (server, words)
 }
 
+/// Whether `word` is one of the verbs `VERBS` maps words to.
+#[cfg(feature = "server")]
+fn is_verb(word: &str) -> bool {
+    VERBS.iter().any(|(verb, _)| *verb == word)
+}
+
+/// Whether word `a` is a slip of word `b`, case aside: the longer has at
+/// least 5 characters, and they're 1 edit apart (one inserted, deleted or
+/// changed character), or a third of the longer's characters from 8 up
+/// (`todosote` for `todowrite`). Review 2: 4-letter words (`file`,
+/// `fill`) and one edit in a 6-letter one (`agent`, `parent`) were too
+/// loose.
+#[cfg(feature = "server")]
+fn is_near(a: &str, b: &str) -> bool {
+    let (a, b): (Vec<char>, Vec<char>) = (a.to_lowercase().chars().collect(), b.to_lowercase().chars().collect());
+    let longer = a.len().max(b.len());
+    let allowed = if longer >= 8 { longer / 3 } else { 1 };
+    longer >= 5 && a != b && edit_distance(&a, &b) <= allowed
+}
+
+/// A tool name's part after its MCP server, or the whole name.
+#[cfg(feature = "server")]
+fn tool_part(name: &str) -> &str {
+    crate::mcp::parse_tool_name(name).map_or(name, |(_, tool)| tool)
+}
+
+/// Levenshtein distance, one row at a time.
+#[cfg(feature = "server")]
+fn edit_distance(a: &[char], b: &[char]) -> usize {
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut previous = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let substituted = previous + usize::from(ca != cb);
+            previous = row[j + 1];
+            row[j + 1] = substituted.min(row[j] + 1).min(previous + 1);
+        }
+    }
+    row[b.len()]
+}
+
 /// Whether two MCP servers' names are the same server's (case aside).
 #[cfg(feature = "server")]
 fn same_server(a: Option<&str>, b: Option<&str>) -> bool {
@@ -449,7 +491,11 @@ fn same_server(a: Option<&str>, b: Option<&str>) -> bool {
 /// fewer words of its own, then by name.
 #[cfg(feature = "server")]
 pub fn similar(name: &str, offered: &[&str]) -> Vec<String> {
-    let (server, words) = server_and_words(name);
+    let (_, words) = server_and_words(name);
+    // Its server by the safe part offered names carry (SME-365), so a call
+    // written as `mcp__linear.app__…` still ranks that server's tools first.
+    let safe = crate::mcp::safe_tool_name(name);
+    let (server, _) = server_and_words(&safe);
     let candidates: Vec<(&str, Option<&str>, std::collections::BTreeSet<String>)> = offered
         .iter()
         .filter(|o| **o != name)
@@ -466,10 +512,27 @@ pub fn similar(name: &str, offered: &[&str]) -> Vec<String> {
         .iter()
         .filter_map(|(o, s, w)| {
             let shared: Vec<&String> = words.intersection(w).collect();
-            if !shared.iter().any(|word| !VERBS.iter().any(|(verb, _)| verb == word)) {
+            let shares_a_word = shared.iter().any(|word| !VERBS.iter().any(|(verb, _)| verb == word));
+            // A slip of a word (`todosote` for `todowrite`, `isue` for
+            // `issue`, SME-307) shares none, so a word a few edits from one
+            // of the candidate's counts as that word, weighed as it is.
+            // Verbs never: `delete_document` isn't near `delete_attachment`.
+            // Only a call word with no exact match nears one, and a near
+            // word weighs half the lighter of the two (review 2: `terminal`
+            // shared exactly mustn't also near `terminate`).
+            let unmatched: Vec<&String> = words.iter().filter(|nw| !is_verb(nw) && !w.contains(*nw)).collect();
+            let near: usize = w
+                .iter()
+                .filter(|cw| !is_verb(cw) && !words.contains(*cw))
+                .filter_map(|cw| unmatched.iter().find(|nw| is_near(nw, cw)).map(|nw| weight(cw).min(weight(nw)) / 2 + 1))
+                .sum();
+            // The same name but for `_` and `-` (`todo_write`, `web_fetch`).
+            let joined = |n: &str| tool_part(n).chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase();
+            let same_joined = joined(name) == joined(o);
+            if !shares_a_word && near == 0 && !same_joined {
                 return None;
             }
-            let score = shared.iter().map(|word| weight(word)).sum();
+            let score = shared.iter().map(|word| weight(word)).sum::<usize>() + near + if same_joined { 4 } else { 0 };
             Some((same_server(server, *s), score, w.len() - shared.len(), *o))
         })
         .collect();
@@ -482,7 +545,6 @@ pub fn similar(name: &str, offered: &[&str]) -> Vec<String> {
 /// It quotes only tool names, never a call's parameters.
 #[cfg(feature = "server")]
 pub fn text_call_notice(calls: &[TextCall], offered: &[&str]) -> String {
-    let quote = |names: &[String]| names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ");
     let mut notice = TEXT_CALL_NOTICE_START.to_string();
     for call in calls {
         let Some(name) = &call.name else {
@@ -493,23 +555,88 @@ pub fn text_call_notice(calls: &[TextCall], offered: &[&str]) -> String {
             notice.push_str(&format!(" `{name}` is offered, but a call written in a reply's text isn't made."));
             continue;
         }
-        let missing_server = crate::mcp::parse_tool_name(name)
-            .map(|(server, _)| server)
-            .filter(|server| !offered.iter().any(|o| crate::mcp::parse_tool_name(o).is_some_and(|(s, _)| s.eq_ignore_ascii_case(server))));
-        let suggestions = similar(name, offered);
-        let mut sentence = format!(" `{name}` isn't an offered tool");
-        if let Some(server) = missing_server {
-            sentence.push_str(&format!(", and no MCP server `{server}` is offered"));
-        }
-        match (suggestions.is_empty(), missing_server.is_some()) {
-            (false, _) => sentence.push_str(&format!("; similar offered tools: {}.", quote(&suggestions))),
-            (true, true) => sentence.push('.'),
-            (true, false) => sentence.push_str(", and no offered tool has a similar name."),
-        }
-        notice.push_str(&sentence);
+        notice.push_str(&format!(" {}", unoffered_sentence(name, offered)));
     }
     notice.push_str(TEXT_CALL_NOTICE_END);
     notice
+}
+
+/// What a call to `name`, which isn't offered, is told: that it isn't, and
+/// the offered tools like it, or that none is (and, for an MCP name, when
+/// its server isn't offered either). Shared by a call written as text
+/// (SME-286) and a real call by an unoffered name (SME-307).
+#[cfg(feature = "server")]
+fn unoffered_sentence(name: &str, offered: &[&str]) -> String {
+    let quote = |names: &[String]| names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ");
+    // Offered names carry safe server parts (SME-365), so a call
+    // written with the server's own name (`linear.app`) is compared by
+    // the safe part that name has.
+    let safe = crate::mcp::safe_tool_name(name);
+    let safe_server = crate::mcp::parse_tool_name(&safe).map(|(server, _)| server);
+    let missing_server = crate::mcp::parse_tool_name(name).map(|(server, _)| server).filter(|server| {
+        !offered.iter().any(|o| {
+            crate::mcp::parse_tool_name(o)
+                .is_some_and(|(s, _)| s.eq_ignore_ascii_case(server) || safe_server.is_some_and(|w| s.eq_ignore_ascii_case(w)))
+        })
+    });
+    let suggestions = similar(name, offered);
+    let mut sentence = format!("`{name}` isn't an offered tool");
+    if let Some(server) = missing_server {
+        sentence.push_str(&format!(", and no MCP server `{server}` is offered"));
+    }
+    match (suggestions.is_empty(), missing_server.is_some()) {
+        (false, _) => sentence.push_str(&format!("; similar offered tools: {}.", quote(&suggestions))),
+        (true, true) => sentence.push('.'),
+        (true, false) => sentence.push_str(", and no offered tool has a similar name."),
+    }
+    sentence
+}
+
+/// Whether `error`, from `anthropic::tools::execute`, says the call's name
+/// is no tool's: no smelt tool of that name (`resolve`), or no configured
+/// MCP server it names (`mcp::resolve_tool`). Not a tool's own failure.
+#[cfg(feature = "server")]
+pub fn is_unknown_name_error(error: &str) -> bool {
+    error.starts_with("unknown tool: ") || error.starts_with("unknown MCP server: ")
+}
+
+/// Whether `name` is an MCP tool no offered name is, on a server some
+/// offered name is on: a made-up tool on a real server, the crossed prefix
+/// (`add_issue_comment` on Linear's server, SME-307 review 2). Its call
+/// reaches the server (an unlisted tool is callable, judged destructive,
+/// SME-237), so its error isn't `is_unknown_name_error`'s. A server whose
+/// tools weren't offered this turn (still connecting) offers no name, so
+/// its calls aren't taken for slips.
+#[cfg(feature = "server")]
+pub fn is_unoffered_tool_of_an_offered_server(name: &str, offered: &[&str]) -> bool {
+    if offered.contains(&name) {
+        return false;
+    }
+    let safe = crate::mcp::safe_tool_name(name);
+    let (Some((raw, _)), Some((server, _))) = (crate::mcp::parse_tool_name(name), crate::mcp::parse_tool_name(&safe)) else {
+        return false;
+    };
+    offered.iter().any(|o| crate::mcp::parse_tool_name(o).is_some_and(|(s, _)| s == server || s == raw))
+}
+
+/// The result of a real call by `name`, a tool that isn't offered (SME-307):
+/// the error its run gave (`error`, one `is_unknown_name_error` names),
+/// then the same sentence a call written as text gets, so a slip like
+/// `todosote` is told `todowrite`.
+#[cfg(feature = "server")]
+pub fn unoffered_call_result(error: &str, name: &str, offered: &[&str]) -> String {
+    format!("{error}\n{}", unoffered_sentence(name, offered))
+}
+
+/// The turn's error once every call of a reply named a tool that isn't
+/// offered, after `MAX_TEXT_CALL_CORRECTIONS` corrections in a row of
+/// either kind (SME-307): `name` is the last reply's first call.
+#[cfg(feature = "server")]
+pub fn unoffered_bound_error(name: &str) -> String {
+    format!(
+        "The model called a tool that isn't offered, or wrote a call as text, {} times in a row (the last: `{name}`), so the turn stopped.",
+        MAX_TEXT_CALL_CORRECTIONS + 1
+    )
 }
 
 /// The turn's error once the model has written calls as text more times

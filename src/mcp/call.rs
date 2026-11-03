@@ -36,7 +36,7 @@ pub async fn call_tool(
     tool_name: &str,
     arguments: serde_json::Value,
 ) -> Result<String, String> {
-    call_tool_classed(pool, config, tool_name, arguments, |_| Ok(())).await
+    call_tool_classed(pool, config, tool_name, arguments, |_, _| Ok(())).await
 }
 
 /// Dispatches a `tools/call` to `config`'s server and turns the result
@@ -67,7 +67,7 @@ pub async fn call_tool_classed(
     config: &McpServerConfig,
     tool_name: &str,
     arguments: serde_json::Value,
-    check_class: impl FnOnce(crate::anthropic::tools::ToolClass) -> Result<(), String> + Send,
+    check_class: impl FnOnce(crate::anthropic::tools::ToolClass, &str) -> Result<(), String> + Send,
 ) -> Result<String, String> {
     use tracing::field::Empty;
     // The server and tool, never the arguments or result (SME-137).
@@ -134,7 +134,7 @@ async fn call_tool_unspanned(
     config: &McpServerConfig,
     tool_name: &str,
     arguments: serde_json::Value,
-    check_class: impl FnOnce(crate::anthropic::tools::ToolClass) -> Result<(), String>,
+    check_class: impl FnOnce(crate::anthropic::tools::ToolClass, &str) -> Result<(), String>,
 ) -> Result<String, CallFailure> {
     let arguments = match arguments {
         serde_json::Value::Object(map) => Some(map),
@@ -149,6 +149,21 @@ async fn call_tool_unspanned(
     ensure_connected(pool, config, Attempt::SkipRecentFailures)
         .await
         .map_err(|e| CallFailure::Failed(e.message))?;
+    // The tool by the name its server lists it under: the model calls it
+    // by a safe name (SME-365), which for a name like `search.web` isn't
+    // that. Read on the connection the call goes out on, and used for the
+    // override, the class, the rule check and the request alike.
+    let (service, tool_name, listed) = REGISTRY
+        .lock()
+        .await
+        .get(&config.id)
+        .map(|conn| {
+            let real = listed_tool_name(&conn.tools, &config.name, tool_name);
+            let listed = listed_class(&conn.tools, &real);
+            (conn.service.clone(), real, listed)
+        })
+        .ok_or_else(|| CallFailure::Failed(format!("not connected to MCP server {:?}", config.name)))?;
+    let tool_name = tool_name.as_str();
     // The user's override, read fresh at every call (SME-240), so a save
     // on the settings page takes effect at the next call — no cache, no
     // evict. Read *after* the connect (SME-237 review 1: a failed connect
@@ -168,12 +183,6 @@ async fn call_tool_unspanned(
                 config.name
             ))
         })?;
-    let (service, listed) = REGISTRY
-        .lock()
-        .await
-        .get(&config.id)
-        .map(|conn| (conn.service.clone(), listed_class(&conn.tools, tool_name)))
-        .ok_or_else(|| CallFailure::Failed(format!("not connected to MCP server {:?}", config.name)))?;
     // The override wins over the connection's list; an unknown text —
     // unreachable under the table's CHECK — is taken as destructive,
     // failing closed toward what SME-241 enforces. The offer path judges
@@ -184,7 +193,7 @@ async fn call_tool_unspanned(
     // never sent. Its message is what the model gets and what this span
     // marks failed, and the class the call was refused for is already
     // recorded on the caller's `tool` span.
-    if let Err(rule) = check_class(class) {
+    if let Err(rule) = check_class(class, tool_name) {
         return Err(CallFailure::Failed(rule));
     }
 

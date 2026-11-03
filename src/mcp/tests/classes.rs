@@ -50,7 +50,7 @@ async fn wait_until_stale(server_id: i64) {
 /// the call fails closed before sending.
 async fn class_of_call_on(pool: &sqlx::PgPool, config: &McpServerConfig, tool: &str) -> Option<ToolClass> {
     let class = std::sync::Mutex::new(None);
-    let _ = call_tool_classed(pool, config, tool, serde_json::json!({}), |c| {
+    let _ = call_tool_classed(pool, config, tool, serde_json::json!({}), |c, _| {
         *class.lock().unwrap() = Some(c);
         Ok(())
     })
@@ -274,7 +274,7 @@ async fn test_a_rule_check_still_waits_for_the_class_override_read() {
     register_test_connection(server_id, false).await;
     let config = test_config(server_id, "test-server");
     let failed =
-        call_tool_classed(&test_pool(), &config, "echo", serde_json::json!({}), |_| Err("the chain denies it".to_string())).await;
+        call_tool_classed(&test_pool(), &config, "echo", serde_json::json!({}), |_, _| Err("the chain denies it".to_string())).await;
     REGISTRY.lock().await.remove(&server_id);
     let error = failed.expect_err("the override read fails the call first");
     assert!(error.contains("class override"), "{error}");

@@ -55,6 +55,13 @@ pub(super) fn history_for_request(
                     anthropic::ContentBlock::CompactionPlaceholder { text } => {
                         anthropic::ContentBlock::Text { text }
                     }
+                    // A call stored under a name from before SME-365 goes
+                    // out under the safe name it has now: Anthropic holds
+                    // names to `^[a-zA-Z0-9_-]{1,128}$`, and the model sees
+                    // its past calls by the names it's offered.
+                    anthropic::ContentBlock::ToolUse { id, name, input } => {
+                        anthropic::ContentBlock::ToolUse { id, name: crate::mcp::safe_tool_name(&name), input }
+                    }
                     other => other,
                 })
                 .collect();
@@ -330,7 +337,8 @@ pub(crate) fn system_prompt(env: &PromptEnvironment) -> String {
     }
     if !env.mcp_servers.is_empty() {
         prompt.push_str(
-            "- MCP servers (their tools are named mcp__<server>__<tool>, and every description \
+            "- MCP servers (their tools are named mcp__<server>__<tool>, any character outside \
+             letters, digits, _ and - made _ with a short code added, and every description \
              starts [server]):\n",
         );
         for server in &env.mcp_servers {

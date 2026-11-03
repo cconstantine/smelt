@@ -15,11 +15,118 @@ pub(super) const TOOL_LIST_WAIT: std::time::Duration = if cfg!(test) {
 const TOOL_NAME_PREFIX: &str = "mcp__";
 const TOOL_NAME_SEPARATOR: &str = "__";
 
-/// The name the model calls an MCP tool by: `mcp__<server>__<tool>`.
+/// The longest tool name Anthropic's API takes; it also refuses any
+/// character outside `[a-zA-Z0-9_-]` (SME-365). Local servers take any
+/// name, which is how an MCP tool named `search.web`, or a server named
+/// `linear.app`, failed every turn only there.
+pub(crate) const MAX_TOOL_NAME: usize = 128;
+/// The most of those 128 a server's part may take.
+const MAX_SERVER_PART: usize = 40;
+
+/// The name the model calls an MCP tool by: `mcp__<server>__<tool>`, each
+/// part made safe by `safe_part`, so every name matches
+/// `^[a-zA-Z0-9_-]{1,128}$` (SME-365). A call names the tool back by it,
+/// and `resolve_tool` finds the server and the tool's real name again.
 /// `pub(crate)` because a rule refusal names the tool the same way
 /// (SME-241), in `crate::personas::rules`.
 pub(crate) fn namespaced_tool_name(server_name: &str, tool_name: &str) -> String {
-    format!("{TOOL_NAME_PREFIX}{server_name}{TOOL_NAME_SEPARATOR}{tool_name}")
+    let server = safe_part(server_name, MAX_SERVER_PART);
+    let room = MAX_TOOL_NAME - TOOL_NAME_PREFIX.len() - server.len() - TOOL_NAME_SEPARATOR.len();
+    format!("{TOOL_NAME_PREFIX}{server}{TOOL_NAME_SEPARATOR}{}", safe_part(tool_name, room))
+}
+
+/// `name` with an MCP tool's parts made safe as `namespaced_tool_name`
+/// makes them; any other name, or one already safe, as it is. For a name
+/// stored before SME-365 (`mcp__linear.app__search.web`, written while a
+/// local server took any name), so history sent again matches what's
+/// offered now.
+pub(crate) fn safe_tool_name(name: &str) -> String {
+    let fits = (1..=MAX_TOOL_NAME).contains(&name.len()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if fits {
+        // Already one Anthropic takes, and re-splitting it can change it
+        // (a server named `__x`: SME-365 review 2).
+        return name.to_string();
+    }
+    parse_tool_name(name).map_or_else(|| name.to_string(), |(server, tool)| namespaced_tool_name(server, tool))
+}
+
+/// `text` as it is when it's already a safe name part of at most `max`
+/// characters, as nearly every name is. Otherwise each character outside
+/// `[a-zA-Z0-9_-]` becomes `_`, the result is cut to fit, and `_` and six
+/// hex digits of a hash of the whole of `text` go on the end: two names
+/// that differ only in a refused character (`a.b`, `a b`), or only past
+/// the cut, still get names of their own, and the same text always gets
+/// the same name.
+fn safe_part(text: &str, max: usize) -> String {
+    let allowed = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    if !text.is_empty() && text.len() <= max && text.chars().all(allowed) {
+        return text.to_string();
+    }
+    let suffix = format!("_{:06x}", fnv1a(text.as_bytes()) & 0x00ff_ffff);
+    let kept: String = text
+        .chars()
+        .map(|c| if allowed(c) { c } else { '_' })
+        .take(max.saturating_sub(suffix.len()))
+        .collect();
+    format!("{kept}{suffix}")
+}
+
+/// FNV-1a, 64-bit: a hash that is the same in every build and release, so
+/// a tool keeps its name across a restart or an upgrade (std's hasher
+/// promises neither).
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// Which of `configs` a model-facing MCP tool `name` belongs to, and the
+/// tool's part of it: the server whose safe part, then `__`, starts what
+/// follows `mcp__`. The longest such server wins, so a server named
+/// `a__b` isn't taken for one named `a`.
+pub(crate) fn server_for<'c, 'n>(name: &'n str, configs: &'c [McpServerConfig]) -> Option<(&'c McpServerConfig, &'n str)> {
+    let rest = name.strip_prefix(TOOL_NAME_PREFIX)?;
+    configs
+        .iter()
+        .filter_map(|config| {
+            let tool = rest.strip_prefix(&safe_part(&config.name, MAX_SERVER_PART))?.strip_prefix(TOOL_NAME_SEPARATOR)?;
+            Some((config, tool))
+        })
+        .max_by_key(|(config, _)| safe_part(&config.name, MAX_SERVER_PART).len())
+}
+
+/// The name `listed` gives the tool the model calls by tool part `part`
+/// on server `server_name`: `part` itself when a listed tool has exactly
+/// that name, else the listed tool whose safe name it is (SME-365), else
+/// `part`, so the server answers an unknown tool as it would have.
+pub(crate) fn listed_tool_name(listed: &[McpTool], server_name: &str, part: &str) -> String {
+    if listed.iter().any(|tool| tool.name == part) {
+        return part.to_string();
+    }
+    let called = namespaced_tool_name(server_name, part);
+    listed
+        .iter()
+        .map(|tool| tool.name.as_ref())
+        .find(|tool| namespaced_tool_name(server_name, tool) == called)
+        .unwrap_or(part)
+        .to_string()
+}
+
+/// The configured server a model-facing MCP tool `name` names, and the
+/// tool's part of the name (SME-365). It connects nothing: the call maps
+/// the part to the tool's real name on the connection it goes out on
+/// (`call::call_tool_unspanned`).
+pub(crate) async fn resolve_tool(pool: &sqlx::PgPool, name: &str) -> Result<(McpServerConfig, String), String> {
+    let configs = crate::db::list_mcp_server_configs(pool)
+        .await
+        .map_err(|e| format!("failed to look up the MCP server for {name:?}: {e}"))?;
+    match server_for(name, &configs) {
+        Some((config, part)) => Ok((config.clone(), part.to_string())),
+        None => {
+            let server = parse_tool_name(name).map_or(name, |(server, _)| server);
+            Err(format!("unknown MCP server: {server:?}"))
+        }
+    }
 }
 
 /// Given a full smelt-facing tool name, returns `(server_name, tool_name)`

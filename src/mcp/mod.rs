@@ -722,4 +722,4 @@ async fn check_connection(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
