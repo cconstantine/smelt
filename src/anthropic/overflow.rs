@@ -22,13 +22,22 @@ use super::stream::provider_error_message;
 /// danger of parsing numbers (SME-73).
 const MIN_PLAUSIBLE_WINDOW: u32 = 1_024;
 
+/// The largest token count a refusal could plausibly mean — window or
+/// input alike. Real windows run to the millions; a refusal naming
+/// billions is a lying gateway, and its number feeds the turn's room
+/// arithmetic directly. An over-bound read is dropped as a misread is:
+/// the turn falls back to its own estimate, exactly as when the refusal
+/// names nothing (SME-73 review).
+const MAX_PLAUSIBLE_TOKENS: u64 = 100_000_000;
+
 /// A refusal that means "this didn't fit the model's context window".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Overflow {
     /// The window the refusal names, when it names one — read from a
     /// known shape only, and only a plausible one.
     pub window: Option<u32>,
-    /// The input size the refusal names, when it names one.
+    /// The input size the refusal names, when it names one — and only a
+    /// plausible one, the same bound as the window's.
     pub input_tokens: Option<u64>,
     /// The refusal as the provider phrased it.
     pub message: String,
@@ -120,8 +129,15 @@ fn numbers(message: &str, json: Option<&Value>) -> (Option<u32>, Option<u64>) {
         json.and_then(|j| j.pointer(&format!("/error/{key}")).and_then(Value::as_u64))
     };
     // llama.cpp answers with the pair structured: n_ctx is the window.
-    if let Some(window) = field("n_ctx").filter(|n| *n >= u64::from(MIN_PLAUSIBLE_WINDOW)) {
-        return (u32::try_from(window).ok(), field("n_prompt_tokens"));
+    // The pair stands or falls together — a window out of the plausible
+    // range vouches for nothing else in the body.
+    if let Some(window) = field("n_ctx").filter(|n| {
+        *n >= u64::from(MIN_PLAUSIBLE_WINDOW) && *n <= MAX_PLAUSIBLE_TOKENS
+    }) {
+        return (
+            u32::try_from(window).ok(),
+            field("n_prompt_tokens").filter(|n| *n <= MAX_PLAUSIBLE_TOKENS),
+        );
     }
     let window = TOO_LONG
         .captures(message)
@@ -134,7 +150,9 @@ fn numbers(message: &str, json: Option<&Value>) -> (Option<u32>, Option<u64>) {
         // input. (hermes-agent PR #126600 saved A as the window — the
         // mistake, caught live, that this shape exists to avoid.)
         .or_else(|| PLUS_OVER.captures(message).and_then(|caps| parsed::<u32>(&caps, 3)))
-        .filter(|window| *window >= MIN_PLAUSIBLE_WINDOW);
+        .filter(|window| {
+            *window >= MIN_PLAUSIBLE_WINDOW && u64::from(*window) <= MAX_PLAUSIBLE_TOKENS
+        });
     let input_tokens = TOO_LONG
         .captures(message)
         .or_else(|| LLAMA_REQUEST.captures(message))
@@ -142,7 +160,8 @@ fn numbers(message: &str, json: Option<&Value>) -> (Option<u32>, Option<u64>) {
         .and_then(|caps| parsed::<u64>(&caps, 1))
         .or_else(|| CONTAINS_INPUT.captures(message).and_then(|caps| parsed::<u64>(&caps, 1)))
         .or_else(|| INPUT_MESSAGES.captures(message).and_then(|caps| parsed::<u64>(&caps, 1)))
-        .or_else(|| PLUS_OVER.captures(message).and_then(|caps| parsed::<u64>(&caps, 1)));
+        .or_else(|| PLUS_OVER.captures(message).and_then(|caps| parsed::<u64>(&caps, 1)))
+        .filter(|n| *n <= MAX_PLAUSIBLE_TOKENS);
     (window, input_tokens)
 }
 
@@ -258,6 +277,39 @@ mod tests {
     fn test_an_implausible_window_is_dropped() {
         let o = refused(r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 9000 tokens > 512 maximum"}}"#).expect("an overflow");
         assert_eq!((o.window, o.input_tokens), (None, Some(9_000)));
+    }
+
+    /// The same the other way up: real windows reach the hundreds of
+    /// thousands, so a gateway claiming billions is lying, and its
+    /// number is no window either (SME-73 review). The ceiling is
+    /// inclusive — a number sitting on it still reads.
+    #[test]
+    fn test_an_implausibly_large_window_is_dropped() {
+        let o = refused(r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210242 tokens > 100000001 maximum"}}"#).expect("an overflow");
+        assert_eq!((o.window, o.input_tokens), (None, Some(210_242)), "the lie is dropped and the honest input stays");
+        let o = refused(r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210242 tokens > 100000000 maximum"}}"#).expect("an overflow");
+        assert_eq!((o.window, o.input_tokens), (Some(100_000_000), Some(210_242)), "the ceiling itself still reads");
+    }
+
+    /// A lying input count goes the same way: over the bound it is no
+    /// number, and feeding one to the turn's room arithmetic does more
+    /// harm than nothing (SME-73 review).
+    #[test]
+    fn test_an_implausibly_large_input_is_dropped() {
+        let o = refused(r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 100000001 tokens > 200000 maximum"}}"#).expect("an overflow");
+        assert_eq!((o.window, o.input_tokens), (Some(200_000), None), "the lie is dropped and the honest window stays");
+        let o = refused(r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 100000000 tokens > 200000 maximum"}}"#).expect("an overflow");
+        assert_eq!((o.window, o.input_tokens), (Some(200_000), Some(100_000_000)), "the ceiling itself still reads");
+    }
+
+    /// A lying gateway can answer in llama.cpp's structured shape too.
+    /// The pair is read together or not at all: a window above the
+    /// bound vouches for nothing else in the body, and the message
+    /// here — wording without digits — names none.
+    #[test]
+    fn test_a_lying_structured_window_is_no_window() {
+        let o = refused(r#"{"error":{"code":400,"type":"exceed_context_size_error","message":"the request exceeds the available context size, try increasing it","from_cache":false,"n_prompt_tokens":15000,"n_ctx":1000000000000000}}"#).expect("an overflow");
+        assert_eq!((o.window, o.input_tokens), (None, None));
     }
 
     // --- and the set that must never count -------------------------------

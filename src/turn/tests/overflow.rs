@@ -84,6 +84,18 @@ fn too_long(input: u32, window: u32) -> Answer {
     ))
 }
 
+/// Anthropic's refusal shape with the counts verbatim: a lying
+/// gateway's numbers don't fit a `u32` — that's the point (SME-73
+/// review).
+fn too_long_big(input: &str, window: &str) -> Answer {
+    Err((
+        axum::http::StatusCode::BAD_REQUEST,
+        format!(
+            r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"prompt is too long: {input} tokens > {window} maximum"}},"request_id":"req_test"}}"#
+        ),
+    ))
+}
+
 /// llama.cpp's structured 400, naming its `n_ctx` beside the wording.
 fn llama_refused(input: u32, window: u32) -> Answer {
     Err((
@@ -261,6 +273,68 @@ async fn test_an_overflow_with_no_window_named_compacts_on_an_unsaved_guess(pool
     let saved = db::list_messages(&pool, conversation.id).await.expect("messages");
     assert_eq!(last_reply(&saved).as_deref(), Some("Answered."));
     assert_eq!(saved_context_window(&pool).await, None, "a guess is kept to the turn, never saved as the model's window");
+}
+
+/// A gateway lying at both ends of the refusal: nine quintillion
+/// tokens fits no `u32`, so there is no window to learn, and `input *
+/// 3` overflows a u64 — the recovery's arithmetic on that input would
+/// be the harm, which is what the review caught (SME-73). Once the
+/// count is refused, the refusal is the unnumbered case it already
+/// answers: compact on the estimate, retry, and no window learned by
+/// anybody.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_absurd_refusal_counts_are_answered_with_the_estimate(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let upstream = start_refusal_mock(
+        &pool,
+        vec![
+            too_long_big("9000000000000000000", "9000000000000000000"),
+            Ok(text_reply_body("Summary: uncountable.")),
+            Ok(text_reply_body("Answered anyway.")),
+        ],
+    )
+    .await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    db::create_message(&pool, conversation.id, "user", &[anthropic::ContentBlock::Text { text: "earlier".to_string() }])
+        .await
+        .expect("seed");
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the refusal recovers");
+
+    assert_eq!(upstream.count(), 3, "refusal, summary, retry — the lying counts answered as the unnumbered case");
+    assert_eq!(compaction_summaries(&pool, conversation.id).await, ["Summary: uncountable."]);
+    let saved = db::list_messages(&pool, conversation.id).await.expect("messages");
+    assert_eq!(last_reply(&saved).as_deref(), Some("Answered anyway."));
+    assert_eq!(saved_context_window(&pool).await, None, "a nine-quintillion-token window is learned by nobody");
+}
+
+/// The same gateway with an honest window and the absurd input alone.
+/// The lying count is refused, the turn's own estimate takes its
+/// place, and that fits the window with room — so the history goes
+/// again on the shrunken budget, and the lie never forces a
+/// compaction it only dreamed up (SME-73 review).
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_absurd_input_count_never_forces_a_compaction(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let upstream = start_refusal_mock(
+        &pool,
+        vec![
+            too_long_big("18446744073709551500", "131072"),
+            Ok(text_reply_body("Answered.")),
+        ],
+    )
+    .await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the refusal recovers");
+
+    assert_eq!(upstream.count(), 2, "one refusal, one retry — the lying input was never trusted to demand a summary");
+    assert!(compaction_summaries(&pool, conversation.id).await.is_empty(), "the estimate fits 131,072 with room: only the lie said otherwise");
+    let saved = db::list_messages(&pool, conversation.id).await.expect("messages");
+    assert_eq!(last_reply(&saved).as_deref(), Some("Answered."));
+    assert_eq!(saved_context_window(&pool).await, Some(131_072), "the honest window is learned all the same");
 }
 
 /// R4 "Can't help": a window that can't hold even the system prompt and

@@ -51,8 +51,10 @@ pub(super) async fn recover(
     } else {
         // The assumption for this turn's compaction and retry — three
         // quarters of the refused request's size. A guess, so it never
-        // leaves the turn.
-        let assumed = u32::try_from(input * 3 / 4).unwrap_or(u32::MAX);
+        // leaves the turn. Provider-supplied sizes are saturating here
+        // and upstream: `anthropic::overflow` drops implausible ones,
+        // and these are the last two spots one could still reach (SME-73 review).
+        let assumed = u32::try_from(input.saturating_mul(3) / 4).unwrap_or(u32::MAX);
         if assumed < turn_model.context_window {
             turn_model.context_window = assumed;
         }
@@ -62,7 +64,7 @@ pub(super) async fn recover(
     // then the reply budget was the whole problem, and the same history
     // goes again as it stands. It doesn't, or no window was named:
     // summarize first, with the window now known.
-    let compacted = named.is_none() || input + needs > u64::from(turn_model.context_window);
+    let compacted = named.is_none() || input.saturating_add(needs) > u64::from(turn_model.context_window);
     if compacted {
         #[cfg(test)]
         test_hooks::before_summary_call(conversation_id).await;
