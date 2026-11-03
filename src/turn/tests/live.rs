@@ -4,6 +4,7 @@ use super::*;
 /// call: a reset when each call starts, then its text.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_turn_streams_its_reply_to_every_tab(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_007)
         .await
@@ -31,6 +32,7 @@ async fn test_a_turn_streams_its_reply_to_every_tab(pool: PgPool) {
 /// A tab that connects mid-reply can show the text so far.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_reply_so_far_is_available_mid_turn(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_008)
         .await
@@ -61,6 +63,7 @@ async fn test_the_reply_so_far_is_available_mid_turn(pool: PgPool) {
 /// Sending returns at once; the turn carries on and every tab hears it.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_start_turn_returns_before_the_turn_finishes(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_010)
         .await
@@ -93,6 +96,7 @@ async fn test_start_turn_returns_before_the_turn_finishes(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_start_turn_refuses_a_missing_conversation(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let error = start_turn(pool, 9_100_000_011, "hi".to_string())
         .await
         .expect_err("a conversation that doesn't exist")
@@ -103,6 +107,7 @@ async fn test_start_turn_refuses_a_missing_conversation(pool: PgPool) {
 /// A sent turn that fails, or is stopped, tells every tab why.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_sent_turn_publishes_its_failure(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let failing = db::create_conversation_with_id(&pool, 9_100_000_012)
         .await
@@ -131,6 +136,7 @@ async fn test_a_sent_turn_publishes_its_failure(pool: PgPool) {
 /// the user's next message clears it.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_turn_error_is_still_there_after_a_reload(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_014)
         .await
@@ -167,6 +173,7 @@ async fn test_a_turn_error_is_still_there_after_a_reload(pool: PgPool) {
 /// mustn't show that error under the newer reply.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_any_new_turn_clears_the_kept_error(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_015)
         .await
@@ -198,6 +205,7 @@ async fn next_turn_error(
 /// notification.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_stopping_a_woken_turn_is_not_reported_as_a_failure(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     // Not `test_a_turn_error_is_still_there_after_a_reload`'s id: that
     // test's stop leaves its conversation paused for the rest of the
@@ -244,6 +252,7 @@ async fn test_stopping_a_woken_turn_is_not_reported_as_a_failure(pool: PgPool) {
 /// then each step of a multi-step reply, not one batch at the end.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_turn_publishes_each_message_as_it_is_saved(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_006)
         .await

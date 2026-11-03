@@ -5,6 +5,7 @@ use super::*;
 /// vanish), every tab gets it, and the next request replays it.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_commentary_before_a_tool_call_on_llama_cpp_is_saved(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_309)
         .await
@@ -44,6 +45,7 @@ async fn test_commentary_before_a_tool_call_on_llama_cpp_is_saved(pool: PgPool) 
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_run_turn_executes_tool_and_persists_full_round_trip(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -133,6 +135,7 @@ async fn test_run_turn_executes_tool_and_persists_full_round_trip(pool: PgPool) 
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_describe_live_state_lists_real_pods_and_terminals(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let conversation = db::create_conversation(&pool)
         .await
         .expect("create conversation");
@@ -162,6 +165,7 @@ async fn test_describe_live_state_lists_real_pods_and_terminals(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_describe_live_state_lists_the_current_todo_list(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let conversation = db::create_conversation(&pool)
         .await
         .expect("create conversation");
@@ -199,6 +203,7 @@ async fn test_describe_live_state_lists_the_current_todo_list(pool: PgPool) {
 /// following turn compacting again at once.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_compaction_forgets_the_usage_that_triggered_it(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     db::create_message(&pool, conversation.id, "user", &[anthropic::ContentBlock::Text { text: "earlier".to_string() }])
@@ -390,6 +395,7 @@ async fn test_run_turn_compacts_before_sending_when_usage_is_near_the_ceiling(po
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_run_turn_errors_when_max_turns_exceeded(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -452,6 +458,7 @@ fn test_conversation_lock_is_shared_per_conversation_id_only() {
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_run_turn_serializes_concurrent_calls_for_the_same_conversation(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await

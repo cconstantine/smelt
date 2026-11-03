@@ -11,6 +11,7 @@ async fn fresh_conversation(pool: &PgPool) -> i64 {
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_users_turn_notes_activity_at_its_end_not_its_start(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation_id = fresh_conversation(&pool).await;
     start_mock_upstream(&pool, vec![text_reply_body("Done.")]).await;
@@ -38,6 +39,7 @@ async fn test_a_users_turn_notes_activity_at_its_end_not_its_start(pool: PgPool)
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_wake_for_an_idle_notice_alone_notes_nothing(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation_id = fresh_conversation(&pool).await;
     let pod = db::create_sandbox_pod(&pool, conversation_id).await.expect("pod");
@@ -64,6 +66,7 @@ async fn test_a_wake_for_an_idle_notice_alone_notes_nothing(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_wake_that_drains_a_finished_command_notes_activity(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation_id = fresh_conversation(&pool).await;
     unnotified_finished_command(&pool, conversation_id, &format!("done-{conversation_id}")).await;
@@ -77,6 +80,7 @@ async fn test_a_wake_that_drains_a_finished_command_notes_activity(pool: PgPool)
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_wake_that_drains_an_agent_message_notes_activity(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation_id = fresh_conversation(&pool).await;
     sqlx::query(
@@ -167,6 +171,7 @@ async fn gated_upstream(pool: &PgPool, gate: Arc<tokio::sync::Semaphore>, seen: 
 /// the send is counted and queues; the wake ends; then the send runs.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_send_queued_behind_an_idle_notice_wake_counts_at_its_own_end(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation_id = fresh_conversation(&pool).await;
     let pod = db::create_sandbox_pod(&pool, conversation_id).await.expect("pod");
@@ -216,6 +221,7 @@ async fn test_a_send_queued_behind_an_idle_notice_wake_counts_at_its_own_end(poo
 /// before its end took it) doesn't make the next idle-notice wake count.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stale_flag_from_an_earlier_turn_does_not_count(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation_id = fresh_conversation(&pool).await;
     let pod = db::create_sandbox_pod(&pool, conversation_id).await.expect("pod");

@@ -2,6 +2,7 @@ use super::*;
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_run_turn_for_a_missing_conversation_says_so(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     start_mock_upstream(&pool, vec![String::new()]).await;
     let error = run_turn(&pool, 987_654_321, hello())
@@ -16,6 +17,7 @@ async fn test_run_turn_for_a_missing_conversation_says_so(pool: PgPool) {
 /// typed is still theirs: it shouldn't vanish on the next reload.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_run_turn_without_a_model_still_saves_the_message(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -33,6 +35,7 @@ async fn test_run_turn_without_a_model_still_saves_the_message(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_run_turn_persists_user_and_assistant_messages_for_text_only_reply(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -93,6 +96,7 @@ async fn test_run_turn_persists_user_and_assistant_messages_for_text_only_reply(
 async fn test_run_turn_retries_without_thinking_after_ollama_tool_call_corruption(
     pool: PgPool,
 ) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -145,6 +149,7 @@ async fn test_run_turn_retries_without_thinking_after_ollama_tool_call_corruptio
 /// regeneration to still recover.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_run_turn_recovers_after_two_ollama_tool_call_failures(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -194,6 +199,7 @@ async fn test_run_turn_recovers_after_two_ollama_tool_call_failures(pool: PgPool
 /// model is reliably bad at.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_run_turn_gives_up_after_exhausting_tool_call_parse_retries(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await

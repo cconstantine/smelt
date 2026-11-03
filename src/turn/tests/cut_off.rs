@@ -88,6 +88,7 @@ fn sent_messages(requests: &std::sync::Mutex<Vec<serde_json::Value>>, n: usize) 
 /// the blank reply after it ends the turn, saving nothing either.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_empty_reply_is_not_saved_and_the_next_turn_works(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     let empty = reply_ending_body(&[], "end_turn");
@@ -135,6 +136,7 @@ fn test_history_leaves_out_an_empty_or_blank_reply() {
 /// is followed by a notice saying so, not saved as if it had finished.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_refused_reply_keeps_its_text_and_says_it_was_refused(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     use crate::api::chat::refusal_notice;
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
@@ -155,6 +157,7 @@ async fn test_a_refused_reply_keeps_its_text_and_says_it_was_refused(pool: PgPoo
 /// reply, only the notice is saved.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_reply_refused_in_a_call_drops_the_call(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     use crate::api::chat::refusal_notice;
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
@@ -205,6 +208,7 @@ fn only_text(message: &crate::models::Message) -> String {
 /// notice and the next message, and is accepted.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_reply_cut_off_in_a_call_keeps_its_text_and_names_the_call(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     use crate::api::chat::{ReplyLimit, cut_off_notice};
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
@@ -244,6 +248,7 @@ async fn test_a_reply_cut_off_in_a_call_keeps_its_text_and_names_the_call(pool: 
 /// each gets a saved "not run" result, sent right after the call.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_whole_calls_before_a_cut_one_are_kept_with_a_not_run_result(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     let body = cut_off_in_a_call_body(&[todowrite_events(0, "toolu_whole", WHOLE_TODOS), todowrite_events(1, "toolu_cut", CUT_TODOS)]);
@@ -281,6 +286,7 @@ async fn test_whole_calls_before_a_cut_one_are_kept_with_a_not_run_result(pool: 
 /// stopped mid-run, which they weren't.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_not_run_results_are_saved_before_anything_that_can_fail(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     let body = cut_off_in_a_call_body(&[todowrite_events(0, "toolu_whole", WHOLE_TODOS), todowrite_events(1, "toolu_cut", CUT_TODOS)]);
@@ -310,6 +316,7 @@ async fn test_not_run_results_are_saved_before_anything_that_can_fail(pool: PgPo
 /// user's message alone.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_reply_that_is_only_the_cut_call_saves_just_the_notice(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     use crate::api::chat::{ReplyLimit, cut_off_notice};
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
@@ -328,6 +335,7 @@ async fn test_a_reply_that_is_only_the_cut_call_saves_just_the_notice(pool: PgPo
 /// maximum rather than telling the user to raise the setting.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_reply_at_the_models_own_cap_doesnt_say_raise_it(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     use crate::api::chat::{ReplyLimit, parse_cut_off_notice};
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -354,6 +362,7 @@ async fn test_a_reply_at_the_models_own_cap_doesnt_say_raise_it(pool: PgPool) {
 /// notice says the conversation ran out of room, whatever bound the budget.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_reply_the_window_stopped_gets_a_room_left_notice(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     use crate::api::chat::{ReplyLimit, parse_cut_off_notice};
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -383,6 +392,7 @@ async fn test_a_reply_the_window_stopped_gets_a_room_left_notice(pool: PgPool) {
 /// reasoning budget of 0 while thinking is on.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_reply_budget_too_small_to_think_in_turns_thinking_off(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -408,6 +418,7 @@ async fn test_a_reply_budget_too_small_to_think_in_turns_thinking_off(pool: PgPo
 /// budget every turn had: a Claude model refuses one above its own cap.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_unsized_anthropic_models_reply_budget_stays_as_it_was(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
