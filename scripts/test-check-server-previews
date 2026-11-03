@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# scripts/check-server's previews and base URL (SME-96): the defaults a
+# check server derives from CHECK_PORT, that only a `-- NAME=` override
+# changes them, the refusals, and the preview-port check that comes before
+# anything is checked out, created or started. The stubs and helpers are in
+# scripts/lib/test-check-scripts.sh; "gets" means what the stub dx was
+# started with ($DX_ENV.previews).
+#
+#   scripts/test-check-server-previews
+. "$(dirname "$0")/lib/test-check-scripts.sh"
+
+check_server stop >/dev/null
+preview_port=$((port + 200))
+env_file=$worktree/.env
+: >"$env_file"
+
+previews_after_start() {
+    for _ in $(seq 1 50); do
+        [ -s "$DX_ENV.previews" ] && break
+        sleep 0.1
+    done
+    cat "$DX_ENV.previews" 2>/dev/null
+}
+expected() { # addr url base
+    printf 'SMELT_PREVIEW_ADDR=%s\nSMELT_PREVIEW_URL=%s\nSMELT_BASE_URL=%s' "$1" "$2" "$3"
+}
+default_url="http://{port}-{conversation}.preview.localhost:$preview_port"
+# Starts with extra_env and the start arguments, compares what the server
+# got with what's expected, and keeps start's output in $out; then stops.
+expect_previews() { # name addr url base [start args...]
+    local name=$1 want got
+    want=$(expected "$2" "$3" "$4")
+    shift 4
+    : >"$DX_ENV.previews"
+    if ! out=$(check_server start HEAD "$@"); then
+        fail "$name: start: $out"
+        extra_env=()
+        return
+    fi
+    got=$(previews_after_start)
+    [ "$got" = "$want" ] || fail "$name: the server got: $(tr '\n' ' ' <<<"$got")"
+    check_server stop >/dev/null
+    extra_env=()
+}
+# A start that must be refused before anything is created: exit 1, no sqlx
+# call (a scratch database would be created), no pid file.
+expect_refused() { # name grep [start args...]
+    local name=$1 want=$2 rc
+    shift 2
+    : >"$SQLX_CALLS"
+    : >"$pid_file"
+    out=$(check_server start HEAD "$@")
+    rc=$?
+    [ "$rc" = 1 ] || fail "$name: start exited $rc: $out"
+    grep -qF -- "$want" <<<"$out" || fail "$name: the refusal doesn't say '$want': $out"
+    [ -s "$SQLX_CALLS" ] && fail "$name: a refused start called sqlx: $(cat "$SQLX_CALLS")"
+    [ -s "$pid_file" ] && fail "$name: a refused start wrote a pid file"
+    check_server stop >/dev/null
+    extra_env=()
+}
+
+# 1. Nothing set: the check server's own, from CHECK_PORT, said as such.
+expect_previews "nothing set" "0.0.0.0:$preview_port" "$default_url" "http://localhost:$port"
+grep -qF "previews on 0.0.0.0:$preview_port (check-server's default) as $default_url (check-server's default), links back to http://localhost:$port (check-server's default)" <<<"$out" ||
+    fail "nothing set: start didn't print the defaults: $out"
+grep -q "ignoring" <<<"$out" && fail "nothing set: start ignored something: $out"
+
+# 2. The dev server's values in the environment: ignored, each named, its
+# value never printed.
+extra_env=(SMELT_BASE_URL=http://localhost:8180/ SMELT_PREVIEW_ADDR=0.0.0.0:8181
+    "SMELT_PREVIEW_URL=http://{port}-{conversation}.preview.localhost:8181")
+expect_previews "the dev server's environment" "0.0.0.0:$preview_port" "$default_url" "http://localhost:$port"
+for name in SMELT_BASE_URL SMELT_PREVIEW_ADDR SMELT_PREVIEW_URL; do
+    grep -qF "ignoring $name from the environment" <<<"$out" || fail "the environment's $name: no notice: $out"
+done
+grep -qF "8180" <<<"$out" && fail "the environment's notice printed a value: $out"
+
+# 3. The same in the check worktree's .env.
+printf 'SMELT_BASE_URL=http://localhost:8180/\nSMELT_PREVIEW_ADDR=0.0.0.0:8181\n' >"$env_file"
+expect_previews ".env's values" "0.0.0.0:$preview_port" "$default_url" "http://localhost:$port"
+grep -qF "ignoring SMELT_BASE_URL from .env" <<<"$out" || fail ".env's SMELT_BASE_URL: no notice: $out"
+grep -qF "ignoring SMELT_PREVIEW_ADDR from .env" <<<"$out" || fail ".env's SMELT_PREVIEW_ADDR: no notice: $out"
+: >"$env_file"
+
+# 4. An override wins over the environment, and is said to be yours.
+extra_env=(SMELT_BASE_URL=http://localhost:8180/)
+expect_previews "a base URL override" "0.0.0.0:$preview_port" "$default_url" "http://example.test:1" -- SMELT_BASE_URL=http://example.test:1
+grep -qF "links back to http://example.test:1 (yours)" <<<"$out" || fail "a base URL override: not said to be yours: $out"
+grep -qF "ignoring SMELT_BASE_URL" <<<"$out" && fail "a base URL override: the environment's was reported as ignored over it: $out"
+
+# 5. Only the address given: the links follow its port.
+alt=$(free_port) || fail "no free port for case 5"
+expect_previews "only the address" "0.0.0.0:$alt" "http://{port}-{conversation}.preview.localhost:$alt" "http://localhost:$port" -- SMELT_PREVIEW_ADDR=0.0.0.0:$alt
+grep -qF "(following your address)" <<<"$out" || fail "only the address: the URL isn't said to follow it: $out"
+
+# 6. Only the URL given, on another port: kept, with a warning.
+expect_previews "only the URL" "0.0.0.0:$preview_port" "http://{port}-{conversation}.p.localhost:18555" "http://localhost:$port" \
+    -- "SMELT_PREVIEW_URL=http://{port}-{conversation}.p.localhost:18555"
+grep -qF "preview links name port 18555 but previews listen on $preview_port" <<<"$out" || fail "only the URL: no port warning: $out"
+
+# 7. Two overrides of one name: the last, as env itself takes it.
+alt2=$(free_port) || fail "no free port for case 7"
+expect_previews "two address overrides" "0.0.0.0:$alt2" "http://{port}-{conversation}.preview.localhost:$alt2" "http://localhost:$port" \
+    -- SMELT_PREVIEW_ADDR=0.0.0.0:$alt SMELT_PREVIEW_ADDR=0.0.0.0:$alt2
+
+# 8. An empty address or URL is refused (smelt would read it as the dev
+# server's :8181); an empty base URL is passed on as asked.
+expect_refused "an empty address" "an empty -- SMELT_PREVIEW_ADDR= is refused" -- SMELT_PREVIEW_ADDR=
+expect_refused "an empty URL" "an empty -- SMELT_PREVIEW_URL= is refused" -- SMELT_PREVIEW_URL=
+expect_previews "an empty base URL" "0.0.0.0:$preview_port" "$default_url" "" -- SMELT_BASE_URL=
+grep -qF "SMELT_BASE_URL unset (yours): derived from each request" <<<"$out" || fail "an empty base URL: not said: $out"
+
+# 9. Addresses that can't be a preview listener's.
+expect_refused "the app's own port" "is the app's own port" -- SMELT_PREVIEW_ADDR=0.0.0.0:$port
+expect_refused "no port" "doesn't end in a port" -- SMELT_PREVIEW_ADDR=0.0.0.0
+extra_env=(CHECK_PORT=65400)
+expect_refused "CHECK_PORT too high for its previews" "leaves no port for its previews"
+
+# 10. The preview port taken: refused before anything is created, naming
+# the port, and the listener left alone; another port given, it starts.
+foreign_ready=$dir/foreign-ready-previews
+: >"$foreign_ready"
+"$STUB_PYTHON3" -I "$STUB_HTTP_200" 127.0.0.1 "$preview_port" --own-group --ready "$foreign_ready" </dev/null >/dev/null 2>&1 &
+foreign_pid=$!
+for _ in $(seq 1 50); do [ -s "$foreign_ready" ] && break; sleep 0.1; done
+if [ -s "$foreign_ready" ]; then
+    expect_refused "the preview port taken" "preview port $preview_port is taken"
+    pid_is_live "$foreign_pid" || fail "the preview port taken: start signalled the listener"
+    expect_previews "the preview port taken, another given" "0.0.0.0:$alt" "http://{port}-{conversation}.preview.localhost:$alt" "http://localhost:$port" \
+        -- SMELT_PREVIEW_ADDR=0.0.0.0:$alt
+else
+    fail "the listener on the preview port never listened"
+fi
+kill "$foreign_pid" 2>/dev/null
+wait "$foreign_pid" 2>/dev/null
+
+finish
