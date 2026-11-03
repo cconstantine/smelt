@@ -50,6 +50,10 @@ pub enum ConversationEvent {
     SandboxPodUpdate {
         pod_id: i64,
         status: String,
+        /// The node it runs on, once scheduled (SME-304). Defaulted, so a
+        /// tab from before it still reads the event.
+        #[serde(default)]
+        node: Option<String>,
         terminated: bool,
     },
     /// Published when the model shares a preview (`sandbox_preview_url`),

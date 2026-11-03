@@ -58,6 +58,9 @@ pub struct SandboxTerminalSummary {
 pub struct SandboxPodSummary {
     pub pod_id: i64,
     pub status: String,
+    /// The node it runs on, once scheduled (SME-304).
+    #[serde(default)]
+    pub node: Option<String>,
     pub terminals: Vec<SandboxTerminalSummary>,
     /// Ports the model has shared as previews, with their links (SME-42).
     pub previews: Vec<crate::events::SandboxPreview>,
@@ -202,6 +205,7 @@ pub async fn get_sandbox_state(id: i64) -> ServerFnResult<SandboxSnapshot> {
         summaries.push(SandboxPodSummary {
             pod_id: pod.pod_id,
             status: pod.status,
+            node: pod.node,
             terminals: by_pod.remove(&pod.pod_id).unwrap_or_default(),
             previews,
         });

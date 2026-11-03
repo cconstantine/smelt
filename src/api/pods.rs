@@ -20,6 +20,10 @@ pub struct PodOverview {
     /// Kubernetes' phase (`Running`, `Pending`, ...), or `None` when the
     /// pod object couldn't be read.
     pub status: Option<String>,
+    /// The node it runs on (`spec.nodeName`), `None` while Pending or when
+    /// the pod couldn't be read (SME-304).
+    #[serde(default)]
+    pub node: Option<String>,
     pub started_at: NaiveDateTime,
     pub activity: PodActivity,
     /// Kubernetes quantity strings, as configured (`"8Gi"`, `"1"`).
@@ -134,6 +138,12 @@ pub struct StoredVolume {
     /// The claim carries a deletion timestamp: it goes when its last
     /// mounting pod does. Views read it "removing…".
     pub deleting: bool,
+    /// The node whose disk holds it (SME-304): local-path claims bind on
+    /// first use and stay on that node, so a conversation's later pods
+    /// follow them there. From the claim's `selected-node` annotation;
+    /// `None` until a pod has used it.
+    #[serde(default)]
+    pub node: Option<String>,
 }
 
 /// Which claim of the pair, by name prefix.
@@ -267,6 +277,11 @@ fn parse_pod_metrics(list: &serde_json::Value) -> std::collections::HashMap<Stri
 /// `sandbox::spec::conversation_claim_kind` — one decision, one place
 /// (SME-253 review 1, finding 5).
 ///
+/// The annotation the scheduler sets on a WaitForFirstConsumer claim
+/// once a pod using it has a node, which local-path then provisions on.
+#[cfg(feature = "server")]
+const SELECTED_NODE: &str = "volume.kubernetes.io/selected-node";
+
 /// The stored-volumes view's rows: `claims` (already narrowed to this
 /// instance's conversation claims) grouped per conversation, `deleting`
 /// from the deletion timestamp, `size` from bound capacity else the
@@ -305,10 +320,17 @@ fn storage_rows(
                     .and_then(|requests| requests.get("storage"))
             })
             .map(|quantity| quantity.0.clone());
+        let node = claim
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(SELECTED_NODE))
+            .cloned();
         by_id.entry(conversation_id).or_default().push(StoredVolume {
             kind,
             size,
             deleting: claim.metadata.deletion_timestamp.is_some(),
+            node,
         });
     }
     by_id
@@ -419,6 +441,7 @@ pub(crate) async fn pod_overviews(pool: &sqlx::PgPool) -> Result<Vec<PodOverview
             conversation_id: row.conversation_id,
             conversation_title: row.conversation_title.clone(),
             status: details.phase,
+            node: details.node,
             started_at: row.created_at,
             activity: pod_activity(&row),
             memory_limit: sum_memory_limits(&details.memory_limits),

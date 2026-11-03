@@ -189,6 +189,7 @@ pub(in crate::sandbox) async fn terminate_pod_as(
             events::ConversationEvent::SandboxPodUpdate {
                 pod_id,
                 status: "terminated".to_string(),
+                node: None,
                 terminated: true,
             },
         );
@@ -204,6 +205,9 @@ pub(in crate::sandbox) async fn terminate_pod_as(
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PodDetails {
     pub phase: Option<String>,
+    /// The node it was scheduled onto (`spec.nodeName`); `None` until the
+    /// scheduler has placed it, so a Pending pod shows no node (SME-304).
+    pub node: Option<String>,
     pub memory_limits: Vec<String>,
     pub cpu_limits: Vec<String>,
 }
@@ -219,6 +223,7 @@ pub async fn pod_details(pool: &PgPool, pod_id: i64) -> Result<Option<PodDetails
     let (memory_limits, cpu_limits) = pod_container_limits(&pod);
     Ok(Some(PodDetails {
         phase: pod.status.as_ref().and_then(|s| s.phase.clone()),
+        node: pod.spec.as_ref().and_then(|spec| spec.node_name.clone()),
         memory_limits,
         cpu_limits,
     }))
@@ -303,14 +308,16 @@ pub async fn list_pods(pool: &PgPool, conversation_id: i64) -> Result<Vec<PodInf
     let mut result = Vec::with_capacity(rows.len());
     for row in rows {
         let name = pod_name(row.id);
-        let status = read_our_pod(&pods, &name, &instance)
-            .await?
+        let pod = read_our_pod(&pods, &name, &instance).await?;
+        let node = pod.as_ref().and_then(|p| p.spec.as_ref()).and_then(|spec| spec.node_name.clone());
+        let status = pod
             .and_then(|p| p.status)
             .and_then(|s| s.phase)
             .unwrap_or_else(|| "Unknown".to_string());
         result.push(PodInfo {
             pod_id: row.id,
             status,
+            node,
             agent: agent_status(row.id),
         });
     }
