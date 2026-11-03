@@ -432,10 +432,10 @@ fn server_and_words(name: &str) -> (Option<&str>, std::collections::BTreeSet<Str
     (server, words)
 }
 
-/// A tool name's part after its MCP server, or the whole name.
+/// Whether `word` is one of the verbs `VERBS` maps words to.
 #[cfg(feature = "server")]
-fn tool_part(name: &str) -> &str {
-    crate::mcp::parse_tool_name(name).map_or(name, |(_, tool)| tool)
+fn is_verb(word: &str) -> bool {
+    VERBS.iter().any(|(verb, _)| *verb == word)
 }
 
 /// Whether `a` is a slip of `b`: at least 4 characters, and at most a
@@ -503,14 +503,18 @@ pub fn similar(name: &str, offered: &[&str]) -> Vec<String> {
         .filter_map(|(o, s, w)| {
             let shared: Vec<&String> = words.intersection(w).collect();
             let shares_a_word = shared.iter().any(|word| !VERBS.iter().any(|(verb, _)| verb == word));
-            // A slip of the name itself (`todosote` for `todowrite`,
-            // SME-307) shares no word, so a tool part a few edits away
-            // counts too, above one shared word.
-            let near = is_near(tool_part(name), tool_part(o));
-            if !shares_a_word && !near {
+            // A slip of a word (`todosote` for `todowrite`, `isue` for
+            // `issue`, SME-307) shares none, so a word a few edits from one
+            // of the candidate's counts as that word, weighed as it is.
+            // Verbs never: `delete_document` isn't near `delete_attachment`.
+            let near: Vec<&String> = w
+                .iter()
+                .filter(|cw| !is_verb(cw) && !words.contains(*cw) && words.iter().any(|nw| !is_verb(nw) && is_near(nw, cw)))
+                .collect();
+            if !shares_a_word && near.is_empty() {
                 return None;
             }
-            let score = shared.iter().map(|word| weight(word)).sum::<usize>() + if near { 2 } else { 0 };
+            let score = shared.iter().chain(near.iter()).map(|word| weight(word)).sum();
             Some((same_server(server, *s), score, w.len() - shared.len(), *o))
         })
         .collect();
@@ -570,10 +574,18 @@ fn unoffered_sentence(name: &str, offered: &[&str]) -> String {
     sentence
 }
 
+/// Whether `error`, from `anthropic::tools::execute`, says the call's name
+/// is no tool's: no smelt tool of that name (`resolve`), or no configured
+/// MCP server it names (`mcp::resolve_tool`). Not a tool's own failure.
+#[cfg(feature = "server")]
+pub fn is_unknown_name_error(error: &str) -> bool {
+    error.starts_with("unknown tool: ") || error.starts_with("unknown MCP server: ")
+}
+
 /// The result of a real call by `name`, a tool that isn't offered (SME-307):
-/// the error its run gave (`error`: an unknown tool, or a rule's refusal,
-/// which names the rule), then the same sentence a call written as text
-/// gets, so a slip like `todosote` is told `todowrite`.
+/// the error its run gave (`error`, one `is_unknown_name_error` names),
+/// then the same sentence a call written as text gets, so a slip like
+/// `todosote` is told `todowrite`.
 #[cfg(feature = "server")]
 pub fn unoffered_call_result(error: &str, name: &str, offered: &[&str]) -> String {
     format!("{error}\n{}", unoffered_sentence(name, offered))

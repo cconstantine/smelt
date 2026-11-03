@@ -184,12 +184,17 @@ pub(super) async fn run_tools(
     conversation_id: i64,
     turn: &anthropic::stream::StreamedTurn,
     offered: &[&str],
-) -> ServerFnResult<(Vec<anthropic::ContentBlock>, bool)> {
+) -> ServerFnResult<RanTools> {
     let mut result_blocks = Vec::new();
+    // The first non-question call whose name no tool has, and whether
+    // every call so far was one (SME-307).
+    let mut unknown: Option<&str> = None;
+    let mut every_call_unknown = true;
     // The question this reply asked, if any: `ask_user`'s or (SME-238)
     // `ask_parent`'s. One per reply, of either kind.
     let mut asked: Option<&str> = None;
     let mut finished = false;
+    every_call_unknown &= !turn.content.iter().any(|b| matches!(b, anthropic::ContentBlock::ToolUse { name, .. } if is_question(name)));
     for block in &turn.content {
         if let anthropic::ContentBlock::ToolUse { id, name, input } = block
             && is_question(name)
@@ -244,13 +249,17 @@ pub(super) async fn run_tools(
             if name == crate::agents::FINISH && result.is_ok() {
                 finished = true;
             }
+            // A call by a name no tool has is told which offered tools are
+            // like it, after its own error (SME-307). Only that error: a
+            // tool that ran, and failed in its own words, isn't a slip.
+            let resolved = !matches!(&result, Err(message) if crate::text_calls::is_unknown_name_error(message));
+            every_call_unknown &= !resolved;
+            if !resolved {
+                unknown.get_or_insert(name.as_str());
+            }
             let (content, is_error) = match result {
                 Ok(output) => (output, None),
-                // A call by a name that isn't offered is told which offered
-                // tools are like it (SME-307), after its own error.
-                Err(message) if !offered.contains(&name.as_str()) => {
-                    (crate::text_calls::unoffered_call_result(&message, name, offered), Some(true))
-                }
+                Err(message) if !resolved => (crate::text_calls::unoffered_call_result(&message, name, offered), Some(true)),
                 Err(message) => (message, Some(true)),
             };
             result_blocks.push(anthropic::ContentBlock::ToolResult {
@@ -260,7 +269,21 @@ pub(super) async fn run_tools(
             });
         }
     }
-    Ok((result_blocks, asked.is_some() || finished))
+    Ok(RanTools {
+        results: result_blocks,
+        ends: asked.is_some() || finished,
+        unknown: unknown.filter(|_| every_call_unknown).map(str::to_string),
+    })
+}
+
+/// What running a reply's calls gave: their results, whether the turn ends
+/// (a question asked, or `finish`), and, when every call named a tool no
+/// tool has, the first of those names (SME-307).
+#[cfg(feature = "server")]
+pub(super) struct RanTools {
+    pub(super) results: Vec<anthropic::ContentBlock>,
+    pub(super) ends: bool,
+    pub(super) unknown: Option<String>,
 }
 
 /// Whether `name` is a question that ends the turn while it waits.
@@ -278,6 +301,32 @@ fn is_question(name: &str) -> bool {
 pub(super) struct TextCallStreak {
     corrections: usize,
     nudged: bool,
+}
+
+#[cfg(feature = "server")]
+impl TextCallStreak {
+    /// Settles the count once a reply's calls have run and their results
+    /// are saved (SME-307). A reply whose every call failed on a name no
+    /// tool has (`unknown`, the first of them) was a correction too: its
+    /// results name the tools like it. So it counts toward the bound that
+    /// calls written as text count toward, and the 4th in a row of either
+    /// kind ends the turn, its results already saved for the model to read
+    /// next turn. Any other reply made a real call, which resets the count.
+    pub(super) fn after_calls(&mut self, unknown: Option<&str>) -> Result<(), String> {
+        match unknown {
+            Some(name) if self.corrections == crate::text_calls::MAX_TEXT_CALL_CORRECTIONS => {
+                Err(crate::text_calls::unoffered_bound_error(name))
+            }
+            Some(_) => {
+                self.corrections += 1;
+                Ok(())
+            }
+            None => {
+                self.corrections = 0;
+                Ok(())
+            }
+        }
+    }
 }
 
 /// What the turn does after a reply: runs its calls (and then saves the
@@ -322,25 +371,9 @@ pub(super) async fn after_reply(
         if turn.stop_reason != "tool_use" {
             return Ok(NextStep::End);
         }
+        // The correction count is settled once the calls have run, by
+        // what they did (`TextCallStreak::after_calls`, SME-307).
         streak.nudged = false;
-        // A reply whose every call names a tool that isn't offered is a
-        // correction too (each result says which tools are like it), so it
-        // counts toward the same bound as calls written as text, and a
-        // model alternating between the two still reaches it (SME-307).
-        let unoffered = turn.content.iter().filter_map(|b| match b {
-            anthropic::ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
-            _ => None,
-        });
-        let mut unoffered = unoffered.peekable();
-        let first = unoffered.peek().copied();
-        if unoffered.all(|name| !offered.contains(&name)) {
-            if streak.corrections == crate::text_calls::MAX_TEXT_CALL_CORRECTIONS {
-                return Err(ServerFnError::new(crate::text_calls::unoffered_bound_error(first.unwrap_or_default())));
-            }
-            streak.corrections += 1;
-        } else {
-            streak.corrections = 0;
-        }
         // Markup for a call the reply also made is a provider leaving the
         // parsed call in the text too: it ran, and a correction would have
         // the model make it again (review 1). Matched by name; markup with

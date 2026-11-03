@@ -415,6 +415,7 @@ async fn test_a_real_call_by_an_unoffered_name_is_told_the_tools_like_it(pool: P
 
     assert_eq!(requests.lock().expect("the request log").len(), 3);
     let slip = tool_result_for(&saved, "toolu_slip").expect("the slip's result");
+    assert!(slip.starts_with("unknown tool: todosote\n"), "its own error first: {slip}");
     assert!(slip.contains("similar offered tools: `todowrite`"), "{slip}");
     let none = tool_result_for(&saved, "toolu_none").expect("the stranger's result");
     assert!(none.contains("`frobnicate` isn't an offered tool, and no offered tool has a similar name."), "{none}");
@@ -439,6 +440,29 @@ async fn test_unoffered_calls_share_the_text_call_bound(pool: PgPool) {
     assert_eq!(requests.lock().expect("the request log").len(), 4);
     let error = error.to_string();
     assert!(error.contains("4 times in a row") && error.contains("`todosote`"), "{error}");
+    // The 4th reply's call ran and its result is saved before the turn
+    // ends (review 1), so the next turn reads its suggestion, not an
+    // unanswered call.
+    let saved = db::list_messages(&pool, conversation.id).await.expect("list messages");
+    let last = tool_result_for(&saved, "toolu_2").expect("the 4th reply's result is saved");
+    assert!(last.contains("similar offered tools: `todowrite`"), "{last}");
+}
+
+/// SME-307 review: a reply of two calls by unknown names is one correction.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_reply_of_two_unknown_calls_counts_once(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let two = |n: &str| text_blocks_body(&[Block::Call(&format!("toolu_{n}a"), "todosote"), Block::Call(&format!("toolu_{n}b"), "frobnicate")], "tool_use");
+    let bodies = vec![two("1"), two("2"), two("3"), two("4")];
+    let requests = start_recording_mock_upstream(&pool, bodies).await;
+
+    let error = run_turn_bounded(&pool, TurnInFlight::start(conversation.id), Some(hello()), 10, None, false)
+        .await
+        .expect_err("the 4th reply of unknown calls ends the turn");
+    assert_eq!(requests.lock().expect("the request log").len(), 4);
+    assert!(error.to_string().contains("`todosote`"), "{error}");
 }
 
 /// SME-307: a reply with an offered call beside an unoffered one is a real
@@ -454,4 +478,23 @@ async fn test_an_offered_call_beside_an_unoffered_one_resets_the_streak(pool: Pg
 
     run_turn(&pool, conversation.id, hello()).await.expect("the turn succeeds: the mixed reply reset the streak");
     assert_eq!(requests.lock().expect("the request log").len(), 6);
+}
+
+/// SME-307 review: an offered tool that ran and failed in its own words
+/// isn't a slip: its result gains no "isn't an offered tool", and replies
+/// of such calls don't count toward the bound.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_tool_failing_in_its_own_words_is_no_correction(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let failing = |id: &str| text_blocks_body(&[Block::Call(id, "read_file")], "tool_use");
+    let bodies =
+        vec![failing("toolu_f1"), failing("toolu_f2"), failing("toolu_f3"), failing("toolu_f4"), failing("toolu_f5"), text_reply_body("Done.")];
+    let requests = start_recording_mock_upstream(&pool, bodies).await;
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("five failing real calls don't reach the bound");
+    assert_eq!(requests.lock().expect("the request log").len(), 6);
+    let result = tool_result_for(&saved, "toolu_f5").expect("the 5th call's result");
+    assert!(!result.contains("isn't an offered tool"), "{result}");
 }

@@ -314,3 +314,22 @@ fn test_an_unoffered_calls_result_names_the_tools_like_it() {
     let stranger = unoffered_call_result("unknown tool: frobnicate", "frobnicate", OFFERED);
     assert!(stranger.ends_with("`frobnicate` isn't an offered tool, and no offered tool has a similar name."), "{stranger}");
 }
+
+/// SME-307 review: a slip counts word by word, never by a shared verb, so a
+/// wrong destructive tool isn't put first.
+#[test]
+fn test_a_shared_verb_doesnt_make_a_wrong_tool_similar() {
+    let document = similar("mcp__linear.app__delete_document", OFFERED);
+    assert_ne!(document.first().map(String::as_str), Some("mcp__linear.app__delete_attachment"), "{document:?}");
+    assert!(!similar("delete_file", &["delete_volume", "edit_file"]).contains(&"delete_volume".to_string()));
+}
+
+/// SME-307 review: only an error saying the name is no tool's gets the
+/// suggestions; a tool that ran and failed in its own words doesn't.
+#[test]
+fn test_only_an_unknown_names_error_is_one() {
+    assert!(is_unknown_name_error("unknown tool: todosote"));
+    assert!(is_unknown_name_error("unknown MCP server: \"linear.app\""));
+    assert!(!is_unknown_name_error("issue not found"));
+    assert!(!is_unknown_name_error("missing or non-string field: path"));
+}
