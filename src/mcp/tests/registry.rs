@@ -6,6 +6,17 @@
 use super::gated_http::{self, HEADER, WAIT};
 use super::*;
 
+/// A server row whose connects get the product's budget, not the test
+/// build's 1 s: each test here holds a connect at the mock across a step
+/// that, on a loaded runner, can take longer than that, and a held attempt
+/// that timed out first was retried before the evict, a second
+/// `initialize` (SME-363). None of these tests is about the give-up.
+async fn held_server(pool: &sqlx::PgPool, url: &str) -> McpServerConfig {
+    let config = create_static_server(pool, url).await;
+    crate::mcp::test_support::give_product_budget(config.id);
+    config
+}
+
 /// Saves `url` and `headers` over `config`'s row and evicts it, as
 /// `update_mcp_server` does.
 async fn edit(pool: &sqlx::PgPool, config: &McpServerConfig, url: &str, headers: &[(&str, &str)]) -> McpServerConfig {
@@ -62,7 +73,7 @@ async fn connected(server_id: i64) -> bool {
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_connect_finishing_after_a_url_edit_is_not_kept(pool: sqlx::PgPool) {
     let (a, b) = (gated_http::spawn("tool_a").await, gated_http::spawn("tool_b").await);
-    let config = create_static_server(&pool, &a.url).await;
+    let config = held_server(&pool, &a.url).await;
     let mut held = a.hold("initialize");
     let turn = list_tools_in_background(&pool, &config);
     held.reached().await;
@@ -85,7 +96,7 @@ async fn test_a_connect_finishing_after_a_url_edit_is_not_kept(pool: sqlx::PgPoo
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_connect_finishing_after_a_header_edit_is_not_kept(pool: sqlx::PgPool) {
     let a = gated_http::spawn("tool_a").await;
-    let created = create_static_server(&pool, &a.url).await;
+    let created = held_server(&pool, &a.url).await;
     let config = edit(&pool, &created, &a.url, &[(HEADER, "old")]).await;
     let mut held = a.hold("initialize");
     let turn = list_tools_in_background(&pool, &config);
@@ -114,7 +125,7 @@ async fn test_a_connect_finishing_after_a_header_edit_is_not_kept(pool: sqlx::Pg
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_connect_finishing_after_a_delete_is_not_kept(pool: sqlx::PgPool) {
     let a = gated_http::spawn("tool_a").await;
-    let config = create_static_server(&pool, &a.url).await;
+    let config = held_server(&pool, &a.url).await;
     let mut held = a.hold("initialize");
     let turn = list_tools_in_background(&pool, &config);
     held.reached().await;
@@ -143,7 +154,7 @@ async fn test_a_connect_finishing_after_a_delete_is_not_kept(pool: sqlx::PgPool)
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_connect_failing_after_an_edit_is_not_recorded_as_a_failure(pool: sqlx::PgPool) {
     let (a, b) = (gated_http::spawn("tool_a").await, gated_http::spawn("tool_b").await);
-    let config = create_static_server(&pool, &a.url).await;
+    let config = held_server(&pool, &a.url).await;
     let mut held = a.hold("initialize");
     let turn = list_tools_in_background(&pool, &config);
     held.reached().await;
@@ -167,7 +178,7 @@ async fn test_a_connect_failing_after_an_edit_is_not_recorded_as_a_failure(pool:
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_caller_holding_the_config_from_before_an_edit_connects_to_the_new_one(pool: sqlx::PgPool) {
     let (a, b) = (gated_http::spawn("tool_a").await, gated_http::spawn("tool_b").await);
-    let config = create_static_server(&pool, &a.url).await;
+    let config = held_server(&pool, &a.url).await;
     edit(&pool, &config, &b.url, &[]).await;
 
     let checked = tokio::time::timeout(WAIT, connection_check(&pool, &config))
@@ -183,7 +194,7 @@ async fn test_a_caller_holding_the_config_from_before_an_edit_connects_to_the_ne
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_relist_finishing_after_an_evict_does_not_overwrite_the_new_connection(pool: sqlx::PgPool) {
     let (a, b) = (gated_http::spawn("tool_a").await, gated_http::spawn("tool_b").await);
-    let config = create_static_server(&pool, &a.url).await;
+    let config = held_server(&pool, &a.url).await;
     assert_eq!(connection_check(&pool, &config).await, Ok(vec!["tool_a".to_string()]));
     REGISTRY.lock().await.get(&config.id).expect("connected").stale.store(true, Ordering::SeqCst);
     let mut held = a.hold("tools/list");
@@ -213,8 +224,8 @@ async fn test_a_relist_finishing_after_an_evict_does_not_overwrite_the_new_conne
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_connect_the_evict_did_not_interrupt_is_kept(pool: sqlx::PgPool) {
     let a = gated_http::spawn("tool_a").await;
-    let config = create_static_server(&pool, &a.url).await;
-    let other = create_static_server(&pool, &a.url).await;
+    let config = held_server(&pool, &a.url).await;
+    let other = held_server(&pool, &a.url).await;
     let mut held = a.hold("initialize");
     let turn = list_tools_in_background(&pool, &config);
     held.reached().await;
