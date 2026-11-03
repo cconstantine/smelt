@@ -2,7 +2,9 @@
 //! learn the window the server named, shrink what it sends, and send
 //! once more. Reading a refusal is `anthropic::overflow`'s business;
 //! this is the answering. At most one recovery per request — a later
-//! tool round starts its own — and a second refusal ends the turn.
+//! tool round starts its own — and a second refusal ends the turn. The
+//! gentler half lives here too: a reply the *window* stopped rather than
+//! its budget is kept as it stands and leaves its measured size behind.
 
 use super::*;
 
@@ -90,11 +92,64 @@ pub(super) async fn recover(
     }
 }
 
+/// How far short of its budget a `max_tokens` stop may be written before
+/// the stop stops being the budget's: usage counts round, and a llama.cpp
+/// slot that fills stops with whatever room the window left — far less
+/// than the budget it was sent with (SME-73).
+const WINDOW_STOP_SLACK: i64 = 64;
+
+/// The smallest measured size worth learning: below this the stop tells
+/// more about a server that reports no usage than about any window — the
+/// same floor `anthropic::overflow::classify` refuses small windows at.
+const MIN_PLAUSIBLE_WINDOW: i64 = 1_024;
+
+/// Whether this stop means the window ran out rather than the reply
+/// budget (SME-73): Claude 4.5+ says so itself (`model_context_window_exceeded`),
+/// and a llama.cpp slot that fills stops at `max_tokens` written more than
+/// [`WINDOW_STOP_SLACK`] under the budget — anything but a stop word maps
+/// to `max_tokens` there, so the shortfall is the tell. A server that
+/// reported no usage at all (`written` 0) keeps today's budget reading:
+/// nothing says otherwise.
+pub(super) fn window_stop(stop_reason: &str, written: i64, budget: u32) -> bool {
+    match stop_reason {
+        "model_context_window_exceeded" => true,
+        "max_tokens" => written > 0 && written + WINDOW_STOP_SLACK < i64::from(budget),
+        _ => false,
+    }
+}
+
+/// What a window stop measured is the room the server really had: the
+/// whole call — input, cache and output together — stopped at the window.
+/// When that came in below this turn's believed window by more than
+/// `COMPACTION_SAFETY_BUFFER` the belief was too big: learn the measured
+/// size (the write only ever lowers), and the next request compacts
+/// before it is refused. The reply is kept either way and nothing is
+/// retried; a save that doesn't land says nothing more (`learn`).
+pub(super) async fn learn_window_stop(
+    pool: &PgPool,
+    conversation_id: i64,
+    turn_model: &mut crate::providers::TurnModel,
+    usage: &anthropic::TokenUsage,
+) {
+    let measured = usage
+        .input_tokens
+        .saturating_add(usage.output_tokens)
+        .saturating_add(usage.cache_creation_input_tokens)
+        .saturating_add(usage.cache_read_input_tokens);
+    if measured >= MIN_PLAUSIBLE_WINDOW
+        && measured.saturating_add(i64::from(COMPACTION_SAFETY_BUFFER)) < i64::from(turn_model.context_window)
+    {
+        let window = u32::try_from(measured).unwrap_or(u32::MAX);
+        learn(pool, conversation_id, turn_model, Some(window)).await;
+    }
+}
+
 /// Puts `window` on the turn's copy (every later size reads it) and
 /// saves it for the model. A save that fails — a provider moved mid-
 /// turn — is not the turn's failure: it says nothing more. Returns
 /// whether a window was named at all. Shared with the compaction's own
-/// overflow recovery (`compaction.rs`), the plan's learner 3.
+/// overflow recovery (`compaction.rs`) and the window-stop measurement
+/// below — the plan's learners 3 and 4.
 pub(super) async fn learn(
     pool: &PgPool,
     conversation_id: i64,

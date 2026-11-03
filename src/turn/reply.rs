@@ -114,7 +114,8 @@ pub(super) async fn save_reply(
 /// refuses a prefilled partial reply, and a local model would
 /// start its reasoning over.
 /// The context window stopping it (Claude 4.5+'s own stop
-/// reason) is the room running out, whatever bound the budget
+/// reason, or a llama.cpp slot that filled short of its budget,
+/// SME-73) is the room running out, whatever bound the budget
 /// (SME-111 review 1).
 /// The window stops a reply short of its budget: the notice
 /// says what it wrote (SME-111 review 2).
@@ -133,7 +134,11 @@ pub(super) async fn save_stop_notice(
     let refused = turn.stop_reason == "refusal";
     let cut_off_by = match turn.stop_reason.as_str() {
         _ if !cut_off => None,
-        "model_context_window_exceeded" => Some((
+        // The window stopped it, whatever bound the budget: Claude 4.5+
+        // says so (`model_context_window_exceeded`), and a llama.cpp slot
+        // that fills stops at `max_tokens` written far short of its
+        // budget (SME-73). The notice says the room, and what it wrote.
+        reason if super::overflow::window_stop(reason, turn.usage.output_tokens, budget.tokens) => Some((
             u32::try_from(turn.usage.output_tokens)
                 .ok()
                 .filter(|written| *written > 0)
