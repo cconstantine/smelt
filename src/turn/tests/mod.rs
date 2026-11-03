@@ -143,6 +143,27 @@ async fn unnotified_finished_command(pool: &PgPool, conversation_id: i64, comman
         .expect("mark terminal command finished");
 }
 
+/// A running command started `secs` ago and never touched since — the state
+/// the idle watch wakes for. `created_at` is what moves: with no touch and no
+/// notice yet, that is where the idle clock starts (SME-79).
+async fn untouched_running_command(pool: &PgPool, conversation_id: i64, command_id: &str, secs: i64) {
+    let pod = db::create_sandbox_pod(pool, conversation_id)
+        .await
+        .expect("create sandbox pod");
+    let terminal = db::create_sandbox_terminal(pool, pod.id)
+        .await
+        .expect("create sandbox terminal");
+    db::create_terminal_command(pool, conversation_id, terminal.id, command_id, "sleep 100", 300)
+        .await
+        .expect("create terminal command");
+    sqlx::query("UPDATE terminal_commands SET created_at = now() - make_interval(secs => $1) WHERE command_id = $2")
+        .bind(secs as f64)
+        .bind(command_id)
+        .execute(pool)
+        .await
+        .expect("backdate created_at");
+}
+
 /// Like `start_mock_upstream` (replies in order, the last one repeated),
 /// but also keeps every request body it receives, parsed as JSON, so a
 /// test can check what was actually sent. Same locking rule as

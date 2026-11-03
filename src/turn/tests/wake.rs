@@ -255,27 +255,6 @@ async fn test_wake_conversation_publishes_notification_delivery_failed_on_error(
 
 // --- Idle notices (SME-79) ---
 
-/// A running command started `secs` ago and never touched since — the state
-/// the idle watch wakes for. `created_at` is what moves: with no touch and no
-/// notice yet, that is where the idle clock starts (SME-79).
-async fn untouched_running_command(pool: &PgPool, conversation_id: i64, command_id: &str, secs: i64) {
-    let pod = db::create_sandbox_pod(pool, conversation_id)
-        .await
-        .expect("create sandbox pod");
-    let terminal = db::create_sandbox_terminal(pool, pod.id)
-        .await
-        .expect("create sandbox terminal");
-    db::create_terminal_command(pool, conversation_id, terminal.id, command_id, "sleep 100", 300)
-        .await
-        .expect("create terminal command");
-    sqlx::query("UPDATE terminal_commands SET created_at = now() - make_interval(secs => $1) WHERE command_id = $2")
-        .bind(secs as f64)
-        .bind(command_id)
-        .execute(pool)
-        .await
-        .expect("backdate created_at");
-}
-
 /// SME-79: a wake drains idle notices too — a running command left untouched
 /// past its notice period is told to the model as its own user message, says
 /// plainly that nothing stopped it and what it can do about it, and is marked
