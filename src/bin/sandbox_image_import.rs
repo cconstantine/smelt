@@ -10,10 +10,10 @@
 //! the node's image disk nears the kubelet's image-GC line (`disk`, SME-229).
 //!
 //! A short-lived pod gets the node's containerd socket hostPath-mounted
-//! (and, for `--check`, the containerd root read-only, for `df`)
 //! (`/run/k3s/containerd` — the path this project's own `rancher/k3s`
 //! image, and a real k3s install, both use; not configurable here since
-//! this binary isn't meant to run against anything else), receives the
+//! this binary isn't meant to run against anything else), and for
+//! `--check` the containerd root read-only, for `df` (`disk`). It receives the
 //! tarball over `pods.exec` stdin, imports it, and is deleted either way.
 //!
 //! Standalone rather than reusing `src/sandbox.rs`'s `Sandbox`/
@@ -544,8 +544,8 @@ async fn check(pods: &Api<Pod>, loader: &str, wanted: &[String]) -> Result<(), B
         Ok(()) => true,
         Err(e) => {
             eprintln!(
-                "sandbox_image_import: the loader didn't start with the node's {} mounted ({e}); \
-                 checking without the disk warning",
+                "sandbox_image_import: couldn't start the loader with the node's {} mounted ({e}), \
+                 the mount or something else; trying without it and the disk warning",
                 disk::IMAGE_FS_HOST_PATH
             );
             start_loader(pods, loader, LOADER_LIFETIME, false).await?;
