@@ -15,8 +15,9 @@ use k8s_openapi::api::core::v1::Pod;
 
 use super::{exec_capture, BoxError, CONTAINERD_SOCKET};
 
-/// Where k3s keeps containerd's images on the node, the same layout
-/// `CONTAINERD_SOCKET`'s `/run/k3s` assumes.
+/// Where k3s keeps containerd's images on the node with its default data
+/// dir (`--data-dir` moves it, unlike the `/run/k3s` socket); `check`
+/// goes on without the warning when it isn't there.
 pub(crate) const IMAGE_FS_HOST_PATH: &str = "/var/lib/rancher/k3s/agent/containerd";
 /// Where the loader pod mounts it.
 pub(crate) const IMAGE_FS_MOUNT: &str = "/hostimagefs";
@@ -42,10 +43,23 @@ impl DiskUse {
         100 - (self.available.saturating_mul(100) / self.capacity.max(1)).min(100)
     }
 
+    /// The least free space at which the kubelet doesn't collect: its
+    /// percent is an integer, `100 - floor(available * 100 / capacity)`,
+    /// so 85% is reached as soon as less than 16% is free, not 15%.
+    fn free_floor(&self) -> u64 {
+        let percent = u128::from(101 - GC_HIGH_PERCENT);
+        let floor = (u128::from(self.capacity) * percent).div_ceil(100);
+        u64::try_from(floor).unwrap_or(u64::MAX)
+    }
+
+    /// Whether the kubelet's image GC is collecting now.
+    fn past(&self) -> bool {
+        self.available < self.free_floor()
+    }
+
     /// Bytes left before the kubelet starts deleting images (zero once past).
     fn headroom(&self) -> u64 {
-        let reserve = self.capacity / 100 * (100 - GC_HIGH_PERCENT);
-        self.available.saturating_sub(reserve)
+        self.available.saturating_sub(self.free_floor())
     }
 }
 
@@ -55,16 +69,20 @@ pub(crate) fn parse_df(out: &str) -> Option<DiskUse> {
         let fields: Vec<&str> = line.split_whitespace().collect();
         let capacity = fields.get(1)?.parse::<u64>().ok()?;
         let available = fields.get(3)?.parse::<u64>().ok()?;
-        (capacity > 0).then(|| DiskUse { capacity: capacity * 1024, available: available * 1024 })
+        let capacity = capacity.checked_mul(1024).filter(|c| *c > 0)?;
+        Some(DiskUse { capacity, available: available.checked_mul(1024)? })
     })
 }
 
-/// An image on the node: its digest, its names, its size in bytes.
+/// An image on the node: its digest, its names, its size in bytes, and
+/// whether CRI pinned it (`io.cri-containerd.pinned=pinned`: the pause
+/// image, k3s's own), which the kubelet never deletes.
 #[derive(Debug, PartialEq)]
 pub(crate) struct NodeImage {
     pub(crate) digest: String,
     pub(crate) names: Vec<String>,
     pub(crate) size: u64,
+    pub(crate) pinned: bool,
 }
 
 impl NodeImage {
@@ -92,12 +110,17 @@ pub(crate) fn parse_images(out: &str) -> Vec<NodeImage> {
         let (Some(size), true) = (parse_size(number, unit), digest.starts_with("sha256:")) else {
             continue;
         };
+        let pinned = fields.iter().skip(5).any(|f| f.contains("io.cri-containerd.pinned=pinned"));
         match images.iter_mut().find(|i| i.digest == *digest) {
-            Some(image) => image.names.push((*name).to_string()),
+            Some(image) => {
+                image.names.push((*name).to_string());
+                image.pinned |= pinned;
+            }
             None => images.push(NodeImage {
                 digest: (*digest).to_string(),
                 names: vec![(*name).to_string()],
                 size,
+                pinned,
             }),
         }
     }
@@ -140,7 +163,7 @@ pub(crate) fn warning(disk: &DiskUse, images: &[NodeImage], in_use: &[String], w
     }
     let mut unused: Vec<&NodeImage> = images
         .iter()
-        .filter(|image| !image.names.iter().any(|n| in_use.contains(n)))
+        .filter(|image| !image.pinned && !image.names.iter().any(|n| in_use.contains(n)))
         .collect();
     let is_wanted = |image: &NodeImage| image.names.iter().any(|n| wanted.contains(n));
     unused.sort_by_key(|image| (!is_wanted(image), std::cmp::Reverse(image.size)));
@@ -150,7 +173,7 @@ pub(crate) fn warning(disk: &DiskUse, images: &[NodeImage], in_use: &[String], w
         .map(|image| format!("{} ({})", image.display_name(), gib(image.size)))
         .collect();
     let more = unused.len().saturating_sub(listed.len());
-    let line = if headroom == 0 { "is past" } else { "is near" };
+    let line = if disk.past() { "is past" } else { "is near" };
     let mut text = format!(
         "warning: the node's image disk is {}% full, {} free: it {line} the kubelet's {GC_HIGH_PERCENT}% \
          image garbage-collection line ({} before it), past which it deletes unused images, the gate's \
@@ -186,14 +209,14 @@ pub(crate) async fn warn_if_near_gc(pods: &Api<Pod>, loader: &str, wanted: &[Str
 async fn try_warn(pods: &Api<Pod>, loader: &str, wanted: &[String]) -> Result<(), BoxError> {
     let df = exec_capture(pods, loader, &["df", "-Pk", IMAGE_FS_MOUNT]).await?;
     let disk = parse_df(&df).ok_or_else(|| format!("df printed {:?}", df.trim()))?;
+    if disk.headroom() >= WARN_MARGIN_BYTES {
+        return Ok(());
+    }
     let ctr = |args: &'static [&'static str]| {
         let mut command = vec!["ctr", "--address", CONTAINERD_SOCKET, "--namespace", "k8s.io"];
         command.extend_from_slice(args);
         command
     };
-    if disk.headroom() >= WARN_MARGIN_BYTES {
-        return Ok(());
-    }
     let images = parse_images(&exec_capture(pods, loader, &ctr(&["images", "ls"])).await?);
     let in_use = parse_container_images(&exec_capture(pods, loader, &ctr(&["containers", "ls"])).await?);
     if let Some(text) = warning(&disk, &images, &in_use, wanted) {
