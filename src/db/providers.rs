@@ -322,6 +322,39 @@ pub async fn set_provider_model_reported(
     Ok(())
 }
 
+/// Saves the context window an overflow refusal named (SME-73), for the
+/// model the turn ran on. One statement: the row is added if it has
+/// none, and `context_window` is set only where it's null or larger —
+/// it only ever lowers, so two learners settle on the smaller — and
+/// only while the provider still answers at `base_url`, so a provider
+/// moved to another server mid-turn isn't given the old server's
+/// window. Returns whether anything was written.
+#[cfg_attr(not(test), allow(dead_code))] // until the turn's recovery calls it (SME-73)
+pub async fn lower_model_context_window(
+    pool: &PgPool,
+    provider_id: i64,
+    base_url: &str,
+    model: &str,
+    window: u32,
+) -> Result<bool, sqlx::Error> {
+    let window = i32::try_from(window).unwrap_or(i32::MAX);
+    let written = sqlx::query(
+        "INSERT INTO provider_models (provider_id, model, context_window)\n\
+         SELECT $1, $2, $3 FROM inference_providers WHERE id = $1 AND base_url = $4\n\
+         ON CONFLICT (provider_id, model) DO UPDATE\n\
+         SET context_window = $3\n\
+         WHERE (provider_models.context_window IS NULL OR provider_models.context_window > $3)\n\
+           AND EXISTS (SELECT 1 FROM inference_providers WHERE id = $1 AND base_url = $4)",
+    )
+    .bind(provider_id)
+    .bind(model)
+    .bind(window)
+    .bind(base_url)
+    .execute(pool)
+    .await?;
+    Ok(written.rows_affected() > 0)
+}
+
 /// The default provider and model, if one is set.
 pub async fn get_default_model(pool: &PgPool) -> Result<Option<(i64, String)>, sqlx::Error> {
     let row: Option<(Option<i64>, Option<String>)> =

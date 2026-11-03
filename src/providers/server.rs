@@ -201,6 +201,20 @@ pub fn context_window(model: &str, row: Option<&db::ProviderModelRow>) -> (u32, 
         .map_or((ASSUMED_CONTEXT_WINDOW, false), |window| (window, true))
 }
 
+/// Saves the context window an overflow refusal named (SME-73) for the
+/// model this turn ran on — it only ever lowers (see
+/// `db::lower_model_context_window`) — and tells the app, so the
+/// providers page and pickers refresh. The meter takes the new window
+/// from the turn's own copy, which its caller updates too.
+#[cfg_attr(not(test), allow(dead_code))] // until the turn's recovery calls it (SME-73)
+pub async fn learn_context_window(pool: &PgPool, model: &TurnModel, window: u32) -> Result<bool, sqlx::Error> {
+    let lowered = db::lower_model_context_window(pool, model.provider_id, &model.endpoint.base_url, &model.model, window).await?;
+    if lowered {
+        providers_changed();
+    }
+    Ok(lowered)
+}
+
 /// The cap on a reply to a model on a `kind` provider (SME-111): the
 /// user's, else what the provider reported, else `UNKNOWN_OUTPUT_CAP`
 /// on an Anthropic or Other provider. `None`: only the window caps it.
