@@ -4,7 +4,9 @@
 # real-cluster test failing with ErrImageNeverPull: the node must have the
 # image the tests will use and the Docker sidecar's, via the read-only
 # `sandbox_image_import --check`. The kubelet deletes unused images once
-# its disk is over 85% full.
+# its disk is over 85% full, so the check also warns (on stderr, without
+# failing) when the node's image disk is within 15 GiB of that, naming the
+# images no container uses (SME-229).
 #
 # The image is SANDBOX_IMAGE when set (scripts/check.sh sets it), else this
 # working tree's own (`scripts/sandbox-image-ref`): named after the agent
