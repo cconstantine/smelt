@@ -153,14 +153,15 @@ async fn call_tool_unspanned(
     // by a safe name (SME-365), which for a name like `search.web` isn't
     // that. Read on the connection the call goes out on, and used for the
     // override, the class, the rule check and the request alike.
-    let (service, tool_name, listed) = REGISTRY
+    let (service, tool_name, (listed, listed_tool)) = REGISTRY
         .lock()
         .await
         .get(&config.id)
         .map(|conn| {
             let real = listed_tool_name(&conn.tools, &config.name, tool_name);
             let listed = listed_class(&conn.tools, &real);
-            (conn.service.clone(), real, listed)
+            let tool = conn.tools.iter().find(|tool| tool.name == real).cloned();
+            (conn.service.clone(), real, (listed, tool))
         })
         .ok_or_else(|| CallFailure::Failed(format!("not connected to MCP server {:?}", config.name)))?;
     let tool_name = tool_name.as_str();
@@ -175,7 +176,7 @@ async fn call_tool_unspanned(
     // SME-241 is about to enforce on this same read. The message names
     // server and tool only — both already on the `mcp call` span — never
     // tool input or output (SME-137).
-    let override_class = crate::db::get_mcp_tool_class(pool, config.id, tool_name)
+    let saved = crate::db::get_mcp_tool_class(pool, config.id, tool_name)
         .await
         .map_err(|e| {
             CallFailure::Failed(format!(
@@ -183,6 +184,9 @@ async fn call_tool_unspanned(
                 config.name
             ))
         })?;
+    // Set for a different tool than the one listed under the name, it can
+    // only narrow (SME-295; the rule the offer and the page share).
+    let override_class = saved.map(|row| effective_override(&row, listed_tool.as_ref()));
     // The override wins over the connection's list; an unknown text —
     // unreachable under the table's CHECK — is taken as destructive,
     // failing closed toward what SME-241 enforces. The offer path judges

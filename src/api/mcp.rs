@@ -290,6 +290,17 @@ pub struct McpToolClassRow {
     pub annotated: Option<bool>,
     pub override_class: Option<String>,
     pub listed: Option<bool>,
+    /// The override was set for a different tool than the one the server
+    /// lists under this name now, so it doesn't decide the class: the
+    /// server's does, until the user saves it again (SME-295). `default`
+    /// for a bundle from before it.
+    #[serde(default)]
+    pub tool_changed: bool,
+    /// The fingerprint of the tool listed under this name now, which the
+    /// page sends back with a save, so an override binds to the tool the
+    /// user saw (SME-295 review 1). `None` when it isn't listed.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 /// The edit page's Tool-classes section: one row per listed tool plus
@@ -310,30 +321,38 @@ pub struct McpToolClasses {
 #[cfg(feature = "server")]
 fn merge_tool_class_rows(
     listed: Vec<crate::mcp::McpToolClassInfo>,
-    saved: Vec<(String, String)>,
+    saved: Vec<db::SavedToolClass>,
 ) -> Vec<McpToolClassRow> {
-    let overrides: HashMap<&str, &str> =
-        saved.iter().map(|(name, class)| (name.as_str(), class.as_str())).collect();
+    let overrides: HashMap<&str, &db::SavedToolClass> = saved.iter().map(|row| (row.tool_name.as_str(), row)).collect();
     let mut rows: Vec<McpToolClassRow> = listed
         .iter()
-        .map(|tool| McpToolClassRow {
-            tool_name: tool.name.clone(),
-            server_class: Some(tool.server_class.as_str().to_string()),
-            annotated: Some(tool.annotated),
-            override_class: overrides.get(tool.name.as_str()).map(|class| (*class).to_string()),
-            listed: Some(true),
+        .map(|tool| {
+            let saved = overrides.get(tool.name.as_str());
+            McpToolClassRow {
+                tool_name: tool.name.clone(),
+                server_class: Some(tool.server_class.as_str().to_string()),
+                annotated: Some(tool.annotated),
+                override_class: saved.map(|row| row.class.clone()),
+                listed: Some(true),
+                tool_changed: saved
+                    .and_then(|row| row.tool_fingerprint.as_deref())
+                    .is_some_and(|fingerprint| fingerprint != tool.fingerprint),
+                fingerprint: Some(tool.fingerprint.clone()),
+            }
         })
         .collect();
     let listed_names: std::collections::HashSet<&str> =
         listed.iter().map(|tool| tool.name.as_str()).collect();
     // `db::list_mcp_tool_classes` already delivers by tool name, so the
     // stale overrides come out by name without another sort.
-    rows.extend(saved.into_iter().filter(|(name, _)| !listed_names.contains(name.as_str())).map(|(tool_name, class)| McpToolClassRow {
-        tool_name,
+    rows.extend(saved.iter().filter(|row| !listed_names.contains(row.tool_name.as_str())).map(|row| McpToolClassRow {
+        tool_name: row.tool_name.clone(),
         server_class: None,
         annotated: None,
-        override_class: Some(class),
+        override_class: Some(row.class.clone()),
         listed: Some(false),
+        tool_changed: false,
+        fingerprint: None,
     }));
     rows
 }
@@ -342,15 +361,17 @@ fn merge_tool_class_rows(
 /// overrides alone, `listed: None` — the live state is unknown, not
 /// absent.
 #[cfg(feature = "server")]
-fn saved_only_rows(saved: Vec<(String, String)>) -> Vec<McpToolClassRow> {
+fn saved_only_rows(saved: Vec<db::SavedToolClass>) -> Vec<McpToolClassRow> {
     saved
         .into_iter()
-        .map(|(tool_name, class)| McpToolClassRow {
-            tool_name,
+        .map(|row| McpToolClassRow {
+            tool_name: row.tool_name,
             server_class: None,
             annotated: None,
-            override_class: Some(class),
+            override_class: Some(row.class),
             listed: None,
+            tool_changed: false,
+            fingerprint: None,
         })
         .collect()
 }
@@ -427,6 +448,7 @@ pub async fn set_mcp_tool_class(
     id: i64,
     tool_name: String,
     class: Option<String>,
+    fingerprint: Option<String>,
 ) -> ServerFnResult<()> {
     let config = db::get_mcp_server_config(db::get(), id)
         .await
@@ -434,9 +456,18 @@ pub async fn set_mcp_tool_class(
         .ok_or_else(|| ServerFnError::new(format!("no MCP server config with id {id}")))?;
     check_override_tool_name(&tool_name).map_err(ServerFnError::new)?;
     match parse_override_class(class).map_err(ServerFnError::new)? {
-        Some(class) => db::set_mcp_tool_class(db::get(), config.id, &tool_name, class)
-            .await
-            .map_err(ServerFnError::new)?,
+        Some(class) => {
+            // Set for the tool the page showed (SME-295 review 1), else
+            // the one the server lists under the name now; neither leaves
+            // a stored fingerprint as it was.
+            let fingerprint = match fingerprint {
+                Some(shown) => Some(shown),
+                None => crate::mcp::listed_tool_fingerprint(db::get(), &config, &tool_name).await,
+            };
+            db::set_mcp_tool_class(db::get(), config.id, &tool_name, class, fingerprint.as_deref())
+                .await
+                .map_err(ServerFnError::new)?
+        }
         None => {
             if !db::clear_mcp_tool_class(db::get(), config.id, &tool_name)
                 .await
@@ -574,8 +605,12 @@ mod tests {
 
     // --- Per-tool class overrides (SME-240) ---
 
+    fn saved(tool: &str, class: &str, fingerprint: Option<&str>) -> db::SavedToolClass {
+        db::SavedToolClass { tool_name: tool.to_string(), class: class.to_string(), tool_fingerprint: fingerprint.map(str::to_string) }
+    }
+
     fn info(name: &str, server_class: crate::anthropic::tools::ToolClass, annotated: bool) -> crate::mcp::McpToolClassInfo {
-        crate::mcp::McpToolClassInfo { name: name.to_string(), server_class, annotated }
+        crate::mcp::McpToolClassInfo { name: name.to_string(), server_class, annotated, fingerprint: format!("fp-{name}") }
     }
 
     /// Listed rows keep the server's own order and carry `server_class`
@@ -591,10 +626,7 @@ mod tests {
                 info("edit_thing", ToolClass::Destructive, false),
             ],
             // `list_mcp_tool_classes` delivers these already by name.
-            vec![
-                ("old_tool".to_string(), "writing".to_string()),
-                ("web_search_exa".to_string(), "destructive".to_string()),
-            ],
+            vec![saved("old_tool", "writing", None), saved("web_search_exa", "destructive", None)],
         );
         assert_eq!(
             rows,
@@ -605,6 +637,8 @@ mod tests {
                     annotated: Some(true),
                     override_class: Some("destructive".to_string()),
                     listed: Some(true),
+                    tool_changed: false,
+                    fingerprint: Some("fp-web_search_exa".to_string()),
                 },
                 McpToolClassRow {
                     tool_name: "edit_thing".to_string(),
@@ -612,6 +646,8 @@ mod tests {
                     annotated: Some(false),
                     override_class: None,
                     listed: Some(true),
+                    tool_changed: false,
+                    fingerprint: Some("fp-edit_thing".to_string()),
                 },
                 McpToolClassRow {
                     tool_name: "old_tool".to_string(),
@@ -619,9 +655,25 @@ mod tests {
                     annotated: None,
                     override_class: Some("writing".to_string()),
                     listed: Some(false),
+                    tool_changed: false,
+                    fingerprint: None,
                 },
             ]
         );
+    }
+
+    /// SME-295: an override saved for a different tool than the one listed
+    /// under its name now is marked changed; one saved for this tool, or
+    /// with no fingerprint (from before), isn't.
+    #[test]
+    fn test_merge_marks_an_override_whose_tool_changed() {
+        use crate::anthropic::tools::ToolClass;
+        let rows = merge_tool_class_rows(
+            vec![info("a", ToolClass::ReadOnly, true), info("b", ToolClass::ReadOnly, true), info("c", ToolClass::ReadOnly, true)],
+            vec![saved("a", "destructive", Some("fp-a")), saved("b", "destructive", Some("fp-old")), saved("c", "writing", None)],
+        );
+        let changed: Vec<(&str, bool)> = rows.iter().map(|r| (r.tool_name.as_str(), r.tool_changed)).collect();
+        assert_eq!(changed, vec![("a", false), ("b", true), ("c", false)]);
     }
 
     /// A server with no annotations at all still merges: every listed row
@@ -638,11 +690,13 @@ mod tests {
                 annotated: Some(false),
                 override_class: None,
                 listed: Some(true),
+                tool_changed: false,
+                    fingerprint: Some("fp-t".to_string()),
             }]
         );
         let rows = merge_tool_class_rows(
             Vec::new(),
-            vec![("gone".to_string(), "read-only".to_string())],
+            vec![saved("gone", "read-only", None)],
         );
         assert_eq!(
             rows,
@@ -652,6 +706,8 @@ mod tests {
                 annotated: None,
                 override_class: Some("read-only".to_string()),
                 listed: Some(false),
+                tool_changed: false,
+                    fingerprint: None,
             }]
         );
     }
@@ -703,6 +759,8 @@ mod tests {
                     annotated: Some(true),
                     override_class: None,
                     listed: Some(true),
+                    tool_changed: false,
+                    fingerprint: Some("fp-web_search_exa".to_string()),
                 },
                 McpToolClassRow {
                     tool_name: "old_tool".to_string(),
@@ -710,6 +768,8 @@ mod tests {
                     annotated: None,
                     override_class: Some("writing".to_string()),
                     listed: None,
+                    tool_changed: false,
+                    fingerprint: None,
                 },
             ],
             server_note: Some("Unreachable: refused".to_string()),

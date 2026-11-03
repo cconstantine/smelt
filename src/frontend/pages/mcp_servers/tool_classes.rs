@@ -36,6 +36,13 @@ pub(super) fn class_select_value(row: &McpToolClassRow) -> String {
         .unwrap_or_else(|| SERVER_ANSWER.to_string())
 }
 
+/// The more reaching of two class texts (read-only < writing < destructive),
+/// an unknown one counted as destructive, as the server judges it.
+pub(super) fn stricter<'a>(a: &'a str, b: &'a str) -> &'a str {
+    let rank = |class: &str| ["read-only", "writing", "destructive"].iter().position(|c| *c == class).unwrap_or(2);
+    if rank(a) >= rank(b) { a } else { b }
+}
+
 /// The row's origin note — the section's whole point: the effective
 /// class first, then where it comes from. The two override states the
 /// API distinguishes — a listed-with-override tool and one the server
@@ -43,6 +50,17 @@ pub(super) fn class_select_value(row: &McpToolClassRow) -> String {
 /// is unknown (the server is down) claims only that it's yours.
 pub(super) fn tool_class_origin_note(row: &McpToolClassRow) -> String {
     if let Some(class) = row.override_class.as_deref() {
+        // SME-295: the server lists a different tool under this name now,
+        // so the override can only narrow it: the stricter of the two.
+        if row.tool_changed {
+            let server = row.server_class.as_deref().unwrap_or("destructive");
+            let applied = stricter(class, server);
+            return format!(
+                "{applied} \u{2014} your override ({class}) was set for a different tool than the one \
+                 listed under this name now, so the stricter of it and the server's class ({server}) \
+                 applies until you apply it to this tool"
+            );
+        }
         return if row.listed == Some(false) {
             format!("{class} \u{2014} your override (the server no longer lists this tool)")
         } else {
@@ -93,6 +111,11 @@ pub fn McpToolClassesSection(id: i64, status_reload: Signal<u32>) -> Element {
                     for row in classes.rows {
                         {
                             let tool_name = row.tool_name.clone();
+                            let apply_name = row.tool_name.clone();
+                            let shown = row.fingerprint.clone();
+                            let apply_fingerprint = row.fingerprint.clone();
+                            let apply_class = row.override_class.clone();
+                            let changed = row.tool_changed;
                             let select_value = class_select_value(&row);
                             let note = tool_class_origin_note(&row);
                             rsx! {
@@ -105,9 +128,10 @@ pub fn McpToolClassesSection(id: i64, status_reload: Signal<u32>) -> Element {
                                             let sent = evt.value();
                                             let class = if sent == SERVER_ANSWER { None } else { Some(sent) };
                                             let tool_name = tool_name.clone();
+                                            let shown = shown.clone();
                                             save_error.set(None);
                                             spawn(async move {
-                                                match set_mcp_tool_class(id, tool_name, class).await {
+                                                match set_mcp_tool_class(id, tool_name, class, shown).await {
                                                     Ok(()) => classes_reload.set(classes_reload() + 1),
                                                     Err(e) => save_error.set(Some(super::server_error_message(&e))),
                                                 }
@@ -123,6 +147,26 @@ pub fn McpToolClassesSection(id: i64, status_reload: Signal<u32>) -> Element {
                                         option { value: "destructive", selected: select_value == "destructive", "destructive" }
                                     }
                                     span { class: "mcp-tool-class-origin", "{note}" }
+                                    // SME-295 review 1: re-choosing the shown class
+                                    // fires no change, so a changed row says how.
+                                    if changed {
+                                        button {
+                                            class: "mcp-tool-class-apply",
+                                            r#type: "button",
+                                            onclick: move |_| {
+                                                let (tool_name, class, shown) =
+                                                    (apply_name.clone(), apply_class.clone(), apply_fingerprint.clone());
+                                                save_error.set(None);
+                                                spawn(async move {
+                                                    match set_mcp_tool_class(id, tool_name, class, shown).await {
+                                                        Ok(()) => classes_reload.set(classes_reload() + 1),
+                                                        Err(e) => save_error.set(Some(super::server_error_message(&e))),
+                                                    }
+                                                });
+                                            },
+                                            "Apply to this tool"
+                                        }
+                                    }
                                 }
                             }
                         }

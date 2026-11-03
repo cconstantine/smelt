@@ -190,6 +190,75 @@ pub(crate) struct McpToolClassInfo {
     pub name: String,
     pub server_class: ToolClass,
     pub annotated: bool,
+    /// `tool_fingerprint` of the tool listed now (SME-295).
+    pub fingerprint: String,
+}
+
+/// Which tool a server lists under a name, as an override remembers it
+/// (SME-295): a hash of its description and input schema, the schema's
+/// object keys sorted at every level (review 1: not left to whether
+/// serde_json preserves order), so a different tool listed under the same
+/// name, or one whose description or arguments changed, reads as a
+/// different tool, and the same tool always reads the same.
+pub(crate) fn tool_fingerprint(tool: &McpTool) -> String {
+    let schema = canonical_json(&serde_json::Value::Object((*tool.input_schema).clone()));
+    let description = tool.description.as_deref().unwrap_or_default();
+    format!("{:016x}", fnv1a(format!("{description}\u{0}{schema}").as_bytes()))
+}
+
+/// `value` as JSON with every object's keys in sorted order.
+pub(super) fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let fields: Vec<String> = keys
+                .into_iter()
+                .map(|key| format!("{}:{}", serde_json::Value::String(key.clone()), canonical_json(&map[key])))
+                .collect();
+            format!("{{{}}}", fields.join(","))
+        }
+        serde_json::Value::Array(items) => format!("[{}]", items.iter().map(canonical_json).collect::<Vec<_>>().join(",")),
+        other => other.to_string(),
+    }
+}
+
+/// Whether a saved override was set for the tool listed under its name
+/// now (SME-295): one with no fingerprint counts as current, as before.
+pub(crate) fn override_is_current(saved: &crate::db::SavedToolClass, listed: Option<&McpTool>) -> bool {
+    match saved.tool_fingerprint.as_deref() {
+        None => true,
+        Some(fingerprint) => listed.is_some_and(|tool| tool_fingerprint(tool) == fingerprint),
+    }
+}
+
+/// The class text a saved override gives its tool's judgment (SME-295),
+/// the one rule the call, the offer and the page share. Set for the tool
+/// listed now, its class. Set for a different tool, it can only narrow:
+/// the more reaching of its class and the server's own (review 1: falling
+/// back to the annotations alone let a server drop a user's `destructive`
+/// pin by editing a description, and an override exists because the
+/// annotations can't be trusted).
+pub(crate) fn effective_override(saved: &crate::db::SavedToolClass, listed: Option<&McpTool>) -> String {
+    if override_is_current(saved, listed) {
+        return saved.class.clone();
+    }
+    let annotated = listed.map_or(ToolClass::Destructive, |tool| class_from_annotations(tool.annotations.as_ref()));
+    match ToolClass::parse(&saved.class) {
+        Some(class) => class.max(annotated).as_str().to_string(),
+        None => saved.class.clone(),
+    }
+}
+
+/// The fingerprint of the tool `config`'s server lists as `tool_name` now,
+/// connecting first when it isn't connected (review 1: a save after a
+/// restart or an evict read nothing): what an override saved now is set
+/// for. `None` when the server can't be reached or doesn't list the tool.
+pub(crate) async fn listed_tool_fingerprint(pool: &sqlx::PgPool, config: &McpServerConfig, tool_name: &str) -> Option<String> {
+    let _ = ensure_connected(pool, config, Attempt::SkipRecentFailures).await;
+    let registry = REGISTRY.lock().await;
+    let conn = registry.get(&config.id)?;
+    conn.tools.iter().find(|tool| tool.name == tool_name).map(tool_fingerprint)
 }
 
 /// Each of the server's current tools with the class *its own
@@ -230,6 +299,7 @@ pub(crate) async fn tool_class_report(
                 .annotations
                 .as_ref()
                 .is_some_and(|a| a.read_only_hint.is_some() || a.destructive_hint.is_some()),
+            fingerprint: tool_fingerprint(tool),
         })
         .collect())
 }
@@ -318,13 +388,13 @@ pub async fn tool_definitions_for(
             .map(|config| (config.id, config.name.clone()))
             .collect()
     };
-    let overrides: HashMap<i64, HashMap<String, String>> = futures_util::future::join_all(
+    let overrides: HashMap<i64, HashMap<String, crate::db::SavedToolClass>> = futures_util::future::join_all(
         connected.iter().map(|(id, _)| async move { (*id, crate::db::list_mcp_tool_classes(pool, *id).await) }),
     )
     .await
     .into_iter()
     .map(|(id, saved)| match saved {
-        Ok(rows) => (id, rows.into_iter().collect()),
+        Ok(rows) => (id, rows.into_iter().map(|row| (row.tool_name.clone(), row)).collect()),
         Err(e) => {
             let server = connected.iter().find(|(cid, _)| *cid == id).map(|(_, name)| name.as_str()).unwrap_or("?");
             tracing::warn!(server, error = %e, "couldn't read the saved class overrides; the offer falls back to the server's own annotations");
@@ -334,6 +404,34 @@ pub async fn tool_definitions_for(
     .collect();
 
     let registry = REGISTRY.lock().await;
+    // An override saved with no fingerprint (before SME-295, or for a tool
+    // not listed then) takes the tool listed now as the one it's for
+    // (review 1). That's never looser than leaving it unfingerprinted,
+    // which decides for whatever tool is behind the name; from then on, a
+    // change of tool can only narrow it (review 2). Best-effort, off the
+    // turn.
+    let adopt: Vec<(i64, String, String)> = configs
+        .iter()
+        .filter_map(|config| registry.get(&config.id).map(|conn| (config, conn)))
+        .flat_map(|(config, conn)| {
+            let saved = overrides.get(&config.id);
+            conn.tools
+                .iter()
+                .filter(|tool| saved.and_then(|rows| rows.get(tool.name.as_ref())).is_some_and(|row| row.tool_fingerprint.is_none()))
+                .map(|tool| (config.id, tool.name.to_string(), tool_fingerprint(tool)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if !adopt.is_empty() {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            for (server_id, tool, fingerprint) in adopt {
+                if let Err(e) = crate::db::adopt_mcp_tool_fingerprint(&pool, server_id, &tool, &fingerprint).await {
+                    tracing::warn!(server_id, tool, error = %e, "couldn't record which tool a class override is for");
+                }
+            }
+        });
+    }
     configs
         .iter()
         .filter_map(|config| registry.get(&config.id).map(|conn| (config, conn)))
@@ -345,8 +443,11 @@ pub async fn tool_definitions_for(
                 // a server's tools it is offered, judged at the class its
                 // call would be judged by.
                 .filter(|tool| {
+                    // An override set for a different tool under this name
+                    // can only narrow it (SME-295).
+                    let saved = saved.and_then(|rows| rows.get(tool.name.as_ref())).map(|row| effective_override(row, Some(tool)));
                     let class = judged_class(
-                        saved.and_then(|rows| rows.get(tool.name.as_ref())).map(String::as_str),
+                        saved.as_deref(),
                         class_from_annotations(tool.annotations.as_ref()),
                         &config.name,
                         tool.name.as_ref(),
