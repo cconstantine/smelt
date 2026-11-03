@@ -11,10 +11,14 @@
 //! `x/mod.rs` are one module, so a file later split into a directory still
 //! resolves without history). Left alone:
 //!
-//! - absolute paths (`/workspace/a.rs`): a sandbox's files, not the repo's;
+//! - absolute paths (`/workspace/a.rs`) and `~/` ones: not the repo's;
 //! - URLs, and tokens holding `*`, `{`, `<` or `$` (patterns, placeholders);
 //! - a line holding `citation: external` (another project's source, such
 //!   as tokio's) or `citation: historical` (a path meant from a past life).
+//!
+//! Not handled: C raw strings (`cr"…"`), which `classify` reads as
+//! ordinary ones, and a path only a merge commit introduced, which
+//! `git log --name-only` doesn't list (review 1, L4/L5; neither occurs).
 //!
 //! It is a floor, not a fix: it catches an invented path in seconds and
 //! nothing at all for an invented mechanism. Prose and docs are out: they
@@ -33,16 +37,31 @@ pub(crate) fn citations(source: &str) -> Vec<(usize, String)> {
         if comment.contains("citation: external") || comment.contains("citation: historical") {
             continue;
         }
-        for raw in comment.split(|c: char| c.is_whitespace() || "`'\"()[],;".contains(c)) {
-            let token = raw.split(':').next().unwrap_or_default();
-            let token = token.trim_end_matches(['.', '!', '?']);
-            if !token.ends_with(".rs") || !token.contains('/') || token.starts_with('/') {
+        for raw in comment.split(|c: char| c.is_whitespace() || "`'\"()[],;\u{2014}".contains(c)) {
+            if raw.contains("://") {
                 continue;
             }
-            if raw.contains("://") || token.contains(['*', '{', '<', '$']) {
+            // `see:src/x.rs:10` and `src/x.rs#L10`: the part that is the path
+            // (review 1, L1).
+            let Some(token) = raw.split(':').map(|part| part.split('#').next().unwrap_or_default()).find(|part| {
+                part.trim_matches(['*', '<', '>']).trim_end_matches(['.', '!', '?']).ends_with(".rs")
+            }) else {
+                continue;
+            };
+            // Markdown's `**path**` and rustdoc's `<path>` around it.
+            let token = token.trim_matches(['*', '<', '>']).trim_end_matches(['.', '!', '?']);
+            // `~/` is a home directory, `/` a sandbox's: neither is the repo's.
+            if !token.contains('/') || token.starts_with('/') || token.starts_with("~/") {
                 continue;
             }
-            found.push((index + 1, token.trim_start_matches("./").to_string()));
+            if token.contains(['*', '{', '<', '$']) {
+                continue;
+            }
+            let mut token = token;
+            while let Some(rest) = token.strip_prefix("./").or_else(|| token.strip_prefix("../")) {
+                token = rest;
+            }
+            found.push((index + 1, token.to_string()));
         }
     }
     found
@@ -69,8 +88,11 @@ fn comment_lines(source: &str) -> Vec<String> {
 /// Whether `citation` names a path `known` holds: as written, as any
 /// path's tail after a `/`, or as its module twin either way.
 pub(crate) fn resolves(citation: &str, known: &dyn Fn(&dyn Fn(&str) -> bool) -> bool) -> bool {
+    // `x/mod.rs`'s twin is `x.rs` only while `x` keeps a directory: a bare
+    // `foo.rs` would match any `*/foo.rs` in the tree (review 1, L3).
     let twin = match citation.strip_suffix("/mod.rs") {
-        Some(module) => format!("{module}.rs"),
+        Some(module) if module.contains('/') => format!("{module}.rs"),
+        Some(_) => citation.to_string(),
         None => format!("{}/mod.rs", citation.trim_end_matches(".rs")),
     };
     known(&|path: &str| {
@@ -98,9 +120,17 @@ mod tests {
     }
 
     #[test]
+    fn test_a_citation_in_markup_or_with_a_prefix_is_still_one() {
+        let source = "// **src/a/b.rs** <src/c/d.rs> src/e/f.rs#L10 src/g/h.rs\u{2014}then\n\
+                      // see:src/i/j.rs:3 and ../src/k/l.rs\n";
+        let cited: Vec<String> = citations(source).into_iter().map(|(_, c)| c).collect();
+        assert_eq!(cited, ["src/a/b.rs", "src/c/d.rs", "src/e/f.rs", "src/g/h.rs", "src/i/j.rs", "src/k/l.rs"]);
+    }
+
+    #[test]
     fn test_what_isnt_a_repo_citation_is_left_alone() {
         let source = "// /workspace/a.rs and https://github.com/x/y/blob/main/src/lib.rs\n\
-                      // src/*.rs, src/{a}/mod.rs, <dir>/main.rs, $DIR/x.rs, main.rs\n\
+                      // src/*.rs, src/{a}/mod.rs, $DIR/x.rs, main.rs, ~/notes/x.rs\n\
                       // tokio's runtime/blocking/pool.rs (citation: external)\n\
                       // the old src/gone.rs (citation: historical)\n";
         assert_eq!(citations(source), Vec::<(usize, String)>::new());
@@ -115,5 +145,7 @@ mod tests {
         assert!(resolves("src/sandbox.rs", &known), "split into a directory since");
         assert!(!resolves("turn/wake.rs", &known), "SME-334's citation");
         assert!(!resolves("un/run.rs", &known), "a tail, not a substring");
+        let known = known_in(&["src/sandbox/foo.rs"]);
+        assert!(!resolves("foo/mod.rs", &known), "a one-directory module's twin isn't a bare name");
     }
 }
