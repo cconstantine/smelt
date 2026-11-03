@@ -329,7 +329,6 @@ pub async fn set_provider_model_reported(
 /// only while the provider still answers at `base_url`, so a provider
 /// moved to another server mid-turn isn't given the old server's
 /// window. Returns whether anything was written.
-#[cfg_attr(not(test), allow(dead_code))] // until the turn's recovery calls it (SME-73)
 pub async fn lower_model_context_window(
     pool: &PgPool,
     provider_id: i64,

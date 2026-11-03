@@ -612,13 +612,15 @@ fn run_turn_steps<'a: 'b, 'b>(
                 *generation = take_turn_generation(conversation_id, &held);
             }
 
-            let turn_model = match resolved_model.take() {
+            let model = match resolved_model.take() {
                 Some(model) => model,
                 None => crate::providers::resolve_turn_model(pool, conversation_id)
                     .await
                     .map_err(ServerFnError::new)?,
             };
-            let turn_model = &*resolved_model.insert(turn_model);
+            // The turn's own copy, mutable: an overflow refusal's window
+            // lands on it so every later size of the turn reads it (SME-73).
+            let turn_model = resolved_model.insert(model);
             // Take the provider's request slot before this turn's first
             // model call, and re-check the pool every iteration after
             // that: a limit saved (or cleared) mid-turn applies here, at
@@ -660,7 +662,28 @@ fn run_turn_steps<'a: 'b, 'b>(
                 build_request(pool, conversation_id, turn_model, last_known_usage.as_ref(), &pending_new_content)
                     .await?;
             let offered: Vec<String> = request.tools.iter().map(|tool| tool.name.clone()).collect();
-            let (turn, recorder) = call_model(pool, conversation_id, turn_model, &mut request, slot.held()).await?;
+            // A refusal meaning "this didn't fit" answers itself once:
+            // learn the window, shrink, send again (SME-73). Every
+            // other failure ends the turn as it always did.
+            let called = call_model(pool, conversation_id, turn_model, &mut request, slot.held()).await;
+            let (turn, recorder, budget) = match called {
+                Ok((turn, recorder)) => (turn, recorder, budget),
+                Err(CallError::Overflow(overflow)) => {
+                    let recovered = overflow_recovery(
+                        pool,
+                        conversation_id,
+                        turn_model,
+                        last_known_usage,
+                        &pending_new_content,
+                        slot.held(),
+                        &request,
+                        &overflow,
+                    )
+                    .await?;
+                    (recovered.turn, recovered.recorder, recovered.budget)
+                }
+                Err(CallError::Failed(e)) => return Err(e),
+            };
             save_reply(pool, conversation_id, &turn, &mut persisted).await?;
             #[cfg(test)]
             test_hooks::after_reply_saved(conversation_id).await;

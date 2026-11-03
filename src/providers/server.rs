@@ -206,7 +206,6 @@ pub fn context_window(model: &str, row: Option<&db::ProviderModelRow>) -> (u32, 
 /// `db::lower_model_context_window`) — and tells the app, so the
 /// providers page and pickers refresh. The meter takes the new window
 /// from the turn's own copy, which its caller updates too.
-#[cfg_attr(not(test), allow(dead_code))] // until the turn's recovery calls it (SME-73)
 pub async fn learn_context_window(pool: &PgPool, model: &TurnModel, window: u32) -> Result<bool, sqlx::Error> {
     let lowered = db::lower_model_context_window(pool, model.provider_id, &model.endpoint.base_url, &model.model, window).await?;
     if lowered {
