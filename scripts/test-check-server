@@ -199,7 +199,7 @@ check_server stop >/dev/null
 # check reads this repo's sources.
 repo_clone=$dir/repo-env
 wt_repo=$dir/wtrepoenv
-[ -d "$repo_clone/.git" ] || git clone -q --shared "$PWD" "$repo_clone" || exit 1
+shared_clone "$PWD" "$repo_clone" || exit 1
 # A working tree of its own, since start's image check reads this repo's sources
 # through cluster-doctor (an earlier run may have made the clone without one),
 # and --force because the copy over the top below is a change of ours.

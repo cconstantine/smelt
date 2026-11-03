@@ -28,7 +28,20 @@ old_ref=$(git rev-list --max-parents=0 HEAD | tail -n 1)
 port_lock=$SMELT_LOCK_DIR/smelt-check-server-$port.lock
 port_is_free() { flock -n "$port_lock" true; }
 worktree2=$dir/worktree2
-[ -d "$worktree2/.git" ] || git clone -q --shared --no-checkout "$PWD" "$worktree2" || exit 1
+shared_clone "$PWD" "$worktree2" --no-checkout || exit 1
+
+# SME-251: a scratch clone an earlier run made from another path (its
+# alternate names that path's object store) is pointed back at this one,
+# and works; one that can't be is named, not used.
+printf '/nowhere/else/.git/objects\n' >"$worktree2/.git/objects/info/alternates"
+git -C "$worktree2" cat-file -e HEAD 2>/dev/null && fail "the poisoned clone can still read HEAD, so the case tests nothing"
+shared_clone "$PWD" "$worktree2" --no-checkout || fail "shared_clone didn't heal a clone made from another path"
+git -C "$worktree2" cat-file -e HEAD 2>/dev/null || fail "the healed clone can't read HEAD"
+stranger=$dir/stranger
+[ -d "$stranger/.git" ] || git init -q "$stranger"
+out=$(shared_clone "$stranger" "$worktree2" --no-checkout 2>&1) && fail "shared_clone took a clone whose objects its source doesn't have"
+case $out in *"$worktree2"*"remove it"*) ;; *) fail "the refusal doesn't name the clone to remove: $out" ;; esac
+shared_clone "$PWD" "$worktree2" --no-checkout || fail "shared_clone didn't heal the clone back"
 "${cs_env[@]}" CHECK_WORKTREE="$worktree2" scripts/check-server stop >/dev/null 2>&1
 check_server start HEAD >/dev/null || fail "start for the port lock"
 pgid=$(cat "$pid_file" 2>/dev/null)
