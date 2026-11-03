@@ -95,6 +95,12 @@ pub(crate) mod test_support {
         PRODUCT_BUDGET.lock().unwrap_or_else(|e| e.into_inner()).insert(server_id);
     }
 
+    /// `server_id` is held to the test build's 1 s again: for a test whose
+    /// subject is the give-up itself.
+    pub(crate) fn hold_to_test_budget(server_id: i64) {
+        PRODUCT_BUDGET.lock().unwrap_or_else(|e| e.into_inner()).remove(&server_id);
+    }
+
     pub(super) fn has_product_budget(server_id: i64) -> bool {
         PRODUCT_BUDGET.lock().unwrap_or_else(|e| e.into_inner()).contains(&server_id)
     }
