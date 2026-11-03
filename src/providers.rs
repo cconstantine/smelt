@@ -410,12 +410,19 @@ pub(crate) mod test_support {
     /// starts a second mock means the second). Panics on a database error:
     /// it's test setup.
     pub(crate) async fn add_mock_provider(pool: &PgPool, addr: std::net::SocketAddr) {
+        add_mock_provider_kind(pool, addr, "anthropic").await;
+    }
+
+    /// As `add_mock_provider`, on the given provider kind — for tests of
+    /// behaviour one kind's server shapes differently (SME-73's window
+    /// stops, which read a llama.cpp slot's `max_tokens` stop).
+    pub(crate) async fn add_mock_provider_kind(pool: &PgPool, addr: std::net::SocketAddr, kind: &str) {
         // Named by address: a test may start a second mock, which then
         // becomes the default.
         let provider = db::create_inference_provider(
             pool,
             &format!("mock {addr}"),
-            "anthropic",
+            kind,
             &format!("http://{addr}"),
             "api_key",
             "test-key",

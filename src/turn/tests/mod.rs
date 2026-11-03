@@ -149,8 +149,17 @@ async fn unnotified_finished_command(pool: &PgPool, conversation_id: i64, comman
 /// `start_mock_upstream`.
 async fn start_recording_mock_upstream(
     pool: &PgPool,
-    
     bodies: Vec<String>,
+) -> Arc<std::sync::Mutex<Vec<serde_json::Value>>> {
+    start_recording_mock_upstream_of_kind(pool, bodies, "anthropic").await
+}
+
+/// As `start_recording_mock_upstream`, with the provider saved under
+/// `kind` — for behaviour a kind's server shapes differently (SME-73).
+async fn start_recording_mock_upstream_of_kind(
+    pool: &PgPool,
+    bodies: Vec<String>,
+    kind: &str,
 ) -> Arc<std::sync::Mutex<Vec<serde_json::Value>>> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -175,7 +184,7 @@ async fn start_recording_mock_upstream(
     tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
     });
-    crate::providers::test_support::add_mock_provider(pool, addr).await;
+    crate::providers::test_support::add_mock_provider_kind(pool, addr, kind).await;
     requests
 }
 
@@ -297,6 +306,42 @@ async fn drain_events(
     seen
 }
 
+/// The Context window `mock-model` was saved with, if it was ever saved.
+async fn saved_context_window(pool: &PgPool) -> Option<i32> {
+    sqlx::query_scalar::<_, Option<i32>>(
+        "SELECT context_window FROM provider_models WHERE provider_id = (SELECT id FROM inference_providers ORDER BY id) AND model = $1",
+    )
+    .bind(crate::providers::test_support::MOCK_MODEL)
+    .fetch_optional(pool)
+    .await
+    .expect("the model row")
+    .flatten()
+}
+
+/// The text of the last assistant message.
+fn last_reply(messages: &[Message]) -> Option<String> {
+    messages.iter().rev().find(|m| m.role == "assistant").and_then(|m| {
+        m.blocks()
+            .ok()?
+            .into_iter()
+            .find_map(|b| match b {
+                anthropic::ContentBlock::Text { text } => Some(text),
+                _ => None,
+            })
+    })
+}
+
+/// The windows `ContextUsageUpdate`s published to watching tabs.
+fn published_windows(events: Vec<events::ConversationEvent>) -> Vec<u32> {
+    events
+        .into_iter()
+        .filter_map(|e| match e {
+            events::ConversationEvent::ContextUsageUpdate { context_window, .. } => Some(context_window),
+            _ => None,
+        })
+        .collect()
+}
+
 /// A mock upstream that streams `text` and then never finishes. Same
 /// locking rule as `start_mock_upstream`.
 async fn start_partial_then_hanging_mock_upstream(
@@ -374,6 +419,8 @@ mod queue_order;
 mod text_calls;
 mod pod_activity;
 mod turn_slot;
+mod overflow;
+mod window_stop;
 
 /// The reason in conversation `id`'s last failure notice (SME-123 DR3),
 /// where a user's failed turn now says why.

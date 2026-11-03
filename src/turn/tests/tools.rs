@@ -220,14 +220,15 @@ async fn test_a_compaction_forgets_the_usage_that_triggered_it(pool: PgPool) {
     };
     db::upsert_conversation_usage(&pool, conversation.id, &near_limit).await.expect("seed usage");
     start_mock_upstream(&pool, vec![text_reply_body("Summary: earlier.")]).await;
-    let turn_model = crate::providers::resolve_turn_model(&pool, conversation.id)
+    let mut turn_model = crate::providers::resolve_turn_model(&pool, conversation.id)
         .await
         .expect("the mock is the default");
     compact_conversation(
         &pool,
         conversation.id,
-        &turn_model,
+        &mut turn_model,
         anthropic::stream::SlotPolicy::PerCall,
+        None,
     )
         .await
         .expect("compaction");
@@ -341,7 +342,8 @@ async fn test_run_turn_compacts_before_sending_when_usage_is_near_the_ceiling(po
             anthropic::ContentBlock::CompactionSummary {
                 summary,
                 covers_through_message_id,
-            } => Some((summary, covers_through_message_id)),
+                refused,
+            } => Some((summary, covers_through_message_id, refused)),
             _ => None,
         })
     });
@@ -349,11 +351,13 @@ async fn test_run_turn_compacts_before_sending_when_usage_is_near_the_ceiling(po
         compaction_summary.is_some(),
         "expected a CompactionSummary message to have been persisted, got: {all_messages:?}"
     );
+    let (summary, _covers, refused) = compaction_summary.unwrap();
     assert!(
-        compaction_summary
-            .unwrap()
-            .0
-            .contains("discussed earlier topics"),
+        refused.is_none(),
+        "a proactive compaction names no refusal on the divider (SME-73): {refused:?}"
+    );
+    assert!(
+        summary.contains("discussed earlier topics"),
         "expected the real summarization response's text to be what got persisted"
     );
 

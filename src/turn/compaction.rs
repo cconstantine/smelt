@@ -168,11 +168,16 @@ pub(super) const COMPACTION_CONTINUATION_PROMPT: &str = "Continue based on the s
 /// `user` (structural placeholder) -> `assistant` (the summary) -> `user`
 /// (a plain continuation nudge, the thing the *next* real request
 /// actually responds to). See SME-18.
+///
+/// `refused`, when set, is why this compaction happened instead of the
+/// proactive one — the overflow refusal's reason, stored on the summary
+/// block for the transcript divider to read (SME-73).
 #[cfg(feature = "server")]
 pub(super) fn compaction_messages(
     summary: String,
     covers_through_message_id: i64,
     unanswered: &[String],
+    refused: Option<String>,
 ) -> [(&'static str, Vec<anthropic::ContentBlock>); 3] {
     [
         (
@@ -186,6 +191,7 @@ pub(super) fn compaction_messages(
             vec![anthropic::ContentBlock::CompactionSummary {
                 summary,
                 covers_through_message_id,
+                refused,
             }],
         ),
         (
@@ -390,12 +396,20 @@ pub(super) fn compaction_transcript_budget(context_window: u32) -> usize {
 /// error and the whole turn fails loudly, rather than proceeding with the
 /// oversized request compaction exists to prevent — see SME-18's
 /// "Resolved" decision on this.
+///
+/// `refused`, when set, is why the turn needed this compaction rather
+/// than waiting for the proactive check — an overflow refusal's reason
+/// (from `overflow::refused_reason`), saved on the summary block so the
+/// transcript divider reads it (SME-73). A compaction whose *own* summary
+/// request was refused and recovered fills in its own reason when no one
+/// else named one.
 #[cfg(feature = "server")]
 pub(super) async fn compact_conversation(
     pool: &PgPool,
     conversation_id: i64,
-    turn_model: &crate::providers::TurnModel,
+    turn_model: &mut crate::providers::TurnModel,
     slot: anthropic::stream::SlotPolicy<'_>,
+    refused: Option<String>,
 ) -> ServerFnResult<()> {
     use tracing::field::Empty;
     // Its model call is its child (SME-137).
@@ -406,7 +420,7 @@ pub(super) async fn compact_conversation(
         otel.status_description = Empty,
     );
     crate::telemetry::in_span(span.clone(), async move {
-        let result = compact(pool, conversation_id, turn_model, slot).await;
+        let result = compact(pool, conversation_id, turn_model, slot, refused).await;
         if let Err(e) = &result {
             crate::telemetry::mark_error(&span, &e.to_string());
         }
@@ -419,8 +433,9 @@ pub(super) async fn compact_conversation(
 async fn compact(
     pool: &PgPool,
     conversation_id: i64,
-    turn_model: &crate::providers::TurnModel,
+    turn_model: &mut crate::providers::TurnModel,
     slot: anthropic::stream::SlotPolicy<'_>,
+    refused: Option<String>,
 ) -> ServerFnResult<()> {
     let messages = db::list_messages(pool, conversation_id)
         .await
@@ -439,6 +454,74 @@ async fn compact(
         compaction_transcript_budget(turn_model.context_window),
     );
 
+    // A summary request refused as an overflow (SME-73) is that same
+    // refusal, and gets the same one answer here: learn the window it
+    // names and ask once more with the transcript sized to it — half
+    // the refused one when no window was named. A second refusal ends
+    // the turn with the reason.
+    let mut refused = refused;
+    let summary = match summarize(pool, conversation_id, turn_model, slot, &transcript).await {
+        Ok(summary) => summary,
+        Err(anthropic::stream::ModelError::Overflow(overflow)) => {
+            let named = super::overflow::learn(pool, conversation_id, turn_model, overflow.window).await;
+            let budget = named.map_or(transcript.chars().count() / 2, compaction_transcript_budget);
+            let transcript = compaction_transcript(&messages, budget);
+            match summarize(pool, conversation_id, turn_model, slot, &transcript).await {
+                Ok(summary) => {
+                    // The refusal this compaction answered, when its
+                    // caller didn't name one: the divider reads the
+                    // window this refusal learned (SME-73).
+                    refused = refused.or_else(|| Some(super::overflow::refused_reason(named)));
+                    summary
+                }
+                Err(anthropic::stream::ModelError::Overflow(again)) => {
+                    super::overflow::learn(pool, conversation_id, turn_model, again.window).await;
+                    let window = again
+                        .window
+                        .or(named)
+                        .map(|w| format!(" ({} tokens)", super::overflow::grouped(u64::from(w))))
+                        .unwrap_or_default();
+                    return Err(ServerFnError::new(format!(
+                        "Couldn't compact the conversation: even the summary request didn't fit \
+                         `{model}`'s context window{window}. The server said: {said}",
+                        model = turn_model.model,
+                        said = again.message
+                    )));
+                }
+                Err(e) => return Err(ServerFnError::new(e)),
+            }
+        }
+        Err(e) => return Err(ServerFnError::new(e)),
+    };
+
+    let unanswered = unanswered_user_text(&messages);
+    for (role, content) in compaction_messages(summary, covers_through_message_id, &unanswered, refused) {
+        let saved = db::create_message(pool, conversation_id, role, &content)
+            .await
+            .map_err(ServerFnError::new)?;
+        // Watching tabs show the divider as it happens (SME-40 F5).
+        record_saved(conversation_id, &mut Vec::new(), saved);
+    }
+    // The usage that triggered this described the old, long history. Kept,
+    // a failed or stopped next call would have the following turn compact
+    // again at once; the next real reply records the new size (SME-51 B10).
+    db::clear_conversation_usage(pool, conversation_id)
+        .await
+        .map_err(ServerFnError::new)?;
+    Ok(())
+}
+
+/// The summarization call itself: a plain, tools-less request over the
+/// transcript, in its own recorder (a refused attempt is recorded by
+/// its drop, SME-178). Answers with the summary's text, or with the
+/// typed error so the caller can answer an overflow (SME-73).
+async fn summarize(
+    pool: &PgPool,
+    conversation_id: i64,
+    turn_model: &crate::providers::TurnModel,
+    slot: anthropic::stream::SlotPolicy<'_>,
+    transcript: &str,
+) -> Result<String, anthropic::stream::ModelError> {
     let live_state = describe_live_state(pool, conversation_id).await;
     let prompt = format!(
         "Conversation so far:\n{transcript}\n\nCurrently live (preserve these \
@@ -473,34 +556,17 @@ async fn compact(
         recorder.meter(),
         slot,
     )
-    .await
-    .map_err(ServerFnError::new)?;
+    .await?;
     // Recorded as soon as it completes: the tokens are spent whether or
     // not the summary is saved below (SME-106). One stopped or failed
     // before then is recorded by the recorder's drop (SME-178).
-    recorder.finish(&turn, None).await?;
-    let summary = turn
+    recorder.finish(&turn, None).await.map_err(|e| anthropic::stream::ModelError::Other(e.to_string()))?;
+    Ok(turn
         .content
         .into_iter()
         .find_map(|block| match block {
             anthropic::ContentBlock::Text { text } => Some(text),
             _ => None,
         })
-        .unwrap_or_default();
-
-    let unanswered = unanswered_user_text(&messages);
-    for (role, content) in compaction_messages(summary, covers_through_message_id, &unanswered) {
-        let saved = db::create_message(pool, conversation_id, role, &content)
-            .await
-            .map_err(ServerFnError::new)?;
-        // Watching tabs show the divider as it happens (SME-40 F5).
-        record_saved(conversation_id, &mut Vec::new(), saved);
-    }
-    // The usage that triggered this described the old, long history. Kept,
-    // a failed or stopped next call would have the following turn compact
-    // again at once; the next real reply records the new size (SME-51 B10).
-    db::clear_conversation_usage(pool, conversation_id)
-        .await
-        .map_err(ServerFnError::new)?;
-    Ok(())
+        .unwrap_or_default())
 }

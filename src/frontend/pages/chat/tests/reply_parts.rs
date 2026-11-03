@@ -60,7 +60,7 @@ fn test_reply_parts_leave_out_thinking_and_compaction_which_does_not_split_a_rep
         ]),
         message_with_blocks(3, "user", vec![result("t1", "ok")]),
         message_with_blocks(4, "user", vec![ContentBlock::CompactionPlaceholder { text: "placeholder".into() }]),
-        message_with_blocks(5, "assistant", vec![ContentBlock::CompactionSummary { summary: "secret summary".into(), covers_through_message_id: 3 }]),
+        message_with_blocks(5, "assistant", vec![ContentBlock::CompactionSummary { summary: "secret summary".into(), covers_through_message_id: 3, refused: None }]),
         message_with_blocks(6, "user", vec![ContentBlock::CompactionPlaceholder { text: "continue".into() }]),
         message_with_blocks(7, "assistant", vec![text("Second.")]),
     ];

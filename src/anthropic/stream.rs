@@ -17,6 +17,45 @@ use interpret::*;
 pub use endpoint::{Auth, Endpoint};
 pub use meter::UsageMeter;
 
+/// Why a model call failed: a refusal meaning "this request didn't fit
+/// the model's context window" (SME-73) — which a turn can recover from
+/// — and everything else, whose text reads exactly as it did before
+/// this type existed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModelError {
+    Overflow(crate::anthropic::overflow::Overflow),
+    Other(String),
+}
+
+impl ModelError {
+    /// The failure's own text: what `Display` renders, and what the
+    /// Ollama corruption check and the chat span's error read.
+    pub fn message(&self) -> &str {
+        match self {
+            ModelError::Overflow(overflow) => &overflow.message,
+            ModelError::Other(text) => text,
+        }
+    }
+}
+
+impl std::fmt::Display for ModelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl From<String> for ModelError {
+    fn from(text: String) -> Self {
+        ModelError::Other(text)
+    }
+}
+
+impl From<ModelError> for String {
+    fn from(error: ModelError) -> String {
+        error.to_string()
+    }
+}
+
 /// The fully assembled result of one streamed Anthropic turn: every content
 /// block (text and/or tool_use) in order, plus the `stop_reason` that says
 /// whether this turn is final or wants a tool run (`"tool_use"`).
@@ -441,7 +480,9 @@ async fn send_and_await_response(
 /// The human-readable part of an error response: Anthropic's own
 /// `error.message`, unwrapped once more when a router relays a provider's
 /// JSON error inside it (`{"error": "…"}`). Falls back to the raw body.
-fn provider_error_message(body: &str) -> String {
+/// `pub(crate)` for `overflow::classify`, which reads the same text the
+/// failure message shows (SME-73).
+pub(crate) fn provider_error_message(body: &str) -> String {
     let message = serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| v.pointer("/error/message")?.as_str().map(str::to_string));
@@ -476,14 +517,17 @@ const RETRY_DELAYS: [std::time::Duration; 2] = [
 ];
 
 /// `stream_anthropic_message_metered` with a meter of its own, for the
-/// tests that don't need one.
+/// tests that don't need one. Its error stays the plain text the test
+/// bodies already read.
 #[cfg(test)]
 pub async fn stream_anthropic_message(
     endpoint: &Endpoint,
     request: &CreateMessageRequest,
     on_delta: impl FnMut(&str),
 ) -> Result<StreamedTurn, String> {
-    stream_anthropic_message_metered(endpoint, request, on_delta, &UsageMeter::default(), SlotPolicy::PerCall).await
+    stream_anthropic_message_metered(endpoint, request, on_delta, &UsageMeter::default(), SlotPolicy::PerCall)
+        .await
+        .map_err(Into::into)
 }
 
 /// How a model call gets its place in the provider's request pool
@@ -527,7 +571,7 @@ pub async fn stream_anthropic_message_metered(
     on_delta: impl FnMut(&str),
     meter: &UsageMeter,
     slot: SlotPolicy<'_>,
-) -> Result<StreamedTurn, String> {
+) -> Result<StreamedTurn, ModelError> {
     use tracing::field::Empty;
     let span = tracing::info_span!(
         "chat",
@@ -572,7 +616,7 @@ struct Tries {
 
 /// A model call's usage and finish reason on its span; a failure or a
 /// cut-off reply marks it failed.
-fn record_outcome(span: &tracing::Span, result: &Result<StreamedTurn, String>) {
+fn record_outcome(span: &tracing::Span, result: &Result<StreamedTurn, ModelError>) {
     match result {
         Ok(turn) => {
             span.record("gen_ai.usage.input_tokens", turn.usage.input_tokens);
@@ -584,7 +628,7 @@ fn record_outcome(span: &tracing::Span, result: &Result<StreamedTurn, String>) {
                 crate::telemetry::mark_error(span, &format!("the reply was cut off ({})", turn.stop_reason));
             }
         }
-        Err(e) => crate::telemetry::mark_error(span, e),
+        Err(e) => crate::telemetry::mark_error(span, e.message()),
     }
 }
 
@@ -596,7 +640,7 @@ async fn stream_message(
     tries: &mut Tries,
     meter: &UsageMeter,
     slot: SlotPolicy<'_>,
-) -> Result<StreamedTurn, String> {
+) -> Result<StreamedTurn, ModelError> {
     // SME-162: a per-call takes its own slot and holds it through the
     // retries and the whole stream; the wait for it is on the span, apart
     // from the model's time (review 1). SME-343: a held call sends without
@@ -667,7 +711,14 @@ async fn stream_message(
         } else {
             ""
         };
-        return Err(format!("model provider error {status}: {message}{hint}"));
+        // The binding refusals above had their chances; what's left is
+        // either a refusal meaning "this request didn't fit" — which the
+        // turn knows how to answer (SME-73) — or the plain failure it
+        // always was.
+        return Err(match super::overflow::classify(Some(status.as_u16()), &body) {
+            Some(overflow) => ModelError::Overflow(overflow),
+            None => ModelError::Other(format!("model provider error {status}: {message}{hint}")),
+        });
     };
 
     let mut byte_stream = response.bytes_stream();
@@ -732,7 +783,14 @@ async fn stream_message(
                     meter.delta(&delta);
                 }
                 StreamOutcome::InitialUsage(initial) => meter.start(&initial),
-                StreamOutcome::Error(message) => return Err(message),
+                // An `error` event mid-stream carries no status; an
+                // overflow among them still reads (SME-73).
+                StreamOutcome::Error(message) => {
+                    return Err(match super::overflow::classify(None, &value.to_string()) {
+                        Some(overflow) => ModelError::Overflow(overflow),
+                        None => ModelError::Other(message),
+                    })
+                }
                 StreamOutcome::Ignored => {}
             }
         }

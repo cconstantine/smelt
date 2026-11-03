@@ -130,6 +130,16 @@ impl TurnSlot {
     }
 }
 
+/// A model call's failure from a turn: a refusal meaning "this request
+/// didn't fit the model's context window" — which the turn knows how to
+/// answer (SME-73) — and every other way it fails, text already as it
+/// ends the turn.
+#[cfg(feature = "server")]
+pub(super) enum CallError {
+    Overflow(crate::anthropic::overflow::Overflow),
+    Failed(ServerFnError),
+}
+
 /// Calls the model, and every tab watching streams the reply: the text so
 /// far is kept for a tab that connects mid-reply, and each delta published.
 /// Returns the reply with the recorder for its attempt, which the caller
@@ -152,7 +162,7 @@ pub(super) async fn call_model(
     turn_model: &crate::providers::TurnModel,
     request: &mut anthropic::CreateMessageRequest,
     slot: anthropic::stream::SlotPolicy<'_>,
-) -> ServerFnResult<(anthropic::stream::StreamedTurn, CallRecorder)> {
+) -> Result<(anthropic::stream::StreamedTurn, CallRecorder), CallError> {
     let mut relay = |delta: &str| relay_reply_delta(conversation_id, delta);
     let mut last_err = String::new();
     for attempt in 0..=TOOL_CALL_PARSE_RETRIES {
@@ -174,18 +184,22 @@ pub(super) async fn call_model(
         .await
         {
             Ok(t) => return Ok((t, recorder)),
+            // A request that didn't fit short-circuits the parse-retry
+            // loop: resending the same oversized history is only refused
+            // again — the turn's recovery is what answers it (SME-73).
+            Err(anthropic::stream::ModelError::Overflow(overflow)) => return Err(CallError::Overflow(overflow)),
             Err(e)
                 if attempt < TOOL_CALL_PARSE_RETRIES
-                    && is_ollama_thinking_tool_call_corruption(&e) =>
+                    && is_ollama_thinking_tool_call_corruption(e.message()) =>
             {
                 request.thinking = None;
                 request.chat_template_kwargs = turn_model.chat_template_kwargs(false);
-                last_err = e;
+                last_err = e.to_string();
             }
-            Err(e) => return Err(ServerFnError::new(e)),
+            Err(e) => return Err(CallError::Failed(ServerFnError::new(e))),
         }
     }
-    Err(ServerFnError::new(last_err))
+    Err(CallError::Failed(ServerFnError::new(last_err)))
 }
 
 /// Records one model call attempt's usage and cost (SME-106), however the
