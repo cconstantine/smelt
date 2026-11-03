@@ -7,8 +7,26 @@ use super::*;
 pub(super) const CALL_TIMEOUT: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_secs(1)
 } else {
-    std::time::Duration::from_secs(120)
+    PRODUCT_CALL_TIMEOUT
 };
+
+/// The product's call budget, which `CALL_TIMEOUT` is outside a test build.
+const PRODUCT_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// `CALL_TIMEOUT` for `server_id`, on the same rule as `connect_timeout`
+/// (SME-356): an OAuth mock server's call may refresh its token at the
+/// tests' mock provider first, which under CI's load ran past 1 s
+/// ("didn't answer \"echo\" within 1s", CI run 41569971215), so a server
+/// given the product's budget gets the product's call budget too. A
+/// hanging server's tests keep 1 s.
+pub(super) fn call_timeout(server_id: i64) -> std::time::Duration {
+    #[cfg(test)]
+    if test_support::has_product_budget(server_id) {
+        return PRODUCT_CALL_TIMEOUT;
+    }
+    let _ = server_id;
+    CALL_TIMEOUT
+}
 
 /// [`call_tool_classed`] with no use for the class: the tests' shorthand.
 #[cfg(test)]
@@ -175,13 +193,14 @@ async fn call_tool_unspanned(
         request = request.with_arguments(arguments);
     }
 
-    let result = tokio::time::timeout(CALL_TIMEOUT, service.call_tool(request))
+    let budget = call_timeout(config.id);
+    let result = tokio::time::timeout(budget, service.call_tool(request))
         .await
         .map_err(|_| {
             CallFailure::Failed(format!(
                 "MCP server {:?} didn't answer {tool_name:?} within {}s",
                 config.name,
-                CALL_TIMEOUT.as_secs()
+                budget.as_secs()
             ))
         })?;
     let result = match result {

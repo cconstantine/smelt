@@ -66,7 +66,8 @@ const CONNECT_TIMEOUT: std::time::Duration = if cfg!(test) {
 /// build, and which a test may give one of its servers (`connect_timeout`).
 const PRODUCT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// `CONNECT_TIMEOUT` for `server_id`. A test build's 1 s keeps the tests of
+/// `CONNECT_TIMEOUT` for `server_id` (and `call::call_timeout`, the call's,
+/// on the same rule). A test build's 1 s keeps the tests of
 /// a server that never answers quick, but an OAuth server's connect
 /// includes a token refresh at the tests' mock provider, and under CI's
 /// load that alone ran past 1 s ("didn't answer within 1s", SME-341,
