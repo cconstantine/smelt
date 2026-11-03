@@ -406,8 +406,10 @@ pub async fn tool_definitions_for(
     let registry = REGISTRY.lock().await;
     // An override saved with no fingerprint (before SME-295, or for a tool
     // not listed then) takes the tool listed now as the one it's for
-    // (review 1). It can only narrow if that's wrong, so adopting it is
-    // safe; best-effort, off the turn.
+    // (review 1). That's never looser than leaving it unfingerprinted,
+    // which decides for whatever tool is behind the name; from then on, a
+    // change of tool can only narrow it (review 2). Best-effort, off the
+    // turn.
     let adopt: Vec<(i64, String, String)> = configs
         .iter()
         .filter_map(|config| registry.get(&config.id).map(|conn| (config, conn)))
