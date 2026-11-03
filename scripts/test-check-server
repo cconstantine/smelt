@@ -225,9 +225,7 @@ printf 'DATABASE_URL=%s\n' "$repo_url" >"$repo_clone/.env"
 # and the detach below moves it like start would. A directory an earlier,
 # pre-fix run left is migrated in place, keeping the emptied state files the
 # cases below expect.
-if [ -d "$wt_repo/.git" ]; then
-    shared_clone "$repo_clone" "$wt_repo" || exit 1
-else
+if [ ! -d "$wt_repo/.git" ]; then
     { [ -d "$wt_repo" ] && git -C "$wt_repo" init -q; } ||
         git clone -q --shared --no-checkout "$repo_clone" "$wt_repo" || exit 1
     git -C "$wt_repo" fetch -q "$repo_clone" HEAD || exit 1

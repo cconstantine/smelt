@@ -288,8 +288,10 @@ shared_clone() {
         return
     fi
     objects=$(git -C "$src" rev-parse --path-format=absolute --git-common-dir) || return 1
-    printf '%s\n' "$objects/objects" >"$dst/.git/objects/info/alternates" || return 1
-    git -C "$dst" cat-file -e HEAD 2>/dev/null && return 0
+    # A clone a killed run left half made has no objects/info to write to:
+    # it gets the same message as one that can't read its HEAD.
+    { printf '%s\n' "$objects/objects" >"$dst/.git/objects/info/alternates"; } 2>/dev/null &&
+        git -C "$dst" cat-file -e HEAD 2>/dev/null && return 0
     echo "$dst is a scratch clone an earlier run made, and it can't read its objects from $src; remove it and run again" >&2
     return 1
 }
