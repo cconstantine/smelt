@@ -6,6 +6,7 @@
 //! opencode. See docs/process/rules-commits.md, "Files stay under the
 //! ceiling".
 
+mod citations;
 mod cluster_lock;
 mod components;
 mod id_alloc;
@@ -233,6 +234,60 @@ mod tests {
              instead — its bands' cursors never hand two callers one value\n{}",
             findings.len(),
             findings.join("\n")
+        );
+    }
+
+    /// SME-340: every `.rs` path a Rust comment cites names a file the repo
+    /// has, or had. History counts only where the clone has it (the local
+    /// gate's); a shallow clone (CI's test jobs) can't tell a removed file
+    /// from an invented one, so there an unresolved citation is printed and
+    /// not refused.
+    #[test]
+    fn test_every_rs_path_a_comment_cites_resolves() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "safe.directory=*", "-C"])
+                .arg(root)
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).expect("git's output is UTF-8")
+        };
+        let tracked = tracked_files();
+        let shallow = git(&["rev-parse", "--is-shallow-repository"]).trim() == "true";
+        let history: std::collections::BTreeSet<String> = if shallow {
+            Default::default()
+        } else {
+            git(&["log", "--all", "--pretty=format:", "--name-only"]).lines().filter(|l| !l.is_empty()).map(str::to_string).collect()
+        };
+        let known = |matches: &dyn Fn(&str) -> bool| tracked.iter().chain(history.iter()).any(|p| matches(p));
+        let (mut cited, mut unresolved) = (0, Vec::new());
+        // Its own file quotes SME-334's invented path as the example.
+        for path in tracked.iter().filter(|p| p.ends_with(".rs") && p.as_str() != "src/repo_lints/citations.rs") {
+            let Ok(source) = std::fs::read_to_string(root.join(path)) else { continue };
+            for (line, citation) in citations::citations(&source) {
+                cited += 1;
+                if !citations::resolves(&citation, &known) {
+                    unresolved.push(format!(
+                        "{citation} cited at {path}:{line} resolves to nothing; check: git log --all --oneline -- '*{citation}'"
+                    ));
+                }
+            }
+        }
+        assert!(cited > 20, "the walk found the comments' citations ({cited})");
+        if shallow {
+            for finding in &unresolved {
+                eprintln!("not checked in a shallow clone: {finding}");
+            }
+            return;
+        }
+        assert!(
+            unresolved.is_empty(),
+            "code comments cite paths no commit has (SME-340): fix the citation, or mark the line \
+             `citation: external` (another project's file) or `citation: historical`\n{}",
+            unresolved.join("\n")
         );
     }
 
