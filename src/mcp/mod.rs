@@ -74,8 +74,10 @@ const PRODUCT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// SME-356). So every OAuth mock server (`oauth_http::create_server`) gets
 /// the product's own budget (`test_support::give_product_budget`), and a
 /// test whose subject is the give-up puts its server back on 1 s
-/// (`test_support::hold_to_test_budget`). Every other server — static,
-/// hanging — keeps the short one.
+/// (`test_support::hold_to_test_budget`). So do the registry tests'
+/// servers (`tests/registry.rs`'s `held_server`), whose connects are held
+/// at the mock across a step that can outlast 1 s (SME-363). Every other
+/// server — static, hanging — keeps the short one.
 pub(super) fn connect_timeout(server_id: i64) -> std::time::Duration {
     #[cfg(test)]
     if test_support::has_product_budget(server_id) {
