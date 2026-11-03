@@ -464,7 +464,7 @@ fn test_typed_words_are_quoted_and_notices_arent() {
         text_message(9, "assistant", "on it"),
         text_message(10, "user", "And the next thing?"),
     ];
-    let typed = typed_user_text(&messages);
+    let typed = typed_user_text(&messages, 200_000);
     assert_eq!(
         typed,
         Typed {
@@ -493,7 +493,7 @@ fn test_typed_words_over_the_budget_keep_the_first_and_the_newest() {
         messages.push(text_message(3 + 2 * i, "user", &format!("correction {i}: {}", "y".repeat(990))));
     }
     messages.push(text_message(200, "assistant", "ok"));
-    let typed = typed_user_text(&messages);
+    let typed = typed_user_text(&messages, 200_000);
     assert_eq!(typed.quotes.first().map(String::as_str), Some("The original ask."));
     assert!(typed.quotes.last().is_some_and(|q| q.starts_with("correction 39:")), "the newest is kept");
     assert!(typed.omitted > 0 && typed.quotes.len() + typed.omitted == 41, "{} kept, {} left out", typed.quotes.len(), typed.omitted);
@@ -501,4 +501,60 @@ fn test_typed_words_over_the_budget_keep_the_first_and_the_newest() {
     assert!(size <= CONTINUATION_TYPED_MAX_CHARS, "{size}");
     let prompt = continuation_prompt(&typed, &[]);
     assert!(prompt.contains(&format!("({} more they wrote in between are left out here", typed.omitted)), "{prompt}");
+}
+
+/// SME-367 review 1: a request the user stopped isn't quoted as standing;
+/// what they asked next is. The user's answer to the model's question is
+/// quoted; notices worded as news about the user aren't.
+#[test]
+fn test_typed_words_drop_a_stopped_request_and_keep_answers() {
+    let ask = anthropic::ContentBlock::ToolUse {
+        id: "toolu_q".to_string(),
+        name: crate::questions::ASK_USER.to_string(),
+        input: serde_json::json!({}),
+    };
+    let answer = anthropic::ContentBlock::ToolResult {
+        tool_use_id: "toolu_q".to_string(),
+        content: "Which branch? main".to_string(),
+        is_error: None,
+    };
+    let messages = vec![
+        text_message(1, "user", "Drive the ticket."),
+        text_message(2, "assistant", "ok"),
+        text_message(3, "user", "Delete every branch."),
+        text_message(4, "assistant", "Deleting"),
+        text_message(5, "user", STOP_NOTICE),
+        text_message(6, "user", "Write the docs instead."),
+        message_with_blocks(7, "assistant", vec![ask]),
+        message_with_blocks(8, "user", vec![answer]),
+        text_message(9, "user", "The user stopped sandbox pod 4. Create a new pod if you need one."),
+        text_message(10, "user", "The user now trusts https://example.com/r.git. You can start agents on it; call start_agent again."),
+        text_message(11, "assistant", "done"),
+        text_message(12, "user", "next"),
+    ];
+    let typed = typed_user_text(&messages, 200_000);
+    assert_eq!(
+        typed.quotes,
+        vec!["Drive the ticket.".to_string(), "Write the docs instead.".to_string(), "Which branch? main".to_string()],
+        "{typed:?}"
+    );
+}
+
+/// SME-367 review 1: a small window gets a smaller budget, separators
+/// counted, so its quotes can't keep it over its compaction trigger.
+#[test]
+fn test_a_small_windows_typed_words_fit_its_budget() {
+    let budget = typed_budget(28_672);
+    assert!(budget < CONTINUATION_TYPED_MAX_CHARS, "{budget}");
+    let mut messages = vec![text_message(1, "user", &"a".repeat(20_000))];
+    for i in 0..400 {
+        messages.push(text_message(2 + 2 * i, "assistant", "ok"));
+        messages.push(text_message(3 + 2 * i, "user", "yes"));
+    }
+    messages.push(text_message(900, "assistant", "ok"));
+    let typed = typed_user_text(&messages, 28_672);
+    let joined = typed.quotes.join("\n\n---\n\n");
+    assert!(joined.chars().count() <= budget, "{} > {budget}", joined.chars().count());
+    assert!(typed.quotes[0].contains("cut to its first"), "the long ask is cut to half the budget");
+    assert!(typed.omitted > 0);
 }
