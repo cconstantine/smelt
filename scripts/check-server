@@ -96,11 +96,17 @@
 # cluster lock), which the server's process group holds for as long as it
 # runs: a second start on the same port waits for the first to stop. It
 # takes no cluster lock, since nothing it touches is a test run's, and the
-# server never inherits one from its caller (SME-100). Two at once also
-# need previews of their own (`-- SMELT_PREVIEW_ADDR=0.0.0.0:<p>
-# SMELT_PREVIEW_URL=http://{port}-{conversation}.preview.localhost:<p>`):
-# both default to 8181, so the second runs without previews and its links
-# point at the first's listener.
+# server never inherits one from its caller (SME-100).
+#
+# Its previews and the address its pages link back to are its own (SME-96):
+# previews on 0.0.0.0:<CHECK_PORT+200> (8281 by default), links built on
+# that port, and SMELT_BASE_URL=http://localhost:<CHECK_PORT>. Only a
+# `-- NAME=VALUE` override changes them: the environment and .env hold the
+# dev server's values here, so start ignores them and says so. An empty
+# SMELT_PREVIEW_ADDR or SMELT_PREVIEW_URL is refused (smelt reads it as the
+# dev server's :8181); an empty SMELT_BASE_URL is passed on. start refuses
+# a preview port something already listens on, as it does the app's. See
+# scripts/lib/check-server-previews.sh.
 #
 # The port lock keeps out other check servers only. start refuses a port
 # anything else already listens on (a hand-run ./server or dx serve, an
@@ -155,6 +161,7 @@ kubeconfig_file() { echo "$worktree/.check-server.kubeconfig"; }
 . "$repo/scripts/lib/check-server-proc.sh"
 . "$repo/scripts/lib/check-server-url.sh"
 . "$repo/scripts/lib/check-server-scratch.sh"
+. "$repo/scripts/lib/check-server-previews.sh"
 
 stop() {
     # The scratch lock first, before the pid file is read, and held through
@@ -294,6 +301,10 @@ start() {
         echo "an explicit -- DATABASE_URL= is refused: it would replace the scratch database this serves by default. To serve the database you name, say CHECK_DEV_DB=1 as well" >&2
         exit 1
     fi
+    # The previews' settings, with the refusals (a refused start never
+    # waits): an empty or bad value is refused here, before either lock
+    # (SME-96 review 1, L1). Only the listener probe waits for the port lock.
+    choose_preview_settings
     # The scratch lock, after the refusals (a refused start never waits) and
     # before the "already running" check, held until this start writes its
     # pid file: a stop of the same database waits for it, so it can't take
@@ -357,6 +368,18 @@ start() {
     if [ -n "$foreign" ]; then
         # shellcheck disable=SC2086 # one inode per word
         echo "port $port is taken: $(describe_listeners $foreign) listens on it. check-server never stops a server it didn't start: stop that one yourself, or use another CHECK_PORT" >&2
+        exit 1
+    fi
+    # The previews' port too (its value chosen and checked with the
+    # refusals above, SME-96), still before anything is checked out:
+    # smelt doesn't fail on a taken one, it turns previews off and keeps
+    # running, which is how a check "worked" with dead links. Check, then
+    # act: something could take it while dx builds; then previews are off,
+    # with the error in the log, as before.
+    foreign=$(foreign_listener_inodes "" "$PREVIEW_PORT")
+    if [ -n "$foreign" ]; then
+        # shellcheck disable=SC2086 # one inode per word
+        echo "preview port $PREVIEW_PORT is taken: $(describe_listeners $foreign) listens on it (the dev server's previews are on 8181; another check server?). Stop it, or pass -- SMELT_PREVIEW_ADDR=0.0.0.0:<a free port>" >&2
         exit 1
     fi
     if [ -d "$worktree" ]; then
@@ -506,6 +529,8 @@ start() {
     fi
     echo "building $(git -C "$worktree" log --oneline -1) (log: $(log_file))"
     echo "logging at RUST_LOG=$log_level ($log_note)"
+    preview_ignored_notices
+    preview_summary
 
     local deadline=$((SECONDS + 720))
     while [ "$SECONDS" -lt "$deadline" ]; do
