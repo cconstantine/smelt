@@ -169,7 +169,22 @@ pub(super) fn run_turn_bounded<'a>(
                 // parent-row wait notes nothing at all (Revision 6). The
                 // `ends` path — `finish`, a plain reply — has no row.
                 Ok(persisted) if persisted.iter().any(|m| m.role == "assistant") => {
-                    if !question_waits(pool, conversation_id).await.unwrap_or(false) {
+                    // A read that fails says "no wait" and notes a
+                    // Finished — best-effort notifying beats silence —
+                    // but the wait-aware rule silently degraded, so say
+                    // so (review 1): the warn names the case for the log.
+                    let waits = match question_waits(pool, conversation_id).await {
+                        Ok(waits) => waits,
+                        Err(e) => {
+                            tracing::warn!(
+                                conversation_id,
+                                error = %e,
+                                "the pending-question read failed; ending this turn notes Finished without checking for a wait"
+                            );
+                            false
+                        }
+                    };
+                    if !waits {
                         note_attention(conversation_id, crate::events::Attention::Finished)
                     }
                 }

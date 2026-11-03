@@ -1,4 +1,5 @@
 use super::*;
+use futures_util::StreamExt;
 use std::time::Duration;
 
 /// SME-71: what a conversation "needs the user" for, and when the server
@@ -91,7 +92,10 @@ async fn test_a_finished_turn_publishes_needs_user_finished_once_after_turns_cha
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     start_mock_upstream(&pool, vec![done_body("Done.")]).await;
-    let mut conversation_events = events::subscribe(conversation.id);
+    // The one stream a chat tab reads, alive before the busy spell so
+    // every kind of it lands on one merged view (SME-71 review 1).
+    let relay = conversation_relay(conversation.id, events::subscribe(conversation.id), events::subscribe_app());
+    futures_util::pin_mut!(relay);
     let recording = events::AppRecording::start();
 
     start_turn(pool.clone(), conversation.id, "hi".to_string()).await.expect("send");
@@ -102,26 +106,69 @@ async fn test_a_finished_turn_publishes_needs_user_finished_once_after_turns_cha
     let seen = needs_user_of(&recording, conversation.id);
     assert_eq!(seen.len(), 1, "one NeedsUser per busy spell, saw {seen:?}");
     assert_eq!(generation, turn_generation(conversation.id), "the spell's generation");
-    // And after the `TurnsChanged` that says the conversation went idle.
+    // The ordering the plan pins. The recording is this thread's own
+    // publish list, so this is the publish order itself: both
+    // `TurnsChanged`s — the busy spell's, then the idle one — come
+    // before the `NeedsUser` on the app-wide bus. The plan's mutation —
+    // publishing it inside the critical section, before the idle one —
+    // puts the `NeedsUser` second and lands this red. (A first/last
+    // match alone was the review's Medium: it matched the busy spell's
+    // `TurnsChanged`, which precedes any `NeedsUser` by construction.)
     let app_events = recording.events();
-    let turns_at = app_events
-        .iter()
-        .position(|e| matches!(e, events::AppEvent::TurnsChanged))
-        .expect("the idle TurnsChanged");
     let needs_at = app_events
         .iter()
-        .rposition(|e| matches!(e, events::AppEvent::NeedsUser { .. }))
+        .position(|e| matches!(e, events::AppEvent::NeedsUser { conversation_id, .. } if *conversation_id == conversation.id))
         .expect("the NeedsUser");
-    assert!(turns_at < needs_at, "NeedsUser comes after TurnsChanged, saw {app_events:?}");
-    // The conversation's own stream sees it end before the app-wide kind.
-    let mut saw_idle = false;
-    while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_millis(100), conversation_events.recv()).await {
-        if matches!(event, events::ConversationEvent::TurnState { running: false, .. }) {
-            saw_idle = true;
+    let turns_before = app_events[..needs_at]
+        .iter()
+        .filter(|e| matches!(e, events::AppEvent::TurnsChanged))
+        .count();
+    assert!(turns_before >= 2, "the NeedsUser follows both TurnsChanged — busy, then idle — saw {app_events:?}");
+    // The same order as a tab sees it, on the one merged
+    // `conversation_relay` stream. The relay merges two channels with
+    // `tokio::select!` (`api/chat.rs`), so what survives the merge is
+    // each channel's own FIFO order — not publish order across
+    // channels. `NeedsUser` and `TurnsChanged` ride the app channel
+    // together, so on the merged stream the `NeedsUser` follows the
+    // busy and idle `TurnsChanged` in their publish order (the
+    // mutation — publishing it inside the critical section, before the
+    // idle one — lands this red with one `TurnsChanged` before it).
+    let mut relayed: Vec<events::ConversationEvent> = Vec::new();
+    loop {
+        let complete = relayed
+            .iter()
+            .any(|e| matches!(e, events::ConversationEvent::NeedsUser { conversation_id, .. } if *conversation_id == conversation.id))
+            && relayed
+                .iter()
+                .any(|e| matches!(e, events::ConversationEvent::TurnState { running: false, .. }));
+        if complete {
             break;
         }
+        match tokio::time::timeout(Duration::from_secs(2), relay.next()).await {
+            Ok(Some(Ok(event))) => relayed.push(event),
+            _ => break,
+        }
     }
-    assert!(saw_idle, "the conversation's stream saw the turn end");
+    let needs_at = relayed
+        .iter()
+        .position(|e| matches!(e, events::ConversationEvent::NeedsUser { conversation_id, .. } if *conversation_id == conversation.id))
+        .expect("the relayed NeedsUser");
+    let turns_before = relayed[..needs_at]
+        .iter()
+        .filter(|e| matches!(e, events::ConversationEvent::TurnsChanged {}))
+        .count();
+    assert!(turns_before >= 2, "the relayed NeedsUser follows the busy and idle TurnsChanged, saw {relayed:?}");
+    // The conversation channel's idle `TurnState` is judged for arrival
+    // only, never for order: the first run of this assertion saw it land
+    // on the merged stream after the `NeedsUser` — published later, but
+    // the select drained the app channel's backlog first — and a select
+    // merge promises no cross-channel order. A tab learns "the turn
+    // ended" from the `TurnsChanged` above, the same channel the
+    // `NeedsUser` rides.
+    let idle_seen = relayed
+        .iter()
+        .any(|e| matches!(e, events::ConversationEvent::TurnState { running: false, .. }));
+    assert!(idle_seen, "the tab saw the turn end on its stream, saw {relayed:?}");
     events::forget(conversation.id);
 }
 
@@ -205,8 +252,12 @@ async fn test_an_asked_question_publishes_needs_user_question(pool: PgPool) {
     let (attention, _) = wait_needs_user(&recording, conversation.id).await;
     assert_eq!(attention, events::Attention::Question);
     // Exactly one, and it's the Question: the turn's Ok end saves the
-    // ask_user reply too, and the wait-aware rule keeps a Finished from
-    // joining it (the ruling's second path).
+    // ask_user reply too. Honest reach (review 1): this count cannot pin
+    // the wait-aware rule — if the Ok arm did note a Finished, `max`
+    // coalesces it under the Question and the spell still publishes this
+    // one event — so this test never goes red on that mutation. The
+    // red-capable pin of the ruling is the ask_parent test below: no
+    // Question is noted there, and a Finished would show plain.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let seen = needs_user_of(&recording, conversation.id);
     assert_eq!(seen.len(), 1, "one Question, nothing alongside, saw {seen:?}");
