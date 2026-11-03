@@ -12,13 +12,13 @@ async fn test_set_mcp_tool_class_upserts_one_row_per_tool(pool: PgPool) {
     .await
     .expect("create mcp server config");
 
-    set_mcp_tool_class(&pool, server.id, "get_pr", ToolClass::ReadOnly)
+    set_mcp_tool_class(&pool, server.id, "get_pr", ToolClass::ReadOnly, None)
         .await
         .expect("first set");
     // A tiny pause so the `updated_at` move is visible at Postgres's
     // microsecond resolution.
     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    set_mcp_tool_class(&pool, server.id, "get_pr", ToolClass::Destructive)
+    set_mcp_tool_class(&pool, server.id, "get_pr", ToolClass::Destructive, None)
         .await
         .expect("the second set is an update, not a conflict");
 
@@ -45,7 +45,7 @@ async fn test_clear_mcp_tool_class_removes_or_says_no(pool: PgPool) {
     )
     .await
     .expect("create mcp server config");
-    set_mcp_tool_class(&pool, server.id, "get_pr", ToolClass::Writing)
+    set_mcp_tool_class(&pool, server.id, "get_pr", ToolClass::Writing, None)
         .await
         .expect("set an override");
 
@@ -79,16 +79,16 @@ async fn test_list_mcp_tool_classes_is_per_server(pool: PgPool) {
     )
     .await
     .expect("create server b");
-    set_mcp_tool_class(&pool, a.id, "zeta", ToolClass::ReadOnly).await.expect("set a.zeta");
-    set_mcp_tool_class(&pool, a.id, "alpha", ToolClass::Writing).await.expect("set a.alpha");
-    set_mcp_tool_class(&pool, b.id, "other", ToolClass::Destructive).await.expect("set b.other");
+    set_mcp_tool_class(&pool, a.id, "zeta", ToolClass::ReadOnly, None).await.expect("set a.zeta");
+    set_mcp_tool_class(&pool, a.id, "alpha", ToolClass::Writing, None).await.expect("set a.alpha");
+    set_mcp_tool_class(&pool, b.id, "other", ToolClass::Destructive, None).await.expect("set b.other");
 
-    let rows = list_mcp_tool_classes(&pool, a.id).await.expect("list a's overrides");
+    let rows: Vec<(String, String)> = list_mcp_tool_classes(&pool, a.id).await.expect("list a's overrides").into_iter().map(|r| (r.tool_name, r.class)).collect();
     assert_eq!(rows, vec![
         ("alpha".to_string(), "writing".to_string()),
         ("zeta".to_string(), "read-only".to_string()),
     ], "a's rows only, by tool name");
-    let rows = list_mcp_tool_classes(&pool, b.id).await.expect("list b's overrides");
+    let rows: Vec<(String, String)> = list_mcp_tool_classes(&pool, b.id).await.expect("list b's overrides").into_iter().map(|r| (r.tool_name, r.class)).collect();
     assert_eq!(rows, vec![("other".to_string(), "destructive".to_string())]);
 }
 
@@ -101,7 +101,7 @@ async fn test_deleting_a_server_deletes_its_overrides(pool: PgPool) {
     )
     .await
     .expect("create mcp server config");
-    set_mcp_tool_class(&pool, server.id, "get_pr", ToolClass::ReadOnly)
+    set_mcp_tool_class(&pool, server.id, "get_pr", ToolClass::ReadOnly, None)
         .await
         .expect("set an override");
 

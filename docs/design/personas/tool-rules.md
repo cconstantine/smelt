@@ -52,6 +52,12 @@ From the server's annotations, which `mcp_tool_to_definition` (`src/mcp/tools.rs
 
 A tool with no annotations is destructive, the spec's defaults (`readOnlyHint` false, `destructiveHint` true). Many servers don't annotate, so the user's **override** (SME-240) matters: a table `mcp_tool_classes (server_id → mcp_servers ON DELETE CASCADE, tool_name, class, PRIMARY KEY (server_id, tool_name))`. It keys on the server's id, so renaming a server keeps its overrides; an override for a tool the server no longer lists stays and is shown as such. The class of an MCP tool is the override if any, else the annotations.
 
+**An override remembers which tool it was set for** (SME-295). The key is a name, so a server that replaces a tool and lists a different one under a name the user overrode would have handed the new tool the saved class: an override set for a harmless tool could then mark a later destructive one `read-only` and let a `read-only` persona through.
+- **What's stored:** each row also stores `tool_fingerprint`, a hash of the description and input schema of the tool listed under that name when the user saved it (`mcp::tool_fingerprint`).
+- **What reads it:** the call (`call_tool_unspanned`), the offer (`tool_definitions_for`) and the settings page all compare it with the tool listed now. A mismatch means the override doesn't decide the class: the server's annotations do, failing safe in both directions. The page marks the row "set for a different tool … save it again to apply it", and saving it again stores the current tool's fingerprint.
+- **Decided:** carry the fingerprint and fall back. Clearing a changed row instead would silently lose an override the user meant, every time a server edits a description, and the page has to show what happened either way.
+- **No fingerprint:** a row saved before the column, or for a tool the server didn't list at the save (pre-classifying an unlisted tool), has none and applies as before. The cost is that a description edit alone, with the same tool behind it, also asks for a re-save. That's visible and one click, which is cheaper than guessing.
+
 ## The grammar
 
 A persona's rules are its file's `smelt.tools` (plus an optional `own:` block in the same grammar that binds only its own conversation, see [Narrowing](#narrowing-a-child-never-gets-more-than-its-parent); [persona-files.md](persona-files.md#the-format-markdown-with-yaml-frontmatter-smelts-settings-under-one-key)):

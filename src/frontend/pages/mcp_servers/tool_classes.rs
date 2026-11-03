@@ -43,6 +43,14 @@ pub(super) fn class_select_value(row: &McpToolClassRow) -> String {
 /// is unknown (the server is down) claims only that it's yours.
 pub(super) fn tool_class_origin_note(row: &McpToolClassRow) -> String {
     if let Some(class) = row.override_class.as_deref() {
+        // SME-295: the server lists a different tool under this name now.
+        if row.tool_changed {
+            let server = row.server_class.as_deref().unwrap_or("its own class");
+            return format!(
+                "{server} \u{2014} the server's class: your override ({class}) was set for a different \
+                 tool than the one listed under this name now; save it again to apply it"
+            );
+        }
         return if row.listed == Some(false) {
             format!("{class} \u{2014} your override (the server no longer lists this tool)")
         } else {

@@ -169,7 +169,7 @@ async fn test_an_override_wins_at_the_call_and_a_clear_gives_the_server_its_answ
     wait_until_stale(config.id).await;
 
     assert_eq!(class_of_call_on(&pool, &config, "second_tool").await, Some(ReadOnly), "the server's answer first");
-    crate::db::set_mcp_tool_class(&pool, config.id, "second_tool", Destructive)
+    crate::db::set_mcp_tool_class(&pool, config.id, "second_tool", Destructive, None)
         .await
         .expect("set a destructive override");
     assert_eq!(class_of_call_on(&pool, &config, "second_tool").await, Some(Destructive), "the override wins");
@@ -189,7 +189,7 @@ async fn test_an_override_wins_at_the_call_and_a_clear_gives_the_server_its_answ
 async fn test_an_override_for_a_tool_the_server_does_not_list_classes_the_call(pool: sqlx::PgPool) {
     let config = create_static_server(&pool, &test_config(0, "unused").url).await;
     let _server = register_test_connection(config.id, false).await;
-    crate::db::set_mcp_tool_class(&pool, config.id, "no_such_tool", ReadOnly)
+    crate::db::set_mcp_tool_class(&pool, config.id, "no_such_tool", ReadOnly, None)
         .await
         .expect("set a read-only override for an unlisted tool");
     let class = class_of_call_on(&pool, &config, "no_such_tool").await;
@@ -220,7 +220,7 @@ async fn test_a_chain_rules_which_mcp_tools_are_offered(pool: sqlx::PgPool) {
     assert!(names.contains(&second), "annotated read-only stays: {names:?}");
     assert!(!names.contains(&echo), "unannotated means destructive, so the ceiling hides it: {names:?}");
 
-    crate::db::set_mcp_tool_class(&pool, config.id, "echo", ReadOnly).await.expect("read-only override");
+    crate::db::set_mcp_tool_class(&pool, config.id, "echo", ReadOnly, None).await.expect("read-only override");
     let names = tool_definitions_for(&pool, std::slice::from_ref(&config), &read_only)
         .await
         .into_iter()
@@ -279,4 +279,38 @@ async fn test_a_rule_check_still_waits_for_the_class_override_read() {
     let error = failed.expect_err("the override read fails the call first");
     assert!(error.contains("class override"), "{error}");
     assert!(!error.contains("the chain denies it"), "{error}");
+}
+
+/// SME-295: an override set for one tool doesn't decide the class of a
+/// different tool listed under the same name. Set with the listed tool's
+/// fingerprint it wins, at the call and in the offer; with another tool's,
+/// the server's own class decides both, until it's saved again.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_override_set_for_a_different_tool_doesnt_decide_its_class(pool: sqlx::PgPool) {
+    let config = create_static_server(&pool, &test_config(0, "unused").url).await;
+    let server = register_test_connection(config.id, true).await;
+    server.router.write().await.enable_route("second_tool");
+    wait_until_stale(config.id).await;
+    // Re-listed after the stale mark, by the first call.
+    assert_eq!(class_of_call_on(&pool, &config, "second_tool").await, Some(ReadOnly), "the server's answer");
+    let now = crate::mcp::listed_tool_fingerprint(config.id, "second_tool").await.expect("second_tool is listed");
+
+    crate::db::set_mcp_tool_class(&pool, config.id, "second_tool", Destructive, Some(&now)).await.expect("set for this tool");
+    assert_eq!(class_of_call_on(&pool, &config, "second_tool").await, Some(Destructive), "set for the listed tool, it wins");
+    crate::db::set_mcp_tool_class(&pool, config.id, "second_tool", Destructive, Some("another tool")).await.expect("set for another");
+    assert_eq!(class_of_call_on(&pool, &config, "second_tool").await, Some(ReadOnly), "set for another tool, the server's class decides");
+
+    let echo = format!("mcp__{}__echo", config.name);
+    let read_only = crate::personas::rules::RuleChain::from_stored(Some(serde_json::json!([{"class": "read-only"}])));
+    let offered = |pool: sqlx::PgPool, config: McpServerConfig, chain: crate::personas::rules::RuleChain| async move {
+        tool_definitions_for(&pool, std::slice::from_ref(&config), &chain).await.into_iter().map(|d| d.name).collect::<Vec<_>>()
+    };
+    crate::db::set_mcp_tool_class(&pool, config.id, "echo", ReadOnly, Some("another tool")).await.expect("stale read-only override");
+    let names = offered(pool.clone(), config.clone(), read_only.clone()).await;
+    assert!(!names.contains(&echo), "a stale read-only override doesn't widen the offer: {names:?}");
+    let echo_now = crate::mcp::listed_tool_fingerprint(config.id, "echo").await.expect("echo is listed");
+    crate::db::set_mcp_tool_class(&pool, config.id, "echo", ReadOnly, Some(&echo_now)).await.expect("re-confirmed override");
+    let names = offered(pool.clone(), config.clone(), read_only).await;
+    REGISTRY.lock().await.remove(&config.id);
+    assert!(names.contains(&echo), "saved again for this tool, it rules the offer: {names:?}");
 }

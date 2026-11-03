@@ -190,6 +190,39 @@ pub(crate) struct McpToolClassInfo {
     pub name: String,
     pub server_class: ToolClass,
     pub annotated: bool,
+    /// `tool_fingerprint` of the tool listed now (SME-295).
+    pub fingerprint: String,
+}
+
+/// Which tool a server lists under a name, as an override remembers it
+/// (SME-295): a hash of its description and input schema, so a different
+/// tool listed under the same name, or one whose description or arguments
+/// changed, reads as a different tool.
+pub(crate) fn tool_fingerprint(tool: &McpTool) -> String {
+    let schema = serde_json::to_string(&*tool.input_schema).unwrap_or_default();
+    let description = tool.description.as_deref().unwrap_or_default();
+    format!("{:016x}", fnv1a(format!("{description}\u{0}{schema}").as_bytes()))
+}
+
+/// Whether a saved override still decides its tool's class (SME-295): one
+/// saved with no fingerprint does, as before; one saved for a tool decides
+/// it only while the server lists that same tool (`listed`) under the name.
+/// A different tool behind the name is judged by its own annotations until
+/// the user saves the override again.
+pub(crate) fn override_applies(saved_fingerprint: Option<&str>, listed: Option<&McpTool>) -> bool {
+    match saved_fingerprint {
+        None => true,
+        Some(saved) => listed.is_some_and(|tool| tool_fingerprint(tool) == saved),
+    }
+}
+
+/// The fingerprint of the tool `server_id`'s connection lists as
+/// `tool_name` now, if it's connected and lists one: what an override
+/// saved now is set for (SME-295).
+pub(crate) async fn listed_tool_fingerprint(server_id: i64, tool_name: &str) -> Option<String> {
+    let registry = REGISTRY.lock().await;
+    let conn = registry.get(&server_id)?;
+    conn.tools.iter().find(|tool| tool.name == tool_name).map(tool_fingerprint)
 }
 
 /// Each of the server's current tools with the class *its own
@@ -230,6 +263,7 @@ pub(crate) async fn tool_class_report(
                 .annotations
                 .as_ref()
                 .is_some_and(|a| a.read_only_hint.is_some() || a.destructive_hint.is_some()),
+            fingerprint: tool_fingerprint(tool),
         })
         .collect())
 }
@@ -318,13 +352,13 @@ pub async fn tool_definitions_for(
             .map(|config| (config.id, config.name.clone()))
             .collect()
     };
-    let overrides: HashMap<i64, HashMap<String, String>> = futures_util::future::join_all(
+    let overrides: HashMap<i64, HashMap<String, crate::db::SavedToolClass>> = futures_util::future::join_all(
         connected.iter().map(|(id, _)| async move { (*id, crate::db::list_mcp_tool_classes(pool, *id).await) }),
     )
     .await
     .into_iter()
     .map(|(id, saved)| match saved {
-        Ok(rows) => (id, rows.into_iter().collect()),
+        Ok(rows) => (id, rows.into_iter().map(|row| (row.tool_name.clone(), row)).collect()),
         Err(e) => {
             let server = connected.iter().find(|(cid, _)| *cid == id).map(|(_, name)| name.as_str()).unwrap_or("?");
             tracing::warn!(server, error = %e, "couldn't read the saved class overrides; the offer falls back to the server's own annotations");
@@ -345,8 +379,13 @@ pub async fn tool_definitions_for(
                 // a server's tools it is offered, judged at the class its
                 // call would be judged by.
                 .filter(|tool| {
+                    // An override set for a different tool under this name
+                    // doesn't decide it (SME-295).
+                    let saved = saved
+                        .and_then(|rows| rows.get(tool.name.as_ref()))
+                        .filter(|row| override_applies(row.tool_fingerprint.as_deref(), Some(tool)));
                     let class = judged_class(
-                        saved.and_then(|rows| rows.get(tool.name.as_ref())).map(String::as_str),
+                        saved.map(|row| row.class.as_str()),
                         class_from_annotations(tool.annotations.as_ref()),
                         &config.name,
                         tool.name.as_ref(),
