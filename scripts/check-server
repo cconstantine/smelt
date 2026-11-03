@@ -301,6 +301,10 @@ start() {
         echo "an explicit -- DATABASE_URL= is refused: it would replace the scratch database this serves by default. To serve the database you name, say CHECK_DEV_DB=1 as well" >&2
         exit 1
     fi
+    # The previews' settings, with the refusals (a refused start never
+    # waits): an empty or bad value is refused here, before either lock
+    # (SME-96 review 1, L1). Only the listener probe waits for the port lock.
+    choose_preview_settings
     # The scratch lock, after the refusals (a refused start never waits) and
     # before the "already running" check, held until this start writes its
     # pid file: a stop of the same database waits for it, so it can't take
@@ -366,12 +370,12 @@ start() {
         echo "port $port is taken: $(describe_listeners $foreign) listens on it. check-server never stops a server it didn't start: stop that one yourself, or use another CHECK_PORT" >&2
         exit 1
     fi
-    # The previews' port too (SME-96), still before anything is checked out:
+    # The previews' port too (its value chosen and checked with the
+    # refusals above, SME-96), still before anything is checked out:
     # smelt doesn't fail on a taken one, it turns previews off and keeps
     # running, which is how a check "worked" with dead links. Check, then
     # act: something could take it while dx builds; then previews are off,
     # with the error in the log, as before.
-    choose_preview_settings
     foreign=$(foreign_listener_inodes "" "$PREVIEW_PORT")
     if [ -n "$foreign" ]; then
         # shellcheck disable=SC2086 # one inode per word

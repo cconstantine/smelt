@@ -44,11 +44,14 @@ choose_preview_settings() {
         PREVIEW_ADDR=0.0.0.0:$((port + PREVIEW_OFFSET)) PREVIEW_ADDR_NOTE="check-server's default"
         overrides+=("SMELT_PREVIEW_ADDR=$PREVIEW_ADDR")
     fi
-    PREVIEW_PORT=${PREVIEW_ADDR##*:}
-    if ! [[ "$PREVIEW_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$PREVIEW_PORT" -gt 65535 ]; then
-        echo "SMELT_PREVIEW_ADDR=$PREVIEW_ADDR doesn't end in a port from 1 to 65535" >&2
+    # A host (a name, an IPv4 address or a bracketed IPv6 one), a colon and
+    # a port: `8281` or `::1` alone would pass a port check on the tail and
+    # then fail smelt's bind, turning previews off (review 1, L2).
+    if ! [[ "$PREVIEW_ADDR" =~ ^(\[[^]]*\]|[^:]+):([1-9][0-9]{0,4})$ ]] || [ "${BASH_REMATCH[2]}" -gt 65535 ]; then
+        echo "SMELT_PREVIEW_ADDR=$PREVIEW_ADDR isn't a host and a port from 1 to 65535 (for example 0.0.0.0:8281 or [::]:8281)" >&2
         exit 1
     fi
+    PREVIEW_PORT=${BASH_REMATCH[2]}
     if [ "$PREVIEW_PORT" = "$port" ]; then
         echo "SMELT_PREVIEW_ADDR=$PREVIEW_ADDR is the app's own port ($port): give previews another one" >&2
         exit 1

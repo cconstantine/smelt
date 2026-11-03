@@ -48,6 +48,7 @@ expect_refused() { # name grep [start args...]
     local name=$1 want=$2 rc
     shift 2
     : >"$SQLX_CALLS"
+    : >"$CLEANUP_CALLS"
     : >"$pid_file"
     out=$(check_server start HEAD "$@")
     rc=$?
@@ -55,6 +56,7 @@ expect_refused() { # name grep [start args...]
     grep -qF -- "$want" <<<"$out" || fail "$name: the refusal doesn't say '$want': $out"
     [ -s "$SQLX_CALLS" ] && fail "$name: a refused start called sqlx: $(cat "$SQLX_CALLS")"
     [ -s "$pid_file" ] && fail "$name: a refused start wrote a pid file"
+    [ -s "$CLEANUP_CALLS" ] && fail "$name: a refused start ran the scratch cleanup: $(cat "$CLEANUP_CALLS")"
     check_server stop >/dev/null
     extra_env=()
 }
@@ -67,19 +69,21 @@ grep -q "ignoring" <<<"$out" && fail "nothing set: start ignored something: $out
 
 # 2. The dev server's values in the environment: ignored, each named, its
 # value never printed.
-extra_env=(SMELT_BASE_URL=http://localhost:8180/ SMELT_PREVIEW_ADDR=0.0.0.0:8181
-    "SMELT_PREVIEW_URL=http://{port}-{conversation}.preview.localhost:8181")
+sentinel=never-printed.invalid
+extra_env=(SMELT_BASE_URL=http://$sentinel/ SMELT_PREVIEW_ADDR=0.0.0.0:8181
+    "SMELT_PREVIEW_URL=http://{port}-{conversation}.$sentinel:8181")
 expect_previews "the dev server's environment" "0.0.0.0:$preview_port" "$default_url" "http://localhost:$port"
 for name in SMELT_BASE_URL SMELT_PREVIEW_ADDR SMELT_PREVIEW_URL; do
     grep -qF "ignoring $name from the environment" <<<"$out" || fail "the environment's $name: no notice: $out"
 done
-grep -qF "8180" <<<"$out" && fail "the environment's notice printed a value: $out"
+grep -qF "$sentinel" <<<"$out" && fail "the environment's notice printed a value: $out"
 
 # 3. The same in the check worktree's .env.
-printf 'SMELT_BASE_URL=http://localhost:8180/\nSMELT_PREVIEW_ADDR=0.0.0.0:8181\n' >"$env_file"
+printf 'SMELT_BASE_URL=http://%s/\nSMELT_PREVIEW_ADDR=0.0.0.0:8181\n' "$sentinel" >"$env_file"
 expect_previews ".env's values" "0.0.0.0:$preview_port" "$default_url" "http://localhost:$port"
 grep -qF "ignoring SMELT_BASE_URL from .env" <<<"$out" || fail ".env's SMELT_BASE_URL: no notice: $out"
 grep -qF "ignoring SMELT_PREVIEW_ADDR from .env" <<<"$out" || fail ".env's SMELT_PREVIEW_ADDR: no notice: $out"
+grep -qF "$sentinel" <<<"$out" && fail ".env's notice printed a value: $out"
 : >"$env_file"
 
 # 4. An override wins over the environment, and is said to be yours.
@@ -112,9 +116,28 @@ grep -qF "SMELT_BASE_URL unset (yours): derived from each request" <<<"$out" || 
 
 # 9. Addresses that can't be a preview listener's.
 expect_refused "the app's own port" "is the app's own port" -- SMELT_PREVIEW_ADDR=0.0.0.0:$port
-expect_refused "no port" "doesn't end in a port" -- SMELT_PREVIEW_ADDR=0.0.0.0
+expect_refused "no port" "isn't a host and a port" -- SMELT_PREVIEW_ADDR=0.0.0.0
+expect_refused "a port alone" "isn't a host and a port" -- SMELT_PREVIEW_ADDR=8281
+expect_refused "a bare IPv6 address" "isn't a host and a port" -- SMELT_PREVIEW_ADDR=::1
+alt3=$(free_port) || fail "no free port for the bracketed case"
+expect_previews "a bracketed IPv6 address" "[::]:$alt3" "http://{port}-{conversation}.preview.localhost:$alt3" "http://localhost:$port" -- "SMELT_PREVIEW_ADDR=[::]:$alt3"
 extra_env=(CHECK_PORT=65400)
 expect_refused "CHECK_PORT too high for its previews" "leaves no port for its previews"
+
+# 9b. A value refusal never waits (review 1, L1): with the port's lock held
+# by someone else, an empty address is refused at once, not after the wait.
+lock_dir_for_test=${SMELT_LOCK_DIR:-}
+if [ -n "$lock_dir_for_test" ]; then
+    exec 7>>"$lock_dir_for_test/smelt-check-server-$port.lock"
+    flock -n 7 || fail "couldn't hold the port lock for case 9b"
+    started=$SECONDS
+    extra_env=(CHECK_PORT_WAIT=60)
+    expect_refused "a refusal while the port lock is held" "an empty -- SMELT_PREVIEW_ADDR= is refused" -- SMELT_PREVIEW_ADDR=
+    [ $((SECONDS - started)) -lt 30 ] || fail "a refusal while the port lock is held waited $((SECONDS - started))s"
+    exec 7>&-
+else
+    fail "SMELT_LOCK_DIR isn't set by the test library"
+fi
 
 # 10. The preview port taken: refused before anything is created, naming
 # the port, and the listener left alone; another port given, it starts.
