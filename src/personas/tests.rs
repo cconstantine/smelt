@@ -365,7 +365,7 @@ fn test_own_rules_parse_check_and_dont_nest() {
     let err = parse_err(path, &file("    own:\n      deny: [\"\"]\n"));
     assert!(err.contains("smelt.tools.own has an empty pattern"), "{err}");
     let err = parse_err(path, &file("    own:\n      own:\n        deny: [x]\n"));
-    assert!(err.contains("own"), "an own inside own is an unknown field: {err}");
+    assert!(err.contains("unknown field") && err.contains("own"), "an own inside own is an unknown field: {err}");
 }
 
 /// SME-322: an entry's `own` narrows the conversation it's on, says so in
@@ -387,4 +387,14 @@ fn test_own_rules_bind_their_entry_and_not_a_child() {
     let child_chain = rules::RuleChain::from_stored(Some(inherited));
     assert!(child_chain.allows_at(write, crate::anthropic::tools::ToolClass::Writing).is_ok(), "the child may write");
     assert_eq!(rules::for_child(None), None, "no chain stays none");
+    // A grandchild's chain: every entry's own goes, not only the last.
+    let two = serde_json::json!([{"class": "all", "own": {"deny": ["a"]}}, {"class": "read-only", "deny": ["b"], "own": {"deny": ["c"]}}]);
+    assert_eq!(
+        rules::for_child(Some(two)),
+        Some(serde_json::json!([{"class": "all"}, {"class": "read-only", "deny": ["b"]}]))
+    );
+    // `own`'s patterns are reported like the rest when their server isn't configured.
+    let text = "---\nname: driver\ndescription: Drives.\nsmelt:\n  tools:\n    own:\n      deny: [gh/merge_*]\n---\nDrive.\n";
+    let rules = parse_ok(path, text).tools.expect("tools");
+    assert_eq!(rules.unmatched_servers(&[]), vec!["gh/merge_*".to_string()]);
 }

@@ -169,6 +169,16 @@ mod tests {
         );
     }
 
+    /// SME-322: a dead pattern in `own` is a finding too.
+    #[test]
+    fn test_a_dead_pattern_in_own_is_a_finding() {
+        let rules = rules_of("    own:\n      deny: [merge_pull_request]\n");
+        assert_eq!(
+            dead_patterns(&rules, &registry()),
+            vec!["`merge_pull_request` names no tool smelt registers".to_string()]
+        );
+    }
+
     #[test]
     fn test_a_smelt_tool_wildcard_matching_no_tool_is_a_finding() {
         // `read_*` reaches `read_file` and `read_terminal_output`; `get_*`

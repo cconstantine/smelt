@@ -54,7 +54,7 @@ A tool with no annotations is destructive, the spec's defaults (`readOnlyHint` f
 
 ## The grammar
 
-A persona's rules are its file's `smelt.tools` ([persona-files.md](persona-files.md#the-format-markdown-with-yaml-frontmatter-smelts-settings-under-one-key)):
+A persona's rules are its file's `smelt.tools` (plus an optional `own:` block in the same grammar that binds only its own conversation, see [Narrowing](#narrowing-a-child-never-gets-more-than-its-parent); [persona-files.md](persona-files.md#the-format-markdown-with-yaml-frontmatter-smelts-settings-under-one-key)):
 
 ```yaml
 smelt:
@@ -119,7 +119,9 @@ smelt:
       deny: [write_file, edit_file, github/merge_pull_request]   # binds the driver only
 ```
 
-The `own` rides on the persona's chain entry as one more conjunct of that entry, so it only narrows: it can't allow what the entry or an earlier one denies. A child starts with its parent's chain with every entry's `own` taken out (`personas::rules::for_child`), so an `own` is only ever on the entry its conversation's persona added — a persona-less child, which inherits its parent's chain as is, inherits no `own` either. A refusal by an `own` rule says it binds this conversation and not its agents. An allow-only `own` can't widen anything either way, so self-scoping has nothing to offer an allow.
+The `own` rides on the persona's chain entry as one more conjunct of that entry, so it only narrows: it can't allow what the entry or an earlier one denies. A child starts with its parent's chain with every entry's `own` taken out (`personas::rules::for_child`), so an `own` is only ever on the entry its conversation's persona added — a persona-less child, which inherits its parent's chain as is, inherits no `own` either. A refusal by an `own` rule says it binds this conversation and not its agents. An `own` allow can't widen anything either: over the `all` class an allow-only `own` is a no-op, though one can carve an exception out of a stricter `own` class (`own: {class: read-only, allow: [save_comment]}`).
+
+An `own` is restraint, not containment: the agents a persona starts may do whatever its `own` denies it, unless the cascading part of its rules denies that too — a driver with `own: deny [github/merge_pull_request]` can start a persona-less child whose brief is to merge. Deny `start_agent` itself, or the tool in the cascading part, to contain. And a deploy rolled back past SME-322 reads stored entries without `own` (the stored rules ignore an unknown field), so running agents lose their `own` rules until the rollback is undone.
 
 **Alternatives:** computing the child's rules once as a flat allow-set loses wildcards and the class ceiling, so a tool from an MCP server added later would be judged by nobody; inheriting only the persona's rules (opencode, whose subagent uses its own agent's permissions, `packages/core/src/tool/plugin/subagent.ts`) lets a child of a read-only parent write.
 

@@ -273,7 +273,8 @@ impl ToolRules {
     /// rules nothing. Never an error — a pattern may name a server that
     /// isn't configured yet — so this is a report, made where the rules
     /// are read (SME-241: `list_personas`, and `start_agent` to the parent).
-    /// Allow's patterns first, then deny's, each in the order written.
+    /// Allow's patterns first, then deny's, then `own`'s allow and deny
+    /// (SME-322), each in the order written.
     pub(crate) fn unmatched_servers(&self, server_names: &[String]) -> Vec<String> {
         let own = self.own.as_deref().map(|own| own.allow.iter().chain(own.deny.iter()));
         self.allow
