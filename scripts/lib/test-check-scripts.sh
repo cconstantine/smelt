@@ -270,10 +270,34 @@ EOF
 # The port check_server's servers use.
 port=$(free_port) || { echo "no free port" >&2; exit 1; }
 
+# A clone of $1 at $2 that shares $1's objects (`git clone --shared`, with
+# any further clone arguments), made the first time and reused after
+# (SME-251). A --shared clone records $1's object store as an absolute
+# path, in .git/objects/info/alternates, so one an earlier run made from
+# another path can't read its objects here ("unable to normalize alternate
+# object path"): target/ is the same directory on the host, at
+# /workspace/smelt, and in the compose service, at /app. A reused clone
+# has that file pointed at this $1's store, overwritten rather than removed
+# (SME-107), and must then read its HEAD; one that still can't is named,
+# for a person to remove.
+shared_clone() {
+    local src=$1 dst=$2 objects
+    shift 2
+    if [ ! -d "$dst/.git" ]; then
+        git clone -q --shared "$@" "$src" "$dst"
+        return
+    fi
+    objects=$(git -C "$src" rev-parse --path-format=absolute --git-common-dir) || return 1
+    printf '%s\n' "$objects/objects" >"$dst/.git/objects/info/alternates" || return 1
+    git -C "$dst" cat-file -e HEAD 2>/dev/null && return 0
+    echo "$dst is a scratch clone an earlier run made, and it can't read its objects from $src; remove it and run again" >&2
+    return 1
+}
+
 # The check worktree: a clone sharing this repo's objects, so it can check
 # out any commit here without registering a worktree. Reused across runs.
 worktree=$dir/worktree
-[ -d "$worktree/.git" ] || git clone -q --shared --no-checkout "$PWD" "$worktree" || exit 1
+shared_clone "$PWD" "$worktree" --no-checkout || exit 1
 
 export SQLX_CALLS=$dir/sqlx-calls
 export DX_ENV=$dir/dx-env
