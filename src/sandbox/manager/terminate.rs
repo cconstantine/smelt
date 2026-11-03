@@ -230,7 +230,51 @@ pub async fn pod_details(pool: &PgPool, pod_id: i64) -> Result<Option<PodDetails
 /// a 403 error, which callers treat as "usage unavailable".
 pub async fn pod_metrics_list() -> Result<serde_json::Value, SandboxError> {
     let request = pod_metrics_request(NAMESPACE)?;
-    Ok(get()?.client.request::<serde_json::Value>(request).await?)
+    let list = get()?.client.request::<serde_json::Value>(request).await?;
+    #[cfg(test)]
+    let list = sampled_metrics::merged_into(list);
+    Ok(list)
+}
+
+/// A test's stand-in for metrics-server having sampled one of its pods
+/// (SME-206). metrics-server's own sampling isn't smelt's to test, and on
+/// the loaded test cluster it isn't something a test can wait for either:
+/// its kubelet scrape times out under the suite's load and it then serves
+/// no metrics at all for a minute or more, which outlasted the pods view
+/// test's wait. A test names its own pod, so no other test's view changes;
+/// a real sample of the same pod wins over the stand-in.
+#[cfg(test)]
+pub(crate) mod sampled_metrics {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    static SAMPLED: LazyLock<Mutex<HashMap<String, serde_json::Value>>> = LazyLock::new(Default::default);
+
+    /// `pod_name` reads as sampled with this CPU and memory, in
+    /// metrics-server's own units (`"1203981n"`, `"52Mi"`).
+    pub(crate) fn sample(pod_name: &str, cpu: &str, memory: &str) {
+        let item = serde_json::json!({
+            "metadata": {"name": pod_name},
+            "containers": [{"name": "sandbox", "usage": {"cpu": cpu, "memory": memory}}],
+        });
+        SAMPLED.lock().unwrap_or_else(|e| e.into_inner()).insert(pod_name.to_string(), item);
+    }
+
+    pub(super) fn merged_into(mut list: serde_json::Value) -> serde_json::Value {
+        let sampled = SAMPLED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if sampled.is_empty() {
+            return list;
+        }
+        let Some(items) = list.get_mut("items").and_then(|items| items.as_array_mut()) else {
+            return list;
+        };
+        let real: std::collections::HashSet<String> = items
+            .iter()
+            .filter_map(|item| item.pointer("/metadata/name")?.as_str().map(str::to_string))
+            .collect();
+        items.extend(sampled.into_iter().filter(|(name, _)| !real.contains(name)).map(|(_, item)| item));
+        list
+    }
 }
 
 /// The metrics API request for `namespace`'s pods. `NAMESPACE` is always a
