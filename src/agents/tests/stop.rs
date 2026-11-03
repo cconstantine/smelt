@@ -37,6 +37,7 @@ async fn settled_child(pool: &PgPool, root: i64, brief: &str) -> i64 {
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_stop_agent_refuses_another_roots_child_and_any_other_id(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     setup(&pool, vec![text_reply("ok")]).await;
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let other = db::create_conversation(&pool).await.expect("create conversation").id;
@@ -90,6 +91,7 @@ async fn test_stop_agent_stops_the_subtree_and_ends_a_running_turn(pool: PgPool)
 /// is refused.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_child_stopped_during_its_start_never_becomes_active(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let requests = setup(&pool, vec![text_reply("ok")]).await;
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let (reached, release) = test_hooks::pause(test_hooks::BEFORE_START_DONE, root);
@@ -112,6 +114,7 @@ async fn test_a_child_stopped_during_its_start_never_becomes_active(pool: PgPool
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_users_send_makes_a_finished_or_stopped_child_active_and_a_failed_one_refuses(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     setup(&pool, vec![text_reply("ok")]).await;
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let finished = settled_child(&pool, root, "One.").await;
@@ -139,6 +142,7 @@ async fn test_the_users_send_makes_a_finished_or_stopped_child_active_and_a_fail
 /// the parent once, and a second Stop adds nothing.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_users_stop_on_a_child_tells_its_parent_once(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     setup(&pool, vec![text_reply("ok")]).await;
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let child = settled_child(&pool, root, "Work.").await;
@@ -176,6 +180,7 @@ async fn test_the_users_stop_on_a_child_tells_its_parent_once(pool: PgPool) {
 /// queued waits for its first turn.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_wake_or_notice_to_a_starting_child_runs_no_turn(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let requests = setup(&pool, vec![text_reply("ok")]).await;
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let (reached, release) = test_hooks::pause(test_hooks::BEFORE_START_DONE, root);
@@ -205,6 +210,7 @@ async fn test_a_wake_or_notice_to_a_starting_child_runs_no_turn(pool: PgPool) {
 /// user writing in it brings a stopped one back.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stopped_or_failed_child_runs_no_turn_for_a_wake_or_notice(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let requests = setup(&pool, vec![text_reply("ok")]).await;
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let stopped = settled_child(&pool, root, "One.").await;
@@ -232,6 +238,7 @@ async fn test_a_stopped_or_failed_child_runs_no_turn_for_a_wake_or_notice(pool: 
 /// its stop finds no turn to end. The send is refused, and no turn runs.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stop_between_the_users_admission_and_its_turn_refuses_the_send(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let requests = setup(&pool, vec![text_reply("ok")]).await;
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let child = settled_child(&pool, root, "Work.").await;
@@ -262,6 +269,7 @@ async fn test_a_stop_between_the_users_admission_and_its_turn_refuses_the_send(p
 /// stays, still answerable.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_answer_in_a_child_that_cant_take_a_turn_is_refused_before_its_recorded(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     setup(&pool, vec![text_reply("ok")]).await;
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let child = settled_child(&pool, root, "Work.").await;

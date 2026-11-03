@@ -251,6 +251,7 @@ async fn abort_a_send_whose_place_is_waiting(pool: &PgPool, release_first: bool)
 /// lock, the lock freed after the abort, lets a later send run.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_send_aborted_while_queued_leaves_the_queue(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     abort_a_send_whose_place_is_waiting(&pool, false).await;
 }
@@ -259,6 +260,7 @@ async fn test_a_send_aborted_while_queued_leaves_the_queue(pool: PgPool) {
 /// polls it, then aborted, gives the lock back to a later send.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_send_aborted_once_granted_but_unpolled_frees_the_lock(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     abort_a_send_whose_place_is_waiting(&pool, true).await;
 }

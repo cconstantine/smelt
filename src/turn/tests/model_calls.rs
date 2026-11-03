@@ -4,6 +4,7 @@ use super::*;
 /// compaction's summary call, then each call of the turn's tool loop.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_each_model_call_of_a_turn_is_recorded_with_its_usage(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -93,6 +94,7 @@ async fn test_each_model_call_of_a_turn_is_recorded_with_its_usage(pool: PgPool)
 /// provider's catalog entry; a provider without one records no cost.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_each_recorded_call_is_priced_from_the_catalog(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -139,6 +141,7 @@ async fn test_each_recorded_call_is_priced_from_the_catalog(pool: PgPool) {
 /// nothing goes out while it's unset.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_models_effort_is_sent_on_its_turns(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -164,6 +167,7 @@ async fn test_a_models_effort_is_sent_on_its_turns(pool: PgPool) {
 /// compaction turns the template's reasoning off.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_llama_cpp_turn_sends_template_settings_and_compaction_turns_thinking_off(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -223,6 +227,7 @@ async fn test_a_llama_cpp_turn_sends_template_settings_and_compaction_turns_thin
 /// compaction the new, smaller history's room, not the old one's.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_turns_reply_budget_grows_with_the_room_left(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -273,6 +278,7 @@ async fn test_a_turns_reply_budget_grows_with_the_room_left(pool: PgPool) {
 /// SME-111: the user's "Max reply tokens" caps a turn's reply budget.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_models_max_reply_tokens_caps_its_turns(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -297,6 +303,7 @@ async fn test_a_models_max_reply_tokens_caps_its_turns(pool: PgPool) {
 /// one's thinking stays adaptive.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_llama_cpp_turn_sends_a_thinking_budget(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -344,6 +351,7 @@ async fn test_a_llama_cpp_turn_sends_a_thinking_budget(pool: PgPool) {
 /// `prompt.rs`'s `test_context_detail_shows_the_system_prompt_a_turn_sends`.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_context_detail_shows_the_groups_spend_and_a_childs_group(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let root = db::create_conversation(&pool).await.expect("root");
     sqlx::query("UPDATE conversations SET title = 'Build the thing' WHERE id = $1")
         .bind(root.id)

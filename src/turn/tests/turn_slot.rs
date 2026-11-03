@@ -238,6 +238,7 @@ async fn finished(turn: tokio::task::JoinHandle<TurnResult>) -> Vec<Message> {
 /// A's per-call slot frees when its first call ends, and B takes it there.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_turn_holds_one_slot_across_its_calls(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let (addr, gate) = start_slot_gate(vec![
         GateResponse::Sse(unknown_tool_call_body("Thinking.", "no_such_tool_343")),
@@ -286,6 +287,7 @@ async fn test_a_turn_holds_one_slot_across_its_calls(pool: PgPool) {
 /// (per-call slots), and the test the stubbed-reuse mutant goes red on.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_compaction_inside_a_turn_reuses_its_slot(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     // Usage close to the 200,000 assumed window: the second iteration's
     // `should_compact` fires (the ceiling is 200,000 − 16,384).
@@ -320,6 +322,7 @@ async fn test_compaction_inside_a_turn_reuses_its_slot(pool: PgPool) {
 /// B, waiting on the slot, goes at once.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_stop_frees_the_turns_slot(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let (addr, gate) = start_slot_gate(vec![GateResponse::Sse(text_reply_body("held"))]).await;
     let (provider, a, b) = slot_provider_and_conversations(&pool, addr, 9_162_000_313, Some(1)).await;
@@ -356,6 +359,7 @@ async fn test_stop_frees_the_turns_slot(pool: PgPool) {
 /// 500. (A held it mid-call, so this is a leak guard for the body-drop path.)
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_failed_turn_frees_its_slot(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let (addr, gate) = start_slot_gate(vec![
         GateResponse::Error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, "upstream boom".to_string()),
@@ -395,6 +399,7 @@ async fn test_a_failed_turn_frees_its_slot(pool: PgPool) {
 /// the slot with it.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_ask_user_frees_the_turns_slot(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let (addr, gate) = start_slot_gate(vec![
         GateResponse::Sse(super::ask_user::ask_body()),
@@ -433,6 +438,7 @@ async fn test_ask_user_frees_the_turns_slot(pool: PgPool) {
 /// holds nothing, and must find the limit that appeared.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_limit_saved_mid_turn_applies_at_the_turns_next_call(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let (addr, gate) = start_slot_gate(vec![
         GateResponse::Sse(unknown_tool_call_body("Thinking.", "no_such_tool_343")),
@@ -478,6 +484,7 @@ async fn test_a_limit_saved_mid_turn_applies_at_the_turns_next_call(pool: PgPool
 /// keeps the closed pool's permit until it ends.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_clearing_a_limit_mid_turn_releases_the_held_slot(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let (addr, gate) = start_slot_gate(vec![
         GateResponse::Sse(unknown_tool_call_body("Thinking.", "no_such_tool_343")),
@@ -533,6 +540,7 @@ async fn test_clearing_a_limit_mid_turn_releases_the_held_slot(pool: PgPool) {
 /// clear-then-set re-take records a second time.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_clearing_and_resetting_a_limit_mid_turn_records_the_wait_once(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let (addr, gate) = start_slot_gate(vec![
         GateResponse::Sse(unknown_tool_call_body("Thinking.", "no_such_tool_343")),
@@ -592,6 +600,7 @@ async fn test_clearing_and_resetting_a_limit_mid_turn_records_the_wait_once(pool
 /// whole turn ends. T1 is the other side: a stranger (no child) still waits.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_parents_turn_lets_its_own_agent_call_between_its_calls(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let (addr, gate) = start_slot_gate(vec![
         GateResponse::Sse(unknown_tool_call_body("Thinking.", "no_such_tool_354")),

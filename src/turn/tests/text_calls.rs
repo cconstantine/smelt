@@ -81,6 +81,7 @@ fn last_sent(requests: &std::sync::Mutex<Vec<serde_json::Value>>, n: usize) -> (
 /// the model's next, real call runs.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_call_written_as_text_gets_a_correction_and_the_turn_goes_on(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     let requests =
@@ -142,6 +143,7 @@ async fn test_corrections_are_bounded_and_end_in_a_visible_error(pool: PgPool) {
 /// reach the bound.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_real_call_resets_the_streak(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     let bodies = vec![
@@ -164,6 +166,7 @@ async fn test_a_real_call_resets_the_streak(pool: PgPool) {
 /// the turn, not only through `find`.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_every_form_gets_the_correction(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let forms = [
         include_str!("../../text_calls/fixtures/qwen3_coder.txt"),
@@ -195,6 +198,7 @@ async fn test_every_form_gets_the_correction(pool: PgPool) {
 /// notice, and the turn ends.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_quoted_markup_ends_the_turn_as_before(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let qwen = include_str!("../../text_calls/fixtures/qwen3_coder.txt");
     let fenced = format!("A Qwen call looks like this:\n\n```xml\n{qwen}\n```");
@@ -215,6 +219,7 @@ async fn test_quoted_markup_ends_the_turn_as_before(pool: PgPool) {
 /// one ran.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_mixed_reply_gets_the_correction_after_its_results(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     let written = include_str!("../../text_calls/fixtures/evidence_96.txt");
@@ -253,6 +258,7 @@ async fn test_a_mixed_reply_gets_the_correction_after_its_results(pool: PgPool) 
 /// saved either way (one was, and the next request sent it).
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_tool_use_with_no_calls_is_the_end_of_the_reply(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let written = text_blocks_body(&[Block::Text(EVIDENCE)], "tool_use");
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
@@ -277,6 +283,7 @@ async fn test_tool_use_with_no_calls_is_the_end_of_the_reply(pool: PgPool) {
 /// on; a second such reply ends the turn, as a model that meant to stop.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_reply_with_no_text_and_no_call_gets_one_nudge(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     use crate::text_calls::EMPTY_REPLY_NOTICE;
     let _guard = lock_turn_tests();
     let thinking = || text_blocks_body(&[Block::Thinking("The context was compacted.")], "end_turn");
@@ -309,6 +316,7 @@ async fn test_a_reply_with_no_text_and_no_call_gets_one_nudge(pool: PgPool) {
 /// second empty reply is nudged too (review 1 corrected this comment).
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_nudge_resets_after_a_real_call(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let thinking = || text_blocks_body(&[Block::Thinking("Hmm.")], "end_turn");
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
@@ -322,6 +330,7 @@ async fn test_the_nudge_resets_after_a_real_call(pool: PgPool) {
 /// only the cut-off notice, and the turn ends as before.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_cut_off_reply_with_markup_gets_only_the_cut_off_notice(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     let body = text_blocks_body(&[Block::Text(EVIDENCE)], "max_tokens");
@@ -338,6 +347,7 @@ async fn test_a_cut_off_reply_with_markup_gets_only_the_cut_off_notice(pool: PgP
 /// telling the model it didn't would have it make the call again.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_markup_for_a_call_the_reply_also_made_gets_no_correction(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     let markup = "<tool_call>\n<function=todoread>\n</function>\n</tool_call>";
@@ -357,6 +367,7 @@ async fn test_markup_for_a_call_the_reply_also_made_gets_no_correction(pool: PgP
 /// calls that ran.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_unnamed_markup_beside_real_calls_gets_no_correction(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     let markup = "[TOOL_CALLS][{\"name\": \"todoread\", \"arguments\": {}}]";

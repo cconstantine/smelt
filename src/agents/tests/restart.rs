@@ -41,6 +41,7 @@ async fn restart_notices(pool: &PgPool, id: i64) -> i64 {
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_child_cut_off_mid_turn_gets_the_restart_notice_and_carries_on(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let requests = setup(&pool, vec![text_reply("Carrying on.")]).await;
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let child = active_child(&pool, root).await;
@@ -85,6 +86,7 @@ async fn test_a_child_cut_off_mid_turn_gets_the_restart_notice_and_carries_on(po
 /// one whose last message is a notice saved while it was idle.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_restart_notice_is_only_for_an_active_child_cut_off_mid_turn(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let requests = setup(&pool, vec![text_reply("Carrying on.")]).await;
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     cut_off_turn(&pool, root).await;
@@ -156,6 +158,7 @@ async fn test_the_restart_notice_is_only_for_an_active_child_cut_off_mid_turn(po
 /// restarts again: the second restart adds none.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_two_restarts_in_a_row_queue_one_notice(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     setup(&pool, vec![text_reply("Carrying on.")]).await;
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let child = active_child(&pool, root).await;
