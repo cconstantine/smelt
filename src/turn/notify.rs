@@ -259,16 +259,25 @@ pub(super) async fn drain_idle_command_notices(
 }
 
 /// Whether this turn saved an idle notice among its persisted messages:
-/// any saved **user** message carrying `IDLE_NOTICE_FRAGMENT`. A turn that
-/// drained one owes the user no `Finished` at its end (SME-370) — it is
-/// smelt telling itself about a command that keeps running, every interval,
-/// not an answer awaited. The role check keeps an assistant reply that
-/// merely *quoted* the notice's sentence from quieting its own turn.
+/// any saved **user** message with a Text block carrying
+/// `IDLE_NOTICE_FRAGMENT`. A turn that drained one owes the user no
+/// `Finished` at its end (SME-370) — it is smelt telling itself about a
+/// command that keeps running, every interval, not an answer awaited.
+/// Text blocks only, the notice's own shape: tool results ride user-role
+/// too, and one merely *echoing* the sentence — a grep of this file is the
+/// way — is no notice (SME-370 review 1); the role check likewise drops an
+/// assistant reply quoting it, and unparseable content matches nothing.
 #[cfg(feature = "server")]
 pub(super) fn saved_idle_notice(persisted: &[Message]) -> bool {
-    persisted
-        .iter()
-        .any(|m| m.role == "user" && m.content.contains(IDLE_NOTICE_FRAGMENT))
+    persisted.iter().any(|m| {
+        m.role == "user"
+            && m.blocks().is_ok_and(|blocks| {
+                blocks.iter().any(|b| {
+                    matches!(b, anthropic::ContentBlock::Text { text }
+                        if text.contains(IDLE_NOTICE_FRAGMENT))
+                })
+            })
+    })
 }
 
 /// Drains the reports and notices queued to `conversation_id`

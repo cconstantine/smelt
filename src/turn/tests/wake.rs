@@ -315,6 +315,60 @@ async fn test_wake_drains_an_idle_notice_and_the_command_keeps_running(pool: PgP
     assert_eq!(counter.load(Ordering::SeqCst), 1, "one API call, for the notice");
 }
 
+/// SME-370 review 1: the Finished-suppression predicate reads Text blocks,
+/// not raw `content`. Tool results ride as user-role messages exactly like
+/// the notice does, and one whose output merely *echoes* the notice's
+/// sentence — grepping `notify.rs` is the way to hit this — is no notice,
+/// and must not quiet its turn's `Finished`.
+#[test]
+fn test_saved_idle_notice_reads_text_blocks_not_tool_output() {
+    let message = |role: &str, content: String| crate::models::Message {
+        id: 1,
+        conversation_id: 1,
+        role: role.to_string(),
+        content,
+        created_at: chrono::Utc::now().naive_utc(),
+    };
+    let sentence = "Terminal command cmd-1 (\"sleep 100\", running for 10 minutes) is still running and hasn't been touched in 10 minutes: 0 lines on stdout, 0 on stderr.";
+    let one_block = |block: anthropic::ContentBlock| {
+        serde_json::to_string(&vec![block]).expect("blocks serialize")
+    };
+
+    // The notice itself: a saved user Text block.
+    let notice = message(
+        "user",
+        one_block(anthropic::ContentBlock::Text { text: sentence.to_string() }),
+    );
+    assert!(saved_idle_notice(&[notice]), "the saved notice *is* the marker");
+
+    // The same sentence echoed inside a tool result: user-role too, but
+    // the model's own reading of the file, not smelt telling it a command
+    // keeps running.
+    let echoed = message(
+        "user",
+        one_block(anthropic::ContentBlock::ToolResult {
+            tool_use_id: "toolu_1".to_string(),
+            content: format!("turn/notify.rs:42: {sentence}"),
+            is_error: None,
+        }),
+    );
+    assert!(
+        !saved_idle_notice(&[echoed]),
+        "a tool result echoing the sentence is not a notice"
+    );
+
+    // An assistant reply quoting the sentence is no notice either.
+    let quoted = message(
+        "assistant",
+        one_block(anthropic::ContentBlock::Text { text: sentence.to_string() }),
+    );
+    assert!(!saved_idle_notice(&[quoted]), "no assistant message is a notice");
+
+    // Unparseable content simply doesn't match — it quiets nothing.
+    let junk = message("user", "is still running and hasn't been touched in — not json".to_string());
+    assert!(!saved_idle_notice(&[junk]), "unparseable content quiets nothing");
+}
+
 /// SME-79: the wake-up is for *untouched* commands. A running command
 /// nobody has left long is no reason to wake anyone.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
