@@ -31,13 +31,133 @@ async fn test_a_persona_not_in_the_parents_checkout_is_refused_before_anything_i
     let refused = start_on(&pool, root, serde_json::json!({"brief": "x", "repo": "/workspace/app", "persona": "developer"}))
         .await
         .expect_err("refused");
-    assert_eq!(refused, "no persona `developer` in /workspace/app (its personas: reviewer); list_personas lists them");
+    assert_eq!(refused, "no persona `app:developer` in /workspace/app (its personas: app:reviewer); list_personas lists them");
+    // A bare name with no repo: no checkout of the caller's records one.
     let refused = start_on(&pool, root, serde_json::json!({"brief": "x", "persona": "developer"})).await.expect_err("refused");
-    assert_eq!(refused, "persona needs repo: the checkout whose .agents/personas/ it's in");
-    let refused = start_on(&pool, root, serde_json::json!({"brief": "x", "repo": "/workspace/app", "persona": "../x"}))
+    assert_eq!(
+        refused,
+        "persona `developer` needs its repo: name it scoped, as list_personas does \
+         (no checkout of yours has one; list_personas lists them)"
+    );
+    for bad in ["../x", "app:", "app:../x", "app:Developer"] {
+        let refused = start_on(&pool, root, serde_json::json!({"brief": "x", "repo": "/workspace/app", "persona": bad}))
+            .await
+            .expect_err("refused");
+        assert!(refused.contains("isn't a persona name"), "{bad}: {refused}");
+    }
+    assert_eq!(children(&pool, root).await, 0);
+}
+
+#[test]
+fn test_split_name_splits_at_the_last_colon() {
+    use crate::agents::persona::split_name;
+    assert_eq!(split_name("app:developer"), (Some("app"), "developer"));
+    assert_eq!(split_name("x:y:developer"), (Some("x:y"), "developer"));
+    assert_eq!(split_name("developer"), (None, "developer"));
+    assert_eq!(split_name("app:"), (Some("app"), ""));
+}
+
+const LIB_URL: &str = "https://example.com/team/lib.git";
+const LIB_KEY: &str = "example.com/team/lib";
+
+/// Records `files` as the persona files of `root`'s checkout `dir`, as a
+/// clone or list_personas does.
+async fn record_personas(pool: &PgPool, root: i64, dir: &str, files: &[&str]) {
+    let files: Vec<String> = files.iter().map(|f| f.to_string()).collect();
+    sqlx::query("UPDATE conversation_repos SET persona_files = $3 WHERE conversation_id = $1 AND dir = $2")
+        .bind(root)
+        .bind(dir)
+        .bind(&files)
+        .execute(pool)
+        .await
+        .expect("record persona files");
+}
+
+/// A scoped name names its repo: no `repo` needed, with or without a ref.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_scoped_persona_starts_with_no_repo(pool: PgPool) {
+    setup(&pool, vec![text_reply("ok")]).await;
+    let mut fake = fake_with(&[(DEVELOPER, persona_file(None, "Work.\n"))]);
+    fake.parent = Some(Ok((COMMIT.to_string(), "main".to_string())));
+    fake.parent_personas = vec![DEVELOPER.to_string()];
+    let root = root_with_checkout(&pool, Some(true), Arc::new(fake)).await;
+    let mut started = Vec::new();
+    for input in [
+        serde_json::json!({"brief": "x", "persona": "app:developer"}),
+        serde_json::json!({"brief": "x", "persona": "app:developer", "ref": "v2"}),
+        serde_json::json!({"brief": "x", "persona": "app:developer", "repo": "/workspace/app/"}),
+    ] {
+        let result = start_on(&pool, root, input.clone()).await.unwrap_or_else(|e| panic!("{input}: {e}"));
+        assert!(result.contains("(app:developer)"), "{result}");
+        let child = child_of(&pool, root, &result).await;
+        eventually("the child goes active", || async { state(&pool, child).await.as_deref() == Some(db::AGENT_ACTIVE) }).await;
+        let name: Option<String> = sqlx::query_scalar("SELECT persona_name FROM agents WHERE conversation_id = $1")
+            .bind(child)
+            .fetch_one(&pool)
+            .await
+            .expect("the child's row");
+        assert_eq!(name.as_deref(), Some("developer"));
+        let repos = db::list_conversation_repos(&pool, child).await.expect("repos");
+        assert_eq!(repos.iter().map(|r| r.dir.as_str()).collect::<Vec<_>>(), ["app"]);
+        let persona = db::agent_persona(&pool, child).await.expect("persona").expect("a persona");
+        assert_eq!(persona.persona_path, "/workspace/app/.agents/personas/developer.md");
+        started.push(child);
+    }
+    eventually("every turn is over", || async {
+        !crate::turn::turn_running(root) && started.iter().all(|c| !crate::turn::turn_running(*c))
+    })
+    .await;
+}
+
+/// Two checkouts each with a `developer`: the scoped name picks its own,
+/// and a bare name with no repo is refused, naming both.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_two_repos_developer_scoped_picks_its_repo_and_bare_is_refused(pool: PgPool) {
+    setup(&pool, vec![text_reply("ok")]).await;
+    let mut fake = fake_with(&[
+        (format!("app/{DEVELOPER}").as_str(), persona_file(None, "App's work.\n")),
+        (format!("lib/{DEVELOPER}").as_str(), persona_file(None, "Lib's work.\n")),
+    ]);
+    fake.parent = Some(Ok((COMMIT.to_string(), "main".to_string())));
+    fake.parent_personas_in = [("app", vec![DEVELOPER.to_string()]), ("lib", vec![DEVELOPER.to_string()])]
+        .into_iter()
+        .map(|(dir, paths)| (dir.to_string(), paths))
+        .collect();
+    let root = root_with_checkout(&pool, Some(true), Arc::new(fake)).await;
+    let lib = db::create_conversation_repo(&pool, root, LIB_URL, LIB_KEY, None, "lib").await.expect("a repo row");
+    db::set_repo_cloned(&pool, lib.id, "main", Some(COMMIT)).await.expect("ready");
+    db::set_repo_trust(&pool, LIB_KEY, true).await.expect("trust");
+    record_personas(&pool, root, "app", &[DEVELOPER]).await;
+    record_personas(&pool, root, "lib", &[DEVELOPER, ".agents/personas/reviewer.md"]).await;
+
+    let result = start_on(&pool, root, serde_json::json!({"brief": "x", "persona": "lib:developer"})).await.expect("started");
+    assert!(result.contains("(lib:developer)") && result.contains(LIB_URL), "{result}");
+    let child = child_of(&pool, root, &result).await;
+    eventually("the child goes active", || async { state(&pool, child).await.as_deref() == Some(db::AGENT_ACTIVE) }).await;
+    let persona = db::agent_persona(&pool, child).await.expect("persona").expect("a persona");
+    assert_eq!(persona.persona_path, "/workspace/lib/.agents/personas/developer.md");
+    assert!(persona.persona_body.contains("Lib's work."), "{}", persona.persona_body);
+
+    let refused = start_on(&pool, root, serde_json::json!({"brief": "x", "persona": "developer"})).await.expect_err("refused");
+    assert_eq!(
+        refused,
+        "persona `developer` needs its repo: name it scoped, as list_personas does (app:developer, lib:developer)"
+    );
+    assert_eq!(children(&pool, root).await, 1, "a refusal writes nothing");
+    eventually("every turn is over", || async { !crate::turn::turn_running(root) && !crate::turn::turn_running(child) }).await;
+}
+
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_scoped_persona_and_a_different_repo_are_refused(pool: PgPool) {
+    setup(&pool, vec![text_reply("ok")]).await;
+    let root = root_with_checkout(&pool, Some(true), Arc::new(fake_with(&[]))).await;
+    let refused = start_on(&pool, root, serde_json::json!({"brief": "x", "persona": "app:developer", "repo": "/workspace/lib"}))
         .await
         .expect_err("refused");
-    assert!(refused.contains("isn't a persona name"), "{refused}");
+    assert_eq!(
+        refused,
+        "persona `app:developer` is in /workspace/app, but repo is /workspace/lib; drop repo or make them agree"
+    );
     assert_eq!(children(&pool, root).await, 0);
 }
 

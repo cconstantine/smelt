@@ -10,16 +10,82 @@ fn persona_file(name: &str) -> String {
     format!(".agents/personas/{name}.md")
 }
 
-/// `start_agent`'s `persona`: a name a persona file can have.
-pub(crate) fn check_name(name: &str) -> Result<(), String> {
-    if crate::personas::is_persona_file_name(&format!("{name}.md")) {
+/// `start_agent`'s `persona`, `<repo dir>:<name>` as list_personas names
+/// it, split at its last `:` (a name holds none); a bare name has no dir.
+pub(crate) fn split_name(persona: &str) -> (Option<&str>, &str) {
+    match persona.rsplit_once(':') {
+        Some((dir, name)) => (Some(dir), name),
+        None => (None, persona),
+    }
+}
+
+/// `start_agent`'s `persona`: a name a persona file can have, scoped to a
+/// checkout dir or bare.
+pub(crate) fn check_name(persona: &str) -> Result<(), String> {
+    let (dir, name) = split_name(persona);
+    if dir != Some("") && crate::personas::is_persona_file_name(&format!("{name}.md")) {
         Ok(())
     } else {
         Err(format!(
-            "{name:?} isn't a persona name: 1 to 64 lowercase letters, digits and -, as in \
-             .agents/personas/<name>.md (list_personas lists them)"
+            "{persona:?} isn't a persona name: <repo dir>:<name>, the name 1 to 64 lowercase letters, \
+             digits and -, as in smelt:developer, or developer with repo (list_personas lists them)"
         ))
     }
+}
+
+/// `start_agent`'s `persona` and `repo`, checked against each other: the
+/// bare persona name and the checkout path. A scoped name supplies its
+/// repo; a bare one needs `repo`, and without it is refused naming the
+/// scoped names that match (SME-368).
+pub(crate) async fn with_repo<'a>(
+    pool: &PgPool,
+    caller: i64,
+    persona: Option<&'a str>,
+    repo: Option<&'a str>,
+) -> Result<(Option<&'a str>, Option<String>), String> {
+    let Some(persona) = persona else {
+        return Ok((None, repo.map(str::to_string)));
+    };
+    check_name(persona)?;
+    let (dir, name) = split_name(persona);
+    match (dir, repo) {
+        (Some(dir), None) => Ok((Some(name), Some(format!("{}/{dir}", crate::sandbox::WORKSPACE_DIR)))),
+        (Some(dir), Some(path)) => {
+            let named = format!("{}/{dir}", crate::sandbox::WORKSPACE_DIR);
+            if path.trim().trim_end_matches('/') == named {
+                Ok((Some(name), Some(path.to_string())))
+            } else {
+                Err(format!("persona `{persona}` is in {named}, but repo is {path}; drop repo or make them agree"))
+            }
+        }
+        (None, Some(path)) => Ok((Some(name), Some(path.to_string()))),
+        (None, None) => Err(bare_refusal(pool, caller, name).await),
+    }
+}
+
+/// A bare persona name with no repo, refused: the scoped names it could
+/// mean, from the caller's ready checkouts' recorded persona files (the
+/// clone's, refreshed by list_personas). A hint only: the start itself
+/// checks the checkout.
+async fn bare_refusal(pool: &PgPool, caller: i64, name: &str) -> String {
+    let file = persona_file(name);
+    let scoped: Vec<String> = match db::list_conversation_repos(pool, caller).await {
+        Ok(repos) => repos
+            .into_iter()
+            .filter(|r| r.status == "ready" && r.persona_files.contains(&file))
+            .map(|r| format!("{}:{name}", r.dir))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't read the checkouts for a bare persona's refusal");
+            Vec::new()
+        }
+    };
+    let hint = if scoped.is_empty() {
+        "no checkout of yours has one; list_personas lists them".to_string()
+    } else {
+        scoped.join(", ")
+    };
+    format!("persona `{name}` needs its repo: name it scoped, as list_personas does ({hint})")
 }
 
 /// Without a ref, the persona must be in the parent's checkout now, so a
@@ -29,13 +95,14 @@ pub(crate) async fn check_in_parent(pool: &PgPool, parent: i64, dir: &str, name:
     if paths.iter().any(|p| *p == persona_file(name)) {
         return Ok(());
     }
-    let names: Vec<&str> = paths
+    let names: Vec<String> = paths
         .iter()
         .filter_map(|p| p.strip_prefix(".agents/personas/").and_then(|f| f.strip_suffix(".md")))
+        .map(|n| format!("{dir}:{n}"))
         .collect();
     let theirs = if names.is_empty() { "none".to_string() } else { names.join(", ") };
     Err(format!(
-        "no persona `{name}` in {}/{dir} (its personas: {theirs}); list_personas lists them",
+        "no persona `{dir}:{name}` in {}/{dir} (its personas: {theirs}); list_personas lists them",
         crate::sandbox::WORKSPACE_DIR
     ))
 }

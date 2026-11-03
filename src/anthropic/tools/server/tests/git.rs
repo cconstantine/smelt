@@ -54,3 +54,16 @@ async fn test_clone_repo_tool_needs_a_url(pool: sqlx::PgPool) {
     assert!(outside.contains("isn't in"), "{outside}");
 }
 
+/// SME-368: list_personas no longer says nothing can be started with a
+/// persona, and start_agent's `persona` takes the scoped name it shows.
+#[test]
+fn test_list_personas_points_at_start_agent_which_takes_its_scoped_name() {
+    let defs = native_tool_definitions();
+    let list = defs.iter().find(|d| d.name == "list_personas").expect("list_personas");
+    assert!(!list.description.contains("Nothing can be started"), "{}", list.description);
+    assert!(list.description.contains("start_agent"), "{}", list.description);
+    let start = defs.iter().find(|d| d.name == "start_agent").expect("start_agent");
+    let persona = start.input_schema["properties"]["persona"]["description"].as_str().expect("persona's description");
+    assert!(persona.contains("<repo dir>:<name>") && persona.contains("smelt:developer"), "{persona}");
+}
+

@@ -21,7 +21,11 @@ pub(super) struct FakeCheckout {
     pub parent: Option<Result<(String, String), String>>,
     /// The parent's persona files, relative to its checkout.
     pub parent_personas: Vec<String>,
-    /// Other files in the child's checkout, by path relative to it.
+    /// The parent's persona files in one checkout dir, over
+    /// `parent_personas`, for a parent with two checkouts (SME-368).
+    pub parent_personas_in: std::collections::HashMap<String, Vec<String>>,
+    /// Other files in the child's checkout, by path relative to it; a
+    /// `<dir>/<path>` key is that checkout's alone, and wins.
     pub files: Mutex<std::collections::HashMap<String, String>>,
 }
 
@@ -39,9 +43,9 @@ impl ChildCheckout for FakeCheckout {
         &'a self,
         _pool: &'a PgPool,
         _parent: i64,
-        _dir: &'a str,
+        dir: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>, String>> + Send + 'a>> {
-        Box::pin(async move { Ok(self.parent_personas.clone()) })
+        Box::pin(async move { Ok(self.parent_personas_in.get(dir).unwrap_or(&self.parent_personas).clone()) })
     }
 
     fn clone_repo<'a>(
@@ -76,13 +80,16 @@ impl ChildCheckout for FakeCheckout {
         &'a self,
         _pool: &'a PgPool,
         _child: i64,
-        _dir: &'a str,
+        dir: &'a str,
         rel: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<db::InstructionsFile>, String>> + Send + 'a>> {
         Box::pin(async move {
             let content = match rel {
                 "AGENTS.md" => self.agents_md.clone(),
-                rel => self.files.lock().expect("files").get(rel).cloned(),
+                rel => {
+                    let files = self.files.lock().expect("files");
+                    files.get(&format!("{dir}/{rel}")).or_else(|| files.get(rel)).cloned()
+                }
             };
             Ok(content.map(|content| db::InstructionsFile {
                 file_bytes: content.len() as i64,
