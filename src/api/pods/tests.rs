@@ -267,8 +267,8 @@ fn test_storage_rows_groups_a_conversations_two_claims() {
             conversation_id: 7,
             conversation_title: "seat a".into(),
             volumes: vec![
-                StoredVolume { kind: StorageKind::Workspace, size: Some("20Gi".into()), deleting: false , node: None},
-                StoredVolume { kind: StorageKind::Docker, size: Some("20Gi".into()), deleting: true , node: None},
+                StoredVolume { kind: StorageKind::Workspace, size: Some("20Gi".into()), deleting: false, node: None },
+                StoredVolume { kind: StorageKind::Docker, size: Some("20Gi".into()), deleting: true, node: None },
             ],
             stopped: None,
             observed_at: chrono::NaiveDateTime::default(),

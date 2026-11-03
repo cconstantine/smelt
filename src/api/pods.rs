@@ -273,15 +273,15 @@ fn parse_pod_metrics(list: &serde_json::Value) -> std::collections::HashMap<Stri
         .collect()
 }
 
-/// Which claim of the conversation pair a claim name is lives in
-/// `sandbox::spec::conversation_claim_kind` — one decision, one place
-/// (SME-253 review 1, finding 5).
-///
 /// The annotation the scheduler sets on a WaitForFirstConsumer claim
 /// once a pod using it has a node, which local-path then provisions on.
 #[cfg(feature = "server")]
 const SELECTED_NODE: &str = "volume.kubernetes.io/selected-node";
 
+/// Which claim of the conversation pair a claim name is lives in
+/// `sandbox::spec::conversation_claim_kind` — one decision, one place
+/// (SME-253 review 1, finding 5).
+///
 /// The stored-volumes view's rows: `claims` (already narrowed to this
 /// instance's conversation claims) grouped per conversation, `deleting`
 /// from the deletion timestamp, `size` from bound capacity else the
