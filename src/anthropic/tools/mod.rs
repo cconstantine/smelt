@@ -249,21 +249,20 @@ mod server {
     }
 
     /// The tool a call names: one of smelt's, or an MCP server's.
-    enum Target<'a> {
+    enum Target {
         Native(&'static super::Registered),
-        Mcp { config: crate::db::McpServerConfig, tool: &'a str },
+        /// `tool` is the tool's part of the model's name; the call maps it
+        /// to the name the server lists it under (SME-365).
+        Mcp { config: crate::db::McpServerConfig, tool: String },
     }
 
     /// Finds the tool `name` names. An unknown tool, or an MCP server
     /// that isn't configured, is a plain tool error: the config could have
     /// been deleted between when `tool_definitions` last offered the tool
     /// and when the model called it.
-    async fn resolve<'a>(pool: &PgPool, name: &'a str) -> Result<Target<'a>, String> {
-        if let Some((server_name, tool)) = crate::mcp::parse_tool_name(name) {
-            let config = crate::db::get_mcp_server_config_by_name(pool, server_name)
-                .await
-                .map_err(|e| format!("failed to look up MCP server {server_name:?}: {e}"))?
-                .ok_or_else(|| format!("unknown MCP server: {server_name:?}"))?;
+    async fn resolve(pool: &PgPool, name: &str) -> Result<Target, String> {
+        if crate::mcp::parse_tool_name(name).is_some() {
+            let (config, tool) = crate::mcp::resolve_tool(pool, name).await?;
             return Ok(Target::Mcp { config, tool });
         }
         super::REGISTRY
@@ -296,7 +295,7 @@ mod server {
                 // consults before it sends; the class is recorded either
                 // way, allowed or refused.
                 let chain = call_rule_chain(pool, conversation_id, name).await?;
-                crate::mcp::call_tool_classed(pool, &config, tool, input.clone(), |class| {
+                crate::mcp::call_tool_classed(pool, &config, &tool, input.clone(), |class, tool| {
                     record(class);
                     chain.allows_at(crate::personas::rules::ToolRef::Mcp { server: &config.name, tool }, class)
                 })
