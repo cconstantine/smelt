@@ -164,6 +164,37 @@ async fn untouched_running_command(pool: &PgPool, conversation_id: i64, command_
         .expect("backdate created_at");
 }
 
+/// Both notices due at once, on one live pod — the mixed drain SME-370
+/// tests: a command already finished with its notice owed, and a second
+/// command running untouched past its interval. The two single-purpose
+/// fixtures above can't share a conversation (`sandbox_pods` allows one
+/// live pod each), so this builds the pair the way the pod watch finds
+/// them: two terminals, both notices unmarked.
+async fn finished_and_idle_commands(pool: &PgPool, conversation_id: i64) {
+    let pod = db::create_sandbox_pod(pool, conversation_id)
+        .await
+        .expect("create sandbox pod");
+    let terminal = db::create_sandbox_terminal(pool, pod.id)
+        .await
+        .expect("create sandbox terminal");
+    db::create_terminal_command(pool, conversation_id, terminal.id, "cmd-1", "echo hi", 300)
+        .await
+        .expect("create terminal command");
+    db::mark_terminal_command_finished(pool, "cmd-1", 0)
+        .await
+        .expect("mark terminal command finished");
+    let idle_terminal = db::create_sandbox_terminal(pool, pod.id)
+        .await
+        .expect("create sandbox terminal");
+    db::create_terminal_command(pool, conversation_id, idle_terminal.id, "cmd-idle", "sleep 100", 300)
+        .await
+        .expect("create terminal command");
+    sqlx::query("UPDATE terminal_commands SET created_at = now() - make_interval(secs => 601) WHERE command_id = 'cmd-idle'")
+        .execute(pool)
+        .await
+        .expect("backdate created_at");
+}
+
 /// Like `start_mock_upstream` (replies in order, the last one repeated),
 /// but also keeps every request body it receives, parsed as JSON, so a
 /// test can check what was actually sent. Same locking rule as

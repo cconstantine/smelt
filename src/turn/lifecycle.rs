@@ -168,7 +168,16 @@ pub(super) fn run_turn_bounded<'a>(
                 // user-row case already noted the Question at `ask`; a
                 // parent-row wait notes nothing at all (Revision 6). The
                 // `ends` path — `finish`, a plain reply — has no row.
-                Ok(persisted) if persisted.iter().any(|m| m.role == "assistant") => {
+                // SME-370: an idle-notice turn — one that saved an idle
+                // notice — owes no Finished whatever it waits on, so it
+                // skips the wait read with the note; a question asked or a
+                // failure met during such a turn still notes, at its own
+                // site. Without this the watch's every-interval pings all
+                // notify "smelt: done" (SME-71's named follow-up).
+                Ok(persisted)
+                    if persisted.iter().any(|m| m.role == "assistant")
+                        && !saved_idle_notice(persisted) =>
+                {
                     // A read that fails says "no wait" and notes a
                     // Finished — best-effort notifying beats silence —
                     // but the wait-aware rule silently degraded, so say
