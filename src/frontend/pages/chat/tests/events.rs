@@ -26,7 +26,7 @@ fn test_change_sandbox_panel_changes_the_pods_and_terminals_together() {
         let snapshot = SandboxSnapshot {
             pods: vec![SandboxPodSummary {
                 pod_id: 2,
-                status: "Running".to_string(),
+                status: "Running".to_string(), node: None,
                 terminals: vec![SandboxTerminalSummary {
                     terminal_id: 20,
                     pod_id: 2,
@@ -94,11 +94,11 @@ fn test_apply_event_a_saved_reply_replaces_its_streaming_copy() {
 #[test]
 fn test_apply_event_sandbox_pod_update_adds_then_removes_the_pod() {
     with_state(|state| {
-        let effect = apply_event(state, ConversationEvent::SandboxPodUpdate { pod_id: 7, status: "running".to_string(), terminated: false });
+        let effect = apply_event(state, ConversationEvent::SandboxPodUpdate { pod_id: 7, status: "running".to_string(), node: None, terminated: false });
         assert_eq!(effect, EventEffect::None);
         assert_eq!(state.sandbox_pods().peek().iter().map(|p| (p.pod_id, p.status.clone())).collect::<Vec<_>>(), vec![(7, "running".to_string())]);
         apply_event(state, ConversationEvent::SandboxTerminalUpdate { pod_id: 7, terminal_id: 70, status: "open".to_string(), terminated: false });
-        apply_event(state, ConversationEvent::SandboxPodUpdate { pod_id: 7, status: "gone".to_string(), terminated: true });
+        apply_event(state, ConversationEvent::SandboxPodUpdate { pod_id: 7, status: "gone".to_string(), node: None, terminated: true });
         assert!(state.sandbox_pods().peek().is_empty());
         assert!(state.sandbox_terminals().peek().is_empty(), "the pod's terminals go with it");
     });
@@ -107,7 +107,7 @@ fn test_apply_event_sandbox_pod_update_adds_then_removes_the_pod() {
 #[test]
 fn test_apply_event_sandbox_preview_update_sets_the_pods_previews() {
     with_state(|state| {
-        apply_event(state, ConversationEvent::SandboxPodUpdate { pod_id: 7, status: "running".to_string(), terminated: false });
+        apply_event(state, ConversationEvent::SandboxPodUpdate { pod_id: 7, status: "running".to_string(), node: None, terminated: false });
         let effect = apply_event(state, ConversationEvent::SandboxPreviewUpdate { pod_id: 7, previews: vec![preview(3000)] });
         assert_eq!(effect, EventEffect::None);
         assert_eq!(state.sandbox_pods().peek()[0].previews, vec![preview(3000)]);

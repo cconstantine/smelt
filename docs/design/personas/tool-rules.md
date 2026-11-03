@@ -54,7 +54,7 @@ A tool with no annotations is destructive, the spec's defaults (`readOnlyHint` f
 
 ## The grammar
 
-A persona's rules are its file's `smelt.tools` ([persona-files.md](persona-files.md#the-format-markdown-with-yaml-frontmatter-smelts-settings-under-one-key)):
+A persona's rules are its file's `smelt.tools` (plus an optional `own:` block in the same grammar that binds only its own conversation, see [Narrowing](#narrowing-a-child-never-gets-more-than-its-parent); [persona-files.md](persona-files.md#the-format-markdown-with-yaml-frontmatter-smelts-settings-under-one-key)):
 
 ```yaml
 smelt:
@@ -109,11 +109,25 @@ A child's **effective rules** are its persona's rules (allow-all when it has no 
 
 At `start_agent`, smelt stores the child's **rule chain**: the parent's stored chain plus the child's own persona rules, as data (JSONB on the child's `agents` row, [agents.md](agents.md#the-schema)). Evaluation walks the chain (as deep as the nesting limit), so nothing is recomputed from files that may have changed. The same goes for the chain credentials (`git-ssh`) and volumes: a child gets `git-ssh` only if its chain's bit says so — `create_child` seeded it from the parent's, narrowed by the persona's ask — and only volumes its parent created or has mounted. **Named secrets are exempt**, the user's answer to SME-242's question: the persona alone decides who holds one, so a grandchild can hold a secret no ancestor ever held, and the whole guard there is that a persona file can only run from a repo the user trusts ([credentials](#credentials)).
 
+**Rules that bind only their own conversation** (SME-322). A dispatcher — the Project Manager, a Ticket Driver — starts the seats that do the work, so a deny it holds for its own sake would cascade down and disarm them: a driver's `deny: [write_file]` would leave its Developer unable to write. Its persona's `smelt.tools` may hold an `own:` block, in the same grammar (a class and allow/deny lists, no nested `own`), that binds the conversation it's on and none of the agents it starts:
+
+```yaml
+smelt:
+  tools:
+    deny: [create_volume]      # binds the driver and everything under it
+    own:
+      deny: [write_file, edit_file, github/merge_pull_request]   # binds the driver only
+```
+
+The `own` rides on the persona's chain entry as one more conjunct of that entry, so it only narrows: it can't allow what the entry or an earlier one denies. A child starts with its parent's chain with every entry's `own` taken out (`personas::rules::for_child`), so an `own` is only ever on the entry its conversation's persona added — a persona-less child, which inherits its parent's chain as is, inherits no `own` either. A refusal by an `own` rule says it binds this conversation and not its agents. An `own` allow can't widen anything either: over the `all` class an allow-only `own` is a no-op, though one can carve an exception out of a stricter `own` class (`own: {class: read-only, allow: [save_comment]}`).
+
+An `own` is restraint, not containment: the agents a persona starts may do whatever its `own` denies it, unless the cascading part of its rules denies that too — a driver with `own: deny [github/merge_pull_request]` can start a persona-less child whose brief is to merge. Deny `start_agent` itself, or the tool in the cascading part, to contain. And a deploy rolled back past SME-322 reads stored entries without `own` (the stored rules ignore an unknown field), so running agents lose their `own` rules until the rollback is undone.
+
 **Alternatives:** computing the child's rules once as a flat allow-set loses wildcards and the class ceiling, so a tool from an MCP server added later would be judged by nobody; inheriting only the persona's rules (opencode, whose subagent uses its own agent's permissions, `packages/core/src/tool/plugin/subagent.ts`) lets a child of a read-only parent write.
 
 ## Credentials
 
-What a sandbox pod holds: the SSH key and commit identity its conversation is granted, and its granted named secrets — written into `/etc/smelt` under one install lock by `credentials::install_*` (`src/credentials.rs`) at pod start (`install_into_new_pod`) and into every live pod when a key, the identity or a secret changes (`install_into_live_pods`). Nothing else: the pod spec's only environment variable is `WORKSPACE_OWNER` (`src/sandbox/spec.rs`). The namespace's default service-account token is mounted, since the spec doesn't set `automountServiceAccountToken: false`; that's SME-63's.
+What a sandbox pod holds: the SSH key and commit identity its conversation is granted, and its granted named secrets — written into `/etc/smelt` under one install lock by `credentials::install_*` (`src/credentials.rs`) at pod start (`install_into_new_pod`) and into every live pod when a key, the identity or a secret changes (`install_into_live_pods`). Nothing else: the pod spec's environment variables are `WORKSPACE_OWNER` on the Docker sidecar and `NODE_NAME` (the downward API's node, SME-304) on the sandbox container (`src/sandbox/spec/pods.rs`). The namespace's default service-account token is mounted, since the spec doesn't set `automountServiceAccountToken: false`; that's SME-63's.
 
 **Built (SME-242):** one function decides what a pod holds — `credentials::for_conversation(pool, conversation)` — and every site that installs a file asks it: pod start, the live-pod install after a key, identity or secret change, and a child's start, reconciled into its pod (`reconcile_pod`) before `complete_start` wakes the first turn. Before it there were two code paths each deciding for itself: pod start installed whatever git's state held into every pod, the live-pod install asked the same of keys, and neither asked **which conversation** the pod belonged to — every pod got the key. A persona now lists what it runs with, `smelt.credentials: [git-ssh, …]`; absent is none. Two rules answer, kept apart so one can never narrow the other by accident:
 

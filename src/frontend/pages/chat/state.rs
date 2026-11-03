@@ -197,9 +197,9 @@ pub(super) fn apply_event(state: Store<ConversationState>, event: ConversationEv
             accept_saved_messages(&mut state.messages().write(), rows);
             return EventEffect::ConversationsChanged;
         }
-        ConversationEvent::SandboxPodUpdate { pod_id, status, terminated } => {
+        ConversationEvent::SandboxPodUpdate { pod_id, status, node, terminated } => {
             change_sandbox_panel(state, |pods, terminals| {
-                apply_sandbox_pod_update(pods, terminals, pod_id, status, terminated)
+                apply_sandbox_pod_update(pods, terminals, pod_id, status, node, terminated)
             });
         }
         ConversationEvent::SandboxPreviewUpdate { pod_id, previews } => {
@@ -385,6 +385,8 @@ pub(super) fn apply_reply_delta(reply: &mut Option<String>, offset: usize, text:
 pub(super) struct SandboxPodPanelEntry {
     pub(super) pod_id: i64,
     pub(super) status: String,
+    /// The node it runs on, once scheduled (SME-304).
+    pub(super) node: Option<String>,
     /// Preview links for the user's own browser (SME-42).
     pub(super) previews: Vec<SandboxPreview>,
 }
@@ -451,11 +453,13 @@ pub(super) fn merge_sandbox_snapshot(
     for pod in snapshot.pods {
         if let Some(entry) = pods.iter_mut().find(|p| p.pod_id == pod.pod_id) {
             entry.status = pod.status.clone();
+            entry.node = pod.node.clone();
             entry.previews = pod.previews.clone();
         } else {
             pods.push(SandboxPodPanelEntry {
                 pod_id: pod.pod_id,
                 status: pod.status.clone(),
+                node: pod.node.clone(),
                 previews: pod.previews.clone(),
             });
         }
@@ -510,6 +514,7 @@ pub(super) fn apply_sandbox_pod_update(
     terminals: &mut Vec<SandboxTerminalPanelEntry>,
     pod_id: i64,
     status: String,
+    node: Option<String>,
     terminated: bool,
 ) {
     if terminated {
@@ -519,8 +524,12 @@ pub(super) fn apply_sandbox_pod_update(
     }
     if let Some(entry) = pods.iter_mut().find(|p| p.pod_id == pod_id) {
         entry.status = status;
+        // An event without one (an older server's) keeps what's known.
+        if node.is_some() {
+            entry.node = node;
+        }
     } else {
-        pods.push(SandboxPodPanelEntry { pod_id, status, previews: Vec::new() });
+        pods.push(SandboxPodPanelEntry { pod_id, status, node, previews: Vec::new() });
     }
 }
 

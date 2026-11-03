@@ -274,6 +274,9 @@ pub(in super::super) fn SandboxPanel(
                 div { key: "{pod.pod_id}", class: "sandbox-pod",
                     div { class: "sandbox-pod-header",
                         span { class: "sandbox-pod-status", "{pod.status}" }
+                        if let Some(node) = pod.node.clone() {
+                            span { class: "sandbox-pod-node", title: "The cluster node this sandbox runs on", "on {node}" }
+                        }
                         super::TwoStepButton {
                             armed: pending_pod_stop() == Some(pod.pod_id),
                             class: "pod-stop",

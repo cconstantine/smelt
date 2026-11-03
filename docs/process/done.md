@@ -34,6 +34,11 @@ For a security boundary, also write down what it does *not* cover, and test the 
 
 **CI runs all of this automatically on every PR** (`.github/workflows/ci.yml`) — `cargo test --features server`, the WASM `cargo check`, and the browser tier, against the same `docker-compose.yml` stack (Postgres, real k3s cluster) local dev uses. A red CI check means the same thing a red local run does; it doesn't replace running these yourself before pushing, since CI turnaround is much slower than local iteration.
 
+**A PR merges only when CI passes on its head** (SME-329, the user's rule since 2026-10-30): "only PRs with passing tests get merged." No merge is signed off past a red, a known flake's included.
+
+- **A test that fails** is fixed in that PR, or in a Test reliability PR that merges first and that this PR then takes in. It's never re-run to green: see [testing.md](../testing.md#keeping-the-suite-fast-and-green).
+- **A red where no test ran** (the checkout, an image pull, the runner's DNS, as on 2026-11-03, SME-362) says nothing about the change. Its failed job may be re-run once, on the same head. Say so in the PR, and file the infrastructure ticket with the error's signature. A second such red is the infrastructure ticket's to fix before merging.
+
 ## Adding a New Feature (Typical Flow)
 
 1. Add struct to `src/models.rs` (see [models.md](../models.md))

@@ -81,12 +81,29 @@ pub(crate) struct ToolRules {
     pub(crate) allow: Vec<Pattern>,
     #[serde(default)]
     pub(crate) deny: Vec<Pattern>,
+    /// Rules that bind this persona's own conversation and not the agents
+    /// it starts (SME-322): its `smelt.tools.own` block. A child inherits
+    /// its parent's chain with every `own` taken out (`for_child`), so an
+    /// `own` is only ever on the entry its conversation's persona added.
+    /// It narrows that entry further; it can't allow what the entry denies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) own: Option<Box<ToolRules>>,
 }
 
 /// The YAML shape, before its patterns are checked: lists as text.
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub(crate) struct RawToolRules {
+    class: Ceiling,
+    allow: Vec<String>,
+    deny: Vec<String>,
+    own: Option<RawOwnRules>,
+}
+
+/// `smelt.tools.own`: the same grammar, without an `own` of its own.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub(crate) struct RawOwnRules {
     class: Ceiling,
     allow: Vec<String>,
     deny: Vec<String>,
@@ -98,23 +115,36 @@ pub(crate) struct RawToolRules {
 /// than one `/`, a `*` in a server segment, and a pattern text in both
 /// lists. A pattern naming a server that isn't configured is none of
 /// them — that's a report, not an error.
-pub(crate) fn check(path: &str, raw: RawToolRules) -> Result<ToolRules, String> {
+pub(crate) fn check(path: &str, mut raw: RawToolRules) -> Result<ToolRules, String> {
+    let own = raw
+        .own
+        .take()
+        .map(|own| check_lists(path, "smelt.tools.own", RawToolRules { class: own.class, allow: own.allow, deny: own.deny, own: None }))
+        .transpose()?
+        .map(Box::new);
+    let mut rules = check_lists(path, "smelt.tools", raw)?;
+    rules.own = own;
+    Ok(rules)
+}
+
+/// One block's class and lists, checked; `block` names it in errors.
+fn check_lists(path: &str, block: &str, raw: RawToolRules) -> Result<ToolRules, String> {
     let parse = |text: String| -> Result<Pattern, String> {
         if text.is_empty() {
-            return Err(format!("{path}: smelt.tools has an empty pattern: name a smelt tool or a <server>/<tool> pair."));
+            return Err(format!("{path}: {block} has an empty pattern: name a smelt tool or a <server>/<tool> pair."));
         }
         match text.split_once('/') {
             Some((server, tool)) if server.contains('/') || tool.contains('/') => Err(format!(
-                "{path}: smelt.tools pattern {text:?} has more than one /: it names a smelt tool, one server's tools, or one tool in one server."
+                "{path}: {block} pattern {text:?} has more than one /: it names a smelt tool, one server's tools, or one tool in one server."
             )),
             // `*/get_*` would let a rule reach every server's reads; the
             // design keeps server rules exact so a server rule can't be
             // undercut by a pattern that names no server.
             Some((server, _)) if server.contains('*') => Err(format!(
-                "{path}: smelt.tools pattern {text:?} has a wildcard in its server part: a pattern's server is always named."
+                "{path}: {block} pattern {text:?} has a wildcard in its server part: a pattern's server is always named."
             )),
             Some((server, tool)) if server.is_empty() || tool.is_empty() => Err(format!(
-                "{path}: smelt.tools pattern {text:?} has an empty part: name both the server and the tool, or neither."
+                "{path}: {block} pattern {text:?} has an empty part: name both the server and the tool, or neither."
             )),
             Some((server, tool)) => Ok(Pattern { server: Some(server.to_string()), tool: tool.to_string() }),
             None => Ok(Pattern { server: None, tool: text }),
@@ -123,9 +153,9 @@ pub(crate) fn check(path: &str, raw: RawToolRules) -> Result<ToolRules, String> 
     let allow = raw.allow.iter().cloned().map(&parse).collect::<Result<Vec<_>, _>>()?;
     let deny = raw.deny.iter().cloned().map(&parse).collect::<Result<Vec<_>, _>>()?;
     if let Some(dup) = raw.deny.iter().find(|text| raw.allow.iter().any(|a| a == *text)) {
-        return Err(format!("{path}: smelt.tools pattern {dup:?} is in both allow and deny: it belongs to one."));
+        return Err(format!("{path}: {block} pattern {dup:?} is in both allow and deny: it belongs to one."));
     }
-    Ok(ToolRules { class: raw.class, allow, deny })
+    Ok(ToolRules { class: raw.class, allow, deny, own: None })
 }
 
 /// What one rule entry judges: a smelt tool by name, or an MCP tool by
@@ -184,6 +214,9 @@ impl RuleChain {
     pub(crate) fn allows_at(&self, tool: ToolRef, class: ToolClass) -> Result<(), String> {
         for entry in &self.0 {
             entry.allows(tool, class)?;
+            if let Some(own) = &entry.own {
+                own.allows(tool, class).map_err(|why| format!("{why}, which binds this conversation and not its agents"))?;
+            }
         }
         Ok(())
     }
@@ -240,11 +273,14 @@ impl ToolRules {
     /// rules nothing. Never an error — a pattern may name a server that
     /// isn't configured yet — so this is a report, made where the rules
     /// are read (SME-241: `list_personas`, and `start_agent` to the parent).
-    /// Allow's patterns first, then deny's, each in the order written.
+    /// Allow's patterns first, then deny's, then `own`'s allow and deny
+    /// (SME-322), each in the order written.
     pub(crate) fn unmatched_servers(&self, server_names: &[String]) -> Vec<String> {
+        let own = self.own.as_deref().map(|own| own.allow.iter().chain(own.deny.iter()));
         self.allow
             .iter()
             .chain(self.deny.iter())
+            .chain(own.into_iter().flatten())
             .filter(|p| match &p.server {
                 // A smelt-tool pattern names no server, so it's never
                 // unmatched; a server pattern is unmatched exactly when no
@@ -314,4 +350,21 @@ fn glob(pattern: &str, text: &str) -> bool {
             })
         }
     }
+}
+
+/// The chain a child starts with: its parent's, every entry's `own` taken
+/// out (SME-322). A self-rule binds the conversation whose persona wrote it;
+/// the agents it starts inherit only the rules meant for the group. The
+/// child's own persona entry, with its `own`, is appended at `complete_start`.
+pub(crate) fn for_child(parent: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    parent.map(|mut chain| {
+        if let Some(entries) = chain.as_array_mut() {
+            for entry in entries {
+                if let Some(entry) = entry.as_object_mut() {
+                    entry.remove("own");
+                }
+            }
+        }
+        chain
+    })
 }

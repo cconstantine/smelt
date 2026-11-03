@@ -174,7 +174,7 @@ pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChi
                 None => true,
                 Some(list) => list.iter().any(|name| name == crate::credentials::CREDENTIAL_GIT_SSH),
             };
-            (depth + 1, root, chain, if git_ssh { vec![crate::credentials::CREDENTIAL_GIT_SSH.to_string()] } else { vec![] })
+            (depth + 1, root, crate::personas::rules::for_child(chain), if git_ssh { vec![crate::credentials::CREDENTIAL_GIT_SSH.to_string()] } else { vec![] })
         }
         // The root's own answer is decided at each install, not here
         // (SME-354 B11): the key if one is stored then. So its child

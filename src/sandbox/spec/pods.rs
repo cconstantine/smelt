@@ -194,6 +194,7 @@ pub(in crate::sandbox) fn build_pod_spec(
                 // SME-17.
                 resources: Some(memory_only(memory)),
                 volume_mounts: Some(shared_mounts),
+                env: Some(vec![node_name_env()]),
                 ..Default::default()
             }],
             volumes: Some(pod_volumes),
@@ -238,4 +239,21 @@ pub(in crate::sandbox) fn dockerd_args() -> Vec<String> {
         "--default-address-pool".to_string(),
         format!("base={DOCKER_NETWORK_POOL},size=24"),
     ]
+}
+
+/// `NODE_NAME`, the node the pod was scheduled onto, from the downward API
+/// (SME-304): the sandbox's own shell can name the host it runs on, with no
+/// cluster access, so a seat's report can say where it gated.
+pub(crate) fn node_name_env() -> EnvVar {
+    EnvVar {
+        name: "NODE_NAME".to_string(),
+        value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
+            field_ref: Some(k8s_openapi::api::core::v1::ObjectFieldSelector {
+                field_path: "spec.nodeName".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }

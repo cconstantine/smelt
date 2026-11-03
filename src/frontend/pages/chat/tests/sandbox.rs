@@ -7,6 +7,7 @@ fn test_storage_line_names_both_claims_their_size_or_removal() {
         kind,
         size: size.map(str::to_string),
         deleting,
+        node: None,
     };
     assert_eq!(
         storage_line(&[
@@ -48,7 +49,7 @@ fn test_output_line_entry(stream: &str, data: &str) -> SandboxOutputLinePanelEnt
 fn test_merge_sandbox_snapshot_carries_each_pods_previews() {
     let mut pods = vec![SandboxPodPanelEntry {
         pod_id: 1,
-        status: "Running".to_string(),
+        status: "Running".to_string(), node: None,
         previews: vec![preview(8080)],
     }];
     let mut terminals = Vec::new();
@@ -56,13 +57,13 @@ fn test_merge_sandbox_snapshot_carries_each_pods_previews() {
         pods: vec![
             SandboxPodSummary {
                 pod_id: 1,
-                status: "Running".to_string(),
+                status: "Running".to_string(), node: None,
                 terminals: Vec::new(),
                 previews: vec![preview(3000)],
             },
             SandboxPodSummary {
                 pod_id: 2,
-                status: "Running".to_string(),
+                status: "Running".to_string(), node: None,
                 terminals: Vec::new(),
                 previews: vec![preview(5173)],
             },
@@ -76,8 +77,8 @@ fn test_merge_sandbox_snapshot_carries_each_pods_previews() {
 #[test]
 fn test_apply_sandbox_preview_update_replaces_only_its_pods_list() {
     let mut pods = vec![
-        SandboxPodPanelEntry { pod_id: 1, status: "Running".to_string(), previews: Vec::new() },
-        SandboxPodPanelEntry { pod_id: 2, status: "Running".to_string(), previews: vec![preview(9000)] },
+        SandboxPodPanelEntry { pod_id: 1, status: "Running".to_string(), node: None, previews: Vec::new() },
+        SandboxPodPanelEntry { pod_id: 2, status: "Running".to_string(), node: None, previews: vec![preview(9000)] },
     ];
     apply_sandbox_preview_update(&mut pods, 1, vec![preview(3000), preview(5173)]);
     assert_eq!(pods[0].previews, vec![preview(3000), preview(5173)]);
@@ -91,11 +92,11 @@ fn test_apply_sandbox_preview_update_replaces_only_its_pods_list() {
 fn test_a_pod_status_update_keeps_its_previews() {
     let mut pods = vec![SandboxPodPanelEntry {
         pod_id: 1,
-        status: "Pending".to_string(),
+        status: "Pending".to_string(), node: None,
         previews: vec![preview(3000)],
     }];
     let mut terminals = Vec::new();
-    apply_sandbox_pod_update(&mut pods, &mut terminals, 1, "Running".to_string(), false);
+    apply_sandbox_pod_update(&mut pods, &mut terminals, 1, "Running".to_string(), None, false);
     assert_eq!(pods[0].previews, vec![preview(3000)]);
 }
 
@@ -106,7 +107,7 @@ fn test_merge_sandbox_snapshot_flattens_pods_and_terminals_and_hydrates_command_
     let snapshot = SandboxSnapshot {
         pods: vec![SandboxPodSummary {
             pod_id: 1,
-            status: "Running".to_string(),
+            status: "Running".to_string(), node: None,
             terminals: vec![SandboxTerminalSummary {
                 terminal_id: 2,
                 pod_id: 1,
@@ -171,14 +172,14 @@ fn test_merge_sandbox_snapshot_flattens_pods_and_terminals_and_hydrates_command_
 fn test_merge_sandbox_snapshot_is_authoritative_over_existing_entries() {
     let mut pods = vec![SandboxPodPanelEntry {
         pod_id: 1,
-        status: "Pending".to_string(),
+        status: "Pending".to_string(), node: None,
         previews: Vec::new(),
     }];
     let mut terminals = Vec::new();
     let snapshot = SandboxSnapshot {
         pods: vec![SandboxPodSummary {
             pod_id: 1,
-            status: "Running".to_string(),
+            status: "Running".to_string(), node: None,
             terminals: Vec::new(),
             previews: Vec::new(),
         }],
@@ -199,7 +200,7 @@ fn test_merge_sandbox_snapshot_is_authoritative_over_existing_entries() {
 /// leaving it out is the only sign (SME-43).
 #[test]
 fn test_merge_sandbox_snapshot_drops_pods_and_terminals_it_no_longer_lists() {
-    let pod = |pod_id| SandboxPodPanelEntry { pod_id, status: "Running".to_string(), previews: Vec::new() };
+    let pod = |pod_id| SandboxPodPanelEntry { pod_id, status: "Running".to_string(), node: None, previews: Vec::new() };
     let terminal = |terminal_id, pod_id| SandboxTerminalPanelEntry {
         terminal_id,
         pod_id,
@@ -211,7 +212,7 @@ fn test_merge_sandbox_snapshot_drops_pods_and_terminals_it_no_longer_lists() {
     let snapshot = SandboxSnapshot {
         pods: vec![SandboxPodSummary {
             pod_id: 1,
-            status: "Running".to_string(),
+            status: "Running".to_string(), node: None,
             terminals: vec![SandboxTerminalSummary {
                 terminal_id: 10,
                 pod_id: 1,
@@ -232,11 +233,11 @@ fn test_merge_sandbox_snapshot_drops_pods_and_terminals_it_no_longer_lists() {
 fn test_apply_sandbox_pod_update_upserts_when_not_terminated() {
     let mut pods = Vec::new();
     let mut terminals = Vec::new();
-    apply_sandbox_pod_update(&mut pods, &mut terminals, 1, "Running".to_string(), false);
+    apply_sandbox_pod_update(&mut pods, &mut terminals, 1, "Running".to_string(), None, false);
     assert_eq!(pods.len(), 1);
     assert_eq!(pods[0].status, "Running");
 
-    apply_sandbox_pod_update(&mut pods, &mut terminals, 1, "Running".to_string(), false);
+    apply_sandbox_pod_update(&mut pods, &mut terminals, 1, "Running".to_string(), None, false);
     assert_eq!(
         pods.len(),
         1,
@@ -248,7 +249,7 @@ fn test_apply_sandbox_pod_update_upserts_when_not_terminated() {
 fn test_apply_sandbox_pod_update_removes_pod_and_its_terminals_when_terminated() {
     let mut pods = vec![SandboxPodPanelEntry {
         pod_id: 1,
-        status: "Running".to_string(),
+        status: "Running".to_string(), node: None,
         previews: Vec::new(),
     }];
     let mut terminals = vec![
@@ -256,7 +257,7 @@ fn test_apply_sandbox_pod_update_removes_pod_and_its_terminals_when_terminated()
         test_sandbox_terminal_entry(20, 2),
     ];
 
-    apply_sandbox_pod_update(&mut pods, &mut terminals, 1, "terminated".to_string(), true);
+    apply_sandbox_pod_update(&mut pods, &mut terminals, 1, "terminated".to_string(), None, true);
 
     assert!(
         pods.is_empty(),
@@ -416,4 +417,16 @@ fn test_apply_sandbox_command_update_finish_sets_status_and_exit_code_on_the_mos
 
     assert_eq!(terminals[0].commands[0].status, "finished");
     assert_eq!(terminals[0].commands[0].exit_code, Some(0));
+}
+
+/// SME-304: a pod's Running update carries its node; an update without
+/// one (an older server's) keeps the node the panel already knows.
+#[test]
+fn test_a_pod_update_carries_its_node_and_one_without_keeps_it() {
+    let mut pods = vec![SandboxPodPanelEntry { pod_id: 1, status: "Pending".to_string(), node: None, previews: Vec::new() }];
+    let mut terminals = Vec::new();
+    apply_sandbox_pod_update(&mut pods, &mut terminals, 1, "Running".to_string(), Some("ryzen".to_string()), false);
+    assert_eq!(pods[0].node.as_deref(), Some("ryzen"));
+    apply_sandbox_pod_update(&mut pods, &mut terminals, 1, "Running".to_string(), None, false);
+    assert_eq!(pods[0].node.as_deref(), Some("ryzen"), "kept");
 }

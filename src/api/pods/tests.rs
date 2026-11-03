@@ -90,6 +90,7 @@ fn test_a_pod_overview_round_trips_through_json_with_each_agent_status() {
             conversation_id: 3,
             conversation_title: "t".into(),
             status: Some("Running".into()),
+            node: None,
             started_at: at,
             activity: PodActivity::Busy,
             memory_limit: None,
@@ -266,8 +267,8 @@ fn test_storage_rows_groups_a_conversations_two_claims() {
             conversation_id: 7,
             conversation_title: "seat a".into(),
             volumes: vec![
-                StoredVolume { kind: StorageKind::Workspace, size: Some("20Gi".into()), deleting: false },
-                StoredVolume { kind: StorageKind::Docker, size: Some("20Gi".into()), deleting: true },
+                StoredVolume { kind: StorageKind::Workspace, size: Some("20Gi".into()), deleting: false, node: None },
+                StoredVolume { kind: StorageKind::Docker, size: Some("20Gi".into()), deleting: true, node: None },
             ],
             stopped: None,
             observed_at: chrono::NaiveDateTime::default(),
@@ -327,4 +328,18 @@ fn test_storage_rows_sort_conversations_by_id() {
         vec![7, 9],
         "stable order for the page's rows"
     );
+}
+
+/// SME-304: a claim names the node whose disk holds it, from the
+/// scheduler's `selected-node` annotation; one no pod has used has none.
+#[test]
+fn test_storage_rows_name_the_node_a_claim_was_bound_on() {
+    let titles = std::collections::HashMap::from([(7i64, "seat".to_string())]);
+    let mut bound = stored_claim(&crate::sandbox::workspace_pvc_name(7), Some("7"), Some("20Gi"), None, false);
+    bound.metadata.annotations =
+        Some(std::collections::BTreeMap::from([("volume.kubernetes.io/selected-node".to_string(), "ryzen".to_string())]));
+    let unused = stored_claim(&crate::sandbox::docker_pvc_name(7), Some("7"), None, Some("20Gi"), false);
+    let rows = storage_rows(&[bound, unused], &titles);
+    let nodes: Vec<Option<&str>> = rows[0].volumes.iter().map(|volume| volume.node.as_deref()).collect();
+    assert_eq!(nodes, vec![Some("ryzen"), None]);
 }

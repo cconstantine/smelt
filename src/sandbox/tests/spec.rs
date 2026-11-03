@@ -89,6 +89,15 @@ fn test_pod_spec_shares_workspace_and_socket_but_keeps_docker_data_in_the_sideca
         .and_then(|env| env.iter().find(|e| e.name == "WORKSPACE_OWNER"))
         .and_then(|e| e.value.as_deref());
     assert_eq!(owner, Some(SANDBOX_OWNER));
+    // The sandbox's shell can name its node with no cluster access (SME-304).
+    let node = sandbox
+        .env
+        .as_ref()
+        .and_then(|env| env.iter().find(|e| e.name == "NODE_NAME"))
+        .and_then(|e| e.value_from.as_ref())
+        .and_then(|from| from.field_ref.as_ref())
+        .map(|field| field.field_path.as_str());
+    assert_eq!(node, Some("spec.nodeName"), "NODE_NAME comes from the downward API");
 
     let volumes = spec.volumes.expect("pod should have volumes");
     let data = volumes.iter().find(|v| v.name == "docker-data").expect("docker-data volume");

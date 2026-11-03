@@ -264,3 +264,43 @@ async fn test_a_rule_naming_no_configured_server_is_noticed_to_the_parent(pool: 
     assert!(!told.contains("github/get_"), "{told} leaves a configured server's pattern alone");
     eventually("every turn is over", || async { !crate::turn::turn_running(root) && !crate::turn::turn_running(child) }).await;
 }
+
+/// SME-322: a dispatcher's `own` rules bind it and not the agents it starts.
+/// The driver can't write (`own: deny write_file`) but its group-wide deny
+/// (`create_volume`) holds for its child; the child it starts inherits the
+/// chain without the driver's `own` and is offered `write_file`.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_dispatchers_own_rules_bind_it_and_not_its_agents(pool: PgPool) {
+    setup(&pool, vec![text_reply("ok")]).await;
+    let driver_rules = "---\nname: driver\ndescription: Drives one ticket.\nsmelt:\n  tools:\n    deny: [create_volume]\n    own:\n      deny: [write_file]\n---\nDrive.\n";
+    let fake = Arc::new(FakeCheckout {
+        files: Mutex::new([(".agents/personas/driver.md".to_string(), driver_rules.to_string())].into_iter().collect()),
+        ..Default::default()
+    });
+    let root = root_with_checkout(&pool, Some(true), fake.clone()).await;
+    let input = serde_json::json!({"brief": "x", "repo": "/workspace/app", "ref": "v2", "persona": "driver"});
+    let driver = child_of(&pool, root, &start_on(&pool, root, input).await.expect("started")).await;
+    eventually("the driver goes active", || async { state(&pool, driver).await.as_deref() == Some(db::AGENT_ACTIVE) }).await;
+    let names = |defs: Vec<crate::anthropic::ToolDefinition>| defs.into_iter().map(|d| d.name).collect::<Vec<_>>();
+    let offered = names(crate::anthropic::tools::tool_definitions(&pool, driver).await);
+    assert!(!offered.iter().any(|n| n == "write_file"), "its own deny binds it: {offered:?}");
+    assert!(!offered.iter().any(|n| n == "create_volume"), "and its group deny: {offered:?}");
+
+    test_fakes::register(driver, fake.clone());
+    let result = crate::anthropic::tools::execute(&pool, driver, "toolu_s", "start_agent", &serde_json::json!({"brief": "Work."}))
+        .await
+        .expect("the driver may start a seat");
+    let seat = child_of(&pool, driver, &result).await;
+    assert_eq!(
+        chain(&pool, seat).await,
+        Some(serde_json::json!([{"class": "all", "allow": [], "deny": ["create_volume"]}])),
+        "the seat inherits the group's rules, not the driver's own"
+    );
+    let offered = names(crate::anthropic::tools::tool_definitions(&pool, seat).await);
+    assert!(offered.iter().any(|n| n == "write_file"), "the seat may write: {offered:?}");
+    assert!(!offered.iter().any(|n| n == "create_volume"), "the group deny holds down the line: {offered:?}");
+    eventually("every turn is over", || async {
+        !crate::turn::turn_running(root) && !crate::turn::turn_running(driver) && !crate::turn::turn_running(seat)
+    })
+    .await;
+}

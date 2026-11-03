@@ -351,6 +351,8 @@ impl From<sqlx::Error> for TerminalError {
 pub struct PodInfo {
     pub pod_id: i64,
     pub status: String,
+    /// The node it runs on, once scheduled (SME-304).
+    pub node: Option<String>,
     /// See `agent_status`.
     pub agent: Option<crate::api::pods::AgentStatus>,
 }

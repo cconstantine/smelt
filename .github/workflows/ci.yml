@@ -91,6 +91,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        # The repo lints read the history (SME-340: a cited path that
+        # existed once resolves).
+        with:
+          fetch-depth: 0
 
       - name: The dev image and the build caches
         uses: ./.github/actions/start-stack
@@ -114,6 +118,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        # The repo lints read the history (SME-340: a cited path that
+        # existed once resolves).
+        with:
+          fetch-depth: 0
 
       - name: Start the compose stack
         uses: ./.github/actions/start-stack

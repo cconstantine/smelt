@@ -348,3 +348,53 @@ fn test_a_bad_credential_entry_is_a_parse_error_naming_the_file_and_line() {
         assert!(error.contains("line"), "the error should name the line: {error}");
     }
 }
+
+/// SME-322: `smelt.tools.own` parses with the same grammar, is checked the
+/// same way (its errors name the block), and can't nest another `own`.
+#[test]
+fn test_own_rules_parse_check_and_dont_nest() {
+    let file = |tools: &str| format!("---\nname: driver\ndescription: Drives.\nsmelt:\n  tools:\n{tools}---\nDrive.\n");
+    let path = ".agents/personas/driver.md";
+    let persona = parse_ok(path, &file("    deny: [create_volume]\n    own:\n      class: no-destructive\n      deny: [write_file]\n"));
+    let rules = persona.tools.expect("tools");
+    assert_eq!(String::from(rules.deny[0].clone()), "create_volume");
+    let own = rules.own.expect("own");
+    assert_eq!(own.class, rules::Ceiling::NoDestructive);
+    assert_eq!(own.deny.iter().map(|p| String::from(p.clone())).collect::<Vec<_>>(), vec!["write_file"]);
+
+    let err = parse_err(path, &file("    own:\n      deny: [\"\"]\n"));
+    assert!(err.contains("smelt.tools.own has an empty pattern"), "{err}");
+    let err = parse_err(path, &file("    own:\n      own:\n        deny: [x]\n"));
+    assert!(err.contains("unknown field") && err.contains("own"), "an own inside own is an unknown field: {err}");
+}
+
+/// SME-322: an entry's `own` narrows the conversation it's on, says so in
+/// its refusal, and is gone from the chain a child inherits.
+#[test]
+fn test_own_rules_bind_their_entry_and_not_a_child() {
+    let path = ".agents/personas/driver.md";
+    let text = "---\nname: driver\ndescription: Drives.\nsmelt:\n  tools:\n    own:\n      deny: [write_file]\n---\nDrive.\n";
+    let rules = parse_ok(path, text).tools.expect("tools");
+    let stored = serde_json::json!([serde_json::to_value(&rules).expect("serializes")]);
+    let own_chain = rules::RuleChain::from_stored(Some(stored.clone()));
+    let write = rules::ToolRef::Native("write_file");
+    let refused = own_chain.allows_at(write, crate::anthropic::tools::ToolClass::Writing).expect_err("its own deny binds it");
+    assert!(refused.contains("binds this conversation and not its agents"), "{refused}");
+    assert!(own_chain.allows_at(rules::ToolRef::Native("read_file"), crate::anthropic::tools::ToolClass::ReadOnly).is_ok());
+
+    let inherited = rules::for_child(Some(stored)).expect("a chain");
+    assert_eq!(inherited, serde_json::json!([{"class": "all", "allow": [], "deny": []}]), "no own on the inherited entry");
+    let child_chain = rules::RuleChain::from_stored(Some(inherited));
+    assert!(child_chain.allows_at(write, crate::anthropic::tools::ToolClass::Writing).is_ok(), "the child may write");
+    assert_eq!(rules::for_child(None), None, "no chain stays none");
+    // A grandchild's chain: every entry's own goes, not only the last.
+    let two = serde_json::json!([{"class": "all", "own": {"deny": ["a"]}}, {"class": "read-only", "deny": ["b"], "own": {"deny": ["c"]}}]);
+    assert_eq!(
+        rules::for_child(Some(two)),
+        Some(serde_json::json!([{"class": "all"}, {"class": "read-only", "deny": ["b"]}]))
+    );
+    // `own`'s patterns are reported like the rest when their server isn't configured.
+    let text = "---\nname: driver\ndescription: Drives.\nsmelt:\n  tools:\n    own:\n      deny: [gh/merge_*]\n---\nDrive.\n";
+    let rules = parse_ok(path, text).tools.expect("tools");
+    assert_eq!(rules.unmatched_servers(&[]), vec!["gh/merge_*".to_string()]);
+}

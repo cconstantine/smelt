@@ -226,6 +226,12 @@
     color: var(--muted);
 }
 
+/* The node the pod runs on (SME-304), beside its status and as quiet. */
+.sandbox-pod-node {
+    color: var(--muted);
+    margin-left: 6px;
+}
+
 /* Links to what the sandbox is serving, for the user's own browser
    (SME-42): one per port the model shared. */
 .sandbox-panel .sandbox-previews {
