@@ -89,12 +89,18 @@ flock -n "$SMELT_LOCK_DIR/smelt-cluster.lock" true && echo unlocked || echo lock
 EOF
 # cargo: records each call. A test run (not --no-run) prints a result line.
 # CARGO_FAIL: a pattern; a call whose arguments match it fails.
+# CARGO_WARN: a pattern; a call whose arguments match it succeeds with a
+# compiler warning, as rustc prints one (SME-361).
 cat >"$dir/bin/cargo" <<'EOF'
 #!/usr/bin/env bash
 echo "cargo $* $(lock-state)" >>"$CALLS"
 if [ -n "${CARGO_FAIL:-}" ] && [[ "$*" =~ $CARGO_FAIL ]]; then
     echo "error: stub cargo told to fail"
     exit 101
+fi
+if [ -n "${CARGO_WARN:-}" ] && [[ "$*" =~ $CARGO_WARN ]]; then
+    echo "warning: unused variable: \`pod\`"
+    echo "   --> src/stub.rs:1:9"
 fi
 if [ "$1" = test ] && [[ " $* " != *" --no-run "* ]]; then
     echo "test result: ok. 1 passed; 0 failed"
@@ -165,6 +171,11 @@ fi
 echo "stub dx started as $$"
 printf 'RUST_LOG=%s\nNO_COLOR=%s\n' "${RUST_LOG-<unset>}" "${NO_COLOR-<unset>}" >"$DX_ENV.tmp"
 mv "$DX_ENV.tmp" "$DX_ENV"
+# The previews' settings, apart (SME-96), so the log-settings cases' exact
+# comparison of DX_ENV stays as it was.
+printf 'SMELT_PREVIEW_ADDR=%s\nSMELT_PREVIEW_URL=%s\nSMELT_BASE_URL=%s\n' "${SMELT_PREVIEW_ADDR-<unset>}" \
+    "${SMELT_PREVIEW_URL-<unset>}" "${SMELT_BASE_URL-<unset>}" >"$DX_ENV.previews.tmp"
+mv "$DX_ENV.previews.tmp" "$DX_ENV.previews"
 port=""
 while [ $# -gt 0 ]; do
     [ "$1" = --port ] && port=$2
@@ -219,7 +230,8 @@ chmod +x "$dir/bin/lock-state" "$dir/bin/cargo" "$dir/bin/dx" "$dir/bin/sqlx" "$
 # binds the port, so a case on 8081 would collide with a persona's live
 # check server. A bind test says it's free on IPv4 (and IPv6's loopback,
 # when there is one); a port handed out before in this run is never handed
-# out again, so two cases' ports never meet.
+# out again, so two cases' ports never meet. Its previews' port, 200 up
+# (SME-96), is checked and kept out of later hands the same way.
 ports_given=$dir/ports-given
 : >"$ports_given"
 free_port() {
@@ -229,7 +241,8 @@ import random, socket, sys
 given = set(open(sys.argv[1]).read().split())
 low, high = map(int, open("/proc/sys/net/ipv4/ip_local_port_range").read().split())
 candidates = [p for p in range(20000, 30000)
-              if not low <= p <= high and p not in (8080, 8081, 8181, 8182) and str(p) not in given]
+              if not low <= p <= high and p not in (8080, 8081, 8181, 8182)
+              and str(p) not in given and str(p + 200) not in given]
 random.shuffle(candidates)
 def free(family, host, port):
     try:
@@ -244,14 +257,14 @@ def free(family, host, port):
     finally:
         s.close()
 for port in candidates[:200]:
-    if free(socket.AF_INET, "0.0.0.0", port) and free(socket.AF_INET6, "::1", port):
+    if all(free(socket.AF_INET, "0.0.0.0", q) and free(socket.AF_INET6, "::1", q) for q in (port, port + 200)):
         print(port)
         break
 else:
     sys.exit(1)
 EOF
 ) || return 1
-    echo "$p" >>"$ports_given"
+    printf '%s\n%s\n' "$p" "$((p + 200))" >>"$ports_given"
     echo "$p"
 }
 # The port check_server's servers use.
@@ -277,9 +290,10 @@ log_file=$worktree/.check-server.log
 # Extra VAR=VALUE settings for check_server's environment, set per case.
 extra_env=()
 # The caller's own RUST_LOG and NO_COLOR are dropped, so they can't change
-# the results.
+# the results, and the previews' three settings (SME-96: compose sets
+# SMELT_BASE_URL for every shell in the container).
 check_server() {
-    env -u SANDBOX_IMAGE -u RUST_LOG -u NO_COLOR PATH="$dir/bin:$PATH" CHECK_WORKTREE="$worktree" \
+    env -u SANDBOX_IMAGE -u RUST_LOG -u NO_COLOR -u SMELT_PREVIEW_ADDR -u SMELT_PREVIEW_URL -u SMELT_BASE_URL PATH="$dir/bin:$PATH" CHECK_WORKTREE="$worktree" \
         SANDBOX_IMAGE_IMPORT="$dir/bin/import" SANDBOX_INSTANCE_CLEANUP="$dir/bin/cleanup" \
         DATABASE_URL=postgres://u@localhost/smelt_dev CHECK_PORT="$port" \
         "${extra_env[@]}" scripts/check-server "$@" 2>&1
@@ -289,7 +303,7 @@ scratch_url=postgres://u@localhost/smelt_scratch_worktree
 # case can run it under `timeout` or `flock`, which take a command and not a
 # shell function. CHECK_WORKTREE is left to the case, which usually names a
 # second worktree.
-cs_env=(env -u SANDBOX_IMAGE -u RUST_LOG -u NO_COLOR PATH="$dir/bin:$PATH" SANDBOX_IMAGE_IMPORT="$dir/bin/import"
+cs_env=(env -u SANDBOX_IMAGE -u RUST_LOG -u NO_COLOR -u SMELT_PREVIEW_ADDR -u SMELT_PREVIEW_URL -u SMELT_BASE_URL PATH="$dir/bin:$PATH" SANDBOX_IMAGE_IMPORT="$dir/bin/import"
     SANDBOX_INSTANCE_CLEANUP="$dir/bin/cleanup" DATABASE_URL=postgres://u@localhost/smelt_dev CHECK_PORT="$port")
 
 

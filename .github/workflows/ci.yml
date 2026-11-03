@@ -197,6 +197,13 @@ jobs:
           docker compose run --rm \
             smelt scripts/lint-expects
 
+      # The test step's build has no -D warnings, so a warning in it, in test
+      # code or not, would pass CI (SME-361). Last, so a warnings-only red
+      # skips none of the checks above (review 2, L2).
+      - name: No compiler warnings (server)
+        if: always()
+        run: scripts/ci-no-warnings "$RUNNER_TEMP/server-tests.log"
+
       - name: Stop the compose stack
         if: always()
         uses: ./.github/actions/stop-stack
@@ -273,6 +280,12 @@ jobs:
           echo "--- events, most recent first ---"
           docker compose run --rm smelt ./kubectl-diag get events -n smelt-park-test --sort-by=.lastTimestamp || true
           rm -f kubectl-diag
+
+      # The `browser-test` feature's code is compiled only in this job's test
+      # step (SME-361). After the diagnostics: those are for a test failure.
+      - name: No compiler warnings (browser)
+        if: always()
+        run: scripts/ci-no-warnings "$RUNNER_TEMP/browser-tests.log"
 
       - name: Stop the compose stack
         if: always()

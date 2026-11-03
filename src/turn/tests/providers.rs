@@ -21,6 +21,7 @@ fn test_is_ollama_thinking_tool_call_corruption_does_not_match_unrelated_errors(
 /// Hugging Face's wants exactly that).
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_bearer_providers_turn_sends_its_token_as_a_bearer_header(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -80,6 +81,7 @@ async fn test_a_bearer_providers_turn_sends_its_token_as_a_bearer_header(pool: P
 /// a time take turns at the server, and both turns finish.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_two_conversations_on_a_one_request_provider_take_turns(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let first = db::create_conversation(&pool).await.expect("create conversation");
     let second = db::create_conversation(&pool).await.expect("create conversation");

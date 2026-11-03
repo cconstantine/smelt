@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The checks every commit must pass (docs/process/rules-commits.md, "Every
-# commit builds for both targets"): the web build and the server build,
-# each with no warnings, no unexplained expect() or unwrap() outside tests
+# commit builds for both targets"): the web build, the server build and
+# the server tests' build, each with no warnings, no unexplained expect() or unwrap() outside tests
 # (scripts/lint-expects), and the server tests, run against this working
 # tree's own sandbox image (SANDBOX_IMAGE, see scripts/sandbox-image-ref).
 # Exits non-zero on any failure, so it can gate a commit:
@@ -64,7 +64,7 @@ lint_output=$(scripts/lint-expects 2>&1) || {
 # a minute together, and none of them needs a cluster or a database.
 echo "== script tests"
 if [ -z "${SMELT_SKIP_SCRIPT_TESTS:-}" ]; then
-    for t in test-start-dockerd test-cluster-doctor test-ci-web-bundle test-check-server test-check-server-scratch test-check-server-guards test-check-server-db-inputs test-check-server-ports test-dotenv-value test-cluster-lock test-gate-scripts test-retro-scan; do
+    for t in test-start-dockerd test-cluster-doctor test-ci-web-bundle test-check-server test-check-server-scratch test-check-server-guards test-check-server-db-inputs test-check-server-ports test-check-server-previews test-dotenv-value test-cluster-lock test-gate-scripts test-retro-scan; do
         echo "-- scripts/$t"
         "scripts/$t" || {
             echo "scripts/$t failed"
@@ -78,13 +78,19 @@ fi
 mkdir -p target/check
 
 # The tests compiled before the lock is taken, so the locked run below
-# only runs them (SME-100). Its warnings are the server build's, already
-# checked above.
+# only runs them (SME-100). Its warnings are checked too: the server build
+# above compiles no `#[cfg(test)]` code, so a warning there (an unused
+# binding in a test, SME-361) reached main past a green gate.
 echo "== server tests (build)"
 build_log=target/check/server-tests-build.log
 if ! cargo test --features server --no-run >"$build_log" 2>&1; then
     grep -E '^error' -A8 "$build_log" | head -40
     echo "the server tests don't build (full log: $build_log)"
+    exit 1
+fi
+if grep -qE '^warning' "$build_log"; then
+    grep -E '^warning' -A8 "$build_log" | head -40 || true
+    echo "the server tests' build has warnings (full log: $build_log)"
     exit 1
 fi
 

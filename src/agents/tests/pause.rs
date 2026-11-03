@@ -13,6 +13,7 @@ async fn undelivered(pool: &PgPool, to: i64) -> usize {
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stop_is_stored_and_the_users_send_clears_it(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     setup(&pool, vec![text_reply("ok")]).await;
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
 
@@ -36,6 +37,7 @@ async fn test_a_stop_is_stored_and_the_users_send_clears_it(pool: PgPool) {
 /// user's send in the root drains its row into that turn.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_paused_conversation_stays_paused_across_a_restart(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let requests = setup(&pool, vec![text_reply("Noted.")]).await;
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let child = active_child(&pool, root).await;
@@ -79,6 +81,7 @@ async fn test_a_paused_conversation_stays_paused_across_a_restart(pool: PgPool) 
 /// the Stop's write lands last. The row ends as memory says: not paused.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stop_and_a_send_racing_leave_the_row_as_memory_says(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     setup(&pool, vec![text_reply("ok")]).await;
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let (reached, release) = test_hooks::pause(test_hooks::STORE_PAUSE_READ, root);
