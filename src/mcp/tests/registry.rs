@@ -6,8 +6,8 @@
 use super::gated_http::{self, HEADER, WAIT};
 use super::*;
 
-/// A server row whose connects get the product's budget, not the test
-/// build's 1 s: each test here holds a connect at the mock across a step
+/// A server row whose connects and calls get the product's budgets, not
+/// the test build's 1 s: each test here holds a connect at the mock across a step
 /// that, on a loaded runner, can take longer than that, and a held attempt
 /// that timed out first was retried before the evict, a second
 /// `initialize` (SME-363). None of these tests is about the give-up.
@@ -52,7 +52,13 @@ async fn connect_ended(server_id: i64) {
     let _ended = tokio::time::timeout(WAIT, lock.lock()).await.expect("the connect didn't end in time");
 }
 
+/// The tools `config` lists, connecting it first: a tool list gives each
+/// connect only `TOOL_LIST_WAIT` (1 s in a test build) and lists nothing
+/// from a server still connecting, so on a loaded runner a fresh connect
+/// listed straight away read `[]` (SME-363 review). The connect's own
+/// result is left to the assertions on what's listed.
 async fn tool_names(pool: &sqlx::PgPool, config: &McpServerConfig) -> Vec<String> {
+    let _ = tokio::time::timeout(WAIT, ensure_connected(pool, config, Attempt::Always)).await;
     let listed = tokio::time::timeout(WAIT, tool_definitions_for(pool, std::slice::from_ref(config), &unruled()))
         .await
         .expect("listing tools didn't finish in time");
