@@ -51,6 +51,16 @@ fn test_every_native_tool_name_is_unique() {
     assert_eq!(names.len(), count, "a tool name is registered twice");
 }
 
+/// Anthropic refuses a request whose any tool name isn't
+/// `^[a-zA-Z0-9_-]{1,128}$` (SME-365); smelt's own tools are in every one.
+#[test]
+fn test_every_native_tool_name_matches_anthropics_pattern() {
+    for tool in native_tool_definitions() {
+        let ok = (1..=128).contains(&tool.name.len()) && tool.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        assert!(ok, "{:?}", tool.name);
+    }
+}
+
 #[tokio::test]
 async fn test_execute_still_dispatches_native_tools_normally() {
     let pool = test_pool();

@@ -449,7 +449,11 @@ fn same_server(a: Option<&str>, b: Option<&str>) -> bool {
 /// fewer words of its own, then by name.
 #[cfg(feature = "server")]
 pub fn similar(name: &str, offered: &[&str]) -> Vec<String> {
-    let (server, words) = server_and_words(name);
+    let (_, words) = server_and_words(name);
+    // Its server by the safe part offered names carry (SME-365), so a call
+    // written as `mcp__linear.app__…` still ranks that server's tools first.
+    let safe = crate::mcp::safe_tool_name(name);
+    let (server, _) = server_and_words(&safe);
     let candidates: Vec<(&str, Option<&str>, std::collections::BTreeSet<String>)> = offered
         .iter()
         .filter(|o| **o != name)
@@ -493,9 +497,17 @@ pub fn text_call_notice(calls: &[TextCall], offered: &[&str]) -> String {
             notice.push_str(&format!(" `{name}` is offered, but a call written in a reply's text isn't made."));
             continue;
         }
-        let missing_server = crate::mcp::parse_tool_name(name)
-            .map(|(server, _)| server)
-            .filter(|server| !offered.iter().any(|o| crate::mcp::parse_tool_name(o).is_some_and(|(s, _)| s.eq_ignore_ascii_case(server))));
+        // Offered names carry safe server parts (SME-365), so a call
+        // written with the server's own name (`linear.app`) is compared by
+        // the safe part that name has.
+        let safe = crate::mcp::safe_tool_name(name);
+        let safe_server = crate::mcp::parse_tool_name(&safe).map(|(server, _)| server);
+        let missing_server = crate::mcp::parse_tool_name(name).map(|(server, _)| server).filter(|server| {
+            !offered.iter().any(|o| {
+                crate::mcp::parse_tool_name(o)
+                    .is_some_and(|(s, _)| s.eq_ignore_ascii_case(server) || safe_server.is_some_and(|w| s.eq_ignore_ascii_case(w)))
+            })
+        });
         let suggestions = similar(name, offered);
         let mut sentence = format!(" `{name}` isn't an offered tool");
         if let Some(server) = missing_server {

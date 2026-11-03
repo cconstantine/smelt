@@ -33,14 +33,33 @@ async fn test_an_mcp_call_is_a_span_under_its_caller(pool: sqlx::PgPool) {
 
 /// The connects a turn's tool list starts run in the background, but
 /// as the turn's children, not roots of their own.
+///
+/// The list waits for its connect only up to `TOOL_LIST_WAIT` (1 s in a
+/// test build), so under a gate's load it could return first, and the
+/// connect's span then ended after the capture stopped (SME-352). The
+/// test waits for the connect to end, by its `CONNECTING` lock, inside
+/// the capture.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_tool_lists_connect_is_a_child_of_its_caller(pool: sqlx::PgPool) {
     let config = create_static_server(&pool, &test_config(0, "unused").url).await;
     let (_, spans) = crate::telemetry::capture_spans(async {
-        crate::telemetry::in_span(tracing::info_span!("caller"), async {
+        let listed = crate::telemetry::in_span(tracing::info_span!("caller"), async {
             tool_definitions_for(&pool, std::slice::from_ref(&config), &unruled()).await
         })
-        .await
+        .await;
+        // Until the connect has said how it went (its URL refuses, so a
+        // recorded failure), then its lock: it records that while holding
+        // the lock, so the lock is free only once its span has closed.
+        let ended = async {
+            while !failed_recently(config.id) && !REGISTRY.lock().await.contains_key(&config.id) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            drop(server_lock(&CONNECTING, config.id).lock().await);
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), ended)
+            .await
+            .expect("the tool list's connect didn't end in time");
+        listed
     })
     .await;
     let caller = spans.iter().find(|span| span.name == "caller").expect("the caller's span");

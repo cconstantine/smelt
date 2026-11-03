@@ -131,9 +131,10 @@ pub async fn get_mcp_server_config(
         .await
 }
 
-/// Resolves a `mcp__<server_name>__<tool_name>` tool call's server half —
-/// `name` is unique, so this is how `anthropic::tools::execute`'s MCP
-/// dispatch arm turns the model-facing name back into a row.
+/// The server named `name` (unique). The tests' lookup: a tool call finds
+/// its server by the safe part of its name (`mcp::resolve_tool`, SME-365),
+/// which isn't always the name.
+#[cfg(test)]
 pub async fn get_mcp_server_config_by_name(
     pool: &PgPool,
     name: &str,

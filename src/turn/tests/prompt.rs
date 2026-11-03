@@ -222,7 +222,7 @@ fn test_system_prompt_describes_the_environment() {
         "Today's date: 2026-09-25",
         "Model: claude-test-model",
         "cargo-cache mounted at /home/sandbox/.cargo",
-        "- MCP servers (their tools are named mcp__<server>__<tool>, and every description starts [server]):\n  - exa\n  - github — Repos, issues and pull requests.\n",
+        "- MCP servers (their tools are named mcp__<server>__<tool>, any character outside letters, digits, _ and - made _ with a short code added, and every description starts [server]):\n  - exa\n  - github — Repos, issues and pull requests.\n",
     ] {
         assert!(environment.contains(expected), "missing {expected:?} in: {environment}");
     }
@@ -244,7 +244,8 @@ fn test_system_prompt_lists_each_mcp_server_with_its_purpose() {
     let prompt = system_prompt(&env);
     assert!(
         prompt.contains(
-            "- MCP servers (their tools are named mcp__<server>__<tool>, and every description \
+            "- MCP servers (their tools are named mcp__<server>__<tool>, any character outside \
+             letters, digits, _ and - made _ with a short code added, and every description \
              starts [server]):\n  - Github — GitHub repositories, issues and pull requests.\n  - exa\n"
         ),
         "{prompt}"

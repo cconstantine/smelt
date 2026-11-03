@@ -197,6 +197,9 @@ mod server {
             otel.status_code = Empty,
             otel.status_description = Empty,
         );
+        // The name's server part until the call resolves its server, which
+        // then records the configured name (SME-365: the part can be a
+        // safe one).
         if let Some((server_name, _)) = crate::mcp::parse_tool_name(name) {
             span.record("smelt.tool.mcp_server", server_name);
         }
@@ -249,21 +252,20 @@ mod server {
     }
 
     /// The tool a call names: one of smelt's, or an MCP server's.
-    enum Target<'a> {
+    enum Target {
         Native(&'static super::Registered),
-        Mcp { config: crate::db::McpServerConfig, tool: &'a str },
+        /// `tool` is the tool's part of the model's name; the call maps it
+        /// to the name the server lists it under (SME-365).
+        Mcp { config: crate::db::McpServerConfig, tool: String },
     }
 
     /// Finds the tool `name` names. An unknown tool, or an MCP server
     /// that isn't configured, is a plain tool error: the config could have
     /// been deleted between when `tool_definitions` last offered the tool
     /// and when the model called it.
-    async fn resolve<'a>(pool: &PgPool, name: &'a str) -> Result<Target<'a>, String> {
-        if let Some((server_name, tool)) = crate::mcp::parse_tool_name(name) {
-            let config = crate::db::get_mcp_server_config_by_name(pool, server_name)
-                .await
-                .map_err(|e| format!("failed to look up MCP server {server_name:?}: {e}"))?
-                .ok_or_else(|| format!("unknown MCP server: {server_name:?}"))?;
+    async fn resolve(pool: &PgPool, name: &str) -> Result<Target, String> {
+        if crate::mcp::parse_tool_name(name).is_some() {
+            let (config, tool) = crate::mcp::resolve_tool(pool, name).await?;
             return Ok(Target::Mcp { config, tool });
         }
         super::REGISTRY
@@ -289,6 +291,7 @@ mod server {
         };
         match resolve(pool, name).await? {
             Target::Mcp { config, tool } => {
+                span.record("smelt.tool.mcp_server", config.name.as_str());
                 // SME-241: an MCP call is ruled at its class, and the class
                 // is only known inside the call — after the connect and the
                 // override read, on the very connection it goes out on. So
@@ -296,7 +299,7 @@ mod server {
                 // consults before it sends; the class is recorded either
                 // way, allowed or refused.
                 let chain = call_rule_chain(pool, conversation_id, name).await?;
-                crate::mcp::call_tool_classed(pool, &config, tool, input.clone(), |class| {
+                crate::mcp::call_tool_classed(pool, &config, &tool, input.clone(), |class, tool| {
                     record(class);
                     chain.allows_at(crate::personas::rules::ToolRef::Mcp { server: &config.name, tool }, class)
                 })
@@ -430,7 +433,17 @@ mod server {
             .collect();
         match crate::db::list_mcp_server_configs(pool).await {
             Ok(configs) => {
-                definitions.extend(crate::mcp::tool_definitions_for(pool, &configs, &chain).await)
+                // Two tools reaching one name (a tool listed under another's
+                // safe name, SME-365 review): Anthropic refuses a request
+                // with a repeated name, so the second is left out.
+                let mut seen: std::collections::HashSet<String> = definitions.iter().map(|d| d.name.clone()).collect();
+                for definition in crate::mcp::tool_definitions_for(pool, &configs, &chain).await {
+                    if seen.insert(definition.name.clone()) {
+                        definitions.push(definition);
+                    } else {
+                        tracing::warn!(tool = %definition.name, "two tools have this name; the second is left out");
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to list configured MCP servers; their tools are unavailable this turn")

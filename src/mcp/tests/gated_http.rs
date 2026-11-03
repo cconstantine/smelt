@@ -120,9 +120,15 @@ async fn handler(
         "tools/list" => serde_json::json!({"tools": [
             {"name": mock.tool, "description": "A tool", "inputSchema": {"type": "object"}}
         ]}),
-        "tools/call" => serde_json::json!({
+        // Answers only a call to its own tool, by the name it listed, so a
+        // test sees which name a call sent (SME-365).
+        "tools/call" if request["params"]["name"] == mock.tool => serde_json::json!({
             "content": [{"type": "text", "text": format!("called {}", mock.tool)}],
             "isError": false,
+        }),
+        "tools/call" => serde_json::json!({
+            "content": [{"type": "text", "text": format!("unknown tool {}", request["params"]["name"])}],
+            "isError": true,
         }),
         _ => {
             return axum::Json(serde_json::json!({
