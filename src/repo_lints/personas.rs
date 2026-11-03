@@ -75,7 +75,9 @@ pub(crate) fn names(pattern: &str, tool: &str) -> bool {
 /// part is this deployment's MCP configuration, so it isn't judged here.
 pub(crate) fn dead_patterns(rules: &ToolRules, registry: &[String]) -> Vec<String> {
     let mut dead = Vec::new();
-    for pattern in rules.allow.iter().chain(rules.deny.iter()) {
+    // `own`'s too (SME-322): a typo there rules nothing just the same.
+    let own = rules.own.as_deref().map(|own| own.allow.iter().chain(own.deny.iter()));
+    for pattern in rules.allow.iter().chain(rules.deny.iter()).chain(own.into_iter().flatten()) {
         if pattern.server.is_some() {
             continue;
         }

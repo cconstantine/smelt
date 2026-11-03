@@ -109,6 +109,18 @@ A child's **effective rules** are its persona's rules (allow-all when it has no 
 
 At `start_agent`, smelt stores the child's **rule chain**: the parent's stored chain plus the child's own persona rules, as data (JSONB on the child's `agents` row, [agents.md](agents.md#the-schema)). Evaluation walks the chain (as deep as the nesting limit), so nothing is recomputed from files that may have changed. The same goes for the chain credentials (`git-ssh`) and volumes: a child gets `git-ssh` only if its chain's bit says so — `create_child` seeded it from the parent's, narrowed by the persona's ask — and only volumes its parent created or has mounted. **Named secrets are exempt**, the user's answer to SME-242's question: the persona alone decides who holds one, so a grandchild can hold a secret no ancestor ever held, and the whole guard there is that a persona file can only run from a repo the user trusts ([credentials](#credentials)).
 
+**Rules that bind only their own conversation** (SME-322). A dispatcher — the Project Manager, a Ticket Driver — starts the seats that do the work, so a deny it holds for its own sake would cascade down and disarm them: a driver's `deny: [write_file]` would leave its Developer unable to write. Its persona's `smelt.tools` may hold an `own:` block, in the same grammar (a class and allow/deny lists, no nested `own`), that binds the conversation it's on and none of the agents it starts:
+
+```yaml
+smelt:
+  tools:
+    deny: [create_volume]      # binds the driver and everything under it
+    own:
+      deny: [write_file, edit_file, github/merge_pull_request]   # binds the driver only
+```
+
+The `own` rides on the persona's chain entry as one more conjunct of that entry, so it only narrows: it can't allow what the entry or an earlier one denies. A child starts with its parent's chain with every entry's `own` taken out (`personas::rules::for_child`), so an `own` is only ever on the entry its conversation's persona added — a persona-less child, which inherits its parent's chain as is, inherits no `own` either. A refusal by an `own` rule says it binds this conversation and not its agents. An allow-only `own` can't widen anything either way, so self-scoping has nothing to offer an allow.
+
 **Alternatives:** computing the child's rules once as a flat allow-set loses wildcards and the class ceiling, so a tool from an MCP server added later would be judged by nobody; inheriting only the persona's rules (opencode, whose subagent uses its own agent's permissions, `packages/core/src/tool/plugin/subagent.ts`) lets a child of a read-only parent write.
 
 ## Credentials
