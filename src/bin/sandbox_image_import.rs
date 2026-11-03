@@ -6,12 +6,14 @@
 //! never by the main `smelt` server process at runtime. With `--check
 //! [reference...]` instead of a tarball, it only checks that the node has
 //! those images (default: `SANDBOX_IMAGES`), with the read-only
-//! `ctr images ls -q` (`scripts/cluster-doctor`, SME-102).
+//! `ctr images ls -q` (`scripts/cluster-doctor`, SME-102), and warns when
+//! the node's image disk nears the kubelet's image-GC line (`disk`, SME-229).
 //!
 //! A short-lived pod gets the node's containerd socket hostPath-mounted
 //! (`/run/k3s/containerd` — the path this project's own `rancher/k3s`
 //! image, and a real k3s install, both use; not configurable here since
-//! this binary isn't meant to run against anything else), receives the
+//! this binary isn't meant to run against anything else), and for
+//! `--check` the containerd root read-only, for `df` (`disk`). It receives the
 //! tarball over `pods.exec` stdin, imports it, and is deleted either way.
 //!
 //! Standalone rather than reusing `src/sandbox.rs`'s `Sandbox`/
@@ -30,6 +32,9 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, AttachParams, DeleteParams, ListParams, PostParams};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+
+#[path = "sandbox_image_import/disk.rs"]
+mod disk;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -86,7 +91,7 @@ async fn import(pods: &Api<Pod>, loader: &str, tar_path: &str) -> Result<(), Box
         tar_bytes.len()
     );
 
-    start_loader(pods, loader, LOADER_LIFETIME).await?;
+    start_loader(pods, loader, LOADER_LIFETIME, false).await?;
     let started = std::time::Instant::now();
     let sent = stream_tarball(pods, loader, LOADER_LIFETIME, tar_bytes.as_slice()).await?;
     let secs = started.elapsed().as_secs_f64().max(0.001);
@@ -145,7 +150,9 @@ fn finished_loaders(listed: &[Pod], now: k8s_openapi::jiff::Timestamp) -> Vec<St
 
 /// A fresh loader pod named `name`, Running, that ends on its own after
 /// `lifetime`.
-async fn start_loader(pods: &Api<Pod>, name: &str, lifetime: Duration) -> Result<(), BoxError> {
+/// With `image_fs`, it also mounts the node's containerd root read-only,
+/// for `--check`'s disk warning (SME-229); the import never needs it.
+async fn start_loader(pods: &Api<Pod>, name: &str, lifetime: Duration, image_fs: bool) -> Result<(), BoxError> {
     // Finished loaders left by runs that were killed; never a live one,
     // which another run is still using.
     let selector = format!("{}={}", LOADER_LABEL.0, LOADER_LABEL.1);
@@ -156,13 +163,13 @@ async fn start_loader(pods: &Api<Pod>, name: &str, lifetime: Duration) -> Result
     }
     let _ = pods.delete(name, &immediate_delete()).await;
     wait_gone(pods, name).await;
-    pods.create(&PostParams::default(), &loader_pod_spec(name, lifetime)).await?;
+    pods.create(&PostParams::default(), &loader_pod_spec(name, lifetime, image_fs)).await?;
     wait_running(pods, name).await?;
     println!("sandbox_image_import: loader pod Running");
     Ok(())
 }
 
-fn loader_pod_spec(name: &str, lifetime: Duration) -> Pod {
+fn loader_pod_spec(name: &str, lifetime: Duration, image_fs: bool) -> Pod {
     // Explicit and small, on purpose: `smelt-park`'s `LimitRange` sets only
     // a `max` (64Gi/16 cores, see k8s/smelt-park-rbac.yaml), no `default` —
     // Kubernetes fills that gap by making an unspecified request/limit
@@ -193,27 +200,51 @@ fn loader_pod_spec(name: &str, lifetime: Duration) -> Pod {
                     limits: Some(limits),
                     ..Default::default()
                 }),
-                volume_mounts: Some(vec![VolumeMount {
-                    name: "k3s-run".to_string(),
-                    mount_path: "/hostcontainerd".to_string(),
-                    sub_path: Some("containerd".to_string()),
-                    ..Default::default()
-                }]),
+                volume_mounts: Some(loader_mounts(image_fs)),
                 ..Default::default()
             }],
-            volumes: Some(vec![Volume {
-                name: "k3s-run".to_string(),
-                host_path: Some(HostPathVolumeSource {
-                    path: "/run/k3s".to_string(),
-                    type_: Some("Directory".to_string()),
-                }),
-                ..Default::default()
-            }]),
+            volumes: Some(loader_volumes(image_fs)),
             restart_policy: Some("Never".to_string()),
             ..Default::default()
         }),
         status: None,
     }
+}
+
+/// The containerd socket's mount, and with `image_fs` the containerd root's
+/// (read-only).
+fn loader_mounts(image_fs: bool) -> Vec<VolumeMount> {
+    let mut mounts = vec![VolumeMount {
+        name: "k3s-run".to_string(),
+        mount_path: "/hostcontainerd".to_string(),
+        sub_path: Some("containerd".to_string()),
+        ..Default::default()
+    }];
+    if image_fs {
+        mounts.push(VolumeMount {
+            name: "image-fs".to_string(),
+            mount_path: disk::IMAGE_FS_MOUNT.to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+    }
+    mounts
+}
+
+fn loader_volumes(image_fs: bool) -> Vec<Volume> {
+    let host_dir = |name: &str, path: &str| Volume {
+        name: name.to_string(),
+        host_path: Some(HostPathVolumeSource {
+            path: path.to_string(),
+            type_: Some("Directory".to_string()),
+        }),
+        ..Default::default()
+    };
+    let mut volumes = vec![host_dir("k3s-run", "/run/k3s")];
+    if image_fs {
+        volumes.push(host_dir("image-fs", disk::IMAGE_FS_HOST_PATH));
+    }
+    volumes
 }
 
 fn immediate_delete() -> DeleteParams {
@@ -504,8 +535,23 @@ fn missing_images<S: AsRef<str>>(listed: &str, wanted: &[S]) -> Vec<String> {
 }
 
 /// `--check`: fails, naming them, if the node lacks any of `wanted`.
+/// The disk warning's mount is the only thing that could stop its loader
+/// starting (a k3s with another data dir has no such directory), so a
+/// loader that won't start with it is started again without, and the
+/// check goes on with no warning (SME-229 review).
 async fn check(pods: &Api<Pod>, loader: &str, wanted: &[String]) -> Result<(), BoxError> {
-    start_loader(pods, loader, LOADER_LIFETIME).await?;
+    let image_fs = match start_loader(pods, loader, LOADER_LIFETIME, true).await {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!(
+                "sandbox_image_import: couldn't start the loader with the node's {} mounted ({e}), \
+                 the mount or something else; trying without it and the disk warning",
+                disk::IMAGE_FS_HOST_PATH
+            );
+            start_loader(pods, loader, LOADER_LIFETIME, false).await?;
+            false
+        }
+    };
     let listed = exec_capture(
         pods,
         loader,
@@ -513,6 +559,9 @@ async fn check(pods: &Api<Pod>, loader: &str, wanted: &[String]) -> Result<(), B
     )
     .await?;
     let missing = missing_images(&listed, wanted);
+    if image_fs {
+        disk::warn_if_near_gc(pods, loader, wanted).await;
+    }
     if missing.is_empty() {
         println!("sandbox_image_import: the node has {}", wanted.join(" and "));
         Ok(())
@@ -566,7 +615,7 @@ mod tests {
         });
 
         let result = async {
-            start_loader(&pods, NAME, Duration::from_secs(5)).await?;
+            start_loader(&pods, NAME, Duration::from_secs(5), false).await?;
             Ok::<_, BoxError>(stream_tarball(&pods, NAME, Duration::from_secs(5), reader).await)
         }
         .await;
@@ -590,7 +639,7 @@ mod tests {
         // Two containers' runs can share a process id.
         assert_ne!(loader_name(7, 1), loader_name(7, 2));
         assert!(a.starts_with("sandbox-image-import-") && b.starts_with("sandbox-image-import-"), "{a} {b}");
-        let labels = loader_pod_spec(&a, LOADER_LIFETIME).metadata.labels.unwrap_or_default();
+        let labels = loader_pod_spec(&a, LOADER_LIFETIME, false).metadata.labels.unwrap_or_default();
         assert_eq!(labels.get(LOADER_LABEL.0).map(String::as_str), Some(LOADER_LABEL.1));
     }
 
@@ -626,7 +675,7 @@ mod tests {
     /// took longer than the old 300 s just to stream the tarball (SME-89).
     #[test]
     fn test_the_loader_lives_as_long_as_the_ci_job() {
-        let spec = loader_pod_spec(LOADER_POD_NAME, LOADER_LIFETIME);
+        let spec = loader_pod_spec(LOADER_POD_NAME, LOADER_LIFETIME, false);
         let command = spec.spec.and_then(|s| s.containers.into_iter().next()).and_then(|c| c.command);
         assert_eq!(command, Some(vec!["sleep".to_string(), "3600".to_string()]));
     }
@@ -702,5 +751,22 @@ mod tests {
         let sandbox = SANDBOX_IMAGES[0];
         let listed = format!("{sandbox}-old\ndocker.io/library/docker:29-dind\n");
         assert_eq!(missing_images(&listed, SANDBOX_IMAGES), vec![sandbox.to_string()]);
+    }
+
+    /// Only `--check`'s loader mounts the containerd root, read-only: an
+    /// import doesn't need it, so a k3s without that directory still
+    /// imports (SME-229 review).
+    #[test]
+    fn test_only_the_checks_loader_mounts_the_image_disk_read_only() {
+        let mounts = |image_fs| {
+            loader_pod_spec(LOADER_POD_NAME, LOADER_LIFETIME, image_fs)
+                .spec
+                .map(|s| s.containers.into_iter().flat_map(|c| c.volume_mounts.unwrap_or_default()).collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        assert!(!mounts(false).iter().any(|m| m.mount_path == disk::IMAGE_FS_MOUNT));
+        let check = mounts(true);
+        let image_fs = check.iter().find(|m| m.mount_path == disk::IMAGE_FS_MOUNT);
+        assert_eq!(image_fs.and_then(|m| m.read_only), Some(true), "{check:?}");
     }
 }
