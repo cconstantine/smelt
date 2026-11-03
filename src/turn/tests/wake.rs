@@ -296,6 +296,18 @@ async fn test_wake_drains_an_idle_notice_and_the_command_keeps_running(pool: PgP
     ] {
         assert!(text.contains(wanted), "{wanted:?} missing from: {text}");
     }
+    // SME-370 review 1: the fixed clause, pinned as this test's own literal —
+    // never through `IDLE_NOTICE_FRAGMENT`, an assertion interpolating the
+    // const it guards can never go red. The transcript's short line
+    // (`pages/chat/transcript/text.rs`) re-splits the stored sentence on
+    // these words, so a re-word must be answered in both copies at once;
+    // this is what makes that no-silent.
+    assert!(
+        text.contains("is still running and hasn't been touched in"),
+        "the idle notice's fixed clause drifted: update IDLE_NOTICE_FRAGMENT \
+         (src/turn/notify.rs) and the transcript copy \
+         (src/frontend/pages/chat/transcript/text.rs) together — {text}"
+    );
     assert_eq!(messages[1].role, "assistant");
 
     let command = db::get_terminal_command(&pool, "cmd-idle")

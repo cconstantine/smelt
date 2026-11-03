@@ -201,8 +201,11 @@ pub(super) async fn drain_unnotified_terminal_commands(
 /// `drain_idle_command_notices`, read only by `saved_idle_notice` — an
 /// idle-notice turn carries no other marker, so this sentence *is* it
 /// (SME-370). Re-wording the notice must keep this matching: wake's
-/// `test_wake_drains_an_idle_notice_and_the_command_keeps_running` pins the
-/// sentence byte-for-byte and fails on the drift.
+/// `test_wake_drains_an_idle_notice_and_the_command_keeps_running` pins
+/// the sentence in parts and pins this clause as the test's own literal —
+/// never through this const, which could never go red for guarding it —
+/// and its failure message names this const and the transcript copy
+/// (`pages/chat/transcript/text.rs`) to re-word together (review 1).
 #[cfg(feature = "server")]
 const IDLE_NOTICE_FRAGMENT: &str = "is still running and hasn't been touched in";
 
