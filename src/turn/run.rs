@@ -741,7 +741,8 @@ fn run_turn_steps<'a: 'b, 'b>(
             slot.yield_to_own_agents(pool, conversation_id, turn_model.provider_id).await;
             // Asked the user, or an agent finished (SME-236): the turn ends,
             // with any results saved. A reply here makes at least one call.
-            let (result_blocks, ends) = run_tools(pool, conversation_id, &turn).await?;
+            let ran = run_tools(pool, conversation_id, &turn, &offered).await?;
+            let (result_blocks, ends) = (ran.results, ran.ends);
             if !result_blocks.is_empty() {
                 let saved = db::create_message(pool, conversation_id, "user", &result_blocks)
                     .await
@@ -754,6 +755,9 @@ fn run_turn_steps<'a: 'b, 'b>(
             if let Some(correction) = correction {
                 save_notice(pool, conversation_id, correction, &mut persisted, &mut pending_new_content).await?;
             }
+            // Calls that all named no tool count toward the correction
+            // bound, settled after their results are saved (SME-307).
+            streak.after_calls(ran.unknown.as_deref()).map_err(ServerFnError::new)?;
             if ends {
                 return Ok(persisted);
             }

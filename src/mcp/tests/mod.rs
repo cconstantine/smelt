@@ -610,7 +610,7 @@ mod oauth_http {
     }
 }
 
-mod gated_http;
+pub(crate) mod gated_http;
 mod labels;
 mod client;
 mod names;

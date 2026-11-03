@@ -288,3 +288,72 @@ fn test_a_call_naming_a_servers_own_name_finds_its_safe_named_tools() {
     assert!(!notice.contains("no MCP server"), "{notice}");
     assert!(notice.contains(&offered), "{notice}");
 }
+
+/// SME-307: a slip of the name itself shares no word with the tool meant,
+/// so a name a few edits away is similar too; a long-word stranger isn't.
+#[test]
+fn test_similar_finds_a_slip_of_the_name() {
+    let slip = similar("todosote", OFFERED);
+    assert_eq!(slip.first().map(String::as_str), Some("todowrite"), "{slip:?}");
+    let typo = similar("mcp__linear.app__get_isue", OFFERED);
+    assert_eq!(typo.first().map(String::as_str), Some("mcp__linear.app__get_issue"), "{typo:?}");
+    assert_eq!(similar("frobnicate", OFFERED), Vec::<String>::new());
+    assert_eq!(similar("abcd", &["abce"]), Vec::<String>::new(), "words under 5 characters aren't matched by edits");
+}
+
+/// SME-307: a real call by a name that isn't offered keeps its own error
+/// and gets the text call's sentence: the slip, the crossed MCP prefix, and
+/// a name with nothing close.
+#[test]
+fn test_an_unoffered_calls_result_names_the_tools_like_it() {
+    let slip = unoffered_call_result("unknown tool: todosote", "todosote", OFFERED);
+    assert!(slip.starts_with("unknown tool: todosote\n"), "{slip}");
+    assert!(slip.contains("`todosote` isn't an offered tool; similar offered tools: `todowrite`"), "{slip}");
+    let crossed = unoffered_call_result("unknown tool", "mcp__linear.app__add_issue_comment", OFFERED);
+    assert!(crossed.contains("similar offered tools: `mcp__linear.app__save_comment`"), "{crossed}");
+    let stranger = unoffered_call_result("unknown tool: frobnicate", "frobnicate", OFFERED);
+    assert!(stranger.ends_with("`frobnicate` isn't an offered tool, and no offered tool has a similar name."), "{stranger}");
+}
+
+/// SME-307 review: a slip counts word by word, never by a shared verb, so a
+/// wrong destructive tool isn't put first.
+#[test]
+fn test_a_shared_verb_doesnt_make_a_wrong_tool_similar() {
+    let document = similar("mcp__linear.app__delete_document", OFFERED);
+    assert_ne!(document.first().map(String::as_str), Some("mcp__linear.app__delete_attachment"), "{document:?}");
+    assert!(!similar("delete_file", &["delete_volume", "edit_file"]).contains(&"delete_volume".to_string()));
+}
+
+/// SME-307 review: only an error saying the name is no tool's gets the
+/// suggestions; a tool that ran and failed in its own words doesn't.
+#[test]
+fn test_only_an_unknown_names_error_is_one() {
+    assert!(is_unknown_name_error("unknown tool: todosote"));
+    assert!(is_unknown_name_error("unknown MCP server: \"linear.app\""));
+    assert!(!is_unknown_name_error("issue not found"));
+    assert!(!is_unknown_name_error("missing or non-string field: path"));
+}
+
+/// SME-307 review 2: a near word never outranks the tool that shares the
+/// word exactly, short words don't near, and a name that differs only in
+/// `_` or `-` is found.
+#[test]
+fn test_near_words_dont_outrank_exact_ones_and_joined_names_are_found() {
+    let terminals = ["terminate_terminal", "read_terminal_output", "send_signal", "todowrite"];
+    let terminal = similar("read_terminal", &terminals);
+    assert_eq!(terminal.first().map(String::as_str), Some("read_terminal_output"), "{terminal:?}");
+    let file = similar("delete_file", &["browser_fill", "edit_file", "delete_volume"]);
+    assert!(!file.contains(&"browser_fill".to_string()) && !file.contains(&"delete_volume".to_string()), "{file:?}");
+    assert_eq!(similar("todo_write", OFFERED).first().map(String::as_str), Some("todowrite"));
+    assert_eq!(similar("web_fetch", &["webfetch", "http_request"]).first().map(String::as_str), Some("webfetch"));
+}
+
+/// SME-307 review 2: a made-up tool on an offered server is a slip; one on
+/// a server nothing of which is offered (still connecting) isn't.
+#[test]
+fn test_an_unoffered_tool_of_an_offered_server_is_a_slip() {
+    assert!(is_unoffered_tool_of_an_offered_server("mcp__linear.app__add_issue_comment", OFFERED));
+    assert!(!is_unoffered_tool_of_an_offered_server("mcp__linear.app__save_comment", OFFERED), "offered");
+    assert!(!is_unoffered_tool_of_an_offered_server("mcp__slack__post_message", OFFERED), "its server offers nothing");
+    assert!(!is_unoffered_tool_of_an_offered_server("todosote", OFFERED), "not an MCP name");
+}
