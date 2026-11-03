@@ -18,7 +18,7 @@ The notifier lives in the `Shell` layout route, so it stays mounted across navig
 
 1. Read the setting (the JS re-reads `localStorage` on every tick, on `storage` events, and again at construct) — off, nothing.
 2. If this tab is visible, focused and shows that conversation, nothing: the user is looking at it.
-3. For Finished, apply the 30 s per-conversation cooldown (a chain of quick command-notice turns doesn't buzz each time; the other four kinds are never held back).
+3. For Finished, apply the 30 s per-conversation cooldown (a chain of quick command-notice turns doesn't buzz each time; the other four kinds are never held back) — an idle-notice turn never reaches this step: it notes no Finished at all (SME-370).
 4. Call `api::notifications::get_attention(conversation_id, generation, attention)` — the check right before acting. `None` means the event is stale (a turn running again, the generation moved on, the question answered/dismissed/asked of a parent, the conversation gone) and nothing shows.
 5. Show `new Notification(heading, { body, tag, renotify: true })`: "smelt has a question" / "smelt: the turn failed" / "smelt: the reply was cut off" / "smelt: the model refused" / "smelt: done", with the conversation's title and, for a question, the first question's header as body.
 6. Keep the `Notification` in a JS map by conversation id: clicking it focuses the window and sends `click` to Rust, which pushes the route and closes it; every `QuestionsChanged`/`TurnsChanged` revalidates the open ones and closes the stale; this tab focused on that conversation closes it too.
