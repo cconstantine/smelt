@@ -420,6 +420,29 @@ pub(in crate::frontend::pages::chat) fn system_notice(text: &str, commands: &Has
             .unwrap_or_default();
         return Some(format!("The sandbox stopped unexpectedly{reason}; its terminals are gone"));
     }
+    // The sandbox's other notices (SME-354 B20: they showed as the user's
+    // own bubble). Each is the sentence the server writes, cut to what the
+    // user needs; the model gets the whole of it.
+    if let Some(rest) = text.strip_prefix("Docker in sandbox pod ")
+        && let Some((head, _)) = rest.split_once(", so the containers it was running have stopped")
+    {
+        let why = head.split_once(" was restarted").map(|(_, why)| why).unwrap_or_default();
+        return Some(format!("Docker restarted{why}, so its containers stopped; images, terminals and /workspace are kept"));
+    }
+    if let Some(rest) = text.strip_prefix("Sandbox pod ")
+        && let Some((_, tail)) = rest.split_once("'s storage was removed after ")
+        && let Some((days, _)) = tail.split_once(" days stopped")
+    {
+        return Some(format!("The sandbox's storage was removed after {days} days stopped; the next sandbox starts fresh"));
+    }
+    if text.starts_with("The user removed this conversation's sandbox storage") {
+        return Some("You removed the sandbox's storage; the next sandbox starts fresh".to_string());
+    }
+    if let Some(rest) = text.strip_prefix("Language server ")
+        && let Some((head, _)) = rest.rsplit_once(". The sandbox is unaffected")
+    {
+        return Some(format!("Language server {head}"));
+    }
     if text == crate::api::chat::STOP_NOTICE {
         return Some("Stopped.".to_string());
     }
@@ -560,17 +583,25 @@ pub(in crate::frontend::pages::chat) fn answered_lines(result: &str) -> Vec<Stri
 /// An answered `ask_user`'s record, each answer under its question
 /// (SME-123 DR13): the answer lines the model got ("2. Notes: they wrote:
 /// \"…\"") said in the user's words, against the question at the same
-/// place. A line with no number (the user wrote instead) stands alone.
-pub(in crate::frontend::pages::chat) fn answered_pairs(questions: &[String], lines: &[String]) -> Vec<(Option<String>, String)> {
+/// place. The answer starts after that question's own header, which can
+/// hold ": " itself (SME-354 B16); a line with no number (the user wrote
+/// instead) stands alone.
+pub(in crate::frontend::pages::chat) fn answered_pairs(questions: &[crate::questions::Question], lines: &[String]) -> Vec<(Option<String>, String)> {
     lines
         .iter()
         .map(|line| {
             let numbered = line
                 .split_once(". ")
                 .and_then(|(n, rest)| n.parse::<usize>().ok().map(|n| (n, rest)))
-                .and_then(|(n, rest)| rest.split_once(": ").map(|(_, answer)| (n, answer)));
+                .and_then(|(n, rest)| {
+                    let question = questions.get(n.wrapping_sub(1));
+                    let answer = question
+                        .and_then(|q| rest.strip_prefix(q.header.as_str())?.strip_prefix(": "))
+                        .or_else(|| rest.split_once(": ").map(|(_, answer)| answer))?;
+                    Some((question.map(|q| q.question.clone()), answer))
+                });
             match numbered {
-                Some((n, answer)) => (questions.get(n.wrapping_sub(1)).cloned(), users_words(answer)),
+                Some((question, answer)) => (question, users_words(answer)),
                 None => (None, line.clone()),
             }
         })
@@ -578,10 +609,12 @@ pub(in crate::frontend::pages::chat) fn answered_pairs(questions: &[String], lin
 }
 
 /// An answer as the model got it, in the user's words: `they wrote:
-/// "x"` is the quote alone, and `A; they also wrote: "x"` is `A — "x"`.
+/// "x"` is the quote alone, and `A; they also wrote: "x"` is `A — "x"`,
+/// the written text read back from the debug literal `answered_result`
+/// wrote it as.
 fn users_words(answer: &str) -> String {
     let quote = |text: &str| {
-        let inner = text.trim().trim_matches('"');
+        let inner = debug_literal(text.trim()).unwrap_or_else(|| text.trim().trim_matches('"').to_string());
         format!("\u{201c}{inner}\u{201d}")
     };
     if let Some(text) = answer.strip_prefix("they wrote: ") {
@@ -591,4 +624,33 @@ fn users_words(answer: &str) -> String {
         return format!("{chosen} \u{2014} {}", quote(text));
     }
     answer.to_string()
+}
+
+/// The text of a string written with `{:?}` (`str`'s `Debug`), or `None`
+/// if `text` isn't exactly one such literal (SME-354 B16: the record
+/// showed its escapes, and trimming quotes lost one the user wrote).
+pub(in crate::frontend::pages::chat) fn debug_literal(text: &str) -> Option<String> {
+    let mut chars = text.strip_prefix('"')?.chars();
+    let mut out = String::new();
+    loop {
+        match chars.next()? {
+            '"' => return chars.next().is_none().then_some(out),
+            '\\' => out.push(match chars.next()? {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                '0' => '\0',
+                c @ ('\\' | '"' | '\'') => c,
+                'u' => {
+                    let rest = chars.as_str().strip_prefix('{')?;
+                    let (hex, after) = rest.split_once('}')?;
+                    let c = char::from_u32(u32::from_str_radix(hex, 16).ok()?)?;
+                    chars = after.chars();
+                    c
+                }
+                _ => return None,
+            }),
+            c => out.push(c),
+        }
+    }
 }

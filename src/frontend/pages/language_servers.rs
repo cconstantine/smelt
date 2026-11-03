@@ -270,7 +270,7 @@ pub fn LanguageServerEdit(id: i64) -> Element {
                     }
                     super::TwoStepButton {
                         armed: armed(),
-                        class: "mcp-delete-server",
+                        class: "mcp-delete",
                         idle: "Delete language server",
                         confirm: "Confirm delete?",
                         on_arm: move |_| armed.set(true),

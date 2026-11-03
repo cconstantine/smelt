@@ -25,15 +25,37 @@ const STORAGE_REMOVED_ERROR: &str = "the sandbox storage was deleted; clone the 
 /// reads its row after ours closed, and its claim bind waits out or
 /// skips what this removal left Terminating). Nothing below takes any
 /// other lock, so the bounded pod wait inside cannot deadlock.
+///
+/// The body runs in a task of its own that the caller awaits, the
+/// `run_pod_start` shape (SME-354 B4): the caller is a request, and a
+/// closed tab drops its future. Cut off partway, a removal sent no
+/// notice, left repos `ready` over an empty `/workspace`, or left
+/// `torn_down` set on a pod still live.
 pub async fn remove_conversation_storage(
     pool: &PgPool,
     conversation_id: i64,
 ) -> Result<StorageRemoval, SandboxError> {
-    // One removal or one start at a time for this conversation, for the
-    // whole body (review 1, finding 1).
-    let start_lock = pod_start_lock(conversation_id);
-    let _starting = start_lock.lock().await;
-    remove_conversation_storage_locked(pool, conversation_id).await
+    let pool = pool.clone();
+    // In the caller's span, so the removal's spans are its children.
+    tokio::spawn(tracing::Instrument::in_current_span(async move {
+        // One removal or one start at a time for this conversation, for
+        // the whole body (review 1, finding 1).
+        let start_lock = pod_start_lock(conversation_id);
+        let _starting = start_lock.lock().await;
+        let removal = Box::pin(remove_conversation_storage_locked(&pool, conversation_id)).await?;
+        // The user's removal settles the grace pass's quiet stops too
+        // (SME-354 review 1, M1): nothing is left for it to remove, and
+        // a pass finding the claims gone must not announce this removal
+        // as its own. A claim left behind keeps the marks for the pass.
+        if removal.claims_failed == 0 {
+            if let Err(e) = db::clear_conversation_quiet_stop_marks(&pool, conversation_id).await {
+                tracing::warn!(conversation_id, error = %e, "couldn't settle the conversation's quiet stops after a storage removal");
+            }
+        }
+        Ok(removal)
+    }))
+    .await
+    .unwrap_or_else(|e| Err(SandboxError::StartFailed(format!("removing the sandbox storage failed: {e}"))))
 }
 
 /// The whole body of `remove_conversation_storage`, for a caller that
@@ -69,9 +91,11 @@ pub(in crate::sandbox) async fn remove_conversation_storage_locked(
     // `SandboxPodUpdate { terminated }` and `PodsChanged` itself.
     // `stop_pod_for_user` is deliberately not called: its "user stopped
     // pod" notice would double with the removal notice below.
+    // Its terminals close only once the pod's delete worked (SME-354
+    // B12): a failed one leaves the pod running, terminals and all.
     for row in db::list_sandbox_pods(pool, conversation_id).await.map_err(SandboxError::Db)? {
-        close_pod_terminals(pool, row.id).await;
         force_terminate_pod(pool, row.id).await?;
+        close_pod_terminals(pool, row.id).await;
         removal.pod_stopped = true;
     }
     // Its language-server pods mount the workspace claim too; their

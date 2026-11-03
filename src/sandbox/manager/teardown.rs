@@ -168,12 +168,27 @@ pub(in crate::sandbox) async fn delete_pod_if_unchanged(pods: &Api<Pod>, name: &
 /// told in one notice, saved between turns so it can't split a tool call
 /// from its result. Doesn't wake the model: it learns on its next turn.
 pub async fn stop_pod_for_user(pool: &PgPool, pod_id: i64) -> Result<(), TerminalError> {
+    stop_pod_for_user_with(pool, pod_id, async { Box::pin(delete_terminated_pod(pool, &get()?.client, pod_id)).await })
+        .await
+}
+
+/// `stop_pod_for_user` with the cluster's delete passed in, so a test can
+/// race it with a quiet stop.
+pub(in crate::sandbox) async fn stop_pod_for_user_with(
+    pool: &PgPool,
+    pod_id: i64,
+    delete: impl std::future::Future<Output = Result<(), SandboxError>>,
+) -> Result<(), TerminalError> {
     let live = db::sandbox_pod_is_live(pool, pod_id).await?;
     if !live {
         return Err(TerminalError::NoPod);
     }
+    // Clears a quiet stop's mark should one have closed the row since
+    // the check above (SME-354 B3): the Stop keeps the storage.
+    terminate_pod_as(pool, pod_id, db::PodEnd::ByUser, delete).await?;
+    // Only once the delete worked (SME-354 B12, review 1 L2): a failed
+    // one leaves the pod running, terminals and all.
     let (conversation_id, _) = close_pod_terminals(pool, pod_id).await;
-    force_terminate_pod(pool, pod_id).await?;
     if let Some(conversation_id) = conversation_id {
         let notice = format!(
             "The user stopped sandbox pod {pod_id}. Its terminals, and any files outside /workspace and mounted volumes, are gone. Create a new pod if you need one."

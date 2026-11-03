@@ -130,33 +130,24 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
         .as_ref()
         .and_then(crate::providers::ConversationModel::choice)
         .map(|choice| (choice.provider_id, choice.model.clone()));
-    let branch = repo.as_ref().and_then(|(_, target)| crate::git::requested_branch(target));
-    let new = db::NewChild {
+    let new = OwnedNewChild {
         caller,
-        brief,
-        persona_name: persona,
+        brief: brief.to_string(),
+        persona: persona.map(str::to_string),
         model,
-        max_depth: agent_depth(),
-        volumes: &volumes,
-        repo: repo.as_ref().map(|(parent_repo, _)| db::NewChildRepo {
-            url: &parent_repo.url,
-            remote_key: &parent_repo.remote_key,
-            dir: &parent_repo.dir,
-            branch: branch.as_deref(),
-            parent_repo_id: parent_repo.id,
-        }),
+        volumes: volumes.iter().map(|name| name.to_string()).collect(),
+        repo: repo.clone(),
     };
-    let (child, child_repo) = match db::create_child(pool, &new).await.map_err(|e| format!("couldn't start the agent: {e}"))? {
-        db::CreateChild::Created { child, repo } => (child, repo),
-        db::CreateChild::Refused { why, asked } => {
-            if asked {
-                // The card must reach open tabs, as load_instructions' does.
-                crate::git::publish_repos(pool, caller).await;
-            }
-            return Err(why);
-        }
+    // The child's transaction and the spawn of its start run in a task of
+    // their own (SME-354 B7): a turn dropped while the commit is in
+    // flight can't leave the child committed `starting` with no start.
+    let created = tokio::spawn(tracing::Instrument::in_current_span(create_and_start(pool.clone(), new)))
+        .await
+        .map_err(|e| format!("couldn't start the agent: {e}"))?;
+    let child = match created.map_err(|e| format!("couldn't start the agent: {e}"))? {
+        db::CreateChild::Created { child, .. } => child,
+        db::CreateChild::Refused { why, .. } => return Err(why),
     };
-    crate::events::publish_app(crate::events::AppEvent::ConversationsChanged);
     let on = match &repo {
         Some((parent_repo, crate::git::CloneTarget::Ref(r))) => format!(" on {} at {r}", parent_repo.url),
         Some((parent_repo, crate::git::CloneTarget::Commit { sha, branch })) => {
@@ -176,21 +167,72 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
     } else {
         format!(", with volumes {}", volumes.iter().map(|name| format!("{name:?}")).collect::<Vec<_>>().join(", "))
     };
-    let request = StartRequest {
-        repo: child_repo.zip(repo.map(|(_, target)| target)),
-        persona: persona.map(str::to_string),
-    };
-    let start_pool = pool.clone();
-    // In the tool call's span, so the start is its child.
-    tokio::spawn(tracing::Instrument::in_current_span(async move {
-        run_start(&start_pool, child, caller, request).await;
-    }));
     Ok(format!(
         "Started {} ({named}){on}{vols}. It works on its brief in its own conversation; its report \
          arrives here as a message when it calls finish, message_agent writes to it, and \
          list_agents shows its status.",
         label(child, None)
     ))
+}
+
+/// What `create_and_start` records for a new child, owned so the task
+/// that runs it outlives the turn that asked for it.
+struct OwnedNewChild {
+    caller: i64,
+    brief: String,
+    persona: Option<String>,
+    model: Option<(i64, String)>,
+    volumes: Vec<String>,
+    /// The parent's checkout the child works on, and its target.
+    repo: Option<(db::ConversationRepo, crate::git::CloneTarget)>,
+}
+
+/// `create_child`, then what follows its commit (the sidebar told, the
+/// child's start spawned; a refusal's trust card published): run as a
+/// task of its own by `start_agent`, so no drop of the caller's turn can
+/// land between the commit and the rest (SME-354 B7). The start runs in the
+/// tool call's span, so it's the call's child.
+async fn create_and_start(pool: PgPool, new: OwnedNewChild) -> Result<db::CreateChild, sqlx::Error> {
+    let branch = new.repo.as_ref().and_then(|(_, target)| crate::git::requested_branch(target));
+    let volumes: Vec<&str> = new.volumes.iter().map(String::as_str).collect();
+    let record = db::NewChild {
+        caller: new.caller,
+        brief: &new.brief,
+        persona_name: new.persona.as_deref(),
+        model: new.model.clone(),
+        max_depth: agent_depth(),
+        volumes: &volumes,
+        repo: new.repo.as_ref().map(|(parent_repo, _)| db::NewChildRepo {
+            url: &parent_repo.url,
+            remote_key: &parent_repo.remote_key,
+            dir: &parent_repo.dir,
+            branch: branch.as_deref(),
+            parent_repo_id: parent_repo.id,
+        }),
+    };
+    let created = db::create_child(&pool, &record).await?;
+    let (child, child_repo) = match &created {
+        db::CreateChild::Created { child, repo } => (*child, repo.clone()),
+        db::CreateChild::Refused { asked, .. } => {
+            if *asked {
+                // The card must reach open tabs, as load_instructions' does.
+                crate::git::publish_repos(&pool, new.caller).await;
+            }
+            return Ok(created);
+        }
+    };
+    crate::events::publish_app(crate::events::AppEvent::ConversationsChanged);
+    #[cfg(test)]
+    test_hooks::reach(test_hooks::AFTER_CREATE_CHILD, new.caller).await;
+    let request = StartRequest {
+        repo: child_repo.zip(new.repo.map(|(_, target)| target)),
+        persona: new.persona,
+    };
+    let caller = new.caller;
+    tokio::spawn(tracing::Instrument::in_current_span(async move {
+        run_start(&pool, child, caller, request).await;
+    }));
+    Ok(created)
 }
 
 /// The start notice, the child's own: what its first turn drains.
@@ -318,6 +360,14 @@ pub(crate) async fn credentials_notes(pool: &PgPool, child: i64, snapshot: &db::
             "{}'s persona asks for `git-ssh`, which its parent's chain doesn't have, so it gets none",
             label()
         ));
+    } else if wants_git_ssh && !key_stored(pool).await {
+        // Granted, but nothing to grant yet (SME-354 B11): the store is
+        // short, not the chain, and the next install after a key is
+        // added writes it.
+        notes.push(format!(
+            "{}'s persona asks for `git-ssh`, but no SSH key is stored, so it has none until you add one",
+            label()
+        ));
     }
     let secrets: Vec<String> =
         names.into_iter().filter(|name| name != crate::credentials::CREDENTIAL_GIT_SSH).collect();
@@ -356,6 +406,15 @@ async fn chain_has_git_ssh(pool: &PgPool, child: i64) -> bool {
             true
         }
     }
+}
+
+/// Whether an SSH key is stored, for the credentials note: a store that
+/// can't be read accuses nothing, as for the secrets.
+async fn key_stored(pool: &PgPool) -> bool {
+    db::ssh_key_stored(pool).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "couldn't read whether an SSH key is stored for the agent's credentials note");
+        true
+    })
 }
 
 /// One notice to the parent, whatever the start found to tell it: the
@@ -414,7 +473,29 @@ pub(crate) async fn fail_start(
 ) -> Option<tokio::task::JoinHandle<()>> {
     let label = label(child, None);
     let text = format!("{label}'s start failed: {error}");
-    match db::fail_start(pool, child, parent, &label, &text).await {
+    // A write that errors is tried again (SME-354 B7): given up on, the
+    // child would stay `starting` with no start task until a restart's
+    // sweep, its parent waiting on a report that never comes.
+    let mut attempt = 0;
+    let written = loop {
+        attempt += 1;
+        #[cfg(test)]
+        let written = if test_hooks::fail_start_write_fails(parent) {
+            Err(sqlx::Error::Protocol("a test failed the failed start's write".to_string()))
+        } else {
+            db::fail_start(pool, child, parent, &label, &text).await
+        };
+        #[cfg(not(test))]
+        let written = db::fail_start(pool, child, parent, &label, &text).await;
+        match written {
+            Err(e) if attempt < FAIL_START_ATTEMPTS => {
+                tracing::warn!(conversation_id = child, error = %e, attempt, "couldn't record a failed start; trying again");
+                tokio::time::sleep(std::time::Duration::from_millis(200 * attempt)).await;
+            }
+            written => break written,
+        }
+    };
+    match written {
         Ok(true) => {
             let wake = crate::turn::notify(pool, parent, vec![crate::turn::Notice::Wake]);
             crate::events::publish_app(crate::events::AppEvent::ConversationsChanged);
@@ -425,11 +506,20 @@ pub(crate) async fn fail_start(
             None
         }
         Err(e) => {
-            tracing::warn!(conversation_id = child, error = %e, start_error = %error, "couldn't record a failed start");
+            tracing::error!(
+                conversation_id = child,
+                error = %e,
+                start_error = %error,
+                attempts = FAIL_START_ATTEMPTS,
+                "couldn't record a failed start: the agent stays starting until the next restart's sweep"
+            );
             None
         }
     }
 }
+
+/// How many times `fail_start` tries its write.
+const FAIL_START_ATTEMPTS: u64 = 3;
 
 /// Held by a start from its first step: on every way out (done, failed,
 /// the child stopped or deleted, the task dropped) it removes the start's

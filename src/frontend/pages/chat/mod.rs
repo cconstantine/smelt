@@ -153,11 +153,15 @@ pub fn Chat() -> Element {
     // Bumped when a conversation starts or stops waiting on an answer to
     // the model's question (`ConversationEvent::QuestionsChanged`, SME-34).
     let questions_changed = use_signal(|| 0u64);
+    // The conversation tree, as the sidebar last fetched it: its own list,
+    // and the header's, which once fetched a second copy on every turn
+    // event (SME-354 B18).
+    let conversation_nodes: Signal<Vec<crate::api::agents::ConversationNode>> = use_signal(Vec::new);
 
     rsx! {
         div { class: "chat-layout",
-            ConversationSidebar { selected, conversations_changed, pods_changed, turns_changed, questions_changed }
-            ChatPanel { selected, conversations_changed, pods_changed, turns_changed, questions_changed }
+            ConversationSidebar { selected, conversations: conversation_nodes, conversations_changed, pods_changed, turns_changed, questions_changed }
+            ChatPanel { selected, conversation_nodes, conversations_changed, pods_changed, turns_changed, questions_changed }
         }
     }
 }
@@ -165,6 +169,7 @@ pub fn Chat() -> Element {
 #[component]
 fn ChatPanel(
     selected: Memo<Option<i64>>,
+    conversation_nodes: Signal<Vec<crate::api::agents::ConversationNode>>,
     conversations_changed: Signal<u64>,
     pods_changed: Signal<u64>,
     turns_changed: Signal<u64>,
@@ -298,7 +303,7 @@ fn ChatPanel(
                 None => rsx! { empty_home::EmptyHome {} },
                 Some(_) => {
                     rsx! {
-                    if !sandbox_pods().is_empty() || !repos().is_empty() || !todos().is_empty() || browsing_session_open() || !stored_volumes().is_empty() {
+                    if !conversation_missing() && (!sandbox_pods().is_empty() || !repos().is_empty() || !todos().is_empty() || browsing_session_open() || !stored_volumes().is_empty()) {
                         div { class: "side-panels-row",
                             if browsing_session_open() {
                                 BrowsingPanel {
@@ -323,7 +328,12 @@ fn ChatPanel(
                         }
                     }
                     div { class: "chat-main",
-                        conversation_header::ConversationHeader { selected, conversations_changed, turns_changed, questions_changed }
+                        // A conversation deleted elsewhere keeps neither its
+                        // header nor its side panels (SME-354 B24: its sandbox
+                        // panel's Remove volumes stayed up).
+                        if !conversation_missing() {
+                            conversation_header::ConversationHeader { selected, nodes: conversation_nodes }
+                        }
                         AgentsWaitingBanner { selected, conversations_changed, questions_changed }
                         ContextUsage {
                             selected,

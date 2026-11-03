@@ -407,6 +407,14 @@ pub(super) async fn scenario_deleted_in_another_tab(t: &Scenario<'_>) {
     )
     .await
     .expect("save a message");
+    // A todo list puts the side panels up, to see them go (SME-354 B24).
+    db::set_conversation_todos(
+        t.pool,
+        deleted.id,
+        &[anthropic::tools::TodoItem { content: "B24 todo".to_string(), status: anthropic::tools::TodoStatus::Pending }],
+    )
+    .await
+    .expect("set todos");
     let other = t.conversation().await;
     let row = format!(".conversation-item[data-conversation-id='{}']", deleted.id);
 
@@ -434,5 +442,16 @@ pub(super) async fn scenario_deleted_in_another_tab(t: &Scenario<'_>) {
     assert!(
         wait_for_count(&open, &row, 0, Duration::from_secs(10)).await,
         "the open tab's sidebar shouldn't list the deleted conversation"
+    );
+    // Its side panels and header go too: the sandbox panel's Remove
+    // volumes stayed up for a conversation that no longer exists
+    // (SME-354 B24).
+    assert!(
+        wait_for_count(&open, ".side-panels-row", 0, Duration::from_secs(10)).await,
+        "the deleted conversation's side panels should go"
+    );
+    assert!(
+        wait_for_count(&open, ".conversation-header", 0, Duration::from_secs(10)).await,
+        "the deleted conversation's header should go"
     );
 }

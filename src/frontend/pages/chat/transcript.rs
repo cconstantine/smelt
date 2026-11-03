@@ -154,10 +154,10 @@ pub(super) fn render_block_element(
         {
             match question_call(tool_results.get(id)) {
                 QuestionCall::Answered(answer) => {
-                    let questions: Vec<String> = input
+                    let questions: Vec<crate::questions::Question> = input
                         .get("questions")
                         .and_then(|q| q.as_array())
-                        .map(|qs| qs.iter().filter_map(|q| q.get("question").and_then(|t| t.as_str()).map(str::to_string)).collect())
+                        .map(|qs| qs.iter().filter_map(|q| serde_json::from_value(q.clone()).ok()).collect())
                         .unwrap_or_default();
                     rsx! {
                         div { key: "{key}", class: "question-answered",

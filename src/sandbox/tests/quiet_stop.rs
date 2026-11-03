@@ -359,3 +359,127 @@ async fn test_a_quiet_stop_stamps_the_row_and_other_ends_do_not(pool: PgPool) {
     terminate_pod_with(&pool, stopped, deleted(stopped)).await.expect("the user's stop");
     assert!(quiet_stop_mark(&pool, stopped).await.is_none(), "a Stop through terminate_pod_with leaves NULL");
 }
+
+/// A delete that tells `reached` it's waiting, then waits for `release`.
+async fn held_delete(
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) -> Result<(), SandboxError> {
+    let _ = reached.send(());
+    let _ = release.await;
+    Ok(())
+}
+
+/// `rx`, or a failure after 10 s: a regression that never signals fails
+/// the test rather than hanging it.
+async fn within_10s(rx: tokio::sync::oneshot::Receiver<()>, what: &str) {
+    match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+        Ok(Ok(())) => {}
+        other => panic!("{what}: {other:?}"),
+    }
+}
+
+/// SME-354 B3, interleaving 1: the quiet stop has re-checked and waits on
+/// its delete when the user's Stop (which takes neither lock) closes the
+/// row. The quiet stop then finds the row already ended: no mark, so the
+/// grace pass never removes the storage the Stop keeps, and no "stopped
+/// after N minutes" notice.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_users_stop_during_a_quiet_stops_delete_leaves_no_mark_and_no_quiet_notice(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let (conversation, pod) = idle_pod(&pool, 90).await;
+    let (reached_tx, reached) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    let notes = ActivityNotes::default();
+
+    let quiet = stop_candidate(&pool, &notes, pod, conversation, StopReason::Idle { minutes: 60 }, held_delete(reached_tx, release_rx));
+    let user = async {
+        within_10s(reached, "the quiet stop reached its delete").await;
+        stop_pod_for_user_with(&pool, pod, deleted(pod)).await.expect("the user's stop");
+        let _ = release.send(());
+    };
+    let (stopped, ()) = tokio::join!(quiet, user);
+
+    assert!(!stopped, "the user's Stop ended the pod, not the quiet stop");
+    assert!(!live(&pool, pod).await);
+    assert!(quiet_stop_mark(&pool, pod).await.is_none(), "a user's Stop is never swept");
+    assert_eq!(notices_with(&pool, conversation, "was stopped after").await.len(), 0, "no quiet-stop notice");
+}
+
+/// SME-354 B3, interleaving 2: the user's Stop has passed its live check
+/// and waits on its delete when a quiet stop runs to its end. The Stop
+/// then closes the row and clears the quiet stop's mark: the user asked
+/// for the storage to be kept.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_quiet_stop_inside_a_users_stop_leaves_the_mark_cleared(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let (conversation, pod) = idle_pod(&pool, 90).await;
+    let (reached_tx, reached) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    let notes = ActivityNotes::default();
+
+    let user = stop_pod_for_user_with(&pool, pod, held_delete(reached_tx, release_rx));
+    let quiet = async {
+        within_10s(reached, "the user's stop reached its delete").await;
+        let stopped = stop_candidate(&pool, &notes, pod, conversation, StopReason::Idle { minutes: 60 }, deleted(pod)).await;
+        let _ = release.send(());
+        stopped
+    };
+    let (user, stopped) = tokio::join!(user, quiet);
+
+    user.expect("the user's stop");
+    assert!(stopped, "the quiet stop ran first");
+    assert!(!live(&pool, pod).await);
+    assert!(quiet_stop_mark(&pool, pod).await.is_none(), "the user's Stop cleared the mark");
+}
+
+/// SME-354 B12: a quiet stop whose delete fails leaves the pod running,
+/// so it leaves its terminals open too: they're closed only once the
+/// termination has worked.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_quiet_stop_whose_delete_fails_leaves_its_terminals_open(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let (conversation, pod) = idle_pod(&pool, 90).await;
+    let terminal = db::create_sandbox_terminal(&pool, pod).await.expect("terminal");
+
+    let stopped = stop_locked(&pool, pod, conversation, StopReason::Idle { minutes: 60 }, delete_fails(pod)).await;
+
+    assert!(!stopped);
+    assert!(live(&pool, pod).await, "the pod's row stays live");
+    let open: Vec<i64> = db::list_sandbox_terminals_for_pod(&pool, pod).await.expect("terminals").into_iter().map(|t| t.id).collect();
+    assert_eq!(open, vec![terminal.id], "the running pod keeps its terminal");
+}
+
+/// SME-354 B12, remove-storage's side: a removal whose pod delete fails
+/// (here the cluster can't be reached) leaves that pod running with its
+/// terminals open.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_removal_whose_pod_delete_fails_leaves_its_terminals_open(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    crate::sandbox::test_support::use_unreachable_test_manager();
+    let (conversation, pod) = idle_pod(&pool, 0).await;
+    let terminal = db::create_sandbox_terminal(&pool, pod).await.expect("terminal");
+
+    let removal = remove_conversation_storage_locked(&pool, conversation).await;
+
+    assert!(removal.is_err(), "the pod's delete couldn't reach the cluster: {removal:?}");
+    assert!(live(&pool, pod).await, "the pod's row stays live");
+    let open: Vec<i64> = db::list_sandbox_terminals_for_pod(&pool, pod).await.expect("terminals").into_iter().map(|t| t.id).collect();
+    assert_eq!(open, vec![terminal.id], "the running pod keeps its terminal");
+}
+
+/// SME-354 review 1, L2: the user's Stop too — a delete that fails
+/// leaves the pod running and its terminals open.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_users_stop_whose_delete_fails_leaves_its_terminals_open(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let (_conversation, pod) = idle_pod(&pool, 0).await;
+    let terminal = db::create_sandbox_terminal(&pool, pod).await.expect("terminal");
+
+    let stop = stop_pod_for_user_with(&pool, pod, delete_fails(pod)).await;
+
+    assert!(stop.is_err(), "the delete failed: {stop:?}");
+    assert!(live(&pool, pod).await, "the pod's row stays live");
+    let open: Vec<i64> = db::list_sandbox_terminals_for_pod(&pool, pod).await.expect("terminals").into_iter().map(|t| t.id).collect();
+    assert_eq!(open, vec![terminal.id], "the running pod keeps its terminal");
+}

@@ -68,6 +68,15 @@ async fn test_deleting_a_child_tells_its_parent_and_a_failed_delete_tells_nothin
     assert!(failed.contains("a test failed the delete"), "{failed}");
     assert!(exists(&pool, child).await, "a failed delete deletes nothing");
     assert_eq!(queued_to(&pool, root).await.len(), before, "and tells no one");
+    // SME-354 B8: and leaves it as it was, not marked deleting with its
+    // agent stopped, which would refuse every later start_agent in it.
+    let deleting_at = sqlx::query_scalar::<_, Option<chrono::NaiveDateTime>>("SELECT deleting_at FROM conversations WHERE id = $1")
+        .bind(child)
+        .fetch_one(&pool)
+        .await
+        .expect("the child's row");
+    assert_eq!(deleting_at, None, "the failed delete's mark is cleared");
+    assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_ACTIVE), "its state is restored");
 
     delete_subtree(&pool, child).await.expect("the delete");
     assert!(!exists(&pool, child).await);

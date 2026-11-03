@@ -433,13 +433,15 @@ pub async fn install_into_new_pod(pool: &PgPool, pod_id: i64) -> Result<(), Stri
 /// never re-granted by the loop's blanket reach. A pod that can't be
 /// reached is logged and skipped (it may be starting or ending); it
 /// keeps its old files until its next create (Trade-off 2, today's
-/// behaviour).
-pub async fn install_into_live_pods(pool: &PgPool) {
+/// behaviour). The pods it couldn't write to, so a delete can say a
+/// removed key or secret may still be in them (SME-354 B5); `None` when
+/// the live pods couldn't even be listed, so none is known written.
+pub async fn install_into_live_pods(pool: &PgPool) -> Option<Vec<i64>> {
     let pods = match db::list_live_pods(pool).await {
         Ok(pods) => pods,
         Err(e) => {
             tracing::warn!(error = %e, "couldn't list live pods to install credentials");
-            return;
+            return None;
         }
     };
     // Side by side, a few at a time: one pod after another made a save wait
@@ -447,12 +449,30 @@ pub async fn install_into_live_pods(pool: &PgPool) {
     // live pods the secrets page sat on "Adding..." for 11 s (SME-341).
     // Each conversation's install takes only its own lock, and the caller
     // still answers once they're all done.
+    let missed = std::sync::Mutex::new(Vec::new());
+    let missed_ref = &missed;
     futures_util::StreamExt::for_each_concurrent(futures_util::stream::iter(pods), INSTALLS_AT_ONCE, |pod| async move {
         if let Err(e) = install_into_pod(pool, pod.pod_id).await {
             tracing::warn!(pod_id = pod.pod_id, error = %e, "couldn't install credentials");
+            missed_ref.lock().unwrap_or_else(|e| e.into_inner()).push(pod.pod_id);
         }
     })
     .await;
+    Some(missed.into_inner().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// What a delete tells the page about the live pods it couldn't prune
+/// (SME-354 B5): `None` when every one was, else how many may still hold
+/// the deleted file — every live pod when they couldn't be listed.
+pub async fn prune_live_pods(pool: &PgPool) -> Option<u32> {
+    let missed = match install_into_live_pods(pool).await {
+        Some(missed) => missed.len(),
+        None => match db::list_live_pods(pool).await {
+            Ok(pods) => pods.len().max(1),
+            Err(_) => 1,
+        },
+    };
+    (missed > 0).then(|| u32::try_from(missed).unwrap_or(u32::MAX))
 }
 
 /// How many live pods `install_into_live_pods` writes to at once.

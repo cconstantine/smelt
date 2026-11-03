@@ -403,3 +403,52 @@ async fn test_a_message_sent_before_the_parent_read_the_question_is_not_the_answ
     assert_eq!(stored.answer, None, "the unprompted message was taken as the answer");
     eventually("every turn is over", || async { !crate::turn::turn_running(child) }).await;
 }
+
+/// SME-354 B9: a question tool the chain denies is refused when the
+/// model calls it anyway, like any denied tool: no question is recorded
+/// and the turn goes on with the refusal as the call's result.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_denied_question_tool_is_refused_at_call_time(pool: PgPool) {
+    let ask_user = tool_call_reply(
+        "ask_user",
+        serde_json::json!({"questions": [{"question": "Go?", "header": "Go", "options": [{"label": "Yes"}, {"label": "No"}]}]}),
+    );
+    for (name, first) in [("ask_parent", ask_reply()), ("ask_user", ask_user)] {
+        let requests = agent_mock(&pool, vec![first, text_reply("Fine.")]).await;
+        let root = db::create_conversation(&pool).await.expect("create conversation").id;
+        let child = active_child(&pool, root).await;
+        sqlx::query("UPDATE agents SET rule_chain = $2 WHERE conversation_id = $1")
+            .bind(child)
+            .bind(serde_json::json!([{"class": "read-only", "allow": [], "deny": [name]}]))
+            .execute(&pool)
+            .await
+            .expect("a chain denying it");
+        crate::turn::start_turn(pool.clone(), child, "Work.".to_string()).await.expect("the send");
+        eventually("the child's turn goes on past the call", || async {
+            requests_for(&requests, Some(child)).len() >= 2 && !crate::turn::turn_running(child)
+        })
+        .await;
+        assert!(db::get_pending_question(&pool, child).await.expect("read").is_none(), "{name}: nothing was asked");
+        let results = since_last_reply(&requests_for(&requests, Some(child))[1]);
+        let refusal = format!("tool_result: {name} is denied by this conversation's tool rules (deny pattern `{name}`)");
+        assert_eq!(results, vec![refusal], "{name}");
+        eventually("the parent's turns are over", || async { !crate::turn::turn_running(root) }).await;
+    }
+}
+
+/// SME-354 B10: a chain that won't read refuses the call (fails closed)
+/// with a clear error, where the offer path still falls open.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_unreadable_rule_chain_refuses_the_call(pool: PgPool) {
+    agent_mock(&pool, vec![text_reply("Fine.")]).await;
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    let child = active_child(&pool, root).await;
+    sqlx::query("UPDATE agents SET rule_chain = '{\"not\": \"a list\"}'::jsonb WHERE conversation_id = $1")
+        .bind(child)
+        .execute(&pool)
+        .await
+        .expect("a corrupt chain");
+    let refused = crate::anthropic::tools::execute(&pool, child, "toolu_l", "list_agents", &serde_json::json!({})).await;
+    let error = refused.expect_err("the call is refused");
+    assert!(error.starts_with("couldn't read this conversation's tool rules, so list_agents is refused:"), "{error}");
+}

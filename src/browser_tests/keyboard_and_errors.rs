@@ -215,7 +215,11 @@ pub(super) async fn scenario_settings_two_step(t: &Scenario<'_>) {
     .expect("create a language server");
     let page = t.tab(t.url(&format!("language-servers/{}", server.id))).await;
     wait_for_resource(&page, &format!("/api/language-servers/{}", server.id)).await;
-    two_step_delete(&page, ".mcp-delete-server").await;
+    // The red two-step every page's Delete is, at its own width: the
+    // language server's and the provider's were unstyled grey buttons,
+    // the provider's as wide as its 80-character confirm (SME-354 B25).
+    assert_red_two_step(&page).await;
+    two_step_delete(&page, ".mcp-delete").await;
     assert!(
         wait_until(|| async { matches!(db::get_language_server(pool, server.id).await, Ok(None)) }, Duration::from_secs(10)).await,
         "the language server should be deleted"
@@ -226,11 +230,20 @@ pub(super) async fn scenario_settings_two_step(t: &Scenario<'_>) {
         .expect("create a provider");
     let page = t.tab(t.url(&format!("providers/{}", provider.id))).await;
     wait_for_resource(&page, &format!("/api/providers/{}", provider.id)).await;
-    two_step_delete(&page, ".mcp-delete-server").await;
+    assert_red_two_step(&page).await;
+    two_step_delete(&page, ".mcp-delete").await;
     assert!(
         wait_until(|| async { matches!(db::get_inference_provider(pool, provider.id).await, Ok(None)) }, Duration::from_secs(10)).await,
         "the provider should be deleted"
     );
+}
+
+/// The page's Delete is the shared red two-step (`.mcp-delete`), not
+/// wider than a button needs (SME-354 B25).
+async fn assert_red_two_step(page: &chromiumoxide::Page) {
+    wait_for_element(page, ".mcp-delete", Duration::from_secs(10)).await;
+    let width = element_box(page, ".mcp-delete").await.2;
+    assert!(width < 260, "the Delete is {width}px wide");
 }
 
 /// Clicks a two-step button at `selector` once (it must arm: `confirm`

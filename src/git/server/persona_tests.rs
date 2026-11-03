@@ -183,7 +183,11 @@ async fn test_only_a_trusted_repos_personas_reach_the_model(pool: PgPool) {
     for path in ["/workspace/declined", "/workspace/undecided", "/workspace/bare", "/workspace/c"] {
         assert!(repo_entry(&listing, path).get("personas").is_none(), "{told}");
     }
-    assert!(listing["note"].as_str().expect("note").contains("isn't available yet"), "{told}");
+    // SME-354 B22: the note said persona agents weren't available yet,
+    // long after start_agent took a persona; it says how to use one.
+    let note = listing["note"].as_str().expect("note");
+    assert!(!note.contains("isn't available"), "{told}");
+    assert!(note.contains("start_agent") && note.contains("persona"), "{told}");
 
     // The user trusts one meanwhile ("Work on a repo" on it): the next
     // listing has its personas.

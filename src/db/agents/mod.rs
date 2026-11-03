@@ -232,8 +232,13 @@ pub enum Finish {
     /// agent or is gone.
     NotActive(Option<String>),
     /// A message to the child is still unread (SME-238): it reads it
-    /// first, or it would be `finished` with no way to report on it.
+    /// first, or it would be `finished` with no way to report on it. A
+    /// report from one of its own agents counts too (SME-354 B2).
     MessageWaiting,
+    /// Agents of its own are still `starting` or `active` (SME-354 B2):
+    /// their ids and states, in ascending id. Their reports would reach
+    /// a finished agent, whose turn sends nothing on.
+    AgentsRunning(Vec<(i64, String)>),
 }
 
 /// `finish`'s transaction: the child `finished` and its report queued to
@@ -270,6 +275,23 @@ pub async fn finish_agent(pool: &PgPool, child: i64, label: &str, report: &str) 
             .await?;
         return Ok(Finish::NotActive(state));
     }
+    // Its own agents still running would report to a finished agent,
+    // which sends nothing on (SME-354 B2): it waits for them or stops
+    // them first. One of them finishing at the same moment is read
+    // here still `active` (not yet committed) or `finished` with its
+    // report queued (committed), which the unread check below refuses.
+    let running = sqlx::query_as::<_, (i64, String)>(
+        "SELECT a.conversation_id, a.state FROM agents a JOIN conversations c ON c.id = a.conversation_id
+         WHERE c.parent_id = $1 AND a.state IN ($2, $3) ORDER BY a.conversation_id",
+    )
+    .bind(child)
+    .bind(AGENT_STARTING)
+    .bind(AGENT_ACTIVE)
+    .fetch_all(&mut *tx)
+    .await?;
+    if !running.is_empty() {
+        return Ok(Finish::AgentsRunning(running));
+    }
     // A statement after the update got the row: a `message_agent` that
     // held it first has committed, and its row is seen (SME-238).
     if unread_by(&mut tx, child).await? {
@@ -280,18 +302,19 @@ pub async fn finish_agent(pool: &PgPool, child: i64, label: &str, report: &str) 
     Ok(Finish::Queued { parent })
 }
 
-/// Whether a message or a question to `child` is still undelivered, or
-/// an answer to its own question is still untaken, on the caller's
-/// transaction.
+/// Whether a message, a question or (SME-354 B2) a report from one of
+/// its own agents to `child` is still undelivered, or an answer to its
+/// own question is still untaken, on the caller's transaction.
 async fn unread_by(conn: &mut sqlx::PgConnection, child: i64) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT 1 FROM agent_messages
-                        WHERE to_conversation_id = $1 AND delivered_at IS NULL AND kind IN ($2, $3))
+                        WHERE to_conversation_id = $1 AND delivered_at IS NULL AND kind IN ($2, $3, $4))
              OR EXISTS (SELECT 1 FROM pending_questions WHERE conversation_id = $1 AND answer IS NOT NULL)",
     )
     .bind(child)
     .bind(KIND_MESSAGE)
     .bind(KIND_QUESTION)
+    .bind(KIND_REPORT)
     .fetch_one(&mut *conn)
     .await
 }
@@ -325,8 +348,34 @@ async fn subtree_ids(conn: &mut sqlx::PgConnection, id: i64) -> Result<Vec<i64>,
     Ok(ids)
 }
 
+/// Locks `id` and every conversation under it `FOR NO KEY UPDATE`, the
+/// mode `create_child` takes on its caller, and returns their ids as
+/// `subtree_ids` does (SME-354 B1). A `create_child` by any of them that
+/// held its row first has committed by the time the lock is granted, so
+/// the subtree is read again under the locks until nothing new appears;
+/// one that comes later waits for the caller's commit and sees its
+/// writes (`stopped`, `deleting_at`). A new child's id is larger than
+/// every row already locked, so the rows are still taken in ascending id.
+pub(super) async fn lock_subtree(conn: &mut sqlx::PgConnection, id: i64) -> Result<Vec<i64>, sqlx::Error> {
+    let mut locked: Vec<i64> = Vec::new();
+    loop {
+        let subtree = subtree_ids(&mut *conn, id).await?;
+        let new: Vec<(i64, RowLock)> = subtree
+            .iter()
+            .filter(|row| !locked.contains(row))
+            .map(|row| (*row, RowLock::NoKeyUpdate))
+            .collect();
+        if new.is_empty() {
+            return Ok(subtree);
+        }
+        lock_conversations(&mut *conn, &new).await?;
+        locked.extend(new.iter().map(|(row, _)| *row));
+    }
+}
+
 /// `stop_agent`'s transaction: `id`, one of `caller`'s children, and its
-/// whole subtree set `stopped`, the rows locked in ascending id first. The
+/// whole subtree set `stopped`, the rows locked in ascending id first
+/// (`lock_subtree`, so a grandchild being made meanwhile is in it). The
 /// caller stops their turns after the commit (state first, SME-217's order).
 pub async fn stop_subtree(pool: &PgPool, caller: i64, id: i64) -> Result<StopSubtree, sqlx::Error> {
     let mut tx = pool.begin().await?;
@@ -341,9 +390,7 @@ pub async fn stop_subtree(pool: &PgPool, caller: i64, id: i64) -> Result<StopSub
     if !is_child {
         return Ok(StopSubtree::NotYourChild);
     }
-    let subtree = subtree_ids(&mut tx, id).await?;
-    let locks: Vec<(i64, RowLock)> = subtree.iter().map(|id| (*id, RowLock::KeyShare)).collect();
-    lock_conversations(&mut tx, &locks).await?;
+    let subtree = lock_subtree(&mut tx, id).await?;
     let state = sqlx::query_scalar::<_, String>("SELECT state FROM agents WHERE conversation_id = $1")
         .bind(id)
         .fetch_optional(&mut *tx)

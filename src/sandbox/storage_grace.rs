@@ -142,6 +142,15 @@ where
                     return false;
                 }
             }
+            // B13: recorded before the removal, so a retry of one given
+            // up on after it deleted the claims still says so.
+            let tried_before = match db::start_storage_removal(pool, pod_id).await {
+                Ok(tried_before) => tried_before,
+                Err(e) => {
+                    tracing::warn!(pod_id, conversation_id, error = %e, "couldn't record a storage-grace attempt; the next pass tries again");
+                    return false;
+                }
+            };
             // F1: bounded — this runs holding the conversation's turn
             // lock; a stall settles as nothing happened, and the next
             // pass retries from the top.
@@ -157,6 +166,17 @@ where
                 // and claims.
                 Ok(Err(e)) => {
                     tracing::warn!(conversation_id, error = %e, "a storage-grace removal failed; the next pass tries again");
+                    // Every error returns before the claim loop: this
+                    // attempt deleted nothing, so a retry finding the
+                    // claims gone (the user removed them meanwhile) must
+                    // not credit it (SME-354 review 1, M1) — unless an
+                    // earlier attempt of this mark, given up on, may have
+                    // deleted them (B13): that record stands (review 2).
+                    if !tried_before {
+                        if let Err(e) = db::forget_storage_removal_attempt(pool, pod_id).await {
+                            tracing::warn!(pod_id, error = %e, "couldn't forget a failed storage-grace attempt");
+                        }
+                    }
                     false
                 }
                 Ok(Ok(removal)) if removal.claims_failed > 0 => {
@@ -167,16 +187,31 @@ where
                     // Claims gone: deleted now, already gone (the user
                     // removed the storage after the stop), or `Foreign`
                     // — retrying could never have helped. One notice,
-                    // only when this removal deleted something, the
-                    // workspace itself went (F2: a `Foreign` workspace
-                    // stands, and its files' owner is another server),
-                    // and stopping a live pod didn't already save one.
-                    if removal.claims_deleted > 0 && removal.workspace_gone && !removal.pod_stopped {
+                    // only when this mark's removal deleted something —
+                    // now, or in an earlier attempt given up on, which
+                    // may have deleted them before it stalled (SME-354
+                    // B13) — the workspace itself went (F2: a `Foreign`
+                    // workspace stands, and its files' owner is another
+                    // server), and stopping a live pod didn't already
+                    // save one.
+                    let deleted = removal.claims_deleted > 0 || tried_before;
+                    // Settled whatever the outcome, so the attempt is
+                    // forgotten first (review 1, M1; review 2, L1):
+                    // should the clear below fail, the retry finds the
+                    // claims gone and no earlier attempt, and settles
+                    // with no notice — no second one, and none for a
+                    // removal this pass didn't do.
+                    if let Err(e) = db::forget_storage_removal_attempt(pool, pod_id).await {
+                        tracing::warn!(pod_id, error = %e, "couldn't forget a storage-grace attempt; the next pass settles it again");
+                        return false;
+                    }
+                    if deleted && removal.workspace_gone && !removal.pod_stopped {
                         save_removal_notice(pool, pod_id, conversation_id, days).await;
                     }
                     // If clearing fails the next pass re-removes as a
-                    // no-op (claims gone now settles without a notice),
-                    // so one notice per stop still holds.
+                    // no-op — claims gone, and the attempt forgotten
+                    // above, so it settles without a notice — and one
+                    // notice per stop still holds.
                     match db::clear_pod_quiet_stop_mark(pool, pod_id).await {
                         Ok(()) => true,
                         Err(e) => {

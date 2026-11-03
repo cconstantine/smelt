@@ -102,3 +102,50 @@ async fn test_start_agent_from_a_conversation_being_deleted_is_refused(pool: PgP
         .expect("count");
     assert_eq!(children, 0);
 }
+
+/// SME-354 B7, interleaving: the turn calling `start_agent` is dropped
+/// after `create_child` commits and before the start is spawned. The
+/// start must still run, or the child is left `starting` with no task.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_turn_dropped_after_the_child_commits_still_starts_it(pool: PgPool) {
+    setup(&pool, vec![text_reply("ok")]).await;
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    let (reached, release) = test_hooks::pause(test_hooks::AFTER_CREATE_CHILD, root);
+    let call = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            crate::anthropic::tools::execute(&pool, root, "toolu_s", "start_agent", &serde_json::json!({"brief": "Work."}))
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(10), reached).await.expect("the child commits").expect("paused");
+    let child = sqlx::query_scalar::<_, i64>("SELECT id FROM conversations WHERE parent_id = $1")
+        .bind(root)
+        .fetch_one(&pool)
+        .await
+        .expect("the child's row");
+    call.abort();
+    let _ = call.await;
+    // The release finds nobody waiting when the turn's own future held
+    // the hook; it's the spawned start's when the fix holds it.
+    let _ = release.send(());
+    eventually("the child's start ends", || async { state(&pool, child).await.as_deref() != Some(db::AGENT_STARTING) })
+        .await;
+    assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_ACTIVE));
+    eventually("the child's turns are over", || async { !crate::turn::turn_running(child) }).await;
+}
+
+/// SME-354 B7: a failed start whose first write fails (a database error)
+/// is written again, so the child still ends `failed` with its report,
+/// rather than `starting` with no start task.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_failed_starts_write_that_errors_is_tried_again(pool: PgPool) {
+    setup(&pool, vec![text_reply("ok")]).await;
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    test_hooks::fail_next_start(root, "boom");
+    test_hooks::fail_next_fail_start_writes(root, 1);
+    let child = start_child(&pool, root, "Work.").await;
+    eventually("the child's start ends", || async { test_hooks::starts_ended(child) }).await;
+    eventually("the child is failed", || async { state(&pool, child).await.as_deref() == Some(db::AGENT_FAILED) }).await;
+    eventually("the parent's turns are over", || async { !crate::turn::turn_running(root) }).await;
+}

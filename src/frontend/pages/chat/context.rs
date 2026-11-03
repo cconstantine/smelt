@@ -180,6 +180,19 @@ fn spend_cost_text(spend: &crate::models::ConversationSpend) -> String {
     crate::models::cost_text(spend.calls, spend.cost_usd, spend.unpriced_calls)
 }
 
+/// `calls`' count and tokens: "27 model calls — uncached input: 9,000, …".
+fn spend_tokens_text(spend: &crate::models::ConversationSpend) -> String {
+    use crate::models::{calls_text, grouped};
+    format!(
+        "{} \u{2014} uncached input: {}, cache write: {}, cache read: {}, output: {}",
+        calls_text(spend.calls),
+        grouped(spend.input_tokens),
+        grouped(spend.cache_creation_input_tokens),
+        grouped(spend.cache_read_input_tokens),
+        grouped(spend.output_tokens)
+    )
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -230,24 +243,26 @@ pub(super) fn render_context_detail_body(detail: Option<&Result<ContextDetailSna
             }
             h4 { class: "context-detail-heading", "Spent so far" }
             p { "{spend_cost_text(&detail.spend)}" }
+            // Its own calls and tokens under its own cost, before the group
+            // line (SME-354 B21: printed after it, they read as the group's).
+            if detail.spend.calls > 0 {
+                p { "{spend_tokens_text(&detail.spend)}" }
+            }
             // The group line (SME-244): an agent's always shows it — it
             // answers "which group is this?" with the root's title, and
             // it's never empty (a group's root had to run a turn to
             // start the agent). A root shows it only once an agent's
             // call has landed: shown always, a root with no agents
-            // would see its own figure twice. The tests in
+            // would see its own figure twice. It carries the group's own
+            // calls and tokens: on an unpriced model its cost line says
+            // only that there's no price (SME-354 B21). The tests in
             // context/tests.rs pin these exact strings.
             if let Some(root_title) = &detail.group_root_title {
-                p { "In {root_title}'s group: {spend_cost_text(&detail.group_spend)}" }
+                p { "In {root_title}'s group: {spend_cost_text(&detail.group_spend)} {spend_tokens_text(&detail.group_spend)}" }
             } else if detail.group_spend.calls > detail.spend.calls {
-                p { "With its agents: {spend_cost_text(&detail.group_spend)}" }
+                p { "With its agents: {spend_cost_text(&detail.group_spend)} {spend_tokens_text(&detail.group_spend)}" }
             }
             if detail.spend.calls > 0 {
-                p {
-                    "{crate::models::calls_text(detail.spend.calls)} \u{2014} uncached input: {crate::models::grouped(detail.spend.input_tokens)}, "
-                    "cache write: {crate::models::grouped(detail.spend.cache_creation_input_tokens)}, cache read: {crate::models::grouped(detail.spend.cache_read_input_tokens)}, "
-                    "output: {crate::models::grouped(detail.spend.output_tokens)}"
-                }
                 p { class: "muted",
                     "A stopped or failed call is counted with what it used before it ended, estimated where the provider "
                     "hadn't said yet: its output, and its input from the request's size when the provider reports that "

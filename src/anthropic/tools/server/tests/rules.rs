@@ -213,13 +213,17 @@ async fn test_a_denied_tool_call_names_the_deny_pattern(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_a_corrupt_chain_fails_open_consistently_in_offer_and_call(pool: PgPool) {
+async fn test_a_corrupt_chain_falls_open_in_the_offer_and_refuses_the_call(pool: PgPool) {
     // The column is smelt-written JSON; one that won't read as rule entries
-    // (hand-corrupted, say) falls open with a warning — offer and call must
-    // agree, or a conversation is offered tools whose calls are refused.
+    // (hand-corrupted, say) falls open with a warning in the offer, so it
+    // hides no tools, but refuses the call (SME-354 B10): a tool the chain
+    // may deny never runs unruled, and the refusal says why.
     let child = child_with_chain(&pool, Some(Value::String("not-json".to_string()))).await;
     let names = offered_names(&pool, child).await;
     assert!(names.iter().any(|n| n == "browser_click"), "offer falls open");
-    let message = execute(&pool, child, "t1", "http_request", &serde_json::json!({})).await.expect_err("its own error");
-    assert!(message.contains("missing or non-string field: url"), "the call falls open the same way: {message}");
+    let message = execute(&pool, child, "t1", "http_request", &serde_json::json!({})).await.expect_err("refused");
+    assert!(
+        message.starts_with("couldn't read this conversation's tool rules, so http_request is refused:"),
+        "the call fails closed: {message}"
+    );
 }

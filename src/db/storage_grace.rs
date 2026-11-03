@@ -9,10 +9,13 @@ use super::*;
 // live ones. `sandbox_pods` must be aliased `p`.
 
 /// Stamps `pod_id`'s row as ended by a quiet stop, so the storage-grace
-/// pass can count its grace from that moment. Only
-/// `quiet_stop::stop_locked` calls it: every other end — a user's Stop,
-/// the model's `terminate_pod`, a lost pod — leaves NULL, and only the
-/// pass clears it again.
+/// pass can count its grace from that moment: the tests' setup. A real
+/// quiet stop stamps it in the statement that closes the row
+/// (`terminate_sandbox_pod_as`'s `PodEnd::Quiet`, SME-354 B3); every
+/// other end — the model's `terminate_pod`, a lost pod — leaves NULL, a
+/// user's Stop clears it, so does the user's storage removal (SME-354
+/// review 1, M1), and otherwise only the pass clears it again.
+#[cfg(test)]
 pub async fn mark_pod_quietly_stopped(pool: &PgPool, pod_id: i64) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE sandbox_pods SET quietly_stopped_at = now() WHERE id = $1")
         .bind(pod_id)
@@ -71,6 +74,52 @@ pub async fn storage_removal_still_due(pool: &PgPool, pod_id: i64, days: u32) ->
     .await
 }
 
+/// Records that the pass is about to try removing `pod_id`'s mark's
+/// storage (SME-354 B13), keeping the first attempt's time. Whether an
+/// earlier attempt of this mark was already recorded: one given up on may
+/// have deleted the claims, so a retry finding them gone still sends the
+/// stop's notice.
+pub async fn start_storage_removal(pool: &PgPool, pod_id: i64) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "WITH old AS (SELECT storage_removal_started_at AS at FROM sandbox_pods WHERE id = $1)
+         UPDATE sandbox_pods p SET storage_removal_started_at = COALESCE(old.at, now())
+           FROM old WHERE p.id = $1
+         RETURNING old.at IS NOT NULL",
+    )
+    .bind(pod_id)
+    .fetch_optional(pool)
+    .await
+    .map(|earlier| earlier.unwrap_or(false))
+}
+
+/// Forgets this mark's recorded attempt (SME-354 review 1, M1), for the
+/// two outcomes that leave nothing for a retry to announce: a first
+/// attempt that failed before deleting anything (a later one leaves an
+/// earlier attempt's record standing), and a settled one, before its
+/// notice and clear. A retry after a failed clear then finds no earlier
+/// attempt and settles quietly, so the stop keeps its one notice.
+pub async fn forget_storage_removal_attempt(pool: &PgPool, pod_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE sandbox_pods SET storage_removal_started_at = NULL WHERE id = $1")
+        .bind(pod_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Settles every quiet stop of `conversation_id` (SME-354 review 1, M1):
+/// the user removed its storage, so the grace pass has nothing left to
+/// remove, and must not later read the claims' absence as its own work.
+pub async fn clear_conversation_quiet_stop_marks(pool: &PgPool, conversation_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE sandbox_pods SET quietly_stopped_at = NULL, storage_removal_started_at = NULL
+          WHERE conversation_id = $1 AND (quietly_stopped_at IS NOT NULL OR storage_removal_started_at IS NOT NULL)",
+    )
+    .bind(conversation_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Clears the mark once the pass has settled the stop: the claims are
 /// gone (or were never there), so the row never qualifies again and a
 /// later quiet stop — of the newer row a pickup starts — stamps its own
@@ -80,7 +129,7 @@ pub async fn clear_pod_quiet_stop_mark(pool: &PgPool, pod_id: i64) -> Result<(),
     if let Some(result) = fake_clear::take(pod_id) {
         return result;
     }
-    sqlx::query("UPDATE sandbox_pods SET quietly_stopped_at = NULL WHERE id = $1")
+    sqlx::query("UPDATE sandbox_pods SET quietly_stopped_at = NULL, storage_removal_started_at = NULL WHERE id = $1")
         .bind(pod_id)
         .execute(pool)
         .await?;
@@ -121,18 +170,25 @@ fn days_param(days: u32) -> i32 {
 /// mark if that stop was one (SME-123 DR9: the stored volumes said
 /// neither): its latest pod row, if that row has ended. Keyed by
 /// conversation; a conversation whose latest pod is live has no entry.
-pub async fn last_pod_stops(
-    pool: &PgPool,
-) -> Result<std::collections::HashMap<i64, (chrono::NaiveDateTime, Option<chrono::NaiveDateTime>)>, sqlx::Error> {
+/// With the clock the stops are measured against (SME-354 B14).
+pub async fn last_pod_stops(pool: &PgPool) -> Result<(LastPodStops, chrono::NaiveDateTime), sqlx::Error> {
+    // One connection for both reads: the clock is `now()` in the session
+    // the timestamps are read in, never the server's own (B14).
+    let mut conn = pool.acquire().await?;
     let rows: Vec<(i64, chrono::NaiveDateTime, Option<chrono::NaiveDateTime>)> = sqlx::query_as(
         "SELECT DISTINCT ON (conversation_id) conversation_id, terminated_at, quietly_stopped_at
            FROM sandbox_pods
           ORDER BY conversation_id, id DESC",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await
     .map(|rows: Vec<(i64, Option<chrono::NaiveDateTime>, Option<chrono::NaiveDateTime>)>| {
         rows.into_iter().filter_map(|(id, ended, quiet)| ended.map(|ended| (id, ended, quiet))).collect()
     })?;
-    Ok(rows.into_iter().map(|(id, ended, quiet)| (id, (ended, quiet))).collect())
+    let stops = rows.into_iter().map(|(id, ended, quiet)| (id, (ended, quiet))).collect();
+    let observed_at = sqlx::query_scalar("SELECT now()::timestamp").fetch_one(&mut *conn).await?;
+    Ok((stops, observed_at))
 }
+
+/// Each conversation's last stop and its quiet stop's mark, if any.
+pub type LastPodStops = std::collections::HashMap<i64, (chrono::NaiveDateTime, Option<chrono::NaiveDateTime>)>;

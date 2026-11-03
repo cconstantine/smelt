@@ -162,8 +162,9 @@ pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChi
     // `git-ssh` bit passes down and nothing else does — a NULL column
     // reads granted, like every other Rule G read, so a pre-ticket line
     // keeps the key rather than stranding its children. An agent-less
-    // caller passes Rule G's root answer: the key, as every pod has
-    // today, if one is stored. The named-secret half of the credential
+    // caller passes Rule G's root answer: the bit, so its line has the
+    // key whenever one is stored — the install checks the store, every
+    // time (SME-354 B11). The named-secret half of the credential
     // set is not here at all — Rule S reads the child's own persona
     // snapshot, so no secret name can ride this column down the tree.
     let nested = agent.flatten();
@@ -175,18 +176,14 @@ pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChi
             };
             (depth + 1, root, chain, if git_ssh { vec![crate::credentials::CREDENTIAL_GIT_SSH.to_string()] } else { vec![] })
         }
-        None => {
-            let has_key: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM ssh_keys)")
-                .fetch_one(&mut *tx)
-                .await?;
-            (
-                1,
-                new.caller,
-                None,
-                if has_key { vec![crate::credentials::CREDENTIAL_GIT_SSH.to_string()] } else { vec![] },
-            )
-        }
+        // The root's own answer is decided at each install, not here
+        // (SME-354 B11): the key if one is stored then. So its child
+        // carries the bit with or without a key stored now, and a key
+        // added later reaches it (`credentials::install_into_live_pods`).
+        None => (1, new.caller, None, vec![crate::credentials::CREDENTIAL_GIT_SSH.to_string()]),
     };
+    #[cfg(test)]
+    crate::agents::test_hooks::reach(crate::agents::test_hooks::CREATE_CHILD_LOCKED, new.caller).await;
     let (provider_id, model) = new.model.clone().unzip();
     let child = sqlx::query_scalar::<_, i64>(
         "INSERT INTO conversations (title, parent_id, provider_id, model) VALUES ($1, $2, $3, $4) RETURNING id",

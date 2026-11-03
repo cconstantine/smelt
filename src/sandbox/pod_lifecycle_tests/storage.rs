@@ -200,6 +200,13 @@ async fn test_removing_a_stopped_conversations_storage_leaves_no_claims(pool: Pg
         let id = conversation.id;
         create_pod(&pool, id, PodLimitOverrides::default()).await.expect("create_pod");
         terminate_pod(&pool, id).await.expect("terminate_pod");
+        // As a quiet stop leaves it, an attempt of the grace pass's
+        // recorded too (SME-354 review 1, M1).
+        sqlx::query("UPDATE sandbox_pods SET quietly_stopped_at = now(), storage_removal_started_at = now() WHERE conversation_id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("quiet-stop mark");
         let names = [workspace_pvc_name(id), docker_pvc_name(id)];
         // Stopping frees no disk: both claims stay until removed.
         for name in &names {
@@ -210,6 +217,15 @@ async fn test_removing_a_stopped_conversations_storage_leaves_no_claims(pool: Pg
         assert!(!removal.pod_stopped, "no live pod to stop");
         assert_eq!((removal.claims_deleted, removal.claims_failed), (2, 0), "{removal:?}");
         assert!(claims_gone(&client, &names).await, "a stopped conversation's removal leaves no claims");
+        let marks: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sandbox_pods WHERE conversation_id = $1
+               AND (quietly_stopped_at IS NOT NULL OR storage_removal_started_at IS NOT NULL)",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("read the marks");
+        assert_eq!(marks, 0, "the user's removal settles the grace pass's quiet stop");
     })
     .await;
 }
@@ -375,9 +391,66 @@ async fn test_removal_waits_for_the_pod_start_lock(pool: PgPool) {
         }
         drop(start_held);
 
-        let removal = remove_conversation_storage(&pool, id).await.expect("remove after the start released");
-        assert_eq!((removal.claims_deleted, removal.claims_failed), (2, 0), "{removal:?}");
+        // The timed-out request's removal was never cut off (SME-354 B4):
+        // it took the lock as soon as it freed, so the claims go without
+        // another call. One made now queues behind it and finds them gone.
         assert!(claims_gone(&client, &names).await, "both claims go once the lock frees");
+        let removal = remove_conversation_storage(&pool, id).await.expect("remove after the start released");
+        assert_eq!((removal.claims_deleted, removal.claims_failed), (0, 0), "the first removal took them: {removal:?}");
+    })
+    .await;
+}
+
+/// SME-354 B4: a removal whose request goes away midway — a closed tab
+/// drops the server function's future — still finishes. The request is
+/// dropped the moment the pod's row reads closed, while the removal waits
+/// out the pod with both claims still standing; the claims then go and
+/// the conversation's repos are marked, as a whole removal does.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_removal_whose_request_is_dropped_midway_still_finishes(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT * 2, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let id = conversation.id;
+        let pod = create_pod(&pool, id, PodLimitOverrides::default()).await.expect("create_pod");
+        let repo = db::create_conversation_repo(&pool, id, "u", &format!("k-{id}"), None, "r").await.expect("repo row");
+        db::set_repo_ready(&pool, repo.id, 1, "main", None, &[], &[], None).await.expect("ready");
+        let names = [workspace_pvc_name(id), docker_pvc_name(id)];
+
+        let pod_closed = async {
+            loop {
+                if !db::sandbox_pod_is_live(&pool, pod).await.expect("live?") {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let dropped = tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::select! {
+                biased;
+                () = pod_closed => true,
+                _ = remove_conversation_storage(&pool, id) => false,
+            }
+        })
+        .await;
+        assert_eq!(dropped, Ok(true), "the request is dropped midway, after the pod's row closed");
+        for name in &names {
+            assert!(pvc_api(&client).get_opt(name).await.expect("get_opt").is_some(), "{name} stood when the request went");
+        }
+
+        assert!(claims_gone(&client, &names).await, "the removal finished without its request");
+        let failed = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let row = db::get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
+                if row.status != "ready" {
+                    return row;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the repo row was marked after the removal");
+        assert!(failed.error.is_some(), "{failed:?}");
     })
     .await;
 }

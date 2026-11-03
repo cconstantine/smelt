@@ -21,8 +21,10 @@ pub(super) fn tools() -> Vec<Registered> {
                          that works on `brief` in the background while you go on. Returns its id at \
                          once. The brief is its first message, so say everything it needs: the task, \
                          what to report back, and when it's done. Its report arrives here as a \
-                         message when it calls finish; message_agent writes to it, list_agents shows \
-                         its status, and the user can open it and write to it. Pass it the volumes \
+                         message when it calls finish, and starts a turn of yours if none is running: \
+                         to wait for it, end your turn, rather than polling with list_agents, sleep or \
+                         message_agent, which spends calls and can hold up its own on a busy provider. message_agent writes to it, list_agents \
+                         shows its status, and the user can open it and write to it. Pass it the volumes \
                          you hold (`volumes`) and they mount in its pod too — a child never mounts \
                          more than you do. Up to {} characters.",
                         crate::agents::MAX_BRIEF_CHARS

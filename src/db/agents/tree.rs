@@ -57,3 +57,31 @@ pub async fn agents_waiting_under(pool: &PgPool, id: i64) -> Result<Vec<(i64, St
     .fetch_all(pool)
     .await
 }
+
+/// Whether an agent under `id`, at any depth, is `starting` or `active` on
+/// provider `provider_id` (its own, or the default it'll take): the agents
+/// a turn of `id`'s gives its request slot up to across a tool pass, so a
+/// one-slot provider doesn't keep them waiting for that whole turn (SME-354
+/// B6).
+pub async fn live_agent_under_on_provider(pool: &PgPool, id: i64, provider_id: i64) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "WITH RECURSIVE under(id) AS (
+             SELECT id FROM conversations WHERE parent_id = $1
+             UNION
+             SELECT g.id FROM conversations g JOIN under u ON g.parent_id = u.id
+         )
+         SELECT EXISTS (
+             SELECT 1 FROM under u
+             JOIN conversations c ON c.id = u.id
+             JOIN agents a ON a.conversation_id = u.id
+             WHERE a.state IN ($2, $3)
+               AND COALESCE(c.provider_id, (SELECT default_provider_id FROM inference_settings)) = $4
+         )",
+    )
+    .bind(id)
+    .bind(AGENT_STARTING)
+    .bind(AGENT_ACTIVE)
+    .bind(provider_id)
+    .fetch_one(pool)
+    .await
+}

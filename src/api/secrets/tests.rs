@@ -158,3 +158,24 @@ async fn test_a_multi_line_value_saves_byte_equal_and_leaks_nothing(pool: PgPool
         assert!(!body.contains(leaked), "{leaked} reached the list body: {body}");
     }
 }
+
+/// SME-354 B5: a delete that can't prune a live pod says so rather than
+/// reporting success. The pod's row is live but the cluster can't be
+/// reached, as when an exec into it fails.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_delete_that_cant_reach_a_live_pod_says_how_many(pool: PgPool) {
+    crate::sandbox::test_support::use_unreachable_test_manager();
+    let pool = &pool;
+    let saved = save_secret_of(pool, None, "linear-key", "value-1234567890").await.expect("saved");
+    assert_eq!(delete_secret_of(pool, saved.id).await.expect("no live pod"), None, "nothing to prune: no warning");
+
+    let saved = save_secret_of(pool, None, "linear-key", "value-1234567890").await.expect("saved again");
+    let conversation = crate::db::create_conversation(pool).await.expect("conversation");
+    crate::db::create_sandbox_pod(pool, conversation.id).await.expect("a live pod row");
+    assert_eq!(delete_secret_of(pool, saved.id).await.expect("deleted"), Some(1), "the unreached pod is counted");
+    assert!(list_secrets_of(pool).await.expect("listed").is_empty(), "the row is deleted all the same");
+    assert_eq!(
+        unpruned_sandboxes_notice(1),
+        "Deleted, but couldn't remove it from 1 running sandbox; stop them to be sure."
+    );
+}

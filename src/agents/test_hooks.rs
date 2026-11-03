@@ -95,6 +95,10 @@ pub const DELETE_LOCKED: &str = "delete_locked";
 /// memory and before it writes it.
 pub const STORE_PAUSE_READ: &str = "store_pause_read";
 
+/// `create_child` by caller `id`, holding its row's lock with every
+/// check passed (its state read), before it writes the child.
+pub const CREATE_CHILD_LOCKED: &str = "create_child_locked";
+
 /// `finish` by child `id`, after its state's update and before its report.
 pub const FINISH_UPDATED: &str = "finish_updated";
 
@@ -136,4 +140,29 @@ impl Drop for StoreDone {
 /// How many `turn::store_pause` runs for `id` have ended.
 pub fn stores_done(id: i64) -> usize {
     STORES_DONE.lock().unwrap_or_else(|e| e.into_inner()).get(&id).copied().unwrap_or(0)
+}
+
+/// `start_agent` by caller `id`, after `create_child` committed and
+/// before the start is spawned.
+pub const AFTER_CREATE_CHILD: &str = "after_create_child";
+
+static FAIL_START_WRITE_FAILURES: LazyLock<Mutex<HashMap<i64, usize>>> = LazyLock::new(Default::default);
+
+/// Makes the next `times` writes of a failed start of a child of parent
+/// `id` fail as a database error would.
+pub fn fail_next_fail_start_writes(id: i64, times: usize) {
+    FAIL_START_WRITE_FAILURES.lock().unwrap_or_else(|e| e.into_inner()).insert(id, times);
+}
+
+/// Whether a test asked this write of a failed start of a child of
+/// parent `id` to fail; counts one down.
+pub fn fail_start_write_fails(id: i64) -> bool {
+    let mut failures = FAIL_START_WRITE_FAILURES.lock().unwrap_or_else(|e| e.into_inner());
+    match failures.get_mut(&id) {
+        Some(left) if *left > 0 => {
+            *left -= 1;
+            true
+        }
+        _ => false,
+    }
 }

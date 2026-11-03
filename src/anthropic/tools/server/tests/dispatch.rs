@@ -54,9 +54,15 @@ fn test_every_native_tool_name_is_unique() {
 #[tokio::test]
 async fn test_execute_still_dispatches_native_tools_normally() {
     let pool = test_pool();
-    // `http_request` refuses a missing url before any I/O: the
-    // error is the tool's own, not "unknown tool".
+    // The name resolves to smelt's own `http_request`, not "unknown
+    // tool": the call gets as far as its rule chain, whose read on a pool
+    // that never connects refuses it (SME-354 B10: the call path fails
+    // closed), naming the tool it resolved.
     let result = execute(&pool, 1, "toolu_http", "http_request", &serde_json::json!({})).await;
-    assert_eq!(result, Err("missing or non-string field: url".to_string()));
+    let error = result.expect_err("refused at the chain read");
+    assert!(
+        error.starts_with("couldn't read this conversation's tool rules, so http_request is refused:"),
+        "{error}"
+    );
 }
 

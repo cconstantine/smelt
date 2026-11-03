@@ -221,8 +221,8 @@ fn KeysSection(keys: Signal<Vec<SshKeySummary>>) -> Element {
     let confirm_delete = move |id: i64| {
         spawn(async move {
             match delete_ssh_key(id).await {
-                Ok(()) => {
-                    key_error.set(None);
+                Ok(unpruned) => {
+                    key_error.set(unpruned.map(crate::api::secrets::unpruned_sandboxes_notice));
                     keys.write().retain(|k| k.id != id);
                     pending_delete.set(None);
                 }

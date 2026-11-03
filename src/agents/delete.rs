@@ -45,7 +45,14 @@ pub(crate) async fn delete_subtree(pool: &PgPool, id: i64) -> Result<(), String>
             Vec::new()
         }
     };
-    db::delete_subtree_rows(pool, id, &deleting, &label).await.map_err(|e| e.to_string())?;
+    if let Err(e) = db::delete_subtree_rows(pool, id, &deleting, &label).await {
+        // Nothing was deleted: undo the mark, or every later start_agent
+        // in the subtree is refused as "being deleted" (SME-354 B8).
+        if let Err(unmark) = db::unmark_subtree_deleting(pool, &deleting).await {
+            tracing::error!(conversation_id = id, error = %unmark, "couldn't undo a failed delete's mark; its subtree refuses start_agent until it's deleted");
+        }
+        return Err(e.to_string());
+    }
     if let Some(parent) = deleting.parent {
         crate::turn::notify(pool, parent, vec![crate::turn::Notice::Wake]);
     }

@@ -10,6 +10,10 @@ pub struct Deleting {
     pub subtree: Vec<i64>,
     /// The deleted conversation's parent, when it's an agent.
     pub parent: Option<i64>,
+    /// The agents the mark stopped that had started (`active` or
+    /// `finished`), with that state: what `unmark_subtree_deleting` puts
+    /// back when the delete fails (SME-354 B8).
+    pub stopped: Vec<(i64, String)>,
 }
 
 /// The delete's transaction A: the group's root row locked (the lock
@@ -43,7 +47,18 @@ pub async fn mark_subtree_deleting(pool: &PgPool, id: i64) -> Result<Option<Dele
     else {
         return Ok(None);
     };
-    let subtree = subtree_ids(&mut tx, id).await?;
+    // Every row in the subtree too, not just the root: a `create_child`
+    // by an agent below the root locks only its own row (SME-354 B1).
+    let subtree = lock_subtree(&mut tx, id).await?;
+    let stopped = sqlx::query_as::<_, (i64, String)>(
+        "SELECT conversation_id, state FROM agents WHERE conversation_id = ANY($1) AND state IN ($2, $3)
+         ORDER BY conversation_id",
+    )
+    .bind(&subtree)
+    .bind(AGENT_ACTIVE)
+    .bind(AGENT_FINISHED)
+    .fetch_all(&mut *tx)
+    .await?;
     sqlx::query("UPDATE conversations SET deleting_at = now() WHERE id = ANY($1)")
         .bind(&subtree)
         .execute(&mut *tx)
@@ -60,7 +75,32 @@ pub async fn mark_subtree_deleting(pool: &PgPool, id: i64) -> Result<Option<Dele
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(Some(Deleting { subtree, parent }))
+    Ok(Some(Deleting { subtree, parent, stopped }))
+}
+
+/// A delete that failed after transaction A (SME-354 B8): the subtree's
+/// `deleting_at` cleared and each agent the mark stopped put back as it
+/// was, so later `start_agent`s in it aren't refused as "being deleted".
+/// Only a row still `stopped` goes back — a Stop since then stands — and
+/// a child the mark stopped while `starting` stays stopped: its start
+/// saw the stop and ended, and nothing would run it again.
+pub async fn unmark_subtree_deleting(pool: &PgPool, deleting: &Deleting) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let locks: Vec<(i64, RowLock)> = deleting.subtree.iter().map(|id| (*id, RowLock::NoKeyUpdate)).collect();
+    lock_conversations(&mut tx, &locks).await?;
+    sqlx::query("UPDATE conversations SET deleting_at = NULL WHERE id = ANY($1)")
+        .bind(&deleting.subtree)
+        .execute(&mut *tx)
+        .await?;
+    for (id, state) in &deleting.stopped {
+        sqlx::query("UPDATE agents SET state = $2, state_changed_at = now() WHERE conversation_id = $1 AND state = $3")
+            .bind(id)
+            .bind(state)
+            .bind(AGENT_STOPPED)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await
 }
 
 /// The delete's transaction B: the parent's row (shared) and the subtree's

@@ -11,7 +11,10 @@
 //! the prompt) and a request over the limit waits in smelt instead of
 //! queueing, silently, on a busy server until it times out. A raw call
 //! outside a turn takes one per call, holding from before it sends until
-//! it ends (`SlotPolicy::PerCall`). The pools are in memory, set from the
+//! it ends (`SlotPolicy::PerCall`). A turn whose own agents are live on
+//! the same provider gives its slot up across each tool pass and takes one
+//! again before its next call, so they don't wait for its whole turn
+//! (`TurnSlot::yield_to_own_agents`, SME-354 B6). The pools are in memory, set from the
 //! column and the server's report (`resolved_max`) by whatever changes
 //! either, and by every endpoint build, so a restart rebuilds them as
 //! they're used.
