@@ -296,16 +296,29 @@ async fn test_wake_drains_an_idle_notice_and_the_command_keeps_running(pool: PgP
     ] {
         assert!(text.contains(wanted), "{wanted:?} missing from: {text}");
     }
-    // SME-370 review 1: the fixed clause, pinned as this test's own literal —
-    // never through `IDLE_NOTICE_FRAGMENT`, an assertion interpolating the
-    // const it guards can never go red. The transcript's short line
-    // (`pages/chat/transcript/text.rs`) re-splits the stored sentence on
-    // these words, so a re-word must be answered in both copies at once;
-    // this is what makes that no-silent.
+    // SME-370 review 1/2: the notice's fixed text, pinned as this test's own
+    // literals — never through `IDLE_NOTICE_FRAGMENT`, an assertion
+    // interpolating the const it guards can never go red. Two pins: the words,
+    // and the delimiter the transcript splits on *with its spaces*. The short
+    // line (`pages/chat/transcript/text.rs`) cuts the stored sentence at
+    // `" is still running and hasn't been touched in "` — a leading and a
+    // trailing space and all — so a space is part of the seam: a re-word OR a
+    // whitespace-only re-flow of the `format!` (a lost or doubled space) breaks
+    // that cut in silence, which the words-alone pin misses. Pin the delimiter
+    // spaces and all, and both drifts go red here in lockstep with the const.
     assert!(
         text.contains("is still running and hasn't been touched in"),
         "the idle notice's fixed clause drifted: update IDLE_NOTICE_FRAGMENT \
          (src/turn/notify.rs) and the transcript copy \
+         (src/frontend/pages/chat/transcript/text.rs) together — {text}"
+    );
+    // The exact delimiter `text.rs` splits on, spaces and all — this is what
+    // catches a whitespace-only re-flow the words-alone pin sails past.
+    assert!(
+        text.contains(" is still running and hasn't been touched in "),
+        "the delimiter's spaces drifted — the transcript splits on the phrase \
+         with a leading and a trailing space, so a re-flow of the `format!`'s \
+         whitespace must match them; update IDLE_NOTICE_FRAGMENT and the copy \
          (src/frontend/pages/chat/transcript/text.rs) together — {text}"
     );
     assert_eq!(messages[1].role, "assistant");
