@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- The waiting shape (SME-71): the same "s" with a dot for the
+       conversations that need the user — the title count's other half. -->
+  <text x="16" y="24" text-anchor="middle" font-family="system-ui, sans-serif" font-size="26" font-weight="700" fill="#3b6fd8">s</text>
+  <circle cx="26" cy="7" r="5.5" fill="#e5484d" stroke="white" stroke-width="1.5"/>
+</svg>

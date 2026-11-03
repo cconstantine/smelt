@@ -98,7 +98,7 @@ The server publishes `AppEvent::NeedsUser { conversation_id, attention, generati
   - `run_turn_bounded` (`turn/lifecycle.rs` after the split), after its result, next to `keep_turn_error` and before `drop(in_flight)` (which is what takes the attention):
     - `Err(TurnFailure::Failed(_))` and `Err(TurnFailure::Noted { .. })`: Failed;
     - `Err(TurnFailure::Stopped)`: `clear_attention` (the user is there);
-    - `Ok(persisted)` with at least one `assistant` message: Finished.
+    - `Ok(persisted)` with at least one `assistant` message, and no question waiting: Finished — *wait-aware (2026-11-03)*: when `question_waits` the turn ended on a wait (a user row noted its Question at `ask`; parent rows notify nothing), so no Finished too.
   - That covers `start_turn` (`run.rs`), `answer_question` (`questions.rs`), `deliver_notice` and `wake_conversation` (`notify.rs`). A wake with no pending work is never counted (`wake_has_work`, SME-218), so it notes and publishes nothing. The maximum means a later turn can't hide an earlier failure or question in the same busy spell.
 - `src/api/notifications.rs` (new): `#[get("/api/conversations/{id}/attention?generation&attention")] get_attention(id: i64, generation: u64, attention: Attention) -> Option<AttentionDetails>` (query arguments as `api/providers.rs`'s `?ask_each`; the leader passes the event's kind back, since the server no longer holds it once published). It returns `None` when:
   - `turn_running(id)`;
@@ -287,7 +287,7 @@ In `turn/tests/attention.rs`, `api/notifications.rs`, `events/wire_tests.rs`, `a
   - a user turn whose call fails so its failure notice is saved (`TurnFailure::Noted`) → Failed, once;
   - a plain reply → Finished, for each of `start_turn`, `answer_question`, `deliver_notice` and a wake with a pending command notice.
 - **SME-73 pair:** a turn that overflows once, compacts and answers → one Finished, no Failed; a turn refused a second time (mock refuses twice with a named window) → Failed.
-- Nothing published for: a Stop mid-turn; a Stop catching a queued message (SME-170 path); a no-op wake; a notice saved while a question waits; a turn ending on `ask_parent` (the child waits on its parent, not the user — `get_attention(…, Question)` answers `None` while only a parent-row question waits).
+- Nothing published for: a Stop mid-turn; a Stop catching a queued message (SME-170 path); a no-op wake; a notice saved while a question waits; a turn ending on `ask_parent` (the wait-aware Ok rule notes nothing; amended 2026-11-03).
 - A queued notice turn that finishes after a failed run publishes Failed (the maximum), once.
 - A Stop after a Question in the same busy spell publishes nothing.
 - `NeedsUser` comes after `TurnsChanged` on the app channel and after `ConversationEvent::TurnState { running: false }` on the conversation's, and carries `turn_generation` as at that end.

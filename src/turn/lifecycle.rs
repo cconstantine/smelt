@@ -155,6 +155,26 @@ pub(super) fn run_turn_bounded<'a>(
                     _ => {}
                 }
             }
+            // SME-71: what this turn's end owes the user, before
+            // `drop(in_flight)` takes it (the order the plan fixes). A
+            // Stop clears the spell's debt instead: the user is there.
+            match &result {
+                Err(TurnFailure::Failed(_) | TurnFailure::Noted { .. }) => {
+                    note_attention(conversation_id, crate::events::Attention::Failed)
+                }
+                Err(TurnFailure::Stopped) => clear_attention(conversation_id),
+                // The ruling: a turn ending on a wait — the user's card
+                // or its parent's — owes that wait, not a Finished. The
+                // user-row case already noted the Question at `ask`; a
+                // parent-row wait notes nothing at all (Revision 6). The
+                // `ends` path — `finish`, a plain reply — has no row.
+                Ok(persisted) if persisted.iter().any(|m| m.role == "assistant") => {
+                    if !question_waits(pool, conversation_id).await.unwrap_or(false) {
+                        note_attention(conversation_id, crate::events::Attention::Finished)
+                    }
+                }
+                Ok(_) => {}
+            }
             // A child agent whose last turn ended without its report tells
             // its parent (SME-236), checked once this turn no longer counts.
             // Not after a stop, nor a wake that found nothing to do.

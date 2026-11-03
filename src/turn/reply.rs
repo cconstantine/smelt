@@ -166,6 +166,18 @@ pub(super) async fn save_stop_notice(
             .await
             .map_err(ServerFnError::new)?;
         record_saved(conversation_id, persisted, saved);
+        // SME-71: a reply smelt stopped and won't continue needs the user:
+        // CutOff for a cut-off reply (budget or window), Refused for a
+        // refused one. The note follows the save: if the save failed,
+        // there's no notice to act on and the turn fails, so Failed.
+        note_attention(
+            conversation_id,
+            if cut_off {
+                crate::events::Attention::CutOff
+            } else {
+                crate::events::Attention::Refused
+            },
+        );
     }
     Ok(())
 }

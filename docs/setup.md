@@ -330,3 +330,5 @@ Accepting the browser's warning once also works, but the warning comes back when
 **Check it's HTTP/2:** open `https://localhost:8443`, then DevTools → Network, add the "Protocol" column (right-click a column header). smelt's requests should say `h2`.
 
 **MCP OAuth** redirects are built from `SMELT_BASE_URL` (`http://localhost:8180/` in the compose file). When using the HTTPS address for an OAuth flow, set it to `https://localhost:8443` (no trailing slash, per the table above).
+
+**Desktop notifications** (SME-71) need a secure context too: the `Notification` constructor doesn't exist over plain HTTP, and the sidebar button then just says so. `https://localhost:8443` works as shipped, and production (`*.constantlee.us`) is HTTPS already. From another machine over LAN HTTP, Chrome's `chrome://flags/#unsafely-treat-insecure-origin-as-secure` with `http://ryzen.lan:8180` is the quick fix; either way the `(N) smelt` tab title works everywhere.

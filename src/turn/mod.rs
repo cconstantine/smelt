@@ -27,7 +27,7 @@ mod state;
 #[cfg(test)]
 mod test_hooks;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use self::call::*;
 use self::compaction::*;

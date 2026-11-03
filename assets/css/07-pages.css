@@ -25,6 +25,41 @@
     color: var(--ink);
 }
 
+/* The notifications button (SME-71) sits among the settings links and
+   reads like them — a button, not a link, since it changes state rather
+   than navigating. Full width across the two-column grid: its longest
+   label ("Notifications aren't supported in this browser", 45
+   characters) wraps to two lines in the 272 px sidebar. Colour tokens
+   carry both themes, as everywhere else; `:disabled` keeps a browser
+   from greying it its own way. */
+.notifications-toggle {
+    grid-column: 1 / -1;
+    width: 100%;
+    padding: 4px 6px;
+    border: 0;
+    border-radius: 6px;
+    background: none;
+    color: var(--text-2);
+    font-family: inherit;
+    font-size: 13px;
+    text-align: left;
+}
+
+.notifications-toggle:hover:not(:disabled) {
+    background: var(--subtle);
+    color: var(--ink);
+}
+
+.notifications-toggle:disabled {
+    color: var(--muted);
+    cursor: default;
+}
+
+/* On takes the accent, so the state reads without reading the label. */
+.notifications-toggle[aria-pressed="true"] {
+    color: var(--accent);
+}
+
 /* A conversation with a live sandbox pod. */
 .live-pod-dot {
     flex-shrink: 0;

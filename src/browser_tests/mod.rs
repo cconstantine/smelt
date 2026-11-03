@@ -259,6 +259,10 @@ fn scenarios() -> Vec<Entry> {
         entry("agent_tree", 90, Runs::Alone, |t| Box::pin(scenario_agent_tree(t))),
         entry("text_call_correction", 30, Runs::Alone, |t| Box::pin(scenario_text_call_correction(t))),
         entry("secrets_page", 60, Runs::Alone, |t| Box::pin(scenario_secrets_page(t))),
+        // Alone (SME-71): the leader holds the app-wide stream, so other
+        // lanes' turn ends would land in this scenario's counts, and it's
+        // the only scenario that touches a browser-wide setting.
+        entry("desktop_notifications", 240, Runs::Alone, |t| Box::pin(scenario_desktop_notifications(t))),
     ]
 }
 
@@ -420,6 +424,7 @@ mod links_and_commands;
 mod repo_attach;
 mod agents;
 mod text_calls;
+mod notifications;
 
 use harness::*;
 use mock::*;
@@ -439,3 +444,4 @@ use links_and_commands::*;
 use repo_attach::*;
 use agents::*;
 use text_calls::*;
+use notifications::*;
