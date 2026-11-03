@@ -4,6 +4,7 @@ use super::*;
 use std::collections::HashSet;
 
 use crate::api::agents::{ConversationNode, get_conversation_tree};
+use crate::frontend::notifications::NotificationsToggle;
 
 mod tree;
 
@@ -216,6 +217,9 @@ pub(super) fn ConversationSidebar(
                 Link { to: Route::GitRoute {}, class: "settings-link git-link", "Git" }
                 Link { to: Route::SecretsRoute {}, class: "settings-link secrets-link", "Secrets" }
                 Link { to: Route::LanguageServersRoute {}, class: "settings-link language-servers-link", "Language servers" }
+                // The one place the browser's notification permission
+                // prompt ever appears (SME-71).
+                NotificationsToggle {}
             }
             super::ErrorText { message: list_error() }
             super::ErrorText { message: action_error() }

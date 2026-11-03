@@ -120,6 +120,11 @@ pub(super) fn use_conversation_events(
     let mut context_usage = state.context_usage();
     let mut live = state.live();
     let mut event_task: Signal<Option<Task>> = use_signal(|| None);
+    // The layout's notifier (SME-71), if this page sits under the
+    // `Shell` at all: relayed `NeedsUser`s feed its title count, and its
+    // revalidate counter re-checks everything already open on each turn
+    // or question change. `None` only where there's no layout — SSR.
+    let notifier = crate::frontend::notifications::NotifierFeed::current();
     use_effect(move || {
         if let Some(task) = event_task.write().take() {
             task.cancel();
@@ -224,8 +229,22 @@ pub(super) fn use_conversation_events(
                             EventEffect::None => {}
                             EventEffect::ConversationsChanged => *conversations_changed.write() += 1,
                             EventEffect::PodsChanged => *pods_changed.write() += 1,
-                            EventEffect::TurnsChanged => *turns_changed.write() += 1,
-                            EventEffect::QuestionsChanged => *questions_changed.write() += 1,
+                            EventEffect::TurnsChanged => {
+                                *turns_changed.write() += 1;
+                                // Questions and turns both move the set
+                                // of conversations needing the user:
+                                // re-check every one already counted
+                                // (SME-71).
+                                if let Some(feed) = notifier {
+                                    feed.bump_revalidate();
+                                }
+                            }
+                            EventEffect::QuestionsChanged => {
+                                *questions_changed.write() += 1;
+                                if let Some(feed) = notifier {
+                                    feed.bump_revalidate();
+                                }
+                            }
                             EventEffect::ModelChanged => {
                                 *model_changed.write() += 1;
                                 // Another model can mean another context window: the
@@ -243,6 +262,18 @@ pub(super) fn use_conversation_events(
                             }
                             EventEffect::TurnStarted => {
                                 stream_errors.write().clear_turn_error(id);
+                            }
+                            // The layout's notifier takes it for the
+                            // title count, and revalidates its own
+                            // notifications by it (SME-71).
+                            EventEffect::NeedsUser { conversation_id, attention, generation } => {
+                                if let Some(feed) = notifier {
+                                    feed.needs_user(crate::frontend::notifications::NeedsUserEvent {
+                                        conversation_id,
+                                        attention,
+                                        generation,
+                                    });
+                                }
                             }
                             EventEffect::StaleBundle => *crate::frontend::STALE_BUNDLE.write() = true,
                         }
@@ -321,6 +352,10 @@ pub(super) fn use_sidebar_app_events(
                             // The model picker's, and with no conversation
                             // open there is no picker on screen.
                             crate::events::AppEvent::ProvidersChanged => {}
+                            // The layout's notifier (SME-71) runs its own
+                            // leader stream; this one is only the sidebar's
+                            // counters.
+                            crate::events::AppEvent::NeedsUser { .. } => {}
                             // A type this page's bundle predates (SME-43).
                             crate::events::AppEvent::Unknown => *crate::frontend::STALE_BUNDLE.write() = true,
                         }

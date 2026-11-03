@@ -177,6 +177,16 @@ pub async fn conversation_exists(pool: &PgPool, id: i64) -> Result<bool, sqlx::E
         .await
 }
 
+/// The conversation's title, or `None` when there is no such conversation
+/// (SME-71: a notification names its conversation, and this is also the
+/// attention endpoint's "the conversation is gone" answer).
+pub async fn get_conversation_title(pool: &PgPool, id: i64) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>("SELECT title FROM conversations WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
 /// Mirrors the in-memory pause after a Stop into `paused_at` (SME-238):
 /// set (keeping when it was first set) or cleared.
 pub async fn set_paused(pool: &PgPool, id: i64, paused: bool) -> Result<(), sqlx::Error> {

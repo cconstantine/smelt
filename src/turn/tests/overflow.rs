@@ -11,29 +11,29 @@ use std::sync::Arc;
 
 /// How one arrival is answered: `Ok` streams that SSE reply, `Err` is a
 /// flat HTTP refusal — the shape an overflow arrives in.
-type Answer = Result<String, (axum::http::StatusCode, String)>;
+pub(super) type Answer = Result<String, (axum::http::StatusCode, String)>;
 
 /// A mock upstream answering each arrival in order from `answers`,
 /// clamped to the last once they run out, and keeping every request
 /// body parsed: `count()` says how many sends reached the server, and
 /// `request(i)` what the (i+1)th carried. Same locking rule as
 /// `start_mock_upstream`.
-struct RefusalMock {
+pub(super) struct RefusalMock {
     answers: Vec<Answer>,
     requests: std::sync::Mutex<Vec<serde_json::Value>>,
 }
 
 impl RefusalMock {
-    fn count(&self) -> usize {
+    pub(super) fn count(&self) -> usize {
         self.requests.lock().expect("the request log").len()
     }
 
-    fn request(&self, i: usize) -> serde_json::Value {
+    pub(super) fn request(&self, i: usize) -> serde_json::Value {
         self.requests.lock().expect("the request log")[i].clone()
     }
 }
 
-async fn start_refusal_mock(pool: &PgPool, answers: Vec<Answer>) -> Arc<RefusalMock> {
+pub(super) async fn start_refusal_mock(pool: &PgPool, answers: Vec<Answer>) -> Arc<RefusalMock> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
@@ -75,7 +75,7 @@ async fn start_refusal_mock(pool: &PgPool, answers: Vec<Answer>) -> Arc<RefusalM
 
 /// Anthropic's refusal of every model, "prompt is too long: A tokens >
 /// W maximum", as a flat 400.
-fn too_long(input: u32, window: u32) -> Answer {
+pub(super) fn too_long(input: u32, window: u32) -> Answer {
     Err((
         axum::http::StatusCode::BAD_REQUEST,
         format!(
