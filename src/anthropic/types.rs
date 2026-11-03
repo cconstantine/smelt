@@ -41,6 +41,19 @@ pub enum ContentBlock {
     CompactionSummary {
         summary: String,
         covers_through_message_id: i64,
+        /// Why this compaction happened instead of the usual proactive
+        /// one, when a request was refused as an overflow (SME-73): the
+        /// reason the transcript divider reads after "Conversation
+        /// compacted: " — "the model's server refused a request that
+        /// didn't fit its 32,768-token window", or with no window named,
+        /// "the model's server refused a request that didn't fit".
+        /// `None` on every proactive compaction and every row saved
+        /// before SME-73 — `default` keeps those reading unchanged.
+        /// Storage and frontend only: `history_for_request` replays the
+        /// `summary` as a plain `Text` block, so the model never sees
+        /// this.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refused: Option<String>,
     },
     /// A fixed, structural message auto-compaction inserts immediately
     /// before and after a `CompactionSummary` block (see
@@ -349,6 +362,7 @@ mod tests {
             serde_json::to_value(ContentBlock::CompactionSummary {
                 summary: "earlier discussion condensed".to_string(),
                 covers_through_message_id: 42,
+                refused: None,
             })
             .unwrap(),
             serde_json::json!({
@@ -357,6 +371,45 @@ mod tests {
                 "covers_through_message_id": 42
             })
         );
+    }
+
+    /// SME-73: the refusal reason rides along on the block for the
+    /// transcript divider, and drops out of the wire shape when absent —
+    /// rows saved before SME-73 deserialize unchanged.
+    #[test]
+    fn test_compaction_summary_refused_round_trips() {
+        let block = ContentBlock::CompactionSummary {
+            summary: "the summary".to_string(),
+            covers_through_message_id: 7,
+            refused: Some("the model's server refused a request that didn't fit its 32,768-token window".to_string()),
+        };
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(
+            json["refused"].as_str(),
+            Some("the model's server refused a request that didn't fit its 32,768-token window")
+        );
+        assert_eq!(serde_json::from_value::<ContentBlock>(json).unwrap(), block);
+    }
+
+    /// A row saved before SME-73 has no `refused` key at all: it reads as
+    /// no reason, and writes back without one.
+    #[test]
+    fn test_a_pre_sme_73_compaction_summary_row_reads_unchanged() {
+        let row = serde_json::json!({
+            "type": "compaction_summary",
+            "summary": "old summary",
+            "covers_through_message_id": 3
+        });
+        let block: ContentBlock = serde_json::from_value(row.clone()).expect("old row parses");
+        assert_eq!(
+            block,
+            ContentBlock::CompactionSummary {
+                summary: "old summary".to_string(),
+                covers_through_message_id: 3,
+                refused: None,
+            }
+        );
+        assert_eq!(serde_json::to_value(&block).unwrap(), row);
     }
 
     #[test]

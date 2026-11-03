@@ -219,6 +219,7 @@ pub(super) async fn scenario_compaction_divider(t: &Scenario<'_>) {
         &[anthropic::ContentBlock::CompactionSummary {
             summary: "the user said hello; nothing else happened".to_string(),
             covers_through_message_id: 1,
+            refused: None,
         }],
     )
     .await
@@ -260,6 +261,75 @@ pub(super) async fn scenario_compaction_divider(t: &Scenario<'_>) {
         .await,
         "expanding the divider should reveal the real summary text"
     );
+}
+
+/// SME-73: a request the server refuses as an overflow compacts and
+/// carries on. The lane's first request is refused with llama.cpp's
+/// "exceeds the available context size" body naming a 131,072-token
+/// window; the turn must learn that window, compact, and retry — the
+/// transcript shows the divider *reading that refusal*, the retry's
+/// reply lands, and no error line appears anywhere. The window the
+/// learning saves is the lane model's own row, taken back afterwards so
+/// the lane's next scenario starts where this one did.
+pub(super) async fn scenario_overflow_compacts(t: &Scenario<'_>) {
+    let pool = t.pool;
+    let provider = *MOCK_PROVIDER.get().expect("the mock provider is saved first");
+    let model = t.mock.model.clone();
+    let before = db::get_provider_model(pool, provider, &model).await.expect("read the lane model's row");
+
+    let _fast = t.mock.hurry();
+    let _refused_first = t.mock.refuse_next(1, exceed_context_size(120_000, 131_072));
+    let conversation = t.conversation().await;
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_live_client(&page, conversation.id).await;
+    send_from(&page, "overflow me").await;
+
+    assert!(
+        wait_for_text(
+            &page,
+            "Conversation compacted: the model's server refused a request that didn't fit its 131,072-token window",
+            Duration::from_secs(20)
+        )
+        .await,
+        "the refused request should compact, and its divider should read the refusal and the window it named"
+    );
+    assert!(
+        wait_for_text(&page, "zebra0", Duration::from_secs(20)).await,
+        "the retry should answer after the divider"
+    );
+    // The reply landed, so the turn has ended: a failure would be showing
+    // its words by now, and this turn must not have any.
+    for words in ["still didn't fit", "Couldn't compact"] {
+        assert!(
+            !wait_for_text(&page, words, Duration::from_millis(500)).await,
+            "a recovered turn shows no error line — it showed {words:?}"
+        );
+    }
+
+    // Take the window back (SME-73's learner wrote it to this lane's
+    // model row).
+    match before {
+        Some(row) => db::set_provider_model_overrides(
+            pool,
+            provider,
+            &model,
+            row.thinking,
+            row.context_window,
+            row.effort.as_deref(),
+            row.max_output,
+            row.reasoning_budget,
+        )
+        .await
+        .expect("restore the lane model's settings"),
+        None => {
+            sqlx::query("DELETE FROM provider_models WHERE provider_id = $1 AND model = $2")
+                .bind(provider)
+                .bind(&model)
+                .execute(pool)
+                .await
+                .expect("unlearn the lane model's window");
+        }
+    }
 }
 
 /// Scenario 7: the todo panel — cold-load population from a seeded list,

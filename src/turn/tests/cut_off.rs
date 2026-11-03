@@ -54,17 +54,19 @@ async fn test_a_cut_off_reply_is_followed_by_a_notice(pool: PgPool) {
     assert_eq!(requests[0]["max_tokens"], 16_384);
 }
 
-/// A reply cut off at `max_tokens` (60 tokens written): `blocks` in
-/// Anthropic's order, each a content block's SSE events.
+/// A reply cut off at `max_tokens`, written to the end of its budget
+/// (16,384 — what these unsized mocks are sent): the budget stopped it,
+/// where SME-73 reads a stop far short of the budget as the window.
+/// `blocks` in Anthropic's order, each a content block's SSE events.
 fn cut_off_in_a_call_body(blocks: &[[String; 3]]) -> String {
-    reply_ending_body(blocks, "max_tokens")
+    reply_ending_body(blocks, "max_tokens", 16_384)
 }
 
 /// A reply of `blocks` (each a content block's SSE events) that ends with
-/// `stop_reason`, 60 tokens written.
-fn reply_ending_body(blocks: &[[String; 3]], stop_reason: &str) -> String {
+/// `stop_reason`, `written` tokens written.
+fn reply_ending_body(blocks: &[[String; 3]], stop_reason: &str, written: u32) -> String {
     let start = r#"{"type":"message_start","message":{"usage":{"input_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}"#.to_string();
-    let end = format!(r#"{{"type":"message_delta","delta":{{"stop_reason":"{stop_reason}"}},"usage":{{"output_tokens":60}}}}"#);
+    let end = format!(r#"{{"type":"message_delta","delta":{{"stop_reason":"{stop_reason}"}},"usage":{{"output_tokens":{written}}}}}"#);
     std::iter::once(&start)
         .chain(blocks.iter().flatten())
         .chain([&end, &r#"{"type":"message_stop"}"#.to_string()])
@@ -91,8 +93,8 @@ async fn test_an_empty_reply_is_not_saved_and_the_next_turn_works(pool: PgPool) 
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
-    let empty = reply_ending_body(&[], "end_turn");
-    let blank = reply_ending_body(&[text_events(0, " ")], "end_turn");
+    let empty = reply_ending_body(&[], "end_turn", 60);
+    let blank = reply_ending_body(&[text_events(0, " ")], "end_turn", 60);
     let requests = start_recording_mock_upstream(&pool, vec![empty, blank, text_reply_body("Done.")]).await;
 
     let saved = run_turn(&pool, conversation.id, hello()).await.expect("an empty reply doesn't fail the turn");
@@ -140,7 +142,7 @@ async fn test_a_refused_reply_keeps_its_text_and_says_it_was_refused(pool: PgPoo
     use crate::api::chat::refusal_notice;
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
-    let body = reply_ending_body(&[text_events(0, "Here is how to")], "refusal");
+    let body = reply_ending_body(&[text_events(0, "Here is how to")], "refusal", 60);
     start_recording_mock_upstream(&pool, vec![body]).await;
 
     let saved = run_turn(&pool, conversation.id, hello()).await.expect("a refusal doesn't fail the turn");
@@ -161,7 +163,7 @@ async fn test_a_reply_refused_in_a_call_drops_the_call(pool: PgPool) {
     use crate::api::chat::refusal_notice;
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
-    let body = reply_ending_body(&[todowrite_events(0, "toolu_cut", CUT_TODOS)], "refusal");
+    let body = reply_ending_body(&[todowrite_events(0, "toolu_cut", CUT_TODOS)], "refusal", 60);
     let requests = start_recording_mock_upstream(&pool, vec![body, text_reply_body("Done.")]).await;
 
     let saved = run_turn(&pool, conversation.id, hello()).await.expect("a refusal in a call doesn't fail the turn");
@@ -227,7 +229,7 @@ async fn test_a_reply_cut_off_in_a_call_keeps_its_text_and_names_the_call(pool: 
         .fetch_all(&pool)
         .await
         .expect("the recorded calls");
-    assert_eq!(output, [60], "the cut-off call's usage is recorded");
+    assert_eq!(output, [16_384], "the cut-off call's usage is recorded (the body writes its full budget, SME-73)");
 
     run_turn(&pool, conversation.id, hello()).await.expect("the next turn is accepted");
     let requests = requests.lock().expect("the request log");

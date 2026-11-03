@@ -71,6 +71,7 @@ fn input(name: &str, base_url: &str, secret: &str) -> ProviderInput {
 
 mod resolution;
 mod forms;
+mod learning;
 mod llama;
 mod listing;
 mod limiter;

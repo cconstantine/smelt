@@ -179,3 +179,27 @@ pub async fn stopped_while_queued(conversation_id: i64, new_message: &Option<cra
         let _ = release.await;
     }
 }
+
+static BEFORE_SUMMARY_CALL: Pauses = LazyLock::new(Default::default);
+
+/// Pauses `conversation_id`'s overflow recovery right before it asks the
+/// model for the summary (SME-73). As `pause_after_message_saved`.
+pub fn pause_before_summary_call(conversation_id: i64) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    pause_at(&BEFORE_SUMMARY_CALL, conversation_id)
+}
+
+pub async fn before_summary_call(conversation_id: i64) {
+    reach(&BEFORE_SUMMARY_CALL, conversation_id).await;
+}
+
+static BEFORE_RETRY: Pauses = LazyLock::new(Default::default);
+
+/// Pauses `conversation_id`'s overflow recovery right before it re-sends
+/// the request it shrank (SME-73). As `pause_after_message_saved`.
+pub fn pause_before_retry(conversation_id: i64) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    pause_at(&BEFORE_RETRY, conversation_id)
+}
+
+pub async fn before_retry(conversation_id: i64) {
+    reach(&BEFORE_RETRY, conversation_id).await;
+}

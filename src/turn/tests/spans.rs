@@ -150,15 +150,16 @@ async fn test_a_compaction_is_a_span_with_its_model_call_under_it(pool: PgPool) 
         .await
         .expect("seed");
     start_mock_upstream(&pool, vec![text_reply_body("Summary: earlier.")]).await;
-    let turn_model = crate::providers::resolve_turn_model(&pool, conversation.id)
+    let mut turn_model = crate::providers::resolve_turn_model(&pool, conversation.id)
         .await
         .expect("the mock is the default");
     let (result, spans) =
         crate::telemetry::capture_spans(compact_conversation(
             &pool,
             conversation.id,
-            &turn_model,
+            &mut turn_model,
             anthropic::stream::SlotPolicy::PerCall,
+            None,
         ))
         .await;
     result.expect("compaction");

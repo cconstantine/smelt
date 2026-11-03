@@ -612,13 +612,15 @@ fn run_turn_steps<'a: 'b, 'b>(
                 *generation = take_turn_generation(conversation_id, &held);
             }
 
-            let turn_model = match resolved_model.take() {
+            let model = match resolved_model.take() {
                 Some(model) => model,
                 None => crate::providers::resolve_turn_model(pool, conversation_id)
                     .await
                     .map_err(ServerFnError::new)?,
             };
-            let turn_model = &*resolved_model.insert(turn_model);
+            // The turn's own copy, mutable: an overflow refusal's window
+            // lands on it so every later size of the turn reads it (SME-73).
+            let turn_model = resolved_model.insert(model);
             // Take the provider's request slot before this turn's first
             // model call, and re-check the pool every iteration after
             // that: a limit saved (or cleared) mid-turn applies here, at
@@ -650,7 +652,9 @@ fn run_turn_steps<'a: 'b, 'b>(
                 estimate_tokens(&pending_new_content),
                 turn_model.context_window,
             ) {
-                compact_conversation(pool, conversation_id, turn_model, slot.held()).await?;
+                // A proactive compaction: no refusal to name on the
+                // divider (SME-73).
+                compact_conversation(pool, conversation_id, turn_model, slot.held(), None).await?;
                 // The last usage measured the history just summarized: the
                 // reply budget below estimates the new one instead.
                 last_known_usage = None;
@@ -660,7 +664,47 @@ fn run_turn_steps<'a: 'b, 'b>(
                 build_request(pool, conversation_id, turn_model, last_known_usage.as_ref(), &pending_new_content)
                     .await?;
             let offered: Vec<String> = request.tools.iter().map(|tool| tool.name.clone()).collect();
-            let (turn, recorder) = call_model(pool, conversation_id, turn_model, &mut request, slot.held()).await?;
+            // A refusal meaning "this didn't fit" answers itself once:
+            // learn the window, shrink, send again (SME-73). Every
+            // other failure ends the turn as it always did.
+            let called = call_model(pool, conversation_id, turn_model, &mut request, slot.held()).await;
+            let (turn, recorder, budget) = match called {
+                Ok((turn, recorder)) => {
+                    // Ollama truncates an oversized request quietly rather
+                    // than refusing it: when this reply measured far below
+                    // the request that went, ask the server what window it
+                    // really loaded (SME-73). The reply is kept as it
+                    // stands; this only fixes the next request — and it
+                    // runs before the meter publish below, so the meter
+                    // reads the new window with this reply's own usage.
+                    super::overflow::learn_ollama_window(pool, conversation_id, turn_model, &request, &turn.usage).await;
+                    (turn, recorder, budget)
+                }
+                Err(CallError::Overflow(overflow)) => {
+                    let recovered = overflow_recovery(
+                        pool,
+                        conversation_id,
+                        turn_model,
+                        last_known_usage,
+                        &pending_new_content,
+                        slot.held(),
+                        &request,
+                        &overflow,
+                    )
+                    .await?;
+                    (recovered.turn, recovered.recorder, recovered.budget)
+                }
+                Err(CallError::Failed(e)) => return Err(e),
+            };
+            // A reply the window stopped, rather than one that ran out of
+            // budget, measured the room the server really has: when the
+            // whole call came in far below the window this turn believed,
+            // believe less now (SME-73). Kept as it stands — a cut-off
+            // reply isn't retried or continued — and this runs before the
+            // meter is published below, so it reads the new window too.
+            if super::overflow::window_stop(turn_model.kind, &turn.stop_reason, turn.usage.output_tokens, budget.tokens) {
+                super::overflow::learn_window_stop(pool, conversation_id, turn_model, &turn.usage).await;
+            }
             save_reply(pool, conversation_id, &turn, &mut persisted).await?;
             #[cfg(test)]
             test_hooks::after_reply_saved(conversation_id).await;

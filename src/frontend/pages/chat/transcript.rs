@@ -241,16 +241,24 @@ pub(super) fn render_block_element(
         // happened (per SME-18's "visible
         // to the user" decision), collapsed by default same as `Thinking`
         // above so it doesn't dominate the transcript on every reload.
-        ContentBlock::CompactionSummary { summary, .. } => rsx! {
-            details { key: "{key}", class: "compaction-summary-block",
-                summary { class: "compaction-summary-header",
-                    span { class: "compaction-summary-icon", "🗜️" }
-                    span { "Conversation compacted" }
-                    span { class: "timestamp", "{timestamp}" }
+        // When a refusal caused it, the header says why (SME-73); the
+        // reason never reaches the model, only the summary replays.
+        ContentBlock::CompactionSummary { summary, refused, .. } => {
+            let header = match refused {
+                Some(reason) => format!("Conversation compacted: {reason}"),
+                None => "Conversation compacted".to_string(),
+            };
+            rsx! {
+                details { key: "{key}", class: "compaction-summary-block",
+                    summary { class: "compaction-summary-header",
+                        span { class: "compaction-summary-icon", "🗜️" }
+                        span { "{header}" }
+                        span { class: "timestamp", "{timestamp}" }
+                    }
+                    div { class: "compaction-summary-body", "{summary}" }
                 }
-                div { class: "compaction-summary-body", "{summary}" }
             }
-        },
+        }
         // Purely structural (see its own doc comment) — nothing a human
         // typed or needs to see; the `CompactionSummary` divider above is
         // what actually marks "compaction happened" in the transcript.
