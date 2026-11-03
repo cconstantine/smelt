@@ -293,12 +293,23 @@ async fn test_an_override_set_for_a_different_tool_doesnt_decide_its_class(pool:
     wait_until_stale(config.id).await;
     // Re-listed after the stale mark, by the first call.
     assert_eq!(class_of_call_on(&pool, &config, "second_tool").await, Some(ReadOnly), "the server's answer");
-    let now = crate::mcp::listed_tool_fingerprint(config.id, "second_tool").await.expect("second_tool is listed");
+    let now = crate::mcp::listed_tool_fingerprint(&pool, &config, "second_tool").await.expect("second_tool is listed");
 
     crate::db::set_mcp_tool_class(&pool, config.id, "second_tool", Destructive, Some(&now)).await.expect("set for this tool");
     assert_eq!(class_of_call_on(&pool, &config, "second_tool").await, Some(Destructive), "set for the listed tool, it wins");
-    crate::db::set_mcp_tool_class(&pool, config.id, "second_tool", Destructive, Some("another tool")).await.expect("set for another");
-    assert_eq!(class_of_call_on(&pool, &config, "second_tool").await, Some(ReadOnly), "set for another tool, the server's class decides");
+    crate::db::set_mcp_tool_class(&pool, config.id, "second_tool", Writing, Some(&now)).await.expect("set writing for this tool");
+    assert_eq!(class_of_call_on(&pool, &config, "second_tool").await, Some(Writing), "set for the listed tool, it decides either way");
+    // Review 1: set for another tool, it can only narrow. A `destructive`
+    // pin holds over the server's `read-only` annotation; a `read-only` one
+    // over an unannotated (destructive) tool gives way to the server.
+    sqlx::query("UPDATE mcp_tool_classes SET class = 'destructive', tool_fingerprint = 'another tool' WHERE tool_name = 'second_tool'")
+        .execute(&pool)
+        .await
+        .expect("make it stale");
+    assert_eq!(class_of_call_on(&pool, &config, "second_tool").await, Some(Destructive), "a stale pin never widens");
+    crate::db::set_mcp_tool_class(&pool, config.id, "echo", ReadOnly, Some("another tool")).await.expect("stale read-only on echo");
+    assert_eq!(class_of_call_on(&pool, &config, "echo").await, Some(Destructive), "a stale read-only doesn't widen echo");
+    crate::db::clear_mcp_tool_class(&pool, config.id, "echo").await.expect("clear echo");
 
     let echo = format!("mcp__{}__echo", config.name);
     let read_only = crate::personas::rules::RuleChain::from_stored(Some(serde_json::json!([{"class": "read-only"}])));
@@ -308,9 +319,44 @@ async fn test_an_override_set_for_a_different_tool_doesnt_decide_its_class(pool:
     crate::db::set_mcp_tool_class(&pool, config.id, "echo", ReadOnly, Some("another tool")).await.expect("stale read-only override");
     let names = offered(pool.clone(), config.clone(), read_only.clone()).await;
     assert!(!names.contains(&echo), "a stale read-only override doesn't widen the offer: {names:?}");
-    let echo_now = crate::mcp::listed_tool_fingerprint(config.id, "echo").await.expect("echo is listed");
+    let echo_now = crate::mcp::listed_tool_fingerprint(&pool, &config, "echo").await.expect("echo is listed");
     crate::db::set_mcp_tool_class(&pool, config.id, "echo", ReadOnly, Some(&echo_now)).await.expect("re-confirmed override");
     let names = offered(pool.clone(), config.clone(), read_only).await;
     REGISTRY.lock().await.remove(&config.id);
     assert!(names.contains(&echo), "saved again for this tool, it rules the offer: {names:?}");
+}
+
+/// SME-295 review 1: an override saved with no fingerprint takes the tool
+/// an offer lists under its name as the one it's for, once.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_offer_adopts_the_listed_tool_for_an_override_saved_without_one(pool: sqlx::PgPool) {
+    let config = create_static_server(&pool, &test_config(0, "unused").url).await;
+    let _server = register_test_connection(config.id, true).await;
+    crate::db::set_mcp_tool_class(&pool, config.id, "echo", ReadOnly, None).await.expect("an override from before");
+    let _ = tool_definitions_for(&pool, std::slice::from_ref(&config), &crate::personas::rules::RuleChain::default()).await;
+    let want = crate::mcp::listed_tool_fingerprint(&pool, &config, "echo").await;
+    let adopted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let row = crate::db::get_mcp_tool_class(&pool, config.id, "echo").await.expect("read the row");
+            if let Some(fingerprint) = row.and_then(|r| r.tool_fingerprint) {
+                return fingerprint;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the offer recorded which tool the override is for");
+    REGISTRY.lock().await.remove(&config.id);
+    assert_eq!(Some(adopted), want);
+}
+
+/// SME-295 review 1: the fingerprint's schema text doesn't depend on the
+/// order a server sends an object's keys in.
+#[test]
+fn test_canonical_json_ignores_key_order() {
+    let a = serde_json::json!({"type": "object", "properties": {"b": {"type": "string"}, "a": {"type": "integer"}}});
+    let b: serde_json::Value = serde_json::from_str(r#"{"properties":{"a":{"type":"integer"},"b":{"type":"string"}},"type":"object"}"#)
+        .expect("parse");
+    assert_eq!(super::tools::canonical_json(&a), super::tools::canonical_json(&b));
+    assert_ne!(super::tools::canonical_json(&a), super::tools::canonical_json(&serde_json::json!({"type": "object"})));
 }

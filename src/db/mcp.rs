@@ -348,7 +348,7 @@ pub async fn set_mcp_tool_class(
     sqlx::query(
         "INSERT INTO mcp_tool_classes (server_id, tool_name, class, tool_fingerprint) VALUES ($1, $2, $3, $4) \
          ON CONFLICT (server_id, tool_name) DO UPDATE SET class = excluded.class, \
-         tool_fingerprint = excluded.tool_fingerprint, updated_at = now()",
+         tool_fingerprint = COALESCE(excluded.tool_fingerprint, mcp_tool_classes.tool_fingerprint), updated_at = now()",
     )
     .bind(server_id)
     .bind(tool_name)
@@ -393,6 +393,26 @@ pub struct SavedToolClass {
     pub tool_name: String,
     pub class: String,
     pub tool_fingerprint: Option<String>,
+}
+
+/// Records `fingerprint` as the tool an override saved without one is for
+/// (SME-295 review 1), leaving a row that already has one as it is.
+pub async fn adopt_mcp_tool_fingerprint(
+    pool: &PgPool,
+    server_id: i64,
+    tool_name: &str,
+    fingerprint: &str,
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query(
+        "UPDATE mcp_tool_classes SET tool_fingerprint = $3 \
+         WHERE server_id = $1 AND tool_name = $2 AND tool_fingerprint IS NULL",
+    )
+    .bind(server_id)
+    .bind(tool_name)
+    .bind(fingerprint)
+    .execute(pool)
+    .await?;
+    Ok(updated.rows_affected() == 1)
 }
 
 /// The call path's one-row PK read: `server_id`'s override for

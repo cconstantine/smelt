@@ -127,3 +127,22 @@ async fn test_the_class_check_refuses_an_unknown_class(pool: PgPool) {
         .await;
     assert!(result.is_err(), "the CHECK is the source of truth for valid classes");
 }
+
+/// SME-295 review 1: a save with no fingerprint (the server unreachable at
+/// it) keeps the one stored; adoption fills only a row without one.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_save_without_a_fingerprint_keeps_the_stored_one(pool: PgPool) {
+    use crate::anthropic::tools::ToolClass;
+    let server = crate::db::create_mcp_server_config(&pool, "fp", "https://example.com/mcp", &std::collections::HashMap::new(), "static_headers", None, None)
+        .await
+        .expect("create server");
+    set_mcp_tool_class(&pool, server.id, "t", ToolClass::ReadOnly, Some("fp-1")).await.expect("set with a fingerprint");
+    set_mcp_tool_class(&pool, server.id, "t", ToolClass::Writing, None).await.expect("re-save, unreachable");
+    let row = get_mcp_tool_class(&pool, server.id, "t").await.expect("read").expect("the row");
+    assert_eq!((row.class.as_str(), row.tool_fingerprint.as_deref()), ("writing", Some("fp-1")));
+    assert!(!adopt_mcp_tool_fingerprint(&pool, server.id, "t", "fp-2").await.expect("adopt"), "a stored one stays");
+    set_mcp_tool_class(&pool, server.id, "u", ToolClass::ReadOnly, None).await.expect("one without");
+    assert!(adopt_mcp_tool_fingerprint(&pool, server.id, "u", "fp-3").await.expect("adopt"));
+    let row = get_mcp_tool_class(&pool, server.id, "u").await.expect("read").expect("the row");
+    assert_eq!(row.tool_fingerprint.as_deref(), Some("fp-3"));
+}

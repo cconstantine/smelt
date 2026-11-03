@@ -296,6 +296,11 @@ pub struct McpToolClassRow {
     /// for a bundle from before it.
     #[serde(default)]
     pub tool_changed: bool,
+    /// The fingerprint of the tool listed under this name now, which the
+    /// page sends back with a save, so an override binds to the tool the
+    /// user saw (SME-295 review 1). `None` when it isn't listed.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 /// The edit page's Tool-classes section: one row per listed tool plus
@@ -332,6 +337,7 @@ fn merge_tool_class_rows(
                 tool_changed: saved
                     .and_then(|row| row.tool_fingerprint.as_deref())
                     .is_some_and(|fingerprint| fingerprint != tool.fingerprint),
+                fingerprint: Some(tool.fingerprint.clone()),
             }
         })
         .collect();
@@ -346,6 +352,7 @@ fn merge_tool_class_rows(
         override_class: Some(row.class.clone()),
         listed: Some(false),
         tool_changed: false,
+        fingerprint: None,
     }));
     rows
 }
@@ -364,6 +371,7 @@ fn saved_only_rows(saved: Vec<db::SavedToolClass>) -> Vec<McpToolClassRow> {
             override_class: Some(row.class),
             listed: None,
             tool_changed: false,
+            fingerprint: None,
         })
         .collect()
 }
@@ -440,6 +448,7 @@ pub async fn set_mcp_tool_class(
     id: i64,
     tool_name: String,
     class: Option<String>,
+    fingerprint: Option<String>,
 ) -> ServerFnResult<()> {
     let config = db::get_mcp_server_config(db::get(), id)
         .await
@@ -448,9 +457,13 @@ pub async fn set_mcp_tool_class(
     check_override_tool_name(&tool_name).map_err(ServerFnError::new)?;
     match parse_override_class(class).map_err(ServerFnError::new)? {
         Some(class) => {
-            // Set for the tool the server lists under the name now
-            // (SME-295), when it's connected and lists one.
-            let fingerprint = crate::mcp::listed_tool_fingerprint(config.id, &tool_name).await;
+            // Set for the tool the page showed (SME-295 review 1), else
+            // the one the server lists under the name now; neither leaves
+            // a stored fingerprint as it was.
+            let fingerprint = match fingerprint {
+                Some(shown) => Some(shown),
+                None => crate::mcp::listed_tool_fingerprint(db::get(), &config, &tool_name).await,
+            };
             db::set_mcp_tool_class(db::get(), config.id, &tool_name, class, fingerprint.as_deref())
                 .await
                 .map_err(ServerFnError::new)?
@@ -625,6 +638,7 @@ mod tests {
                     override_class: Some("destructive".to_string()),
                     listed: Some(true),
                     tool_changed: false,
+                    fingerprint: Some("fp-web_search_exa".to_string()),
                 },
                 McpToolClassRow {
                     tool_name: "edit_thing".to_string(),
@@ -633,6 +647,7 @@ mod tests {
                     override_class: None,
                     listed: Some(true),
                     tool_changed: false,
+                    fingerprint: Some("fp-edit_thing".to_string()),
                 },
                 McpToolClassRow {
                     tool_name: "old_tool".to_string(),
@@ -641,6 +656,7 @@ mod tests {
                     override_class: Some("writing".to_string()),
                     listed: Some(false),
                     tool_changed: false,
+                    fingerprint: None,
                 },
             ]
         );
@@ -675,6 +691,7 @@ mod tests {
                 override_class: None,
                 listed: Some(true),
                 tool_changed: false,
+                    fingerprint: Some("fp-t".to_string()),
             }]
         );
         let rows = merge_tool_class_rows(
@@ -690,6 +707,7 @@ mod tests {
                 override_class: Some("read-only".to_string()),
                 listed: Some(false),
                 tool_changed: false,
+                    fingerprint: None,
             }]
         );
     }
@@ -742,6 +760,7 @@ mod tests {
                     override_class: None,
                     listed: Some(true),
                     tool_changed: false,
+                    fingerprint: Some("fp-web_search_exa".to_string()),
                 },
                 McpToolClassRow {
                     tool_name: "old_tool".to_string(),
@@ -750,6 +769,7 @@ mod tests {
                     override_class: Some("writing".to_string()),
                     listed: None,
                     tool_changed: false,
+                    fingerprint: None,
                 },
             ],
             server_note: Some("Unreachable: refused".to_string()),

@@ -20,6 +20,7 @@ fn row(
         override_class: override_class.map(str::to_string),
         listed,
         tool_changed: false,
+        fingerprint: None,
     }
 }
 
@@ -76,13 +77,17 @@ fn test_an_unrulable_server_name_says_its_tools_are_ruled_by_class_only() {
     assert!(unrulable_name_note(false).is_none(), "an ordinary name gets no line");
 }
 
-/// SME-295: an override set for a different tool says the server's class
-/// applies and how to re-apply it.
+/// SME-295: an override set for a different tool says the stricter of it
+/// and the server's class applies, and how to apply it to this tool.
 #[test]
 fn test_a_changed_tools_override_says_the_servers_class_applies() {
     let mut changed = row(Some("read-only"), Some(true), Some("destructive"), Some(true));
     changed.tool_changed = true;
     let note = tool_class_origin_note(&changed);
-    assert!(note.starts_with("read-only \u{2014} the server's class"), "{note}");
-    assert!(note.contains("set for a different tool") && note.contains("save it again"), "{note}");
+    // Review 1: it can only narrow, so the stricter of the two applies.
+    assert!(note.starts_with("destructive \u{2014} your override (destructive)"), "{note}");
+    assert!(note.contains("set for a different tool") && note.contains("the server's class (read-only)"), "{note}");
+    let mut loose = row(Some("destructive"), Some(true), Some("read-only"), Some(true));
+    loose.tool_changed = true;
+    assert!(tool_class_origin_note(&loose).starts_with("destructive \u{2014}"), "a stale read-only never widens");
 }

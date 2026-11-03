@@ -153,15 +153,15 @@ async fn call_tool_unspanned(
     // by a safe name (SME-365), which for a name like `search.web` isn't
     // that. Read on the connection the call goes out on, and used for the
     // override, the class, the rule check and the request alike.
-    let (service, tool_name, (listed, listed_fingerprint)) = REGISTRY
+    let (service, tool_name, (listed, listed_tool)) = REGISTRY
         .lock()
         .await
         .get(&config.id)
         .map(|conn| {
             let real = listed_tool_name(&conn.tools, &config.name, tool_name);
             let listed = listed_class(&conn.tools, &real);
-            let fingerprint = conn.tools.iter().find(|tool| tool.name == real).map(tool_fingerprint);
-            (conn.service.clone(), real, (listed, fingerprint))
+            let tool = conn.tools.iter().find(|tool| tool.name == real).cloned();
+            (conn.service.clone(), real, (listed, tool))
         })
         .ok_or_else(|| CallFailure::Failed(format!("not connected to MCP server {:?}", config.name)))?;
     let tool_name = tool_name.as_str();
@@ -184,15 +184,9 @@ async fn call_tool_unspanned(
                 config.name
             ))
         })?;
-    // Only while the server lists the tool it was set for (SME-295): a
-    // different tool behind the name is judged by its own annotations.
-    let override_class = saved
-        .filter(|row| match (row.tool_fingerprint.as_deref(), listed_fingerprint.as_deref()) {
-            (None, _) => true,
-            (Some(saved), Some(now)) => saved == now,
-            (Some(_), None) => false,
-        })
-        .map(|row| row.class);
+    // Set for a different tool than the one listed under the name, it can
+    // only narrow (SME-295; the rule the offer and the page share).
+    let override_class = saved.map(|row| effective_override(&row, listed_tool.as_ref()));
     // The override wins over the connection's list; an unknown text —
     // unreachable under the table's CHECK — is taken as destructive,
     // failing closed toward what SME-241 enforces. The offer path judges
