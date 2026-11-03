@@ -91,14 +91,14 @@ fn build_browser_runtime() -> std::io::Result<tokio::runtime::Runtime> {
 ///
 /// When the OS refuses a worker thread, tokio 1.53.1's `build()` doesn't
 /// return an `Err`: it panics ("OS can't spawn worker thread: …",
-/// `runtime/blocking/pool.rs`); only driver setup comes back as one. So the
+/// tokio's `runtime/blocking/pool.rs`, citation: external); only driver setup comes back as one. So the
 /// build runs under `catch_unwind`, and its panic becomes the same error.
 /// That needs an unwinding build (`dx serve`, the tests): under the release
 /// profile's `panic = "abort"` the panic ends the process before
 /// `catch_unwind` sees it (SME-139).
 /// Unwinding out of a half-built runtime is safe here: its blocking pool's
 /// drop sees `thread::panicking()` in an async context and returns without
-/// waiting (`runtime/blocking/shutdown.rs`). A worker thread that did start
+/// waiting (tokio's `runtime/blocking/shutdown.rs`, citation: external). A worker thread that did start
 /// before the refusal is left behind, idle.
 async fn runtime_in(
     cell: &'static OnceCell<tokio::runtime::Runtime>,
@@ -520,7 +520,7 @@ mod tests {
 
     /// When the OS refuses a worker thread, tokio 1.53.1's `Builder::build`
     /// doesn't return an `Err`: it panics with this message
-    /// (`runtime/blocking/pool.rs`). That call must still fail as an error
+    /// (tokio's `runtime/blocking/pool.rs`, citation: external). That call must still fail as an error
     /// the model can read, and the next one build the runtime (SME-119,
     /// review round 1).
     #[tokio::test]
