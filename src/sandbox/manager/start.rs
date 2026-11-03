@@ -126,7 +126,7 @@ pub(in crate::sandbox) fn timed_out_outcome(pod: &Pod, events: Result<&[Event], 
 
 /// `pod`'s events, or why they couldn't be listed. The `park` Role may
 /// list events in both namespaces (`k8s/smelt-park-rbac.yaml`).
-async fn pod_events(pods: &Api<Pod>, pod: &Pod) -> Result<Vec<Event>, String> {
+pub(in crate::sandbox) async fn pod_events(pods: &Api<Pod>, pod: &Pod) -> Result<Vec<Event>, String> {
     let client = pods.clone().into_client();
     let events: Api<Event> = match pods.namespace() {
         Some(namespace) => Api::namespaced(client, namespace),
