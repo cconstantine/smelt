@@ -259,7 +259,10 @@ mod tests {
         let history: std::collections::BTreeSet<String> = if shallow {
             Default::default()
         } else {
-            git(&["log", "--all", "--pretty=format:", "--name-only"]).lines().filter(|l| !l.is_empty()).map(str::to_string).collect()
+            // HEAD's own history, not `--all`: a file that only another
+            // branch or a stash ever had would resolve here and not once that
+            // ref is gone (review 2).
+            git(&["log", "HEAD", "--pretty=format:", "--name-only"]).lines().filter(|l| !l.is_empty()).map(str::to_string).collect()
         };
         let known = |matches: &dyn Fn(&str) -> bool| tracked.iter().chain(history.iter()).any(|p| matches(p));
         let (mut cited, mut unresolved) = (0, Vec::new());
@@ -270,7 +273,7 @@ mod tests {
                 cited += 1;
                 if !citations::resolves(&citation, &known) {
                     unresolved.push(format!(
-                        "{citation} cited at {path}:{line} resolves to nothing; check: git log --all --oneline -- '*{citation}'"
+                        "{citation} cited at {path}:{line} resolves to nothing; check: git log HEAD --oneline -- '*{citation}'"
                     ));
                 }
             }

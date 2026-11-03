@@ -6,8 +6,8 @@
 //!
 //! A citation is a token in a `//` comment that holds a `/` and ends in
 //! `.rs` (an optional `:line` after it is ignored). It resolves when some
-//! known path — tracked now, or in any commit when the clone has its
-//! history — is it, ends in `/` and it, or is its module twin (`x.rs` and
+//! known path — tracked now, or in any commit of HEAD's history (the
+//! lint reads it) — is it, ends in `/` and it, or is its module twin (`x.rs` and
 //! `x/mod.rs` are one module, so a file later split into a directory still
 //! resolves without history). Left alone:
 //!
@@ -37,7 +37,7 @@ pub(crate) fn citations(source: &str) -> Vec<(usize, String)> {
         if comment.contains("citation: external") || comment.contains("citation: historical") {
             continue;
         }
-        for raw in comment.split(|c: char| c.is_whitespace() || "`'\"()[],;\u{2014}".contains(c)) {
+        for raw in comment.split(|c: char| c.is_whitespace() || "`'\"()[],;|\u{2013}\u{2014}\u{2026}".contains(c)) {
             if raw.contains("://") {
                 continue;
             }
@@ -51,15 +51,22 @@ pub(crate) fn citations(source: &str) -> Vec<(usize, String)> {
             // Markdown's `**path**` and rustdoc's `<path>` around it.
             let token = token.trim_matches(['*', '<', '>']).trim_end_matches(['.', '!', '?']);
             // `~/` is a home directory, `/` a sandbox's: neither is the repo's.
-            if !token.contains('/') || token.starts_with('/') || token.starts_with("~/") {
+            if token.starts_with('/') || token.starts_with("~/") {
                 continue;
             }
-            if token.contains(['*', '{', '<', '$']) {
+            // A placeholder (`<dir>/main.rs` keeps its `>` after the trim),
+            // a pattern or a variable (review 2).
+            if token.contains(['*', '{', '<', '>', '$']) {
                 continue;
             }
+            // Before the `/` check, so `../x.rs` isn't kept as a bare name
+            // (review 2).
             let mut token = token;
             while let Some(rest) = token.strip_prefix("./").or_else(|| token.strip_prefix("../")) {
                 token = rest;
+            }
+            if !token.contains('/') {
+                continue;
             }
             found.push((index + 1, token.to_string()));
         }
@@ -130,7 +137,7 @@ mod tests {
     #[test]
     fn test_what_isnt_a_repo_citation_is_left_alone() {
         let source = "// /workspace/a.rs and https://github.com/x/y/blob/main/src/lib.rs\n\
-                      // src/*.rs, src/{a}/mod.rs, $DIR/x.rs, main.rs, ~/notes/x.rs\n\
+                      // src/*.rs, src/{a}/mod.rs, <dir>/main.rs, $DIR/x.rs, main.rs, ~/notes/x.rs, ../x.rs\n\
                       // tokio's runtime/blocking/pool.rs (citation: external)\n\
                       // the old src/gone.rs (citation: historical)\n";
         assert_eq!(citations(source), Vec::<(usize, String)>::new());
