@@ -138,7 +138,7 @@ pub(super) async fn save_stop_notice(
         // says so (`model_context_window_exceeded`), and a llama.cpp slot
         // that fills stops at `max_tokens` written far short of its
         // budget (SME-73). The notice says the room, and what it wrote.
-        reason if super::overflow::window_stop(reason, turn.usage.output_tokens, budget.tokens) => Some((
+        reason if super::overflow::window_stop(turn_model.kind, reason, turn.usage.output_tokens, budget.tokens) => Some((
             u32::try_from(turn.usage.output_tokens)
                 .ok()
                 .filter(|written| *written > 0)

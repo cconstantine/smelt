@@ -149,8 +149,17 @@ async fn unnotified_finished_command(pool: &PgPool, conversation_id: i64, comman
 /// `start_mock_upstream`.
 async fn start_recording_mock_upstream(
     pool: &PgPool,
-    
     bodies: Vec<String>,
+) -> Arc<std::sync::Mutex<Vec<serde_json::Value>>> {
+    start_recording_mock_upstream_of_kind(pool, bodies, "anthropic").await
+}
+
+/// As `start_recording_mock_upstream`, with the provider saved under
+/// `kind` — for behaviour a kind's server shapes differently (SME-73).
+async fn start_recording_mock_upstream_of_kind(
+    pool: &PgPool,
+    bodies: Vec<String>,
+    kind: &str,
 ) -> Arc<std::sync::Mutex<Vec<serde_json::Value>>> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -175,7 +184,7 @@ async fn start_recording_mock_upstream(
     tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
     });
-    crate::providers::test_support::add_mock_provider(pool, addr).await;
+    crate::providers::test_support::add_mock_provider_kind(pool, addr, kind).await;
     requests
 }
 

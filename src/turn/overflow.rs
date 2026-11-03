@@ -104,16 +104,19 @@ const WINDOW_STOP_SLACK: i64 = 64;
 const MIN_PLAUSIBLE_WINDOW: i64 = 1_024;
 
 /// Whether this stop means the window ran out rather than the reply
-/// budget (SME-73): Claude 4.5+ says so itself (`model_context_window_exceeded`),
-/// and a llama.cpp slot that fills stops at `max_tokens` written more than
-/// [`WINDOW_STOP_SLACK`] under the budget — anything but a stop word maps
-/// to `max_tokens` there, so the shortfall is the tell. A server that
-/// reported no usage at all (`written` 0) keeps today's budget reading:
-/// nothing says otherwise.
-pub(super) fn window_stop(stop_reason: &str, written: i64, budget: u32) -> bool {
+/// budget (SME-73): Claude 4.5+ says so itself (`model_context_window_exceeded`,
+/// and a gateway passes it through). The `max_tokens` tell is
+/// llama.cpp's alone — anything but a stop word maps to `max_tokens`
+/// there, so a stop written more than [`WINDOW_STOP_SLACK`] under the
+/// budget is the slot, not the budget. An Anthropic-kind server means
+/// `max_tokens` literally, and Ollama truncates quietly rather than
+/// stopping short (that tell is `learn_ollama_window`'s), so there the
+/// stop stays what it says. A server that reported no usage at all
+/// (`written` 0) keeps the budget reading: nothing says otherwise.
+pub(super) fn window_stop(kind: crate::providers::ProviderKind, stop_reason: &str, written: i64, budget: u32) -> bool {
     match stop_reason {
         "model_context_window_exceeded" => true,
-        "max_tokens" => written > 0 && written + WINDOW_STOP_SLACK < i64::from(budget),
+        "max_tokens" => kind == crate::providers::ProviderKind::LlamaCpp && written > 0 && written + WINDOW_STOP_SLACK < i64::from(budget),
         _ => false,
     }
 }

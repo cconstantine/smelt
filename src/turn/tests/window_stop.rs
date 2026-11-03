@@ -6,11 +6,13 @@
 
 use super::*;
 
-/// Saves `mock-model`'s Context window, as the provider page's field would.
-async fn set_context_window(pool: &PgPool, window: i32) {
-    sqlx::query("INSERT INTO provider_models (provider_id, model, context_window) SELECT id, $1, $2 FROM inference_providers")
+/// Saves `mock-model`'s Context window (and Max reply tokens, if given),
+/// as the provider page's field would.
+async fn set_context_window(pool: &PgPool, window: i32, max_output: Option<i32>) {
+    sqlx::query("INSERT INTO provider_models (provider_id, model, context_window, max_output) SELECT id, $1, $2, $3 FROM inference_providers")
         .bind(crate::providers::test_support::MOCK_MODEL)
         .bind(window)
+        .bind(max_output)
         .execute(pool)
         .await
         .expect("seed the window");
@@ -20,7 +22,8 @@ async fn set_context_window(pool: &PgPool, window: i32) {
 /// of the budget — the notice reads the room left with what it wrote, the
 /// call's whole measured size (below the believed window by more than the
 /// safety buffer) is learned for the next request to compact on, and
-/// nothing is retried.
+/// nothing is retried. A llama.cpp kind provider: that reading is its
+/// stop's tell, W5 pins the Anthropic-kind same shape staying a budget stop.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_max_tokens_stop_short_of_its_budget_reads_as_the_window(pool: PgPool) {
     use crate::api::chat::{ReplyLimit, parse_cut_off_notice};
@@ -30,9 +33,9 @@ async fn test_a_max_tokens_stop_short_of_its_budget_reads_as_the_window(pool: Pg
     // 64,000 the turn believed.
     let body = with_usage(&text_reply_body("Right up to the room."), 30_000, 0, 12_000)
         .replace(r#""stop_reason":"end_turn""#, r#""stop_reason":"max_tokens""#);
-    let requests = start_recording_mock_upstream(&pool, vec![body]).await;
+    let requests = start_recording_mock_upstream_of_kind(&pool, vec![body], "llama_cpp").await;
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
-    set_context_window(&pool, 64_000).await;
+    set_context_window(&pool, 64_000, None).await;
     let mut rx = events::subscribe(conversation.id);
 
     run_turn(&pool, conversation.id, hello()).await.expect("a window-stopped reply still succeeds");
@@ -53,9 +56,38 @@ async fn test_a_max_tokens_stop_short_of_its_budget_reads_as_the_window(pool: Pg
     assert!(published_windows(drain_events(&mut rx).await).contains(&42_000), "the meter reads the new window too");
 }
 
-/// W2: a stop that wrote the whole budget was bound by the budget: the
-/// notice says so and nothing is learned, however far the call measured
-/// under the believed window.
+/// W5: a stop short of its budget reads as the room only where a stop
+/// word can't be trusted to mean the budget — llama.cpp maps anything
+/// but one to `max_tokens`. An Anthropic-kind server writes that reason
+/// for its own budget and nothing else, so the same shape stays a
+/// budget stop there: the notice names the budget, and nothing is
+/// learned (the CI failure of `cut_off_in_a_call`, whose captured
+/// llama.cpp stream arrives through an Anthropic-kind shim).
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_short_stop_from_an_anthropic_kind_server_stays_a_budget_stop(pool: PgPool) {
+    use crate::api::chat::{ReplyLimit, parse_cut_off_notice};
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let body = with_usage(&text_reply_body("Right up to the room."), 30_000, 0, 12_000)
+        .replace(r#""stop_reason":"end_turn""#, r#""stop_reason":"max_tokens""#);
+    start_recording_mock_upstream(&pool, vec![body]).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    set_context_window(&pool, 64_000, None).await;
+
+    run_turn(&pool, conversation.id, hello()).await.expect("turn");
+
+    let saved = db::list_messages(&pool, conversation.id).await.expect("messages");
+    let notice = match saved.last().expect("a notice").blocks().expect("blocks").as_slice() {
+        [anthropic::ContentBlock::Text { text }] => text.clone(),
+        other => panic!("one text block: {other:?}"),
+    };
+    assert_eq!(parse_cut_off_notice(&notice), Some((16_384, ReplyLimit::OutputCap, None)), "{notice}");
+    assert_eq!(saved_context_window(&pool).await, Some(64_000), "an Anthropic stop measures nothing");
+}
+
+/// W2: on llama.cpp, a stop that wrote the whole budget was bound by the
+/// budget: the notice says so and nothing is learned, however far the
+/// call measured under the believed window.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_budget_stop_still_names_its_budget_and_learns_nothing(pool: PgPool) {
     use crate::api::chat::{ReplyLimit, parse_cut_off_notice};
@@ -63,9 +95,9 @@ async fn test_a_budget_stop_still_names_its_budget_and_learns_nothing(pool: PgPo
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
     let body = with_usage(&text_reply_body("Every token I had."), 100, 0, 16_384)
         .replace(r#""stop_reason":"end_turn""#, r#""stop_reason":"max_tokens""#);
-    let requests = start_recording_mock_upstream(&pool, vec![body]).await;
+    let requests = start_recording_mock_upstream_of_kind(&pool, vec![body], "llama_cpp").await;
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
-    set_context_window(&pool, 64_000).await;
+    set_context_window(&pool, 64_000, Some(16_384)).await;
 
     run_turn(&pool, conversation.id, hello()).await.expect("a budget-stopped reply still succeeds");
 
@@ -79,8 +111,8 @@ async fn test_a_budget_stop_still_names_its_budget_and_learns_nothing(pool: PgPo
     assert_eq!(saved_context_window(&pool).await, Some(64_000), "a budget stop measures nothing of the window");
 }
 
-/// W3: 32 tokens short is within the slack — usage counts round, and a
-/// budget stop stays a budget stop.
+/// W3: on llama.cpp, 32 tokens short is within the slack — usage counts
+/// round, and a budget stop stays a budget stop.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stop_within_its_slack_of_the_budget_keeps_the_budget_wording(pool: PgPool) {
     use crate::api::chat::{ReplyLimit, parse_cut_off_notice};
@@ -88,9 +120,9 @@ async fn test_a_stop_within_its_slack_of_the_budget_keeps_the_budget_wording(poo
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
     let body = with_usage(&text_reply_body("Almost every token."), 100, 0, 16_352)
         .replace(r#""stop_reason":"end_turn""#, r#""stop_reason":"max_tokens""#);
-    start_recording_mock_upstream(&pool, vec![body]).await;
+    start_recording_mock_upstream_of_kind(&pool, vec![body], "llama_cpp").await;
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
-    set_context_window(&pool, 64_000).await;
+    set_context_window(&pool, 64_000, Some(16_384)).await;
 
     run_turn(&pool, conversation.id, hello()).await.expect("turn");
 
@@ -115,7 +147,7 @@ async fn test_a_reply_stopped_by_the_window_learns_its_measured_size(pool: PgPoo
         .replace(r#""stop_reason":"end_turn""#, r#""stop_reason":"model_context_window_exceeded""#);
     start_recording_mock_upstream(&pool, vec![body]).await;
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
-    set_context_window(&pool, 64_000).await;
+    set_context_window(&pool, 64_000, None).await;
 
     run_turn(&pool, conversation.id, hello()).await.expect("turn");
 
@@ -205,7 +237,7 @@ async fn test_a_quietly_truncated_ollama_reply_learns_the_loaded_window(pool: Pg
     let mock = start_ollama_mock(&pool, reply, r#"{"models":[{"name":"mock-model","context_length":32768}]}"#.to_string()).await;
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     seed_long_message(&pool, conversation.id, 40_000).await;
-    set_context_window(&pool, 64_000).await;
+    set_context_window(&pool, 64_000, None).await;
     let mut rx = events::subscribe(conversation.id);
 
     run_turn(&pool, conversation.id, hello()).await.expect("the quietly truncated reply still succeeds");
@@ -240,7 +272,7 @@ async fn test_a_whole_ollama_reply_never_asks_the_server(pool: PgPool) {
     let mock = start_ollama_mock(&pool, reply, r#"{"models":[{"name":"mock-model","context_length":32768}]}"#.to_string()).await;
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     seed_long_message(&pool, conversation.id, 40_000).await;
-    set_context_window(&pool, 64_000).await;
+    set_context_window(&pool, 64_000, None).await;
 
     run_turn(&pool, conversation.id, hello()).await.expect("turn");
 
@@ -258,7 +290,7 @@ async fn test_an_ollama_window_that_isnt_smaller_teaches_nothing(pool: PgPool) {
     let mock = start_ollama_mock(&pool, reply, r#"{"models":[{"name":"mock-model","context_length":131072}]}"#.to_string()).await;
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     seed_long_message(&pool, conversation.id, 40_000).await;
-    set_context_window(&pool, 64_000).await;
+    set_context_window(&pool, 64_000, None).await;
 
     run_turn(&pool, conversation.id, hello()).await.expect("turn");
 

@@ -702,7 +702,7 @@ fn run_turn_steps<'a: 'b, 'b>(
             // believe less now (SME-73). Kept as it stands — a cut-off
             // reply isn't retried or continued — and this runs before the
             // meter is published below, so it reads the new window too.
-            if super::overflow::window_stop(&turn.stop_reason, turn.usage.output_tokens, budget.tokens) {
+            if super::overflow::window_stop(turn_model.kind, &turn.stop_reason, turn.usage.output_tokens, budget.tokens) {
                 super::overflow::learn_window_stop(pool, conversation_id, turn_model, &turn.usage).await;
             }
             save_reply(pool, conversation_id, &turn, &mut persisted).await?;
