@@ -85,19 +85,14 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
     if brief.trim().is_empty() || chars > MAX_BRIEF_CHARS {
         return Err(format!("brief must be 1 to {MAX_BRIEF_CHARS} characters (it has {chars})"));
     }
-    let repo_path = optional_str(input, "repo")?;
+    let (persona, repo_path) =
+        persona::with_repo(pool, caller, optional_str(input, "persona")?, optional_str(input, "repo")?).await?;
+    let repo_path = repo_path.as_deref();
     let git_ref = optional_str(input, "ref")?;
     if git_ref.is_some() && repo_path.is_none() {
         return Err("ref needs repo: the checkout whose remote it's on".to_string());
     }
-    let persona = optional_str(input, "persona")?;
     let volumes = optional_volumes(input)?;
-    if let Some(name) = persona {
-        if repo_path.is_none() {
-            return Err("persona needs repo: the checkout whose .agents/personas/ it's in".to_string());
-        }
-        persona::check_name(name)?;
-    }
     let repo = match repo_path {
         None => None,
         Some(path) => {

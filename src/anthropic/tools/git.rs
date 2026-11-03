@@ -62,8 +62,8 @@ pub(super) fn tools() -> Vec<Tool> {
                                persona is named <repo dir>:<name> (smelt:developer), with its \
                                description; a file that doesn't parse is listed with its error. \
                                Only a repo the user trusts shows its personas; for one they \
-                               haven't decided about, it says how they can be asked. Nothing \
-                               can be started with a persona yet."
+                               haven't decided about, it says how they can be asked. \
+                               start_agent takes a persona by that name."
                     .to_string(),
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
             },

@@ -43,7 +43,7 @@ pub(super) fn tools() -> Vec<Registered> {
                             },
                             "persona": {
                                 "type": "string",
-                                "description": "a persona of repo (list_personas lists them), by name: the agent runs under its instructions, read at its ref"
+                                "description": "a persona as list_personas names it, <repo dir>:<name> (smelt:developer): the agent gets that repo, as with repo, and runs under the persona's instructions, read at its ref; a bare name needs repo"
                             },
                             "volumes": {
                                 "type": "array",

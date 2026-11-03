@@ -32,7 +32,7 @@ The `agents` row is separate from `conversations` so the user's own conversation
 
 | Tool | Who is offered it | What it does |
 | -- | -- | -- |
-| `start_agent(brief, repo?, ref?, persona?, volumes?)` | any conversation, within the limits | Creates the child, records its parent, saves the brief as its first message and starts its first turn in the background once its repo is cloned and its persona read; returns the child's id at once. `persona` requires `repo`; `ref` is [checkouts-and-volumes.md](checkouts-and-volumes.md#which-ref-the-childs-clone-is-on)'s; `volumes` is SME-239's. |
+| `start_agent(brief, repo?, ref?, persona?, volumes?)` | any conversation, within the limits | Creates the child, records its parent, saves the brief as its first message and starts its first turn in the background once its repo is cloned and its persona read; returns the child's id at once. A scoped `persona` (`smelt:developer`, as list_personas names it) names its repo; a bare one requires `repo` (SME-368); `ref` is [checkouts-and-volumes.md](checkouts-and-volumes.md#which-ref-the-childs-clone-is-on)'s; `volumes` is SME-239's. |
 | `list_agents()` | any conversation | This conversation's own children: id, title, persona (`<dir>:<name>` or none), status, `created_at`, the time of its last message, and how many agents it has started. Never anyone else's children. |
 | `stop_agent(id)` | any conversation | Stops one of its own children and everything under it ([Stop](#stop-stop_agent-and-the-user)). Refuses any other id. |
 | `message_agent(to, text)` | a conversation with a parent or children | `to` is `parent` or one of its own children's ids. Queues the message and wakes the recipient. Refuses anyone else (siblings go through the parent). |
