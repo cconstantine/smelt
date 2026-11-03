@@ -67,12 +67,14 @@ const CONNECT_TIMEOUT: std::time::Duration = if cfg!(test) {
 const PRODUCT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// `CONNECT_TIMEOUT` for `server_id`. A test build's 1 s keeps the tests of
-/// a server that never answers quick, but a test that holds its own
-/// provider back on purpose (to make two callers meet on one refresh)
-/// spends that budget waiting on itself, and under CI's load ran past it
-/// ("didn't answer within 1s", SME-341). Such a test gives its server the
-/// product's own budget (`test_support::give_product_budget`); every other
-/// server keeps the short one.
+/// a server that never answers quick, but an OAuth server's connect
+/// includes a token refresh at the tests' mock provider, and under CI's
+/// load that alone ran past 1 s ("didn't answer within 1s", SME-341,
+/// SME-356). So every OAuth mock server (`oauth_http::create_server`) gets
+/// the product's own budget (`test_support::give_product_budget`), and a
+/// test whose subject is the give-up puts its server back on 1 s
+/// (`test_support::hold_to_test_budget`). Every other server — static,
+/// hanging — keeps the short one.
 pub(super) fn connect_timeout(server_id: i64) -> std::time::Duration {
     #[cfg(test)]
     if test_support::has_product_budget(server_id) {
