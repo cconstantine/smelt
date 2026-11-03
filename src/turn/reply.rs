@@ -252,7 +252,8 @@ pub(super) async fn run_tools(
             // A call by a name no tool has is told which offered tools are
             // like it, after its own error (SME-307). Only that error: a
             // tool that ran, and failed in its own words, isn't a slip.
-            let resolved = !matches!(&result, Err(message) if crate::text_calls::is_unknown_name_error(message));
+            let resolved = !matches!(&result, Err(message) if crate::text_calls::is_unknown_name_error(message)
+                || crate::text_calls::is_unoffered_tool_of_an_offered_server(name, offered));
             every_call_unknown &= !resolved;
             if !resolved {
                 unknown.get_or_insert(name.as_str());

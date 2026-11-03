@@ -438,14 +438,24 @@ fn is_verb(word: &str) -> bool {
     VERBS.iter().any(|(verb, _)| *verb == word)
 }
 
-/// Whether `a` is a slip of `b`: at least 4 characters, and at most a
-/// third of the longer's characters apart by edits (one inserted,
-/// deleted or changed character each), case aside.
+/// Whether word `a` is a slip of word `b`, case aside: the longer has at
+/// least 5 characters, and they're 1 edit apart (one inserted, deleted or
+/// changed character), or a third of the longer's characters from 8 up
+/// (`todosote` for `todowrite`). Review 2: 4-letter words (`file`,
+/// `fill`) and one edit in a 6-letter one (`agent`, `parent`) were too
+/// loose.
 #[cfg(feature = "server")]
 fn is_near(a: &str, b: &str) -> bool {
     let (a, b): (Vec<char>, Vec<char>) = (a.to_lowercase().chars().collect(), b.to_lowercase().chars().collect());
     let longer = a.len().max(b.len());
-    longer >= 4 && a != b && edit_distance(&a, &b) <= longer / 3
+    let allowed = if longer >= 8 { longer / 3 } else { 1 };
+    longer >= 5 && a != b && edit_distance(&a, &b) <= allowed
+}
+
+/// A tool name's part after its MCP server, or the whole name.
+#[cfg(feature = "server")]
+fn tool_part(name: &str) -> &str {
+    crate::mcp::parse_tool_name(name).map_or(name, |(_, tool)| tool)
 }
 
 /// Levenshtein distance, one row at a time.
@@ -507,14 +517,22 @@ pub fn similar(name: &str, offered: &[&str]) -> Vec<String> {
             // `issue`, SME-307) shares none, so a word a few edits from one
             // of the candidate's counts as that word, weighed as it is.
             // Verbs never: `delete_document` isn't near `delete_attachment`.
-            let near: Vec<&String> = w
+            // Only a call word with no exact match nears one, and a near
+            // word weighs half the lighter of the two (review 2: `terminal`
+            // shared exactly mustn't also near `terminate`).
+            let unmatched: Vec<&String> = words.iter().filter(|nw| !is_verb(nw) && !w.contains(*nw)).collect();
+            let near: usize = w
                 .iter()
-                .filter(|cw| !is_verb(cw) && !words.contains(*cw) && words.iter().any(|nw| !is_verb(nw) && is_near(nw, cw)))
-                .collect();
-            if !shares_a_word && near.is_empty() {
+                .filter(|cw| !is_verb(cw) && !words.contains(*cw))
+                .filter_map(|cw| unmatched.iter().find(|nw| is_near(nw, cw)).map(|nw| weight(cw).min(weight(nw)) / 2 + 1))
+                .sum();
+            // The same name but for `_` and `-` (`todo_write`, `web_fetch`).
+            let joined = |n: &str| tool_part(n).chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase();
+            let same_joined = joined(name) == joined(o);
+            if !shares_a_word && near == 0 && !same_joined {
                 return None;
             }
-            let score = shared.iter().chain(near.iter()).map(|word| weight(word)).sum();
+            let score = shared.iter().map(|word| weight(word)).sum::<usize>() + near + if same_joined { 4 } else { 0 };
             Some((same_server(server, *s), score, w.len() - shared.len(), *o))
         })
         .collect();
@@ -580,6 +598,25 @@ fn unoffered_sentence(name: &str, offered: &[&str]) -> String {
 #[cfg(feature = "server")]
 pub fn is_unknown_name_error(error: &str) -> bool {
     error.starts_with("unknown tool: ") || error.starts_with("unknown MCP server: ")
+}
+
+/// Whether `name` is an MCP tool no offered name is, on a server some
+/// offered name is on: a made-up tool on a real server, the crossed prefix
+/// (`add_issue_comment` on Linear's server, SME-307 review 2). Its call
+/// reaches the server (an unlisted tool is callable, judged destructive,
+/// SME-237), so its error isn't `is_unknown_name_error`'s. A server whose
+/// tools weren't offered this turn (still connecting) offers no name, so
+/// its calls aren't taken for slips.
+#[cfg(feature = "server")]
+pub fn is_unoffered_tool_of_an_offered_server(name: &str, offered: &[&str]) -> bool {
+    if offered.contains(&name) {
+        return false;
+    }
+    let safe = crate::mcp::safe_tool_name(name);
+    let (Some((raw, _)), Some((server, _))) = (crate::mcp::parse_tool_name(name), crate::mcp::parse_tool_name(&safe)) else {
+        return false;
+    };
+    offered.iter().any(|o| crate::mcp::parse_tool_name(o).is_some_and(|(s, _)| s == server || s == raw))
 }
 
 /// The result of a real call by `name`, a tool that isn't offered (SME-307):

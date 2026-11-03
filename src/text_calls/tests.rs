@@ -298,7 +298,7 @@ fn test_similar_finds_a_slip_of_the_name() {
     let typo = similar("mcp__linear.app__get_isue", OFFERED);
     assert_eq!(typo.first().map(String::as_str), Some("mcp__linear.app__get_issue"), "{typo:?}");
     assert_eq!(similar("frobnicate", OFFERED), Vec::<String>::new());
-    assert_eq!(similar("abc", &["abd"]), Vec::<String>::new(), "names under 4 characters aren't matched by edits");
+    assert_eq!(similar("abcd", &["abce"]), Vec::<String>::new(), "words under 5 characters aren't matched by edits");
 }
 
 /// SME-307: a real call by a name that isn't offered keeps its own error
@@ -332,4 +332,28 @@ fn test_only_an_unknown_names_error_is_one() {
     assert!(is_unknown_name_error("unknown MCP server: \"linear.app\""));
     assert!(!is_unknown_name_error("issue not found"));
     assert!(!is_unknown_name_error("missing or non-string field: path"));
+}
+
+/// SME-307 review 2: a near word never outranks the tool that shares the
+/// word exactly, short words don't near, and a name that differs only in
+/// `_` or `-` is found.
+#[test]
+fn test_near_words_dont_outrank_exact_ones_and_joined_names_are_found() {
+    let terminals = ["terminate_terminal", "read_terminal_output", "send_signal", "todowrite"];
+    let terminal = similar("read_terminal", &terminals);
+    assert_eq!(terminal.first().map(String::as_str), Some("read_terminal_output"), "{terminal:?}");
+    let file = similar("delete_file", &["browser_fill", "edit_file", "delete_volume"]);
+    assert!(!file.contains(&"browser_fill".to_string()) && !file.contains(&"delete_volume".to_string()), "{file:?}");
+    assert_eq!(similar("todo_write", OFFERED).first().map(String::as_str), Some("todowrite"));
+    assert_eq!(similar("web_fetch", &["webfetch", "http_request"]).first().map(String::as_str), Some("webfetch"));
+}
+
+/// SME-307 review 2: a made-up tool on an offered server is a slip; one on
+/// a server nothing of which is offered (still connecting) isn't.
+#[test]
+fn test_an_unoffered_tool_of_an_offered_server_is_a_slip() {
+    assert!(is_unoffered_tool_of_an_offered_server("mcp__linear.app__add_issue_comment", OFFERED));
+    assert!(!is_unoffered_tool_of_an_offered_server("mcp__linear.app__save_comment", OFFERED), "offered");
+    assert!(!is_unoffered_tool_of_an_offered_server("mcp__slack__post_message", OFFERED), "its server offers nothing");
+    assert!(!is_unoffered_tool_of_an_offered_server("todosote", OFFERED), "not an MCP name");
 }

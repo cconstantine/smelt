@@ -498,3 +498,27 @@ async fn test_a_tool_failing_in_its_own_words_is_no_correction(pool: PgPool) {
     let result = tool_result_for(&saved, "toolu_f5").expect("the 5th call's result");
     assert!(!result.contains("isn't an offered tool"), "{result}");
 }
+
+/// SME-307 review 2: the crossed prefix through the turn: a real call to a
+/// tool an offered MCP server doesn't list reaches the server, fails there,
+/// and is still told the server's tools like it, and counts as a slip.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_made_up_tool_on_an_offered_server_is_told_its_tools(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let mock = crate::mcp::tests::gated_http::spawn("save_comment").await;
+    let config = crate::db::create_mcp_server_config(&pool, "linear.app", &mock.url, &std::collections::HashMap::new(), "static_headers", None, None)
+        .await
+        .expect("create the server");
+    let crossed = crate::mcp::namespaced_tool_name("linear.app", "add_issue_comment");
+    let offered = crate::mcp::namespaced_tool_name("linear.app", "save_comment");
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let bodies = vec![unoffered_reply("toolu_crossed", &crossed), text_reply_body("Done.")];
+    let _requests = start_recording_mock_upstream(&pool, bodies).await;
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("the turn succeeds");
+    crate::mcp::evict(config.id).await;
+
+    let result = tool_result_for(&saved, "toolu_crossed").expect("the crossed call's result");
+    assert!(result.contains(&format!("similar offered tools: `{offered}`")), "{result}");
+}
