@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The checks every commit must pass (docs/process/rules-commits.md, "Every
-# commit builds for both targets"): the web build and the server build,
-# each with no warnings, no unexplained expect() or unwrap() outside tests
+# commit builds for both targets"): the web build, the server build and
+# the server tests' build, each with no warnings, no unexplained expect() or unwrap() outside tests
 # (scripts/lint-expects), and the server tests, run against this working
 # tree's own sandbox image (SANDBOX_IMAGE, see scripts/sandbox-image-ref).
 # Exits non-zero on any failure, so it can gate a commit:

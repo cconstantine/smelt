@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Fails when a cargo test log's compile section has a compiler warning
+# (SME-361): CI's test steps build and run in one `cargo test`, with no
+# `-D warnings` (setting RUSTFLAGS would drop the build cache), so this
+# reads the warnings back out of the log they tee. Only the lines before
+# the first `Running` line count: after it a test's subprocess (git,
+# kubectl, docker) may write its own "warning: …" to stderr.
+#
+#   scripts/ci-no-warnings LOG
+set -euo pipefail
+log=${1:?usage: scripts/ci-no-warnings LOG}
+[ -r "$log" ] || { echo "ci-no-warnings: no log at $log" >&2; exit 2; }
+compile=$(sed '/^ *Running /q' "$log")
+if grep -qE '^warning' <<<"$compile"; then
+    grep -E '^warning' -A8 <<<"$compile" | head -40
+    echo "::error::the build has compiler warnings (scripts/check.sh fails on them too)"
+    exit 1
+fi
+echo "ci-no-warnings: no compiler warnings"

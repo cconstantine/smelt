@@ -158,6 +158,12 @@ jobs:
         if: always()
         run: scripts/ci-test-report "$RUNNER_TEMP/server-tests.log" server 600
 
+      # The build above has no -D warnings, so a warning in it, in test
+      # code or not, would pass CI (SME-361).
+      - name: No compiler warnings (server)
+        if: always()
+        run: scripts/ci-no-warnings "$RUNNER_TEMP/server-tests.log"
+
       - name: Dump sandbox pod diagnostics on failure
         if: failure()
         # kubectl runs *inside* the smelt service (docker compose run),
@@ -258,6 +264,11 @@ jobs:
       - name: Browser test time and slowest scenarios
         if: always()
         run: scripts/ci-test-report "$RUNNER_TEMP/browser-tests.log" browser 480
+
+      # The `browser-test` feature's code is compiled only here (SME-361).
+      - name: No compiler warnings (browser)
+        if: always()
+        run: scripts/ci-no-warnings "$RUNNER_TEMP/browser-tests.log"
 
       - name: Dump sandbox pod diagnostics on failure (browser tests)
         if: failure()

@@ -20,7 +20,7 @@ done
 # step: this suite does run check.sh, and the nested run would run this
 # suite again, under stubs, recursing and polluting the calls recorded below.
 export CALLS=$dir/calls
-gate_env=(env -u SANDBOX_IMAGE -u CARGO_FAIL PATH="$dir/bin:$PATH" SANDBOX_IMAGE_IMPORT="$dir/bin/import"
+gate_env=(env -u SANDBOX_IMAGE -u CARGO_FAIL -u CARGO_WARN PATH="$dir/bin:$PATH" SANDBOX_IMAGE_IMPORT="$dir/bin/import"
     DATABASE_URL=postgres://u@localhost/smelt_dev BROWSER_CHECK_CACHE="$dir" SMELT_SKIP_SCRIPT_TESTS=1)
 # Never the real cargo or dx: that would build, and run the real tests.
 for tool in cargo dx sqlx; do
@@ -63,6 +63,28 @@ fi
 grep -q " locked$" "$CALLS" && fail "check.sh took the lock after a test build with a warning: $(cat "$CALLS")"
 grep -q "unused variable" <<<"$out" || fail "check.sh didn't show the test build's warning: $out"
 grep -q "the server tests' build has warnings" <<<"$out" || fail "check.sh didn't say the test build warned: $out"
+
+# 7b. ci-no-warnings (SME-361): a warning before the first `Running` line
+# fails, one a test's subprocess prints after it doesn't, and a clean log
+# passes.
+ci_log=$dir/ci-test.log
+printf '   Compiling smelt v0.1.0\nwarning: unused variable: `pod`\n   --> src/x.rs:1:9\n    Finished `test` profile\n     Running unittests src/main.rs\ntest result: ok.\n' >"$ci_log"
+if out=$(scripts/ci-no-warnings "$ci_log" 2>&1); then
+    fail "ci-no-warnings passed a log with a compile warning: $out"
+fi
+grep -q "unused variable" <<<"$out" || fail "ci-no-warnings didn't show the warning: $out"
+printf '   Compiling smelt v0.1.0\n    Finished `test` profile\n     Running unittests src/main.rs\nwarning: a subprocess said this\ntest result: ok.\n' >"$ci_log"
+out=$(scripts/ci-no-warnings "$ci_log" 2>&1) || fail "ci-no-warnings failed on a warning after Running: $out"
+: >"$ci_log"
+out=$(scripts/ci-no-warnings "$ci_log" 2>&1) || fail "ci-no-warnings failed on an empty log: $out"
+
+# 7c. browser-tier stops on a warning in its test build, before the lock.
+: >"$CALLS"
+if out=$(timeout 60 "${gate_env[@]}" CARGO_WARN="browser-test.*--no-run" scripts/browser-tier 2>&1); then
+    fail "browser-tier passed with a warning in its test build: $out"
+fi
+grep -q " locked$" "$CALLS" && fail "browser-tier took the lock after a build with a warning: $(cat "$CALLS")"
+grep -q "unused variable" <<<"$out" || fail "browser-tier didn't show its build's warning: $out"
 
 # 8. browser-tier likewise: the bundle, the test build and the scratch
 # database unlocked, the tier's run locked.
