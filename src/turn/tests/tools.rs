@@ -215,13 +215,13 @@ async fn test_a_compaction_forgets_the_usage_that_triggered_it(pool: PgPool) {
     };
     db::upsert_conversation_usage(&pool, conversation.id, &near_limit).await.expect("seed usage");
     start_mock_upstream(&pool, vec![text_reply_body("Summary: earlier.")]).await;
-    let turn_model = crate::providers::resolve_turn_model(&pool, conversation.id)
+    let mut turn_model = crate::providers::resolve_turn_model(&pool, conversation.id)
         .await
         .expect("the mock is the default");
     compact_conversation(
         &pool,
         conversation.id,
-        &turn_model,
+        &mut turn_model,
         anthropic::stream::SlotPolicy::PerCall,
     )
         .await

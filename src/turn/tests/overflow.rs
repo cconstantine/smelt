@@ -427,3 +427,99 @@ async fn test_a_stop_before_the_retry_keeps_the_compaction_and_the_window(pool: 
     assert_eq!(last_reply(&saved), None, "the retry's reply is never sent, so nothing to discard");
     assert_eq!(saved_context_window(&pool).await, Some(131_072));
 }
+
+/// C1: a compaction whose own summary call is refused gets the same
+/// treatment once, inside `compact_conversation`: learn the named
+/// window, summarise again with the transcript sized to it, and carry
+/// on — the compaction span stays green, the refused summary's chat
+/// span stays marked.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_compaction_that_overflows_retries_its_summary_once(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let upstream = start_refusal_mock(
+        &pool,
+        vec![
+            too_long(150_000, 131_072),
+            Ok(text_reply_body("Summary: recovered on the second ask.")),
+            Ok(text_reply_body("Answered after the recovered compaction.")),
+        ],
+    )
+    .await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    db::create_message(&pool, conversation.id, "user", &[anthropic::ContentBlock::Text { text: "earlier".to_string() }])
+        .await
+        .expect("seed");
+    let near_limit = anthropic::TokenUsage {
+        input_tokens: 190_000,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+    };
+    db::upsert_conversation_usage(&pool, conversation.id, &near_limit).await.expect("seed usage");
+    let id = conversation.id;
+
+    let (result, spans) = crate::telemetry::capture_spans(run_turn(&pool, id, hello())).await;
+    result.expect("the refused summary recovers and the turn carries on");
+
+    assert_eq!(upstream.count(), 3, "refused summary, summary, reply");
+    assert_eq!(
+        compaction_summaries(&pool, id).await,
+        ["Summary: recovered on the second ask."],
+        "the summary asked for once more is the divider"
+    );
+    let saved = db::list_messages(&pool, id).await.expect("messages");
+    assert_eq!(last_reply(&saved).as_deref(), Some("Answered after the recovered compaction."));
+    assert_eq!(saved_context_window(&pool).await, Some(131_072), "the compaction's refusal learns too");
+
+    let compactions: Vec<_> = spans.iter().filter(|s| s.name == "compaction").collect();
+    let [compaction] = compactions.as_slice() else { panic!("one compaction span: {spans:?}") };
+    assert_eq!(compaction.status, opentelemetry::trace::Status::Unset, "a self-recovered compaction ends green");
+    assert_eq!(turn_span(&spans).status, opentelemetry::trace::Status::Unset);
+    let chats = chat_spans(&spans);
+    assert_eq!(chats.len(), 3, "two summary tries and the reply: {chats:?}");
+    let opentelemetry::trace::Status::Error { description } = &chats[0].status else {
+        panic!("the refused summary stays marked: {:?}", chats[0].status);
+    };
+    assert!(description.contains("prompt is too long"), "{description}");
+    assert!(matches!(chats[1].status, opentelemetry::trace::Status::Unset), "the second summary succeeded");
+}
+
+/// C2: a second refusal fails the turn with the "Couldn't compact…"
+/// wording — the window it names is still learned, and the compaction
+/// span ends red.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_compaction_refused_twice_fails_the_turn_with_the_worded_reason(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let upstream = start_refusal_mock(&pool, vec![too_long(150_000, 131_072), llama_refused(24_000, 24_576)]).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    db::create_message(&pool, conversation.id, "user", &[anthropic::ContentBlock::Text { text: "earlier".to_string() }])
+        .await
+        .expect("seed");
+    let near_limit = anthropic::TokenUsage {
+        input_tokens: 190_000,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+    };
+    db::upsert_conversation_usage(&pool, conversation.id, &near_limit).await.expect("seed usage");
+    let id = conversation.id;
+
+    let (result, spans) = crate::telemetry::capture_spans(run_turn(&pool, id, hello())).await;
+    let error = result.expect_err("the summary refused twice fails the turn").to_string();
+    assert!(error.contains("Couldn't compact the conversation"), "{error}");
+    assert!(error.contains("even the summary request didn't fit"), "{error}");
+    assert!(error.contains("(24,576 tokens)"), "the second refusal's window: {error}");
+    assert!(error.contains("The server said:"), "{error}");
+    assert_eq!(upstream.count(), 2, "one summary, one more, no third ask");
+    assert!(compaction_summaries(&pool, id).await.is_empty(), "nothing half-done was saved");
+    assert_eq!(saved_context_window(&pool).await, Some(24_576), "both refusals learn, the smaller lands");
+
+    let compactions: Vec<_> = spans.iter().filter(|s| s.name == "compaction").collect();
+    let [compaction] = compactions.as_slice() else { panic!("one compaction span: {spans:?}") };
+    let opentelemetry::trace::Status::Error { description } = &compaction.status else {
+        panic!("the failed compaction is marked: {:?}", compaction.status);
+    };
+    assert!(description.contains("Couldn't compact"), "{description}");
+}

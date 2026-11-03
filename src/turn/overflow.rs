@@ -93,8 +93,9 @@ pub(super) async fn recover(
 /// Puts `window` on the turn's copy (every later size reads it) and
 /// saves it for the model. A save that fails — a provider moved mid-
 /// turn — is not the turn's failure: it says nothing more. Returns
-/// whether a window was named at all.
-async fn learn(
+/// whether a window was named at all. Shared with the compaction's own
+/// overflow recovery (`compaction.rs`), the plan's learner 3.
+pub(super) async fn learn(
     pool: &PgPool,
     conversation_id: i64,
     turn_model: &mut crate::providers::TurnModel,
@@ -121,7 +122,7 @@ fn without_messages(request: &anthropic::CreateMessageRequest) -> anthropic::Cre
 /// A token count with the thousands commas the SME-73 wordings name
 /// windows in ("32,768 tokens"): Rust's own format strings have no such
 /// grouping.
-fn grouped(n: u64) -> String {
+pub(super) fn grouped(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {
