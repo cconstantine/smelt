@@ -366,8 +366,11 @@ pub(super) async fn scenario_sidebar(t: &Scenario<'_>) {
     assert!(links.contains("Sandboxes") && !links.contains("Pods"), "sidebar links: {links}");
     // The settings links are one compact block: seven full-width buttons
     // took about 400px above the conversations on every page (SME-123 DR4).
+    // The notifications toggle made it eight since SME-71, and the block
+    // measures 152px: one more wrapped line. The guard is against the
+    // 400px regression, not a tally.
     let settings = element_box(&page, ".sidebar .settings-links").await;
-    assert!(settings.3 <= 130, "the settings links take {}px of the sidebar", settings.3);
+    assert!(settings.3 <= 160, "the settings links take {}px of the sidebar", settings.3);
     // With nothing open, the page offers a way on: a new conversation,
     // not just "Select or start a conversation" (SME-123 DR4).
     assert!(

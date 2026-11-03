@@ -16,6 +16,7 @@ mod call;
 mod compaction;
 mod failure;
 mod history;
+mod lifecycle;
 mod notify;
 mod overflow;
 mod outside_turn;
@@ -26,16 +27,17 @@ mod state;
 #[cfg(test)]
 mod test_hooks;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use self::call::*;
 use self::compaction::*;
 pub(crate) use self::failure::*;
 pub(crate) use self::history::*;
+pub(crate) use self::lifecycle::*;
 pub(crate) use self::notify::*;
 use self::overflow::recover as overflow_recovery;
 pub(crate) use self::outside_turn::*;
 pub(crate) use self::questions::*;
 use self::reply::*;
-pub(crate) use self::run::*;
+use self::run::*;
 pub(crate) use self::state::*;

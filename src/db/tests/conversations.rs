@@ -466,3 +466,14 @@ async fn test_the_failure_notice_migration_marks_the_notices_saved_before_it(poo
     assert_eq!(saved(other.id).await, "hello");
     assert_eq!(saved(reply.id).await, legacy, "only the user role's notices");
 }
+
+/// SME-71: a notification names its conversation, so the attention
+/// endpoint needs its title — and `None` for an id that isn't one.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_get_conversation_title_reads_it_and_misses_quietly(pool: PgPool) {
+    let conversation = create_conversation(&pool).await.expect("conversation");
+    let title = get_conversation_title(&pool, conversation.id).await.expect("query");
+    assert_eq!(title.as_deref(), Some(DEFAULT_TITLE));
+    let missing = get_conversation_title(&pool, 999_999_999).await.expect("query");
+    assert_eq!(missing, None, "an id that isn't a conversation reads as no title");
+}

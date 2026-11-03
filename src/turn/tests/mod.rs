@@ -34,7 +34,7 @@ fn text_block(text: &str) -> anthropic::ContentBlock {
 /// Spins up a mock Anthropic upstream that returns `bodies` in order (one
 /// per request, clamped to the last body once exhausted) and saves it
 /// as `pool`'s default provider. Callers hold `lock_turn_tests`.
-async fn start_mock_upstream(
+pub(crate) async fn start_mock_upstream(
     pool: &PgPool,
     bodies: Vec<String>) -> Arc<AtomicUsize> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -344,7 +344,7 @@ fn published_windows(events: Vec<events::ConversationEvent>) -> Vec<u32> {
 
 /// A mock upstream that streams `text` and then never finishes. Same
 /// locking rule as `start_mock_upstream`.
-async fn start_partial_then_hanging_mock_upstream(
+pub(crate) async fn start_partial_then_hanging_mock_upstream(
     pool: &PgPool,
     text: &'static str) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -411,6 +411,7 @@ mod run;
 mod live;
 mod tools;
 mod ask_user;
+mod attention;
 mod spans;
 mod lifecycle;
 mod usage;
