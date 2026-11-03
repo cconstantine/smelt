@@ -63,7 +63,7 @@ fn test_a_stopped_request_isnt_quoted_as_unanswered() {
 #[test]
 fn test_the_continuation_quotes_a_huge_message_only_in_part() {
     let huge = "x".repeat(100_000);
-    let prompt = continuation_prompt(&[huge]);
+    let prompt = continuation_prompt(&Typed::default(), &[huge]);
     assert!(prompt.chars().count() < 10_000, "{} chars", prompt.chars().count());
     assert!(prompt.contains("cut"), "it should say the quote was cut");
 }
@@ -79,7 +79,7 @@ fn compacted_once() -> Vec<Message> {
         text_message(1, "user", "ancient question"),
         text_message(2, "assistant", "ancient answer"),
     ];
-    for (offset, (role, blocks)) in compaction_messages("the earlier summary".to_string(), 2, &[], None)
+    for (offset, (role, blocks)) in compaction_messages("the earlier summary".to_string(), 2, &Typed::default(), &[], None)
         .into_iter()
         .enumerate()
     {
@@ -143,7 +143,7 @@ fn test_the_continuation_quotes_what_the_model_hasnt_answered() {
         ]
     );
 
-    let [_, _, (_, continuation)] = compaction_messages("the summary".to_string(), 5, &unanswered, None);
+    let [_, _, (_, continuation)] = compaction_messages("the summary".to_string(), 5, &Typed::default(), &unanswered, None);
     let text = format!("{continuation:?}");
     assert!(text.contains("Reply with just: ok"), "the request isn't in the continuation: {text}");
     assert!(text.contains("Terminal command abc finished"), "{text}");
@@ -152,7 +152,7 @@ fn test_the_continuation_quotes_what_the_model_hasnt_answered() {
 
 #[test]
 fn test_compaction_messages_start_with_user_and_alternate_correctly() {
-    let inserted = compaction_messages("the summary".to_string(), 42, &[], None);
+    let inserted = compaction_messages("the summary".to_string(), 42, &Typed::default(), &[], None);
     let roles: Vec<&str> = inserted.iter().map(|(role, _)| *role).collect();
     assert_eq!(
         roles,
@@ -440,4 +440,174 @@ fn test_history_for_request_sends_a_stored_mcp_calls_name_made_safe() {
         .collect();
     let safe = crate::mcp::namespaced_tool_name("linear.app", "search.web");
     assert_eq!(names, vec![safe.as_str(), "mcp__github__list_issues", "read_file"]);
+}
+
+/// SME-367: the user's and the parent's own words are quoted through a
+/// compaction, word for word: a mid-run correction too, not only the
+/// unanswered tail. Notices, tool results and other agents' texts aren't.
+#[test]
+fn test_typed_words_are_quoted_and_notices_arent() {
+    let correction = "you should be using the rust available in the smelt service from the docker-compose.yml";
+    let messages = vec![
+        text_message(1, "user", "Drive SME-73."),
+        text_message(2, "assistant", "ok"),
+        text_message(3, "user", "Terminal command abc finished: exit code 0."),
+        text_message(4, "user", correction),
+        text_message(5, "user", "Report from agent #9 (smelt:developer):\n\nDone."),
+        text_message(6, "user", &crate::api::chat::failure_notice("boom")),
+        text_message(7, "user", "Message from your parent:\n\nUse the bare persona name."),
+        message_with_blocks(
+            8,
+            "user",
+            vec![anthropic::ContentBlock::ToolResult { tool_use_id: "t".to_string(), content: "out".to_string(), is_error: None }],
+        ),
+        text_message(9, "assistant", "on it"),
+        text_message(10, "user", "And the next thing?"),
+    ];
+    let typed = typed_user_text(&messages, 200_000);
+    assert_eq!(
+        typed,
+        Typed {
+            quotes: vec![
+                "Drive SME-73.".to_string(),
+                correction.to_string(),
+                "Message from your parent:\n\nUse the bare persona name.".to_string(),
+            ],
+            omitted: 0,
+        },
+        "the unanswered tail is quoted as such, not here"
+    );
+    let prompt = continuation_prompt(&typed, &unanswered_user_text(&messages));
+    assert!(prompt.contains(correction), "{prompt}");
+    assert!(prompt.contains("And the next thing?"), "{prompt}");
+    assert!(!prompt.contains("exit code 0") && !prompt.contains("Report from"), "{prompt}");
+}
+
+/// SME-367: over the budget, the first message (the original ask) and
+/// the newest are kept, and the continuation says how many it left out.
+#[test]
+fn test_typed_words_over_the_budget_keep_the_first_and_the_newest() {
+    let mut messages = vec![text_message(1, "user", "The original ask.")];
+    for i in 0..40 {
+        messages.push(text_message(2 + 2 * i, "assistant", "ok"));
+        messages.push(text_message(3 + 2 * i, "user", &format!("correction {i}: {}", "y".repeat(990))));
+    }
+    messages.push(text_message(200, "assistant", "ok"));
+    let typed = typed_user_text(&messages, 200_000);
+    assert_eq!(typed.quotes.first().map(String::as_str), Some("The original ask."));
+    assert!(typed.quotes.last().is_some_and(|q| q.starts_with("correction 39:")), "the newest is kept");
+    assert!(typed.omitted > 0 && typed.quotes.len() + typed.omitted == 41, "{} kept, {} left out", typed.quotes.len(), typed.omitted);
+    let size: usize = typed.quotes.iter().map(|q| q.chars().count()).sum();
+    assert!(size <= CONTINUATION_TYPED_MAX_CHARS, "{size}");
+    let prompt = continuation_prompt(&typed, &[]);
+    assert!(prompt.contains(&format!("({} more they wrote in between are left out here", typed.omitted)), "{prompt}");
+}
+
+/// SME-367 review 1: a request the user stopped isn't quoted as standing;
+/// what they asked next is. The user's answer to the model's question is
+/// quoted; notices worded as news about the user aren't.
+#[test]
+fn test_typed_words_drop_a_stopped_request_and_keep_answers() {
+    let ask = anthropic::ContentBlock::ToolUse {
+        id: "toolu_q".to_string(),
+        name: crate::questions::ASK_USER.to_string(),
+        input: serde_json::json!({}),
+    };
+    let answer = anthropic::ContentBlock::ToolResult {
+        tool_use_id: "toolu_q".to_string(),
+        content: "Which branch? main".to_string(),
+        is_error: None,
+    };
+    let messages = vec![
+        text_message(1, "user", "Drive the ticket."),
+        text_message(2, "assistant", "ok"),
+        text_message(3, "user", "Delete every branch."),
+        text_message(4, "assistant", "Deleting"),
+        text_message(5, "user", STOP_NOTICE),
+        text_message(6, "user", "Write the docs instead."),
+        message_with_blocks(7, "assistant", vec![ask]),
+        message_with_blocks(8, "user", vec![answer]),
+        text_message(9, "user", "The user stopped sandbox pod 4. Create a new pod if you need one."),
+        text_message(10, "user", "The user now trusts https://example.com/r.git. You can start agents on it; call start_agent again."),
+        text_message(11, "assistant", "done"),
+        text_message(12, "user", "next"),
+    ];
+    let typed = typed_user_text(&messages, 200_000);
+    assert_eq!(
+        typed.quotes,
+        vec!["Drive the ticket.".to_string(), "Write the docs instead.".to_string(), "Which branch? main".to_string()],
+        "{typed:?}"
+    );
+}
+
+/// SME-367 review 1: a small window gets a smaller budget, separators
+/// counted, so its quotes can't keep it over its compaction trigger.
+#[test]
+fn test_a_small_windows_typed_words_fit_its_budget() {
+    let budget = typed_budget(28_672);
+    assert!(budget < CONTINUATION_TYPED_MAX_CHARS, "{budget}");
+    let mut messages = vec![text_message(1, "user", &"a".repeat(20_000))];
+    for i in 0..400 {
+        messages.push(text_message(2 + 2 * i, "assistant", "ok"));
+        messages.push(text_message(3 + 2 * i, "user", "yes"));
+    }
+    messages.push(text_message(900, "assistant", "ok"));
+    let typed = typed_user_text(&messages, 28_672);
+    let joined = typed.quotes.join("\n\n---\n\n");
+    assert!(joined.chars().count() <= budget, "{} > {budget}", joined.chars().count());
+    assert!(typed.quotes[0].contains("cut to its first"), "the long ask is cut to half the budget");
+    assert!(typed.omitted > 0);
+}
+
+/// SME-367 review 2: a stop calls off only what the model hadn't answered
+/// yet. A correction it answered, and then kept working past (tool steps,
+/// a notice), survives a later stop; a stop in the unanswered tail still
+/// calls off the request before it; a refused question call's error isn't
+/// an answer.
+#[test]
+fn test_a_stop_calls_off_only_what_wasnt_answered() {
+    let call = |id: &str, name: &str| anthropic::ContentBlock::ToolUse { id: id.to_string(), name: name.to_string(), input: serde_json::json!({}) };
+    let result = |id: &str, content: &str, is_error: Option<bool>| anthropic::ContentBlock::ToolResult {
+        tool_use_id: id.to_string(),
+        content: content.to_string(),
+        is_error,
+    };
+    // Probe A: the correction was answered, then the model kept working.
+    let a = vec![
+        text_message(1, "user", "Drive it."),
+        text_message(2, "assistant", "ok"),
+        text_message(3, "user", "Use the compose rust, not the pod's."),
+        text_message(4, "assistant", "Understood."),
+        text_message(5, "user", "Terminal command abc finished: exit code 0."),
+        message_with_blocks(6, "assistant", vec![call("t1", "run_terminal_command")]),
+        message_with_blocks(7, "user", vec![result("t1", "out", None)]),
+        text_message(8, "user", STOP_NOTICE),
+        text_message(9, "user", "Carry on."),
+        text_message(10, "assistant", "ok"),
+        text_message(11, "user", "next"),
+    ];
+    assert_eq!(
+        typed_user_text(&a, 200_000).quotes,
+        vec!["Drive it.".to_string(), "Use the compose rust, not the pod's.".to_string(), "Carry on.".to_string()]
+    );
+    // Probe B: the stop is in the unanswered tail.
+    let b = vec![
+        text_message(1, "user", "Drive it."),
+        text_message(2, "assistant", "ok"),
+        text_message(3, "user", "Delete every branch."),
+        message_with_blocks(4, "assistant", vec![call("t2", "run_terminal_command")]),
+        message_with_blocks(5, "user", vec![result("t2", "out", None)]),
+        text_message(6, "user", STOP_NOTICE),
+        text_message(7, "user", "Write docs instead."),
+    ];
+    assert_eq!(typed_user_text(&b, 200_000).quotes, vec!["Drive it.".to_string()]);
+    // A refused question call's error result.
+    let d = vec![
+        text_message(1, "user", "Drive it."),
+        message_with_blocks(2, "assistant", vec![call("q", crate::questions::ASK_USER)]),
+        message_with_blocks(3, "user", vec![result("q", "questions: missing field", Some(true))]),
+        text_message(4, "assistant", "ok"),
+        text_message(5, "user", "next"),
+    ];
+    assert_eq!(typed_user_text(&d, 200_000).quotes, vec!["Drive it.".to_string()]);
 }

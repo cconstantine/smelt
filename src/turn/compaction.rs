@@ -176,6 +176,7 @@ pub(super) const COMPACTION_CONTINUATION_PROMPT: &str = "Continue based on the s
 pub(super) fn compaction_messages(
     summary: String,
     covers_through_message_id: i64,
+    typed: &Typed,
     unanswered: &[String],
     refused: Option<String>,
 ) -> [(&'static str, Vec<anthropic::ContentBlock>); 3] {
@@ -197,7 +198,7 @@ pub(super) fn compaction_messages(
         (
             "user",
             vec![anthropic::ContentBlock::CompactionPlaceholder {
-                text: continuation_prompt(unanswered),
+                text: continuation_prompt(typed, unanswered),
             }],
         ),
     ]
@@ -207,26 +208,223 @@ pub(super) fn compaction_messages(
 /// model hasn't answered yet (the request that triggered it, notices), it
 /// quotes them, so the model answers what was actually asked rather than
 /// the summary's gist of it (SME-40 F3).
+/// It also quotes, word for word, what the user (or the agent's parent)
+/// wrote earlier (`typed`, SME-367): a summary can paraphrase a mid-run
+/// correction away, and on SME-73 a seat whose correction it lost made the
+/// same mistake again after two compactions.
 #[cfg(feature = "server")]
-pub(super) fn continuation_prompt(unanswered: &[String]) -> String {
-    if unanswered.is_empty() {
-        return COMPACTION_CONTINUATION_PROMPT.to_string();
+pub(super) fn continuation_prompt(typed: &Typed, unanswered: &[String]) -> String {
+    let mut prompt = COMPACTION_CONTINUATION_PROMPT.to_string();
+    if !typed.quotes.is_empty() {
+        prompt.push_str(
+            " For reference, what the user (or your parent) wrote earlier in this conversation, \
+             word for word, with their answers to your questions: the corrections and constraints \
+             in them still hold, but the summary says which requests are already done, so don't \
+             redo those.\n\n",
+        );
+        prompt.push_str(&typed.quotes.join(QUOTE_SEPARATOR));
+        if typed.omitted > 0 {
+            prompt.push_str(&format!(
+                "\n\n({} more they wrote in between {} left out here; the summary covers {}.)",
+                typed.omitted,
+                if typed.omitted == 1 { "is" } else { "are" },
+                if typed.omitted == 1 { "it" } else { "them" },
+            ));
+        }
     }
-    // Each quoted in part at most: a huge paste quoted whole would leave
-    // the compacted request as big as the one compaction was for, and the
-    // summary already covers it (SME-51 B10).
-    let quoted: Vec<String> = unanswered
-        .iter()
-        .map(|text| match crate::fetch_guard::truncate(text.clone(), CONTINUATION_QUOTE_MAX_CHARS) {
-            (kept, true) => format!("{kept}\n[cut to its first {CONTINUATION_QUOTE_MAX_CHARS} characters; the summary covers the rest]"),
-            (whole, false) => whole,
-        })
-        .collect();
+    if unanswered.is_empty() {
+        return prompt;
+    }
+    let quoted: Vec<String> = unanswered.iter().map(|text| quote(text)).collect();
     format!(
-        "{COMPACTION_CONTINUATION_PROMPT} The summary includes these latest messages, which you \
-         haven't answered yet; respond to them now:\n\n{}",
+        "{prompt}{}The summary includes these latest messages, which you haven't answered yet; \
+         respond to them now:\n\n{}",
+        if typed.quotes.is_empty() { " " } else { "\n\n" },
         quoted.join("\n\n")
     )
+}
+
+/// One message as a continuation quotes it: in part at most, since a huge
+/// paste quoted whole would leave the compacted request as big as the one
+/// compaction was for, and the summary already covers it (SME-51 B10).
+#[cfg(feature = "server")]
+fn quote(text: &str) -> String {
+    quote_to(text, CONTINUATION_QUOTE_MAX_CHARS)
+}
+
+/// `quote` to at most `max` characters of `text`.
+#[cfg(feature = "server")]
+fn quote_to(text: &str, max: usize) -> String {
+    match crate::fetch_guard::truncate(text.to_string(), max) {
+        (kept, true) => format!("{kept}\n[cut to its first {max} characters; the summary covers the rest]"),
+        (whole, false) => whole,
+    }
+}
+
+/// Between two quoted typed messages; counted in the budget.
+#[cfg(feature = "server")]
+const QUOTE_SEPARATOR: &str = "\n\n---\n\n";
+
+/// What a continuation quotes of the user's and the parent's own words
+/// (SME-367): `quotes`, oldest first and already cut to size, and how many
+/// it left out.
+#[cfg(feature = "server")]
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct Typed {
+    pub(super) quotes: Vec<String>,
+    pub(super) omitted: usize,
+}
+
+/// How much of the user's and the parent's earlier words a continuation
+/// quotes in all, separators included, each also held to
+/// `CONTINUATION_QUOTE_MAX_CHARS`: about 3,000 tokens, so a long run's
+/// quotes can't fill the window. A smaller window gets an eighth of its
+/// size in characters, about a thirtieth of it in tokens (reviews 1 and 2:
+/// a fixed 12,000 left a 28k-token window over its trigger after every
+/// compaction, and a quarter left it at it).
+#[cfg(feature = "server")]
+pub(super) const CONTINUATION_TYPED_MAX_CHARS: usize = 12_000;
+
+/// The typed-words budget for a model with `context_window` tokens.
+#[cfg(feature = "server")]
+pub(super) fn typed_budget(context_window: u32) -> usize {
+    CONTINUATION_TYPED_MAX_CHARS.min(usize::try_from(context_window).unwrap_or(usize::MAX) / 8)
+}
+
+/// How a parent's `message_agent` reaches its child (`turn::notify`'s
+/// `agent_message_text`, the label `agents::messages` gives a parent).
+#[cfg(feature = "server")]
+const PARENT_MESSAGE_START: &str = "Message from your parent:";
+
+/// The starts of the user-role texts smelt writes itself: notices, and what
+/// other agents send (a child's report, message or question). Anything
+/// else in a user-role text block is the user's own words. A notice this
+/// misses is quoted as if typed, which costs space, never a correction.
+#[cfg(feature = "server")]
+const SERVER_TEXT_STARTS: &[&str] = &[
+    crate::api::chat::STOP_NOTICE,
+    crate::api::chat::CUT_OFF_NOTICE_START,
+    crate::api::chat::REFUSAL_NOTICE_START,
+    crate::text_calls::TEXT_CALL_NOTICE_START,
+    crate::text_calls::EMPTY_REPLY_NOTICE,
+    "Terminal command ",
+    "Sandbox pod ",
+    "Docker in sandbox pod ",
+    "Report from ",
+    "Message from agent #",
+    "Question from ",
+    "Notice: ",
+    // Notices worded as news about the user (review 1). They carry no
+    // NOTICE_MARK yet (SME-357 would mark them all), so their starts are
+    // listed: quoted, they'd read as the user asking again.
+    "The user stopped sandbox pod ",
+    "The user removed this conversation's sandbox storage",
+    "The user now trusts ",
+    "The user chose not to trust ",
+];
+
+/// Whether a user-role text is the user's own words or a parent's message:
+/// not a marked notice (`NOTICE_MARK`), and not one of `SERVER_TEXT_STARTS`.
+#[cfg(feature = "server")]
+pub(super) fn is_typed(text: &str) -> bool {
+    if text.starts_with(PARENT_MESSAGE_START) {
+        return true;
+    }
+    !text.starts_with(crate::api::chat::NOTICE_MARK) && !SERVER_TEXT_STARTS.iter().any(|start| text.starts_with(start))
+}
+
+/// The user's and the parent's own words in `messages`, all of the
+/// conversation's (an earlier compaction's summary may have paraphrased
+/// them), up to its unanswered tail, which the continuation quotes as such
+/// (SME-367): their typed messages, and their answers to the model's
+/// `ask_user` and `ask_parent` calls (review 1: those are often the
+/// decisions; a refused call's error result isn't one). A request the user
+/// stopped isn't quoted: a stop, in the tail too, drops what the user
+/// typed since the model's last final reply (review 2). The first, the original ask, is always
+/// kept, to half the budget; the rest newest first while they fit
+/// `typed_budget(context_window)`, then put back in order.
+#[cfg(feature = "server")]
+pub(super) fn typed_user_text(messages: &[Message], context_window: u32) -> Typed {
+    let answered = messages.len() - messages.iter().rev().take_while(|m| m.role == "user").count();
+    let mut questions = std::collections::HashSet::new();
+    let mut all: Vec<String> = Vec::new();
+    // How many of `all` a final reply (one with no tool call) has answered:
+    // a stop calls off only what came after it (review 2: a run the model
+    // had answered, a correction among it, isn't the stopped request). A
+    // stop straight after a reply with no call is that reply stopped (its
+    // part saved), so it calls off what that reply was answering:
+    // `answered_before` is the count before it.
+    let (mut answered_upto, mut answered_before, mut last_was_final) = (0, 0, false);
+    for (index, message) in messages.iter().enumerate() {
+        let blocks = message.blocks().unwrap_or_default();
+        if message.role != "user" {
+            let mut calls = false;
+            for block in blocks {
+                if let anthropic::ContentBlock::ToolUse { id, name, .. } = block {
+                    calls = true;
+                    if name == crate::questions::ASK_USER || name == crate::agents::ASK_PARENT {
+                        questions.insert(id);
+                    }
+                }
+            }
+            if calls {
+                last_was_final = false;
+            } else {
+                (answered_before, answered_upto, last_was_final) = (answered_upto, all.len(), true);
+            }
+            continue;
+        }
+        // The unanswered tail is quoted as such; only its stops count here
+        // (review 2: a stop there still calls the earlier request off).
+        let in_tail = index >= answered;
+        let stops_here = blocks.iter().any(|b| matches!(b, anthropic::ContentBlock::Text { text } if text == STOP_NOTICE));
+        if !stops_here {
+            last_was_final = false;
+        }
+        for block in blocks {
+            let text = match block {
+                anthropic::ContentBlock::Text { text } if text == STOP_NOTICE => {
+                    let upto = if last_was_final { answered_before } else { answered_upto };
+                    all.truncate(upto);
+                    answered_upto = all.len();
+                    continue;
+                }
+                _ if in_tail => continue,
+                anthropic::ContentBlock::Text { text } if is_typed(&text) && !text.trim().is_empty() => text,
+                anthropic::ContentBlock::ToolResult { tool_use_id, content, is_error }
+                    if questions.contains(&tool_use_id)
+                        && is_error != Some(true)
+                        && content != crate::questions::NOT_ANSWERED
+                        && content != crate::questions::NOT_ANSWERED_BY_PARENT =>
+                {
+                    content
+                }
+                _ => continue,
+            };
+            all.push(text);
+        }
+    }
+    let Some((first, rest)) = all.split_first() else {
+        return Typed::default();
+    };
+    let budget = typed_budget(context_window);
+    let first = quote_to(first, (budget / 2).max(1));
+    let mut used = first.chars().count();
+    let mut newest: Vec<String> = Vec::new();
+    for text in rest.iter().rev() {
+        let quoted = quote_to(text, CONTINUATION_QUOTE_MAX_CHARS.min(budget));
+        let size = quoted.chars().count() + QUOTE_SEPARATOR.len();
+        if used + size > budget {
+            break;
+        }
+        used += size;
+        newest.push(quoted);
+    }
+    let omitted = rest.len() - newest.len();
+    newest.reverse();
+    let mut quotes = vec![first];
+    quotes.extend(newest);
+    Typed { quotes, omitted }
 }
 
 /// How much of each unanswered message a continuation quotes.
@@ -495,7 +693,8 @@ async fn compact(
     };
 
     let unanswered = unanswered_user_text(&messages);
-    for (role, content) in compaction_messages(summary, covers_through_message_id, &unanswered, refused) {
+    let typed = typed_user_text(&messages, turn_model.context_window);
+    for (role, content) in compaction_messages(summary, covers_through_message_id, &typed, &unanswered, refused) {
         let saved = db::create_message(pool, conversation_id, role, &content)
             .await
             .map_err(ServerFnError::new)?;
