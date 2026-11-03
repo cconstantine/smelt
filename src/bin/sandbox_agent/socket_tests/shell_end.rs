@@ -288,6 +288,14 @@ async fn wait_until_exited(pid: u32) {
 /// last output still in its pipes. The reader is held off reading (by
 /// `current`'s lock, which it takes for each line) until the shell has
 /// exited, so that output is all unread when it's reaped.
+///
+/// So the shell's last output has to fit in its pipe without a reader,
+/// or the shell blocks writing it and never exits ("process didn't
+/// exit", SME-282). A pipe holds 64 KiB, but only one or two pages (4 or
+/// 8 KiB) once its user's pipes pass `/proc/sys/fs/pipe-user-pages-soft`,
+/// a count the container's uid shares with the whole host. The commands
+/// below write under 4 KiB (`seq 1 1000` is 3,893 bytes), which fits a
+/// pipe of any size.
 async fn run_with_the_reader_stalled_after_the_reap(terminal_id: &str, command: &str) -> (Vec<String>, Vec<String>, i32) {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -319,12 +327,12 @@ async fn run_with_the_reader_stalled_after_the_reap(terminal_id: &str, command: 
 async fn test_a_slow_reader_still_gets_all_of_a_jobless_shells_last_output() {
     let (stdout, stderr, code) = run_with_the_reader_stalled_after_the_reap(
         "sme191-r1-jobless",
-        "while [ ! -e '{go}' ]; do sleep 0.01; done; seq 1 5000; exit 0",
+        "while [ ! -e '{go}' ]; do sleep 0.01; done; seq 1 1000; exit 0",
     )
     .await;
     assert_eq!(code, 0);
-    let expected: Vec<String> = (1..=5000).map(|n| n.to_string()).collect();
-    assert!(stdout == expected, "stdout should be 1..=5000, got {} lines", stdout.len());
+    let expected: Vec<String> = (1..=1000).map(|n| n.to_string()).collect();
+    assert!(stdout == expected, "stdout should be 1..=1000, got {} lines", stdout.len());
     assert!(
         stderr.len() == 1 && stderr[0].contains("shell exited") && !stderr[0].contains("background"),
         "the note should say only that the shell exited: {stderr:?}"
@@ -338,13 +346,13 @@ async fn test_a_slow_reader_still_gets_all_of_a_jobless_shells_last_output() {
 async fn test_a_slow_reader_still_gets_all_of_a_shells_last_output_when_a_job_holds_its_pipes() {
     let (stdout, stderr, code) = run_with_the_reader_stalled_after_the_reap(
         "sme191-r1-job",
-        "sleep 30 & echo \"job $!\" >&2; while [ ! -e '{go}' ]; do sleep 0.01; done; seq 1 5000; exit 4",
+        "sleep 30 & echo \"job $!\" >&2; while [ ! -e '{go}' ]; do sleep 0.01; done; seq 1 1000; exit 4",
     )
     .await;
     let _job = JobGuard(job_pid(&stderr));
     assert_eq!(code, 4);
-    let expected: Vec<String> = (1..=5000).map(|n| n.to_string()).collect();
-    assert!(stdout == expected, "stdout should be 1..=5000, got {} lines", stdout.len());
+    let expected: Vec<String> = (1..=1000).map(|n| n.to_string()).collect();
+    assert!(stdout == expected, "stdout should be 1..=1000, got {} lines", stdout.len());
     assert!(
         stderr.iter().any(|line| line.contains("shell exited") && line.contains("background")),
         "the note should say a background job is still running: {stderr:?}"
