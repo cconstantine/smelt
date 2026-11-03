@@ -529,3 +529,37 @@ async fn test_run_turn_serializes_concurrent_calls_for_the_same_conversation(poo
          (user, assistant) pairs, never interleaved"
     );
 }
+
+/// SME-367: a correction the user typed mid-run survives the compaction
+/// word for word: the request after it quotes it in the continuation,
+/// beside the original ask, though the summary never mentions it.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_mid_run_correction_survives_a_compaction_word_for_word(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let correction = "use the rust in the compose smelt service, not one in the pod";
+    for (role, text) in [("user", "Drive the ticket."), ("assistant", "On it."), ("user", correction), ("assistant", "Understood.")] {
+        db::create_message(&pool, conversation.id, role, &[anthropic::ContentBlock::Text { text: text.to_string() }])
+            .await
+            .expect("seed a message");
+    }
+    let near_ceiling = anthropic::TokenUsage {
+        input_tokens: 190_000,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+    };
+    db::upsert_conversation_usage(&pool, conversation.id, &near_ceiling).await.expect("seed usage");
+    let requests =
+        start_recording_mock_upstream(&pool, vec![text_reply_body("A summary that leaves the correction out."), text_reply_body("Done.")])
+            .await;
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the turn succeeds");
+
+    let log = requests.lock().expect("the request log");
+    assert_eq!(log.len(), 2, "the summary call, then the turn's own");
+    let sent = log[1]["messages"].to_string();
+    assert!(sent.contains(correction), "the continuation quotes the correction: {sent}");
+    assert!(sent.contains("Drive the ticket."), "and the original ask: {sent}");
+}
