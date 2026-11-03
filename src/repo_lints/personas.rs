@@ -75,7 +75,9 @@ pub(crate) fn names(pattern: &str, tool: &str) -> bool {
 /// part is this deployment's MCP configuration, so it isn't judged here.
 pub(crate) fn dead_patterns(rules: &ToolRules, registry: &[String]) -> Vec<String> {
     let mut dead = Vec::new();
-    for pattern in rules.allow.iter().chain(rules.deny.iter()) {
+    // `own`'s too (SME-322): a typo there rules nothing just the same.
+    let own = rules.own.as_deref().map(|own| own.allow.iter().chain(own.deny.iter()));
+    for pattern in rules.allow.iter().chain(rules.deny.iter()).chain(own.into_iter().flatten()) {
         if pattern.server.is_some() {
             continue;
         }
@@ -161,6 +163,16 @@ mod tests {
     #[test]
     fn test_a_smelt_tool_pattern_naming_no_tool_is_a_finding() {
         let rules = rules_of("    allow: [merge_pull_request, linear.app/save_issue]\n");
+        assert_eq!(
+            dead_patterns(&rules, &registry()),
+            vec!["`merge_pull_request` names no tool smelt registers".to_string()]
+        );
+    }
+
+    /// SME-322: a dead pattern in `own` is a finding too.
+    #[test]
+    fn test_a_dead_pattern_in_own_is_a_finding() {
+        let rules = rules_of("    own:\n      deny: [merge_pull_request]\n");
         assert_eq!(
             dead_patterns(&rules, &registry()),
             vec!["`merge_pull_request` names no tool smelt registers".to_string()]
