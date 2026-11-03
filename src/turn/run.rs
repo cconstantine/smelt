@@ -741,7 +741,7 @@ fn run_turn_steps<'a: 'b, 'b>(
             slot.yield_to_own_agents(pool, conversation_id, turn_model.provider_id).await;
             // Asked the user, or an agent finished (SME-236): the turn ends,
             // with any results saved. A reply here makes at least one call.
-            let (result_blocks, ends) = run_tools(pool, conversation_id, &turn).await?;
+            let (result_blocks, ends) = run_tools(pool, conversation_id, &turn, &offered).await?;
             if !result_blocks.is_empty() {
                 let saved = db::create_message(pool, conversation_id, "user", &result_blocks)
                     .await

@@ -9,6 +9,9 @@ enum Block<'a> {
     Text(&'a str),
     /// A `todoread` call (a cheap tool that needs only the database).
     Todoread(&'a str),
+    /// A call to the tool named `.1`, with id `.0` (SME-307: a name that
+    /// isn't offered).
+    Call(&'a str, &'a str),
 }
 
 /// A reply of `blocks` ending with `stop_reason`, as SSE, its text
@@ -24,6 +27,10 @@ fn text_blocks_body(blocks: &[Block], stop_reason: &str) -> String {
             Block::Text(t) => (json!({"type": "text", "text": ""}), json!({"type": "text_delta", "text": t})),
             Block::Todoread(id) => (
                 json!({"type": "tool_use", "id": id, "name": "todoread", "input": {}}),
+                json!({"type": "input_json_delta", "partial_json": "{}"}),
+            ),
+            Block::Call(id, name) => (
+                json!({"type": "tool_use", "id": id, "name": name, "input": {}}),
                 json!({"type": "input_json_delta", "partial_json": "{}"}),
             ),
         };
@@ -379,4 +386,72 @@ async fn test_unnamed_markup_beside_real_calls_gets_no_correction(pool: PgPool) 
     assert_eq!(roles(&saved), ["user", "assistant", "user", "assistant"], "{saved:?}");
     assert_eq!(notices(&saved), 0, "{saved:?}");
     assert_eq!(requests.lock().expect("the request log").len(), 2);
+}
+
+fn unoffered_reply(id: &str, name: &str) -> String {
+    text_blocks_body(&[Block::Call(id, name)], "tool_use")
+}
+
+/// The content of the tool result for `id` among `saved`.
+fn tool_result_for(saved: &[crate::models::Message], id: &str) -> Option<String> {
+    saved.iter().flat_map(|m| m.blocks().expect("blocks")).find_map(|block| match block {
+        anthropic::ContentBlock::ToolResult { tool_use_id, content, .. } if tool_use_id == id => Some(content),
+        _ => None,
+    })
+}
+
+/// SME-307: a real call by a slip of an offered tool's name gets a result
+/// naming the tool meant, and the turn goes on; one with nothing close is
+/// told so. Both stay in the history as a call and its result.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_real_call_by_an_unoffered_name_is_told_the_tools_like_it(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let bodies = vec![unoffered_reply("toolu_slip", "todosote"), unoffered_reply("toolu_none", "frobnicate"), text_reply_body("Done.")];
+    let requests = start_recording_mock_upstream(&pool, bodies).await;
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("the turn succeeds");
+
+    assert_eq!(requests.lock().expect("the request log").len(), 3);
+    let slip = tool_result_for(&saved, "toolu_slip").expect("the slip's result");
+    assert!(slip.contains("similar offered tools: `todowrite`"), "{slip}");
+    let none = tool_result_for(&saved, "toolu_none").expect("the stranger's result");
+    assert!(none.contains("`frobnicate` isn't an offered tool, and no offered tool has a similar name."), "{none}");
+    assert_eq!(notices(&saved), 0, "the result says it; no notice of its own");
+}
+
+/// SME-307: calls by unoffered names count toward the text-call bound,
+/// and alternating the two shapes still reaches it: markup, a bad call,
+/// markup, then the 4th correction ends the turn naming the call.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_unoffered_calls_share_the_text_call_bound(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let bodies = vec![markup_reply(), unoffered_reply("toolu_1", "todosote"), markup_reply(), unoffered_reply("toolu_2", "todosote")];
+    let requests = start_recording_mock_upstream(&pool, bodies).await;
+
+    let error = run_turn_bounded(&pool, TurnInFlight::start(conversation.id), Some(hello()), 10, None, false)
+        .await
+        .expect_err("the turn fails at the shared bound");
+
+    assert_eq!(requests.lock().expect("the request log").len(), 4);
+    let error = error.to_string();
+    assert!(error.contains("4 times in a row") && error.contains("`todosote`"), "{error}");
+}
+
+/// SME-307: a reply with an offered call beside an unoffered one is a real
+/// call, and resets the streak as before.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_offered_call_beside_an_unoffered_one_resets_the_streak(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let mixed = text_blocks_body(&[Block::Todoread("toolu_ok"), Block::Call("toolu_bad", "todosote")], "tool_use");
+    let bodies = vec![markup_reply(), markup_reply(), markup_reply(), mixed, markup_reply(), text_reply_body("Done.")];
+    let requests = start_recording_mock_upstream(&pool, bodies).await;
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the turn succeeds: the mixed reply reset the streak");
+    assert_eq!(requests.lock().expect("the request log").len(), 6);
 }

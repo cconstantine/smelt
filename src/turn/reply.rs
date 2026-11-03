@@ -183,6 +183,7 @@ pub(super) async fn run_tools(
     pool: &PgPool,
     conversation_id: i64,
     turn: &anthropic::stream::StreamedTurn,
+    offered: &[&str],
 ) -> ServerFnResult<(Vec<anthropic::ContentBlock>, bool)> {
     let mut result_blocks = Vec::new();
     // The question this reply asked, if any: `ask_user`'s or (SME-238)
@@ -245,6 +246,11 @@ pub(super) async fn run_tools(
             }
             let (content, is_error) = match result {
                 Ok(output) => (output, None),
+                // A call by a name that isn't offered is told which offered
+                // tools are like it (SME-307), after its own error.
+                Err(message) if !offered.contains(&name.as_str()) => {
+                    (crate::text_calls::unoffered_call_result(&message, name, offered), Some(true))
+                }
                 Err(message) => (message, Some(true)),
             };
             result_blocks.push(anthropic::ContentBlock::ToolResult {
@@ -316,8 +322,25 @@ pub(super) async fn after_reply(
         if turn.stop_reason != "tool_use" {
             return Ok(NextStep::End);
         }
-        streak.corrections = 0;
         streak.nudged = false;
+        // A reply whose every call names a tool that isn't offered is a
+        // correction too (each result says which tools are like it), so it
+        // counts toward the same bound as calls written as text, and a
+        // model alternating between the two still reaches it (SME-307).
+        let unoffered = turn.content.iter().filter_map(|b| match b {
+            anthropic::ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
+            _ => None,
+        });
+        let mut unoffered = unoffered.peekable();
+        let first = unoffered.peek().copied();
+        if unoffered.all(|name| !offered.contains(&name)) {
+            if streak.corrections == crate::text_calls::MAX_TEXT_CALL_CORRECTIONS {
+                return Err(ServerFnError::new(crate::text_calls::unoffered_bound_error(first.unwrap_or_default())));
+            }
+            streak.corrections += 1;
+        } else {
+            streak.corrections = 0;
+        }
         // Markup for a call the reply also made is a provider leaving the
         // parsed call in the text too: it ran, and a correction would have
         // the model make it again (review 1). Matched by name; markup with

@@ -288,3 +288,29 @@ fn test_a_call_naming_a_servers_own_name_finds_its_safe_named_tools() {
     assert!(!notice.contains("no MCP server"), "{notice}");
     assert!(notice.contains(&offered), "{notice}");
 }
+
+/// SME-307: a slip of the name itself shares no word with the tool meant,
+/// so a name a few edits away is similar too; a long-word stranger isn't.
+#[test]
+fn test_similar_finds_a_slip_of_the_name() {
+    let slip = similar("todosote", OFFERED);
+    assert_eq!(slip.first().map(String::as_str), Some("todowrite"), "{slip:?}");
+    let typo = similar("mcp__linear.app__get_isue", OFFERED);
+    assert_eq!(typo.first().map(String::as_str), Some("mcp__linear.app__get_issue"), "{typo:?}");
+    assert_eq!(similar("frobnicate", OFFERED), Vec::<String>::new());
+    assert_eq!(similar("abc", &["abd"]), Vec::<String>::new(), "names under 4 characters aren't matched by edits");
+}
+
+/// SME-307: a real call by a name that isn't offered keeps its own error
+/// and gets the text call's sentence: the slip, the crossed MCP prefix, and
+/// a name with nothing close.
+#[test]
+fn test_an_unoffered_calls_result_names_the_tools_like_it() {
+    let slip = unoffered_call_result("unknown tool: todosote", "todosote", OFFERED);
+    assert!(slip.starts_with("unknown tool: todosote\n"), "{slip}");
+    assert!(slip.contains("`todosote` isn't an offered tool; similar offered tools: `todowrite`"), "{slip}");
+    let crossed = unoffered_call_result("unknown tool", "mcp__linear.app__add_issue_comment", OFFERED);
+    assert!(crossed.contains("similar offered tools: `mcp__linear.app__save_comment`"), "{crossed}");
+    let stranger = unoffered_call_result("unknown tool: frobnicate", "frobnicate", OFFERED);
+    assert!(stranger.ends_with("`frobnicate` isn't an offered tool, and no offered tool has a similar name."), "{stranger}");
+}
