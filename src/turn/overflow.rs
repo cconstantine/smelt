@@ -66,7 +66,7 @@ pub(super) async fn recover(
     if compacted {
         #[cfg(test)]
         test_hooks::before_summary_call(conversation_id).await;
-        compact_conversation(pool, conversation_id, turn_model, slot).await?;
+        compact_conversation(pool, conversation_id, turn_model, slot, Some(refused_reason(named))).await?;
     }
 
     // Once more. A compaction summarized the history the old usage
@@ -239,6 +239,19 @@ pub(super) fn grouped(n: u64) -> String {
         out.push(c);
     }
     out
+}
+
+/// Why a compaction happened, in the words its transcript divider reads
+/// after "Conversation compacted: " (SME-73): the refusal it answered,
+/// naming the window that refusal gave when it named one.
+pub(super) fn refused_reason(window: Option<u32>) -> String {
+    match window {
+        Some(window) => format!(
+            "the model's server refused a request that didn't fit its {}-token window",
+            grouped(u64::from(window))
+        ),
+        None => "the model's server refused a request that didn't fit".to_string(),
+    }
 }
 
 /// The failed turn's words when even compaction couldn't make it fit.

@@ -106,12 +106,18 @@ fn ollama_refused() -> Answer {
 
 /// The summaries of every compaction saved in conversation `id`.
 async fn compaction_summaries(pool: &PgPool, id: i64) -> Vec<String> {
+    compaction_blocks(pool, id).await.into_iter().map(|(summary, _)| summary).collect()
+}
+
+/// Every saved `CompactionSummary` in conversation `id`, as its summary
+/// and its refusal reason (SME-73).
+async fn compaction_blocks(pool: &PgPool, id: i64) -> Vec<(String, Option<String>)> {
     let messages = db::list_messages(pool, id).await.expect("messages");
     messages
         .iter()
         .flat_map(|m| m.blocks().unwrap_or_default())
         .filter_map(|b| match b {
-            anthropic::ContentBlock::CompactionSummary { summary, .. } => Some(summary),
+            anthropic::ContentBlock::CompactionSummary { summary, refused, .. } => Some((summary, refused)),
             _ => None,
         })
         .collect()
@@ -210,6 +216,11 @@ async fn test_an_overflow_whose_input_doesnt_fit_compacts_then_retries(pool: PgP
     assert_eq!(upstream.count(), 3, "refusal, summary, retry");
     let summaries = compaction_summaries(&pool, conversation.id).await;
     assert_eq!(summaries, ["Summary: it was going."], "the divider's summary was saved");
+    assert_eq!(
+        compaction_blocks(&pool, conversation.id).await[0].1.as_deref(),
+        Some("the model's server refused a request that didn't fit its 131,072-token window"),
+        "the divider reads why: the refusal and the window it named (SME-73)"
+    );
     let saved = db::list_messages(&pool, conversation.id).await.expect("messages");
     assert_eq!(last_reply(&saved).as_deref(), Some("Done now."));
     assert_eq!(saved_context_window(&pool).await, Some(131_072));
@@ -242,6 +253,11 @@ async fn test_an_overflow_with_no_window_named_compacts_on_an_unsaved_guess(pool
 
     assert_eq!(upstream.count(), 3, "refusal, summary, retry — the guess still answers the refusal");
     assert_eq!(compaction_summaries(&pool, conversation.id).await, ["Summary: what came before."]);
+    assert_eq!(
+        compaction_blocks(&pool, conversation.id).await[0].1.as_deref(),
+        Some("the model's server refused a request that didn't fit"),
+        "with no window named the divider says only that (SME-73)"
+    );
     let saved = db::list_messages(&pool, conversation.id).await.expect("messages");
     assert_eq!(last_reply(&saved).as_deref(), Some("Answered."));
     assert_eq!(saved_context_window(&pool).await, None, "a guess is kept to the turn, never saved as the model's window");
@@ -432,6 +448,11 @@ async fn test_a_compaction_that_overflows_retries_its_summary_once(pool: PgPool)
         compaction_summaries(&pool, id).await,
         ["Summary: recovered on the second ask."],
         "the summary asked for once more is the divider"
+    );
+    assert_eq!(
+        compaction_blocks(&pool, id).await[0].1.as_deref(),
+        Some("the model's server refused a request that didn't fit its 131,072-token window"),
+        "a compaction answering its own refusal names that refusal on the divider (SME-73)"
     );
     let saved = db::list_messages(&pool, id).await.expect("messages");
     assert_eq!(last_reply(&saved).as_deref(), Some("Answered after the recovered compaction."));

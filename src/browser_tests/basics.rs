@@ -219,6 +219,7 @@ pub(super) async fn scenario_compaction_divider(t: &Scenario<'_>) {
         &[anthropic::ContentBlock::CompactionSummary {
             summary: "the user said hello; nothing else happened".to_string(),
             covers_through_message_id: 1,
+            refused: None,
         }],
     )
     .await

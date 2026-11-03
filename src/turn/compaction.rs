@@ -168,11 +168,16 @@ pub(super) const COMPACTION_CONTINUATION_PROMPT: &str = "Continue based on the s
 /// `user` (structural placeholder) -> `assistant` (the summary) -> `user`
 /// (a plain continuation nudge, the thing the *next* real request
 /// actually responds to). See SME-18.
+///
+/// `refused`, when set, is why this compaction happened instead of the
+/// proactive one — the overflow refusal's reason, stored on the summary
+/// block for the transcript divider to read (SME-73).
 #[cfg(feature = "server")]
 pub(super) fn compaction_messages(
     summary: String,
     covers_through_message_id: i64,
     unanswered: &[String],
+    refused: Option<String>,
 ) -> [(&'static str, Vec<anthropic::ContentBlock>); 3] {
     [
         (
@@ -186,6 +191,7 @@ pub(super) fn compaction_messages(
             vec![anthropic::ContentBlock::CompactionSummary {
                 summary,
                 covers_through_message_id,
+                refused,
             }],
         ),
         (
@@ -390,12 +396,20 @@ pub(super) fn compaction_transcript_budget(context_window: u32) -> usize {
 /// error and the whole turn fails loudly, rather than proceeding with the
 /// oversized request compaction exists to prevent — see SME-18's
 /// "Resolved" decision on this.
+///
+/// `refused`, when set, is why the turn needed this compaction rather
+/// than waiting for the proactive check — an overflow refusal's reason
+/// (from `overflow::refused_reason`), saved on the summary block so the
+/// transcript divider reads it (SME-73). A compaction whose *own* summary
+/// request was refused and recovered fills in its own reason when no one
+/// else named one.
 #[cfg(feature = "server")]
 pub(super) async fn compact_conversation(
     pool: &PgPool,
     conversation_id: i64,
     turn_model: &mut crate::providers::TurnModel,
     slot: anthropic::stream::SlotPolicy<'_>,
+    refused: Option<String>,
 ) -> ServerFnResult<()> {
     use tracing::field::Empty;
     // Its model call is its child (SME-137).
@@ -406,7 +420,7 @@ pub(super) async fn compact_conversation(
         otel.status_description = Empty,
     );
     crate::telemetry::in_span(span.clone(), async move {
-        let result = compact(pool, conversation_id, turn_model, slot).await;
+        let result = compact(pool, conversation_id, turn_model, slot, refused).await;
         if let Err(e) = &result {
             crate::telemetry::mark_error(&span, &e.to_string());
         }
@@ -421,6 +435,7 @@ async fn compact(
     conversation_id: i64,
     turn_model: &mut crate::providers::TurnModel,
     slot: anthropic::stream::SlotPolicy<'_>,
+    refused: Option<String>,
 ) -> ServerFnResult<()> {
     let messages = db::list_messages(pool, conversation_id)
         .await
@@ -444,6 +459,7 @@ async fn compact(
     // names and ask once more with the transcript sized to it — half
     // the refused one when no window was named. A second refusal ends
     // the turn with the reason.
+    let mut refused = refused;
     let summary = match summarize(pool, conversation_id, turn_model, slot, &transcript).await {
         Ok(summary) => summary,
         Err(anthropic::stream::ModelError::Overflow(overflow)) => {
@@ -451,7 +467,13 @@ async fn compact(
             let budget = named.map_or(transcript.chars().count() / 2, compaction_transcript_budget);
             let transcript = compaction_transcript(&messages, budget);
             match summarize(pool, conversation_id, turn_model, slot, &transcript).await {
-                Ok(summary) => summary,
+                Ok(summary) => {
+                    // The refusal this compaction answered, when its
+                    // caller didn't name one: the divider reads the
+                    // window this refusal learned (SME-73).
+                    refused = refused.or_else(|| Some(super::overflow::refused_reason(named)));
+                    summary
+                }
                 Err(anthropic::stream::ModelError::Overflow(again)) => {
                     super::overflow::learn(pool, conversation_id, turn_model, again.window).await;
                     let window = again
@@ -473,7 +495,7 @@ async fn compact(
     };
 
     let unanswered = unanswered_user_text(&messages);
-    for (role, content) in compaction_messages(summary, covers_through_message_id, &unanswered) {
+    for (role, content) in compaction_messages(summary, covers_through_message_id, &unanswered, refused) {
         let saved = db::create_message(pool, conversation_id, role, &content)
             .await
             .map_err(ServerFnError::new)?;

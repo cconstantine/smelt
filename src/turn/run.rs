@@ -652,7 +652,9 @@ fn run_turn_steps<'a: 'b, 'b>(
                 estimate_tokens(&pending_new_content),
                 turn_model.context_window,
             ) {
-                compact_conversation(pool, conversation_id, turn_model, slot.held()).await?;
+                // A proactive compaction: no refusal to name on the
+                // divider (SME-73).
+                compact_conversation(pool, conversation_id, turn_model, slot.held(), None).await?;
                 // The last usage measured the history just summarized: the
                 // reply budget below estimates the new one instead.
                 last_known_usage = None;

@@ -156,6 +156,7 @@ async fn test_a_compaction_is_a_span_with_its_model_call_under_it(pool: PgPool) 
             conversation.id,
             &mut turn_model,
             anthropic::stream::SlotPolicy::PerCall,
+            None,
         ))
         .await;
     result.expect("compaction");

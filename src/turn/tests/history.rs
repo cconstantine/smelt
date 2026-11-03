@@ -79,7 +79,7 @@ fn compacted_once() -> Vec<Message> {
         text_message(1, "user", "ancient question"),
         text_message(2, "assistant", "ancient answer"),
     ];
-    for (offset, (role, blocks)) in compaction_messages("the earlier summary".to_string(), 2, &[])
+    for (offset, (role, blocks)) in compaction_messages("the earlier summary".to_string(), 2, &[], None)
         .into_iter()
         .enumerate()
     {
@@ -143,7 +143,7 @@ fn test_the_continuation_quotes_what_the_model_hasnt_answered() {
         ]
     );
 
-    let [_, _, (_, continuation)] = compaction_messages("the summary".to_string(), 5, &unanswered);
+    let [_, _, (_, continuation)] = compaction_messages("the summary".to_string(), 5, &unanswered, None);
     let text = format!("{continuation:?}");
     assert!(text.contains("Reply with just: ok"), "the request isn't in the continuation: {text}");
     assert!(text.contains("Terminal command abc finished"), "{text}");
@@ -152,7 +152,7 @@ fn test_the_continuation_quotes_what_the_model_hasnt_answered() {
 
 #[test]
 fn test_compaction_messages_start_with_user_and_alternate_correctly() {
-    let inserted = compaction_messages("the summary".to_string(), 42, &[]);
+    let inserted = compaction_messages("the summary".to_string(), 42, &[], None);
     let roles: Vec<&str> = inserted.iter().map(|(role, _)| *role).collect();
     assert_eq!(
         roles,
@@ -166,6 +166,7 @@ fn test_compaction_messages_start_with_user_and_alternate_correctly() {
         vec![anthropic::ContentBlock::CompactionSummary {
             summary: "the summary".to_string(),
             covers_through_message_id: 42,
+            refused: None,
         }]
     );
 }
@@ -293,6 +294,7 @@ fn test_history_for_request_skips_covered_messages_and_translates_the_summary() 
             vec![anthropic::ContentBlock::CompactionSummary {
                 summary: "condensed: talked about X".to_string(),
                 covers_through_message_id: 2,
+                refused: None,
             }],
         ),
         message_with_blocks(4, "user", vec![text_block("new message")]),
@@ -311,6 +313,33 @@ fn test_history_for_request_skips_covered_messages_and_translates_the_summary() 
             },
         ]
     );
+}
+
+/// SME-73: the refusal reason lives on the block for the transcript
+/// divider only. Replayed, the block is its summary text and nothing
+/// else — the model never learns (or imitates) the divider's words.
+#[test]
+fn test_history_replay_never_sends_the_refusal_reason() {
+    let messages = vec![
+        message_with_blocks(1, "user", vec![text_block("old")]),
+        message_with_blocks(
+            2,
+            "user",
+            vec![anthropic::ContentBlock::CompactionSummary {
+                summary: "what the earlier part said".to_string(),
+                covers_through_message_id: 1,
+                refused: Some(
+                    "the model's server refused a request that didn't fit its 32,768-token window".to_string(),
+                ),
+            }],
+        ),
+        message_with_blocks(3, "user", vec![text_block("new")]),
+    ];
+    let history = history_for_request(messages, None).expect("should parse");
+    let sent = serde_json::to_string(&history).expect("serialize");
+    assert!(!sent.contains("refused"), "the reason leaked to the model: {sent}");
+    assert!(!sent.contains("32,768"), "the reason leaked to the model: {sent}");
+    assert_eq!(history[0].content, vec![text_block("what the earlier part said")]);
 }
 
 #[test]
@@ -345,6 +374,7 @@ fn test_history_for_request_only_the_latest_of_two_compactions_applies() {
             vec![anthropic::ContentBlock::CompactionSummary {
                 summary: "first summary".to_string(),
                 covers_through_message_id: 1,
+                refused: None,
             }],
         ),
         message_with_blocks(3, "user", vec![text_block("middle")]),
@@ -354,6 +384,7 @@ fn test_history_for_request_only_the_latest_of_two_compactions_applies() {
             vec![anthropic::ContentBlock::CompactionSummary {
                 summary: "second summary, supersedes the first".to_string(),
                 covers_through_message_id: 3,
+                refused: None,
             }],
         ),
         message_with_blocks(5, "user", vec![text_block("recent")]),
