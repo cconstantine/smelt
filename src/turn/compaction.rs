@@ -278,16 +278,17 @@ pub(super) struct Typed {
 /// How much of the user's and the parent's earlier words a continuation
 /// quotes in all, separators included, each also held to
 /// `CONTINUATION_QUOTE_MAX_CHARS`: about 3,000 tokens, so a long run's
-/// quotes can't fill the window. A smaller window gets a quarter of its
-/// size in characters, about a sixteenth of it in tokens (review 1: a fixed
-/// 12,000 left a 28k-token window over its trigger after every compaction).
+/// quotes can't fill the window. A smaller window gets an eighth of its
+/// size in characters, about a thirtieth of it in tokens (reviews 1 and 2:
+/// a fixed 12,000 left a 28k-token window over its trigger after every
+/// compaction, and a quarter left it at it).
 #[cfg(feature = "server")]
 pub(super) const CONTINUATION_TYPED_MAX_CHARS: usize = 12_000;
 
 /// The typed-words budget for a model with `context_window` tokens.
 #[cfg(feature = "server")]
 pub(super) fn typed_budget(context_window: u32) -> usize {
-    CONTINUATION_TYPED_MAX_CHARS.min(usize::try_from(context_window).unwrap_or(usize::MAX) / 4)
+    CONTINUATION_TYPED_MAX_CHARS.min(usize::try_from(context_window).unwrap_or(usize::MAX) / 8)
 }
 
 /// How a parent's `message_agent` reaches its child (`turn::notify`'s
@@ -337,9 +338,9 @@ pub(super) fn is_typed(text: &str) -> bool {
 /// them), up to its unanswered tail, which the continuation quotes as such
 /// (SME-367): their typed messages, and their answers to the model's
 /// `ask_user` and `ask_parent` calls (review 1: those are often the
-/// decisions). A request the user stopped isn't quoted: a stop drops the
-/// typed messages of the run it called off (review 1, as
-/// `unanswered_user_text` does). The first, the original ask, is always
+/// decisions; a refused call's error result isn't one). A request the user
+/// stopped isn't quoted: a stop, in the tail too, drops what the user
+/// typed since the model's last final reply (review 2). The first, the original ask, is always
 /// kept, to half the budget; the rest newest first while they fit
 /// `typed_budget(context_window)`, then put back in order.
 #[cfg(feature = "server")]
@@ -347,31 +348,52 @@ pub(super) fn typed_user_text(messages: &[Message], context_window: u32) -> Type
     let answered = messages.len() - messages.iter().rev().take_while(|m| m.role == "user").count();
     let mut questions = std::collections::HashSet::new();
     let mut all: Vec<String> = Vec::new();
-    // Where the latest run of typed messages began, in `all`: a stop
-    // after it calls that run off.
-    let (mut run_start, mut in_run) = (0, false);
-    for message in &messages[..answered] {
+    // How many of `all` a final reply (one with no tool call) has answered:
+    // a stop calls off only what came after it (review 2: a run the model
+    // had answered, a correction among it, isn't the stopped request). A
+    // stop straight after a reply with no call is that reply stopped (its
+    // part saved), so it calls off what that reply was answering:
+    // `answered_before` is the count before it.
+    let (mut answered_upto, mut answered_before, mut last_was_final) = (0, 0, false);
+    for (index, message) in messages.iter().enumerate() {
         let blocks = message.blocks().unwrap_or_default();
         if message.role != "user" {
-            in_run = false;
+            let mut calls = false;
             for block in blocks {
-                if let anthropic::ContentBlock::ToolUse { id, name, .. } = block
-                    && (name == crate::questions::ASK_USER || name == crate::agents::ASK_PARENT)
-                {
-                    questions.insert(id);
+                if let anthropic::ContentBlock::ToolUse { id, name, .. } = block {
+                    calls = true;
+                    if name == crate::questions::ASK_USER || name == crate::agents::ASK_PARENT {
+                        questions.insert(id);
+                    }
                 }
             }
+            if calls {
+                last_was_final = false;
+            } else {
+                (answered_before, answered_upto, last_was_final) = (answered_upto, all.len(), true);
+            }
             continue;
+        }
+        // The unanswered tail is quoted as such; only its stops count here
+        // (review 2: a stop there still calls the earlier request off).
+        let in_tail = index >= answered;
+        let stops_here = blocks.iter().any(|b| matches!(b, anthropic::ContentBlock::Text { text } if text == STOP_NOTICE));
+        if !stops_here {
+            last_was_final = false;
         }
         for block in blocks {
             let text = match block {
                 anthropic::ContentBlock::Text { text } if text == STOP_NOTICE => {
-                    all.truncate(run_start);
+                    let upto = if last_was_final { answered_before } else { answered_upto };
+                    all.truncate(upto);
+                    answered_upto = all.len();
                     continue;
                 }
+                _ if in_tail => continue,
                 anthropic::ContentBlock::Text { text } if is_typed(&text) && !text.trim().is_empty() => text,
-                anthropic::ContentBlock::ToolResult { tool_use_id, content, .. }
+                anthropic::ContentBlock::ToolResult { tool_use_id, content, is_error }
                     if questions.contains(&tool_use_id)
+                        && is_error != Some(true)
                         && content != crate::questions::NOT_ANSWERED
                         && content != crate::questions::NOT_ANSWERED_BY_PARENT =>
                 {
@@ -379,9 +401,6 @@ pub(super) fn typed_user_text(messages: &[Message], context_window: u32) -> Type
                 }
                 _ => continue,
             };
-            if !in_run {
-                (run_start, in_run) = (all.len(), true);
-            }
             all.push(text);
         }
     }

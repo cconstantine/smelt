@@ -558,3 +558,56 @@ fn test_a_small_windows_typed_words_fit_its_budget() {
     assert!(typed.quotes[0].contains("cut to its first"), "the long ask is cut to half the budget");
     assert!(typed.omitted > 0);
 }
+
+/// SME-367 review 2: a stop calls off only what the model hadn't answered
+/// yet. A correction it answered, and then kept working past (tool steps,
+/// a notice), survives a later stop; a stop in the unanswered tail still
+/// calls off the request before it; a refused question call's error isn't
+/// an answer.
+#[test]
+fn test_a_stop_calls_off_only_what_wasnt_answered() {
+    let call = |id: &str, name: &str| anthropic::ContentBlock::ToolUse { id: id.to_string(), name: name.to_string(), input: serde_json::json!({}) };
+    let result = |id: &str, content: &str, is_error: Option<bool>| anthropic::ContentBlock::ToolResult {
+        tool_use_id: id.to_string(),
+        content: content.to_string(),
+        is_error,
+    };
+    // Probe A: the correction was answered, then the model kept working.
+    let a = vec![
+        text_message(1, "user", "Drive it."),
+        text_message(2, "assistant", "ok"),
+        text_message(3, "user", "Use the compose rust, not the pod's."),
+        text_message(4, "assistant", "Understood."),
+        text_message(5, "user", "Terminal command abc finished: exit code 0."),
+        message_with_blocks(6, "assistant", vec![call("t1", "run_terminal_command")]),
+        message_with_blocks(7, "user", vec![result("t1", "out", None)]),
+        text_message(8, "user", STOP_NOTICE),
+        text_message(9, "user", "Carry on."),
+        text_message(10, "assistant", "ok"),
+        text_message(11, "user", "next"),
+    ];
+    assert_eq!(
+        typed_user_text(&a, 200_000).quotes,
+        vec!["Drive it.".to_string(), "Use the compose rust, not the pod's.".to_string(), "Carry on.".to_string()]
+    );
+    // Probe B: the stop is in the unanswered tail.
+    let b = vec![
+        text_message(1, "user", "Drive it."),
+        text_message(2, "assistant", "ok"),
+        text_message(3, "user", "Delete every branch."),
+        message_with_blocks(4, "assistant", vec![call("t2", "run_terminal_command")]),
+        message_with_blocks(5, "user", vec![result("t2", "out", None)]),
+        text_message(6, "user", STOP_NOTICE),
+        text_message(7, "user", "Write docs instead."),
+    ];
+    assert_eq!(typed_user_text(&b, 200_000).quotes, vec!["Drive it.".to_string()]);
+    // A refused question call's error result.
+    let d = vec![
+        text_message(1, "user", "Drive it."),
+        message_with_blocks(2, "assistant", vec![call("q", crate::questions::ASK_USER)]),
+        message_with_blocks(3, "user", vec![result("q", "questions: missing field", Some(true))]),
+        text_message(4, "assistant", "ok"),
+        text_message(5, "user", "next"),
+    ];
+    assert_eq!(typed_user_text(&d, 200_000).quotes, vec!["Drive it.".to_string()]);
+}
