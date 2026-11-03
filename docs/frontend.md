@@ -6,7 +6,8 @@ Dioxus components under `src/frontend/`, rendered via **fullstack SSR**: the ser
 
 ```
 frontend/
-  mod.rs               # App (router root), Route enum, a small wrapper component per route, NotFound
+  mod.rs               # App (router root), Route enum, a small wrapper component per route (every route under the Shell layout), NotFound
+  notifications.rs     # Shell and the Notifier: the leader election, the sidebar's NotificationsToggle, the `(N) smelt` title count (SME-71; see frontend/notifications.md)
   pages/
     mod.rs             # TwoStepButton, TwoStepLabel, ErrorText, server_error_message
     chat/              # the chat page (SME-57)
@@ -51,7 +52,7 @@ pub fn App() -> Element {
 
 Without the viewport tag a phone lays the page out at desktop width and shrinks it (SME-40 F8; browser scenario 17 checks it).
 
-The routes (`Route` in `frontend/mod.rs`):
+The routes (`Route` in `frontend/mod.rs`). Every route sits inside the `Shell` layout (`frontend/notifications.rs`, SME-71), so the `Notifier` — leader election, notifications, title count — stays mounted across navigation:
 
 | Path | Page |
 |---|---|

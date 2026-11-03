@@ -22,6 +22,7 @@ fn test_app_events_round_trip_through_json() {
         AppEvent::ProvidersChanged,
         AppEvent::QuestionsChanged,
         AppEvent::ConversationsChanged,
+        AppEvent::NeedsUser { conversation_id: 7, attention: Attention::Failed, generation: 12 },
     ] {
         let json = serde_json::to_string(&event).expect("serialize");
         assert_eq!(serde_json::from_str::<AppEvent>(&json).expect("deserialize"), event);
@@ -66,6 +67,50 @@ fn test_an_event_type_added_later_decodes_as_unknown() {
     }
 }
 
+/// SME-71: the notifier passes the kind it was told back to
+/// `get_attention`, so `Attention` travels as a plain string — and the
+/// server's "keep the maximum" relies on this exact priority order:
+/// a question outranks a failure, a failure outranks a finished turn.
+#[test]
+fn test_attention_is_a_string_on_the_wire_and_orders_by_priority() {
+    for (attention, name) in [
+        (Attention::Finished, "Finished"),
+        (Attention::CutOff, "CutOff"),
+        (Attention::Refused, "Refused"),
+        (Attention::Failed, "Failed"),
+        (Attention::Question, "Question"),
+    ] {
+        let json = format!("\"{name}\"");
+        assert_eq!(serde_json::to_string(&attention).expect("serialize"), json);
+        assert_eq!(serde_json::from_str::<Attention>(&json).expect("deserialize"), attention);
+    }
+    let by_priority = [Attention::Finished, Attention::CutOff, Attention::Refused, Attention::Failed, Attention::Question];
+    for pair in by_priority.windows(2) {
+        assert!(pair[0] < pair[1], "{:?} should rank below {:?}", pair[0], pair[1]);
+    }
+}
+
+/// SME-71: the exact shape the leader and the chat tabs' counts read.
+#[test]
+fn test_a_needs_user_event_names_its_conversation_kind_and_generation() {
+    let json = serde_json::to_string(&AppEvent::NeedsUser {
+        conversation_id: 7,
+        attention: Attention::CutOff,
+        generation: 4,
+    })
+    .expect("serialize");
+    assert_eq!(json, r#"{"type":"NeedsUser","conversation_id":7,"attention":"CutOff","generation":4}"#);
+    let back: AppEvent = serde_json::from_str(&json).expect("app event");
+    assert_eq!(back, AppEvent::NeedsUser { conversation_id: 7, attention: Attention::CutOff, generation: 4 });
+    let json = serde_json::to_string(&ConversationEvent::NeedsUser {
+        conversation_id: 7,
+        attention: Attention::CutOff,
+        generation: 4,
+    })
+    .expect("serialize");
+    assert_eq!(json, r#"{"type":"NeedsUser","conversation_id":7,"attention":"CutOff","generation":4}"#);
+}
+
 fn one_of_each() -> Vec<ConversationEvent> {
     vec![
         ConversationEvent::TurnError { message: "boom".to_string() },
@@ -75,6 +120,11 @@ fn one_of_each() -> Vec<ConversationEvent> {
         ConversationEvent::PodsChanged {},
         ConversationEvent::TurnsChanged {},
         ConversationEvent::QuestionsChanged {},
+        ConversationEvent::NeedsUser {
+            conversation_id: 7,
+            attention: Attention::Question,
+            generation: 3,
+        },
         ConversationEvent::ConversationsChanged {},
         ConversationEvent::QuestionUpdate { question: None },
         ConversationEvent::QuestionUpdate {

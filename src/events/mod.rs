@@ -33,6 +33,21 @@ impl SandboxPreview {
     }
 }
 
+/// What a conversation has been waiting on the user for since it last
+/// went busy (SME-71): published to the notifier, and passed back to
+/// `api::notifications::get_attention` as the kind to re-check. Ordered
+/// by priority — during one busy spell a question outranks a failure, a
+/// failure outranks a finished turn, so a later turn can't hide an
+/// earlier one. Serde as a string.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Attention {
+    Finished,
+    CutOff,
+    Refused,
+    Failed,
+    Question,
+}
+
 /// `MessagesAppended` carries no new data of its own; it's a live-delivery
 /// notification for rows `db::create_message` already persisted. The
 /// `Sandbox*` variants are ephemeral UI telemetry, never persisted and
@@ -166,6 +181,14 @@ pub enum ConversationEvent {
     /// An app-wide `AppEvent::QuestionsChanged`, relayed like `TurnsChanged`
     /// so the sidebar can mark conversations waiting on an answer.
     QuestionsChanged {},
+    /// A conversation needs the user (SME-71): `AppEvent::NeedsUser`,
+    /// relayed like `TurnsChanged` so every chat tab keeps its title
+    /// count. A chat tab hears every conversation's.
+    NeedsUser {
+        conversation_id: i64,
+        attention: Attention,
+        generation: u64,
+    },
     /// An app-wide `AppEvent::ConversationsChanged` (a conversation was
     /// created, retitled or deleted), relayed like `TurnsChanged` so the
     /// sidebar's list follows along in every tab (SME-269).
@@ -240,6 +263,17 @@ pub enum AppEvent {
     /// refetch `api::agents::get_conversation_tree` and the open
     /// conversation's `get_agents_waiting`.
     QuestionsChanged,
+    /// A conversation went idle with something for the user (SME-71):
+    /// published once, after `TurnsChanged`, when its last turn ended and
+    /// it had noted attention — or when `ask` paused it on a question.
+    /// `generation` is the conversation's turn generation at that end;
+    /// `api::notifications::get_attention` answers `None` for a stale
+    /// event, and the notifier checks it right before acting.
+    NeedsUser {
+        conversation_id: i64,
+        attention: Attention,
+        generation: u64,
+    },
     /// A conversation was created, retitled (its first message gave it a
     /// title) or deleted, or an agent's stored state changed. Carries
     /// nothing: listeners refetch `api::agents::get_conversation_tree`,

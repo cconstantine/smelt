@@ -133,6 +133,14 @@ pub(super) enum EventEffect {
     /// A turn started: an earlier turn's error no longer stands, whichever
     /// tab sent either (B19, SME-122).
     TurnStarted,
+    /// A conversation needs the user (SME-71): the relayed
+    /// `ConversationEvent::NeedsUser`, handed to the layout's
+    /// `NotifierFeed` for the title count.
+    NeedsUser {
+        conversation_id: i64,
+        attention: crate::events::Attention,
+        generation: u64,
+    },
     /// A type added since this page loaded: the server is newer than this
     /// bundle.
     StaleBundle,
@@ -272,6 +280,10 @@ pub(super) fn apply_event(state: Store<ConversationState>, event: ConversationEv
         ConversationEvent::PodsChanged {} => return EventEffect::PodsChanged,
         ConversationEvent::TurnsChanged {} => return EventEffect::TurnsChanged,
         ConversationEvent::QuestionsChanged {} => return EventEffect::QuestionsChanged,
+        // SME-71: handed untouched to the layout's NotifierFeed.
+        ConversationEvent::NeedsUser { conversation_id, attention, generation } => {
+            return EventEffect::NeedsUser { conversation_id, attention, generation };
+        }
         ConversationEvent::ConversationsChanged {} => return EventEffect::ConversationsChanged,
         ConversationEvent::ModelChanged {} | ConversationEvent::ProvidersChanged {} => {
             return EventEffect::ModelChanged;

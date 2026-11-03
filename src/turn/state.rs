@@ -63,6 +63,12 @@ pub(super) struct ConversationRuntime {
     /// turn's start and by the drains; taken at its end. An idle notice
     /// alone doesn't set it (the user's answer 2).
     activity_owed: bool,
+    /// What this conversation has owed the user since it last went busy
+    /// (SME-71): kept as the maximum, so a later turn can't hide an
+    /// earlier failure or question in the same busy spell. `admit` clears
+    /// it when the conversation goes 0 → 1 busy; `TurnInFlight::drop`
+    /// takes it, with the generation to carry, when the last turn ends.
+    attention: Option<crate::events::Attention>,
 }
 
 impl ConversationRuntime {
@@ -96,6 +102,7 @@ impl ConversationRuntime {
             && !self.paused
             && self.turns_in_flight == 0
             && self.started_at.is_none()
+            && self.attention.is_none()
             && self.kept.generation == 0
             && self.kept.error.is_none()
     }
@@ -150,6 +157,7 @@ pub(crate) fn forget_conversation_lock(conversation_id: i64) {
         runtime.lock = None;
         runtime.stops = None;
         runtime.paused = false;
+        runtime.attention = None;
         runtime.kept = KeptTurnError::default();
     });
 }
@@ -362,6 +370,10 @@ fn admit(conversation_id: i64, admission: Admission) -> Option<(TurnInFlight, u6
         });
         let first = runtime.turns_in_flight == 1;
         if first {
+            // A new busy spell starts clean (SME-71): what an earlier
+            // spell owed the user was published when it ended, or the
+            // user is here.
+            runtime.attention = None;
             runtime.started_at = Some(std::time::Instant::now());
             crate::events::publish(
                 conversation_id,
@@ -430,6 +442,13 @@ impl Drop for TurnInFlight {
         drop(self.place.take());
         let stop = self.stop.take();
         let mut last = false;
+        // SME-71: what the last turn takes is taken, with the generation
+        // to carry, in the same critical section that ends the busy
+        // spell — so a `NeedsUser` carries the generation of exactly the
+        // spell that ended, and a note racing a delete can't strand an
+        // entry (`is_idle` won't free one holding attention).
+        let mut owed = None;
+        let mut generation = 0;
         update_existing(conversation_id, |runtime| {
             // First, so the release below sees no listener of this turn's:
             // the last turn ending frees the stop counter.
@@ -437,6 +456,8 @@ impl Drop for TurnInFlight {
             runtime.turns_in_flight = runtime.turns_in_flight.saturating_sub(1);
             last = runtime.turns_in_flight == 0;
             if last {
+                owed = runtime.attention.take();
+                generation = runtime.kept.generation;
                 runtime.started_at = None;
                 // A stopped or failed turn leaves no reply in progress.
                 runtime.reply = None;
@@ -451,6 +472,13 @@ impl Drop for TurnInFlight {
         super::test_hooks::after_in_flight_changed(conversation_id);
         if last {
             crate::events::publish_app(crate::events::AppEvent::TurnsChanged);
+            if let Some(attention) = owed {
+                crate::events::publish_app(crate::events::AppEvent::NeedsUser {
+                    conversation_id,
+                    attention,
+                    generation,
+                });
+            }
         }
     }
 }
@@ -487,6 +515,25 @@ pub(super) fn take_activity_owed(conversation_id: i64) -> bool {
     update_existing_with(conversation_id, |runtime| std::mem::take(&mut runtime.activity_owed)).unwrap_or(false)
 }
 
+/// Notes that `conversation_id`'s busy spell owes the user `a` (SME-71),
+/// keeping the most important kind so a later turn can't hide an earlier
+/// failure or question. Never creates an entry: writers run inside a
+/// counted turn, so it exists; one on a forgotten entry is the delete
+/// racing a note, and a turn's state freed means the conversation is
+/// gone — `get_attention` answers `None` for it.
+pub(super) fn note_attention(conversation_id: i64, a: crate::events::Attention) {
+    update_existing(conversation_id, |runtime| {
+        runtime.attention = Some(runtime.attention.map_or(a, |kept| kept.max(a)));
+    });
+}
+
+/// Empties `conversation_id`'s owed attention: a Stop clears what the
+/// busy spell owed (the user is there), and `admit` starts a new spell
+/// clean.
+pub(super) fn clear_attention(conversation_id: i64) {
+    update_existing(conversation_id, |runtime| runtime.attention = None);
+}
+
 /// A turn counted as in flight for `conversation_id` until it drops, for
 /// other modules' tests (SME-78's quiet stops skip a pod whose turn runs).
 #[cfg(test)]
@@ -504,6 +551,15 @@ pub(crate) fn count_a_test_turn(conversation_id: i64) -> TestTurnInFlight {
 /// Whether `conversation_id` has a turn running or queued.
 pub(crate) fn turn_running(conversation_id: i64) -> bool {
     read_runtime(conversation_id, |runtime| runtime.turns_in_flight > 0).unwrap_or(false)
+}
+
+/// `conversation_id`'s turn generation (SME-71): what `TurnInFlight::drop`
+/// carried on the `NeedsUser` it published, for
+/// `api::notifications::get_attention` to call an event stale once its
+/// generation has moved on. 0 with no entry — a restart, or a conversation
+/// that never turned.
+pub(crate) fn turn_generation(conversation_id: i64) -> u64 {
+    read_runtime(conversation_id, |runtime| runtime.kept.generation).unwrap_or(0)
 }
 
 /// How long `conversation_id`'s busy spell has been running, or `None`
@@ -536,7 +592,7 @@ pub(super) struct KeptTurnError {
 /// error, and returns the new generation; for tests. The user's send or
 /// answer takes one in its admission (`TurnInFlight::start_by_user`).
 #[cfg(test)]
-pub(super) fn new_turn_generation(conversation_id: i64) -> u64 {
+pub(crate) fn new_turn_generation(conversation_id: i64) -> u64 {
     with_runtime(conversation_id, |runtime| {
         runtime.kept.generation += 1;
         runtime.kept.error = None;

@@ -543,6 +543,12 @@ pub(crate) fn conversation_relay(
                         let event = events::ConversationEvent::ConversationsChanged {};
                         return Some((Ok(event), (conversation, app)));
                     }
+                    Ok(events::AppEvent::NeedsUser { conversation_id, attention, generation }) => {
+                        // Relayed whatever conversation it names: a chat
+                        // tab hears every conversation's (SME-71).
+                        let event = events::ConversationEvent::NeedsUser { conversation_id, attention, generation };
+                        return Some((Ok(event), (conversation, app)));
+                    }
                     // Only ever decoded, never published.
                     Ok(events::AppEvent::Unknown) => continue,
                     // Missing some just means one refetch covers several.

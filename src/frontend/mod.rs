@@ -1,48 +1,72 @@
 pub(crate) mod clipboard;
+mod notifications;
 mod pages;
 
 use dioxus::prelude::*;
+use notifications::Shell;
 use pages::{
     Chat, GitSettingsPage, LanguageServerEdit, LanguageServerNew, LanguageServersIndex, McpServerEdit,
     McpServerNew, McpServersIndex, PodsIndex, ProviderEdit, ProviderNew, ProvidersIndex, SecretsPage,
     SandboxVolumeNew, SandboxVolumesIndex,
 };
 
+// Every route sits inside the `Shell` layout (SME-71): its `Notifier`
+// stays mounted across navigation, so one tab keeps one leader election,
+// one eval channel and one title count — on Home and the settings pages
+// included, which is the point (a tab with no conversation open still
+// notifies).
 #[derive(Routable, Clone, PartialEq, Debug)]
 pub(crate) enum Route {
+    #[layout(Shell)]
     #[route("/")]
     Home {},
+    #[layout(Shell)]
     #[route("/conversation/:id")]
     ConversationRoute { id: i64 },
+    #[layout(Shell)]
     #[route("/mcp-servers")]
     McpServersRoute {},
+    #[layout(Shell)]
     #[route("/mcp-servers/new")]
     McpServerNewRoute {},
+    #[layout(Shell)]
     #[route("/mcp-servers/:id")]
     McpServerEditRoute { id: i64 },
+    #[layout(Shell)]
     #[route("/sandbox-volumes")]
     SandboxVolumesRoute {},
+    #[layout(Shell)]
     #[route("/sandbox-volumes/new")]
     SandboxVolumeNewRoute {},
+    #[layout(Shell)]
     #[route("/pods")]
     PodsRoute {},
+    #[layout(Shell)]
     #[route("/git")]
     GitRoute {},
+    #[layout(Shell)]
     #[route("/secrets")]
     SecretsRoute {},
+    #[layout(Shell)]
     #[route("/language-servers")]
     LanguageServersRoute {},
+    #[layout(Shell)]
     #[route("/language-servers/new")]
     LanguageServerNewRoute {},
+    #[layout(Shell)]
     #[route("/language-servers/:id")]
     LanguageServerEditRoute { id: i64 },
+    #[layout(Shell)]
     #[route("/providers")]
     ProvidersRoute {},
+    #[layout(Shell)]
     #[route("/providers/new")]
     ProviderNewRoute {},
+    #[layout(Shell)]
     #[route("/providers/:id")]
     ProviderEditRoute { id: i64 },
     // Anything else, including a conversation id that isn't a number.
+    #[layout(Shell)]
     #[route("/:..segments")]
     NotFound { segments: Vec<String> },
 }
@@ -154,6 +178,10 @@ pub fn App() -> Element {
         // Without this a phone lays the page out at desktop width and
         // shrinks it to fit (SME-40 F8).
         document::Meta { name: "viewport", content: "width=device-width, initial-scale=1" }
+        // smelt's own mark (SME-71): the title count swaps this href for
+        // the waiting one, and a pinned tab — which shows only the
+        // favicon — can tell "smelt waits" from "smelt" at a glance.
+        document::Link { rel: "icon", r#type: "image/svg+xml", href: asset!("/assets/favicon.svg") }
         // The app's stylesheet, in parts (SME-163), linked in their order:
         // a later part's rules win ties, as they did in one file.
         document::Stylesheet { href: asset!("/assets/css/01-base.css") }

@@ -93,6 +93,41 @@ async fn test_a_list_change_reaches_every_watched_conversation() {
     events::forget(conversation_id);
 }
 
+/// SME-71: a chat tab keeps its title count from the relayed
+/// `NeedsUser` of every conversation, not just the one it watches —
+/// same channel of the test's own, as above.
+#[tokio::test]
+async fn test_a_needs_user_event_reaches_every_watched_conversation() {
+    use futures_util::StreamExt;
+    let watched = 9_071_000_001;
+    let needing = 9_071_000_002;
+    let (app, app_rx) = tokio::sync::broadcast::channel(16);
+    let stream = conversation_relay(watched, events::subscribe(watched), app_rx);
+    futures_util::pin_mut!(stream);
+    app
+        .send(events::AppEvent::NeedsUser {
+            conversation_id: needing,
+            attention: events::Attention::Question,
+            generation: 5,
+        })
+        .expect("publish");
+    let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the relayed NeedsUser never arrived");
+    assert!(
+        matches!(
+            event,
+            Some(Ok(events::ConversationEvent::NeedsUser {
+                conversation_id,
+                attention: events::Attention::Question,
+                generation: 5,
+            })) if conversation_id == needing
+        ),
+        "got {event:?}"
+    );
+    events::forget(watched);
+}
+
 /// SME-262, the ticket's case. Interleaving: the delete commits, and
 /// teardown's read of this database's instance is held by a table
 /// lock; the request is dropped there. The conversation's turn state

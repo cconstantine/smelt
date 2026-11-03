@@ -28,6 +28,11 @@ struct Lane {
     /// 400, and the body to answer them with. Cleared when the count runs
     /// out and when the arming guard drops (SME-73's recovery scenario).
     refusals: Arc<std::sync::Mutex<Option<(usize, String)>>>,
+    /// An `ask_user` call `ask_user_next` armed: the tool_use id and the
+    /// call's input JSON, answered by the lane's next request and then
+    /// gone (SME-71's notifications scenario — the question has to come
+    /// from a real turn ending on a real card, not from a seeded row).
+    ask_user: Arc<std::sync::Mutex<Option<(String, String)>>>,
 }
 
 impl Lane {
@@ -38,6 +43,7 @@ impl Lane {
             reply_words: Arc::new(AtomicUsize::new(DEFAULT_REPLY_WORDS)),
             hurried: Arc::new(AtomicBool::new(false)),
             refusals: Arc::new(std::sync::Mutex::new(None)),
+            ask_user: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -81,6 +87,16 @@ pub(super) struct RefusalsArmed(Arc<std::sync::Mutex<Option<(usize, String)>>>);
 impl Drop for RefusalsArmed {
     fn drop(&mut self) {
         *self.0.lock().expect("the refusal lock") = None;
+    }
+}
+
+/// An `ask_user` call armed on a lane by `MockUpstream::ask_user_next`.
+/// Dropping it clears an armed call a failed scenario never sent.
+pub(super) struct AskUserArmed(Arc<std::sync::Mutex<Option<(String, String)>>>);
+
+impl Drop for AskUserArmed {
+    fn drop(&mut self) {
+        *self.0.lock().expect("the ask_user lock") = None;
     }
 }
 
@@ -144,9 +160,9 @@ fn reply_chunks(words: usize) -> Vec<String> {
     chunks
 }
 
-/// Streams the lane's reply, a chunk every 200ms unless the lane is hurried.
-fn reply(lane: Lane) -> axum::response::Response {
-    let chunks = reply_chunks(lane.reply_words.load(Ordering::SeqCst));
+/// Streams `chunks` as the lane's reply, a chunk every 200ms unless the
+/// lane is hurried.
+fn stream_chunks(lane: Lane, chunks: Vec<String>) -> axum::response::Response {
     lane.open.fetch_add(1, Ordering::SeqCst);
     let open = OpenReply(lane.open.clone());
     let body = futures_util::StreamExt::then(futures_util::stream::iter(chunks), move |chunk| {
@@ -169,6 +185,37 @@ fn reply(lane: Lane) -> axum::response::Response {
     ))
 }
 
+fn reply(lane: Lane) -> axum::response::Response {
+    let chunks = reply_chunks(lane.reply_words.load(Ordering::SeqCst));
+    stream_chunks(lane, chunks)
+}
+
+/// The events of a reply that calls `ask_user` with `input` and nothing
+/// else: the turn records the question and ends on the card. The shape is
+/// the stream tests' own (`anthropic::stream::tests`' tool_use bodies).
+fn ask_user_chunks(id: &str, input: &str) -> Vec<String> {
+    vec![
+        event("message_start", r#"{"type":"message_start"}"#),
+        event(
+            "content_block_start",
+            &format!(
+                r#"{{"type":"content_block_start","index":0,"content_block":{{"type":"tool_use","id":"{id}","name":"ask_user","input":{{}}}}}}"#
+            ),
+        ),
+        // The whole input in one delta; the parser only concatenates.
+        event(
+            "content_block_delta",
+            &format!(
+                r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"input_json_delta","partial_json":{}}}}}"#,
+                serde_json::Value::String(input.to_string()),
+            ),
+        ),
+        event("content_block_stop", r#"{"type":"content_block_stop","index":0}"#),
+        event("message_delta", r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#),
+        event("message_stop", r#"{"type":"message_stop"}"#),
+    ]
+}
+
 impl MockUpstream {
     /// Starts the server with a lane for each model in `models`. A request
     /// naming no model of theirs is answered by the first lane's.
@@ -184,9 +231,13 @@ impl MockUpstream {
                     .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string));
                 let lane = model.and_then(|m| by_model.get(&m).cloned()).unwrap_or_else(|| first.clone());
                 async move {
+                    let armed = lane.ask_user.lock().expect("the ask_user lock").take();
                     match take_refusal(&lane) {
                         Some(refused) => refused,
-                        None => reply(lane),
+                        None => match armed {
+                            Some((id, input)) => stream_chunks(lane, ask_user_chunks(&id, &input)),
+                            None => reply(lane),
+                        },
                     }
                 }
             }),
@@ -234,6 +285,18 @@ impl MockUpstream {
     pub(super) fn refuse_next(&self, times: usize, body: impl Into<String>) -> RefusalsArmed {
         *self.lane.refusals.lock().expect("the refusal lock") = Some((times, body.into()));
         RefusalsArmed(self.lane.refusals.clone())
+    }
+
+    /// Answer this lane's next request with an `ask_user` tool call — id
+    /// `tool_use_id`, input `input` — instead of the usual text reply:
+    /// SME-71's scenario needs the question to come from a real turn
+    /// ending on a real card. The guard re-arms nothing on drop: an armed
+    /// call a failed scenario never sent dies with it, not the lane's
+    /// next scenario.
+    pub(super) fn ask_user_next(&self, tool_use_id: &str, input: &serde_json::Value) -> AskUserArmed {
+        *self.lane.ask_user.lock().expect("the ask_user lock") =
+            Some((tool_use_id.to_string(), input.to_string()));
+        AskUserArmed(self.lane.ask_user.clone())
     }
 
     /// Waits until no reply is open upstream. False on timeout.

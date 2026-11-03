@@ -277,6 +277,29 @@ fn test_apply_event_question_update_sets_and_clears_the_waiting_question() {
     });
 }
 
+/// SME-71: a relayed `NeedsUser` crosses the chat page untouched, into
+/// the layout's `NotifierFeed` — the title count's only source.
+#[test]
+fn test_apply_event_needs_user_maps_to_its_effect() {
+    with_state(|state| {
+        assert_eq!(
+            apply_event(
+                state,
+                ConversationEvent::NeedsUser {
+                    conversation_id: 7,
+                    attention: crate::events::Attention::Failed,
+                    generation: 4,
+                }
+            ),
+            EventEffect::NeedsUser {
+                conversation_id: 7,
+                attention: crate::events::Attention::Failed,
+                generation: 4,
+            }
+        );
+    });
+}
+
 #[test]
 fn test_apply_event_turn_state_sets_running_and_an_ended_turn_drops_its_reply() {
     with_state(|state| {

@@ -4,6 +4,7 @@ pub mod chat;
 pub mod git;
 pub mod language_servers;
 pub mod mcp;
+pub mod notifications;
 pub mod pods;
 pub mod providers;
 pub mod questions;
