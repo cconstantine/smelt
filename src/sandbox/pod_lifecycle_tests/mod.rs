@@ -102,12 +102,76 @@ async fn run_then_tear_down(
     let outcome = AssertUnwindSafe(Box::pin(tokio::time::timeout(limit, scenario)))
         .catch_unwind()
         .await;
+    // What the cluster held when time ran out, read before teardown deletes
+    // it (SME-161): a bare "didn't finish" said nothing of where the time
+    // went — a pod's start, its pull, a clone.
+    let report = match &outcome {
+        Ok(Err(_)) => Some(Box::pin(cluster_report(pool, client)).await),
+        _ => None,
+    };
     Box::pin(tear_down(pool, client)).await;
     match outcome {
         Ok(Ok(())) => {}
-        Ok(Err(_)) => panic!("the scenario didn't finish within {limit:?}"),
+        Ok(Err(_)) => panic!(
+            "the scenario didn't finish within {limit:?}; its pods then:\n{}",
+            report.unwrap_or_default()
+        ),
         Err(panic) => std::panic::resume_unwind(panic),
     }
+}
+
+/// Each of the test database's pods (by its instance label) as a timed-out
+/// sandbox start reports one: its stage, containers and events
+/// (`pod_start_report`, SME-132). Best-effort: a failed read says so.
+async fn cluster_report(pool: &PgPool, client: &kube::Client) -> String {
+    let Ok(instance) = db::smelt_instance(pool).await else {
+        return "couldn't read the test database's instance".to_string();
+    };
+    let pods = pods_api(client);
+    let params = ListParams::default().labels(&format!("{INSTANCE_LABEL}={}", instance.id));
+    let listed = match tokio::time::timeout(Duration::from_secs(10), pods.list(&params)).await {
+        Ok(Ok(list)) => list.items,
+        Ok(Err(e)) => return format!("couldn't list its pods: {e}"),
+        Err(_) => return "couldn't list its pods: no answer in 10 s".to_string(),
+    };
+    if listed.is_empty() {
+        return "none".to_string();
+    }
+    let mut lines = Vec::new();
+    for pod in &listed {
+        let name = pod.metadata.name.clone().unwrap_or_default();
+        let phase = pod.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_else(|| "unknown".to_string());
+        let events = crate::sandbox::manager::pod_events(&pods, pod).await;
+        let detail = crate::sandbox::manager::pod_start_report(pod, events.as_deref().map_err(String::as_str), k8s_openapi::jiff::Timestamp::now());
+        lines.push(format!("{name} ({phase}): {detail}"));
+    }
+    lines.join("\n")
+}
+
+/// SME-161: a scenario that runs out of time says what its pods were doing.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_timed_out_scenario_reports_its_pods(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let run = run_then_tear_down(&pool, &client, Duration::from_secs(2), async {
+        // A pod start takes longer than two seconds: the limit cuts it off
+        // while the pod is still starting.
+        let _ = create_pod(&pool, conversation.id, PodLimitOverrides::default()).await;
+        tokio::time::sleep(Duration::from_secs(600)).await;
+    });
+    let panic = AssertUnwindSafe(run).catch_unwind().await.expect_err("the scenario times out");
+    let message = panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default();
+    assert!(message.contains("didn't finish within 2s; its pods then:"), "{message}");
+    assert!(message.contains(&pod_name_prefix()), "the report names the scenario's pod: {message}");
+}
+
+/// The prefix every sandbox pod's name has.
+fn pod_name_prefix() -> String {
+    pod_name(0).trim_end_matches('0').to_string()
 }
 
 /// How long teardown waits for a pod start to finish: a start can wait
