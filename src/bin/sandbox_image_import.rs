@@ -6,7 +6,8 @@
 //! never by the main `smelt` server process at runtime. With `--check
 //! [reference...]` instead of a tarball, it only checks that the node has
 //! those images (default: `SANDBOX_IMAGES`), with the read-only
-//! `ctr images ls -q` (`scripts/cluster-doctor`, SME-102).
+//! `ctr images ls -q` (`scripts/cluster-doctor`, SME-102), and warns when
+//! the node's image disk nears the kubelet's image-GC line (`disk`, SME-229).
 //!
 //! A short-lived pod gets the node's containerd socket hostPath-mounted
 //! (`/run/k3s/containerd` — the path this project's own `rancher/k3s`
@@ -30,6 +31,9 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, AttachParams, DeleteParams, ListParams, PostParams};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+
+#[path = "sandbox_image_import/disk.rs"]
+mod disk;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -193,22 +197,41 @@ fn loader_pod_spec(name: &str, lifetime: Duration) -> Pod {
                     limits: Some(limits),
                     ..Default::default()
                 }),
-                volume_mounts: Some(vec![VolumeMount {
-                    name: "k3s-run".to_string(),
-                    mount_path: "/hostcontainerd".to_string(),
-                    sub_path: Some("containerd".to_string()),
-                    ..Default::default()
-                }]),
+                volume_mounts: Some(vec![
+                    VolumeMount {
+                        name: "k3s-run".to_string(),
+                        mount_path: "/hostcontainerd".to_string(),
+                        sub_path: Some("containerd".to_string()),
+                        ..Default::default()
+                    },
+                    // Read-only, for `--check`'s `df` (SME-229).
+                    VolumeMount {
+                        name: "image-fs".to_string(),
+                        mount_path: disk::IMAGE_FS_MOUNT.to_string(),
+                        read_only: Some(true),
+                        ..Default::default()
+                    },
+                ]),
                 ..Default::default()
             }],
-            volumes: Some(vec![Volume {
-                name: "k3s-run".to_string(),
-                host_path: Some(HostPathVolumeSource {
-                    path: "/run/k3s".to_string(),
-                    type_: Some("Directory".to_string()),
-                }),
-                ..Default::default()
-            }]),
+            volumes: Some(vec![
+                Volume {
+                    name: "k3s-run".to_string(),
+                    host_path: Some(HostPathVolumeSource {
+                        path: "/run/k3s".to_string(),
+                        type_: Some("Directory".to_string()),
+                    }),
+                    ..Default::default()
+                },
+                Volume {
+                    name: "image-fs".to_string(),
+                    host_path: Some(HostPathVolumeSource {
+                        path: disk::IMAGE_FS_HOST_PATH.to_string(),
+                        type_: Some("Directory".to_string()),
+                    }),
+                    ..Default::default()
+                },
+            ]),
             restart_policy: Some("Never".to_string()),
             ..Default::default()
         }),
@@ -513,6 +536,7 @@ async fn check(pods: &Api<Pod>, loader: &str, wanted: &[String]) -> Result<(), B
     )
     .await?;
     let missing = missing_images(&listed, wanted);
+    disk::warn_if_near_gc(pods, loader, wanted).await;
     if missing.is_empty() {
         println!("sandbox_image_import: the node has {}", wanted.join(" and "));
         Ok(())
