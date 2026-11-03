@@ -103,7 +103,7 @@ fn test_a_snapshot_finishes_a_command_the_tab_shows_running() {
     let snapshot = SandboxSnapshot {
         pods: vec![SandboxPodSummary {
             pod_id: 1,
-            status: "Running".to_string(),
+            status: "Running".to_string(), node: None,
             terminals: vec![SandboxTerminalSummary {
                 terminal_id: 10,
                 pod_id: 1,

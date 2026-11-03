@@ -315,11 +315,15 @@ pub(in crate::sandbox) async fn create_pod_attempt_unspanned(
                     "the conversation was deleted while its sandbox was starting".to_string(),
                 ));
             }
+            // Running, so scheduled: the node is set (SME-304). A failed
+            // read only leaves the panel without it until its next load.
+            let node = pod_details(pool, row.id).await.ok().flatten().and_then(|details| details.node);
             events::publish(
                 conversation_id,
                 events::ConversationEvent::SandboxPodUpdate {
                     pod_id: row.id,
                     status: "Running".to_string(),
+                    node,
                     terminated: false,
                 },
             );

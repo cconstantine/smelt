@@ -228,7 +228,7 @@ async fn test_sandbox_variants_round_trip_the_bus() {
 
     let pod_event = ConversationEvent::SandboxPodUpdate {
         pod_id: 1,
-        status: "Running".to_string(),
+        status: "Running".to_string(), node: None,
         terminated: false,
     };
     publish(9_135_000_006, pod_event.clone());

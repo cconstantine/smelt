@@ -104,7 +104,7 @@ fn one_of_each() -> Vec<ConversationEvent> {
         }] },
         ConversationEvent::SandboxPodUpdate {
             pod_id: 1,
-            status: "running".to_string(),
+            status: "running".to_string(), node: None,
             terminated: false,
         },
         ConversationEvent::SandboxPreviewUpdate {

@@ -129,6 +129,15 @@ async fn test_the_pods_view_shows_a_busy_pods_limits_and_its_usage(pool: PgPool)
         let overview = overviews.iter().find(|o| o.pod_id == pod).expect("the pods view should list the pod");
         assert_eq!(overview.conversation_id, conversation.id);
         assert_eq!(overview.status.as_deref(), Some("Running"));
+        // The node Kubernetes scheduled it on (SME-304).
+        let scheduled = pods_api(&client)
+            .get(&pod_name(pod))
+            .await
+            .expect("read the pod")
+            .spec
+            .and_then(|spec| spec.node_name);
+        assert!(scheduled.is_some(), "a Running pod is scheduled");
+        assert_eq!(overview.node, scheduled, "the pods view names the pod's node");
         assert_eq!(
             overview.memory_limit,
             crate::api::pods::sum_memory_limits(&[default_memory_limit(), default_docker_memory_limit()])
@@ -331,6 +340,38 @@ async fn test_exhausted_reconnects_force_terminate_an_unreachable_pod(pool: PgPo
             recreated.is_ok(),
             "create_pod should succeed again at once, not stay blocked behind a stale live record, got {recreated:?}"
         );
+    })
+    .await;
+}
+
+/// SME-304: a sandbox pod's shell names its node (`NODE_NAME`, from the
+/// downward API), the conversation's pod list carries it, and so do its
+/// claims once a pod has used them: each the node Kubernetes scheduled it on.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_pod_its_shell_and_its_claims_name_their_node(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let pod = create_pod(&pool, conversation.id, PodLimitOverrides::default()).await.expect("create_pod");
+        let scheduled = pods_api(&client)
+            .get(&pod_name(pod))
+            .await
+            .expect("read the pod")
+            .spec
+            .and_then(|spec| spec.node_name)
+            .expect("a Running pod is scheduled");
+
+        let terminal = create_terminal(&pool, conversation.id).await.expect("create_terminal");
+        run_and_wait(&pool, conversation.id, terminal, "node", "echo \"NODE=$NODE_NAME\"").await;
+        assert_eq!(first_stdout_line(&pool, "node").await, format!("NODE={scheduled}"), "the shell names its node");
+
+        let listed = list_pods(&pool, conversation.id).await.expect("list_pods");
+        assert_eq!(listed.iter().map(|p| p.node.clone()).collect::<Vec<_>>(), vec![Some(scheduled.clone())]);
+
+        let storage = crate::api::pods::stored_storage(&pool).await.expect("stored_storage");
+        let row = storage.iter().find(|row| row.conversation_id == conversation.id).expect("its claims are listed");
+        let nodes: Vec<Option<String>> = row.volumes.iter().map(|volume| volume.node.clone()).collect();
+        assert_eq!(nodes, vec![Some(scheduled.clone()), Some(scheduled)], "both claims bound on the pod's node");
     })
     .await;
 }

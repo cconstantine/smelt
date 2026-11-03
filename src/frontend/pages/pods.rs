@@ -93,6 +93,7 @@ pub fn PodsIndex() -> Element {
                             tr {
                                 th { "Conversation" }
                                 th { "Status" }
+                                th { "Node" }
                                 th { "Up" }
                                 th { "Activity" }
                                 th { "Memory" }
@@ -109,6 +110,7 @@ pub fn PodsIndex() -> Element {
                                         span { class: "muted pod-id", " pod {pod.pod_id}" }
                                     }
                                     td { "{status_text(pod.status.as_deref(), pod.agent.as_ref())}" }
+                                    td { class: "pod-node", "data-label": "Node", "{pod.node.clone().unwrap_or_default()}" }
                                     td { "{format_age(age_seconds(pod.started_at, pod.observed_at))}" }
                                     td { "{activity_text(&pod.activity, pod.observed_at)}" }
                                     td { "{memory_text(pod.usage.as_ref(), pod.memory_limit.as_deref())}" }
@@ -127,7 +129,7 @@ pub fn PodsIndex() -> Element {
                                 }
                                 if !pod.language_servers.is_empty() {
                                     tr { key: "{pod.pod_id}-servers", class: "pod-servers",
-                                        td { colspan: "8", span { class: "muted", "Language servers: " } "{servers_text(&pod.language_servers)}" }
+                                        td { colspan: "9", span { class: "muted", "Language servers: " } "{servers_text(&pod.language_servers)}" }
                                     }
                                 }
                             }
@@ -259,7 +261,14 @@ fn stopped_text(stop: Option<&crate::api::pods::PodStop>, grace_days: Option<u32
 fn volume_cell_text(row: &StoredStorage, kind: StorageKind) -> String {
     match row.volumes.iter().find(|volume| volume.kind == kind) {
         Some(volume) if volume.deleting => "removing\u{2026}".to_string(),
-        Some(volume) => volume.size.clone().unwrap_or_else(|| "stored".to_string()),
+        Some(volume) => {
+            let size = volume.size.clone().unwrap_or_else(|| "stored".to_string());
+            // Which host's disk holds it (SME-304).
+            match &volume.node {
+                Some(node) => format!("{size} on {node}"),
+                None => size,
+            }
+        }
         None => "none".to_string(),
     }
 }
@@ -497,6 +506,7 @@ mod tests {
             kind,
             size: size.map(str::to_string),
             deleting,
+            node: None,
         };
         let row = |volumes| StoredStorage {
             conversation_id: 7,
@@ -517,6 +527,10 @@ mod tests {
         let half = row(vec![volume(StorageKind::Workspace, None, false)]);
         assert_eq!(volume_cell_text(&half, StorageKind::Workspace), "stored");
         assert_eq!(volume_cell_text(&half, StorageKind::Docker), "none");
+        // SME-304: the node whose disk holds the claim, once bound.
+        let mut on_node = volume(StorageKind::Workspace, Some("20Gi"), false);
+        on_node.node = Some("ryzen".to_string());
+        assert_eq!(volume_cell_text(&row(vec![on_node]), StorageKind::Workspace), "20Gi on ryzen");
     }
 
     #[test]

@@ -127,7 +127,7 @@ In [api/events.md](api/events.md#the-browsing-panels-own-live-channel).
 | `refresh_model_details` | `POST /api/providers/{id}/models/refresh` | asks about one model, when it's chosen |
 | `set_model_settings` | `POST /api/providers/{id}/models/settings` | a model's settings (`ModelSettings`): thinking, context window, effort and max reply tokens (SME-111) |
 | `get_default_model` / `set_default_model` | `GET`, `POST /api/default-model` | the default provider and model |
-| `get_pods` | `GET /api/pods` | every live pod with status, activity, limits and usage, see above |
+| `get_pods` | `GET /api/pods` | every live pod with status, node (SME-304), activity, limits and usage, see above |
 | `stop_pod` | `POST /api/pods/{pod_id}/stop` | the user stopping a pod, see above |
 | `get_live_pod_conversations` | `GET /api/pods/conversations` | conversations with a live pod, for the sidebar |
 | `subscribe_app_events` | `GET /api/app-events` | always-open app-wide stream (`AppEvent`), for the pods page and for a chat tab with no conversation open (SME-269) |
