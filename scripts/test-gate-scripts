@@ -54,6 +54,15 @@ if out=$(timeout 60 "${gate_env[@]}" CARGO_FAIL="--no-run" scripts/check.sh 2>&1
 fi
 grep -q " locked$" "$CALLS" && fail "check.sh took the lock after a failing test build: $(cat "$CALLS")"
 grep -q "stub cargo told to fail" <<<"$out" || fail "check.sh didn't show the test build's error: $out"
+# A test build with a warning stops it too, before the lock, showing the
+# warning: test-only code is compiled nowhere else (SME-361).
+: >"$CALLS"
+if out=$(timeout 60 "${gate_env[@]}" CARGO_WARN="--no-run" scripts/check.sh 2>&1); then
+    fail "check.sh passed with a warning in the test build: $out"
+fi
+grep -q " locked$" "$CALLS" && fail "check.sh took the lock after a test build with a warning: $(cat "$CALLS")"
+grep -q "unused variable" <<<"$out" || fail "check.sh didn't show the test build's warning: $out"
+grep -q "the server tests' build has warnings" <<<"$out" || fail "check.sh didn't say the test build warned: $out"
 
 # 8. browser-tier likewise: the bundle, the test build and the scratch
 # database unlocked, the tier's run locked.

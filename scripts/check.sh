@@ -78,13 +78,19 @@ fi
 mkdir -p target/check
 
 # The tests compiled before the lock is taken, so the locked run below
-# only runs them (SME-100). Its warnings are the server build's, already
-# checked above.
+# only runs them (SME-100). Its warnings are checked too: the server build
+# above compiles no `#[cfg(test)]` code, so a warning there (an unused
+# binding in a test, SME-361) reached main past a green gate.
 echo "== server tests (build)"
 build_log=target/check/server-tests-build.log
 if ! cargo test --features server --no-run >"$build_log" 2>&1; then
     grep -E '^error' -A8 "$build_log" | head -40
     echo "the server tests don't build (full log: $build_log)"
+    exit 1
+fi
+if grep -qE '^warning' "$build_log"; then
+    grep -E '^warning' -A8 "$build_log" | head -40
+    echo "the server tests' build has warnings (full log: $build_log)"
     exit 1
 fi
 

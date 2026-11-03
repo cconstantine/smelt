@@ -89,12 +89,18 @@ flock -n "$SMELT_LOCK_DIR/smelt-cluster.lock" true && echo unlocked || echo lock
 EOF
 # cargo: records each call. A test run (not --no-run) prints a result line.
 # CARGO_FAIL: a pattern; a call whose arguments match it fails.
+# CARGO_WARN: a pattern; a call whose arguments match it succeeds with a
+# compiler warning, as rustc prints one (SME-361).
 cat >"$dir/bin/cargo" <<'EOF'
 #!/usr/bin/env bash
 echo "cargo $* $(lock-state)" >>"$CALLS"
 if [ -n "${CARGO_FAIL:-}" ] && [[ "$*" =~ $CARGO_FAIL ]]; then
     echo "error: stub cargo told to fail"
     exit 101
+fi
+if [ -n "${CARGO_WARN:-}" ] && [[ "$*" =~ $CARGO_WARN ]]; then
+    echo "warning: unused variable: \`pod\`"
+    echo "   --> src/stub.rs:1:9"
 fi
 if [ "$1" = test ] && [[ " $* " != *" --no-run "* ]]; then
     echo "test result: ok. 1 passed; 0 failed"
