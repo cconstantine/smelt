@@ -61,12 +61,33 @@ async fn test_a_quiet_stop_keeps_the_workspace_and_dockers_images(pool: PgPool) 
         assert!(db::sandbox_pod_is_live(&pool, pod).await.expect("live?"));
 
         // Interrupted, it ends; two hours on, one real pass with the real
-        // delete stops the pod.
+        // delete stops the pod. Its end wakes the conversation, and the
+        // pass skips a conversation whose turn runs or is queued
+        // (SME-366): the turn lock is held here so the wake, once counted,
+        // stays queued behind it — the interleaving that lost under a
+        // loaded gate, met every run.
+        let lock = crate::turn::conversation_lock(conversation.id);
+        let held = lock.lock().await;
         send_signal(&pool, terminal, &sleeper, "INT").await.expect("send_signal");
         let ended = poll_until_finished(&pool, &sleeper).await;
         assert_ne!(ended.status, "running", "{ended:?}");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !crate::turn::turn_running(conversation.id) {
+            assert!(tokio::time::Instant::now() < deadline, "the command's end should wake the conversation");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         terminate_terminal(&pool, terminal).await.expect("terminate_terminal");
         back_two_hours(pod).await;
+        drop(held);
+        drop(lock);
+        // The fix: the pass needs the conversation between turns, so wait
+        // for the wake's turn to end (it was seen counted above), not just
+        // for the command's status.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while crate::turn::turn_running(conversation.id) {
+            assert!(tokio::time::Instant::now() < deadline, "the wake's turn should end");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let stopped = stop_idle_pods_once_with(&pool, 60, &ActivityNotes::default(), |id| cluster_delete(&pool, id)).await;
         assert_eq!(stopped, vec![pod], "the pass stopped the pod");
         assert!(!db::sandbox_pod_is_live(&pool, pod).await.expect("live?"), "its row is closed");
