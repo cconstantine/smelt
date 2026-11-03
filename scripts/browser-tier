@@ -85,7 +85,7 @@ fi
 # Its warnings too: code behind the `browser-test` feature is compiled
 # only here (SME-361).
 if grep -qE '^warning' "$build_log"; then
-    grep -E '^warning' -A8 "$build_log" | head -40
+    grep -E '^warning' -A8 "$build_log" | head -40 || true
     echo "the browser tier's build has warnings (full log: $build_log)" >&2
     exit 1
 fi

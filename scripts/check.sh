@@ -89,7 +89,7 @@ if ! cargo test --features server --no-run >"$build_log" 2>&1; then
     exit 1
 fi
 if grep -qE '^warning' "$build_log"; then
-    grep -E '^warning' -A8 "$build_log" | head -40
+    grep -E '^warning' -A8 "$build_log" | head -40 || true
     echo "the server tests' build has warnings (full log: $build_log)"
     exit 1
 fi

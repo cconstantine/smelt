@@ -12,7 +12,9 @@ log=${1:?usage: scripts/ci-no-warnings LOG}
 [ -r "$log" ] || { echo "ci-no-warnings: no log at $log" >&2; exit 2; }
 compile=$(sed '/^ *Running /q' "$log")
 if grep -qE '^warning' <<<"$compile"; then
-    grep -E '^warning' -A8 <<<"$compile" | head -40
+    # head stops reading early; its SIGPIPE mustn't end the script under
+    # pipefail before the error line (review 2, L1).
+    grep -E '^warning' -A8 <<<"$compile" | head -40 || true
     echo "::error::the build has compiler warnings (scripts/check.sh fails on them too)"
     exit 1
 fi

@@ -158,12 +158,6 @@ jobs:
         if: always()
         run: scripts/ci-test-report "$RUNNER_TEMP/server-tests.log" server 600
 
-      # The build above has no -D warnings, so a warning in it, in test
-      # code or not, would pass CI (SME-361).
-      - name: No compiler warnings (server)
-        if: always()
-        run: scripts/ci-no-warnings "$RUNNER_TEMP/server-tests.log"
-
       - name: Dump sandbox pod diagnostics on failure
         if: failure()
         # kubectl runs *inside* the smelt service (docker compose run),
@@ -202,6 +196,13 @@ jobs:
         run: |
           docker compose run --rm \
             smelt scripts/lint-expects
+
+      # The test step's build has no -D warnings, so a warning in it, in test
+      # code or not, would pass CI (SME-361). Last, so a warnings-only red
+      # skips none of the checks above (review 2, L2).
+      - name: No compiler warnings (server)
+        if: always()
+        run: scripts/ci-no-warnings "$RUNNER_TEMP/server-tests.log"
 
       - name: Stop the compose stack
         if: always()
@@ -265,11 +266,6 @@ jobs:
         if: always()
         run: scripts/ci-test-report "$RUNNER_TEMP/browser-tests.log" browser 480
 
-      # The `browser-test` feature's code is compiled only here (SME-361).
-      - name: No compiler warnings (browser)
-        if: always()
-        run: scripts/ci-no-warnings "$RUNNER_TEMP/browser-tests.log"
-
       - name: Dump sandbox pod diagnostics on failure (browser tests)
         if: failure()
         run: |
@@ -284,6 +280,12 @@ jobs:
           echo "--- events, most recent first ---"
           docker compose run --rm smelt ./kubectl-diag get events -n smelt-park-test --sort-by=.lastTimestamp || true
           rm -f kubectl-diag
+
+      # The `browser-test` feature's code is compiled only in this job's test
+      # step (SME-361). After the diagnostics: those are for a test failure.
+      - name: No compiler warnings (browser)
+        if: always()
+        run: scripts/ci-no-warnings "$RUNNER_TEMP/browser-tests.log"
 
       - name: Stop the compose stack
         if: always()
