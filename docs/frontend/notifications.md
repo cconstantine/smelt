@@ -16,7 +16,7 @@ The notifier lives in the `Shell` layout route, so it stays mounted across navig
 
 `live.rs` hands relayed `NeedsUser`s to the layout's `NotifierFeed` context (a queue plus a revalidate counter bumped on `TurnsChanged`/`QuestionsChanged`); the leader's own app stream arrives through the queue it owns. A chat tab that also leads therefore hears one event twice — relay and stream — and one event shows one notification: the leader remembers the `(attention, generation)` each open notification was shown for and skips a repeat. For each event:
 
-1. Read the setting (the JS re-reads `localStorage` on every tick and message) — off, nothing.
+1. Read the setting (the JS re-reads `localStorage` on every tick, on `storage` events, and again at construct) — off, nothing.
 2. If this tab is visible, focused and shows that conversation, nothing: the user is looking at it.
 3. For Finished, apply the 30 s per-conversation cooldown (a chain of quick command-notice turns doesn't buzz each time; the other four kinds are never held back).
 4. Call `api::notifications::get_attention(conversation_id, generation, attention)` — the check right before acting. `None` means the event is stale (a turn running again, the generation moved on, the question answered/dismissed/asked of a parent, the conversation gone) and nothing shows.

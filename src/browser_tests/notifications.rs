@@ -240,8 +240,14 @@ pub(super) async fn scenario_desktop_notifications(t: &Scenario<'_>) {
     let _hurry = t.mock.hurry();
     let home = t.conversation().await;
     let asking = t.conversation().await;
+    // Step 4b's asked-elsewhere conversation: created before the tabs
+    // so every tab's first sidebar load already carries it — this is a
+    // direct db create, and no event fires to refresh a live sidebar
+    // for it, which the sidebar click then depends on.
+    let watched = t.conversation().await;
     let asking_tag = format!("smelt-conversation-{}", asking.id);
     let home_tag = format!("smelt-conversation-{}", home.id);
+    let watched_tag = format!("smelt-conversation-{}", watched.id);
 
     // Tab A on a conversation, tab B on a settings page: both take part in
     // the election, only one of them notifies.
@@ -373,6 +379,38 @@ pub(super) async fn scenario_desktop_notifications(t: &Scenario<'_>) {
     );
     assert!(wait_turn_ended(t, asking.id, chunks_answered).await, "the answer's turn ended");
 
+    // 4b. The looked-at close for an event the leader was focused and
+    //     visible when it arrived (review 1, Medium): focused and visible
+    //     the count entry is skipped by design and the notification is
+    //     owed all the same — so the open set holds what the count set
+    //     does not, and opening that conversation here must still close
+    //     it. Every step above led unfocused, which is why the old `&&`
+    //     chain's short-circuit survived the green runs.
+    for tab in [&a, &b, &c] {
+        tab.evaluate("window.__notifications.length = 0").await.expect("clear the records");
+    }
+    set_focus(&a, true, true).await; // the leader, looking at another conversation
+    let _asked_watched = t.mock.ask_user_next(&unique_id("toolu_ask"), &ask_input("Archive the logs?", "Archive"));
+    click_conversation(&c, watched.id).await;
+    send_from(&c, "peek at the logs").await;
+    assert!(
+        wait_tag_count(&a, &watched_tag, 1, Duration::from_secs(20)).await,
+        "the focused, visible leader showed the other conversation's question"
+    );
+    click_conversation(&a, watched.id).await; // now the leader looks at it
+    assert!(
+        wait_last_closed(&a, &watched_tag, "smelt has a question", Duration::from_secs(5)).await,
+        "opening the conversation closes its notification even when the leader was focused and visible for it"
+    );
+    // Answer it on C so nothing hangs open (suppressed in A: it is looked
+    // at), and send the leader back to asking — the reload step below
+    // reloads it there.
+    assert!(wait_for_count(&c, ".question-card", 1, Duration::from_secs(10)).await, "the card waits in C");
+    let chunks_watched = t.mock.chunks_sent();
+    click_when_present(&c, ".question-option", Duration::from_secs(5)).await;
+    assert!(wait_turn_ended(t, watched.id, chunks_watched).await, "the answer's turn ended");
+    click_conversation(&a, asking.id).await;
+
     // 5. Reload the leading tab. Its lock passes to a queued tab, nothing
     //    is re-announced, and a finished turn elsewhere still gives exactly
     //    one notification, from the one tab that leads.
@@ -381,18 +419,24 @@ pub(super) async fn scenario_desktop_notifications(t: &Scenario<'_>) {
     click_conversation(&c, home.id).await;
     send_from(&c, "wrap up").await;
     assert!(t.mock.wait_until_idle(Duration::from_secs(15)).await, "the finished turn ended");
-    let leader_after = if wait_tag_count(&b, &home_tag, 1, Duration::from_secs(15)).await {
-        &b
+    let (leader_after, understudy) = if wait_tag_count(&b, &home_tag, 1, Duration::from_secs(15)).await {
+        (&b, &c)
     } else {
         // The hand-over may have landed on either queued tab; say which.
         assert!(wait_tag_count(&c, &home_tag, 1, Duration::from_secs(10)).await, "some tab took over the lock");
-        &c
+        (&c, &b)
     };
     tokio::time::sleep(Duration::from_millis(600)).await;
     let shown = recorded(leader_after).await;
     assert_eq!(shown.len(), 1, "one finished notification, from one tab");
     assert_eq!(shown[0].heading, "smelt: done", "a finished turn says so");
     assert_eq!(shown[0].body, "wrap up", "the conversation's title");
+    // Across all tabs, not just the leader's own: with the old leader
+    // gone, two tabs each believing it leads would both show
+    // `smelt: done` — the one-notification property is what the leader
+    // is for, so the queued tab that didn't take the lock must record
+    // nothing (review 1, Low).
+    assert!(recorded(understudy).await.is_empty(), "only the one new leader constructed");
     // The reload announced nothing new: tab A's records died with its
     // page and nothing came back for the answered question.
     assert!(recorded(&a).await.is_empty(), "the reload didn't re-announce anything");

@@ -662,10 +662,17 @@ async fn notifier(
         }
 
         // This tab, looked at on a conversation: its count entry and any
-        // notification of it are the user's now.
+        // notification of it are the user's now. Two independent
+        // removals: a tab that was focused and visible when an event
+        // arrived skipped the count entry by design and is owed the
+        // notification anyway, so `open` can hold what `needers` lacks —
+        // and the close rides the `open` removal alone. (The one `&&`
+        // chain short-circuited on the missing count entry there, which
+        // is the leader's normal state: review 1, Medium.)
         if page.focused && page.visible {
             if let Some(id) = *shown.peek() {
-                if needers.remove(&id).is_some() && open.remove(&id).is_some() {
+                needers.remove(&id);
+                if open.remove(&id).is_some() {
                     send(serde_json::json!({ "cmd": "close", "id": id }));
                 }
             }
@@ -724,6 +731,17 @@ async fn notify_leader(
     if !should_notify(page.setting, page.visible, page.focused, showing_this, event.attention, since_last) {
         return;
     }
+    // A denied or never-asked permission decides it here, in page, before
+    // the round-trip: the constructor answers denied with a silent
+    // no-display rather than a throw, so a leader whose permission the
+    // user refused would otherwise spend a `get_attention` on every event
+    // and accumulate `open` entries for notifications that never existed
+    // (review 1). Leadership itself is untouched — one connection, and
+    // the permission can flip back in site settings, which the tick
+    // re-reads — and the sidebar button keeps the same disabled mode.
+    if !matches!(page.mode(), NotifyMode::On) {
+        return;
+    }
     // The same event twice is one notification: on a chat tab that also
     // leads, the relay and the leader's stream both carry it.
     if open.get(&event.conversation_id) == Some(&(event.attention, event.generation)) {
@@ -780,15 +798,20 @@ async fn revalidate_open(
 ) {
     let ids: std::collections::BTreeSet<i64> = needers.keys().chain(open.keys()).copied().collect();
     for id in ids {
+        // A failed request says nothing: a hiccup (dev-server restart,
+        // a dropped connection) must not close a live notification or
+        // empty the count. "Stale" is a fetched `None`; an error leaves
+        // the entry, and the next `QuestionsChanged`/`TurnsChanged`
+        // re-checks it (review 1).
         if let Some((attention, generation)) = needers.get(&id).copied() {
-            let fresh = crate::api::notifications::get_attention(id, generation, attention).await.ok().flatten();
-            if fresh.is_none() {
+            let checked = crate::api::notifications::get_attention(id, generation, attention).await;
+            if matches!(checked, Ok(None)) {
                 needers.remove(&id);
             }
         }
         if let Some((attention, generation)) = open.get(&id).copied() {
-            let fresh = crate::api::notifications::get_attention(id, generation, attention).await.ok().flatten();
-            if fresh.is_none() {
+            let checked = crate::api::notifications::get_attention(id, generation, attention).await;
+            if matches!(checked, Ok(None)) {
                 open.remove(&id);
                 send(serde_json::json!({ "cmd": "close", "id": id }));
             }
