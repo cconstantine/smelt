@@ -36,6 +36,7 @@ fn todoread_call_body() -> String {
 /// all in one trace.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_turns_model_and_tool_calls_are_children_of_its_span(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     start_mock_upstream(&pool, vec![todoread_call_body(), text_reply_body("done")]).await;
@@ -66,6 +67,7 @@ async fn test_a_turns_model_and_tool_calls_are_children_of_its_span(pool: PgPool
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_turn_whose_model_call_fails_is_a_failed_span(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     start_mock_upstream_failing_n_times(&pool, 0, None).await;
@@ -138,6 +140,7 @@ async fn test_a_sent_turn_is_a_child_of_the_request_that_sent_it(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_compaction_is_a_span_with_its_model_call_under_it(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     db::create_message(&pool, conversation.id, "user", &[anthropic::ContentBlock::Text { text: "earlier".to_string() }])

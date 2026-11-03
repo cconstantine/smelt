@@ -86,6 +86,7 @@ fn message_after_call(request: &serde_json::Value, tool_use_id: &str) -> serde_j
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_ask_user_ends_the_turn_and_waits(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_300).await.expect("conversation");
     let calls = start_mock_upstream(&pool, vec![ask_body(), text_reply_body("unreached")]).await;
@@ -108,6 +109,7 @@ async fn test_ask_user_ends_the_turn_and_waits(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_ask_user_with_another_tool_saves_its_result_and_waits(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_301).await.expect("conversation");
     let body = tool_calls_body(&[
@@ -135,6 +137,7 @@ async fn test_ask_user_with_another_tool_saves_its_result_and_waits(pool: PgPool
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_bad_or_second_ask_user_is_an_error_result(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_302).await.expect("conversation");
     let body = tool_calls_body(&[
@@ -171,6 +174,7 @@ async fn test_a_bad_or_second_ask_user_is_an_error_result(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_notice_while_a_question_waits_is_saved_without_calling_the_model(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_303).await.expect("conversation");
     let calls = start_mock_upstream(&pool, vec![ask_body(), text_reply_body("unreached")]).await;
@@ -188,6 +192,7 @@ async fn test_a_notice_while_a_question_waits_is_saved_without_calling_the_model
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_answering_sends_the_result_right_after_the_call(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_304).await.expect("conversation");
     let requests = start_recording_mock_upstream(&pool, vec![ask_body(), text_reply_body("Deleting.")]).await;
@@ -212,6 +217,7 @@ async fn test_answering_sends_the_result_right_after_the_call(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_message_instead_of_an_answer_dismisses_the_question(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_305).await.expect("conversation");
     let requests = start_recording_mock_upstream(&pool, vec![ask_body(), text_reply_body("OK.")]).await;
@@ -232,6 +238,7 @@ async fn test_a_message_instead_of_an_answer_dismisses_the_question(pool: PgPool
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_question_takes_one_valid_answer(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_306).await.expect("conversation");
     let requests = start_recording_mock_upstream(&pool, vec![ask_body(), text_reply_body("OK.")]).await;
@@ -263,6 +270,7 @@ async fn test_a_question_takes_one_valid_answer(pool: PgPool) {
 /// left behind with the call answered "unfinished".
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_answer_landing_mid_turn_is_taken_before_the_model_call(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_307).await.expect("conversation");
     let requests = start_recording_mock_upstream(&pool, vec![ask_body(), text_reply_body("Deleting.")]).await;
@@ -293,6 +301,7 @@ async fn test_an_answer_landing_mid_turn_is_taken_before_the_model_call(pool: Pg
 /// rather than losing it.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_question_is_recorded_before_the_replys_other_tools_run(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_308).await.expect("conversation");
     let body = tool_calls_body(&[
@@ -396,6 +405,7 @@ fn tool_result(tool_use_id: &str, content: &str) -> anthropic::ContentBlock {
 /// call, the user's text right after it.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_written_answer_caught_queued_by_a_stop_dismisses_the_question(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_312).await.expect("conversation");
     let requests = start_recording_mock_upstream(&pool, vec![ask_body(), text_reply_body("OK.")]).await;
@@ -439,6 +449,7 @@ async fn test_a_written_answer_caught_queued_by_a_stop_dismisses_the_question(po
 /// still waits, and the notice is saved as it is.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_notice_caught_queued_by_a_stop_leaves_the_question_waiting(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_310).await.expect("conversation");
     start_mock_upstream(&pool, vec![ask_body(), text_reply_body("unreached")]).await;
@@ -464,6 +475,7 @@ async fn test_a_notice_caught_queued_by_a_stop_leaves_the_question_waiting(pool:
 /// stopped message, as it would in a turn that ran.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_answer_recorded_before_the_stop_goes_with_the_stopped_message(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_311).await.expect("conversation");
     start_mock_upstream(&pool, vec![ask_body(), text_reply_body("unreached")]).await;

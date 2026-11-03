@@ -2,6 +2,7 @@ use super::*;
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_wake_conversation_is_a_noop_when_nothing_is_pending(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -32,6 +33,7 @@ async fn test_wake_conversation_is_a_noop_when_nothing_is_pending(pool: PgPool) 
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_wake_conversation_drains_a_pending_command_and_completes_a_turn(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -87,6 +89,7 @@ async fn test_wake_conversation_drains_a_pending_command_and_completes_a_turn(po
 async fn test_wake_conversation_second_call_is_a_noop_once_the_first_drained_everything(
     pool: PgPool,
 ) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -177,6 +180,7 @@ async fn test_a_wake_with_no_model_still_saves_the_notice(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_wake_with_nothing_pending_leaves_the_model_alone(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     // The mock first: it moves conversations already there onto it.
     start_mock_upstream(&pool, vec!["unused".to_string()]).await;
@@ -278,6 +282,7 @@ async fn untouched_running_command(pool: &PgPool, conversation_id: i64, command_
 /// so its clock restarts from this notice. The command keeps running.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_wake_drains_an_idle_notice_and_the_command_keeps_running(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -335,6 +340,7 @@ async fn test_wake_drains_an_idle_notice_and_the_command_keeps_running(pool: PgP
 /// nobody has left long is no reason to wake anyone.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_running_command_not_due_is_left_alone(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -374,6 +380,7 @@ fn test_format_duration_names_one_or_two_units() {
 /// happen. ("untouched for 3 hours" reads oddly; it's honest.)
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stopped_conversation_holds_the_idle_notice_for_the_next_message(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -495,6 +502,7 @@ async fn test_a_wake_with_only_an_unanswered_question_tells_no_tab(pool: PgPool)
 /// by the next wake, which sends it to the model.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_wake_takes_an_answer_no_turn_took(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
     let counter =
@@ -525,6 +533,7 @@ async fn test_a_wake_takes_an_answer_no_turn_took(pool: PgPool) {
 /// outcome is unknown is told to the model by a wake, as a finished one is.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_wake_drains_a_lost_command(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
     untouched_running_command(&pool, conversation_id, "cmd-lost", 0).await;

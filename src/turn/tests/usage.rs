@@ -107,6 +107,7 @@ fn spawn_turn(pool: &PgPool, conversation_id: i64) -> tokio::task::JoinHandle<Tu
 /// bytes, 100 tokens). It isn't the conversation's last-known usage.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_call_stopped_mid_stream_is_recorded_with_what_it_used(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9178000001).await.expect("conversation");
     let text = "a".repeat(400);
@@ -128,6 +129,7 @@ async fn test_a_call_stopped_mid_stream_is_recorded_with_what_it_used(pool: PgPo
 /// records the call's full usage, but not as the last-known usage.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_call_stopped_after_its_reply_is_saved_is_recorded(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9178000002).await.expect("conversation");
     start_mock_upstream(&pool, vec![with_usage(&text_reply_body("Hi!"), 1000, 2000, 40)]).await;
@@ -153,6 +155,7 @@ async fn test_a_call_stopped_after_its_reply_is_saved_is_recorded(pool: PgPool) 
 /// usage (code review 1).
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stop_while_a_call_is_recorded_records_it_once(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9178000003).await.expect("conversation");
     start_mock_upstream(&pool, vec![with_usage(&text_reply_body("Hi!"), 1000, 2000, 40)]).await;
@@ -178,6 +181,7 @@ async fn test_a_stop_while_a_call_is_recorded_records_it_once(pool: PgPool) {
 /// what the call used before it failed.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_call_failing_mid_stream_is_recorded(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9178000004).await.expect("conversation");
     let body = message_start(500, 0)
@@ -195,6 +199,7 @@ async fn test_a_call_failing_mid_stream_is_recorded(pool: PgPool) {
 /// nothing is known of it. The retry that succeeds is the one row.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_retried_call_that_streamed_nothing_leaves_no_row(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9178000005).await.expect("conversation");
     start_mock_upstream_failing_n_times(&pool, 1, Some(with_usage(&text_reply_body("Hi!"), 10, 0, 3))).await;
@@ -209,6 +214,7 @@ async fn test_a_retried_call_that_streamed_nothing_leaves_no_row(pool: PgPool) {
 /// A compaction's call stopped mid-stream is recorded as one.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_compaction_stopped_mid_stream_is_recorded(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9178000006).await.expect("conversation");
     db::create_message(&pool, conversation.id, "user", &[text_block("earlier message")])
@@ -249,6 +255,7 @@ async fn test_a_compaction_stopped_mid_stream_is_recorded(pool: PgPool) {
 /// still recorded, with no conversation.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_call_on_a_conversation_deleted_mid_turn_is_kept(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9178000007).await.expect("conversation");
     start_prefix_then_hanging_mock_upstream(&pool, message_start(1200, 0) + &text_delta("abcd")).await;
@@ -270,6 +277,7 @@ async fn test_a_call_on_a_conversation_deleted_mid_turn_is_kept(pool: PgPool) {
 /// doesn't overwrite the next turn's last-known usage (code review 1).
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stopped_turns_late_record_doesnt_overwrite_the_next_turns_usage(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9178000008).await.expect("conversation");
     start_mock_upstream(
@@ -322,6 +330,7 @@ fn test_an_unfinished_calls_input_is_estimated_only_when_none_was_reported() {
 /// so its row has the request's estimate instead.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_call_stopped_after_a_zero_message_start_records_the_requests_estimate(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9178000009).await.expect("conversation");
     let text = "a".repeat(400);

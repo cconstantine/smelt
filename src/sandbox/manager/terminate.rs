@@ -230,7 +230,58 @@ pub async fn pod_details(pool: &PgPool, pod_id: i64) -> Result<Option<PodDetails
 /// a 403 error, which callers treat as "usage unavailable".
 pub async fn pod_metrics_list() -> Result<serde_json::Value, SandboxError> {
     let request = pod_metrics_request(NAMESPACE)?;
-    Ok(get()?.client.request::<serde_json::Value>(request).await?)
+    let list = get()?.client.request::<serde_json::Value>(request).await;
+    #[cfg(test)]
+    let list = sampled_metrics::merged_into(list);
+    Ok(list?)
+}
+
+/// A test's stand-in for metrics-server having sampled one of its pods
+/// (SME-206). metrics-server's own sampling isn't smelt's to test, and on
+/// the loaded test cluster it isn't something a test can wait for either:
+/// its kubelet scrape times out under the suite's load and it then serves
+/// no metrics for a minute or more (review 1: possibly as a 503 for the
+/// whole API, not only an empty list), which outlasted the pods view
+/// test's wait. So a stand-in applies whatever the real read returned, and
+/// replaces a real sample of the same pod, whose numbers a test can't
+/// predict. A test names its own pod (ids are unique within a process), so
+/// no other test's view changes.
+#[cfg(test)]
+pub(crate) mod sampled_metrics {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    static SAMPLED: LazyLock<Mutex<HashMap<String, serde_json::Value>>> = LazyLock::new(Default::default);
+
+    /// `pod_name` reads as sampled with this CPU and memory, in
+    /// metrics-server's own units (`"1203981n"`, `"52Mi"`).
+    pub(crate) fn sample(pod_name: &str, cpu: &str, memory: &str) {
+        let item = serde_json::json!({
+            "metadata": {"name": pod_name},
+            "containers": [{"name": "sandbox", "usage": {"cpu": cpu, "memory": memory}}],
+        });
+        SAMPLED.lock().unwrap_or_else(|e| e.into_inner()).insert(pod_name.to_string(), item);
+    }
+
+    /// The real read with the stand-ins in it. A failed read becomes a
+    /// list of the stand-ins alone once any is set, since the pods view
+    /// reads a failure as "no usage" for every pod.
+    pub(super) fn merged_into(
+        list: Result<serde_json::Value, kube::Error>,
+    ) -> Result<serde_json::Value, kube::Error> {
+        let sampled = SAMPLED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if sampled.is_empty() {
+            return list;
+        }
+        let mut list = list.unwrap_or_else(|_| serde_json::json!({"items": []}));
+        if let Some(items) = list.get_mut("items").and_then(|items| items.as_array_mut()) {
+            items.retain(|item| {
+                item.pointer("/metadata/name").and_then(|name| name.as_str()).is_none_or(|name| !sampled.contains_key(name))
+            });
+            items.extend(sampled.into_values());
+        }
+        Ok(list)
+    }
 }
 
 /// The metrics API request for `namespace`'s pods. `NAMESPACE` is always a

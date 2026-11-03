@@ -293,6 +293,7 @@ fn test_system_prompt_names_the_volume_owner() {
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_prompt_environment_reads_volumes_and_mcp_servers(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     db::create_sandbox_volume(&pool, "cargo-cache", "/home/sandbox/.cargo")
         .await
         .expect("create volume");
@@ -385,6 +386,7 @@ async fn test_prompt_environment_reads_volumes_and_mcp_servers(pool: PgPool) {
 /// turn's environment.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_run_turn_sends_the_system_prompt(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -411,6 +413,7 @@ async fn test_run_turn_sends_the_system_prompt(pool: PgPool) {
 /// turn after it gets the agent's system prompt.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_compaction_keeps_its_own_system_prompt(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -462,6 +465,7 @@ async fn test_compaction_keeps_its_own_system_prompt(pool: PgPool) {
 /// cache markers; compaction's one-off summarization call carries neither.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_caching_provider_marks_turn_requests_but_not_compaction(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
         .await
@@ -520,6 +524,7 @@ async fn test_a_caching_provider_marks_turn_requests_but_not_compaction(pool: Pg
 /// The detail view shows exactly the system prompt a turn sends.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_context_detail_shows_the_system_prompt_a_turn_sends(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let conversation = db::create_conversation(&pool)
         .await
         .expect("create conversation");
@@ -534,6 +539,7 @@ async fn test_context_detail_shows_the_system_prompt_a_turn_sends(pool: PgPool) 
 /// The detail view lists the loaded AGENTS.md files on their own.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_context_detail_lists_loaded_instructions(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let repo = db::create_conversation_repo(&pool, conversation.id, "git@github.com:o/r.git", "github.com/o/r", None, "r")
         .await
@@ -661,6 +667,7 @@ fn test_system_prompt_says_what_the_credentials_rules_answer() {
 /// prompt the gatherer and renderer together can build.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_environment_section_names_no_credential_value(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let root = db::create_conversation(&pool).await.expect("a root").id;
     sqlx::query("INSERT INTO named_secrets (name, value) VALUES ('linear-key', 'SECRET-VALUE-MUST-NOT-APPEAR')")
         .execute(&pool)

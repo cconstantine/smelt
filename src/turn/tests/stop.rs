@@ -4,6 +4,7 @@ use super::*;
 /// keeps the user's message.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_stop_turn_ends_a_turn_in_flight(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9100000001)
         .await
@@ -50,6 +51,7 @@ async fn test_stop_turn_ends_a_turn_in_flight(pool: PgPool) {
 /// message a second time.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stop_just_after_the_message_is_saved_keeps_it_once(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9100000091)
         .await
@@ -84,6 +86,7 @@ async fn test_a_stop_just_after_the_message_is_saved_keeps_it_once(pool: PgPool)
 /// is still in flight: the stop clears it and tells every tab.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stop_clears_the_reply_even_with_another_turn_in_flight(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9100000092)
         .await
@@ -160,6 +163,7 @@ fn test_an_idle_release_keeps_a_starting_turns_generation() {
 /// turns are done, but not while someone still holds the lock.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_conversations_turn_state_is_freed_after_its_turns(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9100000191)
         .await
@@ -180,6 +184,7 @@ async fn test_a_conversations_turn_state_is_freed_after_its_turns(pool: PgPool) 
 /// notice started, and when it ends.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_turn_state_is_published_while_a_turn_runs(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9100000002)
         .await
@@ -214,6 +219,7 @@ fn test_stop_turn_with_nothing_running_does_nothing() {
 /// next message does, and its turn includes the command's notice.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stopped_conversation_waits_for_the_user_before_waking(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9100000003)
         .await
@@ -249,6 +255,7 @@ async fn test_a_stopped_conversation_waits_for_the_user_before_waking(pool: PgPo
 /// code review 6: the old save-then-wake never ran a turn).
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_delivered_notice_is_answered_unless_stopped(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let requests = start_recording_mock_upstream(&pool, vec![text_reply_body("Noted.")]).await;
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
@@ -271,6 +278,7 @@ async fn test_a_delivered_notice_is_answered_unless_stopped(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_notice_queued_behind_a_stopped_turn_is_still_saved(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     // SME-40 F4: a notice arriving during a turn (a command finishing,
     // say) queues as a turn of its own, behind the running one. Stop
     // ended both before the queued one had saved anything, so the notice
@@ -317,6 +325,7 @@ async fn test_a_notice_queued_behind_a_stopped_turn_is_still_saved(pool: PgPool)
 /// when the queued turns' own messages land after the first note.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_one_stop_is_noted_once(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9100000093)
         .await
@@ -360,6 +369,7 @@ async fn test_one_stop_is_noted_once(pool: PgPool) {
 /// that next turn succeeds.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_older_turns_failure_isnt_kept_after_a_newer_turn(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9100000094)
         .await
@@ -430,6 +440,7 @@ async fn test_an_older_turns_failure_isnt_kept_after_a_newer_turn(pool: PgPool) 
 /// the turn ends (SME-52).
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_notify_returns_at_once_and_saves_in_order(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let conversation = db::create_conversation_with_id(&pool, 9100000052)
         .await
         .expect("create conversation");
@@ -465,6 +476,7 @@ async fn test_notify_returns_at_once_and_saves_in_order(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_save_notice_between_turns_waits_for_the_turn_lock(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let conversation = db::create_conversation_with_id(&pool, 9100000004)
         .await
         .expect("create conversation");
