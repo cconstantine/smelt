@@ -488,7 +488,7 @@ fn held_call(endpoint: &Endpoint, model: &'static str, id: i64) -> std::pin::Pin
             .expect("a pool")
             .try_acquire()
             .expect("the only slot");
-        stream_anthropic_message_metered(&endpoint, &request, |_| {}, &UsageMeter::default(), SlotPolicy::Held(Some(&slot))).await
+        stream_anthropic_message_metered(&endpoint, &request, |_| {}, &UsageMeter::default(), SlotPolicy::Held(Some(&slot))).await.map_err(Into::into)
     })
 }
 
@@ -531,7 +531,7 @@ async fn test_a_held_none_call_sends_at_once() {
                 output_config: None,
                 chat_template_kwargs: None,
             };
-            stream_anthropic_message_metered(&endpoint, &request, |_| {}, &UsageMeter::default(), SlotPolicy::Held(None)).await
+            stream_anthropic_message_metered(&endpoint, &request, |_| {}, &UsageMeter::default(), SlotPolicy::Held(None)).await.map_err(Into::into)
         }
     });
     upstream.wait_for_arrivals(1).await;

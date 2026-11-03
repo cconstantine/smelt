@@ -6,6 +6,9 @@ pub mod stream;
 #[cfg(feature = "server")]
 pub mod models;
 
+#[cfg(feature = "server")]
+pub mod overflow;
+
 pub mod tools;
 
 pub use types::{ContentBlock, Effort, TokenUsage, ToolDefinition};

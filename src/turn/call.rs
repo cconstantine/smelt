@@ -176,11 +176,11 @@ pub(super) async fn call_model(
             Ok(t) => return Ok((t, recorder)),
             Err(e)
                 if attempt < TOOL_CALL_PARSE_RETRIES
-                    && is_ollama_thinking_tool_call_corruption(&e) =>
+                    && is_ollama_thinking_tool_call_corruption(e.message()) =>
             {
                 request.thinking = None;
                 request.chat_template_kwargs = turn_model.chat_template_kwargs(false);
-                last_err = e;
+                last_err = e.to_string();
             }
             Err(e) => return Err(ServerFnError::new(e)),
         }
