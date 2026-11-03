@@ -408,3 +408,36 @@ fn test_history_for_request_only_the_latest_of_two_compactions_applies() {
         ]
     );
 }
+
+/// A call stored under a pre-SME-365 name (written while a local server
+/// took any name) goes out under the safe name offered now, so a
+/// conversation switched to Anthropic doesn't send a name it refuses; a
+/// safe name, and a native tool's, go out as they were.
+#[test]
+fn test_history_for_request_sends_a_stored_mcp_calls_name_made_safe() {
+    let call = |id: &str, name: &str| anthropic::ContentBlock::ToolUse {
+        id: id.to_string(),
+        name: name.to_string(),
+        input: serde_json::json!({}),
+    };
+    let history = history_for_request_all(vec![
+        text_message(1, "user", "go"),
+        message_with_blocks(
+            2,
+            "assistant",
+            vec![call("t1", "mcp__linear.app__search.web"), call("t2", "mcp__github__list_issues"), call("t3", "read_file")],
+        ),
+        message_with_blocks(3, "user", vec![tool_result("t1"), tool_result("t2"), tool_result("t3")]),
+    ])
+    .expect("history");
+    let names: Vec<&str> = history[1]
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            anthropic::ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let safe = crate::mcp::namespaced_tool_name("linear.app", "search.web");
+    assert_eq!(names, vec![safe.as_str(), "mcp__github__list_issues", "read_file"]);
+}

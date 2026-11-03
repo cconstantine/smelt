@@ -35,6 +35,21 @@ pub(crate) fn namespaced_tool_name(server_name: &str, tool_name: &str) -> String
     format!("{TOOL_NAME_PREFIX}{server}{TOOL_NAME_SEPARATOR}{}", safe_part(tool_name, room))
 }
 
+/// `name` with an MCP tool's parts made safe as `namespaced_tool_name`
+/// makes them; any other name, or one already safe, as it is. For a name
+/// stored before SME-365 (`mcp__linear.app__search.web`, written while a
+/// local server took any name), so history sent again matches what's
+/// offered now.
+pub(crate) fn safe_tool_name(name: &str) -> String {
+    let fits = (1..=MAX_TOOL_NAME).contains(&name.len()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if fits {
+        // Already one Anthropic takes, and re-splitting it can change it
+        // (a server named `__x`: SME-365 review 2).
+        return name.to_string();
+    }
+    parse_tool_name(name).map_or_else(|| name.to_string(), |(server, tool)| namespaced_tool_name(server, tool))
+}
+
 /// `text` as it is when it's already a safe name part of at most `max`
 /// characters, as nearly every name is. Otherwise each character outside
 /// `[a-zA-Z0-9_-]` becomes `_`, the result is cut to fit, and `_` and six

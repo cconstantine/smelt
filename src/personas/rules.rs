@@ -159,8 +159,9 @@ fn check_lists(path: &str, block: &str, raw: RawToolRules) -> Result<ToolRules, 
 }
 
 /// What one rule entry judges: a smelt tool by name, or an MCP tool by
-/// its server and the name that server lists it under — the same split
-/// `crate::mcp::parse_tool_name` does.
+/// its server's configured name and the name that server lists it under,
+/// never the safe name the model calls it by (SME-365: a call maps back
+/// through `mcp::resolve_tool` and `mcp::listed_tool_name`).
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ToolRef<'a> {
     Native(&'a str),

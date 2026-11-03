@@ -47,8 +47,16 @@ async fn test_a_tool_lists_connect_is_a_child_of_its_caller(pool: sqlx::PgPool) 
             tool_definitions_for(&pool, std::slice::from_ref(&config), &unruled()).await
         })
         .await;
-        let lock = server_lock(&CONNECTING, config.id);
-        let _ended = tokio::time::timeout(std::time::Duration::from_secs(5), lock.lock())
+        // Until the connect has said how it went (its URL refuses, so a
+        // recorded failure), then its lock: it records that while holding
+        // the lock, so the lock is free only once its span has closed.
+        let ended = async {
+            while !failed_recently(config.id) && !REGISTRY.lock().await.contains_key(&config.id) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            drop(server_lock(&CONNECTING, config.id).lock().await);
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), ended)
             .await
             .expect("the tool list's connect didn't end in time");
         listed

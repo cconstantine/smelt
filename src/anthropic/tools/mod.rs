@@ -197,6 +197,9 @@ mod server {
             otel.status_code = Empty,
             otel.status_description = Empty,
         );
+        // The name's server part until the call resolves its server, which
+        // then records the configured name (SME-365: the part can be a
+        // safe one).
         if let Some((server_name, _)) = crate::mcp::parse_tool_name(name) {
             span.record("smelt.tool.mcp_server", server_name);
         }
@@ -288,6 +291,7 @@ mod server {
         };
         match resolve(pool, name).await? {
             Target::Mcp { config, tool } => {
+                span.record("smelt.tool.mcp_server", config.name.as_str());
                 // SME-241: an MCP call is ruled at its class, and the class
                 // is only known inside the call — after the connect and the
                 // override read, on the very connection it goes out on. So
@@ -429,7 +433,17 @@ mod server {
             .collect();
         match crate::db::list_mcp_server_configs(pool).await {
             Ok(configs) => {
-                definitions.extend(crate::mcp::tool_definitions_for(pool, &configs, &chain).await)
+                // Two tools reaching one name (a tool listed under another's
+                // safe name, SME-365 review): Anthropic refuses a request
+                // with a repeated name, so the second is left out.
+                let mut seen: std::collections::HashSet<String> = definitions.iter().map(|d| d.name.clone()).collect();
+                for definition in crate::mcp::tool_definitions_for(pool, &configs, &chain).await {
+                    if seen.insert(definition.name.clone()) {
+                        definitions.push(definition);
+                    } else {
+                        tracing::warn!(tool = %definition.name, "two tools have this name; the second is left out");
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to list configured MCP servers; their tools are unavailable this turn")

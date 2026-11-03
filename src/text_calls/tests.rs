@@ -277,3 +277,14 @@ fn test_a_think_tag_in_prose_does_not_hide_a_call() {
         assert_eq!(one_name(&format!("{prose}{call}")).as_deref(), Some("save_comment"), "{prose}");
     }
 }
+
+/// A call written with an MCP server's own name (`linear.app`) is matched
+/// to that server's offered tools by its safe part (SME-365): the notice
+/// doesn't claim the server isn't offered, and its tools are suggested.
+#[test]
+fn test_a_call_naming_a_servers_own_name_finds_its_safe_named_tools() {
+    let offered = crate::mcp::namespaced_tool_name("linear.app", "get_issue");
+    let notice = text_call_notice(&[TextCall { name: Some("mcp__linear.app__issue_read".to_string()) }], &[&offered, "read_file"]);
+    assert!(!notice.contains("no MCP server"), "{notice}");
+    assert!(notice.contains(&offered), "{notice}");
+}
