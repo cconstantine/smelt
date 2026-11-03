@@ -1,7 +1,7 @@
 # A child's checkout, and volumes
 Part of the [personas design](index.md) (SME-234).
 
-Decided by the user (2026-10-18): `start_agent(brief, repo?, persona?, volumes?)`, none of them required. With `repo` the child's sandbox starts with that repo cloned and its AGENTS.md loaded before its first turn; `persona` requires `repo` and is loaded before the first turn. There is no automatic shared volume: the parent creates volumes and passes them; a volume the model created is deleted with the conversation that created it; a parent passes only volumes it created or has mounted. This page decides the rest.
+Decided by the user (2026-10-18): `start_agent(brief, repo?, persona?, volumes?)`, none of them required. With `repo` the child's sandbox starts with that repo cloned and its AGENTS.md loaded before its first turn; `persona` requires `repo` (since SME-368 a scoped `persona`, `<dir>:<name>`, names its repo itself; a bare one still requires `repo`) and is loaded before the first turn. There is no automatic shared volume: the parent creates volumes and passes them; a volume the model created is deleted with the conversation that created it; a parent passes only volumes it created or has mounted. This page decides the rest.
 
 ## Which ref the child's clone is on
 
