@@ -277,9 +277,26 @@ async fn wait_until_exited(pid: u32) {
         if matches!(state.as_deref(), None | Some("Z")) {
             return;
         }
-        assert!(tokio::time::Instant::now() < deadline, "process {pid} didn't exit");
+        assert!(tokio::time::Instant::now() < deadline, "process {pid} didn't exit ({})", why_still_running(pid));
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// What a process that should have exited is doing, for the failure
+/// message (SME-282 review 1): each child's kernel wait channel
+/// (`pipe_write` is a writer blocked on a full pipe, the cause SME-282
+/// found; anything else points elsewhere, such as a slow node).
+fn why_still_running(pid: u32) -> String {
+    let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap_or_default();
+    let waits: Vec<String> = children
+        .split_whitespace()
+        .map(|child| {
+            let comm = std::fs::read_to_string(format!("/proc/{child}/comm")).unwrap_or_default();
+            let wchan = std::fs::read_to_string(format!("/proc/{child}/wchan")).unwrap_or_default();
+            format!("{} {child} waits in {}", comm.trim(), if wchan.is_empty() { "?" } else { wchan.trim() })
+        })
+        .collect();
+    format!("children: {}", if waits.is_empty() { "none".to_string() } else { waits.join(", ") })
 }
 
 /// Runs `command` (which waits for the file `{go}` to exist, and then
