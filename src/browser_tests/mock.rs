@@ -24,6 +24,10 @@ struct Lane {
     open: Arc<AtomicUsize>,
     reply_words: Arc<AtomicUsize>,
     hurried: Arc<AtomicBool>,
+    /// A refusal `refuse_next` armed: how many requests are still owed a
+    /// 400, and the body to answer them with. Cleared when the count runs
+    /// out and when the arming guard drops (SME-73's recovery scenario).
+    refusals: Arc<std::sync::Mutex<Option<(usize, String)>>>,
 }
 
 impl Lane {
@@ -33,6 +37,7 @@ impl Lane {
             open: Arc::new(AtomicUsize::new(0)),
             reply_words: Arc::new(AtomicUsize::new(DEFAULT_REPLY_WORDS)),
             hurried: Arc::new(AtomicBool::new(false)),
+            refusals: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -66,6 +71,48 @@ impl Drop for Hurried {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
     }
+}
+
+/// A refusal armed on a lane by `MockUpstream::refuse_next`. Dropping it
+/// re-arms nothing: a scenario that failed partway leaves the lane's next
+/// scenario answering normally.
+pub(super) struct RefusalsArmed(Arc<std::sync::Mutex<Option<(usize, String)>>>);
+
+impl Drop for RefusalsArmed {
+    fn drop(&mut self) {
+        *self.0.lock().expect("the refusal lock") = None;
+    }
+}
+
+/// llama.cpp's refusal of an oversized request, in the shape
+/// `anthropic::overflow::classify` reads: the window it names is `window`,
+/// the size it was sent `input` comes first in the message — the mistake
+/// the classifier must not make is taking *that* for the window (SME-73).
+pub(super) fn exceed_context_size(input: u32, window: u32) -> String {
+    format!(
+        r#"{{"error":{{"code":400,"type":"exceed_context_size_error","message":"request ({input} tokens) exceeds the available context size ({window} tokens), try increasing it","from_cache":false,"n_prompt_tokens":{input},"n_ctx":{window}}}}}"#
+    )
+}
+
+/// Take one armed refusal if the lane owes one: the 400 to answer with.
+fn take_refusal(lane: &Lane) -> Option<axum::response::Response> {
+    let mut armed = lane.refusals.lock().expect("the refusal lock");
+    let (remaining, _) = armed.as_mut()?;
+    if *remaining == 0 {
+        *armed = None;
+        return None;
+    }
+    *remaining -= 1;
+    let body = if *remaining == 0 {
+        armed.take().expect("the armed refusal").1
+    } else {
+        armed.as_ref().expect("the armed refusal").1.clone()
+    };
+    Some(axum::response::IntoResponse::into_response((
+        axum::http::StatusCode::BAD_REQUEST,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )))
 }
 
 /// Counts one open reply for as long as its body stream lives: the body is
@@ -136,7 +183,12 @@ impl MockUpstream {
                     .ok()
                     .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string));
                 let lane = model.and_then(|m| by_model.get(&m).cloned()).unwrap_or_else(|| first.clone());
-                async move { reply(lane) }
+                async move {
+                    match take_refusal(&lane) {
+                        Some(refused) => refused,
+                        None => reply(lane),
+                    }
+                }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind the mock upstream");
@@ -172,6 +224,16 @@ impl MockUpstream {
 
     pub(super) fn open(&self) -> usize {
         self.lane.open.load(Ordering::SeqCst)
+    }
+
+    /// Answer this lane's next `times` requests with a 400 and `body` —
+    /// an overflow refusal (see `exceed_context_size`) for a scenario
+    /// whose turn recovers (SME-73) — then stream normally again, as the
+    /// recovery's summary call and retry do. The guard re-arms the lane
+    /// on drop, failures included.
+    pub(super) fn refuse_next(&self, times: usize, body: impl Into<String>) -> RefusalsArmed {
+        *self.lane.refusals.lock().expect("the refusal lock") = Some((times, body.into()));
+        RefusalsArmed(self.lane.refusals.clone())
     }
 
     /// Waits until no reply is open upstream. False on timeout.
