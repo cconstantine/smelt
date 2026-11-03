@@ -297,6 +297,42 @@ async fn drain_events(
     seen
 }
 
+/// The Context window `mock-model` was saved with, if it was ever saved.
+async fn saved_context_window(pool: &PgPool) -> Option<i32> {
+    sqlx::query_scalar::<_, Option<i32>>(
+        "SELECT context_window FROM provider_models WHERE provider_id = (SELECT id FROM inference_providers ORDER BY id) AND model = $1",
+    )
+    .bind(crate::providers::test_support::MOCK_MODEL)
+    .fetch_optional(pool)
+    .await
+    .expect("the model row")
+    .flatten()
+}
+
+/// The text of the last assistant message.
+fn last_reply(messages: &[Message]) -> Option<String> {
+    messages.iter().rev().find(|m| m.role == "assistant").and_then(|m| {
+        m.blocks()
+            .ok()?
+            .into_iter()
+            .find_map(|b| match b {
+                anthropic::ContentBlock::Text { text } => Some(text),
+                _ => None,
+            })
+    })
+}
+
+/// The windows `ContextUsageUpdate`s published to watching tabs.
+fn published_windows(events: Vec<events::ConversationEvent>) -> Vec<u32> {
+    events
+        .into_iter()
+        .filter_map(|e| match e {
+            events::ConversationEvent::ContextUsageUpdate { context_window, .. } => Some(context_window),
+            _ => None,
+        })
+        .collect()
+}
+
 /// A mock upstream that streams `text` and then never finishes. Same
 /// locking rule as `start_mock_upstream`.
 async fn start_partial_then_hanging_mock_upstream(
@@ -375,6 +411,7 @@ mod text_calls;
 mod pod_activity;
 mod turn_slot;
 mod overflow;
+mod window_stop;
 
 /// The reason in conversation `id`'s last failure notice (SME-123 DR3),
 /// where a user's failed turn now says why.

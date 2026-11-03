@@ -144,6 +144,58 @@ pub(super) async fn learn_window_stop(
     }
 }
 
+/// The floor on asking Ollama: below this an estimate-vs-measured gap is
+/// likelier tokeniser slop than a truncated prompt (SME-73).
+const OLLAMA_CHECK_MIN_ESTIMATE: u64 = 8_192;
+
+/// Whether a reply measuring `measured` to a request estimated at
+/// `estimate` reads as quietly truncated: the request big enough for the
+/// gap to mean anything, and the reply below half of it (SME-73).
+pub(super) fn ollama_tell_says_truncated(estimate: u64, measured: u64) -> bool {
+    estimate >= OLLAMA_CHECK_MIN_ESTIMATE && measured < estimate / 2
+}
+
+/// Ollama answers an oversized request quietly truncated rather than
+/// refusing it: its prompt builder drops the oldest messages until the
+/// prompt fits the loaded `num_ctx`. The tell is `ollama_tell_says_truncated`
+/// against this reply; then ask `/api/ps` what window the model is loaded
+/// with — that, not the belief, is what the next request must fit — and
+/// learn it when it's smaller. The reply already written is kept either
+/// way: re-running a quietly truncated answer is not attempted
+/// (Trade-offs).
+pub(super) async fn learn_ollama_window(
+    pool: &PgPool,
+    conversation_id: i64,
+    turn_model: &mut crate::providers::TurnModel,
+    request: &anthropic::CreateMessageRequest,
+    usage: &anthropic::TokenUsage,
+) {
+    if turn_model.kind != crate::providers::ProviderKind::Ollama {
+        return;
+    }
+    let estimate = estimate_request_tokens(request);
+    let measured = usage
+        .input_tokens
+        .saturating_add(usage.cache_creation_input_tokens)
+        .saturating_add(usage.cache_read_input_tokens)
+        .max(0) as u64;
+    if !ollama_tell_says_truncated(estimate, measured) {
+        return;
+    }
+    let loaded = match anthropic::models::ollama_loaded_window(&turn_model.endpoint, &turn_model.model).await {
+        Ok(loaded) => loaded,
+        // The turn answers as if nothing was learned: the reply stands,
+        // and the next reply gets the tell again.
+        Err(e) => {
+            tracing::info!(conversation_id, error = %e, "couldn't ask Ollama what's loaded");
+            None
+        }
+    };
+    if let Some(window) = loaded.filter(|window| *window < turn_model.context_window) {
+        learn(pool, conversation_id, turn_model, Some(window)).await;
+    }
+}
+
 /// Puts `window` on the turn's copy (every later size reads it) and
 /// saves it for the model. A save that fails — a provider moved mid-
 /// turn — is not the turn's failure: it says nothing more. Returns

@@ -667,7 +667,17 @@ fn run_turn_steps<'a: 'b, 'b>(
             // other failure ends the turn as it always did.
             let called = call_model(pool, conversation_id, turn_model, &mut request, slot.held()).await;
             let (turn, recorder, budget) = match called {
-                Ok((turn, recorder)) => (turn, recorder, budget),
+                Ok((turn, recorder)) => {
+                    // Ollama truncates an oversized request quietly rather
+                    // than refusing it: when this reply measured far below
+                    // the request that went, ask the server what window it
+                    // really loaded (SME-73). The reply is kept as it
+                    // stands; this only fixes the next request — and it
+                    // runs before the meter publish below, so the meter
+                    // reads the new window with this reply's own usage.
+                    super::overflow::learn_ollama_window(pool, conversation_id, turn_model, &request, &turn.usage).await;
+                    (turn, recorder, budget)
+                }
                 Err(CallError::Overflow(overflow)) => {
                     let recovered = overflow_recovery(
                         pool,

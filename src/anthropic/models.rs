@@ -363,6 +363,17 @@ pub async fn ollama_details(
     shown
 }
 
+/// The context window `model` is loaded with, per Ollama's `/api/ps`
+/// (SME-73): an oversized request is answered quietly truncated to it, so
+/// what's loaded is the window the next request must fit. `Ok(None)` when
+/// the model isn't loaded or the answer names no window — not having it
+/// isn't an error, just nothing more known, as in `model_details`.
+pub async fn ollama_loaded_window(endpoint: &Endpoint, model: &str) -> Result<Option<u32>, String> {
+    let client = endpoint.client()?;
+    let ps = fetch_json(endpoint, client.get(endpoint.url("/api/ps"))).await?;
+    Ok(parse_ollama_ps(&ps, model))
+}
+
 /// What `endpoint` says about `model`. For an Ollama server that's
 /// `/api/show` and maybe `/api/ps`; for the others, the model's entry in
 /// the listing (nothing, if it isn't listed).
