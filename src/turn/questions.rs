@@ -135,20 +135,6 @@ pub(crate) async fn pending_question(pool: &PgPool, conversation_id: i64) -> Ser
         .map(|q| PendingQuestion { tool_use_id: q.tool_use_id, questions: q.questions }))
 }
 
-/// Whether `conversation_id` waits on an unanswered question of either
-/// kind — the user's card or its parent's (SME-71): a turn's Ok end owes
-/// no Finished while a wait is what it owes instead (the user-row wait
-/// already noted its Question; the parent-row wait notes nothing). The
-/// `asked_of` split — which waits on whom — stays in `pending_question`;
-/// this is the one "a row waits, unanswered" check every such call site
-/// uses.
-pub(crate) async fn question_waits(pool: &PgPool, conversation_id: i64) -> ServerFnResult<bool> {
-    let row = db::get_pending_question(pool, conversation_id)
-        .await
-        .map_err(ServerFnError::new)?;
-    Ok(row.is_some_and(|q| q.answer.is_none()))
-}
-
 /// The card's answer to question `tool_use_id`: checked, recorded once
 /// (another tab's later answer gets `ALREADY_ANSWERED`), then a turn takes
 /// it. Ends a Stop's pause, like the user writing does.

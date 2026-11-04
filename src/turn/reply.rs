@@ -184,7 +184,8 @@ pub(super) async fn save_stop_notice(
 
 /// Runs a reply's tool calls and returns their results, and whether the
 /// turn ends here: the reply asked the user a question, or an agent's
-/// `finish` went through (SME-236), whose turn ends as `ask_user`'s does.
+/// `finish` (SME-236) or the model's `notify_user` (SME-377) went
+/// through, whose turn ends as `ask_user`'s does.
 ///
 /// The model's `ask_user` (SME-34): one per reply; it gets no
 /// result now, and the turn ends waiting on it. Recorded before
@@ -258,7 +259,7 @@ pub(super) async fn run_tools(
         {
             let result =
                 anthropic::tools::execute(pool, conversation_id, id, name, input).await;
-            if name == crate::agents::FINISH && result.is_ok() {
+            if (name == crate::agents::FINISH || name == anthropic::tools::NOTIFY_USER) && result.is_ok() {
                 finished = true;
             }
             // A call by a name no tool has is told which offered tools are
@@ -290,7 +291,7 @@ pub(super) async fn run_tools(
 }
 
 /// What running a reply's calls gave: their results, whether the turn ends
-/// (a question asked, or `finish`), and, when every call named a tool no
+/// (a question asked, `finish` or `notify_user`), and, when every call named a tool no
 /// tool has, the first of those names (SME-307).
 #[cfg(feature = "server")]
 pub(super) struct RanTools {

@@ -157,46 +157,16 @@ pub(super) fn run_turn_bounded<'a>(
             }
             // SME-71: what this turn's end owes the user, before
             // `drop(in_flight)` takes it (the order the plan fixes). A
-            // Stop clears the spell's debt instead: the user is there.
+            // Stop clears the spell's debt instead: the user is there. An
+            // Ok end notes nothing by itself (SME-377): a question was
+            // noted at `ask`, the model's `notify_user` at its call, and a
+            // plain reply — a model waking on its command's end, say —
+            // owes the user nothing it didn't say so.
             match &result {
                 Err(TurnFailure::Failed(_) | TurnFailure::Noted { .. }) => {
                     note_attention(conversation_id, crate::events::Attention::Failed)
                 }
                 Err(TurnFailure::Stopped) => clear_attention(conversation_id),
-                // The ruling: a turn ending on a wait — the user's card
-                // or its parent's — owes that wait, not a Finished. The
-                // user-row case already noted the Question at `ask`; a
-                // parent-row wait notes nothing at all (Revision 6). The
-                // `ends` path — `finish`, a plain reply — has no row.
-                // SME-370: an idle-notice turn — one that saved an idle
-                // notice — owes no Finished whatever it waits on, so it
-                // skips the wait read with the note; a question asked or a
-                // failure met during such a turn still notes, at its own
-                // site. Without this the watch's every-interval pings all
-                // notify "smelt: done" (SME-71's named follow-up).
-                Ok(persisted)
-                    if persisted.iter().any(|m| m.role == "assistant")
-                        && !saved_idle_notice(persisted) =>
-                {
-                    // A read that fails says "no wait" and notes a
-                    // Finished — best-effort notifying beats silence —
-                    // but the wait-aware rule silently degraded, so say
-                    // so (review 1): the warn names the case for the log.
-                    let waits = match question_waits(pool, conversation_id).await {
-                        Ok(waits) => waits,
-                        Err(e) => {
-                            tracing::warn!(
-                                conversation_id,
-                                error = %e,
-                                "the pending-question read failed; ending this turn notes Finished without checking for a wait"
-                            );
-                            false
-                        }
-                    };
-                    if !waits {
-                        note_attention(conversation_id, crate::events::Attention::Finished)
-                    }
-                }
                 Ok(_) => {}
             }
             // A child agent whose last turn ended without its report tells

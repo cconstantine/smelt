@@ -4,6 +4,10 @@
 use super::*;
 
 // --- An idle-notice turn notes no Finished (SME-370) ---
+//
+// Since SME-377 no turn's end notes anything by itself, so these pass
+// because the automatic Finished is gone; they stay as the guard against
+// its return. The predictions below are SME-370's.
 
 /// The ticket's reason to exist: a wake whose drain saved an idle notice is
 /// smelt telling itself about a command that keeps running, not an answer

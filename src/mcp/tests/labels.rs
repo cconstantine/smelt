@@ -183,7 +183,7 @@ fn test_the_assembled_offer_says_who_owns_everything() {
         }
     }
     // smelt's own four: label, and the agent-message one rules out the tracker.
-    let confused = ["message_agent", "finish", "ask_parent", "ask_user"];
+    let confused = ["message_agent", "finish", "ask_parent", "ask_user", "notify_user"];
     let natives = crate::anthropic::tools::native_tool_definitions();
     for name in confused {
         let def = natives

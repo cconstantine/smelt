@@ -28,11 +28,12 @@ struct Lane {
     /// 400, and the body to answer them with. Cleared when the count runs
     /// out and when the arming guard drops (SME-73's recovery scenario).
     refusals: Arc<std::sync::Mutex<Option<(usize, String)>>>,
-    /// An `ask_user` call `ask_user_next` armed: the tool_use id and the
-    /// call's input JSON, answered by the lane's next request and then
-    /// gone (SME-71's notifications scenario — the question has to come
-    /// from a real turn ending on a real card, not from a seeded row).
-    ask_user: Arc<std::sync::Mutex<Option<(String, String)>>>,
+    /// A tool call `tool_call_next` armed: the tool's name, the tool_use
+    /// id and the call's input JSON, answered by the lane's next request
+    /// and then gone (SME-71's notifications scenario — the question has
+    /// to come from a real turn ending on a real card, not from a seeded
+    /// row; SME-377's `notify_user` from a real call).
+    tool_call: Arc<std::sync::Mutex<Option<(String, String, String)>>>,
 }
 
 impl Lane {
@@ -43,7 +44,7 @@ impl Lane {
             reply_words: Arc::new(AtomicUsize::new(DEFAULT_REPLY_WORDS)),
             hurried: Arc::new(AtomicBool::new(false)),
             refusals: Arc::new(std::sync::Mutex::new(None)),
-            ask_user: Arc::new(std::sync::Mutex::new(None)),
+            tool_call: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -90,13 +91,13 @@ impl Drop for RefusalsArmed {
     }
 }
 
-/// An `ask_user` call armed on a lane by `MockUpstream::ask_user_next`.
+/// A tool call armed on a lane by `MockUpstream::tool_call_next`.
 /// Dropping it clears an armed call a failed scenario never sent.
-pub(super) struct AskUserArmed(Arc<std::sync::Mutex<Option<(String, String)>>>);
+pub(super) struct ToolCallArmed(Arc<std::sync::Mutex<Option<(String, String, String)>>>);
 
-impl Drop for AskUserArmed {
+impl Drop for ToolCallArmed {
     fn drop(&mut self) {
-        *self.0.lock().expect("the ask_user lock") = None;
+        *self.0.lock().expect("the tool call lock") = None;
     }
 }
 
@@ -190,16 +191,17 @@ fn reply(lane: Lane) -> axum::response::Response {
     stream_chunks(lane, chunks)
 }
 
-/// The events of a reply that calls `ask_user` with `input` and nothing
-/// else: the turn records the question and ends on the card. The shape is
+/// The events of a reply that calls tool `name` with `input` and nothing
+/// else: for `ask_user` the turn records the question and ends on the
+/// card, for `notify_user` it notes the message and ends. The shape is
 /// the stream tests' own (`anthropic::stream::tests`' tool_use bodies).
-fn ask_user_chunks(id: &str, input: &str) -> Vec<String> {
+fn tool_call_chunks(name: &str, id: &str, input: &str) -> Vec<String> {
     vec![
         event("message_start", r#"{"type":"message_start"}"#),
         event(
             "content_block_start",
             &format!(
-                r#"{{"type":"content_block_start","index":0,"content_block":{{"type":"tool_use","id":"{id}","name":"ask_user","input":{{}}}}}}"#
+                r#"{{"type":"content_block_start","index":0,"content_block":{{"type":"tool_use","id":"{id}","name":"{name}","input":{{}}}}}}"#
             ),
         ),
         // The whole input in one delta; the parser only concatenates.
@@ -231,11 +233,11 @@ impl MockUpstream {
                     .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string));
                 let lane = model.and_then(|m| by_model.get(&m).cloned()).unwrap_or_else(|| first.clone());
                 async move {
-                    let armed = lane.ask_user.lock().expect("the ask_user lock").take();
+                    let armed = lane.tool_call.lock().expect("the tool call lock").take();
                     match take_refusal(&lane) {
                         Some(refused) => refused,
                         None => match armed {
-                            Some((id, input)) => stream_chunks(lane, ask_user_chunks(&id, &input)),
+                            Some((name, id, input)) => stream_chunks(lane, tool_call_chunks(&name, &id, &input)),
                             None => reply(lane),
                         },
                     }
@@ -288,15 +290,36 @@ impl MockUpstream {
     }
 
     /// Answer this lane's next request with an `ask_user` tool call — id
-    /// `tool_use_id`, input `input` — instead of the usual text reply:
-    /// SME-71's scenario needs the question to come from a real turn
-    /// ending on a real card. The guard re-arms nothing on drop: an armed
-    /// call a failed scenario never sent dies with it, not the lane's
-    /// next scenario.
-    pub(super) fn ask_user_next(&self, tool_use_id: &str, input: &serde_json::Value) -> AskUserArmed {
-        *self.lane.ask_user.lock().expect("the ask_user lock") =
-            Some((tool_use_id.to_string(), input.to_string()));
-        AskUserArmed(self.lane.ask_user.clone())
+    /// `tool_use_id`, input `input` — instead of a text reply, so the
+    /// scenario's question comes from a real turn ending on a real card
+    /// (`tool_call_next`).
+    pub(super) fn ask_user_next(&self, tool_use_id: &str, input: &serde_json::Value) -> ToolCallArmed {
+        self.tool_call_next("ask_user", tool_use_id, input)
+    }
+
+    /// Answer this lane's next request with a call to tool `name` — id
+    /// `tool_use_id`, input `input` — instead of a text reply. The guard
+    /// re-arms nothing on drop: an armed call a failed scenario never
+    /// sent dies with it, not the lane's next scenario.
+    pub(super) fn tool_call_next(&self, name: &str, tool_use_id: &str, input: &serde_json::Value) -> ToolCallArmed {
+        *self.lane.tool_call.lock().expect("the tool call lock") =
+            Some((name.to_string(), tool_use_id.to_string(), input.to_string()));
+        ToolCallArmed(self.lane.tool_call.clone())
+    }
+
+    /// Waits until the call `tool_call_next` armed has been sent (a
+    /// request took it), then until no reply is open upstream. False on
+    /// timeout. Without the first wait, an idle check made before the
+    /// turn's request arrived passes at once (SME-377).
+    pub(super) async fn wait_until_tool_call_sent(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while self.lane.tool_call.lock().expect("the tool call lock").is_some() {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        self.wait_until_idle(deadline.saturating_duration_since(tokio::time::Instant::now())).await
     }
 
     /// Waits until no reply is open upstream. False on timeout.

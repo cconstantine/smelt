@@ -10,12 +10,16 @@ use serde::{Deserialize, Serialize};
 use crate::events::Attention;
 
 /// What a notification says: the heading comes from `attention`, the body
-/// is the title, plus the first question's header for a question.
+/// is the title, plus the first question's header for a question, or the
+/// model's `notify_user` message for a `Notified` (SME-377).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AttentionDetails {
     pub title: String,
     pub attention: Attention,
     pub question_header: Option<String>,
+    /// Defaulted, so a tab reads an older server's answer.
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 /// The attention event `attention` (of the turn whose generation is
@@ -34,6 +38,8 @@ pub async fn get_attention(id: i64, generation: u64, attention: Attention) -> Se
 ///   answered, or another turn took one;
 /// - for a question, nothing waits any more: answered, dismissed, or a row
 ///   asked of the child's parent, which no card can answer (Revision 6);
+/// - for a `Notified` (SME-377), the runtime no longer holds the model's
+///   message for exactly that generation: a restart, or a newer notice;
 /// - the conversation is gone, so it has no title.
 #[cfg(feature = "server")]
 pub(crate) async fn attention_details(pool: &sqlx::PgPool, id: i64, generation: u64, attention: Attention) -> ServerFnResult<Option<AttentionDetails>> {
@@ -52,11 +58,21 @@ pub(crate) async fn attention_details(pool: &sqlx::PgPool, id: i64, generation: 
     } else {
         None
     };
+    let message = if attention == Attention::Notified {
+        let message = crate::turn::published_notice(id, generation);
+        if message.is_none() {
+            return Ok(None);
+        }
+        message
+    } else {
+        None
+    };
     let title = db::get_conversation_title(pool, id).await.map_err(ServerFnError::new)?;
     Ok(title.map(|title| AttentionDetails {
         title,
         attention,
         question_header: question.and_then(|q| q.questions.into_iter().next().map(|question| question.header)),
+        message,
     }))
 }
 

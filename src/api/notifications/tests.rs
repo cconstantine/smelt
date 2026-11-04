@@ -66,23 +66,58 @@ async fn test_get_attention_answers_some_for_a_fresh_question_with_title_and_hea
             title: "rename the flag".into(),
             attention: Attention::Question,
             question_header: Some("Which".into()),
+            message: None,
         })
     );
 }
 
-/// A Finished answers `Some` with the title alone — a waiting question
-/// stays out of a finished notification.
+/// The spell `conversation_id` runs now ends having called `notify_user`
+/// with `message`, as a turn's call would note it (SME-377). Returns the
+/// generation its `NeedsUser` carried.
+fn notified_spell(conversation_id: i64, message: &str) -> u64 {
+    let turn = crate::turn::count_a_test_turn(conversation_id);
+    crate::turn::note_notified(conversation_id, message.to_string());
+    drop(turn);
+    turn_generation(conversation_id)
+}
+
+/// T10 (SME-377): a Notified whose spell published it answers `Some` with
+/// the title and the model's message — a waiting question stays out of
+/// it; once the generation moves on, `None`.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_get_attention_answers_some_for_finished_with_the_title_alone(pool: PgPool) {
+async fn test_get_attention_answers_some_for_notified_with_the_models_message(pool: PgPool) {
     let _guard = ids_clear_and_locked(&pool).await;
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     rename(&pool, conversation.id, "fix the flaky build").await;
     ask_two(&pool, conversation.id).await;
-    let details = attention_details(&pool, conversation.id, 0, Attention::Finished).await.expect("query");
+    let generation = notified_spell(conversation.id, "Built and tested");
+    let details = attention_details(&pool, conversation.id, generation, Attention::Notified).await.expect("query");
     assert_eq!(
         details,
-        Some(AttentionDetails { title: "fix the flaky build".into(), attention: Attention::Finished, question_header: None })
+        Some(AttentionDetails {
+            title: "fix the flaky build".into(),
+            attention: Attention::Notified,
+            question_header: None,
+            message: Some("Built and tested".into()),
+        })
     );
+    let moved = new_turn_generation(conversation.id);
+    assert_eq!(
+        attention_details(&pool, conversation.id, moved, Attention::Notified).await.expect("query"),
+        None,
+        "the notice was for the old generation"
+    );
+    turn::forget_conversation_lock(conversation.id);
+}
+
+/// A Notified with no notice published for it (a restart, or a forged
+/// event) answers `None`, even with every other check passing.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_get_attention_answers_none_for_notified_without_a_published_notice(pool: PgPool) {
+    let _guard = ids_clear_and_locked(&pool).await;
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let details = attention_details(&pool, conversation.id, 0, Attention::Notified).await.expect("query");
+    assert_eq!(details, None, "nothing the model said is held for it");
 }
 
 /// An event from an older generation is stale news, even while everything
@@ -93,12 +128,12 @@ async fn test_get_attention_answers_none_for_a_stale_generation(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let generation = new_turn_generation(conversation.id);
     assert_eq!(
-        attention_details(&pool, conversation.id, generation - 1, Attention::Finished).await.expect("query"),
+        attention_details(&pool, conversation.id, generation - 1, Attention::Failed).await.expect("query"),
         None,
         "the user wrote since the event's turn: stale"
     );
     assert!(
-        attention_details(&pool, conversation.id, generation, Attention::Finished).await.expect("query").is_some(),
+        attention_details(&pool, conversation.id, generation, Attention::Failed).await.expect("query").is_some(),
         "the same event, current, still notifies"
     );
 }
@@ -113,7 +148,7 @@ async fn test_get_attention_answers_none_while_a_turn_runs(pool: PgPool) {
     turn::start_turn(pool.clone(), conversation.id, "hi".to_string()).await.expect("send");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(turn_running(conversation.id), "the mock holds the turn mid-stream");
-    let details = attention_details(&pool, conversation.id, turn_generation(conversation.id), Attention::Finished).await.expect("query");
+    let details = attention_details(&pool, conversation.id, turn_generation(conversation.id), Attention::Failed).await.expect("query");
     assert_eq!(details, None, "a running turn is never 'needs the user'");
     stop_turn_now(conversation.id);
     wait_turn_done(conversation.id).await;
@@ -188,7 +223,7 @@ async fn test_get_attention_answers_none_for_a_deleted_conversation(pool: PgPool
     let _guard = ids_clear_and_locked(&pool).await;
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     db::delete_conversation(&pool, conversation.id).await.expect("delete");
-    let details = attention_details(&pool, conversation.id, 0, Attention::Finished).await.expect("query");
+    let details = attention_details(&pool, conversation.id, 0, Attention::Failed).await.expect("query");
     assert_eq!(details, None, "a conversation that isn't there has no title");
 }
 

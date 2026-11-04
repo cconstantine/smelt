@@ -83,15 +83,25 @@ async fn published_after_done(recording: &events::AppRecording, conversation_id:
     needs_user_of(recording, conversation_id)
 }
 
-/// The plan's first case, for each of the four callers: a turn that
-/// saved a reply ends the busy spell with one `NeedsUser(Finished)`,
-/// after `TurnsChanged`, carrying the spell's generation — and once.
+/// A reply that calls `notify_user` with `message` (SME-377).
+fn notify_body(message: &str) -> String {
+    super::ask_user::tool_calls_body(&[("toolu_notify", "notify_user", serde_json::json!({ "message": message }))])
+}
+
+/// T3 (SME-377): a turn whose reply calls `notify_user` ends there — one
+/// model request, not a second after the result — and the busy spell
+/// ends with one `NeedsUser(Notified)`, after `TurnsChanged`, carrying
+/// the spell's generation, and `get_attention` answers with the model's
+/// message. (SME-71's ordering checks, kept from the Finished test this
+/// replaced.)
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_a_finished_turn_publishes_needs_user_finished_once_after_turns_changed(pool: PgPool) {
+async fn test_a_notify_user_turn_ends_and_publishes_needs_user_notified_once_after_turns_changed(pool: PgPool) {
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("conversation");
-    start_mock_upstream(&pool, vec![done_body("Done.")]).await;
+    // A second body, so a turn that doesn't end on the call asks again
+    // and ends on the plain reply, rather than calling notify_user forever.
+    let requests = start_mock_upstream(&pool, vec![notify_body("Built and tested"), done_body("And again.")]).await;
     // The one stream a chat tab reads, alive before the busy spell so
     // every kind of it lands on one merged view (SME-71 review 1).
     let relay = conversation_relay(conversation.id, events::subscribe(conversation.id), events::subscribe_app());
@@ -100,12 +110,17 @@ async fn test_a_finished_turn_publishes_needs_user_finished_once_after_turns_cha
 
     start_turn(pool.clone(), conversation.id, "hi".to_string()).await.expect("send");
     let (attention, generation) = wait_needs_user(&recording, conversation.id).await;
-    assert_eq!(attention, events::Attention::Finished);
+    assert_eq!(attention, events::Attention::Notified);
     // Once: nothing more for a while after the first.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let seen = needs_user_of(&recording, conversation.id);
     assert_eq!(seen.len(), 1, "one NeedsUser per busy spell, saw {seen:?}");
     assert_eq!(generation, turn_generation(conversation.id), "the spell's generation");
+    assert_eq!(requests.load(Ordering::SeqCst), 1, "notify_user ends the turn: no model call after its result");
+    let details = crate::api::notifications::attention_details(&pool, conversation.id, generation, events::Attention::Notified)
+        .await
+        .expect("get_attention");
+    assert_eq!(details.and_then(|d| d.message), Some("Built and tested".to_string()), "the model's message");
     // The ordering the plan pins. The recording is this thread's own
     // publish list, so this is the publish order itself: both
     // `TurnsChanged`s — the busy spell's, then the idle one — come
@@ -172,10 +187,25 @@ async fn test_a_finished_turn_publishes_needs_user_finished_once_after_turns_cha
     events::forget(conversation.id);
 }
 
-/// The answer's own turn, replying, ends Finished (the plan's list names
-/// `answer_question` as one of the four callers).
+/// T2 (SME-377), the user's complaint: a turn that only replies notes
+/// nothing by itself. Here the user's send; the three tests below are
+/// the other callers that reached the automatic Finished.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_an_answer_turn_that_replies_publishes_finished(pool: PgPool) {
+async fn test_a_send_turn_that_only_replies_publishes_nothing(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    start_mock_upstream(&pool, vec![done_body("Done.")]).await;
+    let recording = events::AppRecording::start();
+
+    start_turn(pool.clone(), conversation.id, "hi".to_string()).await.expect("send");
+    let seen = published_after_done(&recording, conversation.id).await;
+    assert!(seen.is_empty(), "a plain reply notifies nothing, saw {seen:?}");
+}
+
+/// The answer's own turn, replying: nothing (T2).
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_answer_turn_that_only_replies_publishes_nothing(pool: PgPool) {
     use crate::questions::QuestionAnswer;
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
@@ -204,13 +234,13 @@ async fn test_an_answer_turn_that_replies_publishes_finished(pool: PgPool) {
     )
     .await
     .expect("answer");
-    let (attention, _) = wait_needs_user(&recording, conversation.id).await;
-    assert_eq!(attention, events::Attention::Finished);
+    let seen = published_after_done(&recording, conversation.id).await;
+    assert!(seen.is_empty(), "an answer's plain reply notifies nothing, saw {seen:?}");
 }
 
-/// A delivered notice whose turn replies: Finished, for `deliver_notice`.
+/// A delivered notice whose turn replies: nothing, for `deliver_notice` (T2).
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_a_notice_turn_that_replies_publishes_finished(pool: PgPool) {
+async fn test_a_notice_turn_that_only_replies_publishes_nothing(pool: PgPool) {
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("conversation");
@@ -218,14 +248,15 @@ async fn test_a_notice_turn_that_replies_publishes_finished(pool: PgPool) {
     let recording = events::AppRecording::start();
 
     deliver_notice(&pool, conversation.id, "Terminal command cmd-1 finished: exit code 0.".to_string()).await;
-    let (attention, _) = wait_needs_user(&recording, conversation.id).await;
-    assert_eq!(attention, events::Attention::Finished);
+    let seen = published_after_done(&recording, conversation.id).await;
+    assert!(seen.is_empty(), "a notice's plain reply notifies nothing, saw {seen:?}");
 }
 
-/// A wake with a pending command notice, replying: Finished — the real
-/// end of the command the user waited on.
+/// A wake with a pending command notice, replying: nothing (T2) — the
+/// ticket's case, a model waking on its command's end. Only its own
+/// `notify_user` would tell the user.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_a_wake_turn_that_replies_publishes_finished(pool: PgPool) {
+async fn test_a_wake_turn_that_only_replies_publishes_nothing(pool: PgPool) {
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("conversation");
@@ -234,8 +265,8 @@ async fn test_a_wake_turn_that_replies_publishes_finished(pool: PgPool) {
     let recording = events::AppRecording::start();
 
     wake_conversation(&pool, conversation.id).await.expect("wake");
-    let (attention, _) = wait_needs_user(&recording, conversation.id).await;
-    assert_eq!(attention, events::Attention::Finished);
+    let seen = published_after_done(&recording, conversation.id).await;
+    assert!(seen.is_empty(), "a wake's plain reply notifies nothing, saw {seen:?}");
 }
 
 /// The ticket's reason to exist: an `ask_user` pauses the conversation,
@@ -251,13 +282,7 @@ async fn test_an_asked_question_publishes_needs_user_question(pool: PgPool) {
     start_turn(pool.clone(), conversation.id, "hi".to_string()).await.expect("send");
     let (attention, _) = wait_needs_user(&recording, conversation.id).await;
     assert_eq!(attention, events::Attention::Question);
-    // Exactly one, and it's the Question: the turn's Ok end saves the
-    // ask_user reply too. Honest reach (review 1): this count cannot pin
-    // the wait-aware rule — if the Ok arm did note a Finished, `max`
-    // coalesces it under the Question and the spell still publishes this
-    // one event — so this test never goes red on that mutation. The
-    // red-capable pin of the ruling is the ask_parent test below: no
-    // Question is noted there, and a Finished would show plain.
+    // Exactly one, and it's the Question, noted at `ask`.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let seen = needs_user_of(&recording, conversation.id);
     assert_eq!(seen.len(), 1, "one Question, nothing alongside, saw {seen:?}");
@@ -266,8 +291,6 @@ async fn test_an_asked_question_publishes_needs_user_question(pool: PgPool) {
 
 /// The ruling's first path: a child's turn ending on `ask_parent` waits
 /// on its parent, not the user — the busy spell ends owing nothing.
-/// (Red on the pre-ruling code: a Finished arrives for the saved
-/// tool_use reply within seconds.)
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_turn_ending_on_ask_parent_publishes_nothing(pool: PgPool) {
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -471,3 +494,4 @@ fn test_turn_generation_is_zero_with_no_entry_and_follows_the_takers() {
 
 mod failures;
 mod idle_notice;
+mod notify_user;

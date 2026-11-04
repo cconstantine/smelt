@@ -5,7 +5,7 @@ use super::*;
 
 /// A reply cut off at its budget gets the notice, and the spell ends
 /// CutOff even though the turn itself ended Ok (the maximum at work:
-/// CutOff outranks Finished).
+/// CutOff is noted at the reply, whatever the turn's end).
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_cut_off_reply_publishes_cutoff(pool: PgPool) {
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -120,32 +120,38 @@ async fn test_exceeding_max_turns_publishes_failed(pool: PgPool) {
     assert_eq!(attention, events::Attention::Failed);
 }
 
-/// The maximum, not the last word: a Failed early in a busy spell is
-/// what ends it, whatever replies come after in the same spell.
+/// The maximum, not the last word: a Failed in a busy spell is what ends
+/// it, whatever the model's `notify_user` said earlier in the same spell
+/// (T5, SME-377): the message is dropped with the Notified it rode.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_failed_beats_a_later_finished_in_one_busy_spell(pool: PgPool) {
+async fn test_failed_beats_an_earlier_notify_user_in_one_busy_spell(pool: PgPool) {
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let recording = events::AppRecording::start();
 
-    // Two turns, one spell: the first notes Failed (a failing run's end),
-    // the second notes Finished after it (a reply saved). With a plain
-    // overwrite the spell would end Finished; the maximum keeps Failed.
+    // Two turns, one spell: the first notes Notified (the model's call),
+    // the second Failed after it (a failing run's end). With a plain
+    // overwrite in the other order the spell would end Notified; the
+    // maximum keeps Failed.
     let first = TurnInFlight::start(conversation.id);
-    note_attention(conversation.id, events::Attention::Failed);
+    note_notified(conversation.id, "All done".to_string());
     let second = TurnInFlight::start(conversation.id);
-    note_attention(conversation.id, events::Attention::Finished);
+    note_attention(conversation.id, events::Attention::Failed);
     drop(first);
     assert!(needs_user_of(&recording, conversation.id).is_empty(), "nothing while a turn is still in flight");
     drop(second);
+    let generation = turn_generation(conversation.id);
     let seen = needs_user_of(&recording, conversation.id);
-    assert_eq!(seen, vec![(events::Attention::Failed, turn_generation(conversation.id))]);
+    assert_eq!(seen, vec![(events::Attention::Failed, generation)]);
+    assert_eq!(published_notice(conversation.id, generation), None, "the outranked message isn't kept");
 }
 
 /// The SME-73 pair, first half: a turn that overflows once, compacts and
-/// answers ends Finished — the recovery's refused call notes no Failed.
+/// answers is a normal ending — the recovery's refused call notes no
+/// Failed, so the spell publishes nothing (SME-377: a plain reply notes
+/// nothing by itself).
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_a_turn_that_overflows_once_publishes_finished_not_failed(pool: PgPool) {
+async fn test_a_turn_that_overflows_once_publishes_nothing_not_failed(pool: PgPool) {
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     super::overflow::start_refusal_mock(
@@ -167,10 +173,8 @@ async fn test_a_turn_that_overflows_once_publishes_finished_not_failed(pool: PgP
     let recording = events::AppRecording::start();
 
     run_turn(&pool, conversation.id, hello()).await.expect("the refusal recovers through a compaction");
-    let (attention, _) = wait_needs_user(&recording, conversation.id).await;
-    assert_eq!(attention, events::Attention::Finished, "a recovered overflow is a normal ending");
-    let seen = needs_user_of(&recording, conversation.id);
-    assert_eq!(seen.len(), 1, "one Finished for the spell, no Failed alongside: {seen:?}");
+    let seen = published_after_done(&recording, conversation.id).await;
+    assert!(seen.is_empty(), "a recovered overflow is a normal ending, no Failed: {seen:?}");
 }
 
 /// The SME-73 pair, second half: a turn refused a second time fails —

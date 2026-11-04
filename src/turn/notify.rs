@@ -196,11 +196,11 @@ pub(super) async fn drain_unnotified_terminal_commands(
     Ok(())
 }
 
-/// The idle notice's own fixed words: the clause that tells one apart from
-/// every other saved `user` message. Written only by the one `format!` in
-/// `drain_idle_command_notices`, read only by `saved_idle_notice` — an
-/// idle-notice turn carries no other marker, so this sentence *is* it
-/// (SME-370). Re-wording the notice must keep this matching: wake's
+/// The idle notice's own fixed words, written only by the one `format!` in
+/// `drain_idle_command_notices`. Nothing on the server reads it since
+/// SME-377 removed the automatic Finished that `saved_idle_notice` (SME-370)
+/// used it to quiet; the transcript's short line still splits the stored
+/// sentence on a copy of it. Re-wording the notice must keep the two matching: wake's
 /// `test_wake_drains_an_idle_notice_and_the_command_keeps_running` pins
 /// the sentence in parts and pins this clause as the test's own literal —
 /// never through this const, which could never go red for guarding it —
@@ -259,28 +259,6 @@ pub(super) async fn drain_idle_command_notices(
         record_saved(conversation_id, persisted, saved);
     }
     Ok(())
-}
-
-/// Whether this turn saved an idle notice among its persisted messages:
-/// any saved **user** message with a Text block carrying
-/// `IDLE_NOTICE_FRAGMENT`. A turn that drained one owes the user no
-/// `Finished` at its end (SME-370) — it is smelt telling itself about a
-/// command that keeps running, every interval, not an answer awaited.
-/// Text blocks only, the notice's own shape: tool results ride user-role
-/// too, and one merely *echoing* the sentence — a grep of this file is the
-/// way — is no notice (SME-370 review 1); the role check likewise drops an
-/// assistant reply quoting it, and unparseable content matches nothing.
-#[cfg(feature = "server")]
-pub(super) fn saved_idle_notice(persisted: &[Message]) -> bool {
-    persisted.iter().any(|m| {
-        m.role == "user"
-            && m.blocks().is_ok_and(|blocks| {
-                blocks.iter().any(|b| {
-                    matches!(b, anthropic::ContentBlock::Text { text }
-                        if text.contains(IDLE_NOTICE_FRAGMENT))
-                })
-            })
-    })
 }
 
 /// Drains the reports and notices queued to `conversation_id`
