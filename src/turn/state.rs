@@ -586,6 +586,19 @@ pub(super) fn note_attention(conversation_id: i64, a: crate::events::Attention) 
     });
 }
 
+/// Drops a child's owed Failed, CutOff or Refused (SME-386 N6): its
+/// parent is told — the report, or the failure `after_last_turn` sends —
+/// and reports to the user. A Question stands: a trust card the child
+/// filed waits on the user, not the parent.
+pub(super) fn forgo_child_outcome(conversation_id: i64) {
+    use crate::events::Attention;
+    update_existing(conversation_id, |runtime| {
+        if matches!(runtime.attention, Some(Attention::Failed | Attention::CutOff | Attention::Refused)) {
+            runtime.attention = None;
+        }
+    });
+}
+
 /// Empties `conversation_id`'s owed attention: a Stop clears what the
 /// busy spell owed (the user is there), and `admit` starts a new spell
 /// clean.

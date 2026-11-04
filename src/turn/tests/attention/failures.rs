@@ -275,3 +275,28 @@ async fn test_a_repeat_failed_from_notice_turns_is_suppressed_until_the_user_wri
     assert_eq!(seen[1].0, events::Attention::Failed);
     forget_conversation_lock(conversation.id);
 }
+
+/// N6 (SME-386, Decided by the PM): a child's Failed or CutOff reaches the
+/// user through its parent — the report — and the child itself notifies
+/// nothing. (Red before the fix: the child's failed notice turn publishes
+/// Failed, its cut-off one CutOff.)
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_childs_failed_or_cut_off_turn_notifies_nothing(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let parent = db::create_conversation(&pool).await.expect("parent");
+    let failing = active_child(&pool, parent.id).await;
+    let cut_off = active_child(&pool, parent.id).await;
+    let recording = events::AppRecording::start();
+
+    start_mock_upstream_failing_n_times(&pool, 100, None).await;
+    deliver_notice(&pool, failing, "a notice".to_string()).await;
+    let half = text_reply_body("half a reply").replace(r#""stop_reason":"end_turn""#, r#""stop_reason":"max_tokens""#);
+    start_mock_upstream(&pool, vec![half]).await;
+    deliver_notice(&pool, cut_off, "a notice".to_string()).await;
+
+    assert_eq!(published_after_done(&recording, failing).await, vec![], "the failed child notifies nothing");
+    assert_eq!(published_after_done(&recording, cut_off).await, vec![], "the cut-off child notifies nothing");
+    forget_conversation_lock(failing);
+    forget_conversation_lock(cut_off);
+}

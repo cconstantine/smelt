@@ -1,6 +1,6 @@
 # Desktop notifications (SME-71)
 
-When a conversation needs the user — a question or a repo trust card, a failed turn, a reply cut off or refused, or the model calling `notify_user` to say it's done (SME-377; a turn ending notifies nothing by itself) — smelt says so: a desktop notification from one smelt tab (on any page), and a count in each chat tab's title. The server side (who owes what, and `get_attention`) is in [api/events.md](../api/events.md#app-wide-events-and-pods); this file is the browser's half.
+When a conversation needs the user — a question or a repo trust card, a failed turn, a reply cut off or refused (a root's: a child's goes to its parent, which reports it, SME-386 N6), or the model calling `notify_user` to say it's done (SME-377; a turn ending notifies nothing by itself) — smelt says so: a desktop notification from one smelt tab (on any page), and a count in each chat tab's title. The server side (who owes what, and `get_attention`) is in [api/events.md](../api/events.md#app-wide-events-and-pods); this file is the browser's half.
 
 ## One leader per browser, by Web Lock
 
