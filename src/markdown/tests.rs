@@ -561,3 +561,96 @@ fn test_very_deep_nesting_and_long_input_parse() {
     let long = "word ".repeat(20_000);
     assert_eq!(parse(&long).len(), 1);
 }
+
+/// Every conversation reference in a parsed reply, in document order.
+fn refs_in(source: &str) -> Vec<(i64, String)> {
+    fn inlines(content: &[Inline], out: &mut Vec<(i64, String)>) {
+        for inline in content {
+            match inline {
+                Inline::ConversationRef { id, words } => out.push((*id, words.clone())),
+                Inline::Emphasis(c) | Inline::Strong(c) | Inline::Strike(c) => inlines(c, out),
+                _ => {}
+            }
+        }
+    }
+    fn blocks(content: &[Block], out: &mut Vec<(i64, String)>) {
+        for block in content {
+            match block {
+                Block::Paragraph(c) | Block::Plain(c) | Block::Heading { content: c, .. } => inlines(c, out),
+                Block::Quote(inner) => blocks(inner, out),
+                Block::List { items, .. } => items.iter().for_each(|i| blocks(&i.blocks, out)),
+                Block::Table { head, rows } => {
+                    head.iter().chain(rows.iter().flatten()).for_each(|cell| inlines(cell, out))
+                }
+                Block::Code { .. } | Block::Rule | Block::Html(_) => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    blocks(&parse(source), &mut out);
+    out
+}
+
+fn ref_pair(id: i64, words: &str) -> (i64, String) {
+    (id, words.to_string())
+}
+
+/// SME-384: an `agent #N` reference splits the text like a link, keeping
+/// the words the writer wrote, and both keywords link at any case.
+#[test]
+fn test_a_conversation_reference_becomes_a_link() {
+    assert_eq!(
+        parse("report from agent #1234:"),
+        vec![Block::Paragraph(vec![
+            text("report from "),
+            Inline::ConversationRef { id: 1234, words: "agent #1234".into() },
+            text(":"),
+        ])]
+    );
+    assert_eq!(
+        refs_in("Agent #12 told conversation #341 all about it."),
+        vec![ref_pair(12, "Agent #12"), ref_pair(341, "conversation #341")]
+    );
+}
+
+/// SME-384: references link inside every block that holds text, as bare
+/// URLs do (SME-104).
+#[test]
+fn test_references_link_inside_blocks() {
+    let source = "- agent #1\n\n> conversation #2\n\n| h |\n|---|\n| agent #3 |\n";
+    assert_eq!(
+        refs_in(source),
+        vec![ref_pair(1, "agent #1"), ref_pair(2, "conversation #2"), ref_pair(3, "agent #3")]
+    );
+}
+
+/// SME-384: the autolink pass's skips are the references' skips — code
+/// spans, fenced and indented blocks, an existing link's words and a
+/// shown image's alt text — and text `MAX_DEPTH` deep in formatting
+/// stays text rather than taking the tree deeper.
+#[test]
+fn test_references_skip_code_links_and_deep_text() {
+    for source in [
+        "`agent #1234`",
+        "```\nagent #1234\n```\n",
+        "    agent #1234\n",
+        "[agent #1234](https://e.com)",
+        "https://e.com/#1234",
+        "![conversation #1](https://e.com/a.png)",
+        "subagent #12 and agent 1234 and #1234 and agent #0",
+    ] {
+        assert_eq!(refs_in(source), Vec::new(), "{source:?}");
+    }
+    // The link in the list keeps its words untouched, reference and all.
+    assert_eq!(
+        parse("[agent #1234](https://e.com)"),
+        vec![Block::Paragraph(vec![link("https://e.com", "agent #1234")])]
+    );
+    let stars = "*".repeat(2_000);
+    let deep = format!("{stars}agent #1234{stars}");
+    assert_eq!(refs_in(&deep), Vec::new());
+    assert!(format!("{:?}", parse(&deep)).contains("agent #1234"), "the words survive as text");
+    // One level shallower, there's room for the reference.
+    let fifteen = (0..MAX_DEPTH - 1).fold("agent #12".to_string(), |inner, _| format!("*x {inner} y*"));
+    assert_eq!(refs_in(&fifteen), vec![ref_pair(12, "agent #12")]);
+}

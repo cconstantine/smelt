@@ -6,14 +6,17 @@
 //! so nothing here builds an HTML string or sets `dangerous_inner_html`:
 //! raw HTML in a reply comes out as literal text, a link (written as one,
 //! or a bare URL or email address `autolink` finds) only becomes an
-//! `<a>` for `http`, `https` and `mailto`, and an image only loads for
-//! `http`/`https`. See docs/frontend.md, "Markdown in replies", for what
+//! `<a>` for `http`, `https` and `mailto`, an `agent #N` /
+//! `conversation #N` reference links only through the router to a
+//! conversation (SME-384), and an image only loads for `http`/`https`.
+//! See docs/frontend.md, "Markdown in replies", for what
 //! this boundary covers and what it doesn't.
 
 use dioxus::prelude::*;
 use linkify::{LinkFinder, LinkKind};
 use pulldown_cmark::{CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd};
 
+use crate::frontend::Route;
 use crate::highlight::{self, Span};
 
 /// A block in a reply.
@@ -57,6 +60,10 @@ pub enum Inline {
     /// Only for `http`/`https` sources; any other image is replaced by its
     /// alt text.
     Image { url: String, alt: String },
+    /// An `agent #N` or `conversation #N` reference to another
+    /// conversation (SME-384), shown as a router link to it. `words` are
+    /// the matched words as the writer wrote them.
+    ConversationRef { id: i64, words: String },
     SoftBreak,
     HardBreak,
 }
@@ -67,7 +74,8 @@ pub enum Inline {
 pub const MAX_DEPTH: usize = 16;
 
 /// Parses a reply into blocks. Adjacent text is merged into one
-/// `Inline::Text`.
+/// `Inline::Text`, except where the `autolink` pass splits it into links
+/// and conversation references.
 pub fn parse(source: &str) -> Vec<Block> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
@@ -99,6 +107,12 @@ pub fn parse(source: &str) -> Vec<Block> {
 /// alt text and an allowed link's words are left alone, so a link never
 /// nests in a link; a refused link or image is plain text by now, so a URL
 /// in its words is linked like any other.
+///
+/// The same text pass also splits `agent #N` / `conversation #N`
+/// conversation references into `Inline::ConversationRef`s that link to
+/// that conversation (SME-384, `crate::agent_refs`), so they inherit
+/// every skip above; their link is built by the router, never from the
+/// reply's text.
 fn autolink(blocks: &mut [Block]) {
     let mut www = LinkFinder::new();
     www.kinds(&[LinkKind::Url]).url_must_have_scheme(false);
@@ -168,8 +182,9 @@ fn split_links(text: &str, finder: &Finders, out: &mut Vec<Inline>) {
             }
             Some(LinkKind::Email) if let Some(url) = mailto(found) => push_link(out, url, found),
             // A URL with another scheme, or one that wouldn't go where it
-            // says, stays text, all of it.
-            Some(_) => push_inline(out, Inline::Text(found.to_string())),
+            // says, stays text, all of it (but its conversation references
+            // still link, `push_text`).
+            Some(_) => push_text(out, found),
             None => {
                 for gap in finder.www.spans(found) {
                     let words = gap.as_str();
@@ -179,11 +194,30 @@ fn split_links(text: &str, finder: &Finders, out: &mut Vec<Inline>) {
                     {
                         push_link(out, format!("https://{words}"), words);
                     } else {
-                        push_inline(out, Inline::Text(words.to_string()));
+                        push_text(out, words);
                     }
                 }
             }
         }
+    }
+}
+
+/// Pushes `text` as text, split at any conversation reference
+/// (SME-384): `agent_refs::find` turns `agent #N` / `conversation #N`
+/// into `Inline::ConversationRef`s and the rest into `Inline::Text`, so
+/// the split rides this same walk and inherits its skips — code spans,
+/// blocks, alt text and an allowed link's words never reach here, and
+/// text already `MAX_DEPTH` deep is not split (`autolink_inlines`).
+/// Text with no reference pushes one `Text`, and adjacent texts still
+/// merge in `push_inline`.
+fn push_text(out: &mut Vec<Inline>, text: &str) {
+    for segment in crate::agent_refs::find(text) {
+        push_inline(out, match segment {
+            crate::agent_refs::Segment::Text(t) => Inline::Text(t.to_string()),
+            crate::agent_refs::Segment::Conversation { words, id } => {
+                Inline::ConversationRef { id, words: words.to_string() }
+            }
+        });
     }
 }
 
@@ -297,6 +331,7 @@ fn plain_text(inline: &Inline, out: &mut String) {
             }
         }
         Inline::Image { alt, .. } => out.push_str(alt),
+        Inline::ConversationRef { words, .. } => out.push_str(words),
         Inline::SoftBreak | Inline::HardBreak => out.push(' '),
     }
 }
@@ -720,6 +755,10 @@ fn render_inline(key: usize, inline: &Inline, media: Media) -> Element {
         },
         Inline::SoftBreak => rsx! { span { key: "{key}", " " } },
         Inline::HardBreak => rsx! { br { key: "{key}" } },
+        Inline::ConversationRef { id, words } => rsx! {
+            // The href comes from the router, never from the reply's text.
+            Link { key: "{key}", class: "agent-ref", to: Route::ConversationRoute { id: *id }, "{words}" }
+        },
     }
 }
 
