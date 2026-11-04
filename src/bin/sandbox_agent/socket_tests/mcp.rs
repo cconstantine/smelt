@@ -285,3 +285,20 @@ fn test_a_chunked_answer_is_read_whole() {
     let answer = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n{\"a\"\r\n3\r\n:1}\r\n0\r\n\r\n";
     assert_eq!(cli::parse_response(answer), Some((200, r#"{"a":1}"#.to_string())));
 }
+
+/// Review round 1, L6: an answer as large as smelt sends (its 8 MiB body
+/// cap, escaped inside the message) arrives whole. axum's default 16 MiB
+/// frame limit closed the connection on it.
+#[tokio::test]
+async fn test_a_large_answer_reaches_the_script_whole() {
+    let (addr, path, _state) = serve_agent_with_socket("large").await;
+    let mut smelt = connect_ready(addr).await;
+    let call = tokio::spawn(async move { script(&path, call_request(r#"{"tool":"a/b"}"#)).await });
+    let (call_id, _, _) = next_mcp_request(&mut smelt).await;
+    // 9 MiB of quotes: about 18 MiB once escaped into the message.
+    let body = format!("{{\"text\":\"{}\"}}", "\\\"".repeat(9 << 19));
+    answer(&mut smelt, call_id, 200, &body).await;
+    let (status, got) = tokio::time::timeout(WAIT * 4, call).await.expect("answered").expect("join");
+    assert_eq!(status, 200, "{}", &got[..got.len().min(200)]);
+    assert_eq!(got.len(), body.len());
+}

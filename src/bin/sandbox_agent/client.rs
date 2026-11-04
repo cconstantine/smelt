@@ -41,8 +41,17 @@ pub(super) fn router(state: Arc<AppState>) -> Router {
     Router::new().route("/ws", get(ws_handler)).with_state(state)
 }
 
+/// The largest message (and frame) the agent takes from smelt (SME-359
+/// review round 1, L6): above the largest `mcp_response` smelt sends
+/// (`script_mcp::MAX_RESPONSE_MESSAGE_BYTES`, 24 MiB, an 8 MiB body
+/// escaped into it). axum's default frame limit, 16 MiB, closed the
+/// connection on one.
+pub(super) const MAX_MESSAGE_BYTES: usize = 32 << 20;
+
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    ws.max_message_size(MAX_MESSAGE_BYTES)
+        .max_frame_size(MAX_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_socket(socket, state))
 }
 
 impl AppState {

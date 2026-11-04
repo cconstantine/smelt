@@ -64,10 +64,30 @@ pub(super) fn spawn_request(pool: PgPool, conn: Arc<TerminalConnection>, call_id
     tokio::spawn(async move {
         let caller = Caller { conversation_id: conn.conversation_id, pod_id: conn.pod_id, command_id: command_id.as_deref() };
         let answer = handle(&pool, caller, request).await;
-        if let Err(e) = conn.send(&ClientMessage::McpResponse { call_id, status: answer.status, body: answer.body }) {
-            tracing::debug!(call_id, error = %e, "the script's MCP call ended after its connection did; its answer is dropped");
+        if conn.outgoing.send(response_message(call_id, answer)).is_err() {
+            tracing::debug!(call_id, "the script's MCP call ended after its connection did; its answer is dropped");
         }
     });
+}
+
+/// The most of one `mcp_response` message, serialized (SME-359 review
+/// round 1, L6): an 8 MiB body can about double once escaped into it.
+/// The agent takes up to 32 MiB (its `MAX_MESSAGE_BYTES`).
+pub(crate) const MAX_RESPONSE_MESSAGE_BYTES: usize = 24 << 20;
+
+/// `answer` as the `mcp_response` text for `call_id`, measured once it is
+/// serialized: one past `MAX_RESPONSE_MESSAGE_BYTES` becomes a 502 that
+/// says so, rather than a message the agent would refuse.
+pub(crate) fn response_message(call_id: u64, answer: Answer) -> String {
+    let text = serde_json::to_string(&ClientMessage::McpResponse { call_id, status: answer.status, body: answer.body }).unwrap_or_default();
+    if text.len() <= MAX_RESPONSE_MESSAGE_BYTES {
+        return text;
+    }
+    let too_large = Answer::error(
+        502,
+        format!("the answer is {} bytes once sent to the sandbox, over the {MAX_RESPONSE_MESSAGE_BYTES}-byte limit", text.len()),
+    );
+    serde_json::to_string(&ClientMessage::McpResponse { call_id, status: too_large.status, body: too_large.body }).unwrap_or_default()
 }
 
 /// One request's answer, in a `script mcp call` span: the conversation,

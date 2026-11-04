@@ -506,3 +506,18 @@ async fn test_a_listing_takes_a_rate_token(pool: PgPool) {
     assert_eq!((first.status, second.status, call.status), (200, 429, 429), "{second:?}");
     assert!(second.body.contains("retry_after_secs"), "{}", second.body);
 }
+
+/// Review round 1, L6: the size cap is measured on the message the agent
+/// gets, after the body's escaping, not on the body alone.
+#[test]
+fn test_an_answer_too_large_once_serialized_becomes_a_502() {
+    // Under the body's 8 MiB cap, but every quote doubles when escaped.
+    let quotes = Answer { status: 200, body: "\"".repeat(13 << 20) };
+    let text = response_message(7, quotes);
+    assert!(text.len() <= MAX_RESPONSE_MESSAGE_BYTES, "{} bytes", text.len());
+    let message: crate::agent_protocol::ClientMessage = serde_json::from_str(&text).expect("a message");
+    let crate::agent_protocol::ClientMessage::McpResponse { call_id: 7, status: 502, body } = message else { panic!("not a 502: {}", &text[..200]) };
+    assert!(body.contains("bytes"), "{body}");
+    let small = response_message(8, Answer { status: 200, body: "{}".into() });
+    assert_eq!(small, r#"{"action":"mcp_response","call_id":8,"status":200,"body":"{}"}"#);
+}
