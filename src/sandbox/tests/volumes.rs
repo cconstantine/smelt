@@ -310,10 +310,10 @@ fn test_model_volume_mount_path_refuses_reserved_directories() {
     );
     // What merely sits next to a reserved directory isn't under it. (`/etc/…`
     // itself always is: `/etc` is on the list.)
+    // (`/run/…` always is too, since SME-359's review round 1: `/run` is.)
     for allowed in [
-        "/run/docker-sock-x",
-        "/run/docker-x",
-        "/run/containerd-x",
+        "/runx",
+        "/run-extra",
         "/var/lib/dockerx",
         "/workspace-x",
         "/lib64-extra",
@@ -360,5 +360,36 @@ fn test_the_create_volume_description_names_every_reserved_dir() {
     };
     for dir in RESERVED_MODEL_MOUNT_DIRS {
         assert!(names(dir), "the create_volume description never names {dir} as a reserved path: {description}");
+    }
+}
+
+/// Review round 1 of SME-359, L1: the agent's MCP socket lives in
+/// `/run/smelt`, so no volume, a model's or a global one, may be mounted
+/// at or over it, or over `/run`, which holds it and Docker's socket.
+#[test]
+fn test_a_model_volume_cant_be_mounted_over_run_or_the_mcp_socket() {
+    for path in ["/run/smelt", "/run/smelt/sub", "/run", "/run/other"] {
+        assert!(model_volume_mount_path(path).is_err(), "{path} should be refused");
+    }
+}
+
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_create_volume_refuses_a_reserved_mount_path_before_saving_it(pool: PgPool) {
+    for path in ["/run/smelt", "/run", "/run/x"] {
+        let result = create_volume(&pool, "cache", path).await;
+        assert!(matches!(result, Err(SandboxError::InvalidMountPath(_))), "{path}: expected InvalidMountPath, got {result:?}");
+    }
+    assert!(db::list_sandbox_volumes(&pool).await.expect("list volumes").is_empty());
+}
+
+/// A global volume is the user's choice: only the runtime directories
+/// around the agent's socket are refused for one, not the model's whole
+/// list, so a shared volume under /workspace is fine. (MANAGER is unset
+/// here, so a path that passes stops at the manager instead.)
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_create_volume_accepts_a_global_volume_outside_run(pool: PgPool) {
+    for path in ["/workspace/shared", "/etc/smelt/keys", "/usr/local/cache", "/runx"] {
+        let result = create_volume(&pool, "cache", path).await;
+        assert!(!matches!(result, Err(SandboxError::InvalidMountPath(_))), "{path}: refused as {result:?}");
     }
 }

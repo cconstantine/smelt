@@ -51,6 +51,7 @@ fn test_sandbox_command_entry(command_id: &str, command: &str) -> SandboxCommand
         status: "running".to_string(),
         exit_code: None,
         output: Vec::new(),
+        mcp_calls: None,
     }
 }
 

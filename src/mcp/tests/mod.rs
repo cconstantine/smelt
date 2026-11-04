@@ -147,7 +147,39 @@ impl ServerHandler for MockMcpServer {
 /// `REGISTRY`, bypassing `connect()`'s HTTP-specific transport
 /// construction.
 async fn register_test_connection(server_id: i64, second_tool_disabled: bool) -> MockMcpServer {
-    let server = MockMcpServer::new(second_tool_disabled);
+    register_mock(server_id, MockMcpServer::new(second_tool_disabled)).await
+}
+
+/// For other modules' tests (SME-359): a `static_headers` server row
+/// named `name` with the mock connected under its id, listing `echo`
+/// (unannotated, so destructive) and `second_tool` (read-only). Returns
+/// the row and the mock's count of `tools/call`s. The caller removes it
+/// from `REGISTRY` with [`forget_mock_server`].
+pub(crate) async fn mock_server_for_tests(pool: &sqlx::PgPool, name: &str) -> (McpServerConfig, Arc<AtomicU32>) {
+    let id = next_server_id(pool).await;
+    let config = crate::db::create_mcp_server_config(pool, name, "http://unused.invalid/mcp", &HashMap::new(), "static_headers", None, None)
+        .await
+        .expect("create mcp server config");
+    assert_eq!(config.id, id);
+    let server = MockMcpServer::new(true);
+    // Before it's served, so no `tools/list_changed` marks the list stale.
+    server.router.write().await.enable_route("second_tool");
+    // `hang` listed too, so a script may call it (it may call only listed
+    // tools): `call_tool` holds it before the router is asked.
+    server.router.write().await.add_route(ToolRoute::new_dyn(
+        rmcp::model::Tool::new("hang", "Never answers", Arc::new(serde_json::from_value(serde_json::json!({"type": "object"})).unwrap())),
+        |_ctx| Box::pin(async { Ok(CallToolResult::default().into()) }),
+    ));
+    let server = register_mock(config.id, server).await;
+    (config, server.calls)
+}
+
+/// Drops a [`mock_server_for_tests`] server's connection.
+pub(crate) async fn forget_mock_server(server_id: i64) {
+    REGISTRY.lock().await.remove(&server_id);
+}
+
+async fn register_mock(server_id: i64, server: MockMcpServer) -> MockMcpServer {
     let (server_transport, client_transport) = tokio::io::duplex(4096);
 
     let server_for_task = server.clone();
@@ -620,3 +652,4 @@ mod classes;
 mod connection;
 mod hanging;
 mod oauth;
+mod redaction;

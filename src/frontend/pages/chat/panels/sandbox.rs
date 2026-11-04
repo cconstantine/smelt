@@ -428,6 +428,10 @@ fn TerminalBody(terminal: SandboxTerminalPanelEntry) -> Element {
                             }
                         }
                     }
+                    // SME-359: what its scripts did with MCP tools.
+                    if let Some(summary) = &command.mcp_calls {
+                        div { class: "sandbox-command-mcp", "{summary.text()}" }
+                    }
                     for (i , line) in command.output.iter().enumerate() {
                         div {
                             key: "line-{i}",

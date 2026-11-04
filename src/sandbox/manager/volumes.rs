@@ -69,6 +69,15 @@ pub async fn create_volume(
 ) -> Result<i64, SandboxError> {
     let resolved_path = resolve_mount_path(mount_path);
     validate_mount_path(&resolved_path).map_err(SandboxError::InvalidMountPath)?;
+    // `/run`, around the agent's MCP socket (SME-359 review round 1, L1):
+    // a global volume there would hide the socket in every pod. Only that:
+    // a global volume is the user's choice, so `/workspace/…` is fine.
+    // Checked at creation; a saved one stands.
+    if let Some(dir) = reserved_global_mount_path(&normalize_mount_path(&resolved_path)) {
+        return Err(SandboxError::InvalidMountPath(format!(
+            "{resolved_path:?} is at or under {dir:?}, which a volume can't be mounted over"
+        )));
+    }
     // Before the row, so a missing manager leaves nothing behind.
     let manager = get()?;
     let instance = db::smelt_instance(pool).await.map_err(SandboxError::Db)?;

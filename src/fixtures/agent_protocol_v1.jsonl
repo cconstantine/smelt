@@ -21,3 +21,6 @@
 {"event":"reply","request_id":8,"result":{"kind":"grep_matched","matches":[{"path":"src/main.rs","line":1,"text":"fn main() {"}],"total":1,"scan_capped":false,"skipped":[{"path":"big.bin","reason":"not valid UTF-8"}]}}
 {"event":"reply","request_id":9,"result":{"kind":"error","message":"file has changed since it was last read"}}
 {"event":"protocol_error","request_id":10,"message":"missing field `path` at line 1 column 40"}
+{"action":"mcp_response","call_id":4,"status":200,"body":"{\"tools\":[]}"}
+{"event":"mcp_request","call_id":4,"command_id":"cmd-7","request":{"kind":"list","server":null}}
+{"event":"mcp_request","call_id":5,"command_id":null,"request":{"kind":"call","body":"{\"tool\":\"linear/list_issues\",\"arguments\":{}}"}}

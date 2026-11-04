@@ -200,6 +200,10 @@ fn one_of_each() -> Vec<ConversationEvent> {
             },
             context_window: 200_000,
         },
+        ConversationEvent::SandboxMcpCalls {
+            command_id: "cmd-1".to_string(),
+            summary: crate::api::mcp_calls::McpCallSummary { calls: 2, tools: vec![("linear/get".to_string(), 2)], refused: 1, ..Default::default() },
+        },
         ConversationEvent::TodoListUpdate {
             items: vec![crate::anthropic::tools::TodoItem {
                 content: "ship it".to_string(),

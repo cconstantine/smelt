@@ -234,6 +234,9 @@ pub(crate) struct PromptEnvironment {
     /// Each configured server, and what it said it is for once a
     /// connection captured its `initialize` handshake (SME-309).
     pub mcp_servers: Vec<crate::mcp::PromptMcpServer>,
+    /// The deployment's rate for scripts' MCP calls (SME-359); `0` when
+    /// they're turned off, and the line saying they exist is left out.
+    pub script_mcp_calls_per_minute: u32,
     /// The conversation's repos (SME-32).
     pub repos: Vec<crate::git::RepoSummary>,
     /// Their loaded `AGENTS.md` files.
@@ -346,6 +349,15 @@ pub(crate) fn system_prompt(env: &PromptEnvironment) -> String {
                 Some(purpose) => prompt.push_str(&format!("  - {} — {}\n", server.name, purpose)),
                 None => prompt.push_str(&format!("  - {}\n", server.name)),
             }
+        }
+        // SME-359: static per deployment, so the cached prompt stays put.
+        if env.script_mcp_calls_per_minute > 0 {
+            prompt.push_str(&format!(
+                "- Scripts in your sandbox can call these MCP tools without a model turn: `smelt-mcp tools` lists them, \
+                 `smelt-mcp call <server>/<tool> '<json arguments>'` calls one and prints its JSON result (or HTTP on the Unix socket \
+                 $SMELT_MCP_SOCKET, POST /v1/call). Your tool rules apply to them as to your own calls, and they are limited to {} calls a minute.\n",
+                env.script_mcp_calls_per_minute
+            ));
         }
     }
     if !env.repos.is_empty() {
@@ -533,6 +545,7 @@ pub(crate) async fn prompt_environment(
         model: model.to_string(),
         volumes,
         mcp_servers,
+        script_mcp_calls_per_minute: crate::sandbox::ScriptMcpLimits::deployment().per_minute,
         repos,
         instructions,
         persona_files,

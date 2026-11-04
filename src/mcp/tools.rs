@@ -342,6 +342,29 @@ pub async fn tool_definitions_for(
     configs: &[McpServerConfig],
     chain: &crate::personas::rules::RuleChain,
 ) -> Vec<ToolDefinition> {
+    offered_tools(pool, configs, chain)
+        .await
+        .iter()
+        .map(|offered| mcp_tool_to_definition(&offered.server, &offered.tool))
+        .collect()
+}
+
+/// One MCP tool `chain` lets a conversation call, with the class it is
+/// judged at: what the model is offered, and what a script in the sandbox
+/// lists (SME-359).
+pub struct OfferedTool {
+    pub server: String,
+    pub tool: McpTool,
+    pub class: ToolClass,
+}
+
+/// [`tool_definitions_for`]'s tools before they become definitions: every
+/// connected server's tools that `chain` allows, each at its judged class.
+pub async fn offered_tools(
+    pool: &sqlx::PgPool,
+    configs: &[McpServerConfig],
+    chain: &crate::personas::rules::RuleChain,
+) -> Vec<OfferedTool> {
     // All servers at once, each given at most `TOOL_LIST_WAIT`. A connect
     // that takes longer carries on in the background (it's spawned, so
     // giving up on it here doesn't cancel it), and its tools show up on a
@@ -442,7 +465,7 @@ pub async fn tool_definitions_for(
                 // SME-241: the conversation's stored chain decides which of
                 // a server's tools it is offered, judged at the class its
                 // call would be judged by.
-                .filter(|tool| {
+                .filter_map(|tool| {
                     // An override set for a different tool under this name
                     // can only narrow it (SME-295).
                     let saved = saved.and_then(|rows| rows.get(tool.name.as_ref())).map(|row| effective_override(row, Some(tool)));
@@ -455,8 +478,8 @@ pub async fn tool_definitions_for(
                     chain
                         .allows_at(crate::personas::rules::ToolRef::Mcp { server: &config.name, tool: tool.name.as_ref() }, class)
                         .is_ok()
+                        .then(|| OfferedTool { server: config.name.clone(), tool: tool.clone(), class })
                 })
-                .map(|tool| mcp_tool_to_definition(&config.name, tool))
                 .collect::<Vec<_>>()
         })
         .collect()

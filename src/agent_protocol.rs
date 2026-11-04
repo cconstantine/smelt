@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// The fixture test fails on any change to an existing message, which is
 /// the reminder.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 1 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion {
@@ -105,6 +105,14 @@ pub enum ClientMessage {
         offset: u32,
         limit: u32,
     },
+    /// The answer to the agent's `mcp_request` with this `call_id`
+    /// (1.1, SME-359): the HTTP status and JSON body the script gets, as
+    /// they are. Only ever sent to an agent that sent the request.
+    McpResponse {
+        call_id: u64,
+        status: u16,
+        body: String,
+    },
 }
 
 /// The agent to smelt. `hello` is always the first message on a connection.
@@ -137,9 +145,31 @@ pub enum AgentMessage {
         request_id: Option<u64>,
         message: String,
     },
+    /// A script in the pod asked for the conversation's MCP tools (1.1,
+    /// SME-359). `call_id` is the agent's own, never reused by one agent
+    /// process; smelt answers with `mcp_response`. `command_id` is the
+    /// terminal command the calling process belongs to, when the agent
+    /// could tell. Nothing in it names a conversation or pod: smelt rules
+    /// it by the connection it came on.
+    McpRequest {
+        call_id: u64,
+        command_id: Option<String>,
+        request: McpRequest,
+    },
     /// An event from an agent on a newer minor. smelt ignores it.
     #[serde(other)]
     Unknown,
+}
+
+/// What a script asked for. The agent reads none of it: a call's body is
+/// the HTTP request body as the script sent it, which smelt parses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum McpRequest {
+    /// `GET /v1/tools`, `?server=` given as `server`.
+    List { server: Option<String> },
+    /// `POST /v1/call`.
+    Call { body: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,6 +286,7 @@ mod tests {
             ClientMessage::ListDirectory { .. } => "list_directory",
             ClientMessage::Glob { .. } => "glob",
             ClientMessage::Grep { .. } => "grep",
+            ClientMessage::McpResponse { .. } => "mcp_response",
         }
     }
 
@@ -266,6 +297,8 @@ mod tests {
             AgentMessage::Exit { .. } => "exit".into(),
             AgentMessage::Reply { result, .. } => format!("reply/{}", reply_tag(result)),
             AgentMessage::ProtocolError { .. } => "protocol_error".into(),
+            AgentMessage::McpRequest { request: McpRequest::List { .. }, .. } => "mcp_request/list".into(),
+            AgentMessage::McpRequest { request: McpRequest::Call { .. }, .. } => "mcp_request/call".into(),
             AgentMessage::Unknown => "unknown".into(),
         }
     }
@@ -296,6 +329,7 @@ mod tests {
         "list_directory",
         "glob",
         "grep",
+        "mcp_response",
     ];
 
     /// `unknown` is only ever parsed, never sent, so it has no example.
@@ -313,6 +347,8 @@ mod tests {
         "reply/grep_matched",
         "reply/error",
         "protocol_error",
+        "mcp_request/list",
+        "mcp_request/call",
     ];
 
     #[test]
@@ -344,6 +380,27 @@ mod tests {
             serde_json::from_str(r#"{"event":"terminal_resized","terminal_id":"1","rows":40}"#)
                 .expect("an unknown event still parses");
         assert_eq!(message, AgentMessage::Unknown);
+    }
+
+    /// What a 1.0 smelt makes of a 1.1 agent's script call (SME-359 T27):
+    /// an event it doesn't know, which it ignores, so the script's wait
+    /// runs out in the agent instead of the connection failing.
+    #[test]
+    fn test_a_mcp_request_from_a_1_1_agent_is_unknown_to_a_1_0_smelt() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        #[serde(tag = "event", rename_all = "snake_case")]
+        enum AgentMessageV1_0 {
+            Hello(ProtocolVersion),
+            #[serde(other)]
+            Unknown,
+        }
+        let line = serde_json::to_string(&AgentMessage::McpRequest {
+            call_id: 3,
+            command_id: None,
+            request: McpRequest::List { server: None },
+        })
+        .expect("serializes");
+        assert_eq!(serde_json::from_str::<AgentMessageV1_0>(&line).expect("parses"), AgentMessageV1_0::Unknown);
     }
 
     #[test]

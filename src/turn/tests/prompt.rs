@@ -25,6 +25,7 @@ pub(super) fn prompt_env() -> PromptEnvironment {
                 purpose: Some("Repos, issues and pull requests.".to_string()),
             },
         ],
+        script_mcp_calls_per_minute: 60,
         repos: Vec::new(),
         instructions: Vec::new(),
         persona_files: Default::default(),
@@ -700,4 +701,19 @@ async fn test_the_environment_section_names_no_credential_value(pool: PgPool) {
     for leaked in ["SECRET-VALUE-MUST-NOT-APPEAR", "SECR"] {
         assert!(!prompt.contains(leaked), "{leaked} reached the prompt");
     }
+}
+
+const SCRIPT_MCP_LINE: &str = "- Scripts in your sandbox can call these MCP tools without a model turn: `smelt-mcp tools` lists them, \
+    `smelt-mcp call <server>/<tool> '<json arguments>'` calls one and prints its JSON result (or HTTP on the Unix socket \
+    $SMELT_MCP_SOCKET, POST /v1/call). Your tool rules apply to them as to your own calls, and they are limited to 60 calls a minute.\n";
+
+/// SME-359 T15: the line saying scripts can call MCP tools comes with the
+/// servers, and goes when the deployment turns script calls off.
+#[test]
+fn test_the_environment_says_scripts_can_call_mcp_tools() {
+    assert!(system_prompt(&prompt_env()).contains(SCRIPT_MCP_LINE), "{}", system_prompt(&prompt_env()));
+    let off = PromptEnvironment { script_mcp_calls_per_minute: 0, ..prompt_env() };
+    assert!(!system_prompt(&off).contains("smelt-mcp"), "no line while script calls are off");
+    let no_servers = PromptEnvironment { mcp_servers: Vec::new(), ..prompt_env() };
+    assert!(!system_prompt(&no_servers).contains("smelt-mcp"), "no line with no servers");
 }

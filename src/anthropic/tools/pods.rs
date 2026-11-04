@@ -529,7 +529,7 @@ async fn terminal_command_status_tool(pool: &PgPool, conversation_id: i64, input
     db::touch_terminal_command(pool, &command_id)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "status": status.status,
         "exit_code": status.exit_code,
         "stdout_lines": status.stdout_lines,
@@ -539,8 +539,20 @@ async fn terminal_command_status_tool(pool: &PgPool, conversation_id: i64, input
         // absent once it isn't running.
         "idle_notice_seconds": status.idle_notice_secs,
         "untouched_for_seconds": status.untouched_for_seconds,
-    })
-    .to_string())
+    });
+    with_mcp_summary(pool, conversation_id, &command_id, &mut response).await;
+    Ok(response.to_string())
+}
+
+/// Adds `mcp_calls`, the line summarizing the MCP calls the command's
+/// scripts made (SME-359), when there were any. A summary that can't be
+/// read leaves it out: it is a note, not the tool's answer.
+async fn with_mcp_summary(pool: &PgPool, conversation_id: i64, command_id: &str, response: &mut Value) {
+    match crate::sandbox::script_mcp_summary(pool, conversation_id, command_id).await {
+        Ok(Some(summary)) => response["mcp_calls"] = Value::from(summary.text()),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(command_id, error = %e, "couldn't read the command's MCP call summary"),
+    }
 }
 
 /// A line longer than this is cut, saying so, by `fit_lines`.
@@ -631,6 +643,7 @@ async fn read_terminal_output_tool(pool: &PgPool, conversation_id: i64, input: &
         response["truncated"] = Value::Bool(true);
         response["next_offset"] = Value::from(offset + returned as i64);
     }
+    with_mcp_summary(pool, conversation_id, &command_id, &mut response).await;
     Ok(response.to_string())
 }
 

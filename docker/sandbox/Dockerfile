@@ -84,6 +84,12 @@ RUN chown -R sandbox:sandbox /etc/smelt
 COPY sandbox_agent /usr/local/bin/sandbox_agent
 RUN chmod 0755 /usr/local/bin/sandbox_agent
 
+# Script MCP calls (SME-359): the agent serves them on a Unix socket in
+# /run/smelt, which only the sandbox user can enter, and `smelt-mcp` is the
+# agent binary under another name: run as that, it is the scripts' client.
+RUN mkdir -m 0700 /run/smelt && chown sandbox:sandbox /run/smelt \
+    && ln -s /usr/local/bin/sandbox_agent /usr/local/bin/smelt-mcp
+
 USER sandbox
 WORKDIR /workspace
 

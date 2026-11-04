@@ -141,6 +141,10 @@ pub(super) struct TerminalConnection {
     /// a per-line DB round trip. See
     /// SME-10.
     pub(super) conversation_id: i64,
+    /// The pod this connection was dialed to: a script's MCP call is ruled
+    /// as this pod's and this conversation's (SME-359), never as anything
+    /// the agent says.
+    pub(super) pod_id: i64,
     /// What the agent said it speaks, in its hello.
     pub(super) agent_version: ProtocolVersion,
 }
@@ -309,6 +313,12 @@ pub(super) enum ConnectMode {
     /// Everyone else, who expects the agent to be there. After the last
     /// failed attempt the pod is cleaned up and stopped, as after a crash.
     Reconnect,
+    /// smelt's startup reconnect (SME-359): like `Reconnect`, but only a
+    /// death the cluster confirms is cleaned up. Attempts that fail
+    /// without one leave the pod alone, for the next caller's `Reconnect`
+    /// to decide on: boot never stops a pod it merely couldn't reach
+    /// (review round 1, L2).
+    Startup,
 }
 
 /// Why one attempt to connect failed.
@@ -358,7 +368,7 @@ pub(super) fn connect_with_retry(
         // below would take for a dead pod and stop, closing the record of a
         // pod the start then makes anyway (B1, SME-122). The start reports
         // its own failure.
-        if mode == ConnectMode::Reconnect && start_under_way_for_pod(&pool, pod_id).await {
+        if mode != ConnectMode::First && start_under_way_for_pod(&pool, pod_id).await {
             return Err(TerminalError::NoPod);
         }
 
@@ -412,7 +422,7 @@ pub(super) fn connect_with_retry(
                 }
                 ConnectError::Failed(e) => {
                     tracing::info!(pod_id, attempt, error = %e, "couldn't connect to the sandbox agent");
-                    if mode == ConnectMode::Reconnect {
+                    if mode != ConnectMode::First {
                         if let Some(reason) = dialer.death_reason(pod_id).await {
                             clean_up_and_terminate_pod(&pool, pod_id, reason).await;
                             return Err(TerminalError::AgentUnreachable);
@@ -428,6 +438,10 @@ pub(super) fn connect_with_retry(
 
         match mode {
             ConnectMode::First => Err(last_err.map(TerminalError::from).unwrap_or(TerminalError::AgentUnreachable)),
+            ConnectMode::Startup => {
+                tracing::info!(pod_id, "couldn't reach the pod's agent at startup; left for the next caller to decide on");
+                Err(TerminalError::AgentUnreachable)
+            }
             ConnectMode::Reconnect => {
                 // Every attempt failed without the cluster ever confirming
                 // the pod is dead (a pod stuck reporting `Running` while
@@ -452,6 +466,35 @@ pub(super) async fn clean_up_and_terminate_pod(pool: &PgPool, pod_id: i64, reaso
     handle_crash_cleanup(pool, pod_id, reason).await;
     if let Err(e) = force_terminate_pod(pool, pod_id).await {
         tracing::warn!(pod_id, error = %e, "best-effort pod termination failed after a crash");
+    }
+}
+
+/// Connects to every live pod's agent at startup (SME-359, Q4), each in a
+/// task of its own, so a script in a pod that outlived a restart can call
+/// MCP tools again at once rather than after the model's next sandbox
+/// call. A pod the cluster confirms dead is cleaned up; one that only
+/// doesn't answer is left for the next caller (`ConnectMode::Startup`).
+/// A command exit the agent queued while smelt was
+/// down is delivered now, waking its conversation. Only this database's
+/// pods are listed, and the dial reads each pod first and refuses one
+/// that isn't ours (`refuse_foreign`).
+pub async fn reconnect_live_pods(pool: &PgPool) {
+    let pods = match db::live_sandbox_pod_ids(pool).await {
+        Ok(pods) => pods,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't list the live pods to reconnect to at startup");
+            return;
+        }
+    };
+    tracing::info!(pods = pods.len(), "reconnecting to the live pods' agents");
+    for pod_id in pods {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            if registry_contains(pod_id) {
+                return;
+            }
+            let _ = connect_with_retry(pool, pod_id, ConnectMode::Startup).await;
+        });
     }
 }
 
@@ -522,6 +565,7 @@ fn client_message_action(message: &ClientMessage) -> &'static str {
         ClientMessage::ListDirectory { .. } => "list_directory",
         ClientMessage::Glob { .. } => "glob",
         ClientMessage::Grep { .. } => "grep",
+        ClientMessage::McpResponse { .. } => "mcp_response",
     }
 }
 
@@ -587,6 +631,7 @@ async fn connect_unspanned(
         tasks: StdMutex::new(Vec::new()),
         next_request_id: std::sync::atomic::AtomicU64::new(1),
         conversation_id,
+        pod_id,
         agent_version,
     });
 
@@ -748,6 +793,10 @@ pub(super) async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConne
             // Not the text: serde's error quotes the values it choked on,
             // which can be part of a request's content.
             tracing::warn!(bytes = message.len(), "the sandbox agent couldn't read a message from smelt");
+        }
+        // A script's MCP call (SME-359), answered in a task of its own.
+        AgentMessage::McpRequest { call_id, command_id, request } => {
+            super::script_mcp::spawn_request(pool.clone(), conn.clone(), call_id, command_id, request);
         }
         AgentMessage::Hello(version) => tracing::debug!(%version, "the sandbox agent said hello again"),
         AgentMessage::Unknown => {

@@ -168,3 +168,46 @@ async fn test_a_teardown_during_a_connect_leaves_no_connection(pool: PgPool) {
         .expect("the connection to the torn-down pod is still open")
         .ok();
 }
+
+/// SME-359 T5: a script's call is ruled as the conversation of the
+/// connection it came on, and answered on that connection. Conversation
+/// B's chain denies the server; a request on B's pod is refused even
+/// when its body names A's conversation, and the same request on A's pod
+/// goes.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_scripts_call_is_ruled_by_the_connection_it_came_on(pool: PgPool) {
+    use crate::agent_protocol::McpRequest;
+    let (config, calls) = crate::mcp::tests::mock_server_for_tests(&pool, "mock-t5").await;
+    let (a, pod_a) = pod_row(&pool).await;
+    let (b, pod_b) = pod_row(&pool).await;
+    sqlx::query("INSERT INTO agents (conversation_id, root_id, depth, brief, state, rule_chain) VALUES ($1, $1, 1, 'b', 'active', $2)")
+        .bind(b)
+        .bind(serde_json::json!([{"origin": "t5", "allow": ["*"], "deny": ["mock-t5/*"]}]))
+        .execute(&pool)
+        .await
+        .expect("b's agent row");
+    let mut agent_a = fake_agent(pod_a, current(), Duration::ZERO).await;
+    let mut agent_b = fake_agent(pod_b, current(), Duration::ZERO).await;
+    reconnect_if_needed(&pool, pod_a).await.expect("a connects");
+    reconnect_if_needed(&pool, pod_b).await.expect("b connects");
+    let mut fake_a = agent_a.next_connection().await;
+    let mut fake_b = agent_b.next_connection().await;
+    let body = serde_json::json!({"tool": "mock-t5/second_tool", "conversation_id": a, "pod_id": pod_a}).to_string();
+    for (fake, call_id) in [(&fake_b, 1), (&fake_a, 2)] {
+        let _ = fake.send.send(Out::Message(AgentMessage::McpRequest {
+            call_id,
+            command_id: None,
+            request: McpRequest::Call { body: body.clone() },
+        }));
+    }
+    let on_b = fake_b.next_request().await;
+    let on_a = fake_a.next_request().await;
+    crate::mcp::tests::forget_mock_server(config.id).await;
+    let ClientMessage::McpResponse { call_id: 1, status: 403, .. } = on_b else { panic!("b's call: {on_b:?}") };
+    let ClientMessage::McpResponse { call_id: 2, status: 200, .. } = on_a else { panic!("a's call: {on_a:?}") };
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "only a's call reached the server");
+    let rows_a = db::list_sandbox_mcp_calls(&pool, a).await.expect("rows");
+    let rows_b = db::list_sandbox_mcp_calls(&pool, b).await.expect("rows");
+    assert_eq!((rows_a.len(), rows_a[0].pod_id, rows_a[0].outcome.as_str()), (1, pod_a, "ok"));
+    assert_eq!((rows_b.len(), rows_b[0].pod_id, rows_b[0].outcome.as_str()), (1, pod_b, "refused"));
+}

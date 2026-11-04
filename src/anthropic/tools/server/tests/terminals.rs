@@ -327,3 +327,29 @@ fn test_notice_intervals_are_read_from_their_field_or_refused_naming_it() {
     assert!(message.contains("idle_notice_seconds"), "{message} should name the field");
 }
 
+
+/// SME-359 T14: a command whose scripts called MCP tools says so in both
+/// terminal tools, in the panel's words; one that made none adds nothing.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_terminal_tools_summarize_a_commands_mcp_calls(pool: PgPool) {
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let pod = db::create_sandbox_pod(&pool, conversation.id).await.expect("pod").id;
+    let terminal = db::create_sandbox_terminal(&pool, pod).await.expect("terminal").id;
+    for id in ["cmd-mcp", "cmd-quiet"] {
+        db::create_terminal_command(&pool, conversation.id, terminal, id, "python3 batch.py", 300).await.expect("command");
+    }
+    for (tool, outcome) in [("list_issues", "ok"), ("list_issues", "ok"), ("save_comment", "refused")] {
+        db::insert_sandbox_mcp_call(&pool, conversation.id, pod, Some("cmd-mcp"), "linear", tool, Some("read-only"), outcome)
+            .await
+            .expect("a recorded call");
+    }
+    let expected = "MCP: 3 calls · linear/list_issues ×2, linear/save_comment ×1 · 1 refused";
+    for tool in ["terminal_command_status", "read_terminal_output"] {
+        let out = execute(&pool, conversation.id, "toolu_m", tool, &serde_json::json!({"command_id": "cmd-mcp"})).await.expect(tool);
+        let out: Value = serde_json::from_str(&out).expect("JSON");
+        assert_eq!(out["mcp_calls"], expected, "{tool}: {out}");
+        let quiet = execute(&pool, conversation.id, "toolu_q", tool, &serde_json::json!({"command_id": "cmd-quiet"})).await.expect(tool);
+        let quiet: Value = serde_json::from_str(&quiet).expect("JSON");
+        assert!(quiet.get("mcp_calls").is_none(), "{tool}: {quiet}");
+    }
+}

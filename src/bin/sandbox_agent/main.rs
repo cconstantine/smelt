@@ -78,8 +78,19 @@ extern "C" fn exit_on_sigterm(_: nix::libc::c_int) {
     unsafe { nix::libc::_exit(0) }
 }
 
+fn main() -> std::process::ExitCode {
+    // `smelt-mcp` is a link to this binary (SME-359): run as that name, it
+    // is the scripts' client for the MCP socket, not the agent.
+    let invoked_as = std::env::args().next().unwrap_or_default();
+    if std::path::Path::new(&invoked_as).file_name().is_some_and(|name| name == cli::CLI_NAME) {
+        return cli::main();
+    }
+    agent_main();
+    std::process::ExitCode::SUCCESS
+}
+
 #[tokio::main]
-async fn main() {
+async fn agent_main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -111,7 +122,16 @@ async fn main() {
             .expect("handle SIGTERM");
     }
 
-    let app = router(new_state());
+    let state = new_state();
+    // Script MCP calls (SME-359). A socket that can't be bound costs only
+    // those: the terminals still work.
+    match bind_mcp_socket(&state, MCP_SOCKET_PATH) {
+        Ok(listener) => {
+            tokio::spawn(serve_mcp(listener, state.clone()));
+        }
+        Err(e) => tracing::error!(error = %e, path = MCP_SOCKET_PATH, "couldn't bind the MCP socket; script MCP calls will fail"),
+    }
+    let app = router(state);
     let relay_listener = tokio::net::TcpListener::bind(RELAY_ADDR)
         .await
         .unwrap_or_else(|e| panic!("failed to bind {RELAY_ADDR}: {e}"));
@@ -136,7 +156,10 @@ mod files;
 mod commands;
 mod client;
 mod relay;
+mod mcp;
+mod cli;
 
+use mcp::*;
 use shell::*;
 use files::*;
 use commands::*;
