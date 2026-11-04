@@ -474,7 +474,8 @@ async fn connect(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<Connec
     crate::telemetry::in_span(span.clone(), async move {
         let result = connect_unspanned(pool, config).await;
         if let Err(e) = &result {
-            crate::telemetry::mark_error(&span, &e.message);
+            // Its secrets redacted, as every caller's copy is (SME-386 M2).
+            crate::telemetry::mark_error(&span, &call::redact_secrets(config, &e.message));
         }
         result
     })
@@ -682,7 +683,7 @@ pub async fn connection_check(
         let result = check_connection(pool, config).await;
         match &result {
             Err(CheckError::Unreachable(message) | CheckError::SignInExpired(message)) => {
-                crate::telemetry::mark_error(&span, message)
+                crate::telemetry::mark_error(&span, &call::redact_secrets(config, message))
             }
             Ok(_) => {}
         }

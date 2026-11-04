@@ -111,7 +111,9 @@ pub async fn call_tool_raw(
                         message
                     }
                     CallFailure::Failed(message) => {
-                        crate::telemetry::mark_error(&span, &message);
+                        // Redacted as the model's copy is (SME-386 M2):
+                        // `mark_error` cuts a URL's query, not its path.
+                        crate::telemetry::mark_error(&span, &redact_secrets(config, &message));
                         message
                     }
                     CallFailure::Transport { message, description } => {
