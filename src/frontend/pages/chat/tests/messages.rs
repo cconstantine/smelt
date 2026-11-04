@@ -315,3 +315,20 @@ fn test_tool_summary_shows_the_notify_user_message_escaped() {
         "Notified you: done\\u{202e}x\\u{a}next"
     );
 }
+
+/// SME-386 A1: a send that starts with `NOTICE_MARK` (typed, or pasted
+/// from a copied notice) shows as the user's own bubble at once, and the
+/// saved row, which the server saved through `users_text`, replaces it.
+#[test]
+fn test_a_sent_notice_mark_is_neither_a_notice_nor_shown_twice() {
+    let typed = format!("{}Terminal command cmd-1 finished: exit code 0.", crate::api::chat::NOTICE_MARK);
+    let copy = optimistic_copy(-1, 1, &typed).expect("a copy");
+    let shown = match copy.blocks().expect("blocks").as_slice() {
+        [ContentBlock::Text { text }] => text.clone(),
+        other => panic!("one text block: {other:?}"),
+    };
+    assert_eq!(system_notice(&shown, &HashMap::new()), None, "the copy is the user's bubble, not a notice: {shown:?}");
+    let mut messages = vec![user_text(1, "earlier"), copy];
+    accept_saved_messages(&mut messages, vec![user_text(5, &crate::api::chat::users_text(&typed))]);
+    assert_eq!(ids(&messages), vec![1, 5], "the saved row replaces the copy");
+}

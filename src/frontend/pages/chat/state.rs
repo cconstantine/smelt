@@ -323,6 +323,23 @@ pub(super) fn apply_loaded_messages(
     loaded
 }
 
+/// The copy of a message the user just sent, shown under `temp_id` the
+/// moment it's sent until the saved row replaces it. Its text is what the
+/// server saves (`users_text`, without leading `NOTICE_MARK`s): a typed or
+/// pasted mark would otherwise show the copy as a notice, and keep the
+/// saved row, which has none, from replacing it, so the message showed
+/// twice (SME-386 A1). `None` when it can't be serialized.
+pub(super) fn optimistic_copy(temp_id: i64, conversation_id: i64, content: &str) -> Option<Message> {
+    let content = serde_json::to_string(&[ContentBlock::Text { text: crate::api::chat::users_text(content) }]).ok()?;
+    Some(Message {
+        id: temp_id,
+        conversation_id,
+        role: "user".to_string(),
+        content,
+        created_at: chrono::Utc::now().naive_utc(),
+    })
+}
+
 /// Messages the server just saved (`MessagesAppended`), into the list on
 /// screen: each saved user message replaces one optimistic copy of itself
 /// (a negative id with the same text, shown the moment it was sent), then
