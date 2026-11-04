@@ -389,6 +389,8 @@ fn test_mask_think_leaves_prose_text_after_it_and_code() {
         "I won't use a <think> block here.",
         "<think>never closed",
         "Answer:\n   <think>never closed either",
+        "    <think>x</think>",
+        "\t<think>x</think>",
         "No tags at all.",
     ] {
         assert_eq!(mask_think(left), left, "{left:?} left as written");
