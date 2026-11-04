@@ -37,6 +37,12 @@ async fn test_stop_turn_ends_a_turn_in_flight(pool: PgPool) {
         "the stop isn't recorded: {}",
         saved[1].content
     );
+    // SME-357: the saved note carries the mark before its words.
+    assert!(
+        saved[1].content.contains(&format!("{}{}", crate::api::chat::NOTICE_MARK, STOP_NOTICE)),
+        "the stop note isn't marked: {}",
+        saved[1].content
+    );
 
     // A turn started after the stop isn't affected by it.
     let later = start_recording_mock_upstream(&pool, vec![text_reply_body("Hi!")]).await;

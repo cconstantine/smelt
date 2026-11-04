@@ -162,20 +162,20 @@ pub(super) async fn drain_unnotified_terminal_commands(
         .map_err(ServerFnError::new)?
     {
         let text = if command.status == "finished" {
-            format!(
+            crate::api::chat::mark_notice(&format!(
                 "Terminal command {} finished: exit code {}.",
                 command.command_id,
                 command
                     .exit_code
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "unknown".to_string())
-            )
+            ))
         } else {
-            format!(
+            crate::api::chat::mark_notice(&format!(
                 "Terminal command {}'s outcome is unknown — the terminal became \
                  unreachable while it was running.",
                 command.command_id
-            )
+            ))
         };
         let notification_content = vec![anthropic::ContentBlock::Text { text }];
         // The notice and the command's mark together, so a Stop between
@@ -230,7 +230,7 @@ pub(super) async fn drain_idle_command_notices(
         .await
         .map_err(ServerFnError::new)?
     {
-        let text = format!(
+        let text = crate::api::chat::mark_notice(&format!(
             "Terminal command {id} (\"{shown}\", running for {running}) {IDLE_NOTICE_FRAGMENT} \
              {untouched}: {stdout} lines on stdout, {stderr} on stderr. \
              Nothing stopped it and smelt won't stop it. Read what it has printed with \
@@ -244,7 +244,7 @@ pub(super) async fn drain_idle_command_notices(
             untouched = format_duration(command.untouched_for_secs),
             stdout = command.stdout_lines,
             stderr = command.stderr_lines,
-        );
+        ));
         let notice_content = vec![anthropic::ContentBlock::Text { text }];
         // The notice and the mark together, so a Stop between them can't
         // leave a notice the next drain saves again (SME-91).

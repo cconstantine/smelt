@@ -376,14 +376,20 @@ pub(super) fn typed_user_text(messages: &[Message], context_window: u32) -> Type
         }
         // The unanswered tail is quoted as such; only its stops count here
         // (review 2: a stop there still calls the earlier request off).
+        // The stop's note is compared through `users_text` so both saved
+        // forms count: the marked one written since SME-357 and the legacy
+        // unmarked row.
         let in_tail = index >= answered;
-        let stops_here = blocks.iter().any(|b| matches!(b, anthropic::ContentBlock::Text { text } if text == STOP_NOTICE));
+        let stops_here = blocks.iter().any(|b| {
+            matches!(b, anthropic::ContentBlock::Text { text }
+                if crate::api::chat::users_text(text) == STOP_NOTICE)
+        });
         if !stops_here {
             last_was_final = false;
         }
         for block in blocks {
             let text = match block {
-                anthropic::ContentBlock::Text { text } if text == STOP_NOTICE => {
+                anthropic::ContentBlock::Text { text } if crate::api::chat::users_text(&text) == STOP_NOTICE => {
                     let upto = if last_was_final { answered_before } else { answered_upto };
                     all.truncate(upto);
                     answered_upto = all.len();
@@ -449,7 +455,8 @@ pub(super) fn unanswered_user_text(messages: &[Message]) -> Vec<String> {
         .collect();
     texts.reverse();
     // What came before the user's last stop was called off (SME-51 B10).
-    if let Some(stop) = texts.iter().rposition(|text| text == STOP_NOTICE) {
+    // Both saved stop notes count, marked (since SME-357) and legacy.
+    if let Some(stop) = texts.iter().rposition(|text| crate::api::chat::users_text(text) == STOP_NOTICE) {
         texts.drain(..=stop);
     }
     texts

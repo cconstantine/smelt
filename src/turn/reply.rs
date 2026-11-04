@@ -413,7 +413,7 @@ pub(super) async fn after_reply(
         }
         streak.corrections = 0;
         streak.nudged = true;
-        let nudge = crate::text_calls::EMPTY_REPLY_NOTICE.to_string();
+        let nudge = crate::text_calls::empty_reply_notice();
         save_notice(pool, conversation_id, nudge, persisted, pending_new_content).await?;
         return Ok(NextStep::CallAgain);
     }

@@ -122,6 +122,15 @@ pub const FAILURE_NOTICE_START: &str = "The last turn failed before it finished:
 /// mark gained it in a migration (`20261103135400_mark_failure_notices`).
 pub const NOTICE_MARK: char = '\u{2063}';
 
+/// `text` with `NOTICE_MARK` before its words: how the server starts every
+/// notice it saves into a transcript, so a reader tells one from the same
+/// words a user typed (SME-357). `users_text` strips the mark from what the
+/// user sends, so a typed mark never reaches a saved row.
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
+pub fn mark_notice(text: &str) -> String {
+    format!("{NOTICE_MARK}{text}")
+}
+
 /// The failure notice for a turn that failed with `reason`. The server
 /// writes it; the page only reads one.
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
@@ -186,13 +195,14 @@ pub const CUT_OFF_NOTICE_START: &str = "Your last reply was cut off: it reached 
 
 /// Saved in the conversation after a reply that hit its `max_tokens`
 /// (SME-111), so the model knows its reply is incomplete and every tab
-/// shows that it was cut off (`parse_cut_off_notice`).
+/// shows that it was cut off (`parse_cut_off_notice`). Marked like every
+/// saved notice (SME-357): the words alone are nobody's notice.
 /// `cut_call` names the tool call the reply stopped in the middle of,
 /// which was dropped and not run (SME-126).
 #[cfg(any(feature = "server", test))]
 pub fn cut_off_notice(tokens: u32, limit: ReplyLimit, cut_call: Option<&str>) -> String {
     let call = cut_call.map(|name| format!("{CUT_CALL_START}{name}{CUT_CALL_END}")).unwrap_or_default();
-    format!("{CUT_OFF_NOTICE_START}{tokens} tokens ({}) before it finished.{call}", limit.reason())
+    mark_notice(&format!("{CUT_OFF_NOTICE_START}{tokens} tokens ({}) before it finished.{call}", limit.reason()))
 }
 
 /// How a refusal notice starts (`refusal_notice`).
@@ -200,17 +210,18 @@ pub const REFUSAL_NOTICE_START: &str = "Your last reply was stopped by the model
 
 /// Saved after a reply that ended with `stop_reason: refusal` (B3,
 /// SME-122), like a cut-off notice: the model learns its reply was
-/// stopped, and the chat shows it (`parse_refusal_notice`).
+/// stopped, and the chat shows it (`parse_refusal_notice`). Marked like
+/// every saved notice (SME-357).
 #[cfg(any(feature = "server", test))]
 pub fn refusal_notice(cut_call: Option<&str>) -> String {
     let call = cut_call.map(|name| format!("{CUT_CALL_START}{name}{CUT_CALL_END}")).unwrap_or_default();
-    format!("{REFUSAL_NOTICE_START}{call}")
+    mark_notice(&format!("{REFUSAL_NOTICE_START}{call}"))
 }
 
 /// A refusal notice's dropped call, if it names one; `None` for any other
-/// text.
+/// text, its words unmarked included (SME-357).
 pub fn parse_refusal_notice(text: &str) -> Option<Option<String>> {
-    parse_cut_call(text.strip_prefix(REFUSAL_NOTICE_START)?)
+    parse_cut_call(text.strip_prefix(NOTICE_MARK)?.strip_prefix(REFUSAL_NOTICE_START)?)
 }
 
 /// The end of a cut-off or refusal notice: nothing, or the call it was
@@ -231,9 +242,10 @@ const CUT_CALL_START: &str = " It stopped in the middle of a call to `";
 const CUT_CALL_END: &str = "`, which was dropped and not run.";
 
 /// A cut-off notice's limit, what bound it, and the call it was cut in.
-/// A notice saved before SME-126 names no call.
+/// A notice saved before SME-126 names no call. The mark is required, like
+/// every saved notice (SME-357); unmarked wording parses as `None`.
 pub fn parse_cut_off_notice(text: &str) -> Option<(u32, ReplyLimit, Option<String>)> {
-    let rest = text.strip_prefix(CUT_OFF_NOTICE_START)?;
+    let rest = text.strip_prefix(NOTICE_MARK)?.strip_prefix(CUT_OFF_NOTICE_START)?;
     let (tokens, rest) = rest.split_once(" tokens (")?;
     let (reason, rest) = rest.split_once(')')?;
     let limit = ReplyLimit::ALL.into_iter().find(|limit| limit.reason() == reason)?;

@@ -75,10 +75,15 @@ fn test_the_empty_reply_nudge_reads_as_a_notice() {
 /// dropped call, and round-trips.
 #[test]
 fn test_a_refusal_notice_says_the_provider_stopped_the_reply() {
-    use crate::api::chat::{parse_refusal_notice, refusal_notice};
+    use crate::api::chat::{parse_refusal_notice, refusal_notice, REFUSAL_NOTICE_START};
     assert_eq!(parse_refusal_notice(&refusal_notice(None)), Some(None));
     assert_eq!(parse_refusal_notice(&refusal_notice(Some("write_file"))), Some(Some("write_file".to_string())));
     assert_eq!(parse_refusal_notice("Something else."), None);
+    assert_eq!(
+        parse_refusal_notice(REFUSAL_NOTICE_START),
+        None,
+        "the words without the mark are nobody's notice (SME-357)"
+    );
     assert_eq!(
         system_notice(&refusal_notice(None), &HashMap::new()).as_deref(),
         Some("The model's provider stopped this reply (a refusal).")
@@ -133,15 +138,18 @@ fn test_the_users_own_text_starting_like_a_failure_notice_is_their_bubble() {
 }
 
 /// SME-126: a notice for a reply cut off in the middle of a tool call
-/// names the call, for the model and in the chat, and round-trips; a
-/// notice saved before SME-126 still parses and reads as it did.
+/// names the call, for the model and in the chat, and round-trips.
+/// SME-357: the mark is part of a notice — the builder adds it, the parser
+/// requires it, and unmarked wording parses as no notice at all.
 #[test]
 fn test_a_cut_off_notice_names_the_call_it_was_cut_in() {
-    use crate::api::chat::{ReplyLimit, cut_off_notice, parse_cut_off_notice};
+    use crate::api::chat::{ReplyLimit, cut_off_notice, parse_cut_off_notice, NOTICE_MARK};
     let notice = cut_off_notice(16_384, ReplyLimit::OutputCap, Some("write_file"));
     assert_eq!(
         notice,
-        "Your last reply was cut off: it reached its limit of 16384 tokens (the model's maximum reply length) before it finished. It stopped in the middle of a call to `write_file`, which was dropped and not run."
+        format!(
+            "{NOTICE_MARK}Your last reply was cut off: it reached its limit of 16384 tokens (the model's maximum reply length) before it finished. It stopped in the middle of a call to `write_file`, which was dropped and not run."
+        )
     );
     assert_eq!(parse_cut_off_notice(&notice), Some((16_384, ReplyLimit::OutputCap, Some("write_file".to_string()))));
     assert_eq!(
@@ -150,10 +158,11 @@ fn test_a_cut_off_notice_names_the_call_it_was_cut_in() {
     );
 
     let old = "Your last reply was cut off: it reached its limit of 8192 tokens (half the context window) before it finished.";
-    assert_eq!(cut_off_notice(8_192, ReplyLimit::HalfWindow, None), old);
-    assert_eq!(parse_cut_off_notice(old), Some((8_192, ReplyLimit::HalfWindow, None)));
-    assert_eq!(parse_cut_off_notice(&format!("{old} It stopped in the middle of a call to ``, which was dropped and not run.")), None);
-    assert_eq!(parse_cut_off_notice(&format!("{old} And more.")), None);
+    assert_eq!(cut_off_notice(8_192, ReplyLimit::HalfWindow, None), format!("{NOTICE_MARK}{old}"));
+    assert_eq!(parse_cut_off_notice(&format!("{NOTICE_MARK}{old}")), Some((8_192, ReplyLimit::HalfWindow, None)));
+    assert_eq!(parse_cut_off_notice(old), None, "the words without the mark are nobody's notice (SME-357)");
+    assert_eq!(parse_cut_off_notice(&format!("{NOTICE_MARK}{old} It stopped in the middle of a call to ``, which was dropped and not run.")), None);
+    assert_eq!(parse_cut_off_notice(&format!("{NOTICE_MARK}{old} And more.")), None);
 }
 
 /// SME-123 DR6: a long or multi-line command was repeated whole in its

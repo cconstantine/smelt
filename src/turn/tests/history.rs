@@ -611,3 +611,33 @@ fn test_a_stop_calls_off_only_what_wasnt_answered() {
     ];
     assert_eq!(typed_user_text(&d, 200_000).quotes, vec!["Drive it.".to_string()]);
 }
+
+/// SME-357: the stop note is now saved with `NOTICE_MARK` before its words.
+/// The comparisons that drop a stopped request must count both saved forms:
+/// a marked note calls the request off exactly as the old unmarked one does,
+/// in `typed_user_text` and in `unanswered_user_text`.
+#[test]
+fn test_a_marked_stop_calls_off_the_request_too() {
+    let call = |id: &str| anthropic::ContentBlock::ToolUse {
+        id: id.to_string(),
+        name: "run_terminal_command".to_string(),
+        input: serde_json::json!({}),
+    };
+    let result = |id: &str| anthropic::ContentBlock::ToolResult {
+        tool_use_id: id.to_string(),
+        content: "out".to_string(),
+        is_error: None,
+    };
+    let marked_stop = format!("{}{}", crate::api::chat::NOTICE_MARK, STOP_NOTICE);
+    let b = vec![
+        text_message(1, "user", "Drive it."),
+        text_message(2, "assistant", "ok"),
+        text_message(3, "user", "Delete every branch."),
+        message_with_blocks(4, "assistant", vec![call("t2")]),
+        message_with_blocks(5, "user", vec![result("t2")]),
+        text_message(6, "user", &marked_stop),
+        text_message(7, "user", "Write docs instead."),
+    ];
+    assert_eq!(typed_user_text(&b, 200_000).quotes, vec!["Drive it.".to_string()], "the marked stop calls the stopped request off");
+    assert_eq!(unanswered_user_text(&b), vec!["Write docs instead.".to_string()], "and in the unanswered texts too");
+}
