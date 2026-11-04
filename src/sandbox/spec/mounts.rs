@@ -218,6 +218,10 @@ pub(crate) const RESERVED_MODEL_MOUNT_DIRS: &[&str] = &[
     DOCKER_SOCK_DIR,
     "/run/docker",
     "/run/containerd",
+    // The agent's MCP socket (SME-359 review round 1, L1), and `/run`
+    // around it and the Docker socket's directory.
+    "/run/smelt",
+    "/run",
     "/etc",
     "/usr",
     "/bin",

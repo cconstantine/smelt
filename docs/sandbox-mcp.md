@@ -23,6 +23,8 @@ The agent's own answers: no connection from smelt is a `503` with `"outcome":"no
 
 **After a smelt restart** smelt connects to every live pod's agent at startup (`sandbox::reconnect_live_pods`, SME-359's Q4), so a script's calls work again within the restart itself rather than after the model's next sandbox call. It never stops a pod it only couldn't reach: a death the cluster confirms is cleaned up, and any other failure leaves the pod for the next caller's reconnect to decide on (`ConnectMode::Startup`). A side effect, accepted: command exits the agent queued while smelt was down are delivered at startup and wake their conversations then.
 
+No volume, a model's or a global one, may be mounted at or over `/run/smelt` or `/run` (`RESERVED_MODEL_MOUNT_DIRS`, checked for a global volume at creation too), so nothing can hide the socket.
+
 A Unix socket rather than a port: no port-forward, preview or `webfetch` route reaches it, and the pod never needs a network path to smelt. The pod's Docker containers can't reach it either, so a script that calls MCP tools runs in a terminal, not in `docker run`.
 
 ## smelt's side: the same rules as the model

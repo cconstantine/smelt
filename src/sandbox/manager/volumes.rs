@@ -69,6 +69,14 @@ pub async fn create_volume(
 ) -> Result<i64, SandboxError> {
     let resolved_path = resolve_mount_path(mount_path);
     validate_mount_path(&resolved_path).map_err(SandboxError::InvalidMountPath)?;
+    // The directories a model volume can't sit over (SME-359 review round
+    // 1, L1): a global volume over smelt's own places in the pod breaks
+    // every pod just the same. Checked at creation; a saved one stands.
+    if let Some(dir) = reserved_mount_path(&normalize_mount_path(&resolved_path)) {
+        return Err(SandboxError::InvalidMountPath(format!(
+            "{resolved_path:?} is at or under {dir:?}, which a volume can't be mounted over"
+        )));
+    }
     // Before the row, so a missing manager leaves nothing behind.
     let manager = get()?;
     let instance = db::smelt_instance(pool).await.map_err(SandboxError::Db)?;
