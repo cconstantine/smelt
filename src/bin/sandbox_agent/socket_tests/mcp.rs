@@ -381,4 +381,10 @@ fn test_the_cli_refuses_arguments_that_arent_a_json_object() {
         assert!(err.contains(says), "{arguments:?}: {err}");
         assert!(!err.contains("couldn't reach"), "{arguments:?}: nothing is sent: {err}");
     }
+    // Review round 1, N2: the arguments' error comes first, with no socket
+    // to be found either.
+    let args = vec!["call".to_string(), "exa/web_search_exa".to_string(), String::new()];
+    let (code, _, err) = cli::run(&args, None, unused, &mut std::io::empty());
+    assert_eq!(code, 3);
+    assert!(err.contains("aren't JSON"), "{err}");
 }

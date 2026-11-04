@@ -41,20 +41,6 @@ pub(super) fn main() -> std::process::ExitCode {
 /// `$SMELT_MCP_SOCKET`; without it (`sudo` and `env -i` drop it) the
 /// socket is `fallback`, its fixed path, when that exists (SME-386 M7).
 pub(super) fn run(args: &[String], socket: Option<&str>, fallback: &str, stdin: &mut dyn Read) -> (u8, String, String) {
-    let socket = match socket.filter(|s| !s.is_empty()) {
-        Some(socket) => socket,
-        None if std::path::Path::new(fallback).exists() => fallback,
-        None => {
-            return (
-                3,
-                String::new(),
-                format!(
-                    "${MCP_SOCKET_ENV} isn't set and there's no socket at {fallback}: this sandbox's image predates script MCP calls, \
-                     or its agent couldn't open the socket; stop and start the sandbox to get one that has them"
-                ),
-            );
-        }
-    };
     let request = match args.first().map(String::as_str) {
         Some("tools") if args.len() <= 2 => {
             let path = match args.get(1) {
@@ -102,6 +88,22 @@ pub(super) fn run(args: &[String], socket: Option<&str>, fallback: &str, stdin: 
             )
         }
         _ => return (3, String::new(), USAGE.to_string()),
+    };
+    // After the request is built, so a usage or arguments error is said
+    // first (review round 1, N2).
+    let socket = match socket.filter(|s| !s.is_empty()) {
+        Some(socket) => socket,
+        None if std::path::Path::new(fallback).exists() => fallback,
+        None => {
+            return (
+                3,
+                String::new(),
+                format!(
+                    "${MCP_SOCKET_ENV} isn't set and there's no socket at {fallback}: this sandbox's image predates script MCP calls, \
+                     or its agent couldn't open the socket; stop and start the sandbox to get one that has them"
+                ),
+            );
+        }
     };
     match exchange(socket, &request) {
         Ok((status, body)) => (exit_code(status), body, String::new()),
