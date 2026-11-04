@@ -135,3 +135,42 @@ async fn test_the_rule_check_is_handed_the_tools_real_name(pool: sqlx::PgPool) {
     assert_eq!(judged.into_inner().unwrap_or_else(|e| e.into_inner()), Some("search.web".to_string()));
     evict(config.id).await;
 }
+
+/// One offered tool for the routing tests below.
+fn offer(server: &str, tool: &str) -> OfferedTool {
+    let schema = Arc::new(serde_json::from_value(serde_json::json!({"type": "object"})).expect("a schema object"));
+    OfferedTool { server: server.to_string(), tool: McpTool::new(tool.to_string(), "t", schema), class: crate::anthropic::tools::ToolClass::ReadOnly }
+}
+
+/// SME-386 T7: servers `a` and `a__b` can both make `mcp__a__b__c` (`a`'s
+/// `b__c`, `a__b`'s `c`), and a call by it reaches `a__b`, the longest
+/// server name, then the tool that server lists under it. So an offered
+/// tool is kept only when a call by its name reaches it: `a__b`'s `c`
+/// stays and `a`'s `b__c` goes. Review 1 (L1): within one server too, a
+/// tool listed under another's safe name takes the call, so the other
+/// goes, even when the one that takes it isn't offered.
+#[test]
+fn test_an_offered_tool_a_call_wouldnt_reach_is_left_out() {
+    let configs = [test_config(1, "a"), test_config(2, "a__b"), test_config(3, "z")];
+    let listed_as = |offered: &[OfferedTool]| {
+        let mut listed: HashMap<String, Vec<McpTool>> = HashMap::new();
+        for o in offered {
+            listed.entry(o.server.clone()).or_default().push(o.tool.clone());
+        }
+        listed
+    };
+    let names = |offered: Vec<OfferedTool>, listed: &HashMap<String, Vec<McpTool>>| {
+        routable_offers(offered, &configs, listed).iter().map(|o| format!("{}/{}", o.server, o.tool.name)).collect::<Vec<_>>()
+    };
+    let both = vec![offer("a", "b__c"), offer("a__b", "c"), offer("a", "x")];
+    assert_eq!(names(both.clone(), &listed_as(&both)), ["a__b/c", "a/x"], "the one a call reaches stays");
+    let alone = vec![offer("a", "b__c"), offer("a", "x")];
+    assert_eq!(names(alone.clone(), &listed_as(&alone)), ["a/x"], "a call by `a`'s name would reach `a__b`");
+    let plain = vec![offer("a__b", "c"), offer("z", "y")];
+    assert_eq!(names(plain.clone(), &listed_as(&plain)), ["a__b/c", "z/y"], "a name that routes back stays");
+    // L1: `z` lists `x.y` and a tool literally named after its safe name.
+    let safe = namespaced_tool_name("z", "x.y").trim_start_matches("mcp__z__").to_string();
+    let listed = listed_as(&[offer("z", "x.y"), offer("z", &safe)]);
+    assert_eq!(names(vec![offer("z", "x.y")], &listed), Vec::<String>::new(), "its call reaches the other, unoffered tool");
+    assert_eq!(names(vec![offer("z", "x.y"), offer("z", &safe)], &listed), [format!("z/{safe}")], "the exact name takes it");
+}

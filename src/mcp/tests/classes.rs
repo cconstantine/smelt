@@ -360,3 +360,130 @@ fn test_canonical_json_ignores_key_order() {
     assert_eq!(super::tools::canonical_json(&a), super::tools::canonical_json(&b));
     assert_ne!(super::tools::canonical_json(&a), super::tools::canonical_json(&serde_json::json!({"type": "object"})));
 }
+
+/// The page's rows for `config`, as the Tool-classes GET builds them.
+async fn page_rows(pool: &sqlx::PgPool, config: &McpServerConfig) -> Vec<crate::api::mcp::McpToolClassRow> {
+    let listed = crate::mcp::tool_class_report(pool, config).await.ok().expect("the mock lists its tools");
+    let saved = crate::db::list_mcp_tool_classes(pool, config.id).await.expect("read the overrides");
+    crate::api::mcp::merge_tool_class_rows(listed, saved)
+}
+
+/// SME-386 T3: for a tool the server doesn't list, the page shows the
+/// class its call is judged by. One rule: an override set for a listed
+/// tool (it has a fingerprint) can only narrow once that tool is gone, so
+/// the call is destructive; one set while the tool wasn't listed (no
+/// fingerprint) pre-classifies the name, and decides.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_page_shows_an_unlisted_tools_class_as_its_call_is_judged(pool: sqlx::PgPool) {
+    let config = create_static_server(&pool, &test_config(0, "unused").url).await;
+    let _server = register_test_connection(config.id, false).await;
+    crate::db::set_mcp_tool_class(&pool, config.id, "gone_tool", ReadOnly, Some("a tool listed once")).await.expect("set for a listed tool");
+    crate::db::set_mcp_tool_class(&pool, config.id, "future_tool", Writing, None).await.expect("set while unlisted");
+
+    let gone = class_of_call_on(&pool, &config, "gone_tool").await;
+    let future = class_of_call_on(&pool, &config, "future_tool").await;
+    let rows = page_rows(&pool, &config).await;
+    REGISTRY.lock().await.remove(&config.id);
+    let applied = |name: &str| rows.iter().find(|row| row.tool_name == name).and_then(|row| row.applied_class.clone());
+    assert_eq!(gone, Some(Destructive), "set for a tool now gone, the call fails closed");
+    assert_eq!(applied("gone_tool").as_deref(), Some("destructive"), "and the page says so: {rows:?}");
+    assert_eq!(future, Some(Writing), "set while unlisted, it classes the call");
+    assert_eq!(applied("future_tool").as_deref(), Some("writing"), "and the page says so: {rows:?}");
+}
+
+/// SME-386 T4: a tool's fingerprint is SHA-256 (hex) of its description,
+/// a NUL and its canonical schema, not a 64-bit hash a server could
+/// collide.
+#[test]
+fn test_a_tool_fingerprint_is_sha256_of_its_description_and_schema() {
+    use sha2::Digest;
+    let schema = serde_json::json!({"type": "object", "properties": {"q": {"type": "string"}}});
+    let tool = McpTool::new("search", "Searches", Arc::new(serde_json::from_value(schema.clone()).expect("a schema object")));
+    let text = format!("Searches\u{0}{}", super::tools::canonical_json(&schema));
+    let want: String = sha2::Sha256::digest(text.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(tool_fingerprint(&tool), want);
+}
+
+/// SME-386 T4: an override stored with the old 64-bit fingerprint of the
+/// tool listed now is still that tool's (the page says so, the call
+/// judges by it), and the next offer stores the SHA-256 one in its place.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_legacy_fingerprint_is_adopted_again_as_sha256(pool: sqlx::PgPool) {
+    let config = create_static_server(&pool, &test_config(0, "unused").url).await;
+    let _server = register_test_connection(config.id, true).await;
+    let listed = REGISTRY.lock().await.get(&config.id).expect("connected").tools.clone();
+    let echo = listed.iter().find(|tool| tool.name == "echo").expect("echo is listed");
+    let legacy = super::tools::legacy_fingerprint(echo);
+    crate::db::set_mcp_tool_class(&pool, config.id, "echo", ReadOnly, Some(&legacy)).await.expect("an override from before");
+
+    assert_eq!(class_of_call_on(&pool, &config, "echo").await, Some(ReadOnly), "the legacy fingerprint still names echo");
+    let rows = page_rows(&pool, &config).await;
+    let row = rows.iter().find(|row| row.tool_name == "echo").expect("echo's row");
+    assert!(!row.tool_changed, "the page doesn't call it changed: {row:?}");
+    let _ = tool_definitions_for(&pool, std::slice::from_ref(&config), &crate::personas::rules::RuleChain::default()).await;
+    let want = tool_fingerprint(echo);
+    let adopted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let row = crate::db::get_mcp_tool_class(&pool, config.id, "echo").await.expect("read the row");
+            if let Some(fingerprint) = row.and_then(|r| r.tool_fingerprint).filter(|f| *f != legacy) {
+                return fingerprint;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    REGISTRY.lock().await.remove(&config.id);
+    assert_eq!(adopted.ok(), Some(want), "the offer stored the SHA-256 fingerprint");
+}
+
+/// SME-386 review 1, M2: an override still holding a legacy fingerprint
+/// that doesn't name the tool listed now is marked by the next offer as
+/// one no tool can match, so a server can't later forge a tool to its
+/// 64-bit value: it keeps narrowing.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_legacy_fingerprint_for_a_changed_tool_can_no_longer_be_matched(pool: sqlx::PgPool) {
+    let config = create_static_server(&pool, &test_config(0, "unused").url).await;
+    let _server = register_test_connection(config.id, true).await;
+    let stale = "0123456789abcdef";
+    crate::db::set_mcp_tool_class(&pool, config.id, "echo", ReadOnly, Some(stale)).await.expect("a legacy override for another tool");
+    let _ = tool_definitions_for(&pool, std::slice::from_ref(&config), &crate::personas::rules::RuleChain::default()).await;
+    let marked = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let row = crate::db::get_mcp_tool_class(&pool, config.id, "echo").await.expect("read the row");
+            if let Some(fingerprint) = row.and_then(|r| r.tool_fingerprint).filter(|f| f != stale) {
+                return fingerprint;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let class = class_of_call_on(&pool, &config, "echo").await;
+    REGISTRY.lock().await.remove(&config.id);
+    let marked = marked.ok().expect("the offer replaced the legacy value");
+    assert!(!marked.chars().all(|c| c.is_ascii_hexdigit()), "no hash of any tool can equal it: {marked}");
+    assert_eq!(class, Some(Destructive), "it still narrows the unannotated echo");
+}
+
+/// SME-386 review 2, L1: a legacy fingerprint saved for a name the server
+/// doesn't list now is marked too, so a tool listed later under the name
+/// can't be forged to its 64-bit value.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_legacy_fingerprint_for_an_unlisted_tool_can_no_longer_be_matched(pool: sqlx::PgPool) {
+    let config = create_static_server(&pool, &test_config(0, "unused").url).await;
+    let _server = register_test_connection(config.id, true).await;
+    let stale = "fedcba9876543210";
+    crate::db::set_mcp_tool_class(&pool, config.id, "gone_tool", ReadOnly, Some(stale)).await.expect("a legacy override for a gone tool");
+    let _ = tool_definitions_for(&pool, std::slice::from_ref(&config), &crate::personas::rules::RuleChain::default()).await;
+    let marked = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let row = crate::db::get_mcp_tool_class(&pool, config.id, "gone_tool").await.expect("read the row");
+            if let Some(fingerprint) = row.and_then(|r| r.tool_fingerprint).filter(|f| f != stale) {
+                return fingerprint;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    REGISTRY.lock().await.remove(&config.id);
+    assert_eq!(marked.ok().as_deref(), Some(crate::mcp::LEGACY_CHANGED), "the offer marked the unlisted row");
+}

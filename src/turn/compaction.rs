@@ -329,7 +329,7 @@ pub(super) fn is_typed(text: &str) -> bool {
 /// decisions; a refused call's error result isn't one). A request the user
 /// stopped isn't quoted: a stop, in the tail too, drops what the user
 /// typed since the model's last final reply (review 2). The first, the original ask, is always
-/// kept, to half the budget; the rest newest first while they fit
+/// kept, to half the budget; the rest newest first, each that still fits
 /// `typed_budget(context_window)`, then put back in order.
 #[cfg(feature = "server")]
 pub(super) fn typed_user_text(messages: &[Message], context_window: u32) -> Typed {
@@ -408,8 +408,10 @@ pub(super) fn typed_user_text(messages: &[Message], context_window: u32) -> Type
     for text in rest.iter().rev() {
         let quoted = quote_to(text, CONTINUATION_QUOTE_MAX_CHARS.min(budget));
         let size = quoted.chars().count() + QUOTE_SEPARATOR.len();
+        // One that doesn't fit is left out alone: older, shorter ones may
+        // still fit (SME-386 T8).
         if used + size > budget {
-            break;
+            continue;
         }
         used += size;
         newest.push(quoted);

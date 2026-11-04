@@ -400,3 +400,26 @@ fn test_mask_think_leaves_prose_text_after_it_and_code() {
     let fenced = "```rust\nlet x = 1;\n```";
     assert_eq!(mask_think(fenced), fenced, "code is an answer, not reasoning");
 }
+
+/// SME-386 T6: reasoning whose `<think>` the chat template supplied (so
+/// the reply holds only its `</think>`, at a line's start) is masked from
+/// the reply's start, and a second pair straight after the first on one
+/// line is masked too. A `</think>` with a `<think>` before it, or one
+/// mid-line, or an unclosed `<think>`, is still text.
+#[test]
+fn test_mask_think_masks_a_template_opened_reply_and_a_second_pair() {
+    let blank = |text: &str| mask_think(text).trim().is_empty();
+    assert!(blank("I'll reason here.\n</think>"), "{:?}", mask_think("I'll reason here.\n</think>"));
+    assert!(blank("reasoning\n  </think>\n"), "an indent ≤ 3 still starts the line");
+    let answered = mask_think("reasoning\n</think>\n\nThe answer is 42.");
+    assert!(answered.contains("The answer is 42.") && !answered.contains("reasoning"), "{answered:?}");
+    assert!(blank("<think>a</think><think>b</think>"), "{:?}", mask_think("<think>a</think><think>b</think>"));
+    assert!(blank("<think>a</think> <think>b</think>\n"), "{:?}", mask_think("<think>a</think> <think>b</think>\n"));
+    let after_text = "<think>a</think> then <think>b</think>";
+    assert!(mask_think(after_text).contains("then <think>b</think>"), "a pair after text is prose: {:?}", mask_think(after_text));
+    for left in ["I won't use a <think> block.\n</think>", "Mid-line </think> is text.", "<think>never closed"] {
+        assert_eq!(mask_think(left), left, "{left:?} left as written");
+    }
+    let masked = mask_think("x\n</think>y");
+    assert_eq!(masked.len(), "x\n</think>y".len(), "same length: {masked:?}");
+}
