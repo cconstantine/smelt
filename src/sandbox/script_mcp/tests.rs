@@ -316,8 +316,10 @@ async fn test_calls_over_the_rate_are_held_back_with_a_retry_time(pool: PgPool) 
     assert!(refused["retry_after_secs"].as_u64().is_some_and(|secs| secs > 0), "{refused}");
     assert!(refused["error"].as_str().expect("error").contains("SANDBOX_MCP_CALLS_PER_MINUTE"), "{refused}");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+    // Review round 1, M2: a refusal by a limit writes no row (a runaway
+    // loop would write one per refusal), but the summary still counts it.
     let outcomes: Vec<_> = db::list_sandbox_mcp_calls(&pool, conversation).await.expect("rows").into_iter().map(|r| r.outcome).collect();
-    assert_eq!(outcomes, ["ok", "ok", "limited"]);
+    assert_eq!(outcomes, ["ok", "ok"]);
 }
 
 /// T7, in flight: a call while the cap's worth are in flight is refused
@@ -443,4 +445,49 @@ async fn test_a_tool_the_server_doesnt_list_is_a_404_and_unsent(pool: PgPool) {
     assert_eq!(listed, 200);
     assert_eq!(calls.load(Ordering::SeqCst), 1, "only the listed call was sent");
     assert_eq!(db::list_sandbox_mcp_calls(&pool, conversation).await.expect("rows").len(), 1);
+}
+
+/// Review round 1, M2: calls held back by a limit are counted in the
+/// command's summary without a row each.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_calls_held_back_are_counted_without_rows(pool: PgPool) {
+    let (config, _calls) = mock_server_for_tests(&pool, "mock-m2").await;
+    let (conversation, pod) = conversation_with_pod(&pool, None).await;
+    let terminal = db::create_sandbox_terminal(&pool, pod).await.expect("terminal").id;
+    db::create_terminal_command(&pool, conversation, terminal, "cmd-m2", "loop", 0).await.expect("command");
+    let mine = Caller { conversation_id: conversation, pod_id: pod, command_id: Some("cmd-m2") };
+    let rate = limits(1, 1, 10, 1_000);
+    let statuses: Vec<_> = futures_util::future::join_all((0..4).map(|_| call_under(&pool, mine, "mock-m2/second_tool", &rate)))
+        .await
+        .into_iter()
+        .map(|a| a.status)
+        .collect();
+    forget_mock_server(config.id).await;
+    assert_eq!(statuses.iter().filter(|s| **s == 429).count(), 3, "{statuses:?}");
+    assert_eq!(db::list_sandbox_mcp_calls(&pool, conversation).await.expect("rows").len(), 1, "no row per refusal");
+    let summary = command_summary(&pool, conversation, "cmd-m2").await.expect("read").expect("a summary");
+    assert_eq!(summary.text(), "MCP: 1 call · mock-m2/second_tool ×1 · 3 held back by a limit");
+}
+
+/// Review round 1, M2: a tool name over 256 bytes is refused before
+/// anything is looked up or recorded.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_tool_name_over_256_bytes_is_a_400(pool: PgPool) {
+    let (conversation, pod) = conversation_with_pod(&pool, None).await;
+    let long = format!("mock/{}", "x".repeat(252));
+    let answer = call_body(&pool, caller(conversation, pod), json!({"tool": long})).await;
+    assert_eq!(answer.status, 400, "{}", answer.body);
+    assert!(answer.body.contains("256"), "{}", answer.body);
+}
+
+/// Review round 1, M2: the pod's command-less budget is counted from an
+/// index, not a scan of the pod's calls.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_pods_command_less_calls_have_an_index(pool: PgPool) {
+    let definition: Option<String> = sqlx::query_scalar("SELECT indexdef FROM pg_indexes WHERE tablename = 'sandbox_mcp_calls' AND indexdef LIKE '%(pod_id)%'")
+        .fetch_optional(&pool)
+        .await
+        .expect("read pg_indexes");
+    let definition = definition.expect("an index on sandbox_mcp_calls (pod_id)");
+    assert!(definition.contains("WHERE (command_id IS NULL)"), "{definition}");
 }

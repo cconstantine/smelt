@@ -139,9 +139,3 @@ pub async fn sandbox_mcp_call_counts(
     }
     Ok(counts)
 }
-
-/// One command's summary, `None` when its scripts made no MCP calls.
-pub async fn command_mcp_summary(pool: &PgPool, command_id: &str) -> Result<Option<crate::api::mcp_calls::McpCallSummary>, sqlx::Error> {
-    let counts = sandbox_mcp_call_counts(pool, &[command_id.to_string()]).await?;
-    Ok(counts.get(command_id).and_then(|counts| crate::api::mcp_calls::McpCallSummary::from_counts(counts)))
-}

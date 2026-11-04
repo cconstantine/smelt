@@ -156,6 +156,10 @@ async fn resolve_server(pool: &PgPool, name: &str) -> Result<(db::McpServerConfi
         .ok_or_else(|| Answer::error(404, format!("no MCP tool {name:?}: name it <server>/<tool>, as `smelt-mcp tools` lists it")))
 }
 
+/// The longest `tool` a request may name (review round 1, M2): every name
+/// a server lists is far shorter, and the name is logged and recorded.
+const MAX_TOOL_NAME_BYTES: usize = 256;
+
 /// The tool name and arguments of a `POST /v1/call` body.
 fn parse_call(body: &str) -> Result<(String, Value), Answer> {
     let value: Value = serde_json::from_str(body).map_err(|e| Answer::error(400, format!("the request body isn't JSON: {e}")))?;
@@ -164,6 +168,9 @@ fn parse_call(body: &str) -> Result<(String, Value), Answer> {
         .and_then(Value::as_str)
         .ok_or_else(|| Answer::error(400, "the request needs \"tool\": \"<server>/<tool>\""))?
         .to_string();
+    if tool.len() > MAX_TOOL_NAME_BYTES {
+        return Err(Answer::error(400, format!("\"tool\" is {} bytes, over the {MAX_TOOL_NAME_BYTES}-byte limit", tool.len())));
+    }
     let arguments = match value.get("arguments") {
         None | Some(Value::Null) => json!({}),
         Some(arguments @ Value::Object(_)) => arguments.clone(),
@@ -192,8 +199,11 @@ async fn call(pool: &PgPool, caller: Caller<'_>, span: &tracing::Span, body: &st
     let _slot = match take_limits(pool, caller, limits).await {
         Ok(slot) => slot,
         Err(held_back) => {
-            if let Err(e) = db::insert_sandbox_mcp_call(pool, caller.conversation_id, caller.pod_id, caller.command_id, &config.name, &tool, None, "limited").await {
-                tracing::warn!(error = %e, "couldn't record a script's MCP call held back by a limit");
+            // Counted, not a row: a loop spinning on 429s would otherwise
+            // write a row per refusal (review round 1, M2).
+            if let Some(command_id) = caller.command_id {
+                note_held_back(caller.conversation_id, command_id);
+                publish_summary_soon(pool, caller.conversation_id, command_id);
             }
             return held_back;
         }
@@ -261,7 +271,7 @@ fn publish_summary_soon(pool: &PgPool, conversation_id: i64, command_id: &str) {
         // Off the list before the read, so a call that finishes during it
         // sets up the next publish rather than going unsaid.
         PENDING.lock().unwrap_or_else(|e| e.into_inner()).remove(&command_id);
-        match db::command_mcp_summary(&pool, &command_id).await {
+        match command_summary(&pool, conversation_id, &command_id).await {
             Ok(Some(summary)) => {
                 crate::events::publish(conversation_id, crate::events::ConversationEvent::SandboxMcpCalls { command_id, summary })
             }
@@ -269,6 +279,48 @@ fn publish_summary_soon(pool: &PgPool, conversation_id: i64, command_id: &str) {
             Err(e) => tracing::warn!(%command_id, error = %e, "couldn't read a command's MCP call summary to publish"),
         }
     });
+}
+
+/// The command's summary, with the calls held back by a limit (review
+/// round 1, M2: counted in memory, not a row each).
+pub(crate) async fn command_summary(
+    pool: &PgPool,
+    conversation_id: i64,
+    command_id: &str,
+) -> Result<Option<crate::api::mcp_calls::McpCallSummary>, sqlx::Error> {
+    let mut counts = db::sandbox_mcp_call_counts(pool, &[command_id.to_string()]).await?.remove(command_id).unwrap_or_default();
+    let held_back = held_back(conversation_id, command_id);
+    if held_back > 0 {
+        counts.push(crate::api::mcp_calls::McpCallCount {
+            server: String::new(),
+            tool: String::new(),
+            outcome: "limited".to_string(),
+            stale: false,
+            count: held_back,
+        });
+    }
+    Ok(crate::api::mcp_calls::McpCallSummary::from_counts(&counts))
+}
+
+/// The most commands whose held-back calls are counted at once. Past it
+/// the counts start again: they are a note on the panel, not a record.
+const MAX_HELD_BACK_COMMANDS: usize = 10_000;
+
+/// Calls held back by a limit, per conversation and command, since smelt
+/// started.
+static HELD_BACK: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(i64, String), i64>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn note_held_back(conversation_id: i64, command_id: &str) {
+    let mut held = HELD_BACK.lock().unwrap_or_else(|e| e.into_inner());
+    if held.len() >= MAX_HELD_BACK_COMMANDS && !held.contains_key(&(conversation_id, command_id.to_string())) {
+        held.clear();
+    }
+    *held.entry((conversation_id, command_id.to_string())).or_default() += 1;
+}
+
+fn held_back(conversation_id: i64, command_id: &str) -> i64 {
+    HELD_BACK.lock().unwrap_or_else(|e| e.into_inner()).get(&(conversation_id, command_id.to_string())).copied().unwrap_or(0)
 }
 
 /// What a script gets when the deployment has turned script calls off.

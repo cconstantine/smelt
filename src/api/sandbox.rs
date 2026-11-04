@@ -122,7 +122,7 @@ async fn fetch_command_summary(
     // by `seq` into the order the lines actually happened in.
     let mut output: Vec<db::TerminalLine> = stdout.into_iter().chain(stderr).collect();
     output.sort_by_key(|line| line.seq);
-    let mcp_calls = db::command_mcp_summary(pool, &command.command_id).await.ok().flatten();
+    let mcp_calls = sandbox::script_mcp_summary(pool, command.conversation_id, &command.command_id).await.ok().flatten();
     Some(SandboxCommandSummary {
         command_id: command.command_id.clone(),
         command: command.command.clone(),
