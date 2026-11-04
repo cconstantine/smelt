@@ -575,7 +575,19 @@ pub(super) async fn scenario_secrets_page(t: &Scenario<'_>) {
         assert!(tokio::time::Instant::now() < paste_deadline, "the pasted newlines did not survive the field: {pasted:?}");
     }
     click_when_present(&page, ".secrets-add-form button[type=\"submit\"]", Duration::from_secs(5)).await;
-    assert!(wait_for_count(&page, ".secret-row", 1, Duration::from_secs(10)).await, "the pasted secret's row should appear");
+    if !wait_for_count(&page, ".secret-row", 1, Duration::from_secs(10)).await {
+        // SME-371: say what the page and the store held, so a flake names
+        // its mechanism: refused on the page (the value signal empty at
+        // the submit), failed at the server, or saved but never shown.
+        let seen: String = page
+            .evaluate("(() => [document.querySelectorAll('.secret-row').length, document.querySelector('#secret-value')?.value ?? 'no field', document.querySelector('.secrets-add-form button')?.textContent ?? 'no button', document.querySelector('main')?.innerText.slice(0, 400) ?? ''].join(' | '))()")
+            .await
+            .ok()
+            .and_then(|v| v.into_value().ok())
+            .unwrap_or_default();
+        let stored = crate::db::list_named_secrets(t.pool).await.map(|s| s.iter().any(|s| s.name == paste_name));
+        panic!("the pasted secret's row should appear; rows | field | button | page text: {seen:?}; stored: {stored:?}");
+    }
     let pasted_row: Vec<String> = page
         .evaluate("(() => { const r = document.querySelector('.secret-row'); return [r.querySelector('.secret-shown').textContent, r.querySelector('.secret-lines')?.textContent ?? 'no .secret-lines', r.title]; })()")
         .await
