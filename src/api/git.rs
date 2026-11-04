@@ -83,6 +83,8 @@ async fn decide_and_notify(
 #[cfg(feature = "server")]
 fn deliver(pool: &sqlx::PgPool, notices: Vec<(i64, String)>) {
     for (conversation_id, notice) in notices {
+        // The card it published a Question for is decided (SME-386 N1).
+        crate::turn::note_trust_decided(conversation_id);
         crate::turn::notify(pool, conversation_id, vec![crate::turn::Notice::Deliver(notice)]);
     }
 }

@@ -66,3 +66,95 @@ async fn test_a_stop_after_notify_user_publishes_nothing(pool: PgPool) {
     assert!(needs_user_of(&recording, conversation.id).is_empty(), "a Stop clears the spell's debt");
     assert_eq!(published_notice(conversation.id, turn_generation(conversation.id)), None);
 }
+
+// --- A wake after the notification leaves it standing (SME-386 N1) ---
+
+/// Runs an idle-notice wake on `conversation_id` (a command running
+/// untouched past its interval), and at the moment the wake is admitted
+/// — the `TurnsChanged` the notifier revalidates its open notifications
+/// on — asks `get_attention` about `(attention, generation)`; then lets
+/// the wake finish and asks again. Returns both answers.
+async fn ask_around_a_wake(
+    pool: &PgPool,
+    conversation_id: i64,
+    attention: events::Attention,
+    generation: u64,
+) -> (
+    Option<crate::api::notifications::AttentionDetails>,
+    Option<crate::api::notifications::AttentionDetails>,
+) {
+    untouched_running_command(pool, conversation_id, "cmd-idle", 601).await;
+    let (reached, release) = test_hooks::pause_after_notice_admitted(conversation_id);
+    let wake = tokio::spawn({
+        let pool = pool.clone();
+        async move { wake_conversation(&pool, conversation_id).await.map(|_| ()) }
+    });
+    tokio::time::timeout(Duration::from_secs(10), reached)
+        .await
+        .expect("the wake was admitted within 10 s")
+        .expect("the hook fired");
+    assert!(turn_running(conversation_id), "the wake counts as a running turn here");
+    let during = crate::api::notifications::attention_details(pool, conversation_id, generation, attention)
+        .await
+        .expect("get_attention during the wake");
+    let _ = release.send(());
+    tokio::time::timeout(Duration::from_secs(10), wake)
+        .await
+        .expect("the wake ended within 10 s")
+        .expect("the wake's task")
+        .expect("the wake");
+    let after = crate::api::notifications::attention_details(pool, conversation_id, generation, attention)
+        .await
+        .expect("get_attention after the wake");
+    (during, after)
+}
+
+/// N1: the model said it's done with `notify_user`, and then a command's
+/// idle notice woke it. Nothing the user did or was told changed, so the
+/// notification stands: `get_attention` keeps answering `Some` with the
+/// model's message, while the wake runs (when the notifier revalidates
+/// on its `TurnsChanged`) and after it, and the wake publishes nothing
+/// new. (Red before the fix: `None` during, since a turn was running,
+/// and `None` after, since the wake took a newer generation.)
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_wake_after_notify_user_leaves_the_notification_standing(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    start_mock_upstream(&pool, vec![notify_body("Built and tested"), done_body("Still running.")]).await;
+    let recording = events::AppRecording::start();
+    start_turn(pool.clone(), conversation.id, "hi".to_string()).await.expect("send");
+    let (attention, generation) = wait_needs_user(&recording, conversation.id).await;
+    assert_eq!(attention, events::Attention::Notified);
+    wait_turn_done(conversation.id).await;
+
+    let (during, after) = ask_around_a_wake(&pool, conversation.id, attention, generation).await;
+    assert_eq!(during.and_then(|d| d.message), Some("Built and tested".to_string()), "standing while the wake runs");
+    assert_eq!(after.and_then(|d| d.message), Some("Built and tested".to_string()), "standing after the wake");
+    let seen = published_after_done(&recording, conversation.id).await;
+    assert_eq!(seen, vec![(attention, generation)], "the wake published nothing of its own");
+    forget_conversation_lock(conversation.id);
+}
+
+/// N1's Question variant: a question waits on the user, and a command's
+/// idle notice wakes the conversation (the turn saves the notice and
+/// waits on the answer). The question still waits, so its notification
+/// stands through the wake and after it. (Red before the fix: `None`
+/// during, since a turn was running.)
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_wake_while_a_question_waits_leaves_the_notification_standing(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    start_mock_upstream(&pool, vec![ask_body(), done_body("Still running.")]).await;
+    let recording = events::AppRecording::start();
+    start_turn(pool.clone(), conversation.id, "hi".to_string()).await.expect("send");
+    let (attention, generation) = wait_needs_user(&recording, conversation.id).await;
+    assert_eq!(attention, events::Attention::Question);
+    wait_turn_done(conversation.id).await;
+
+    let (during, after) = ask_around_a_wake(&pool, conversation.id, attention, generation).await;
+    assert_eq!(during.and_then(|d| d.question_header), Some("Which".to_string()), "standing while the wake runs");
+    assert_eq!(after.and_then(|d| d.question_header), Some("Which".to_string()), "standing after the wake");
+    forget_conversation_lock(conversation.id);
+}
