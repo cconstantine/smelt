@@ -8,7 +8,16 @@ use std::sync::atomic::Ordering;
 
 /// A conversation with a live pod; with `chain`, an `active` agent whose
 /// stored rule chain it is.
+///
+/// Its id comes from the fixture band: the limits' buckets are kept per
+/// conversation id for the whole process, and every test's database
+/// numbers its conversations from 1.
 async fn conversation_with_pod(pool: &PgPool, chain: Option<Value>) -> (i64, i64) {
+    sqlx::query("SELECT setval(pg_get_serial_sequence('conversations', 'id'), $1)")
+        .bind(crate::id_alloc::FIXTURE_IDS.next_base())
+        .execute(pool)
+        .await
+        .expect("move the conversation id sequence");
     let conversation = db::create_conversation(pool).await.expect("conversation").id;
     if let Some(chain) = chain {
         sqlx::query(
@@ -280,4 +289,113 @@ async fn test_the_listing_is_what_the_chain_allows(pool: PgPool) {
     assert_eq!(tools[0]["input_schema"]["type"], "object");
     let all_names: Vec<_> = parsed(&all)["tools"].as_array().expect("tools").iter().map(|t| t["name"].clone()).collect();
     assert!(all_names.contains(&json!("mock.app-t13/second_tool")) && !all_names.contains(&json!("mock.app-t13/echo")), "{all_names:?}");
+}
+
+fn limits(per_minute: u32, burst: u32, max_in_flight: u32, per_command: i64) -> Limits {
+    Limits { per_minute, burst, max_in_flight, per_command }
+}
+
+async fn call_under(pool: &PgPool, caller: Caller<'_>, tool: &str, limits: &Limits) -> Answer {
+    handle_with(pool, caller, McpRequest::Call { body: json!({"tool": tool}).to_string() }, limits).await
+}
+
+/// T7, the rate: past the burst, a call is a 429 that says when to try
+/// again, and is recorded as limited.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_calls_over_the_rate_are_held_back_with_a_retry_time(pool: PgPool) {
+    let (config, calls) = mock_server_for_tests(&pool, "mock-t7").await;
+    let (conversation, pod) = conversation_with_pod(&pool, None).await;
+    let rate = limits(2, 2, 10, 1_000);
+    let mut answers = Vec::new();
+    for _ in 0..3 {
+        answers.push(call_under(&pool, caller(conversation, pod), "mock-t7/second_tool", &rate).await);
+    }
+    forget_mock_server(config.id).await;
+    assert_eq!(answers.iter().map(|a| a.status).collect::<Vec<_>>(), [200, 200, 429], "{answers:?}");
+    let refused = parsed(&answers[2]);
+    assert!(refused["retry_after_secs"].as_u64().is_some_and(|secs| secs > 0), "{refused}");
+    assert!(refused["error"].as_str().expect("error").contains("SANDBOX_MCP_CALLS_PER_MINUTE"), "{refused}");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let outcomes: Vec<_> = db::list_sandbox_mcp_calls(&pool, conversation).await.expect("rows").into_iter().map(|r| r.outcome).collect();
+    assert_eq!(outcomes, ["ok", "ok", "limited"]);
+}
+
+/// T7, in flight: a call while the cap's worth are in flight is refused
+/// at once, not queued; once one ends, the next goes.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_call_past_the_in_flight_cap_is_refused_at_once(pool: PgPool) {
+    let (config, calls) = mock_server_for_tests(&pool, "mock-t7b").await;
+    let (conversation, pod) = conversation_with_pod(&pool, None).await;
+    let one_at_a_time = limits(600, 10, 1, 1_000);
+    let held = tokio::spawn({
+        let pool = pool.clone();
+        async move { call_under(&pool, caller(conversation, pod), "mock-t7b/hang", &one_at_a_time).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first call reached the server");
+    let started = std::time::Instant::now();
+    let second = call_under(&pool, caller(conversation, pod), "mock-t7b/second_tool", &one_at_a_time).await;
+    let waited = started.elapsed();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(10), held).await.expect("ends").expect("no panic");
+    let third = call_under(&pool, caller(conversation, pod), "mock-t7b/second_tool", &one_at_a_time).await;
+    forget_mock_server(config.id).await;
+    assert_eq!((first.status, second.status, third.status), (502, 429, 200), "{second:?}");
+    assert!(waited < std::time::Duration::from_millis(500), "refused at once, not queued: {waited:?}");
+    assert!(second.body.contains("SANDBOX_MCP_MAX_IN_FLIGHT"), "{}", second.body);
+}
+
+/// T8: a command past its budget is held back, with no time to retry
+/// after; another command has a budget of its own, and calls traced to no
+/// command share one per pod.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_command_past_its_budget_is_held_back_and_another_command_isnt(pool: PgPool) {
+    let (config, _calls) = mock_server_for_tests(&pool, "mock-t8").await;
+    let (conversation, pod) = conversation_with_pod(&pool, None).await;
+    let terminal = db::create_sandbox_terminal(&pool, pod).await.expect("terminal").id;
+    for id in ["cmd-t8-a", "cmd-t8-b"] {
+        db::create_terminal_command(&pool, conversation, terminal, id, "loop", 0).await.expect("command");
+    }
+    let budget = limits(600, 100, 10, 2);
+    let mut seen = Vec::new();
+    for command in [Some("cmd-t8-a"), Some("cmd-t8-a"), Some("cmd-t8-a"), Some("cmd-t8-b"), None, None, None] {
+        let c = Caller { conversation_id: conversation, pod_id: pod, command_id: command };
+        let answer = call_under(&pool, c, "mock-t8/second_tool", &budget).await;
+        seen.push((command, answer.status, parsed(&answer).get("retry_after_secs").cloned()));
+    }
+    forget_mock_server(config.id).await;
+    let statuses: Vec<_> = seen.iter().map(|(command, status, _)| (*command, *status)).collect();
+    assert_eq!(
+        statuses,
+        [
+            (Some("cmd-t8-a"), 200),
+            (Some("cmd-t8-a"), 200),
+            (Some("cmd-t8-a"), 429),
+            (Some("cmd-t8-b"), 200),
+            (None, 200),
+            (None, 200),
+            (None, 429),
+        ]
+    );
+    assert_eq!(seen[2].2, None, "waiting doesn't help: a new command starts a new budget");
+}
+
+/// `SANDBOX_MCP_CALLS_PER_MINUTE=0` turns script calls off: refused
+/// before anything is sent or recorded.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_zero_calls_a_minute_turns_script_calls_off(pool: PgPool) {
+    let (config, calls) = mock_server_for_tests(&pool, "mock-off").await;
+    let (conversation, pod) = conversation_with_pod(&pool, None).await;
+    let off = limits(0, 0, 4, 1_000);
+    let call = call_under(&pool, caller(conversation, pod), "mock-off/second_tool", &off).await;
+    let list = handle_with(&pool, caller(conversation, pod), McpRequest::List { server: None }, &off).await;
+    forget_mock_server(config.id).await;
+    assert_eq!((call.status, list.status), (403, 403), "{call:?}");
+    assert!(call.body.contains("SANDBOX_MCP_CALLS_PER_MINUTE"), "{}", call.body);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(db::list_sandbox_mcp_calls(&pool, conversation).await.expect("rows").is_empty());
 }

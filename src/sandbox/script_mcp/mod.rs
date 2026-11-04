@@ -74,6 +74,11 @@ pub(super) fn spawn_request(pool: PgPool, conn: Arc<TerminalConnection>, call_id
 /// pod and command, the call's class and outcome, never its arguments or
 /// result (SME-137).
 pub(crate) async fn handle(pool: &PgPool, caller: Caller<'_>, request: McpRequest) -> Answer {
+    handle_with(pool, caller, request, &Limits::deployment()).await
+}
+
+/// [`handle`] under `limits` rather than the deployment's.
+pub(crate) async fn handle_with(pool: &PgPool, caller: Caller<'_>, request: McpRequest, limits: &Limits) -> Answer {
     use tracing::field::Empty;
     let span = tracing::info_span!(
         "script mcp call",
@@ -90,8 +95,8 @@ pub(crate) async fn handle(pool: &PgPool, caller: Caller<'_>, request: McpReques
     );
     crate::telemetry::in_span(span.clone(), async move {
         let answer = match request {
-            McpRequest::List { server } => list(pool, caller, server.as_deref()).await,
-            McpRequest::Call { body } => call(pool, caller, &span, &body).await,
+            McpRequest::List { server } => list(pool, caller, server.as_deref(), limits).await,
+            McpRequest::Call { body } => call(pool, caller, &span, &body, limits).await,
         };
         span.record("smelt.script.status", answer.status as i64);
         if answer.status >= 400 {
@@ -155,7 +160,7 @@ fn parse_call(body: &str) -> Result<(String, Value), Answer> {
     Ok((tool, arguments))
 }
 
-async fn call(pool: &PgPool, caller: Caller<'_>, span: &tracing::Span, body: &str) -> Answer {
+async fn call(pool: &PgPool, caller: Caller<'_>, span: &tracing::Span, body: &str, limits: &Limits) -> Answer {
     let (name, arguments) = match parse_call(body) {
         Ok(call) => call,
         Err(answer) => return answer,
@@ -168,6 +173,19 @@ async fn call(pool: &PgPool, caller: Caller<'_>, span: &tracing::Span, body: &st
     if let Err(answer) = check_caller(pool, caller).await {
         return answer;
     }
+    if !limits.enabled() {
+        return turned_off();
+    }
+    // Held for the whole call: its place among those in flight.
+    let _slot = match take_limits(pool, caller, limits).await {
+        Ok(slot) => slot,
+        Err(held_back) => {
+            if let Err(e) = db::insert_sandbox_mcp_call(pool, caller.conversation_id, caller.pod_id, caller.command_id, &config.name, &tool, None, "limited").await {
+                tracing::warn!(error = %e, "couldn't record a script's MCP call held back by a limit");
+            }
+            return held_back;
+        }
+    };
     let row = match db::insert_sandbox_mcp_call(pool, caller.conversation_id, caller.pod_id, caller.command_id, &config.name, &tool, None, "running").await {
         Ok(row) => row,
         // Failing closed: a call that can't be recorded can't be counted
@@ -209,13 +227,47 @@ async fn call(pool: &PgPool, caller: Caller<'_>, span: &tracing::Span, body: &st
     answer
 }
 
+/// What a script gets when the deployment has turned script calls off.
+fn turned_off() -> Answer {
+    Answer::error(403, format!("script MCP calls are turned off on this deployment ({}=0)", limits::CALLS_PER_MINUTE_ENV))
+}
+
+/// The per-command budget, then a slot and a token (`limits::take`). A
+/// call held back is a 429, with a time to retry after when waiting helps.
+async fn take_limits(pool: &PgPool, caller: Caller<'_>, limits: &Limits) -> Result<limits::Slot, Answer> {
+    let held_back = |held: limits::Limited| {
+        let mut body = json!({ "error": held.message });
+        if let Some(secs) = held.retry_after_secs {
+            body["retry_after_secs"] = Value::from(secs);
+        }
+        Answer::json(429, &body)
+    };
+    let made = db::count_sandbox_mcp_calls_against_budget(pool, caller.conversation_id, caller.pod_id, caller.command_id)
+        .await
+        .map_err(|e| Answer::error(503, format!("couldn't count this command's MCP calls: {e}")))?;
+    if made >= limits.per_command {
+        let whose = if caller.command_id.is_some() { "this command" } else { "this sandbox's processes outside any command" };
+        return Err(held_back(limits::Limited {
+            message: format!(
+                "{whose} made {made} MCP calls, its limit ({}); a new terminal command starts a new budget",
+                limits::CALLS_PER_COMMAND_ENV
+            ),
+            retry_after_secs: None,
+        }));
+    }
+    limits::take(caller.conversation_id, limits).map_err(held_back)
+}
+
 /// `GET /v1/tools`: what this conversation's scripts may call, as the
 /// model is offered it (the same chain and class), with the servers' own
 /// names and input schemas. Best-effort, like the offer: the call is the
 /// check.
-async fn list(pool: &PgPool, caller: Caller<'_>, server: Option<&str>) -> Answer {
+async fn list(pool: &PgPool, caller: Caller<'_>, server: Option<&str>, limits: &Limits) -> Answer {
     if let Err(answer) = check_caller(pool, caller).await {
         return answer;
+    }
+    if !limits.enabled() {
+        return turned_off();
     }
     let chain = match db::agent_rule_chain(pool, caller.conversation_id).await {
         Ok(stored) => crate::personas::rules::RuleChain::from_stored(stored),
@@ -247,6 +299,9 @@ async fn list(pool: &PgPool, caller: Caller<'_>, server: Option<&str>) -> Answer
         .collect();
     Answer::json(200, &json!({ "tools": tools }))
 }
+
+mod limits;
+pub(crate) use limits::Limits;
 
 #[cfg(test)]
 mod tests;

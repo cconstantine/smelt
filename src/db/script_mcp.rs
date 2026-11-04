@@ -49,6 +49,30 @@ pub async fn finish_sandbox_mcp_call(pool: &PgPool, id: i64, class: Option<&str>
     Ok(())
 }
 
+/// The calls counted against a call's budget (SME-359): those of its
+/// command, when the command is this conversation's (as the insert keeps
+/// it), and otherwise those of its pod made outside any command. A call
+/// held back by a limit doesn't count.
+pub async fn count_sandbox_mcp_calls_against_budget(
+    pool: &PgPool,
+    conversation_id: i64,
+    pod_id: i64,
+    command_id: Option<&str>,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM sandbox_mcp_calls
+          WHERE outcome <> 'limited'
+            AND CASE WHEN EXISTS (SELECT 1 FROM terminal_commands WHERE command_id = $3 AND conversation_id = $1)
+                     THEN command_id = $3
+                     ELSE pod_id = $2 AND command_id IS NULL END",
+    )
+    .bind(conversation_id)
+    .bind(pod_id)
+    .bind(command_id)
+    .fetch_one(pool)
+    .await
+}
+
 /// Whether `pod_id` is `conversation_id`'s live pod, and the conversation
 /// isn't being deleted: the check a script's call passes first.
 pub async fn sandbox_pod_is_live_for(pool: &PgPool, pod_id: i64, conversation_id: i64) -> Result<bool, sqlx::Error> {

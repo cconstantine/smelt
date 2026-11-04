@@ -34,3 +34,13 @@ A Unix socket rather than a port: no port-forward, preview or `webfetch` route r
 - **The result is the server's own:** every content block, `structured_content` and the joined `text`, not cut to the model's 30,000 characters, but bounded at 8 MiB of JSON (`502` beyond). A failure below MCP is a `502`. Error text has the server's secrets redacted (`mcp::redact_secrets`: the URL's query and password, header values, OAuth tokens), on the model's calls too.
 - **`GET /v1/tools`** lists what the model is offered (`mcp::offered_tools`, the same chain and class), with the servers' own names and input schemas.
 - **Each call is a `sandbox_mcp_calls` row** ([database.md](database.md)), never holding its arguments or result, and runs in a `script mcp call` span (conversation, pod, command, server, tool, class, status) over the call's `mcp call` span.
+
+## Limits
+
+A script's call costs no model tokens; its cost is the provider's quota, and for a writing tool the writes. The limits are smelt's, per conversation, in memory (`src/sandbox/script_mcp/limits.rs`; they reset when smelt restarts), each a `429` and a `limited` row:
+
+- **Rate:** `SANDBOX_MCP_CALLS_PER_MINUTE` (60), a token bucket with a burst of 20; the answer carries `retry_after_secs`. `0` turns script calls off (a `403`, nothing recorded).
+- **In flight:** `SANDBOX_MCP_MAX_IN_FLIGHT` (4) at once; one more is refused at once rather than queued.
+- **Per command:** `SANDBOX_MCP_CALLS_PER_COMMAND` (1,000) calls, counted in `sandbox_mcp_calls`; calls traced to no command share a budget of the same size per pod. Waiting doesn't clear it: a new command starts a new budget. Two calls racing at the edge can both pass, so it can overshoot by up to the in-flight cap less one.
+
+Each call also keeps the MCP call's own 120 s budget. The other half of a limit is being seen: each command's calls are summarized where the user and the model look (below).
