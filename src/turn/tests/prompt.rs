@@ -227,6 +227,16 @@ fn test_system_prompt_says_when_to_notify_the_user() {
     }
 }
 
+/// SME-384: the prompt tells an agent how to name another agent or
+/// conversation so the chat renders it as a link.
+#[test]
+fn test_system_prompt_tells_agents_how_to_link_another_conversation() {
+    assert!(
+        BASE_SYSTEM_PROMPT.contains("`agent #N` or `conversation #N`"),
+        "missing the conversation-reference sentence in the base prompt"
+    );
+}
+
 #[test]
 fn test_system_prompt_describes_the_environment() {
     let prompt = system_prompt(&prompt_env());

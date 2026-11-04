@@ -88,3 +88,4 @@ Your replies are rendered as Markdown in a chat bubble about 65 characters wide:
 - Lists and short tables are fine. Keep tables narrow: wide ones scroll sideways.
 - Use a heading only to split a long reply into parts; a short update needs none.
 - Links work for http, https and mailto addresses.
+- To name another agent or conversation, write `agent #N` or `conversation #N`; the chat renders it as a link to that conversation.

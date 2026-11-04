@@ -1,5 +1,6 @@
 #[cfg(feature = "server")]
 mod agent_protocol;
+mod agent_refs;
 #[cfg(feature = "server")]
 mod agents;
 mod anthropic;
