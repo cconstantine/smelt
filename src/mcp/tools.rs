@@ -377,7 +377,12 @@ pub async fn tool_definitions_for(
     chain: &crate::personas::rules::RuleChain,
 ) -> Vec<ToolDefinition> {
     // Only names a call routes back to the tool offered (SME-386 T7).
-    routable_offers(offered_tools(pool, configs, chain).await, configs)
+    let offered = offered_tools(pool, configs, chain).await;
+    let listed: HashMap<String, Vec<McpTool>> = {
+        let registry = REGISTRY.lock().await;
+        configs.iter().filter_map(|config| registry.get(&config.id).map(|conn| (config.name.clone(), conn.tools.clone()))).collect()
+    };
+    routable_offers(offered, configs, &listed)
         .iter()
         .map(|offered| mcp_tool_to_definition(&offered.server, &offered.tool))
         .collect()
@@ -386,6 +391,7 @@ pub async fn tool_definitions_for(
 /// One MCP tool `chain` lets a conversation call, with the class it is
 /// judged at: what the model is offered, and what a script in the sandbox
 /// lists (SME-359).
+#[derive(Clone)]
 pub struct OfferedTool {
     pub server: String,
     pub tool: McpTool,
@@ -393,30 +399,29 @@ pub struct OfferedTool {
 }
 
 /// The tools of `offered` a call by their offered name would reach
-/// (SME-386 T7): a name only one of them has, which `server_for` (over
-/// every configured server, `configs`) routes back to its own server.
-/// Servers `a` and `a__b` can both make `mcp__a__b__c`, and a call by it
-/// reaches `a__b`; so both tools of a shared name are left out, and so is
-/// one whose name another server's longer name would catch. The model is
-/// offered no tool its call would miss.
-pub(crate) fn routable_offers(offered: Vec<OfferedTool>, configs: &[McpServerConfig]) -> Vec<OfferedTool> {
-    let names: Vec<String> = offered.iter().map(|o| namespaced_tool_name(&o.server, o.tool.name.as_ref())).collect();
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    for name in &names {
-        *counts.entry(name.as_str()).or_default() += 1;
-    }
-    let keep: Vec<bool> = offered
-        .iter()
-        .zip(&names)
-        .map(|(o, name)| {
-            let routes = counts.get(name.as_str()) == Some(&1) && server_for(name, configs).is_some_and(|(config, _)| config.name == o.server);
+/// (SME-386 T7): the call goes to the configured server `server_for`
+/// picks (over every one, `configs`), then to the tool `listed_tool_name`
+/// finds among what that server lists (`listed`, by server name). Servers
+/// `a` and `a__b` can both make `mcp__a__b__c`, and a call by it reaches
+/// `a__b`'s `c`, so `a`'s `b__c` is left out; within one server, a tool
+/// listed under another's safe name takes its call (review 1, L1), so the
+/// other is left out. The model is offered no tool its call would miss.
+pub(crate) fn routable_offers(offered: Vec<OfferedTool>, configs: &[McpServerConfig], listed: &HashMap<String, Vec<McpTool>>) -> Vec<OfferedTool> {
+    offered
+        .into_iter()
+        .filter(|o| {
+            let name = namespaced_tool_name(&o.server, o.tool.name.as_ref());
+            let reached = server_for(&name, configs).and_then(|(config, part)| {
+                let tools = listed.get(&config.name).map_or(&[][..], Vec::as_slice);
+                (config.name == o.server).then(|| listed_tool_name(tools, &config.name, part))
+            });
+            let routes = reached.as_deref() == Some(o.tool.name.as_ref());
             if !routes {
-                tracing::warn!(server = %o.server, tool = %o.tool.name, name, "another MCP tool or server shares this tool's name; it isn't offered");
+                tracing::warn!(server = %o.server, tool = %o.tool.name, name, "a call by this MCP tool's name would reach another tool; it isn't offered");
             }
             routes
         })
-        .collect();
-    offered.into_iter().zip(keep).filter_map(|(o, keep)| keep.then_some(o)).collect()
+        .collect()
 }
 
 /// [`tool_definitions_for`]'s tools before they become definitions: every
