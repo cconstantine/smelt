@@ -180,3 +180,30 @@ async fn test_a_stop_as_a_delivery_is_let_in_ends_it(pool: PgPool) {
     assert_eq!(saved.iter().filter(|m| m.content.contains(STOP_NOTICE)).count(), 1, "the stop once: {saved:?}");
     resume_turns(conversation_id);
 }
+
+/// SME-386 A2: a message of the user's that quotes the stop's note isn't
+/// the note. A Stop right after it still notes the stop, marked, after it.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_message_quoting_the_stop_note_doesnt_hide_the_stop(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+    let requests = start_recording_mock_upstream(&pool, vec![text_reply_body("Hi!")]).await;
+    let mut rx = events::subscribe(conversation_id);
+    let held = conversation_lock(conversation_id).lock_owned().await;
+    let quoting = format!("Why did you say \"{STOP_NOTICE}\" earlier?");
+
+    start_turn(pool.clone(), conversation_id, quoting).await.expect("the send is taken");
+    stop_turn_now(conversation_id);
+    release_after_the_stop_is_seen(held).await;
+    wait_until_idle(&mut rx).await;
+
+    assert!(requests.lock().expect("the request log").is_empty(), "the stopped send called the model");
+    let saved = db::list_messages(&pool, conversation_id).await.expect("list");
+    assert_eq!(saved.len(), 2, "the message, then the stop's note: {saved:?}");
+    assert!(
+        saved[1].content.contains(&format!("{}{}", crate::api::chat::NOTICE_MARK, STOP_NOTICE)),
+        "the stop is noted after the quoting message: {saved:?}"
+    );
+    resume_turns(conversation_id);
+}
