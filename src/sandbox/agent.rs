@@ -313,6 +313,12 @@ pub(super) enum ConnectMode {
     /// Everyone else, who expects the agent to be there. After the last
     /// failed attempt the pod is cleaned up and stopped, as after a crash.
     Reconnect,
+    /// smelt's startup reconnect (SME-359): like `Reconnect`, but only a
+    /// death the cluster confirms is cleaned up. Attempts that fail
+    /// without one leave the pod alone, for the next caller's `Reconnect`
+    /// to decide on: boot never stops a pod it merely couldn't reach
+    /// (review round 1, L2).
+    Startup,
 }
 
 /// Why one attempt to connect failed.
@@ -362,7 +368,7 @@ pub(super) fn connect_with_retry(
         // below would take for a dead pod and stop, closing the record of a
         // pod the start then makes anyway (B1, SME-122). The start reports
         // its own failure.
-        if mode == ConnectMode::Reconnect && start_under_way_for_pod(&pool, pod_id).await {
+        if mode != ConnectMode::First && start_under_way_for_pod(&pool, pod_id).await {
             return Err(TerminalError::NoPod);
         }
 
@@ -416,7 +422,7 @@ pub(super) fn connect_with_retry(
                 }
                 ConnectError::Failed(e) => {
                     tracing::info!(pod_id, attempt, error = %e, "couldn't connect to the sandbox agent");
-                    if mode == ConnectMode::Reconnect {
+                    if mode != ConnectMode::First {
                         if let Some(reason) = dialer.death_reason(pod_id).await {
                             clean_up_and_terminate_pod(&pool, pod_id, reason).await;
                             return Err(TerminalError::AgentUnreachable);
@@ -432,6 +438,10 @@ pub(super) fn connect_with_retry(
 
         match mode {
             ConnectMode::First => Err(last_err.map(TerminalError::from).unwrap_or(TerminalError::AgentUnreachable)),
+            ConnectMode::Startup => {
+                tracing::info!(pod_id, "couldn't reach the pod's agent at startup; left for the next caller to decide on");
+                Err(TerminalError::AgentUnreachable)
+            }
             ConnectMode::Reconnect => {
                 // Every attempt failed without the cluster ever confirming
                 // the pod is dead (a pod stuck reporting `Running` while
@@ -462,8 +472,9 @@ pub(super) async fn clean_up_and_terminate_pod(pool: &PgPool, pod_id: i64, reaso
 /// Connects to every live pod's agent at startup (SME-359, Q4), each in a
 /// task of its own, so a script in a pod that outlived a restart can call
 /// MCP tools again at once rather than after the model's next sandbox
-/// call. A pod that turns out dead is cleaned up as a reconnect would on
-/// the next touch, and a command exit the agent queued while smelt was
+/// call. A pod the cluster confirms dead is cleaned up; one that only
+/// doesn't answer is left for the next caller (`ConnectMode::Startup`).
+/// A command exit the agent queued while smelt was
 /// down is delivered now, waking its conversation. Only this database's
 /// pods are listed, and the dial reads each pod first and refuses one
 /// that isn't ours (`refuse_foreign`).
@@ -478,7 +489,12 @@ pub async fn reconnect_live_pods(pool: &PgPool) {
     tracing::info!(pods = pods.len(), "reconnecting to the live pods' agents");
     for pod_id in pods {
         let pool = pool.clone();
-        tokio::spawn(async move { try_reconnect(&pool, pod_id).await });
+        tokio::spawn(async move {
+            if registry_contains(pod_id) {
+                return;
+            }
+            let _ = connect_with_retry(pool, pod_id, ConnectMode::Startup).await;
+        });
     }
 }
 

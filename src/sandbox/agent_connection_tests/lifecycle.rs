@@ -350,3 +350,40 @@ async fn test_startup_connects_to_every_live_pod(pool: PgPool) {
     assert_eq!(stopped_agent.dials.load(Ordering::SeqCst), 0, "a stopped pod isn't dialed");
     assert!(!registry_contains(stopped));
 }
+
+/// Review round 1, L2: at startup, a pod whose agent doesn't answer, with
+/// no confirmed death, is left alone for the lazy path to decide on: boot
+/// never stops pods.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_startup_leaves_an_unreachable_pod_alone(pool: PgPool) {
+    let (_, pod) = pod_row(&pool).await;
+    let terminal = db::create_sandbox_terminal(&pool, pod).await.expect("terminal").id;
+    // A port nothing listens on: bound, then released.
+    let addr = std::net::TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr");
+    let dials = Arc::new(AtomicUsize::new(0));
+    test_dialers().lock().unwrap_or_else(|e| e.into_inner()).insert(pod, Arc::new(FakeDialer { addr, delay: Duration::ZERO, dials: dials.clone() }));
+    reconnect_live_pods(&pool).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while dials.load(Ordering::SeqCst) < RECONNECT_ATTEMPTS as usize {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("every attempt was made");
+    // Past the last attempt, where a reconnect would stop the pod.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let live: bool = sqlx::query_scalar("SELECT terminated_at IS NULL FROM sandbox_pods WHERE id = $1")
+        .bind(pod)
+        .fetch_one(&pool)
+        .await
+        .expect("the pod row");
+    assert!(live, "startup stopped a pod it only couldn't reach");
+    // The crash cleanup closes the pod's terminals even where the stop
+    // itself can't reach a cluster: the sign that it ran.
+    let terminal_live: bool = sqlx::query_scalar("SELECT terminated_at IS NULL FROM sandbox_terminals WHERE id = $1")
+        .bind(terminal)
+        .fetch_one(&pool)
+        .await
+        .expect("the terminal row");
+    assert!(terminal_live, "startup cleaned up a pod it only couldn't reach");
+}
