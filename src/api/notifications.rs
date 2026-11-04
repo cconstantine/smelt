@@ -42,7 +42,10 @@ pub async fn get_attention(id: i64, generation: u64, attention: Attention) -> Se
 ///   answered, or another turn took one;
 /// - for a question, nothing waits any more: answered, dismissed, or a row
 ///   asked of the child's parent, which no card can answer (Revision 6),
-///   and no repo trust card waits either (SME-377);
+///   and no repo trust card waits either (SME-377) — unless the spell's
+///   `notify_user` message is held for this generation: then the answer
+///   is that notification instead (review round 1, M1), since a question
+///   resolved mid-spell outranked the model's later "done";
 /// - for a `Notified` (SME-377), the runtime no longer holds the model's
 ///   message for exactly that generation: a restart, or a newer notice;
 /// - the conversation is gone, so it has no title.
@@ -55,13 +58,17 @@ pub(crate) async fn attention_details(pool: &sqlx::PgPool, id: i64, generation: 
     // `pending_question` is the one question check: it answers nothing for
     // a row already answered or asked of the parent. A trust card waits on
     // the user too (SME-377), headed by a fixed line: it holds no repo data.
+    let mut attention = attention;
     let question_header = if attention == Attention::Question {
         match crate::turn::pending_question(pool, id).await? {
             Some(question) => question.questions.into_iter().next().map(|question| question.header),
             None if !db::list_instruction_requests(pool, id).await.map_err(ServerFnError::new)?.is_empty() => {
                 Some(TRUST_CARD_HEADER.to_string())
             }
-            None => return Ok(None),
+            None => {
+                attention = Attention::Notified;
+                None
+            }
         }
     } else {
         None

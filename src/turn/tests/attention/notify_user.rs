@@ -28,7 +28,7 @@ async fn test_two_notify_user_calls_in_one_spell_publish_once_with_the_last_mess
 
 /// T5's second half: a reply that asks the user and notifies in one go
 /// ends on the question, and the spell publishes Question, which
-/// outranks the Notified; the message goes with it.
+/// outranks the Notified; the message is kept behind it (M1).
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_ask_user_and_notify_user_in_one_reply_publish_question(pool: PgPool) {
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -46,7 +46,7 @@ async fn test_ask_user_and_notify_user_in_one_reply_publish_question(pool: PgPoo
     let seen = published_after_done(&recording, conversation.id).await;
     let generation = turn_generation(conversation.id);
     assert_eq!(seen, vec![(events::Attention::Question, generation)], "the question outranks the notification");
-    assert_eq!(published_notice(conversation.id, generation), None, "the outranked message isn't kept");
+    assert_eq!(published_notice(conversation.id, generation), Some("Look at this".to_string()), "kept behind the question");
 }
 
 /// T6: a Stop after the note (`clear_attention`, which a stopped turn's

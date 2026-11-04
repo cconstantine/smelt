@@ -737,7 +737,9 @@ async fn notify_leader(
         return;
     };
     let (heading, body) =
-        notification_text(event.attention, &details.title, details.question_header.as_deref(), details.message.as_deref());
+        // The server's kind, not the event's: a question resolved mid-spell
+        // answers with the spell's notify_user instead (SME-377 review 1).
+        notification_text(details.attention, &details.title, details.question_header.as_deref(), details.message.as_deref());
     send(serde_json::json!({
         "cmd": "notify",
         "id": event.conversation_id,

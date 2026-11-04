@@ -122,7 +122,8 @@ async fn test_exceeding_max_turns_publishes_failed(pool: PgPool) {
 
 /// The maximum, not the last word: a Failed in a busy spell is what ends
 /// it, whatever the model's `notify_user` said earlier in the same spell
-/// (T5, SME-377): the message is dropped with the Notified it rode.
+/// (T5, SME-377). The message is still kept for the generation (review
+/// round 1, M1), for a question that's resolved by the time it's asked.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_failed_beats_an_earlier_notify_user_in_one_busy_spell(pool: PgPool) {
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -143,7 +144,7 @@ async fn test_failed_beats_an_earlier_notify_user_in_one_busy_spell(pool: PgPool
     let generation = turn_generation(conversation.id);
     let seen = needs_user_of(&recording, conversation.id);
     assert_eq!(seen, vec![(events::Attention::Failed, generation)]);
-    assert_eq!(published_notice(conversation.id, generation), None, "the outranked message isn't kept");
+    assert_eq!(published_notice(conversation.id, generation), Some("All done".to_string()), "kept, though outranked");
 }
 
 /// The SME-73 pair, first half: a turn that overflows once, compacts and

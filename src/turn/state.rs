@@ -73,10 +73,10 @@ pub(super) struct ConversationRuntime {
     /// with `attention`'s `Notified`, the last call's winning, and taken
     /// with it at the spell's end. Cleared where `attention` is.
     notified: Option<String>,
-    /// The generation and message of the last `NeedsUser(Notified)` this
-    /// conversation published (SME-377), for `get_attention` to read once
-    /// the spell that owed it has ended. Replaced by the next one, freed
-    /// on delete.
+    /// The generation and message of the last busy spell that ended with
+    /// a `notify_user` message (SME-377), whatever kind it published, for
+    /// `get_attention` to read once the spell has ended. Replaced by the
+    /// next one, freed on delete.
     published_notice: Option<(u64, String)>,
 }
 
@@ -472,13 +472,11 @@ impl Drop for TurnInFlight {
             if last {
                 owed = runtime.attention.take();
                 generation = runtime.kept.generation;
-                // The model's message goes with a `Notified` it still
-                // owes, kept for `get_attention`; a stronger kind in the
-                // same spell drops it (SME-377).
-                let message = runtime.notified.take();
-                if owed == Some(crate::events::Attention::Notified)
-                    && let Some(message) = message
-                {
+                // The spell's `notify_user` message is kept for
+                // `get_attention` (SME-377), even when a stronger kind
+                // outranks it: a question resolved before the spell ended
+                // falls back to it (review round 1, M1).
+                if let Some(message) = runtime.notified.take() {
                     runtime.published_notice = Some((generation, message));
                 }
                 runtime.started_at = None;

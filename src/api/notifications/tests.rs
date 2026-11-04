@@ -266,6 +266,48 @@ async fn test_get_attention_counts_a_trust_card_as_a_question(pool: PgPool) {
     );
 }
 
+/// Review round 1, M1: a question resolved earlier in the same busy spell
+/// outranks the model's later `notify_user`, so the spell publishes
+/// Question. By the time the notifier asks, nothing waits, and the event
+/// falls back to the model's message rather than answering `None`.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_question_resolved_mid_spell_falls_back_to_the_notify_user_message(pool: PgPool) {
+    let _guard = ids_clear_and_locked(&pool).await;
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    rename(&pool, conversation.id, "load the repo").await;
+    let recording = crate::events::AppRecording::start();
+    let turn = crate::turn::count_a_test_turn(conversation.id);
+    let card = trust_card(&pool, conversation.id).await;
+    crate::turn::note_trust_card(conversation.id);
+    let mut conn = pool.acquire().await.expect("connection");
+    db::delete_instruction_request(&mut *conn, card).await.expect("the user decided");
+    crate::turn::note_notified(conversation.id, "x".to_string());
+    drop(turn);
+    let generation = turn_generation(conversation.id);
+    let published: Vec<_> = recording
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            crate::events::AppEvent::NeedsUser { conversation_id, attention, generation } if conversation_id == conversation.id => {
+                Some((attention, generation))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(published, vec![(Attention::Question, generation)], "the spell owed the question");
+    assert_eq!(
+        attention_details(&pool, conversation.id, generation, Attention::Question).await.expect("query"),
+        Some(AttentionDetails {
+            title: "load the repo".into(),
+            attention: Attention::Notified,
+            question_header: None,
+            message: Some("x".into()),
+        }),
+        "nothing waits any more: the model's message is what's left to say"
+    );
+    turn::forget_conversation_lock(conversation.id);
+}
+
 /// A deleted conversation has no title, so nothing shows.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_get_attention_answers_none_for_a_deleted_conversation(pool: PgPool) {
