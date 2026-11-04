@@ -324,31 +324,40 @@ pub async fn set_provider_model_reported(
 
 /// Saves the context window an overflow refusal named (SME-73), for the
 /// model the turn ran on. One statement: the row is added if it has
-/// none, and `context_window` is set only where it's null or larger —
-/// it only ever lowers, so two learners settle on the smaller — and
-/// only while the provider still answers at `base_url`, so a provider
-/// moved to another server mid-turn isn't given the old server's
-/// window. Returns whether anything was written.
+/// none, and `context_window` is set only where `window` is below the
+/// model's effective window — the saved one, else the reported one, else
+/// `unsized_window` (the window `providers::context_window` gives a model with
+/// no row) — so it only ever lowers what turns use (SME-386 T5), and two
+/// learners settle on the smaller; and only while the provider still
+/// answers at `base_url`, so a provider moved to another server mid-turn
+/// isn't given the old server's window. Returns whether anything was
+/// written.
 pub async fn lower_model_context_window(
     pool: &PgPool,
     provider_id: i64,
     base_url: &str,
     model: &str,
     window: u32,
+    unsized_window: u32,
 ) -> Result<bool, sqlx::Error> {
     let window = i32::try_from(window).unwrap_or(i32::MAX);
+    let unsized_window = i32::try_from(unsized_window).unwrap_or(i32::MAX);
+    // A column counts only when positive, as `providers::context_window`
+    // reads it.
     let written = sqlx::query(
         "INSERT INTO provider_models (provider_id, model, context_window)\n\
-         SELECT $1, $2, $3 FROM inference_providers WHERE id = $1 AND base_url = $4\n\
+         SELECT $1, $2, $3 FROM inference_providers WHERE id = $1 AND base_url = $4 AND $3 < $5\n\
          ON CONFLICT (provider_id, model) DO UPDATE\n\
          SET context_window = $3\n\
-         WHERE (provider_models.context_window IS NULL OR provider_models.context_window > $3)\n\
+         WHERE $3 < COALESCE(NULLIF(GREATEST(provider_models.context_window, 0), 0),\n\
+                             NULLIF(GREATEST(provider_models.reported_context_window, 0), 0), $5)\n\
            AND EXISTS (SELECT 1 FROM inference_providers WHERE id = $1 AND base_url = $4)",
     )
     .bind(provider_id)
     .bind(model)
     .bind(window)
     .bind(base_url)
+    .bind(unsized_window)
     .execute(pool)
     .await?;
     Ok(written.rows_affected() > 0)
