@@ -444,14 +444,17 @@ fn test_history_for_request_sends_a_stored_mcp_calls_name_made_safe() {
 
 /// SME-367: the user's and the parent's own words are quoted through a
 /// compaction, word for word: a mid-run correction too, not only the
-/// unanswered tail. Notices, tool results and other agents' texts aren't.
+/// unanswered tail. Notices, tool results and other agents' texts aren't —
+/// the notices in their saved, marked form (SME-357); wording that only
+/// looks like one is the user's own, and quoted by
+/// `test_words_starting_like_a_notice_are_quoted`.
 #[test]
 fn test_typed_words_are_quoted_and_notices_arent() {
     let correction = "you should be using the rust available in the smelt service from the docker-compose.yml";
     let messages = vec![
         text_message(1, "user", "Drive SME-73."),
         text_message(2, "assistant", "ok"),
-        text_message(3, "user", "Terminal command abc finished: exit code 0."),
+        text_message(3, "user", &mark_notice("Terminal command abc finished: exit code 0.")),
         text_message(4, "user", correction),
         text_message(5, "user", "Report from agent #9 (smelt:developer):\n\nDone."),
         text_message(6, "user", &crate::api::chat::failure_notice("boom")),
@@ -523,12 +526,12 @@ fn test_typed_words_drop_a_stopped_request_and_keep_answers() {
         text_message(2, "assistant", "ok"),
         text_message(3, "user", "Delete every branch."),
         text_message(4, "assistant", "Deleting"),
-        text_message(5, "user", STOP_NOTICE),
+        text_message(5, "user", &mark_notice(STOP_NOTICE)),
         text_message(6, "user", "Write the docs instead."),
         message_with_blocks(7, "assistant", vec![ask]),
         message_with_blocks(8, "user", vec![answer]),
-        text_message(9, "user", "The user stopped sandbox pod 4. Create a new pod if you need one."),
-        text_message(10, "user", "The user now trusts https://example.com/r.git. You can start agents on it; call start_agent again."),
+        text_message(9, "user", &mark_notice("The user stopped sandbox pod 4. Create a new pod if you need one.")),
+        text_message(10, "user", &mark_notice("The user now trusts https://example.com/r.git. You can start agents on it; call start_agent again.")),
         text_message(11, "assistant", "done"),
         text_message(12, "user", "next"),
     ];
@@ -578,7 +581,7 @@ fn test_a_stop_calls_off_only_what_wasnt_answered() {
         text_message(2, "assistant", "ok"),
         text_message(3, "user", "Use the compose rust, not the pod's."),
         text_message(4, "assistant", "Understood."),
-        text_message(5, "user", "Terminal command abc finished: exit code 0."),
+        text_message(5, "user", &mark_notice("Terminal command abc finished: exit code 0.")),
         message_with_blocks(6, "assistant", vec![call("t1", "run_terminal_command")]),
         message_with_blocks(7, "user", vec![result("t1", "out", None)]),
         text_message(8, "user", STOP_NOTICE),
@@ -640,4 +643,52 @@ fn test_a_marked_stop_calls_off_the_request_too() {
     ];
     assert_eq!(typed_user_text(&b, 200_000).quotes, vec!["Drive it.".to_string()], "the marked stop calls the stopped request off");
     assert_eq!(unanswered_user_text(&b), vec!["Write docs instead.".to_string()], "and in the unanswered texts too");
+}
+
+/// SME-357: the notice wording left `is_typed`'s exclusion list — what makes
+/// a saved notice is `NOTICE_MARK`, so a user's own messages that merely
+/// start like one are quoted again, and the saved (marked) ones still aren't.
+/// The three agent-message starts stay excluded: another agent's typed words.
+#[test]
+fn test_words_starting_like_a_notice_are_quoted() {
+    let messages = vec![
+        text_message(1, "assistant", "ok"),
+        text_message(2, "user", "Terminal command abc finished: exit code 0."),
+        text_message(3, "user", "Sandbox pod 3 stopped unexpectedly (OOMKilled); every terminal is gone."),
+        text_message(4, "user", "The user now trusts x. Ask about it below."),
+        text_message(5, "user", "Notice: the user deleted agent #7"),
+        text_message(6, "user", &mark_notice("Terminal command abc finished: exit code 0.")),
+        text_message(7, "user", &mark_notice("The user now trusts x. Ask about it below.")),
+        text_message(8, "user", &mark_notice("Notice: the user deleted agent #7")),
+        text_message(9, "user", "Report from agent #9 (smelt:developer):\n\nDone."),
+        text_message(10, "user", "Message from agent #9: hello."),
+        text_message(11, "user", "Question from agent #9: which branch?"),
+        text_message(12, "assistant", "done"),
+    ];
+    assert_eq!(
+        typed_user_text(&messages, 200_000).quotes,
+        vec![
+            "Terminal command abc finished: exit code 0.".to_string(),
+            "Sandbox pod 3 stopped unexpectedly (OOMKilled); every terminal is gone.".to_string(),
+            "The user now trusts x. Ask about it below.".to_string(),
+            "Notice: the user deleted agent #7".to_string(),
+        ]
+    );
+}
+
+/// SME-357: `is_typed` reads the mark, not the words: typed notice wording
+/// is typed, its saved marked form isn't, and the three agent-message
+/// starts stay excluded while a parent's message reads as typed.
+#[test]
+fn test_is_typed_reads_the_mark_not_the_notice_words() {
+    assert!(crate::turn::compaction::is_typed("Terminal command abc finished: exit code 0."));
+    assert!(crate::turn::compaction::is_typed("Sandbox pod 3 stopped unexpectedly (OOMKilled); …"));
+    assert!(crate::turn::compaction::is_typed("The user now trusts x. Ask about it below."));
+    assert!(crate::turn::compaction::is_typed("Notice: the user deleted agent #7"));
+    assert!(!crate::turn::compaction::is_typed(&mark_notice("Terminal command abc finished: exit code 0.")));
+    assert!(!crate::turn::compaction::is_typed(&mark_notice("Notice: the user deleted agent #7")));
+    assert!(!crate::turn::compaction::is_typed("Report from agent #9 (smelt:developer):\n\nDone."));
+    assert!(!crate::turn::compaction::is_typed("Message from agent #9: hello."));
+    assert!(!crate::turn::compaction::is_typed("Question from agent #9: which branch?"));
+    assert!(crate::turn::compaction::is_typed("Message from your parent:\n\nUse the bare persona name."));
 }

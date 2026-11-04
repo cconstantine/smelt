@@ -296,35 +296,20 @@ pub(super) fn typed_budget(context_window: u32) -> usize {
 #[cfg(feature = "server")]
 const PARENT_MESSAGE_START: &str = "Message from your parent:";
 
-/// The starts of the user-role texts smelt writes itself: notices, and what
-/// other agents send (a child's report, message or question). Anything
-/// else in a user-role text block is the user's own words. A notice this
-/// misses is quoted as if typed, which costs space, never a correction.
+/// The starts of the user-role texts smelt writes for other agents: what a
+/// child reports, messages, or asks (`Report from `, `Message from agent #`,
+/// `Question from `). They're another agent's typed words, shown as bubbles
+/// as written, so they carry no `NOTICE_MARK` — marking them would grey
+/// real agent messages in the transcript (SME-357's trade-off). Everything
+/// smelt writes itself now carries the mark and is excluded by it, not by
+/// words. A text this list misses is quoted as if typed, which costs space,
+/// never a correction.
 #[cfg(feature = "server")]
-const SERVER_TEXT_STARTS: &[&str] = &[
-    crate::api::chat::STOP_NOTICE,
-    crate::api::chat::CUT_OFF_NOTICE_START,
-    crate::api::chat::REFUSAL_NOTICE_START,
-    crate::text_calls::TEXT_CALL_NOTICE_START,
-    crate::text_calls::EMPTY_REPLY_NOTICE,
-    "Terminal command ",
-    "Sandbox pod ",
-    "Docker in sandbox pod ",
-    "Report from ",
-    "Message from agent #",
-    "Question from ",
-    "Notice: ",
-    // Notices worded as news about the user (review 1). They carry no
-    // NOTICE_MARK yet (SME-357 would mark them all), so their starts are
-    // listed: quoted, they'd read as the user asking again.
-    "The user stopped sandbox pod ",
-    "The user removed this conversation's sandbox storage",
-    "The user now trusts ",
-    "The user chose not to trust ",
-];
+const SERVER_TEXT_STARTS: &[&str] = &["Report from ", "Message from agent #", "Question from "];
 
 /// Whether a user-role text is the user's own words or a parent's message:
-/// not a marked notice (`NOTICE_MARK`), and not one of `SERVER_TEXT_STARTS`.
+/// not a marked notice (every notice smelt saves into a transcript carries
+/// `NOTICE_MARK` since SME-357), and not one of `SERVER_TEXT_STARTS`.
 #[cfg(feature = "server")]
 pub(super) fn is_typed(text: &str) -> bool {
     if text.starts_with(PARENT_MESSAGE_START) {

@@ -65,6 +65,7 @@ fn preview(port: u16) -> SandboxPreview {
 mod formatting;
 mod messages;
 mod browser_input;
+mod notice_mark;
 mod notices;
 mod sandbox;
 mod commands;
