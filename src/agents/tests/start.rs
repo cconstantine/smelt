@@ -36,7 +36,8 @@ async fn test_start_agent_returns_at_once_and_the_child_runs_its_brief(pool: PgP
     let messages = transcript(&pool, child).await;
     assert_eq!(messages.len(), 3, "{messages:?}");
     assert_eq!(messages[0], ("user".to_string(), "Say hi.".to_string()));
-    assert!(messages[1].1.starts_with("Notice: Your start is done"), "{messages:?}");
+    // SME-357: the delivered start notice carries the mark before its words.
+    assert!(messages[1].1.starts_with(&format!("{}Notice: Your start is done", crate::api::chat::NOTICE_MARK)), "{messages:?}");
     assert_eq!(messages[2], ("assistant".to_string(), "Brief done.".to_string()));
     assert_eq!(requests_for(&requests, Some(child)).len(), 1, "the child's turn calls the model once");
     // Its system prompt says what it is.

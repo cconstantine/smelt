@@ -329,7 +329,10 @@ fn agent_message_text(row: &db::AgentMessage) -> String {
             ),
             None => format!("Question from {} (since deleted):\n\n{}", row.from_label, row.body),
         },
-        _ => format!("Notice: {}", row.body),
+        // SME-357: a queued notice is server-written, so it carries the mark
+        // like every saved notice; reports, messages and questions are
+        // another agent's typed words and stay unmarked.
+        _ => crate::api::chat::mark_notice(&format!("Notice: {}", row.body)),
     }
 }
 

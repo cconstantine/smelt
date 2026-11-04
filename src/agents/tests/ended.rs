@@ -42,7 +42,8 @@ async fn test_a_childs_turn_ending_with_text_tells_its_parent(pool: PgPool) {
         long.chars().take(500).collect::<String>()
     );
     assert_eq!(queued_to(&pool, root).await, vec![expected.clone()]);
-    assert_eq!(transcript(&pool, root).await[0], ("user".to_string(), format!("Notice: {expected}")));
+    // SME-357: the delivered notice carries the mark before its words.
+    assert_eq!(transcript(&pool, root).await[0], ("user".to_string(), format!("{}Notice: {expected}", crate::api::chat::NOTICE_MARK)));
     eventually("every turn is over", || async { !crate::turn::turn_running(root) }).await;
 }
 

@@ -555,11 +555,22 @@ fn test_a_quiet_stop_notice_reads_as_a_sentence() {
 fn test_the_quiet_stop_notices_smelt_saves_are_summarized() {
     let commands = HashMap::new();
     let idle = crate::sandbox::StopReason::Idle { minutes: 3 }.notice(5);
+    // SME-357: the builder marks what it writes; until the reader flip learns
+    // the mark, the fixture hands today's word-matching reader the unmarked
+    // form, as a legacy row would.
+    let idle = idle
+        .strip_prefix(crate::api::chat::NOTICE_MARK)
+        .expect("SME-357: the quiet-stop notice carries the mark")
+        .to_string();
     assert_eq!(
         system_notice(&idle, &commands).as_deref(),
         Some("The sandbox stopped after 3 minutes idle; /workspace and Docker's data are kept")
     );
     let finished = crate::sandbox::StopReason::Finished.notice(5);
+    let finished = finished
+        .strip_prefix(crate::api::chat::NOTICE_MARK)
+        .expect("SME-357: the finish notice carries the mark")
+        .to_string();
     assert_eq!(
         system_notice(&finished, &commands).as_deref(),
         Some("The sandbox stopped when this agent finished; /workspace and Docker's data are kept")

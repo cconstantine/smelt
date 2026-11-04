@@ -242,11 +242,12 @@ async fn save_removal_notice(pool: &PgPool, pod_id: i64, conversation_id: i64, d
             return;
         }
     }
-    let text = format!(
+    // SME-357: marked like every saved notice.
+    let text = crate::api::chat::mark_notice(&format!(
         "Sandbox pod {pod_id}'s storage was removed after {days} days stopped. \
          /workspace and Docker's images, build cache and volumes are gone; repos cloned \
          there need cloning again. The next sandbox starts fresh with empty volumes."
-    );
+    ));
     let content = [crate::anthropic::ContentBlock::Text { text }];
     match db::create_message_in_place(pool, conversation_id, "user", &content).await {
         Ok(saved) => events::publish(
