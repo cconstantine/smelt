@@ -293,6 +293,23 @@ async fn test_a_learned_window_never_raises_the_reported_one(pool: PgPool) {
     assert_eq!(get_provider_model(&pool, p.id, "unsized").await.expect("get"), None, "not even a row");
 }
 
+/// SME-386 review 1, M1: a model whose effective window is above the
+/// unsized one still learns a window between the two: the reported
+/// 262,144 lowers to 230,000, and a saved 1,000,000 to 200,000.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_window_above_the_unsized_one_still_lowers_a_larger_effective_one(pool: PgPool) {
+    let p = test_provider(&pool, "p").await;
+    set_provider_model_reported(&pool, p.id, "big", Some(262_144), None, None, None, None).await.expect("reported");
+    let learn = |model: &'static str, window: u32| lower_model_context_window(&pool, p.id, "https://api.anthropic.com", model, window, UNSIZED);
+    assert!(learn("big", 230_000).await.expect("learn"), "below the reported window, it lowers");
+    let row = get_provider_model(&pool, p.id, "big").await.expect("get").expect("exists");
+    assert_eq!(row.context_window, Some(230_000));
+    set_provider_model_overrides(&pool, p.id, "huge", None, Some(1_000_000), None, None, None).await.expect("save");
+    assert!(learn("huge", 200_000).await.expect("learn"), "below the saved window, it lowers");
+    let row = get_provider_model(&pool, p.id, "huge").await.expect("get").expect("exists");
+    assert_eq!(row.context_window, Some(200_000));
+}
+
 /// The learned window lands wherever there's room for it and lowers
 /// only: inserted for a model with no row, set where it's null or
 /// larger, dropped where it's already smaller.

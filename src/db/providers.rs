@@ -343,10 +343,16 @@ pub async fn lower_model_context_window(
     let window = i32::try_from(window).unwrap_or(i32::MAX);
     let unsized_window = i32::try_from(unsized_window).unwrap_or(i32::MAX);
     // A column counts only when positive, as `providers::context_window`
-    // reads it.
+    // reads it. The SELECT's guard reads an existing row's effective
+    // window too: a SELECT that yields no row reaches no conflict branch,
+    // so a guard on `$5` alone kept a model above the unsized window from
+    // learning anything (review 1, M1).
     let written = sqlx::query(
         "INSERT INTO provider_models (provider_id, model, context_window)\n\
-         SELECT $1, $2, $3 FROM inference_providers WHERE id = $1 AND base_url = $4 AND $3 < $5\n\
+         SELECT $1, $2, $3 FROM inference_providers WHERE id = $1 AND base_url = $4\n\
+           AND $3 < COALESCE((SELECT COALESCE(NULLIF(GREATEST(m.context_window, 0), 0),\n\
+                                              NULLIF(GREATEST(m.reported_context_window, 0), 0))\n\
+                              FROM provider_models m WHERE m.provider_id = $1 AND m.model = $2), $5)\n\
          ON CONFLICT (provider_id, model) DO UPDATE\n\
          SET context_window = $3\n\
          WHERE $3 < COALESCE(NULLIF(GREATEST(provider_models.context_window, 0), 0),\n\
