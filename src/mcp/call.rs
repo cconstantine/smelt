@@ -316,15 +316,18 @@ pub const REDACTED: &str = "<redacted>";
 pub fn redact_secrets(config: &McpServerConfig, text: &str) -> String {
     let mut secrets: Vec<String> = Vec::new();
     // The query as configured and as `url` normalizes it (reqwest prints
-    // the normalized form), and each value, raw and decoded.
+    // the normalized form), and each value that looks like a key, raw and
+    // decoded. Not every value: Exa's built-in URL has
+    // `?tools=web_search_exa`, and that tool's name isn't a secret
+    // (SME-359's hands-on check found it redacted from every error).
     let raw_query = config.url.split_once('?').map(|(_, rest)| rest.split('#').next().unwrap_or(rest).to_string());
     secrets.extend(raw_query.clone());
     if let Some(query) = &raw_query {
-        secrets.extend(query.split('&').filter_map(|pair| pair.split_once('=').map(|(_, value)| value.to_string())));
+        secrets.extend(query.split('&').filter_map(|pair| pair.split_once('=').map(|(_, value)| value.to_string())).filter(|v| looks_like_a_key(v)));
     }
     if let Ok(url) = url::Url::parse(&config.url) {
         secrets.extend(url.query().map(str::to_string));
-        secrets.extend(url.query_pairs().map(|(_, value)| value.into_owned()));
+        secrets.extend(url.query_pairs().map(|(_, value)| value.into_owned()).filter(|v| looks_like_a_key(v)));
         secrets.extend(url.password().map(str::to_string));
     }
     secrets.extend(config.extra_headers.values().cloned());
@@ -340,6 +343,13 @@ pub fn redact_secrets(config: &McpServerConfig, text: &str) -> String {
     secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
     secrets.dedup();
     secrets.iter().fold(text.to_string(), |text, secret| text.replace(secret.as_str(), REDACTED))
+}
+
+/// Whether a URL query value, seen on its own, could be a credential: 16
+/// characters or more, with both letters and digits, as API keys are and
+/// tool names and flags aren't.
+fn looks_like_a_key(value: &str) -> bool {
+    value.chars().count() >= 16 && value.chars().any(|c| c.is_ascii_digit()) && value.chars().any(|c| c.is_ascii_alphabetic())
 }
 
 /// Every string under a key that names a token or secret, anywhere in a

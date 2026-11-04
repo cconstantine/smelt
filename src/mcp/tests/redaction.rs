@@ -111,3 +111,19 @@ async fn test_a_reply_quoting_the_request_doesnt_leak_the_oauth_token(pool: sqlx
     assert_no_marker(&texts, access);
     assert_no_marker(&texts, refresh);
 }
+
+/// Found by SME-359's hands-on check: Exa's built-in URL is
+/// `…/mcp?tools=web_search_exa`, and redacting each query value on its own
+/// turned that tool's name into `<redacted>` in every error naming it. A
+/// value that doesn't look like a key (long, with letters and digits)
+/// stays; the whole query, and a value that does look like one, go.
+#[test]
+fn test_a_query_value_that_isnt_a_key_stays_in_the_text() {
+    let mut config = test_config(-359_009, "exa");
+    config.url = "https://mcp.exa.ai/mcp?tools=web_search_exa&exaApiKey=3f2a9c1e-77b4-4d0e-9a31-5c8e2b6f0d47".to_string();
+    let text = "MCP tool call to \"web_search_exa\" failed: Unknown tool (availableTools: [\"web_search_exa\"]) \
+                for https://mcp.exa.ai/mcp?tools=web_search_exa&exaApiKey=3f2a9c1e-77b4-4d0e-9a31-5c8e2b6f0d47; key 3f2a9c1e-77b4-4d0e-9a31-5c8e2b6f0d47";
+    let redacted = redact_secrets(&config, text);
+    assert_eq!(redacted.matches("web_search_exa").count(), 2, "the tool's name stays: {redacted}");
+    assert!(!redacted.contains("3f2a9c1e"), "the key goes, alone and in the URL: {redacted}");
+}
