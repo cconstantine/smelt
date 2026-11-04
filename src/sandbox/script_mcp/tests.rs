@@ -521,6 +521,24 @@ async fn test_the_budget_counts_use_an_index(pool: PgPool) {
     }
 }
 
+/// SME-386 M5: deleting a pod cascades to its calls, and the cascade's
+/// own delete (Postgres runs `DELETE FROM ONLY … WHERE $1 = pod_id`) is
+/// answered from an index. The partial index on command-less calls
+/// can't serve it, so every pod delete scanned every call.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_pods_cascade_to_its_calls_uses_an_index(pool: PgPool) {
+    let mut conn = pool.acquire().await.expect("a connection");
+    sqlx::query("SET enable_seqscan = off").execute(&mut *conn).await.expect("set");
+    let plan: Vec<String> = sqlx::query_scalar("EXPLAIN DELETE FROM ONLY sandbox_mcp_calls WHERE $1 = pod_id")
+        .bind(2_i64)
+        .fetch_all(&mut *conn)
+        .await
+        .expect("explain");
+    let plan = plan.join("\n");
+    assert!(!plan.contains("Seq Scan on sandbox_mcp_calls"), "the cascade scans the table:\n{plan}");
+    assert!(plan.contains("Index") || plan.contains("Bitmap"), "the cascade uses no index:\n{plan}");
+}
+
 /// Review round 1, L4: listing the tools takes a rate token like a call,
 /// so a loop of listings is held back too.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
