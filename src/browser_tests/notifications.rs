@@ -412,13 +412,16 @@ pub(super) async fn scenario_desktop_notifications(t: &Scenario<'_>) {
     click_conversation(&a, asking.id).await;
 
     // 5. Reload the leading tab. Its lock passes to a queued tab, nothing
-    //    is re-announced, and a finished turn elsewhere still gives exactly
-    //    one notification, from the one tab that leads.
+    //    is re-announced, and the model's `notify_user` elsewhere
+    //    (SME-377) still gives exactly one notification, from the one tab
+    //    that leads, saying the model's message.
     a.reload().await.expect("reload the leader");
     wait_for_live_client(&a, asking.id).await;
     click_conversation(&c, home.id).await;
+    let notify = |message: &str| serde_json::json!({ "message": message });
+    let _notified = t.mock.tool_call_next("notify_user", &unique_id("toolu_notify"), &notify("Wrapped up"));
     send_from(&c, "wrap up").await;
-    assert!(t.mock.wait_until_idle(Duration::from_secs(15)).await, "the finished turn ended");
+    assert!(t.mock.wait_until_tool_call_sent(Duration::from_secs(15)).await, "the notifying turn ended");
     let (leader_after, understudy) = if wait_tag_count(&b, &home_tag, 1, Duration::from_secs(15)).await {
         (&b, &c)
     } else {
@@ -428,29 +431,38 @@ pub(super) async fn scenario_desktop_notifications(t: &Scenario<'_>) {
     };
     tokio::time::sleep(Duration::from_millis(600)).await;
     let shown = recorded(leader_after).await;
-    assert_eq!(shown.len(), 1, "one finished notification, from one tab");
-    assert_eq!(shown[0].heading, "smelt: done", "a finished turn says so");
-    assert_eq!(shown[0].body, "wrap up", "the conversation's title");
+    assert_eq!(shown.len(), 1, "one notification, from one tab");
+    assert_eq!(shown[0].heading, "smelt: wrap up", "the conversation's title heads it");
+    assert_eq!(shown[0].body, "Wrapped up", "the model's message is the body");
     // Across all tabs, not just the leader's own: with the old leader
-    // gone, two tabs each believing it leads would both show
-    // `smelt: done` — the one-notification property is what the leader
+    // gone, two tabs each believing it leads would both show it — the
+    // one-notification property is what the leader
     // is for, so the queued tab that didn't take the lock must record
     // nothing (review 1, Low).
     assert!(recorded(understudy).await.is_empty(), "only the one new leader constructed");
     // The reload announced nothing new: tab A's records died with its
     // page and nothing came back for the answered question.
     assert!(recorded(&a).await.is_empty(), "the reload didn't re-announce anything");
+    // 5b. The user's complaint (SME-377): a turn that only replies, with
+    //     everything else as it was for the notification above, notifies
+    //     nothing anywhere.
+    send_from(&c, "thanks").await;
+    assert!(t.mock.wait_until_idle(Duration::from_secs(15)).await, "the plain turn ended");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(recorded(leader_after).await.len(), 1, "a plain reply adds no notification");
+    assert!(recorded(understudy).await.is_empty() && recorded(&a).await.is_empty(), "nor on any other tab");
 
-    // 6. Turning the switch off: the label flips, and finished turns
-    //    record nothing anywhere.
+    // 6. Turning the switch off: the label flips, and a notifying turn
+    //    records nothing anywhere.
     for tab in [&a, &b, &c] {
         tab.evaluate("window.__notifications.length = 0").await.expect("clear the records");
     }
     click_when_present(&a, ".notifications-toggle", Duration::from_secs(5)).await;
     let (disabled, _) = wait_toggle_label(&a, "Turn on notifications", Duration::from_secs(10)).await;
     assert!(!disabled);
+    let _notified = t.mock.tool_call_next("notify_user", &unique_id("toolu_notify"), &notify("All done"));
     send_from(&c, "and done").await;
-    assert!(t.mock.wait_until_idle(Duration::from_secs(15)).await, "the turn ended");
+    assert!(t.mock.wait_until_tool_call_sent(Duration::from_secs(15)).await, "the turn ended");
     tokio::time::sleep(Duration::from_millis(1000)).await;
     for tab in [&a, &b, &c] {
         assert!(recorded(tab).await.is_empty(), "off is off: nothing is constructed");
@@ -477,8 +489,15 @@ pub(super) async fn scenario_desktop_notifications(t: &Scenario<'_>) {
     assert!(hint.contains("https://localhost:8443"), "the hint names the one origin that works: {hint}");
     assert!(recorded(&d).await.is_empty(), "no Notification is even constructed here");
 
+    // A plain reply counts nothing (SME-377): only the model's
+    // notify_user, below, owes the user anything.
     send_from(&c, "and again").await;
-    assert!(t.mock.wait_until_idle(Duration::from_secs(15)).await, "the turn ended");
+    assert!(t.mock.wait_until_idle(Duration::from_secs(15)).await, "the plain turn ended");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(wait_title(&d, "smelt", Duration::from_secs(1)).await, "a plain reply adds nothing to the count");
+    let _notified = t.mock.tool_call_next("notify_user", &unique_id("toolu_notify"), &notify("Ready again"));
+    send_from(&c, "one more").await;
+    assert!(t.mock.wait_until_tool_call_sent(Duration::from_secs(15)).await, "the notifying turn ended");
     assert!(wait_title(&d, "(1) smelt", Duration::from_secs(15)).await, "the unfocused tab counts in its title");
     assert!(favicon_href(&d).await.contains("favicon-dot"), "the favicon swaps with the count");
     assert!(recorded(&d).await.is_empty(), "still no Notification over plain HTTP");

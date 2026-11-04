@@ -1,6 +1,6 @@
 # Desktop notifications (SME-71)
 
-When a conversation needs the user — a question, a failed turn, a reply cut off or refused, a finished turn — smelt says so: a desktop notification from one smelt tab (on any page), and a count in each chat tab's title. The server side (who owes what, and `get_attention`) is in [api/events.md](../api/events.md#app-wide-events-and-pods); this file is the browser's half.
+When a conversation needs the user — a question or a repo trust card, a failed turn, a reply cut off or refused, or the model calling `notify_user` to say it's done (SME-377; a turn ending notifies nothing by itself) — smelt says so: a desktop notification from one smelt tab (on any page), and a count in each chat tab's title. The server side (who owes what, and `get_attention`) is in [api/events.md](../api/events.md#app-wide-events-and-pods); this file is the browser's half.
 
 ## One leader per browser, by Web Lock
 
@@ -18,10 +18,9 @@ The notifier lives in the `Shell` layout route, so it stays mounted across navig
 
 1. Read the setting (the JS re-reads `localStorage` on every tick, on `storage` events, and again at construct) — off, nothing.
 2. If this tab is visible, focused and shows that conversation, nothing: the user is looking at it.
-3. For Finished, apply the 30 s per-conversation cooldown (a chain of quick command-notice turns doesn't buzz each time; the other four kinds are never held back) — an idle-notice turn never reaches this step: it notes no Finished at all (SME-370).
-4. Call `api::notifications::get_attention(conversation_id, generation, attention)` — the check right before acting. `None` means the event is stale (a turn running again, the generation moved on, the question answered/dismissed/asked of a parent, the conversation gone) and nothing shows.
-5. Show `new Notification(heading, { body, tag, renotify: true })`: "smelt has a question" / "smelt: the turn failed" / "smelt: the reply was cut off" / "smelt: the model refused" / "smelt: done", with the conversation's title and, for a question, the first question's header as body.
-6. Keep the `Notification` in a JS map by conversation id: clicking it focuses the window and sends `click` to Rust, which pushes the route and closes it; every `QuestionsChanged`/`TurnsChanged` revalidates the open ones and closes the stale; this tab focused on that conversation closes it too.
+3. Call `api::notifications::get_attention(conversation_id, generation, attention)` — the check right before acting. `None` means the event is stale (a turn running again, the generation moved on, the question answered/dismissed/asked of a parent with no trust card waiting, a `Notified` whose message the server no longer holds, the conversation gone) and nothing shows.
+4. Show `new Notification(heading, { body, tag, renotify: true })`: "smelt has a question" / "smelt: the turn failed" / "smelt: the reply was cut off" / "smelt: the model refused", with the conversation's title as body and, for a question, the first question's header after it (`Trust a repo?` for a trust card alone); for the model's `notify_user`, "smelt: <title>" with its message as body. No kind has a cooldown (the 30 s one held back the automatic Finished, which is gone).
+5. Keep the `Notification` in a JS map by conversation id: clicking it focuses the window and sends `click` to Rust, which pushes the route and closes it; every `QuestionsChanged`/`TurnsChanged` revalidates the open ones and closes the stale; this tab focused on that conversation closes it too.
 
 All the deciding is pure Rust (`should_notify`, `notification_text`, `notify_mode`, `badge_title` — unit-tested in `notifications/tests.rs`); the JS in `NOTIFIER_JS` is one long-lived `document::eval` per tab that only reports and constructs.
 

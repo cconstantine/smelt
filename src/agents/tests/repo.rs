@@ -135,7 +135,23 @@ async fn test_an_undecided_remote_asks_with_a_repo_card_and_a_declined_one_refus
     setup(&pool, vec![text_reply("ok")]).await;
     let undecided = root_with_checkout(&pool, None, Arc::new(FakeCheckout::default())).await;
     let input = serde_json::json!({"brief": "Fix it.", "repo": "/workspace/app", "ref": "main"});
+    // T11b (SME-377): the card waits on the user, so the turn that filed
+    // it ends owing a Question, which a counted turn publishes at its end.
+    let recording = crate::events::AppRecording::start();
+    let turn = crate::turn::count_a_test_turn(undecided);
     let refused = start_on(&pool, undecided, input.clone()).await.expect_err("refused");
+    drop(turn);
+    let owed: Vec<_> = recording
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            crate::events::AppEvent::NeedsUser { conversation_id, attention, .. } if conversation_id == undecided => {
+                Some(attention)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(owed, vec![crate::events::Attention::Question], "the card notifies as a question");
     // SME-279: a repo the user hasn't decided about asks them itself — no
     // AGENTS.md to ask with needed — and the refusal says the card is there.
     assert!(refused.contains("hasn't decided whether to trust https://example.com/team/app.git"), "{refused}");

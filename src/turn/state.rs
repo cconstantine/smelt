@@ -69,6 +69,20 @@ pub(super) struct ConversationRuntime {
     /// it when the conversation goes 0 → 1 busy; `TurnInFlight::drop`
     /// takes it, with the generation to carry, when the last turn ends.
     attention: Option<crate::events::Attention>,
+    /// The message of this busy spell's last `notify_user` (SME-377): set
+    /// with `attention`'s `Notified`, the last call's winning, and taken
+    /// with it at the spell's end. Cleared where `attention` is.
+    notified: Option<String>,
+    /// The generation and message of the last busy spell that ended with
+    /// a `notify_user` message (SME-377), whatever kind it published, for
+    /// `get_attention` to read once the spell has ended. Replaced by the
+    /// next one, freed on delete.
+    published_notice: Option<(u64, String)>,
+    /// The conversation was deleted (`forget_conversation_lock`) while a
+    /// turn of it was still in flight: that spell's end keeps no
+    /// `published_notice`, which would hold the entry for good (SME-377
+    /// review round 1, L3). Not part of `is_idle`, so the entry still goes.
+    forgotten: bool,
 }
 
 impl ConversationRuntime {
@@ -103,6 +117,8 @@ impl ConversationRuntime {
             && self.turns_in_flight == 0
             && self.started_at.is_none()
             && self.attention.is_none()
+            && self.notified.is_none()
+            && self.published_notice.is_none()
             && self.kept.generation == 0
             && self.kept.error.is_none()
     }
@@ -158,6 +174,9 @@ pub(crate) fn forget_conversation_lock(conversation_id: i64) {
         runtime.stops = None;
         runtime.paused = false;
         runtime.attention = None;
+        runtime.notified = None;
+        runtime.published_notice = None;
+        runtime.forgotten = true;
         runtime.kept = KeptTurnError::default();
     });
 }
@@ -374,6 +393,7 @@ fn admit(conversation_id: i64, admission: Admission) -> Option<(TurnInFlight, u6
             // spell owed the user was published when it ended, or the
             // user is here.
             runtime.attention = None;
+            runtime.notified = None;
             runtime.started_at = Some(std::time::Instant::now());
             crate::events::publish(
                 conversation_id,
@@ -458,6 +478,15 @@ impl Drop for TurnInFlight {
             if last {
                 owed = runtime.attention.take();
                 generation = runtime.kept.generation;
+                // The spell's `notify_user` message is kept for
+                // `get_attention` (SME-377), even when a stronger kind
+                // outranks it: a question resolved before the spell ended
+                // falls back to it (review round 1, M1).
+                if let Some(message) = runtime.notified.take()
+                    && !runtime.forgotten
+                {
+                    runtime.published_notice = Some((generation, message));
+                }
                 runtime.started_at = None;
                 // A stopped or failed turn leaves no reply in progress.
                 runtime.reply = None;
@@ -531,7 +560,36 @@ pub(super) fn note_attention(conversation_id: i64, a: crate::events::Attention) 
 /// busy spell owed (the user is there), and `admit` starts a new spell
 /// clean.
 pub(super) fn clear_attention(conversation_id: i64) {
-    update_existing(conversation_id, |runtime| runtime.attention = None);
+    update_existing(conversation_id, |runtime| {
+        runtime.attention = None;
+        runtime.notified = None;
+    });
+}
+
+/// Notes the model's `notify_user` call (SME-377): the spell owes the user
+/// at least `Notified`, and `message` replaces any earlier call's, so the
+/// last one in a busy spell is what the notification says. Like
+/// `note_attention`, never creates an entry.
+pub(crate) fn note_notified(conversation_id: i64, message: String) {
+    update_existing(conversation_id, |runtime| {
+        let a = crate::events::Attention::Notified;
+        runtime.attention = Some(runtime.attention.map_or(a, |kept| kept.max(a)));
+        runtime.notified = Some(message);
+    });
+}
+
+/// The message of the `NeedsUser(Notified)` `conversation_id` published
+/// at `generation` (SME-377), while it's still the last one it published;
+/// `None` otherwise, a restart included.
+pub(crate) fn published_notice(conversation_id: i64, generation: u64) -> Option<String> {
+    read_runtime(conversation_id, |runtime| {
+        runtime
+            .published_notice
+            .as_ref()
+            .filter(|(published, _)| *published == generation)
+            .map(|(_, message)| message.clone())
+    })
+    .flatten()
 }
 
 /// A turn counted as in flight for `conversation_id` until it drops, for

@@ -264,6 +264,9 @@ pub async fn load_instructions(pool: &PgPool, conversation_id: i64, path: &str) 
     file.commit = head_commit(&shell, &repo.dir).await;
     let outcome = request_or_load(pool, conversation_id, repo, &rel_path, &file).await?;
     publish_repos(pool, conversation_id).await;
+    if matches!(outcome, LoadOutcome::AwaitingTrust) {
+        crate::turn::note_trust_card(conversation_id);
+    }
     Ok(match outcome {
         LoadOutcome::Loaded => loaded_message(&full, &file),
         LoadOutcome::AwaitingTrust => format!(

@@ -51,8 +51,9 @@ const DESIGN: &[(&str, &[ToolClass])] = &[
     ("lsp_servers", &[ReadOnly]),
     ("start_language_server", &[ReadOnly]),
     ("lsp", &[ReadOnly]),
-    // Asks the user.
+    // Asks the user, or tells them (SME-377).
     ("ask_user", &[ReadOnly]),
+    ("notify_user", &[ReadOnly]),
     // Agents.
     ("list_agents", &[ReadOnly]),
     ("message_agent", &[ReadOnly]),
@@ -88,7 +89,7 @@ fn test_every_native_tool_has_the_designs_class() {
         wrong.is_empty() && missing.is_empty(),
         "classes differ from the design's: {wrong:?}; in the design but not the registry: {missing:?}"
     );
-    assert_eq!(registry.len(), 45, "every tool that exists at SME-237, plus SME-239's two volume tools");
+    assert_eq!(registry.len(), 46, "every tool that exists at SME-237, plus SME-239's two volume tools and SME-377's notify_user");
 }
 
 fn http_request_class_of(input: serde_json::Value) -> ToolClass {
