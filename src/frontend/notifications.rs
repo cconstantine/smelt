@@ -390,19 +390,20 @@ function releaseLock() {
 }
 function requestLock(steal) {
   if (!navigator.locks || N.leader) { return; }
+  // One request at a time (SME-386 N2): a queued one already waits, and a
+  // steal on its way (pending with no signal) is granted at once.
+  if (N.pending && (!steal || !N.abort)) { return; }
   // A queued request cannot be promoted to a steal: the spec rejects
   // `signal` together with `steal` outright. Drop a queued one and ask
   // again — steal requests carry no signal, and are granted at once
   // (pre-empting the holder), so there is nothing to abort after that.
-  const had = N.pending;
   if (N.abort) { N.intentional = true; N.abort.abort(); N.abort = null; N.pending = false; }
-  else if (had && !steal) { return; }
   const ac = steal ? null : new AbortController();
   if (ac) { N.abort = ac; }
   N.pending = true;
   let resolveHeld;
   const held = new Promise((res, rej) => { resolveHeld = res; if (ac) { ac.signal.addEventListener("abort", rej); } });
-  navigator.locks.request(LOCK, ac ? { signal: ac.signal } : {}, () => {
+  navigator.locks.request(LOCK, ac ? { signal: ac.signal } : { steal: true }, () => {
     if (N.dead) { throw new DOMException("replaced", "AbortError"); }
     N.pending = false; N.intentional = false; N.leader = true; N.heldResolve = resolveHeld;
     post({ ev: "leader" });

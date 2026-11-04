@@ -263,6 +263,8 @@ fn scenarios() -> Vec<Entry> {
         // lanes' turn ends would land in this scenario's counts, and it's
         // the only scenario that touches a browser-wide setting.
         entry("desktop_notifications", 240, Runs::Alone, |t| Box::pin(scenario_desktop_notifications(t))),
+        // Alone for the same reasons (SME-386).
+        entry("notifier_leadership", 90, Runs::Alone, |t| Box::pin(scenario_notifier_leadership(t))),
     ]
 }
 
@@ -425,6 +427,7 @@ mod repo_attach;
 mod agents;
 mod text_calls;
 mod notifications;
+mod notifier_leader;
 
 use harness::*;
 use mock::*;
@@ -445,3 +448,4 @@ use repo_attach::*;
 use agents::*;
 use text_calls::*;
 use notifications::*;
+use notifier_leader::*;
