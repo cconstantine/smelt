@@ -23,7 +23,7 @@ RUN mkdir -p -m 755 /etc/apt/keyrings \
 # Docker CLI only (no daemon) — talks to the `docker` sidecar service in
 # docker-compose.yml over DOCKER_HOST, not a locally running daemon.
 # Pinned to match that sidecar's major version (docker:29-dind).
-RUN curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-29.6.2.tgz \
+RUN curl -fsSL "https://download.docker.com/linux/static/stable/$(uname -m)/docker-29.6.2.tgz" \
     | tar -xz --strip-components=1 -C /usr/local/bin docker/docker
 
 # Playwright (Python), for driving/screenshotting the running app in a real
@@ -207,6 +207,6 @@ EXPOSE 8080 8181
 # resolve every library Chrome needs; if the image is missing one, the
 # image build fails here instead of the user's first browse.
 RUN test -x /opt/smelt/smelt && test -d /opt/smelt/public \
-    && LD_LIBRARY_PATH=/opt/browser-check-cache/libs/usr/lib/x86_64-linux-gnu:/opt/browser-check-cache/libs/usr/lib/x86_64-linux-gnu/dri \
-    /opt/browser-check-cache/chrome/chrome-headless-shell-linux64/chrome-headless-shell --version
+    && lib="/opt/browser-check-cache/libs/usr/lib/$(uname -m)-linux-gnu" \
+    && LD_LIBRARY_PATH="$lib:$lib/dri" /opt/browser-check-cache/libs/usr/lib/chromium/chromium-headless-shell --version
 ENTRYPOINT ["/opt/smelt/smelt"]

@@ -289,7 +289,7 @@ mod browser_tests {
                     .rsplit_once(')')
                     .and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse::<u32>().ok());
                 let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-                ppid == Some(parent) && String::from_utf8_lossy(&cmdline).contains("chrome-headless-shell")
+                ppid == Some(parent) && String::from_utf8_lossy(&cmdline).contains("chromium-headless-shell")
             })
             .collect()
     }

@@ -24,10 +24,16 @@ use std::time::Duration;
 use chromiumoxide::Browser;
 use futures_util::StreamExt;
 
-/// Where `scripts/browser-check/setup.sh` puts Chrome and its libraries,
-/// relative to its cache directory (see `cache_dir`).
-const CHROME_BINARY: &str = "chrome/chrome-headless-shell-linux64/chrome-headless-shell";
-const LIB_DIR: &str = "libs/usr/lib/x86_64-linux-gnu";
+/// Where `scripts/browser-check/setup.sh` puts Debian's headless Chromium
+/// (SME-360: Debian's build, for amd64 and arm64 alike), relative to its
+/// cache directory (see `cache_dir`).
+const CHROME_BINARY: &str = "libs/usr/lib/chromium/chromium-headless-shell";
+
+/// Its libraries: Debian's multiarch directory for the arch smelt was built
+/// for (`x86_64-linux-gnu`, `aarch64-linux-gnu`), as setup.sh names it.
+fn lib_dir() -> String {
+    format!("libs/usr/lib/{}-linux-gnu", std::env::consts::ARCH)
+}
 /// The cache directory when `BROWSER_CHECK_CACHE` isn't set, relative to
 /// the checkout smelt was built from.
 const DEFAULT_CACHE_DIR: &str = ".browser-check-cache";
@@ -95,12 +101,12 @@ async fn launch_in(cache: &Path, extra_args: &[String]) -> Result<Browser, Strin
     let chrome_binary = cache.join(CHROME_BINARY);
     if !chrome_binary.is_file() {
         return Err(format!(
-            "chrome-headless-shell not found at {} — run scripts/browser-check/setup.sh first, \
+            "chromium-headless-shell not found at {} — run scripts/browser-check/setup.sh first, \
              or set BROWSER_CHECK_CACHE to the directory it downloaded into",
             chrome_binary.display()
         ));
     }
-    let lib_dir = cache.join(LIB_DIR);
+    let lib_dir = cache.join(lib_dir());
     let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
     let ld_library_path = format!("{}:{}/dri:{existing}", lib_dir.display(), lib_dir.display());
 
@@ -130,7 +136,7 @@ async fn launch_in(cache: &Path, extra_args: &[String]) -> Result<Browser, Strin
     let ws_url = spawn_owned(&chrome_binary, &args, &ld_library_path).await?;
     let (browser, mut handler) = Browser::connect(ws_url)
         .await
-        .map_err(|e| format!("failed to connect to chrome-headless-shell: {e}"))?;
+        .map_err(|e| format!("failed to connect to chromium-headless-shell: {e}"))?;
     // chromiumoxide needs this driven continuously to process the CDP
     // connection at all (command responses, events).
     tokio::spawn(async move { while handler.next().await.is_some() {} });
@@ -185,7 +191,7 @@ async fn spawn_owned(binary: &Path, args: &[String], ld_library_path: &str) -> R
                 Ok(child) => child,
                 Err(e) => {
                     let _ = updates.send(LaunchUpdate::Failed(format!(
-                        "chrome-headless-shell failed to start: {e}"
+                        "chromium-headless-shell failed to start: {e}"
                     )));
                     return;
                 }
@@ -202,7 +208,7 @@ async fn spawn_owned(binary: &Path, args: &[String], ld_library_path: &str) -> R
             // stderr closed: Chrome has exited.
             let _ = child.wait();
             let _ = updates.send(LaunchUpdate::Failed(format!(
-                "chrome-headless-shell exited before it was ready{}",
+                "chromium-headless-shell exited before it was ready{}",
                 take_tail(&tail_for_owner)
             )));
         })
@@ -217,10 +223,10 @@ async fn spawn_owned(binary: &Path, args: &[String], ld_library_path: &str) -> R
                 LaunchUpdate::Failed(e) => return Err(e),
             }
         }
-        Err("chrome-headless-shell launch ended without a result".to_string())
+        Err("chromium-headless-shell launch ended without a result".to_string())
     })
     .await
-    .unwrap_or_else(|_| Err("timed out waiting for chrome-headless-shell to start".to_string()));
+    .unwrap_or_else(|_| Err("timed out waiting for chromium-headless-shell to start".to_string()));
     if outcome.is_err()
         && let Some(pid) = pid
     {
