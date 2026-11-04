@@ -255,27 +255,6 @@ async fn test_wake_conversation_publishes_notification_delivery_failed_on_error(
 
 // --- Idle notices (SME-79) ---
 
-/// A running command started `secs` ago and never touched since — the state
-/// the idle watch wakes for. `created_at` is what moves: with no touch and no
-/// notice yet, that is where the idle clock starts (SME-79).
-async fn untouched_running_command(pool: &PgPool, conversation_id: i64, command_id: &str, secs: i64) {
-    let pod = db::create_sandbox_pod(pool, conversation_id)
-        .await
-        .expect("create sandbox pod");
-    let terminal = db::create_sandbox_terminal(pool, pod.id)
-        .await
-        .expect("create sandbox terminal");
-    db::create_terminal_command(pool, conversation_id, terminal.id, command_id, "sleep 100", 300)
-        .await
-        .expect("create terminal command");
-    sqlx::query("UPDATE terminal_commands SET created_at = now() - make_interval(secs => $1) WHERE command_id = $2")
-        .bind(secs as f64)
-        .bind(command_id)
-        .execute(pool)
-        .await
-        .expect("backdate created_at");
-}
-
 /// SME-79: a wake drains idle notices too — a running command left untouched
 /// past its notice period is told to the model as its own user message, says
 /// plainly that nothing stopped it and what it can do about it, and is marked
@@ -317,6 +296,31 @@ async fn test_wake_drains_an_idle_notice_and_the_command_keeps_running(pool: PgP
     ] {
         assert!(text.contains(wanted), "{wanted:?} missing from: {text}");
     }
+    // SME-370 review 1/2: the notice's fixed text, pinned as this test's own
+    // literals — never through `IDLE_NOTICE_FRAGMENT`, an assertion
+    // interpolating the const it guards can never go red. Two pins: the words,
+    // and the delimiter the transcript splits on *with its spaces*. The short
+    // line (`pages/chat/transcript/text.rs`) cuts the stored sentence at
+    // `" is still running and hasn't been touched in "` — a leading and a
+    // trailing space and all — so a space is part of the seam: a re-word OR a
+    // whitespace-only re-flow of the `format!` (a lost or doubled space) breaks
+    // that cut in silence, which the words-alone pin misses. Pin the delimiter
+    // spaces and all, and both drifts go red here in lockstep with the const.
+    assert!(
+        text.contains("is still running and hasn't been touched in"),
+        "the idle notice's fixed clause drifted: update IDLE_NOTICE_FRAGMENT \
+         (src/turn/notify.rs) and the transcript copy \
+         (src/frontend/pages/chat/transcript/text.rs) together — {text}"
+    );
+    // The exact delimiter `text.rs` splits on, spaces and all — this is what
+    // catches a whitespace-only re-flow the words-alone pin sails past.
+    assert!(
+        text.contains(" is still running and hasn't been touched in "),
+        "the delimiter's spaces drifted — the transcript splits on the phrase \
+         with a leading and a trailing space, so a re-flow of the `format!`'s \
+         whitespace must match them; update IDLE_NOTICE_FRAGMENT and the copy \
+         (src/frontend/pages/chat/transcript/text.rs) together — {text}"
+    );
     assert_eq!(messages[1].role, "assistant");
 
     let command = db::get_terminal_command(&pool, "cmd-idle")
@@ -334,6 +338,60 @@ async fn test_wake_drains_an_idle_notice_and_the_command_keeps_running(pool: PgP
     let second = wake_conversation(&pool, conversation.id).await.expect("second wake");
     assert!(second.is_empty(), "the clock restarted, nothing is due yet: {second:?}");
     assert_eq!(counter.load(Ordering::SeqCst), 1, "one API call, for the notice");
+}
+
+/// SME-370 review 1: the Finished-suppression predicate reads Text blocks,
+/// not raw `content`. Tool results ride as user-role messages exactly like
+/// the notice does, and one whose output merely *echoes* the notice's
+/// sentence — grepping `notify.rs` is the way to hit this — is no notice,
+/// and must not quiet its turn's `Finished`.
+#[test]
+fn test_saved_idle_notice_reads_text_blocks_not_tool_output() {
+    let message = |role: &str, content: String| crate::models::Message {
+        id: 1,
+        conversation_id: 1,
+        role: role.to_string(),
+        content,
+        created_at: chrono::Utc::now().naive_utc(),
+    };
+    let sentence = "Terminal command cmd-1 (\"sleep 100\", running for 10 minutes) is still running and hasn't been touched in 10 minutes: 0 lines on stdout, 0 on stderr.";
+    let one_block = |block: anthropic::ContentBlock| {
+        serde_json::to_string(&vec![block]).expect("blocks serialize")
+    };
+
+    // The notice itself: a saved user Text block.
+    let notice = message(
+        "user",
+        one_block(anthropic::ContentBlock::Text { text: sentence.to_string() }),
+    );
+    assert!(saved_idle_notice(&[notice]), "the saved notice *is* the marker");
+
+    // The same sentence echoed inside a tool result: user-role too, but
+    // the model's own reading of the file, not smelt telling it a command
+    // keeps running.
+    let echoed = message(
+        "user",
+        one_block(anthropic::ContentBlock::ToolResult {
+            tool_use_id: "toolu_1".to_string(),
+            content: format!("turn/notify.rs:42: {sentence}"),
+            is_error: None,
+        }),
+    );
+    assert!(
+        !saved_idle_notice(&[echoed]),
+        "a tool result echoing the sentence is not a notice"
+    );
+
+    // An assistant reply quoting the sentence is no notice either.
+    let quoted = message(
+        "assistant",
+        one_block(anthropic::ContentBlock::Text { text: sentence.to_string() }),
+    );
+    assert!(!saved_idle_notice(&[quoted]), "no assistant message is a notice");
+
+    // Unparseable content simply doesn't match — it quiets nothing.
+    let junk = message("user", "is still running and hasn't been touched in — not json".to_string());
+    assert!(!saved_idle_notice(&[junk]), "unparseable content quiets nothing");
 }
 
 /// SME-79: the wake-up is for *untouched* commands. A running command

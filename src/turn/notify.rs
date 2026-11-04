@@ -196,6 +196,19 @@ pub(super) async fn drain_unnotified_terminal_commands(
     Ok(())
 }
 
+/// The idle notice's own fixed words: the clause that tells one apart from
+/// every other saved `user` message. Written only by the one `format!` in
+/// `drain_idle_command_notices`, read only by `saved_idle_notice` — an
+/// idle-notice turn carries no other marker, so this sentence *is* it
+/// (SME-370). Re-wording the notice must keep this matching: wake's
+/// `test_wake_drains_an_idle_notice_and_the_command_keeps_running` pins
+/// the sentence in parts and pins this clause as the test's own literal —
+/// never through this const, which could never go red for guarding it —
+/// and its failure message names this const and the transcript copy
+/// (`pages/chat/transcript/text.rs`) to re-word together (review 1).
+#[cfg(feature = "server")]
+const IDLE_NOTICE_FRAGMENT: &str = "is still running and hasn't been touched in";
+
 /// The second half of the drain, run with
 /// `drain_unnotified_terminal_commands` in the same place: commands still
 /// *running* whose idle notice is due (SME-79) — untouched for their whole
@@ -218,8 +231,8 @@ pub(super) async fn drain_idle_command_notices(
         .map_err(ServerFnError::new)?
     {
         let text = format!(
-            "Terminal command {id} (\"{shown}\", running for {running}) is still running and \
-             hasn't been touched in {untouched}: {stdout} lines on stdout, {stderr} on stderr. \
+            "Terminal command {id} (\"{shown}\", running for {running}) {IDLE_NOTICE_FRAGMENT} \
+             {untouched}: {stdout} lines on stdout, {stderr} on stderr. \
              Nothing stopped it and smelt won't stop it. Read what it has printed with \
              read_terminal_output, check it with terminal_command_status, interrupt it with \
              send_signal (INT, then KILL if it ignores that), or run your next command in \
@@ -246,6 +259,28 @@ pub(super) async fn drain_idle_command_notices(
         record_saved(conversation_id, persisted, saved);
     }
     Ok(())
+}
+
+/// Whether this turn saved an idle notice among its persisted messages:
+/// any saved **user** message with a Text block carrying
+/// `IDLE_NOTICE_FRAGMENT`. A turn that drained one owes the user no
+/// `Finished` at its end (SME-370) — it is smelt telling itself about a
+/// command that keeps running, every interval, not an answer awaited.
+/// Text blocks only, the notice's own shape: tool results ride user-role
+/// too, and one merely *echoing* the sentence — a grep of this file is the
+/// way — is no notice (SME-370 review 1); the role check likewise drops an
+/// assistant reply quoting it, and unparseable content matches nothing.
+#[cfg(feature = "server")]
+pub(super) fn saved_idle_notice(persisted: &[Message]) -> bool {
+    persisted.iter().any(|m| {
+        m.role == "user"
+            && m.blocks().is_ok_and(|blocks| {
+                blocks.iter().any(|b| {
+                    matches!(b, anthropic::ContentBlock::Text { text }
+                        if text.contains(IDLE_NOTICE_FRAGMENT))
+                })
+            })
+    })
 }
 
 /// Drains the reports and notices queued to `conversation_id`
