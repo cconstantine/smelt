@@ -336,7 +336,8 @@ async fn redact_secrets_now(pool: &sqlx::PgPool, config: &McpServerConfig, text:
 pub const REDACTED: &str = "<redacted>";
 
 /// `text` with every secret `config` holds replaced by [`REDACTED`]
-/// (SME-359): the URL's query (whole, and each value) and password,
+/// (SME-359): the URL's query (whole, and each value), password and
+/// key-shaped path segments (SME-386),
 /// every extra header's value, the OAuth client secret and every token
 /// in the stored grant. An error from a call can quote any of them (a
 /// connect error quotes the URL, a server's error page the request's
@@ -370,6 +371,18 @@ pub fn redact_secrets(config: &McpServerConfig, text: &str) -> String {
                 .filter(|(name, value)| names_a_credential(name) || looks_like_a_key(value))
                 .map(|(_, value)| value.into_owned()),
         );
+        // A key can be a path segment (`…/mcp/s/<key>/mcp`, SME-386 M1),
+        // and reqwest's connect error quotes the path: each segment that
+        // looks like a key, as `url` prints it and decoded. The path's
+        // words (`mcp`, `s`) stay.
+        if let Some(segments) = url.path_segments() {
+            for segment in segments.filter(|segment| looks_like_a_key(segment)) {
+                secrets.push(segment.to_string());
+                if let Ok(decoded) = percent_encoding::percent_decode_str(segment).decode_utf8() {
+                    secrets.push(decoded.into_owned());
+                }
+            }
+        }
         secrets.extend(url.password().map(str::to_string));
         // A token can be the URL's user part (`https://ghp_…@host`).
         secrets.extend(Some(url.username().to_string()).filter(|user| !user.is_empty()));
