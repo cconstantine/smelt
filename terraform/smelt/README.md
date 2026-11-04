@@ -39,13 +39,14 @@ where smelt's own real-cluster test suite runs.
   binds loopback inside the pod, which is the safe default).
 - OAuth and anything else secret go in through `extra_env`; the module has no
   opinion about them.
-- **amd64 only.** Every image CI publishes is built linux/amd64
-  (`publish-images.yml` has no `platforms:`), the Docker sidecar wants the
-  node's own architecture, and the homelab's nodes are all x86_64 — so every
-  pod template here pins `kubernetes.io/arch: amd64`. Sandbox pods carry the
-  same pin in smelt's own pod spec (`src/sandbox/spec.rs`), and language-server
-  pods are bound to their sandbox pod's node, so no pod of this system ever
-  schedules off amd64.
+- **amd64 or arm64 nodes, or a mix.** Every image CI publishes is built for
+  linux/amd64 and linux/arm64 (SME-360), and so are the module's other
+  defaults (`postgres:17-alpine`, `docker:29-dind`). So no pod template here
+  pins an architecture, and neither does smelt's own sandbox pod spec. If you
+  point `image`, `postgres_image` or the sandbox image at a single-arch image
+  of your own on a mixed cluster, set `node_selector` (for example
+  `{ "kubernetes.io/arch" = "amd64" }`). The server and the database take it;
+  sandbox pods take SANDBOX_IMAGE's own platforms (docs/setup.md).
 - The pod gets its cluster access from its own ServiceAccount token — no
   kubeconfig is mounted, and none should be.
 

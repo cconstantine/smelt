@@ -207,3 +207,9 @@ variable "extra_env" {
   type        = map(string)
   default     = {}
 }
+
+variable "node_selector" {
+  description = "Node labels the server and database pods must match. Empty by default: every image the module deploys is multi-arch (amd64 and arm64). Set one only to pin a single-arch image of your own, for example { \"kubernetes.io/arch\" = \"amd64\" }."
+  type        = map(string)
+  default     = {}
+}

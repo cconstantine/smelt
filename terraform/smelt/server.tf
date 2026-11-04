@@ -72,16 +72,13 @@ resource "kubernetes_deployment_v1" "smelt" {
       spec {
         service_account_name = kubernetes_service_account_v1.park.metadata[0].name
 
-        # Every image smelt publishes is linux/amd64 alone
-        # (`publish-images.yml` builds natively on ubuntu-latest), and the
-        # nodes this runs on are all x86_64. A pod on a node of another
-        # architecture would fail its pull on a platform mismatch, so no
-        # pod of this system is ever scheduled on one. Sandbox pods carry
-        # the same pin in smelt's own pod spec (src/sandbox/spec.rs);
-        # language-server pods follow their sandbox pod's node.
-        node_selector = {
-          "kubernetes.io/arch" = "amd64"
-        }
+        # No architecture pin (SME-373): every image smelt publishes is
+        # linux/amd64 and linux/arm64 (SME-360, `publish-images.yml`), and
+        # so are the module's other defaults (`postgres:17-alpine`). Sandbox
+        # pods carry no pin either (src/sandbox/spec/pods.rs). A deployment
+        # that runs a single-arch image of its own on a mixed cluster sets
+        # `node_selector`, which this pod and the database's take.
+        node_selector = var.node_selector
 
         dynamic "image_pull_secrets" {
           for_each = var.image_pull_secret != null ? toset([var.image_pull_secret]) : toset([])
