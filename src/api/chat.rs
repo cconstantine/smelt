@@ -124,8 +124,10 @@ pub const NOTICE_MARK: char = '\u{2063}';
 
 /// `text` with `NOTICE_MARK` before its words: how the server starts every
 /// notice it saves into a transcript, so a reader tells one from the same
-/// words a user typed (SME-357). `users_text` strips the mark from what the
-/// user sends, so a typed mark never reaches a saved row.
+/// words a user typed (SME-357) — the deciding `"The user trusts …"` wording
+/// in `git::server::trust` excepted, deliberately unmarked so compaction
+/// keeps quoting it as the user's news. `users_text` strips the mark from
+/// what the user sends, so a typed mark never reaches a saved row.
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 pub fn mark_notice(text: &str) -> String {
     format!("{NOTICE_MARK}{text}")

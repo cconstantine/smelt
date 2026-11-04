@@ -302,14 +302,17 @@ const PARENT_MESSAGE_START: &str = "Message from your parent:";
 /// as written, so they carry no `NOTICE_MARK` — marking them would grey
 /// real agent messages in the transcript (SME-357's trade-off). Everything
 /// smelt writes itself now carries the mark and is excluded by it, not by
-/// words. A text this list misses is quoted as if typed, which costs space,
+/// words — one exception: the deciding `"The user trusts …"` wording in
+/// `git::server::trust` stays unmarked on purpose, quoted as the user's own
+/// news. A text this list misses is quoted as if typed, which costs space,
 /// never a correction.
 #[cfg(feature = "server")]
 const SERVER_TEXT_STARTS: &[&str] = &["Report from ", "Message from agent #", "Question from "];
 
 /// Whether a user-role text is the user's own words or a parent's message:
 /// not a marked notice (every notice smelt saves into a transcript carries
-/// `NOTICE_MARK` since SME-357), and not one of `SERVER_TEXT_STARTS`.
+/// `NOTICE_MARK` since SME-357, its deciding unmarked `"The user trusts …"`
+/// wording excepted), and not one of `SERVER_TEXT_STARTS`.
 #[cfg(feature = "server")]
 pub(super) fn is_typed(text: &str) -> bool {
     if text.starts_with(PARENT_MESSAGE_START) {
