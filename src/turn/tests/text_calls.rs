@@ -4,7 +4,7 @@
 use super::*;
 
 /// A content block of a mock reply.
-enum Block<'a> {
+pub(super) enum Block<'a> {
     Thinking(&'a str),
     Text(&'a str),
     /// A `todoread` call (a cheap tool that needs only the database).
@@ -17,7 +17,7 @@ enum Block<'a> {
 /// A reply of `blocks` ending with `stop_reason`, as SSE, its text
 /// escaped by `serde_json` (`text_reply_body` pastes text into JSON raw,
 /// so it can't carry markup's quotes and newlines).
-fn text_blocks_body(blocks: &[Block], stop_reason: &str) -> String {
+pub(super) fn text_blocks_body(blocks: &[Block], stop_reason: &str) -> String {
     use serde_json::json;
     let mut events = vec![json!({"type": "message_start", "message": {"usage": {
         "input_tokens": 100, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 1}}})];
@@ -56,12 +56,12 @@ fn call_reply(id: &str) -> String {
     text_blocks_body(&[Block::Todoread(id)], "tool_use")
 }
 
-fn roles(saved: &[crate::models::Message]) -> Vec<&str> {
+pub(super) fn roles(saved: &[crate::models::Message]) -> Vec<&str> {
     saved.iter().map(|m| m.role.as_str()).collect()
 }
 
 /// The text of a message that is one text block, or `None`.
-fn notice_text(message: &crate::models::Message) -> Option<String> {
+pub(super) fn notice_text(message: &crate::models::Message) -> Option<String> {
     match message.blocks().expect("blocks").as_slice() {
         [anthropic::ContentBlock::Text { text }] => Some(text.clone()),
         _ => None,
@@ -77,7 +77,7 @@ fn notices(saved: &[crate::models::Message]) -> usize {
 }
 
 /// The last message request `n` sent: its role and its first text.
-fn last_sent(requests: &std::sync::Mutex<Vec<serde_json::Value>>, n: usize) -> (String, String) {
+pub(super) fn last_sent(requests: &std::sync::Mutex<Vec<serde_json::Value>>, n: usize) -> (String, String) {
     let log = requests.lock().expect("the request log");
     let last = log[n]["messages"].as_array().expect("messages").last().expect("a message").clone();
     let text = last["content"][0]["text"].as_str().unwrap_or_default().to_string();
