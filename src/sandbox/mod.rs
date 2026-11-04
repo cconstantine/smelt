@@ -40,6 +40,7 @@ mod idle_notice;
 mod manager;
 mod ports;
 mod quiet_stop;
+mod script_mcp;
 mod spec;
 mod storage_grace;
 mod watch;

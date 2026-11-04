@@ -141,6 +141,10 @@ pub(super) struct TerminalConnection {
     /// a per-line DB round trip. See
     /// SME-10.
     pub(super) conversation_id: i64,
+    /// The pod this connection was dialed to: a script's MCP call is ruled
+    /// as this pod's and this conversation's (SME-359), never as anything
+    /// the agent says.
+    pub(super) pod_id: i64,
     /// What the agent said it speaks, in its hello.
     pub(super) agent_version: ProtocolVersion,
 }
@@ -588,6 +592,7 @@ async fn connect_unspanned(
         tasks: StdMutex::new(Vec::new()),
         next_request_id: std::sync::atomic::AtomicU64::new(1),
         conversation_id,
+        pod_id,
         agent_version,
     });
 
@@ -750,12 +755,9 @@ pub(super) async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConne
             // which can be part of a request's content.
             tracing::warn!(bytes = message.len(), "the sandbox agent couldn't read a message from smelt");
         }
-        AgentMessage::McpRequest { call_id, .. } => {
-            // SME-359: script calls aren't served yet.
-            let body = serde_json::json!({ "error": "this smelt can't take script calls yet" }).to_string();
-            if let Err(e) = conn.send(&ClientMessage::McpResponse { call_id, status: 501, body }) {
-                tracing::debug!(call_id, error = %e, "couldn't answer a script's MCP call");
-            }
+        // A script's MCP call (SME-359), answered in a task of its own.
+        AgentMessage::McpRequest { call_id, command_id, request } => {
+            super::script_mcp::spawn_request(pool.clone(), conn.clone(), call_id, command_id, request);
         }
         AgentMessage::Hello(version) => tracing::debug!(%version, "the sandbox agent said hello again"),
         AgentMessage::Unknown => {

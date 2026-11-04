@@ -342,6 +342,58 @@ mod server {
         crate::personas::rules::RuleChain::try_from_stored(stored).map_err(refused)
     }
 
+    /// How a script's MCP call (SME-359) went: the class it was judged
+    /// at and the tool's name as its server lists it, once the call got
+    /// that far, and the server's result as it came.
+    pub struct ScriptMcpCall {
+        pub class: Option<super::ToolClass>,
+        pub tool: Option<String>,
+        pub result: Result<rmcp::model::CallToolResult, ScriptMcpError>,
+    }
+
+    /// Why a script's MCP call has no result: the rules refused it, or the
+    /// call itself failed.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum ScriptMcpError {
+        Refused(String),
+        Failed(String),
+    }
+
+    /// A script's call to MCP tool `tool` on `config`, ruled exactly as the
+    /// model's own call to it is (SME-359, Q1: "same as the model"): the
+    /// conversation's stored chain, read strictly (SME-354 B10), checked
+    /// at the class `call_tool_raw` finds on the connection the call goes
+    /// out on. Only the result differs: the server's own, uncut, for the
+    /// script to read as data.
+    pub async fn call_mcp_for_script(
+        pool: &PgPool,
+        conversation_id: i64,
+        config: &crate::db::McpServerConfig,
+        tool: &str,
+        arguments: Value,
+    ) -> ScriptMcpCall {
+        let name = format!("{}/{tool}", config.name);
+        let chain = match call_rule_chain(pool, conversation_id, &name).await {
+            Ok(chain) => chain,
+            Err(refusal) => return ScriptMcpCall { class: None, tool: None, result: Err(ScriptMcpError::Refused(refusal)) },
+        };
+        let judged = std::sync::Mutex::new(None);
+        let result = crate::mcp::call_tool_raw(pool, config, tool, arguments, |class, listed| {
+            let verdict = chain.allows_at(crate::personas::rules::ToolRef::Mcp { server: &config.name, tool: listed }, class);
+            *judged.lock().unwrap_or_else(|e| e.into_inner()) = Some((class, listed.to_string(), verdict.is_err()));
+            verdict
+        })
+        .await;
+        let judged = judged.into_inner().unwrap_or_else(|e| e.into_inner());
+        let refused = judged.as_ref().is_some_and(|(_, _, refused)| *refused);
+        let (class, tool) = match judged {
+            Some((class, tool, _)) => (Some(class), Some(tool)),
+            None => (None, None),
+        };
+        let result = result.map_err(|message| if refused { ScriptMcpError::Refused(message) } else { ScriptMcpError::Failed(message) });
+        ScriptMcpCall { class, tool, result }
+    }
+
     /// Whether this conversation's chain lets it call the question tool
     /// `name` (`ask_user`, `ask_parent`), which the turn handles itself
     /// rather than through `execute` (SME-354 B9): the same check, at the
@@ -510,6 +562,8 @@ mod server {
 pub use server::execute;
 #[cfg(feature = "server")]
 pub use server::question_allowed;
+#[cfg(feature = "server")]
+pub use server::{ScriptMcpError, call_mcp_for_script};
 // Test-only: `turn`'s tests read the native tool names.
 #[cfg(all(feature = "server", test))]
 pub use server::native_tool_definitions;

@@ -22,3 +22,15 @@ Every terminal's `bash` has `$SMELT_MCP_SOCKET`, `/run/smelt/mcp.sock`: HTTP on 
 The agent's own answers: no connection from smelt is a `503` with `"outcome":"not_sent"`; a call waiting when the connection closes, or a newer one replaces it, or after 180 s, is a `503` with `"outcome":"unknown"` (the call may have run); more than 16 waiting is a `429`.
 
 A Unix socket rather than a port: no port-forward, preview or `webfetch` route reaches it, and the pod never needs a network path to smelt. The pod's Docker containers can't reach it either, so a script that calls MCP tools runs in a terminal, not in `docker run`.
+
+## smelt's side: the same rules as the model
+
+`src/sandbox/script_mcp/` answers each `mcp_request` in a task of its own, so the connection's reader never waits on a call.
+
+- **The connection is the identity.** A request carries no conversation or pod id (a body that names one is ignored): it is ruled as the conversation of the connection smelt itself dialed to that pod (`TerminalConnection`'s `conversation_id` and `pod_id`), so a pod can't call as another, and no token is needed.
+- **First, the caller:** the pod must still be the conversation's live pod and the conversation not being deleted (`503` otherwise), and an agent conversation must be `active` (`403` once it is finished, stopped or failed).
+- **Then the call, exactly as the model's** (the user's answer to SME-359's Q1, "same as the model"): `anthropic::tools::call_mcp_for_script` reads the conversation's stored rule chain strictly (unreadable refuses, SME-354 B10) and `mcp::call_tool_raw` checks it at the class the connection's tool list and the user's override give, before anything is sent. A refusal is a `403` with the rule's own text. There is no separate ceiling for scripts.
+- **The tool's name** is `<server>/<tool>` (the longest configured server name before a `/` wins) or the model's `mcp__<server>__<tool>`. An unknown one is a `404`, a body that isn't a JSON object with a `tool` string and object `arguments` a `400`; neither is recorded.
+- **The result is the server's own:** every content block, `structured_content` and the joined `text`, not cut to the model's 30,000 characters, but bounded at 8 MiB of JSON (`502` beyond). A failure below MCP is a `502`. Error text has the server's secrets redacted (`mcp::redact_secrets`: the URL's query and password, header values, OAuth tokens), on the model's calls too.
+- **`GET /v1/tools`** lists what the model is offered (`mcp::offered_tools`, the same chain and class), with the servers' own names and input schemas.
+- **Each call is a `sandbox_mcp_calls` row** ([database.md](database.md)), never holding its arguments or result, and runs in a `script mcp call` span (conversation, pod, command, server, tool, class, status) over the call's `mcp call` span.
