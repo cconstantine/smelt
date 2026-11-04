@@ -204,6 +204,8 @@ pub(in crate::sandbox) fn build_pod_spec(
             // pod-level setting covers the pair, as SANDBOX_IMAGE_PULL_POLICY
             // does.
             image_pull_secrets: default_image_pull_secrets(),
+            // The deployment's own pin, if any (SME-379): SANDBOX_NODE_SELECTOR.
+            node_selector: default_node_selector(),
             // No architecture pin (SME-360): every image a sandbox pod runs
             // is published for both linux/amd64 and linux/arm64 — the
             // sandbox image (`publish-images.yml`, from the same commit as
@@ -215,7 +217,8 @@ pub(in crate::sandbox) fn build_pod_spec(
             // image was amd64 only and pods were pinned to
             // `kubernetes.io/arch: amd64`. A deployment that points
             // SANDBOX_IMAGE or SANDBOX_DOCKER_IMAGE at a single-arch image on
-            // a mixed cluster has to pin its nodes itself (docs/setup.md).
+            // a mixed cluster, or runs on nodes whose kernel can't start the
+            // Docker sidecar, pins them with SANDBOX_NODE_SELECTOR.
             restart_policy: Some("Never".to_string()),
             ..Default::default()
         }),
