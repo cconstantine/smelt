@@ -75,8 +75,26 @@ pub(super) fn run(args: &[String], socket: Option<&str>, fallback: &str, stdin: 
                 }
                 Some(text) => text.to_string(),
             };
-            // The arguments as the script wrote them: smelt reads them, and
-            // says what's wrong with them.
+            // Read here, so arguments that aren't an object are a usage
+            // error of the CLI's own (SME-386 M8): spliced in as they were,
+            // `''` made a body smelt could only call malformed. They go up
+            // as the script wrote them, not re-serialized.
+            match serde_json::from_str::<serde_json::Value>(&arguments) {
+                Ok(serde_json::Value::Object(_)) => {}
+                Ok(other) => {
+                    let kind = match other {
+                        serde_json::Value::Array(_) => "an array",
+                        serde_json::Value::String(_) => "a string",
+                        serde_json::Value::Number(_) => "a number",
+                        serde_json::Value::Bool(_) => "a boolean",
+                        _ => "null",
+                    };
+                    return (3, String::new(), format!("the arguments must be a JSON object, like '{{\"query\":\"x\"}}', not {kind}"));
+                }
+                Err(e) => {
+                    return (3, String::new(), format!("the arguments aren't JSON ({e}); pass an object, like '{{\"query\":\"x\"}}', or none for {{}}"));
+                }
+            }
             let body = format!("{{\"tool\":{},\"arguments\":{}}}", json_string(&args[1]), arguments.trim());
             format!(
                 "POST /v1/call HTTP/1.1\r\nHost: smelt\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

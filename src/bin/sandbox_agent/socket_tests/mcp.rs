@@ -367,3 +367,18 @@ async fn test_the_cli_without_the_socket_variable_uses_the_fixed_path() {
     assert_eq!(code, 3);
     assert!(err.contains("SMELT_MCP_SOCKET isn't set") && err.contains("/nonexistent/smelt-mcp.sock"), "{err}");
 }
+
+/// SME-386 M8: arguments that aren't a JSON object (an empty `''`, a
+/// typo, an array) are the CLI's own usage error, said plainly, and
+/// nothing is sent; smelt's 400 for the body they made read as smelt's.
+#[test]
+fn test_the_cli_refuses_arguments_that_arent_a_json_object() {
+    let unused = "/nonexistent/smelt-mcp.sock";
+    for (arguments, says) in [("", "aren't JSON"), ("{\"q\": ", "aren't JSON"), ("[1]", "must be a JSON object"), ("-", "aren't JSON")] {
+        let args = vec!["call".to_string(), "exa/web_search_exa".to_string(), arguments.to_string()];
+        let (code, out, err) = cli::run(&args, Some(unused), unused, &mut std::io::empty());
+        assert_eq!((code, out.as_str()), (3, ""), "{arguments:?}: {err}");
+        assert!(err.contains(says), "{arguments:?}: {err}");
+        assert!(!err.contains("couldn't reach"), "{arguments:?}: nothing is sent: {err}");
+    }
+}
