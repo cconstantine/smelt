@@ -43,9 +43,9 @@ pub(crate) use ownership::{test_instance, TEST_INSTANCE};
 pub(crate) use pods::pod_delete_params;
 pub(crate) use pvcs::{conversation_claim_kind, docker_pvc_name, workspace_pvc_name};
 
-pub(in crate::sandbox) use images::{default_docker_image, default_image_pull_policy, default_image_pull_secrets, how_to_build};
+pub(in crate::sandbox) use images::{default_docker_image, default_image_pull_policy, default_image_pull_secrets, default_node_selector, how_to_build};
 #[cfg(test)]
-pub(in crate::sandbox) use images::{image_pull_policy_from, image_pull_secrets_from, sandbox_image_from};
+pub(in crate::sandbox) use images::{image_pull_policy_from, image_pull_secrets_from, node_selector_from, sandbox_image_from};
 pub(in crate::sandbox) use limits::{memory_only, pod_container_limits, running_wait_timeout};
 #[cfg(test)]
 pub(in crate::sandbox) use limits::{default_docker_memory_limit, default_memory_limit};

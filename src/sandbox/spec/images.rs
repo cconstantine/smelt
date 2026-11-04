@@ -111,6 +111,33 @@ pub(in crate::sandbox) fn default_image_pull_secrets() -> Option<Vec<LocalObject
     (!secrets.is_empty()).then_some(secrets)
 }
 
+/// `SANDBOX_NODE_SELECTOR`: the node labels every sandbox pod must match
+/// (SME-379), or `None` for no pin. Sandbox pods carry no architecture pin
+/// of their own (SME-360), so a cluster with nodes that can't run them (an
+/// arm64 Jetson whose kernel won't start the Docker sidecar, say) keeps
+/// them off those nodes here. Language-server pods follow their sandbox
+/// pod's node, so they need no setting of their own.
+pub(in crate::sandbox) fn default_node_selector() -> Option<std::collections::BTreeMap<String, String>> {
+    node_selector_from(std::env::var("SANDBOX_NODE_SELECTOR").ok().as_deref())
+}
+
+/// The labels a `SANDBOX_NODE_SELECTOR` of `setting` names: `key=value`
+/// entries, comma-separated, spaces trimmed. An entry with no `=` or no key
+/// can't be a label and is dropped with a warning, since failing every pod
+/// would stop every sandbox. `None` when nothing usable is named.
+pub(in crate::sandbox) fn node_selector_from(setting: Option<&str>) -> Option<std::collections::BTreeMap<String, String>> {
+    let mut labels = std::collections::BTreeMap::new();
+    for entry in setting.into_iter().flat_map(|s| s.split(',')).map(str::trim).filter(|e| !e.is_empty()) {
+        match entry.split_once('=') {
+            Some((key, value)) if !key.trim().is_empty() => {
+                labels.insert(key.trim().to_string(), value.trim().to_string());
+            }
+            _ => tracing::warn!(entry, "SANDBOX_NODE_SELECTOR: not a key=value label, ignored"),
+        }
+    }
+    (!labels.is_empty()).then_some(labels)
+}
+
 /// The pull credentials a `SANDBOX_IMAGE_PULL_SECRET` of `setting` names: one
 /// per comma-separated entry, spaces trimmed, blanks dropped. Empty when the
 /// setting names nothing at all.

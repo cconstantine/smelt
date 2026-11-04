@@ -49,9 +49,12 @@ where smelt's own real-cluster test suite runs.
     and `sandbox_image` to a later tag in the same apply that picks up this
     module, or set `node_selector = { "kubernetes.io/arch" = "amd64" }` until
     you do.
-  - **`node_selector` reaches only the server and the database.** Sandbox and
-    language-server pods have no pin: a single-arch `sandbox_image` or
-    `SANDBOX_DOCKER_IMAGE` needs a single-arch cluster, or a multi-arch image.
+  - **`node_selector` reaches only the server and the database.** Sandbox
+    pods take `SANDBOX_NODE_SELECTOR` through `extra_env`, e.g.
+    `{ SANDBOX_NODE_SELECTOR = "kubernetes.io/arch=amd64" }`. Set it when
+    some nodes can't run them: a single-arch `sandbox_image`, or a kernel
+    that won't start the Docker sidecar (an arm64 Jetson's doesn't).
+    Language-server pods follow their sandbox pod's node (SME-379).
   - **Applying a change to `node_selector` rolls both pods at once:** the
     database's one pod and the server (Recreate). The server's init container
     waits about 2 minutes for Postgres, so it's a short outage. The database
