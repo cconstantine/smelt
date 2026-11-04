@@ -277,29 +277,75 @@ fn json_name(s: &str) -> Option<Option<String>> {
 
 /// The byte ranges of leaked reasoning in `text`: each `<think>` at a
 /// line's start (indent ≤ 3 spaces), up to the `</think>` that closes it —
-/// tags included. One elsewhere (prose, inline code) or never closed is
-/// text, so it can't hide the rest of the reply (SME-286 review 2).
+/// tags included — and any pair straight after that one on its line
+/// (spaces between). A `</think>` at a line's start with no `<think>`
+/// anywhere before it closes reasoning the chat template opened, so it
+/// runs from the reply's start (SME-386 T6). A `<think>` elsewhere (prose,
+/// inline code) or never closed is text, so it can't hide the rest of the
+/// reply (SME-286 review 2).
 #[cfg(feature = "server")]
 fn think_ranges(text: &str) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut from = 0;
+    if let Some(close) = template_opened_close(text) {
+        ranges.push((0, close));
+        from = pairs_after(text, close, &mut ranges);
+    }
     while from < text.len() {
         let line_end = text[from..].find('\n').map_or(text.len(), |at| from + at + 1);
         let line = &text[from..line_end];
         let body = line.trim_start_matches(' ');
+        let open = line_end - body.len();
         if line.len() - body.len() <= 3
             && body.starts_with("<think>")
-            && let Some(at) = text[line_end - body.len() + "<think>".len()..].find("</think>")
+            && let Some(close) = closing(text, open)
         {
-            let open = line_end - body.len();
-            let close = open + "<think>".len() + at + "</think>".len();
             ranges.push((open, close));
-            from = text[close..].find('\n').map_or(text.len(), |at| close + at + 1);
+            from = pairs_after(text, close, &mut ranges);
             continue;
         }
         from = line_end;
     }
     ranges
+}
+
+/// The end of the `</think>` closing the `<think>` at `open`, if one does.
+#[cfg(feature = "server")]
+fn closing(text: &str, open: usize) -> Option<usize> {
+    let after = open + "<think>".len();
+    text[after..].find("</think>").map(|at| after + at + "</think>".len())
+}
+
+/// Adds each pair that follows `close` straight away on its line (only
+/// spaces between) to `ranges`, and returns where the next line starts.
+#[cfg(feature = "server")]
+fn pairs_after(text: &str, mut close: usize, ranges: &mut Vec<(usize, usize)>) -> usize {
+    loop {
+        let open = close + (text[close..].len() - text[close..].trim_start_matches(' ').len());
+        match text[open..].starts_with("<think>").then(|| closing(text, open)).flatten() {
+            Some(next) => {
+                ranges.push((open, next));
+                close = next;
+            }
+            None => return text[close..].find('\n').map_or(text.len(), |at| close + at + 1),
+        }
+    }
+}
+
+/// The end of the first `</think>` at a line's start (indent ≤ 3 spaces)
+/// when no `<think>` comes before it: reasoning the template opened.
+#[cfg(feature = "server")]
+fn template_opened_close(text: &str) -> Option<usize> {
+    let mut start = 0;
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_start_matches(' ');
+        if line.len() - body.len() <= 3 && body.starts_with("</think>") {
+            let at = start + line.len() - body.len();
+            return (!text[..at].contains("<think>")).then_some(at + "</think>".len());
+        }
+        start += line.len();
+    }
+    None
 }
 
 /// `text` with leaked reasoning masked: each range `think_ranges` finds
