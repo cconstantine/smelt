@@ -463,3 +463,27 @@ async fn test_a_legacy_fingerprint_for_a_changed_tool_can_no_longer_be_matched(p
     assert!(!marked.chars().all(|c| c.is_ascii_hexdigit()), "no hash of any tool can equal it: {marked}");
     assert_eq!(class, Some(Destructive), "it still narrows the unannotated echo");
 }
+
+/// SME-386 review 2, L1: a legacy fingerprint saved for a name the server
+/// doesn't list now is marked too, so a tool listed later under the name
+/// can't be forged to its 64-bit value.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_legacy_fingerprint_for_an_unlisted_tool_can_no_longer_be_matched(pool: sqlx::PgPool) {
+    let config = create_static_server(&pool, &test_config(0, "unused").url).await;
+    let _server = register_test_connection(config.id, true).await;
+    let stale = "fedcba9876543210";
+    crate::db::set_mcp_tool_class(&pool, config.id, "gone_tool", ReadOnly, Some(stale)).await.expect("a legacy override for a gone tool");
+    let _ = tool_definitions_for(&pool, std::slice::from_ref(&config), &crate::personas::rules::RuleChain::default()).await;
+    let marked = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let row = crate::db::get_mcp_tool_class(&pool, config.id, "gone_tool").await.expect("read the row");
+            if let Some(fingerprint) = row.and_then(|r| r.tool_fingerprint).filter(|f| f != stale) {
+                return fingerprint;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    REGISTRY.lock().await.remove(&config.id);
+    assert_eq!(marked.ok().as_deref(), Some(crate::mcp::LEGACY_CHANGED), "the offer marked the unlisted row");
+}

@@ -522,6 +522,14 @@ pub async fn offered_tools(
                         Some(_) => None,
                     }
                 })
+                // A legacy value whose name the server doesn't list now is
+                // marked too: a tool listed under it later can't be forged
+                // to it (review 2, L1).
+                .chain(saved.into_iter().flat_map(|rows| rows.values()).filter_map(|row| {
+                    let stored = row.tool_fingerprint.as_deref().filter(|stored| is_legacy_form(stored))?;
+                    (!conn.tools.iter().any(|tool| tool.name == row.tool_name))
+                        .then(|| (config.id, row.tool_name.clone(), Some(stored.to_string()), LEGACY_CHANGED.to_string()))
+                }))
                 .collect::<Vec<_>>()
         })
         .collect();
