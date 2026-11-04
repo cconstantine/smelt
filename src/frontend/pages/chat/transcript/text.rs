@@ -106,6 +106,16 @@ pub(in crate::frontend::pages::chat) fn tool_summary(name: &str, input: &serde_j
             host if host.is_empty() => format!("Shared a preview of port {}", field("port")),
             host => format!("Shared a preview of {host}:{}", field("port")),
         },
+        // SME-377: what the model told the user, every character that could
+        // break the line, reorder it or hide in it escaped (SME-276's rule):
+        // a refused call's input is saved as the model sent it.
+        "notify_user" => format!(
+            "Notified you: {}",
+            field("message")
+                .chars()
+                .map(|c| if crate::git::not_plain(c) { c.escape_unicode().to_string() } else { c.to_string() })
+                .collect::<String>()
+        ),
         "todowrite" => "Updated the todo list".to_string(),
         "todoread" => "Checked the todo list".to_string(),
         "clone_repo" => format!("Cloned {}", field("url")),

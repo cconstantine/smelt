@@ -303,3 +303,15 @@ fn test_an_attach_error_line_shows_under_a_message_but_not_on_a_switchs_load() {
     assert!(!shows_attach_error_line(false, true, false), "a deleted conversation");
     assert!(!shows_attach_error_line(true, true, true), "a deleted conversation with an error line");
 }
+
+/// T13 (SME-377): the model's `notify_user` call reads as what it told
+/// the user, with anything that could reorder or hide text escaped: a
+/// refused call's input is saved as the model sent it.
+#[test]
+fn test_tool_summary_shows_the_notify_user_message_escaped() {
+    assert_eq!(tool_summary("notify_user", &serde_json::json!({"message": "Built and tested"})), "Notified you: Built and tested");
+    assert_eq!(
+        tool_summary("notify_user", &serde_json::json!({"message": "done\u{202e}x\nnext"})),
+        "Notified you: done\\u{202e}x\\u{a}next"
+    );
+}

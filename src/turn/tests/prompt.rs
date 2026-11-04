@@ -213,6 +213,20 @@ fn test_system_prompt_names_the_tool_confusions() {
     }
 }
 
+/// T14 (SME-377): the base prompt says when to call `notify_user` — once,
+/// as the last step — and when not to: while waiting on its own work. An
+/// agent is told it has none.
+#[test]
+fn test_system_prompt_says_when_to_notify_the_user() {
+    for phrase in [
+        "call `notify_user` once, as your last step",
+        "Not while you wait on your own commands or agents",
+        "An agent has no `notify_user`",
+    ] {
+        assert!(BASE_SYSTEM_PROMPT.contains(phrase), "missing {phrase:?} in the base prompt");
+    }
+}
+
 #[test]
 fn test_system_prompt_describes_the_environment() {
     let prompt = system_prompt(&prompt_env());
