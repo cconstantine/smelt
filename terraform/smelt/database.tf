@@ -120,13 +120,12 @@ resource "kubernetes_stateful_set_v1" "database" {
       }
 
       spec {
-        # The same arch pin as the server (see server.tf): every image this
-        # module deploys is linux/amd64, and this StatefulSet's claim is
-        # `ReadWriteOnce` — it wants to land where the data is, not where
-        # the pull would fail.
-        node_selector = {
-          "kubernetes.io/arch" = "amd64"
-        }
+        # No architecture pin of its own (SME-373): `postgres_image`'s
+        # default is multi-arch, like every image this module deploys.
+        # `var.node_selector` pins it with the server when a deployment
+        # needs one. Its `ReadWriteOnce` claim on `local-path` is node-local
+        # anyway, so once made, the pod follows its data.
+        node_selector = var.node_selector
 
         # The claim lands on whatever node takes the pod; fsGroup is what makes
         # it writable by the postgres user (uid 5432 in the image) instead of

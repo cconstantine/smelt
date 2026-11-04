@@ -52,13 +52,13 @@ variable "kubeconfig_context" {
 variable "image" {
   description = "Server image to deploy."
   type        = string
-  default     = "ghcr.io/cconstantine/smelt:c0a089794fc7"
+  default     = "ghcr.io/cconstantine/smelt:6d2831da191e"
 }
 
 variable "sandbox_image" {
   description = "Sandbox agent image pods get created from."
   type        = string
-  default     = "ghcr.io/cconstantine/smelt-sandbox:c0a089794fc7"
+  default     = "ghcr.io/cconstantine/smelt-sandbox:6d2831da191e"
 }
 
 provider "kubernetes" {
