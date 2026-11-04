@@ -49,6 +49,16 @@ pub async fn finish_sandbox_mcp_call(pool: &PgPool, id: i64, class: Option<&str>
     Ok(())
 }
 
+/// The budget count for a call traced to a command of this conversation
+/// (`$1`, the command id): answered from `idx_sandbox_mcp_calls_command`.
+pub(crate) const COMMAND_BUDGET_SQL: &str =
+    "SELECT count(*) FROM sandbox_mcp_calls WHERE command_id = $1 AND outcome <> 'limited'";
+
+/// The budget count for a call traced to no command (`$1`, the pod id):
+/// answered from the partial index on the pod's command-less calls.
+pub(crate) const POD_BUDGET_SQL: &str =
+    "SELECT count(*) FROM sandbox_mcp_calls WHERE pod_id = $1 AND command_id IS NULL AND outcome <> 'limited'";
+
 /// The calls counted against a call's budget (SME-359): those of its
 /// command, when the command is this conversation's (as the insert keeps
 /// it), and otherwise those of its pod made outside any command. A call
@@ -59,18 +69,23 @@ pub async fn count_sandbox_mcp_calls_against_budget(
     pod_id: i64,
     command_id: Option<&str>,
 ) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT count(*) FROM sandbox_mcp_calls
-          WHERE outcome <> 'limited'
-            AND CASE WHEN EXISTS (SELECT 1 FROM terminal_commands WHERE command_id = $3 AND conversation_id = $1)
-                     THEN command_id = $3
-                     ELSE pod_id = $2 AND command_id IS NULL END",
-    )
-    .bind(conversation_id)
-    .bind(pod_id)
-    .bind(command_id)
-    .fetch_one(pool)
-    .await
+    // Two plain queries, not one CASE: a condition inside a CASE can't use
+    // an index, and this runs on every call (review round 2).
+    let owned = match command_id {
+        Some(command_id) => sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM terminal_commands WHERE command_id = $1 AND conversation_id = $2)",
+        )
+        .bind(command_id)
+        .bind(conversation_id)
+        .fetch_one(pool)
+        .await?
+        .then_some(command_id),
+        None => None,
+    };
+    match owned {
+        Some(command_id) => sqlx::query_scalar(COMMAND_BUDGET_SQL).bind(command_id).fetch_one(pool).await,
+        None => sqlx::query_scalar(POD_BUDGET_SQL).bind(pod_id).fetch_one(pool).await,
+    }
 }
 
 /// Whether `pod_id` is `conversation_id`'s live pod, and the conversation

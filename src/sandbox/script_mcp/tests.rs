@@ -480,16 +480,26 @@ async fn test_a_tool_name_over_256_bytes_is_a_400(pool: PgPool) {
     assert!(answer.body.contains("256"), "{}", answer.body);
 }
 
-/// Review round 1, M2: the pod's command-less budget is counted from an
-/// index, not a scan of the pod's calls.
+/// Review rounds 1 and 2 (M2): both budget counts, the command's and the
+/// pod's command-less one, are answered from an index, never a scan of
+/// every call: they run on every call, 429s included. A condition inside
+/// a CASE can't use an index, so each is a plain query. With sequential
+/// scans priced out, a plan that still scans the table is one that can't
+/// use an index at all.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_the_pods_command_less_calls_have_an_index(pool: PgPool) {
-    let definition: Option<String> = sqlx::query_scalar("SELECT indexdef FROM pg_indexes WHERE tablename = 'sandbox_mcp_calls' AND indexdef LIKE '%(pod_id)%'")
-        .fetch_optional(&pool)
-        .await
-        .expect("read pg_indexes");
-    let definition = definition.expect("an index on sandbox_mcp_calls (pod_id)");
-    assert!(definition.contains("WHERE (command_id IS NULL)"), "{definition}");
+async fn test_the_budget_counts_use_an_index(pool: PgPool) {
+    let mut conn = pool.acquire().await.expect("a connection");
+    sqlx::query("SET enable_seqscan = off").execute(&mut *conn).await.expect("set");
+    for name in ["command", "pod"] {
+        let plan: Vec<String> = match name {
+            "command" => sqlx::query_scalar(&format!("EXPLAIN {}", db::COMMAND_BUDGET_SQL)).bind("cmd-x").fetch_all(&mut *conn).await,
+            _ => sqlx::query_scalar(&format!("EXPLAIN {}", db::POD_BUDGET_SQL)).bind(2_i64).fetch_all(&mut *conn).await,
+        }
+        .expect("explain");
+        let plan = plan.join("\n");
+        assert!(!plan.contains("Seq Scan on sandbox_mcp_calls"), "the {name} count scans the table:\n{plan}");
+        assert!(plan.contains("Index") || plan.contains("Bitmap"), "the {name} count uses no index:\n{plan}");
+    }
 }
 
 /// Review round 1, L4: listing the tools takes a rate token like a call,
