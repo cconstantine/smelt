@@ -633,7 +633,11 @@ async fn notifier(
                     }
                     notify_leader(&send, &page, &shown, &mut open, event).await;
                 }
-                crate::events::AppEvent::TurnsChanged | crate::events::AppEvent::QuestionsChanged => {
+                // A delete moves no turn or question (SME-386 N3): its
+                // `ConversationsChanged` is what closes the gone one's.
+                crate::events::AppEvent::TurnsChanged
+                | crate::events::AppEvent::QuestionsChanged
+                | crate::events::AppEvent::ConversationsChanged => {
                     revalidate_open(&send, &mut needers, &mut open).await;
                 }
                 crate::events::AppEvent::Unknown => *crate::frontend::STALE_BUNDLE.write() = true,

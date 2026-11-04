@@ -65,6 +65,21 @@ pub(super) async fn scenario_notifier_leadership(t: &Scenario<'_>) {
     assert!(!leads(&b).await, "B stopped leading");
     assert_eq!(queued_requests(&a).await, 1, "B queued once");
 
+    // N3: a conversation deleted while it waits on the user takes its
+    // notification with it — the delete's `ConversationsChanged` makes the
+    // leader revalidate, and the gone conversation answers `None`.
+    let gone = t.conversation().await;
+    let gone_tag = format!("smelt-conversation-{}", gone.id);
+    set_focus(&a, false, false).await;
+    crate::turn::publish_a_test_spell(gone.id, crate::events::Attention::Failed);
+    assert!(wait_tag_count(&a, &gone_tag, 1, Duration::from_secs(10)).await, "the leader showed the failure");
+    crate::api::chat::delete_conversation(gone.id).await.expect("delete the conversation");
+    assert!(
+        wait_last_closed(&a, &gone_tag, "smelt: the turn failed", Duration::from_secs(10)).await,
+        "deleting the conversation closes its notification"
+    );
+    set_focus(&a, true, true).await;
+
     // Leave the browser's setting off, as the next scenario expects.
     a.evaluate("localStorage.removeItem('smelt.notifications')").await.expect("turn the setting off");
 }
