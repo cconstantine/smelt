@@ -127,3 +127,25 @@ fn test_a_query_value_that_isnt_a_key_stays_in_the_text() {
     assert_eq!(redacted.matches("web_search_exa").count(), 2, "the tool's name stays: {redacted}");
     assert!(!redacted.contains("3f2a9c1e"), "the key goes, alone and in the URL: {redacted}");
 }
+
+/// Review round 1, M1: a query value is a secret by its parameter's name,
+/// whatever its shape, and a token in the URL's user part is one too.
+/// Exa's `tools=web_search_exa` still isn't.
+#[test]
+fn test_a_credential_named_parameter_and_a_username_token_are_redacted() {
+    let letters = "abcdefghijklmnopqrstuvwxyzABCDEF";
+    let cases = [
+        (format!("https://mcp.example.com/mcp?api_key=Sk12345678ab&tools=web_search_exa"), "Sk12345678ab"),
+        (format!("https://mcp.example.com/mcp?Key={letters}"), letters),
+        ("https://ghp_TOKENINUSERNAME359@mcp.example.com/mcp".to_string(), "ghp_TOKENINUSERNAME359"),
+        ("https://mcp.example.com/mcp?AuthToken=short1".to_string(), "short1"),
+    ];
+    for (url, secret) in cases {
+        let mut config = test_config(-359_010, "example");
+        config.url = url.clone();
+        let text = format!("failed: the server echoed {secret} back (tools: web_search_exa)");
+        let redacted = redact_secrets(&config, &text);
+        assert!(!redacted.contains(secret), "{url}: {redacted}");
+        assert!(redacted.contains("web_search_exa"), "{url}: a tool name isn't a secret: {redacted}");
+    }
+}

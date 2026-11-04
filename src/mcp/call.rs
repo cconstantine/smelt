@@ -320,15 +320,29 @@ pub fn redact_secrets(config: &McpServerConfig, text: &str) -> String {
     // decoded. Not every value: Exa's built-in URL has
     // `?tools=web_search_exa`, and that tool's name isn't a secret
     // (SME-359's hands-on check found it redacted from every error).
+    // A value whose parameter's name says it's a credential goes whatever
+    // its shape (review round 1, M1).
     let raw_query = config.url.split_once('?').map(|(_, rest)| rest.split('#').next().unwrap_or(rest).to_string());
     secrets.extend(raw_query.clone());
     if let Some(query) = &raw_query {
-        secrets.extend(query.split('&').filter_map(|pair| pair.split_once('=').map(|(_, value)| value.to_string())).filter(|v| looks_like_a_key(v)));
+        secrets.extend(
+            query
+                .split('&')
+                .filter_map(|pair| pair.split_once('='))
+                .filter(|(name, value)| names_a_credential(name) || looks_like_a_key(value))
+                .map(|(_, value)| value.to_string()),
+        );
     }
     if let Ok(url) = url::Url::parse(&config.url) {
         secrets.extend(url.query().map(str::to_string));
-        secrets.extend(url.query_pairs().map(|(_, value)| value.into_owned()).filter(|v| looks_like_a_key(v)));
+        secrets.extend(
+            url.query_pairs()
+                .filter(|(name, value)| names_a_credential(name) || looks_like_a_key(value))
+                .map(|(_, value)| value.into_owned()),
+        );
         secrets.extend(url.password().map(str::to_string));
+        // A token can be the URL's user part (`https://ghp_…@host`).
+        secrets.extend(Some(url.username().to_string()).filter(|user| !user.is_empty()));
     }
     secrets.extend(config.extra_headers.values().cloned());
     // A header's value can be quoted without its scheme ("Bearer ").
@@ -343,6 +357,13 @@ pub fn redact_secrets(config: &McpServerConfig, text: &str) -> String {
     secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
     secrets.dedup();
     secrets.iter().fold(text.to_string(), |text, secret| text.replace(secret.as_str(), REDACTED))
+}
+
+/// Whether a query parameter's name says its value is a credential.
+fn names_a_credential(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    ["key", "token", "secret", "auth", "password", "passwd", "pwd", "credential", "signature"].iter().any(|word| name.contains(word))
+        || name.starts_with("api")
 }
 
 /// Whether a URL query value, seen on its own, could be a credential: 16
