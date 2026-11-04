@@ -19,6 +19,16 @@ CACHE_DIR="${BROWSER_CHECK_CACHE:-$REPO_ROOT/.browser-check-cache}"
 # Debian's multiarch library directory for this machine (x86_64-linux-gnu,
 # aarch64-linux-gnu); `src/headless_chrome.rs` derives the same one.
 TRIPLET="$(uname -m)-linux-gnu"
+# Only those two: on any other arch Debian's directory is named otherwise
+# (arm-linux-gnueabihf, i386-linux-gnu, powerpc64le-linux-gnu), so the
+# fetch would end in libraries "not found" rather than say why (SME-386 A7).
+case "$(uname -m)" in
+    x86_64 | aarch64) ;;
+    *)
+        echo "error: unsupported architecture $(uname -m): smelt's headless Chromium is set up for x86_64 and aarch64 only" >&2
+        exit 1
+        ;;
+esac
 LIBDIR="$CACHE_DIR/libs/usr/lib/$TRIPLET"
 BIN="$CACHE_DIR/libs/usr/lib/chromium/chromium-headless-shell"
 
