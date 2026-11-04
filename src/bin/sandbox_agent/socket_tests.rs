@@ -9,6 +9,8 @@ const WAIT: Duration = Duration::from_secs(5);
 
 /// A terminal's shell ending: `exit`, a kill, an ended shell's last events.
 mod shell_end;
+/// Script MCP calls through the socket (SME-359).
+mod mcp;
 
 async fn serve_agent() -> std::net::SocketAddr {
     serve_agent_with(new_state()).await

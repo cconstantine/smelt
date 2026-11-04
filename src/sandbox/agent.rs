@@ -522,6 +522,7 @@ fn client_message_action(message: &ClientMessage) -> &'static str {
         ClientMessage::ListDirectory { .. } => "list_directory",
         ClientMessage::Glob { .. } => "glob",
         ClientMessage::Grep { .. } => "grep",
+        ClientMessage::McpResponse { .. } => "mcp_response",
     }
 }
 
@@ -748,6 +749,13 @@ pub(super) async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConne
             // Not the text: serde's error quotes the values it choked on,
             // which can be part of a request's content.
             tracing::warn!(bytes = message.len(), "the sandbox agent couldn't read a message from smelt");
+        }
+        AgentMessage::McpRequest { call_id, .. } => {
+            // SME-359: script calls aren't served yet.
+            let body = serde_json::json!({ "error": "this smelt can't take script calls yet" }).to_string();
+            if let Err(e) = conn.send(&ClientMessage::McpResponse { call_id, status: 501, body }) {
+                tracing::debug!(call_id, error = %e, "couldn't answer a script's MCP call");
+            }
         }
         AgentMessage::Hello(version) => tracing::debug!(%version, "the sandbox agent said hello again"),
         AgentMessage::Unknown => {

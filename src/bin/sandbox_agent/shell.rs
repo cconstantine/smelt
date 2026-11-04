@@ -47,7 +47,7 @@ pub(super) async fn create_terminal(state: &Arc<AppState>, terminal_id: String) 
     if state.terminals.lock().await.contains_key(&terminal_id) {
         return reply_error("terminal_id already exists");
     }
-    let shell = match spawn_shell(&terminal_id, &state.events_tx).await {
+    let shell = match spawn_shell(&terminal_id, state).await {
         Ok(shell) => shell,
         Err(message) => return reply_error(&message),
     };
@@ -61,8 +61,16 @@ pub(super) async fn create_terminal(state: &Arc<AppState>, terminal_id: String) 
 }
 
 /// Starts a terminal's `bash`, set up for commands, and its reader.
-async fn spawn_shell(terminal_id: &str, events_tx: &mpsc::UnboundedSender<ShellEvent>) -> Result<Arc<Shell>, String> {
-    let mut child = Command::new("bash")
+async fn spawn_shell(terminal_id: &str, state: &AppState) -> Result<Arc<Shell>, String> {
+    let events_tx = &state.events_tx;
+    let mut command = Command::new("bash");
+    // Where a script reaches the conversation's MCP tools (SME-359); unset
+    // when the agent couldn't bind the socket.
+    match state.mcp.socket_path() {
+        Some(path) => command.env(MCP_SOCKET_ENV, path),
+        None => command.env_remove(MCP_SOCKET_ENV),
+    };
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -134,7 +142,7 @@ async fn shell_for_command(state: &Arc<AppState>, terminal_id: &str) -> Option<R
     if !shell.ended.load(Ordering::SeqCst) {
         return Some(Ok(shell));
     }
-    Some(match spawn_shell(terminal_id, &state.events_tx).await {
+    Some(match spawn_shell(terminal_id, state).await {
         Ok(new) => {
             terminals.insert(terminal_id.to_string(), new.clone());
             Ok(new)

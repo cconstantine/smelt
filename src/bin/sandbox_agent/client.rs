@@ -19,6 +19,8 @@ pub(super) struct AppState {
     unsent: std::sync::Mutex<Option<AgentMessage>>,
     /// Signalled when `unsent` fills, so the live connection sends it.
     unsent_ready: tokio::sync::Notify,
+    /// Script MCP calls waiting on smelt (SME-359).
+    pub(super) mcp: McpCalls,
 }
 
 pub(super) fn new_state() -> Arc<AppState> {
@@ -31,6 +33,7 @@ pub(super) fn new_state() -> Arc<AppState> {
         next_connection: AtomicU64::new(0),
         unsent: std::sync::Mutex::new(None),
         unsent_ready: tokio::sync::Notify::new(),
+        mcp: McpCalls::default(),
     })
 }
 
@@ -77,11 +80,23 @@ impl AppState {
 /// so an exit during a smelt restart still reaches it. So does one whose
 /// send failed (`send_or_keep`). Not covered: a send the kernel accepted
 /// into a socket smelt had already abandoned counts as sent, and is lost.
-async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
-    let (connection, mut replaced) = state.take_over();
+async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
+    let (connection, replaced) = state.take_over();
+    let mcp_requests = state.mcp.attach(connection);
+    serve_socket(socket, &state, connection, replaced, mcp_requests).await;
+    state.mcp.detach(connection);
+    state.release(connection);
+}
+
+async fn serve_socket(
+    mut socket: WebSocket,
+    state: &Arc<AppState>,
+    connection: u64,
+    mut replaced: oneshot::Receiver<()>,
+    mut mcp_requests: mpsc::UnboundedReceiver<AgentMessage>,
+) {
     send_message(&mut socket, &AgentMessage::Hello(PROTOCOL_VERSION)).await;
-    if !send_unsent(&mut socket, &state).await {
-        state.release(connection);
+    if !send_unsent(&mut socket, state).await {
         return;
     }
     loop {
@@ -96,33 +111,40 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
             // The connection this one replaced failed a send after this one
             // had opened.
             _ = state.unsent_ready.notified() => {
-                if !send_unsent(&mut socket, &state).await {
+                if !send_unsent(&mut socket, state).await {
+                    break;
+                }
+            }
+            // A script's MCP call. A failed send ends the connection, and
+            // `detach` tells the call its outcome is unknown.
+            Some(request) = mcp_requests.recv() => {
+                let Ok(text) = serde_json::to_string(&request) else { continue };
+                if socket.send(Message::Text(text.into())).await.is_err() {
                     break;
                 }
             }
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        handle_client_message(&text, &state, &mut socket).await;
+                        handle_client_message(&text, state, connection, &mut socket).await;
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Err(_)) => break,
                     _ => {}
                 }
             }
-            event = recv_shell_event(&state) => {
+            event = recv_shell_event(state) => {
                 let Some(event) = event else {
                     break; // AppState (and its events_tx) dropped — agent shutting down
                 };
                 if let Some(message) = event_message(event) {
-                    if !send_or_keep(&mut socket, &state, message).await {
+                    if !send_or_keep(&mut socket, state, message).await {
                         break;
                     }
                 }
             }
         }
     }
-    state.release(connection);
 }
 
 /// The message a shell event becomes; `None` for a marker with no command
@@ -191,7 +213,7 @@ async fn send_message(socket: &mut WebSocket, message: &AgentMessage) {
 
 /// Handles one message from smelt. A request (anything with a
 /// `request_id`) gets exactly one reply; `command` and `signal` get none.
-async fn handle_client_message(text: &str, state: &Arc<AppState>, socket: &mut WebSocket) {
+async fn handle_client_message(text: &str, state: &Arc<AppState>, connection: u64, socket: &mut WebSocket) {
     let msg = match serde_json::from_str::<ClientMessage>(text) {
         Ok(msg) => msg,
         Err(e) => {
@@ -226,6 +248,7 @@ async fn handle_client_message(text: &str, state: &Arc<AppState>, socket: &mut W
             id,
             signal,
         } => return signal_current_command(state, &terminal_id, &id, &signal).await,
+        ClientMessage::McpResponse { call_id, status, body } => return state.mcp.answer(connection, call_id, status, body),
         ClientMessage::CreateTerminal { request_id, terminal_id } => {
             (request_id, create_terminal(state, terminal_id).await)
         }
