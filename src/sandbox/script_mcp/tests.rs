@@ -491,3 +491,18 @@ async fn test_the_pods_command_less_calls_have_an_index(pool: PgPool) {
     let definition = definition.expect("an index on sandbox_mcp_calls (pod_id)");
     assert!(definition.contains("WHERE (command_id IS NULL)"), "{definition}");
 }
+
+/// Review round 1, L4: listing the tools takes a rate token like a call,
+/// so a loop of listings is held back too.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_listing_takes_a_rate_token(pool: PgPool) {
+    let (config, _calls) = mock_server_for_tests(&pool, "mock-l4").await;
+    let (conversation, pod) = conversation_with_pod(&pool, None).await;
+    let rate = limits(1, 1, 10, 1_000);
+    let first = handle_with(&pool, caller(conversation, pod), McpRequest::List { server: None }, &rate).await;
+    let second = handle_with(&pool, caller(conversation, pod), McpRequest::List { server: None }, &rate).await;
+    let call = call_under(&pool, caller(conversation, pod), "mock-l4/second_tool", &rate).await;
+    forget_mock_server(config.id).await;
+    assert_eq!((first.status, second.status, call.status), (200, 429, 429), "{second:?}");
+    assert!(second.body.contains("retry_after_secs"), "{}", second.body);
+}

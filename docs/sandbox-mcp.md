@@ -41,7 +41,7 @@ A Unix socket rather than a port: no port-forward, preview or `webfetch` route r
 
 A script's call costs no model tokens; its cost is the provider's quota, and for a writing tool the writes. The limits are smelt's, per conversation, in memory (`src/sandbox/script_mcp/limits.rs`; they reset when smelt restarts), each a `429`. A call held back writes no row, so a loop spinning on 429s can't fill the table: it is counted in memory per command, for the summary's "held back by a limit", and that count resets with smelt. A `tool` over 256 bytes is a `400`:
 
-- **Rate:** `SANDBOX_MCP_CALLS_PER_MINUTE` (60), a token bucket with a burst of 20; the answer carries `retry_after_secs`. `0` turns script calls off (a `403`, nothing recorded).
+- **Rate:** `SANDBOX_MCP_CALLS_PER_MINUTE` (60), a token bucket with a burst of 20, taken by a call and by `GET /v1/tools` alike (a listing connects to every server); the answer carries `retry_after_secs`. `0` turns script calls off (a `403`, nothing recorded).
 - **In flight:** `SANDBOX_MCP_MAX_IN_FLIGHT` (4) at once; one more is refused at once rather than queued.
 - **Per command:** `SANDBOX_MCP_CALLS_PER_COMMAND` (1,000) calls, counted in `sandbox_mcp_calls`; calls traced to no command share a budget of the same size per pod, counted from an index on the pod's command-less calls. Waiting doesn't clear it: a new command starts a new budget. Two calls racing at the edge can both pass, so it can overshoot by up to the in-flight cap less one.
 

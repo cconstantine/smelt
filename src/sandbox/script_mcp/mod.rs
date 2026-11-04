@@ -331,19 +331,12 @@ fn turned_off() -> Answer {
 /// The per-command budget, then a slot and a token (`limits::take`). A
 /// call held back is a 429, with a time to retry after when waiting helps.
 async fn take_limits(pool: &PgPool, caller: Caller<'_>, limits: &Limits) -> Result<limits::Slot, Answer> {
-    let held_back = |held: limits::Limited| {
-        let mut body = json!({ "error": held.message });
-        if let Some(secs) = held.retry_after_secs {
-            body["retry_after_secs"] = Value::from(secs);
-        }
-        Answer::json(429, &body)
-    };
     let made = db::count_sandbox_mcp_calls_against_budget(pool, caller.conversation_id, caller.pod_id, caller.command_id)
         .await
         .map_err(|e| Answer::error(503, format!("couldn't count this command's MCP calls: {e}")))?;
     if made >= limits.per_command {
         let whose = if caller.command_id.is_some() { "this command" } else { "this sandbox's processes outside any command" };
-        return Err(held_back(limits::Limited {
+        return Err(held_back_answer(limits::Limited {
             message: format!(
                 "{whose} made {made} MCP calls, its limit ({}); a new terminal command starts a new budget",
                 limits::CALLS_PER_COMMAND_ENV
@@ -351,7 +344,17 @@ async fn take_limits(pool: &PgPool, caller: Caller<'_>, limits: &Limits) -> Resu
             retry_after_secs: None,
         }));
     }
-    limits::take(caller.conversation_id, limits).map_err(held_back)
+    limits::take(caller.conversation_id, limits).map_err(held_back_answer)
+}
+
+/// A 429 for a call or listing held back by a limit, with a time to retry
+/// after when waiting helps.
+fn held_back_answer(held: limits::Limited) -> Answer {
+    let mut body = json!({ "error": held.message });
+    if let Some(secs) = held.retry_after_secs {
+        body["retry_after_secs"] = Value::from(secs);
+    }
+    Answer::json(429, &body)
 }
 
 /// `GET /v1/tools`: what this conversation's scripts may call, as the
@@ -365,6 +368,12 @@ async fn list(pool: &PgPool, caller: Caller<'_>, server: Option<&str>, limits: &
     if !limits.enabled() {
         return turned_off();
     }
+    // A rate token, as a call takes (review round 1, L4): a listing
+    // connects to every server, so a loop of them costs too.
+    let _slot = match limits::take(caller.conversation_id, limits) {
+        Ok(slot) => slot,
+        Err(held) => return held_back_answer(held),
+    };
     let chain = match db::agent_rule_chain(pool, caller.conversation_id).await {
         Ok(stored) => crate::personas::rules::RuleChain::from_stored(stored),
         Err(e) => return Answer::error(503, format!("couldn't read this conversation's tool rules: {e}")),
