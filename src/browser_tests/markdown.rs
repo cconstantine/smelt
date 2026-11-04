@@ -301,3 +301,109 @@ async fn deep_code_at(t: &Scenario<'_>, depth: usize) -> Vec<String> {
     );
     problems
 }
+
+/// SME-384: `agent #N` / `conversation #N` references render as links
+/// to that conversation — in an assistant reply (the markdown path) and
+/// in a report header shown as a plain user bubble (the path smelt's
+/// own delivered words take) — and clicking one navigates the same tab.
+/// A reference in backticks stays code, a bare `#255` stays text, and a
+/// link to a deleted id lands on the doesn't-exist state.
+pub(super) async fn scenario_agent_reference_links(t: &Scenario<'_>) {
+    let a = t.conversation().await;
+    let b = t.conversation().await;
+    let c = t.conversation().await;
+    let (a_id, b_id, c_id) = (a.id, b.id, c.id);
+    // B and C get a message of their own so the scenario can tell the
+    // conversation it navigated to from A's transcript.
+    db::create_message(t.pool, b_id, "user", &[anthropic::ContentBlock::Text { text: "B-TRANSCRIPT-MARKER".into() }])
+        .await
+        .expect("seed B");
+    db::create_message(t.pool, c_id, "user", &[anthropic::ContentBlock::Text { text: "C-TRANSCRIPT-MARKER".into() }])
+        .await
+        .expect("seed C");
+    // A report header as `turn::notify`'s `agent_message_text` delivers
+    // it: an unmarked user-role message.
+    db::create_message(
+        t.pool,
+        a_id,
+        "user",
+        &[anthropic::ContentBlock::Text { text: format!("Report from agent #{b_id} (smelt:developer):\n\nAll done: 42.") }],
+    )
+    .await
+    .expect("seed the report header");
+    const DELETED: i64 = 987_654_321;
+    db::create_message(
+        t.pool,
+        a_id,
+        "assistant",
+        &[anthropic::ContentBlock::Text {
+            text: format!("See conversation #{c_id} for the details, and `agent #{b_id}` in code, and See #255, and agent #{DELETED} is gone."),
+        }],
+    )
+    .await
+    .expect("seed the reply");
+    let page = t.tab(t.url(&format!("conversation/{a_id}"))).await;
+    wait_for_live_client(&page, a_id).await;
+
+    // The reply's reference to C is a link through the router...
+    let reply_link = format!(".message-assistant .markdown a[href=\"/conversation/{c_id}\"]");
+    wait_for_element(&page, &reply_link, Duration::from_secs(10)).await;
+    // ...and so is the header's reference to B, which before SME-384 was
+    // one text node with no anchor anywhere in the bubble.
+    let header_link = format!(".message-user .message-text a[href=\"/conversation/{b_id}\"]");
+    wait_for_element(&page, &header_link, Duration::from_secs(10)).await;
+
+    let facts: serde_json::Value = page
+        .evaluate(
+            "(() => ({ userHref: document.querySelector('.message-user .message-text a')?.getAttribute('href') ?? null, \
+               userTarget: document.querySelector('.message-user .message-text a')?.getAttribute('target') ?? null, \
+               userAnchors: document.querySelectorAll('.message-user .message-text a').length, \
+               replyHrefs: Array.from(document.querySelectorAll('.message-assistant .markdown a')).map(x => x.getAttribute('href')), \
+               code: document.querySelector('.message-assistant .markdown code')?.innerText ?? null }))()",
+        )
+        .await
+        .expect("read the links")
+        .into_value()
+        .expect("facts");
+    assert_eq!(facts["userHref"], format!("/conversation/{b_id}"), "the header links to B: {facts}");
+    assert!(facts["userTarget"].is_null(), "a reference opens in the same tab: {facts}");
+    assert_eq!(facts["userAnchors"], 1, "{facts}");
+    assert_eq!(
+        facts["replyHrefs"],
+        serde_json::json!([format!("/conversation/{c_id}"), format!("/conversation/{DELETED}")]),
+        "only the two real references link — the backticked one stays code and #255 stays text: {facts}"
+    );
+    assert_eq!(facts["code"], format!("agent #{b_id}"), "the backtick control: {facts}");
+
+    // Clicking the header's link navigates this very tab to B.
+    click_when_present(&page, &header_link, Duration::from_secs(10)).await;
+    assert!(wait_for_text(&page, "B-TRANSCRIPT-MARKER", Duration::from_secs(10)).await, "the header link didn't open B");
+    let path: String = page.evaluate("location.pathname").await.expect("read the path").into_value().expect("a string");
+    assert_eq!(path, format!("/conversation/{b_id}"), "{facts}");
+
+    // Back to A; the reply's link navigates the same way.
+    page.evaluate("history.back()").await.expect("back to A");
+    assert!(wait_for_text(&page, "See conversation", Duration::from_secs(10)).await, "back didn't return to A");
+    click_when_present(&page, &reply_link, Duration::from_secs(10)).await;
+    assert!(wait_for_text(&page, "C-TRANSCRIPT-MARKER", Duration::from_secs(10)).await, "the reply link didn't open C");
+    let path: String = page.evaluate("location.pathname").await.expect("read the path").into_value().expect("a string");
+    assert_eq!(path, format!("/conversation/{c_id}"), "{facts}");
+
+    // Back to A; a reference to a deleted id lands on the doesn't-exist
+    // state without killing the tab.
+    page.evaluate("history.back()").await.expect("back to A");
+    assert!(wait_for_text(&page, "Report from agent", Duration::from_secs(10)).await, "back didn't return to A");
+    let dead_link = format!(".message-assistant .markdown a[href=\"/conversation/{DELETED}\"]");
+    click_when_present(&page, &dead_link, Duration::from_secs(10)).await;
+    assert!(
+        wait_for_text(&page, "doesn't exist", Duration::from_secs(10)).await,
+        "a deleted reference should land on the doesn't-exist state"
+    );
+    let alive: bool = page
+        .evaluate("document.body.innerText.length > 0")
+        .await
+        .expect("the tab is alive")
+        .into_value()
+        .expect("a bool");
+    assert!(alive, "the tab broke on the dead reference");
+}

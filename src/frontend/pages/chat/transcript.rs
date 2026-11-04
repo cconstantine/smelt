@@ -18,6 +18,30 @@ fn ReplyOutline(lit_reply: Signal<Option<i64>>) -> Element {
     }
 }
 
+/// Renders text with `agent #N` / `conversation #N` references as links
+/// to that conversation (SME-384). Smelt's own words — a
+/// `Report from agent #N:` header, a `Message from agent #N` delivery, a
+/// queued notice — take this plain path and never reach markdown, and the
+/// same pure `crate::agent_refs::find` underlies both renderers, so
+/// the server render and the client hydration show the same DOM. With no
+/// reference in the text it returns a single text node, so an untouched
+/// transcript keeps its exact DOM.
+fn text_with_refs(text: &str) -> Element {
+    match crate::agent_refs::find(text).as_slice() {
+        [crate::agent_refs::Segment::Text(words)] => rsx! { "{words}" },
+        segments => rsx! {
+            for segment in segments {
+                match segment {
+                    crate::agent_refs::Segment::Text(words) => rsx! { "{words}" },
+                    crate::agent_refs::Segment::Conversation { words, id } => rsx! {
+                        Link { to: Route::ConversationRoute { id: *id }, class: "agent-ref", "{words}" }
+                    },
+                }
+            }
+        },
+    }
+}
+
 /// user- and assistant-aligned bubbles, so a tool call/result reads as
 /// "the agent doing something" rather than "someone said something."
 pub(super) fn render_block_element(
@@ -42,7 +66,7 @@ pub(super) fn render_block_element(
             let notice = system_notice(text, commands).unwrap_or_default();
             rsx! {
                 div { key: "{key}", class: "system-notice",
-                    span { "{notice}" }
+                    span { {text_with_refs(&notice)} }
                     span { class: "timestamp", "{timestamp}" }
                 }
             }
@@ -86,7 +110,7 @@ pub(super) fn render_block_element(
         }
         ContentBlock::Text { text } => rsx! {
             div { key: "{key}", class: "message message-{role}",
-                div { class: "message-text", "{display_text(text)}" }
+                div { class: "message-text", {text_with_refs(&display_text(text))} }
                 span { class: "timestamp", "{timestamp}" }
             }
         },

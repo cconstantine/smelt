@@ -263,6 +263,7 @@ fn scenarios() -> Vec<Entry> {
         // lanes' turn ends would land in this scenario's counts, and it's
         // the only scenario that touches a browser-wide setting.
         entry("desktop_notifications", 240, Runs::Alone, |t| Box::pin(scenario_desktop_notifications(t))),
+        entry("agent_reference_links", 90, Runs::Beside, |t| Box::pin(scenario_agent_reference_links(t))),
     ]
 }
 
