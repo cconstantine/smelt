@@ -301,6 +301,11 @@ pub struct McpToolClassRow {
     /// user saw (SME-295 review 1). `None` when it isn't listed.
     #[serde(default)]
     pub fingerprint: Option<String>,
+    /// For a saved override whose tool the server doesn't list now: the
+    /// class a call under the name is judged by (SME-386 T3), which the
+    /// page shows. `None` on every other row.
+    #[serde(default)]
+    pub applied_class: Option<String>,
 }
 
 /// The edit page's Tool-classes section: one row per listed tool plus
@@ -319,7 +324,7 @@ pub struct McpToolClasses {
 /// list no longer has — the design keeps those, and the page offers them
 /// for clearing. Pure, so it's testable without a connection.
 #[cfg(feature = "server")]
-fn merge_tool_class_rows(
+pub(crate) fn merge_tool_class_rows(
     listed: Vec<crate::mcp::McpToolClassInfo>,
     saved: Vec<db::SavedToolClass>,
 ) -> Vec<McpToolClassRow> {
@@ -338,6 +343,7 @@ fn merge_tool_class_rows(
                     .and_then(|row| row.tool_fingerprint.as_deref())
                     .is_some_and(|fingerprint| fingerprint != tool.fingerprint),
                 fingerprint: Some(tool.fingerprint.clone()),
+                applied_class: None,
             }
         })
         .collect();
@@ -353,6 +359,8 @@ fn merge_tool_class_rows(
         listed: Some(false),
         tool_changed: false,
         fingerprint: None,
+        // The call judges it by the same rule (SME-386 T3).
+        applied_class: Some(crate::mcp::effective_override(row, None)),
     }));
     rows
 }
@@ -372,6 +380,7 @@ fn saved_only_rows(saved: Vec<db::SavedToolClass>) -> Vec<McpToolClassRow> {
             listed: None,
             tool_changed: false,
             fingerprint: None,
+            applied_class: None,
         })
         .collect()
 }
@@ -639,6 +648,7 @@ mod tests {
                     listed: Some(true),
                     tool_changed: false,
                     fingerprint: Some("fp-web_search_exa".to_string()),
+                    applied_class: None,
                 },
                 McpToolClassRow {
                     tool_name: "edit_thing".to_string(),
@@ -648,6 +658,7 @@ mod tests {
                     listed: Some(true),
                     tool_changed: false,
                     fingerprint: Some("fp-edit_thing".to_string()),
+                    applied_class: None,
                 },
                 McpToolClassRow {
                     tool_name: "old_tool".to_string(),
@@ -657,6 +668,7 @@ mod tests {
                     listed: Some(false),
                     tool_changed: false,
                     fingerprint: None,
+                    applied_class: Some("writing".to_string()),
                 },
             ]
         );
@@ -692,6 +704,7 @@ mod tests {
                 listed: Some(true),
                 tool_changed: false,
                     fingerprint: Some("fp-t".to_string()),
+                    applied_class: None,
             }]
         );
         let rows = merge_tool_class_rows(
@@ -708,6 +721,7 @@ mod tests {
                 listed: Some(false),
                 tool_changed: false,
                     fingerprint: None,
+                    applied_class: Some("read-only".to_string()),
             }]
         );
     }
@@ -761,6 +775,7 @@ mod tests {
                     listed: Some(true),
                     tool_changed: false,
                     fingerprint: Some("fp-web_search_exa".to_string()),
+                    applied_class: None,
                 },
                 McpToolClassRow {
                     tool_name: "old_tool".to_string(),
@@ -770,6 +785,7 @@ mod tests {
                     listed: None,
                     tool_changed: false,
                     fingerprint: None,
+                    applied_class: None,
                 },
             ],
             server_note: Some("Unreachable: refused".to_string()),

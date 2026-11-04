@@ -61,8 +61,17 @@ pub(super) fn tool_class_origin_note(row: &McpToolClassRow) -> String {
                  applies until you apply it to this tool"
             );
         }
+        // SME-386 T3: set for a tool now gone, a call under the name is
+        // judged by the class the GET says (`applied_class`), not the
+        // override's own, until the override is cleared and set again.
         return if row.listed == Some(false) {
-            format!("{class} \u{2014} your override (the server no longer lists this tool)")
+            match row.applied_class.as_deref().filter(|applied| *applied != class) {
+                Some(applied) => format!(
+                    "{applied} \u{2014} your override ({class}) was set for a tool the server no longer lists, \
+                     so a call under this name is judged {applied} until you clear it and set it again"
+                ),
+                None => format!("{class} \u{2014} your override (the server no longer lists this tool)"),
+            }
         } else {
             format!("{class} \u{2014} your override")
         };

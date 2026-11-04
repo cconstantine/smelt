@@ -360,3 +360,33 @@ fn test_canonical_json_ignores_key_order() {
     assert_eq!(super::tools::canonical_json(&a), super::tools::canonical_json(&b));
     assert_ne!(super::tools::canonical_json(&a), super::tools::canonical_json(&serde_json::json!({"type": "object"})));
 }
+
+/// The page's rows for `config`, as the Tool-classes GET builds them.
+async fn page_rows(pool: &sqlx::PgPool, config: &McpServerConfig) -> Vec<crate::api::mcp::McpToolClassRow> {
+    let listed = crate::mcp::tool_class_report(pool, config).await.ok().expect("the mock lists its tools");
+    let saved = crate::db::list_mcp_tool_classes(pool, config.id).await.expect("read the overrides");
+    crate::api::mcp::merge_tool_class_rows(listed, saved)
+}
+
+/// SME-386 T3: for a tool the server doesn't list, the page shows the
+/// class its call is judged by. One rule: an override set for a listed
+/// tool (it has a fingerprint) can only narrow once that tool is gone, so
+/// the call is destructive; one set while the tool wasn't listed (no
+/// fingerprint) pre-classifies the name, and decides.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_page_shows_an_unlisted_tools_class_as_its_call_is_judged(pool: sqlx::PgPool) {
+    let config = create_static_server(&pool, &test_config(0, "unused").url).await;
+    let _server = register_test_connection(config.id, false).await;
+    crate::db::set_mcp_tool_class(&pool, config.id, "gone_tool", ReadOnly, Some("a tool listed once")).await.expect("set for a listed tool");
+    crate::db::set_mcp_tool_class(&pool, config.id, "future_tool", Writing, None).await.expect("set while unlisted");
+
+    let gone = class_of_call_on(&pool, &config, "gone_tool").await;
+    let future = class_of_call_on(&pool, &config, "future_tool").await;
+    let rows = page_rows(&pool, &config).await;
+    REGISTRY.lock().await.remove(&config.id);
+    let applied = |name: &str| rows.iter().find(|row| row.tool_name == name).and_then(|row| row.applied_class.clone());
+    assert_eq!(gone, Some(Destructive), "set for a tool now gone, the call fails closed");
+    assert_eq!(applied("gone_tool").as_deref(), Some("destructive"), "and the page says so: {rows:?}");
+    assert_eq!(future, Some(Writing), "set while unlisted, it classes the call");
+    assert_eq!(applied("future_tool").as_deref(), Some("writing"), "and the page says so: {rows:?}");
+}

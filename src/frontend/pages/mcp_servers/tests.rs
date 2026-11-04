@@ -21,6 +21,7 @@ fn row(
         listed,
         tool_changed: false,
         fingerprint: None,
+        applied_class: None,
     }
 }
 
@@ -90,4 +91,19 @@ fn test_a_changed_tools_override_says_the_servers_class_applies() {
     let mut loose = row(Some("destructive"), Some(true), Some("read-only"), Some(true));
     loose.tool_changed = true;
     assert!(tool_class_origin_note(&loose).starts_with("destructive \u{2014}"), "a stale read-only never widens");
+}
+
+/// SME-386 T3: a saved override whose tool the server no longer lists
+/// says the class a call under the name is judged by, when that isn't the
+/// override's own (it was set for a tool now gone, so it can only narrow).
+#[test]
+fn test_a_gone_tools_override_says_the_class_its_call_is_judged_by() {
+    let mut gone = row(None, None, Some("read-only"), Some(false));
+    gone.applied_class = Some("destructive".to_string());
+    let note = tool_class_origin_note(&gone);
+    assert!(note.starts_with("destructive \u{2014} your override (read-only)"), "{note}");
+    assert!(note.contains("no longer lists"), "{note}");
+    let mut kept = row(None, None, Some("writing"), Some(false));
+    kept.applied_class = Some("writing".to_string());
+    assert_eq!(tool_class_origin_note(&kept), "writing \u{2014} your override (the server no longer lists this tool)");
 }
