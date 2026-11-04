@@ -227,7 +227,14 @@ pub(super) fn use_conversation_events(
                         };
                         match apply_event(state, event) {
                             EventEffect::None => {}
-                            EventEffect::ConversationsChanged => *conversations_changed.write() += 1,
+                            EventEffect::ConversationsChanged => {
+                                *conversations_changed.write() += 1;
+                                // A delete, which moves no turn or
+                                // question (SME-386 N3).
+                                if let Some(feed) = notifier {
+                                    feed.bump_revalidate();
+                                }
+                            }
                             EventEffect::PodsChanged => *pods_changed.write() += 1,
                             EventEffect::TurnsChanged => {
                                 *turns_changed.write() += 1;

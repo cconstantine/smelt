@@ -37,9 +37,12 @@ pub async fn get_attention(id: i64, generation: u64, attention: Attention) -> Se
 
 /// `get_attention`'s decision on `pool` — `None` when, between the event
 /// and this call, it stopped being true:
-/// - a turn is running again (`turn_running`);
-/// - the generation has moved on (`turn_generation`): the user wrote,
-///   answered, or another turn took one;
+/// - it isn't the conversation's standing publish any more
+///   (`published_generation`, SME-386 N1): the user wrote or answered
+///   since (a trust decision, for a Question), or a newer spell
+///   published. A spell that owed nothing — a wake on an idle notice,
+///   a finished command, an agent's report — leaves it standing, running
+///   or not: smelt talking to itself is nothing the user acted on;
 /// - for a question, nothing waits any more: answered, dismissed, or a row
 ///   asked of the child's parent, which no card can answer (Revision 6),
 ///   and no repo trust card waits either (SME-377) — unless the spell's
@@ -52,7 +55,7 @@ pub async fn get_attention(id: i64, generation: u64, attention: Attention) -> Se
 #[cfg(feature = "server")]
 pub(crate) async fn attention_details(pool: &sqlx::PgPool, id: i64, generation: u64, attention: Attention) -> ServerFnResult<Option<AttentionDetails>> {
     use crate::db;
-    if crate::turn::turn_running(id) || crate::turn::turn_generation(id) != generation {
+    if crate::turn::published_generation(id) != Some(generation) {
         return Ok(None);
     }
     // `pending_question` is the one question check: it answers nothing for

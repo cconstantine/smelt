@@ -241,3 +241,62 @@ async fn test_a_turn_refused_twice_publishes_failed(pool: PgPool) {
     let seen = needs_user_of(&recording, conversation.id);
     assert_eq!(seen.len(), 1, "one Failed for the spell: {seen:?}");
 }
+
+/// N5 (SME-386): with the provider down, every notice turn fails, and
+/// each used to publish a new Failed, so every idle notice re-notified.
+/// A Failed while the last publish is a Failed the user hasn't acted on
+/// is a repeat: suppressed, and the first one stands. A user turn in
+/// between makes the next Failed news again. (Red before the fix: the
+/// second notice's turn publishes a second Failed.)
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_repeat_failed_from_notice_turns_is_suppressed_until_the_user_writes(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    start_mock_upstream_failing_n_times(&pool, 100, None).await;
+    let recording = events::AppRecording::start();
+
+    deliver_notice(&pool, conversation.id, "first notice".to_string()).await;
+    let first = needs_user_of(&recording, conversation.id);
+    assert_eq!(first.len(), 1, "the first failure notifies, saw {first:?}");
+    assert_eq!(first[0].0, events::Attention::Failed);
+    deliver_notice(&pool, conversation.id, "second notice".to_string()).await;
+    let seen = published_after_done(&recording, conversation.id).await;
+    assert_eq!(seen, first, "the repeat is suppressed");
+    let standing = crate::api::notifications::attention_details(&pool, conversation.id, first[0].1, events::Attention::Failed)
+        .await
+        .expect("get_attention");
+    assert!(standing.is_some(), "the first failure's notification stands");
+
+    start_turn(pool.clone(), conversation.id, "try again".to_string()).await.expect("send");
+    wait_turn_done(conversation.id).await;
+    let seen = published_after_done(&recording, conversation.id).await;
+    assert_eq!(seen.len(), 2, "the user's own failed turn is news, saw {seen:?}");
+    assert_eq!(seen[1].0, events::Attention::Failed);
+    forget_conversation_lock(conversation.id);
+}
+
+/// N6 (SME-386, Decided by the PM): a child's Failed or CutOff reaches the
+/// user through its parent — the report — and the child itself notifies
+/// nothing. (Red before the fix: the child's failed notice turn publishes
+/// Failed, its cut-off one CutOff.)
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_childs_failed_or_cut_off_turn_notifies_nothing(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let parent = db::create_conversation(&pool).await.expect("parent");
+    let failing = active_child(&pool, parent.id).await;
+    let cut_off = active_child(&pool, parent.id).await;
+    let recording = events::AppRecording::start();
+
+    start_mock_upstream_failing_n_times(&pool, 100, None).await;
+    deliver_notice(&pool, failing, "a notice".to_string()).await;
+    let half = text_reply_body("half a reply").replace(r#""stop_reason":"end_turn""#, r#""stop_reason":"max_tokens""#);
+    start_mock_upstream(&pool, vec![half]).await;
+    deliver_notice(&pool, cut_off, "a notice".to_string()).await;
+
+    assert_eq!(published_after_done(&recording, failing).await, vec![], "the failed child notifies nothing");
+    assert_eq!(published_after_done(&recording, cut_off).await, vec![], "the cut-off child notifies nothing");
+    forget_conversation_lock(failing);
+    forget_conversation_lock(cut_off);
+}

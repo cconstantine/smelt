@@ -59,7 +59,8 @@ async fn test_get_attention_answers_some_for_a_fresh_question_with_title_and_hea
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     rename(&pool, conversation.id, "rename the flag").await;
     ask_two(&pool, conversation.id).await;
-    let details = attention_details(&pool, conversation.id, 0, Attention::Question).await.expect("query");
+    let generation = turn::publish_a_test_spell(conversation.id, Attention::Question);
+    let details = attention_details(&pool, conversation.id, generation, Attention::Question).await.expect("query");
     assert_eq!(
         details,
         Some(AttentionDetails {
@@ -69,6 +70,7 @@ async fn test_get_attention_answers_some_for_a_fresh_question_with_title_and_hea
             message: None,
         })
     );
+    turn::forget_conversation_lock(conversation.id);
 }
 
 /// The spell `conversation_id` runs now ends having called `notify_user`
@@ -121,35 +123,49 @@ async fn test_get_attention_answers_none_for_notified_without_a_published_notice
 }
 
 /// An event from an older generation is stale news, even while everything
-/// else about it still holds; the current generation answers `Some`.
+/// else about it still holds; the published one answers `Some` until the
+/// user writes (SME-386 N1: the user's send, not any newer turn).
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_get_attention_answers_none_for_a_stale_generation(pool: PgPool) {
     let _guard = ids_clear_and_locked(&pool).await;
     let conversation = db::create_conversation(&pool).await.expect("conversation");
-    let generation = new_turn_generation(conversation.id);
+    new_turn_generation(conversation.id);
+    let generation = turn::publish_a_test_spell(conversation.id, Attention::Failed);
     assert_eq!(
         attention_details(&pool, conversation.id, generation - 1, Attention::Failed).await.expect("query"),
         None,
-        "the user wrote since the event's turn: stale"
+        "an older event than the one published: stale"
     );
     assert!(
         attention_details(&pool, conversation.id, generation, Attention::Failed).await.expect("query").is_some(),
-        "the same event, current, still notifies"
+        "the published event still notifies"
     );
+    new_turn_generation(conversation.id);
+    assert_eq!(
+        attention_details(&pool, conversation.id, generation, Attention::Failed).await.expect("query"),
+        None,
+        "the user wrote since: stale"
+    );
+    turn::forget_conversation_lock(conversation.id);
 }
 
-/// While a turn runs, no event is worth a notification: the plan's
-/// between-publish-and-check race, driven by a real held turn.
+/// While the user's own turn runs, what was published before it is no
+/// one's notification: the plan's between-publish-and-check race, driven
+/// by a real held turn. (A wake's turn is N1's, in
+/// `turn::tests::attention::notify_user`.)
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_get_attention_answers_none_while_a_turn_runs(pool: PgPool) {
     let _guard = ids_clear_and_locked(&pool).await;
     let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let generation = turn::publish_a_test_spell(conversation.id, Attention::Failed);
     start_partial_then_hanging_mock_upstream(&pool, "streaming…").await;
     turn::start_turn(pool.clone(), conversation.id, "hi".to_string()).await.expect("send");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(turn_running(conversation.id), "the mock holds the turn mid-stream");
+    let details = attention_details(&pool, conversation.id, generation, Attention::Failed).await.expect("query");
+    assert_eq!(details, None, "the user's running turn is never 'needs the user'");
     let details = attention_details(&pool, conversation.id, turn_generation(conversation.id), Attention::Failed).await.expect("query");
-    assert_eq!(details, None, "a running turn is never 'needs the user'");
+    assert_eq!(details, None, "nor is the turn's own generation, unpublished");
     stop_turn_now(conversation.id);
     wait_turn_done(conversation.id).await;
 }
@@ -161,6 +177,7 @@ async fn test_get_attention_answers_none_for_an_answered_question(pool: PgPool) 
     let _guard = ids_clear_and_locked(&pool).await;
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     ask_two(&pool, conversation.id).await;
+    let generation = turn::publish_a_test_spell(conversation.id, Attention::Question);
     let answered = db::answer_pending_question(
         &pool,
         conversation.id,
@@ -170,8 +187,9 @@ async fn test_get_attention_answers_none_for_an_answered_question(pool: PgPool) 
     .await
     .expect("answer query");
     assert!(answered, "the row was waiting");
-    let details = attention_details(&pool, conversation.id, 0, Attention::Question).await.expect("query");
+    let details = attention_details(&pool, conversation.id, generation, Attention::Question).await.expect("query");
     assert_eq!(details, None, "an answered question drops out");
+    turn::forget_conversation_lock(conversation.id);
 }
 
 /// A question the user dismissed by writing a message instead: the
@@ -181,6 +199,7 @@ async fn test_get_attention_answers_none_for_a_question_the_user_dismissed(pool:
     let _guard = ids_clear_and_locked(&pool).await;
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     ask_two(&pool, conversation.id).await;
+    let generation = turn::publish_a_test_spell(conversation.id, Attention::Question);
     let saved = db::create_message_taking_question(
         &pool,
         conversation.id,
@@ -193,8 +212,9 @@ async fn test_get_attention_answers_none_for_a_question_the_user_dismissed(pool:
     .expect("message query")
     .expect("the message was saved");
     assert!(saved.1.is_some(), "the waiting question was taken with it");
-    let details = attention_details(&pool, conversation.id, 0, Attention::Question).await.expect("query");
+    let details = attention_details(&pool, conversation.id, generation, Attention::Question).await.expect("query");
     assert_eq!(details, None, "a dismissed question drops out too");
+    turn::forget_conversation_lock(conversation.id);
 }
 
 /// A row asked of the child's parent (`ask_parent`, SME-238) waits, but
@@ -213,8 +233,10 @@ async fn test_get_attention_answers_none_for_a_question_asked_of_the_parent(pool
     )
     .await
     .expect("ask the parent");
-    let details = attention_details(&pool, conversation.id, 0, Attention::Question).await.expect("query");
+    let generation = turn::publish_a_test_spell(conversation.id, Attention::Question);
+    let details = attention_details(&pool, conversation.id, generation, Attention::Question).await.expect("query");
     assert_eq!(details, None, "a parent-row question is no one's card");
+    turn::forget_conversation_lock(conversation.id);
 }
 
 /// A repo trust card on `conversation_id` (SME-279's shape: a checkout
@@ -236,8 +258,9 @@ async fn test_get_attention_counts_a_trust_card_as_a_question(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     rename(&pool, conversation.id, "ship it").await;
     let card = trust_card(&pool, conversation.id).await;
+    let generation = turn::publish_a_test_spell(conversation.id, Attention::Question);
     assert_eq!(
-        attention_details(&pool, conversation.id, 0, Attention::Question).await.expect("query"),
+        attention_details(&pool, conversation.id, generation, Attention::Question).await.expect("query"),
         Some(AttentionDetails {
             title: "ship it".into(),
             attention: Attention::Question,
@@ -246,7 +269,7 @@ async fn test_get_attention_counts_a_trust_card_as_a_question(pool: PgPool) {
         })
     );
     ask_two(&pool, conversation.id).await;
-    let both = attention_details(&pool, conversation.id, 0, Attention::Question).await.expect("query");
+    let both = attention_details(&pool, conversation.id, generation, Attention::Question).await.expect("query");
     assert_eq!(both.and_then(|d| d.question_header), Some("Which".into()), "the question's own header wins");
     let mut conn = pool.acquire().await.expect("connection");
     db::delete_instruction_request(&mut *conn, card).await.expect("decided");
@@ -260,10 +283,11 @@ async fn test_get_attention_counts_a_trust_card_as_a_question(pool: PgPool) {
     .expect("answer query");
     assert!(answered, "the question was waiting");
     assert_eq!(
-        attention_details(&pool, conversation.id, 0, Attention::Question).await.expect("query"),
+        attention_details(&pool, conversation.id, generation, Attention::Question).await.expect("query"),
         None,
         "nothing waits any more"
     );
+    turn::forget_conversation_lock(conversation.id);
 }
 
 /// Review round 1, M1: a question resolved earlier in the same busy spell
@@ -313,9 +337,11 @@ async fn test_a_question_resolved_mid_spell_falls_back_to_the_notify_user_messag
 async fn test_get_attention_answers_none_for_a_deleted_conversation(pool: PgPool) {
     let _guard = ids_clear_and_locked(&pool).await;
     let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let generation = turn::publish_a_test_spell(conversation.id, Attention::Failed);
     db::delete_conversation(&pool, conversation.id).await.expect("delete");
-    let details = attention_details(&pool, conversation.id, 0, Attention::Failed).await.expect("query");
+    let details = attention_details(&pool, conversation.id, generation, Attention::Failed).await.expect("query");
     assert_eq!(details, None, "a conversation that isn't there has no title");
+    turn::forget_conversation_lock(conversation.id);
 }
 
 /// The delete-racing-a-turn case: the delete happens while the mock
@@ -334,4 +360,37 @@ async fn test_get_attention_answers_none_for_a_delete_racing_a_turn(pool: PgPool
     wait_turn_done(conversation.id).await;
     let details = attention_details(&pool, conversation.id, turn_generation(conversation.id), Attention::Failed).await.expect("query");
     assert_eq!(details, None, "the deleted conversation's end notifies nothing");
+}
+
+/// SME-386 N1, kept from before it: a trust decision after the spell
+/// published its Question answers that Question, as the decision's notice
+/// turn used to by taking a newer generation (a wake no longer moves
+/// anything), so the M1 fallback doesn't hold the card's notification
+/// open after the user decided it. Other kinds stand.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_trust_decision_after_the_publish_answers_its_question(pool: PgPool) {
+    let _guard = ids_clear_and_locked(&pool).await;
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let card = trust_card(&pool, conversation.id).await;
+    let turn = crate::turn::count_a_test_turn(conversation.id);
+    crate::turn::note_trust_card(conversation.id);
+    crate::turn::note_notified(conversation.id, "x".to_string());
+    drop(turn);
+    let generation = turn_generation(conversation.id);
+    let mut conn = pool.acquire().await.expect("connection");
+    db::delete_instruction_request(&mut *conn, card).await.expect("the user decided");
+    turn::note_trust_decided(conversation.id);
+    assert_eq!(
+        attention_details(&pool, conversation.id, generation, Attention::Question).await.expect("query"),
+        None,
+        "the user decided the card the Question was for"
+    );
+
+    let notified = notified_spell(conversation.id, "done");
+    turn::note_trust_decided(conversation.id);
+    assert!(
+        attention_details(&pool, conversation.id, notified, Attention::Notified).await.expect("query").is_some(),
+        "a decision answers no Notified"
+    );
+    turn::forget_conversation_lock(conversation.id);
 }
