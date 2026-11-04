@@ -116,6 +116,15 @@ pub(super) async fn ask(
     Ok(())
 }
 
+/// Notes that a turn of `conversation_id` filed a repo trust card
+/// (SME-377): the card waits on the user like a question, so the busy
+/// spell owes a Question. `git::load_instructions` asking and
+/// `start_agent`'s refusal on an undecided repo call it; a child's own
+/// start-time card, which fails the start and is deleted, doesn't.
+pub(crate) fn note_trust_card(conversation_id: i64) {
+    note_attention(conversation_id, crate::events::Attention::Question);
+}
+
 /// Tells every tab on the conversation which question it waits on, and
 /// every tab's sidebar that the set of waiting conversations changed.
 fn publish_question(conversation_id: i64, question: Option<PendingQuestion>) {

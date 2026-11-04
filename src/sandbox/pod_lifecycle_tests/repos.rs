@@ -166,11 +166,24 @@ async fn test_clone_repo_checks_out_loads_instructions_and_retries_safely(pool: 
         assert_eq!(repo.agents_files, vec!["AGENTS.md".to_string()]);
         assert!(crate::git::project_instructions(&pool, id).await.expect("loaded").is_empty());
         // The model asks to load it: a remote the user hasn't decided
-        // about, so they're asked, with exactly that file.
+        // about, so they're asked, with exactly that file — and the turn
+        // that asked ends owing the user a Question (T11c, SME-377).
+        let recording = crate::events::AppRecording::start();
+        let turn = crate::turn::count_a_test_turn(id);
         let asked = crate::git::load_instructions(&pool, id, "/workspace/origin/AGENTS.md")
             .await
             .expect("load_instructions");
+        drop(turn);
         assert!(asked.contains("being asked"), "{asked}");
+        let owed: Vec<_> = recording
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                crate::events::AppEvent::NeedsUser { conversation_id, attention, .. } if conversation_id == id => Some(attention),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(owed, vec![crate::events::Attention::Question], "the AGENTS.md card notifies as a question");
         let repos = crate::git::list_repos(&pool, id).await.expect("list repos");
         assert_eq!(repos[0].trust_requests.len(), 1);
         assert_eq!(repos[0].trust_requests[0].content, "Run make test.\n");

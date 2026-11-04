@@ -217,6 +217,55 @@ async fn test_get_attention_answers_none_for_a_question_asked_of_the_parent(pool
     assert_eq!(details, None, "a parent-row question is no one's card");
 }
 
+/// A repo trust card on `conversation_id` (SME-279's shape: a checkout
+/// row and its card), as `start_agent`'s refusal files one. Returns the
+/// card's id.
+async fn trust_card(pool: &PgPool, conversation_id: i64) -> i64 {
+    let repo = db::create_conversation_repo(pool, conversation_id, "https://example.com/team/app.git", "example.com/team/app", None, "app")
+        .await
+        .expect("a checkout row");
+    db::request_repo_trust_card(pool, conversation_id, repo.id).await.expect("a card").id
+}
+
+/// T10's card half (SME-377): a trust card alone is a question the user
+/// owes, headed `Trust a repo?`; once it's decided (the card gone),
+/// `None`; and a real question beside a card keeps the question's header.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_get_attention_counts_a_trust_card_as_a_question(pool: PgPool) {
+    let _guard = ids_clear_and_locked(&pool).await;
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    rename(&pool, conversation.id, "ship it").await;
+    let card = trust_card(&pool, conversation.id).await;
+    assert_eq!(
+        attention_details(&pool, conversation.id, 0, Attention::Question).await.expect("query"),
+        Some(AttentionDetails {
+            title: "ship it".into(),
+            attention: Attention::Question,
+            question_header: Some("Trust a repo?".into()),
+            message: None,
+        })
+    );
+    ask_two(&pool, conversation.id).await;
+    let both = attention_details(&pool, conversation.id, 0, Attention::Question).await.expect("query");
+    assert_eq!(both.and_then(|d| d.question_header), Some("Which".into()), "the question's own header wins");
+    let mut conn = pool.acquire().await.expect("connection");
+    db::delete_instruction_request(&mut *conn, card).await.expect("decided");
+    let answered = db::answer_pending_question(
+        &pool,
+        conversation.id,
+        "toolu_q",
+        &[crate::questions::QuestionAnswer::default(), crate::questions::QuestionAnswer::default()],
+    )
+    .await
+    .expect("answer query");
+    assert!(answered, "the question was waiting");
+    assert_eq!(
+        attention_details(&pool, conversation.id, 0, Attention::Question).await.expect("query"),
+        None,
+        "nothing waits any more"
+    );
+}
+
 /// A deleted conversation has no title, so nothing shows.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_get_attention_answers_none_for_a_deleted_conversation(pool: PgPool) {

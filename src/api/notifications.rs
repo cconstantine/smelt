@@ -22,6 +22,10 @@ pub struct AttentionDetails {
     pub message: Option<String>,
 }
 
+/// What a notification for a repo trust card alone says after the title.
+#[cfg(feature = "server")]
+const TRUST_CARD_HEADER: &str = "Trust a repo?";
+
 /// The attention event `attention` (of the turn whose generation is
 /// `generation`) announced is still worth a notification. Query arguments
 /// as `api/providers.rs`'s `?ask_each`; the leader passes the event's kind
@@ -37,7 +41,8 @@ pub async fn get_attention(id: i64, generation: u64, attention: Attention) -> Se
 /// - the generation has moved on (`turn_generation`): the user wrote,
 ///   answered, or another turn took one;
 /// - for a question, nothing waits any more: answered, dismissed, or a row
-///   asked of the child's parent, which no card can answer (Revision 6);
+///   asked of the child's parent, which no card can answer (Revision 6),
+///   and no repo trust card waits either (SME-377);
 /// - for a `Notified` (SME-377), the runtime no longer holds the model's
 ///   message for exactly that generation: a restart, or a newer notice;
 /// - the conversation is gone, so it has no title.
@@ -48,13 +53,16 @@ pub(crate) async fn attention_details(pool: &sqlx::PgPool, id: i64, generation: 
         return Ok(None);
     }
     // `pending_question` is the one question check: it answers nothing for
-    // a row already answered or asked of the parent.
-    let question = if attention == Attention::Question {
-        let question = crate::turn::pending_question(pool, id).await?;
-        if question.is_none() {
-            return Ok(None);
+    // a row already answered or asked of the parent. A trust card waits on
+    // the user too (SME-377), headed by a fixed line: it holds no repo data.
+    let question_header = if attention == Attention::Question {
+        match crate::turn::pending_question(pool, id).await? {
+            Some(question) => question.questions.into_iter().next().map(|question| question.header),
+            None if !db::list_instruction_requests(pool, id).await.map_err(ServerFnError::new)?.is_empty() => {
+                Some(TRUST_CARD_HEADER.to_string())
+            }
+            None => return Ok(None),
         }
-        question
     } else {
         None
     };
@@ -71,7 +79,7 @@ pub(crate) async fn attention_details(pool: &sqlx::PgPool, id: i64, generation: 
     Ok(title.map(|title| AttentionDetails {
         title,
         attention,
-        question_header: question.and_then(|q| q.questions.into_iter().next().map(|question| question.header)),
+        question_header,
         message,
     }))
 }

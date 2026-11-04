@@ -210,8 +210,10 @@ async fn create_and_start(pool: PgPool, new: OwnedNewChild) -> Result<db::Create
         db::CreateChild::Created { child, repo } => (*child, repo.clone()),
         db::CreateChild::Refused { asked, .. } => {
             if *asked {
-                // The card must reach open tabs, as load_instructions' does.
+                // The card must reach open tabs, as load_instructions' does,
+                // and the user's desktop, as a question (SME-377).
                 crate::git::publish_repos(&pool, new.caller).await;
+                crate::turn::note_trust_card(new.caller);
             }
             return Ok(created);
         }
