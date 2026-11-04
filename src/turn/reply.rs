@@ -325,7 +325,10 @@ impl TextCallStreak {
     /// results name the tools like it. So it counts toward the bound that
     /// calls written as text count toward, and the 4th in a row of either
     /// kind ends the turn, its results already saved for the model to read
-    /// next turn. Any other reply made a real call, which resets the count.
+    /// next turn. Any other reply made a real call, which resets the count
+    /// and the nudge. A reply of unknown calls resets neither: it isn't a
+    /// real call, and letting it clear the nudge let the two bounds reset
+    /// each other turn after turn (SME-386 T1).
     pub(super) fn after_calls(&mut self, unknown: Option<&str>) -> Result<(), String> {
         match unknown {
             Some(name) if self.corrections == crate::text_calls::MAX_TEXT_CALL_CORRECTIONS => {
@@ -337,6 +340,7 @@ impl TextCallStreak {
             }
             None => {
                 self.corrections = 0;
+                self.nudged = false;
                 Ok(())
             }
         }
@@ -387,9 +391,9 @@ pub(super) async fn after_reply(
         if turn.stop_reason != "tool_use" {
             return Ok(NextStep::End);
         }
-        // The correction count is settled once the calls have run, by
-        // what they did (`TextCallStreak::after_calls`, SME-307).
-        streak.nudged = false;
+        // The correction count and the nudge are settled once the calls
+        // have run, by what they did (`TextCallStreak::after_calls`,
+        // SME-307): a call by a name no tool has is no real call.
         // Markup for a call the reply also made is a provider leaving the
         // parsed call in the text too: it ran, and a correction would have
         // the model make it again (review 1). Matched by name; markup with
