@@ -620,3 +620,4 @@ mod classes;
 mod connection;
 mod hanging;
 mod oauth;
+mod redaction;
