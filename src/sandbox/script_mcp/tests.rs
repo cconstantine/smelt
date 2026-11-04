@@ -531,3 +531,37 @@ fn test_an_answer_too_large_once_serialized_becomes_a_502() {
     let small = response_message(8, Answer { status: 200, body: "{}".into() });
     assert_eq!(small, r#"{"action":"mcp_response","call_id":8,"status":200,"body":"{}"}"#);
 }
+
+/// Review round 2, Low: a call that the caller's checks or the deployment
+/// refuse never reaches the server, not even to connect or refresh a
+/// grant: the checks come before the tool is looked up.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_refused_caller_never_connects_to_the_server(pool: PgPool) {
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let url = format!("http://{}/mcp", listener.local_addr().expect("addr"));
+    let counter = requests.clone();
+    let app = axum::Router::new().fallback(move || {
+        let counter = counter.clone();
+        async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    // An id of its own: the MCP registry is shared by every test.
+    sqlx::query(&format!("ALTER TABLE mcp_servers ALTER COLUMN id RESTART WITH {}", crate::id_alloc::FIXTURE_IDS.next_base()))
+        .execute(&pool)
+        .await
+        .expect("move the server id");
+    let config = db::create_mcp_server_config(&pool, "counted-r2", &url, &std::collections::HashMap::new(), "static_headers", None, None)
+        .await
+        .expect("a server row");
+    let (conversation, pod) = conversation_with_pod(&pool, None).await;
+    let off = call_under(&pool, caller(conversation, pod), "counted-r2/echo", &limits(0, 0, 4, 1_000)).await;
+    sqlx::query("UPDATE sandbox_pods SET terminated_at = now() WHERE id = $1").bind(pod).execute(&pool).await.expect("stop");
+    let stopped = call_under(&pool, caller(conversation, pod), "counted-r2/echo", &limits(60, 20, 4, 1_000)).await;
+    crate::mcp::evict(config.id).await;
+    assert_eq!((off.status, stopped.status), (403, 503), "{off:?} / {stopped:?}");
+    assert_eq!(requests.load(Ordering::SeqCst), 0, "the server was contacted");
+}

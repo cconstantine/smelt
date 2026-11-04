@@ -204,11 +204,10 @@ async fn call(pool: &PgPool, caller: Caller<'_>, span: &tracing::Span, body: &st
         Ok(call) => call,
         Err(answer) => return answer,
     };
-    let (config, tool) = match resolve(pool, &name).await {
-        Ok(resolved) => resolved,
-        Err(answer) => return answer,
-    };
-    span.record("smelt.mcp.server", config.name.as_str());
+    // The caller, the deployment and the limits first (review round 2):
+    // looking the tool up connects to its server, and can refresh an OAuth
+    // grant, which a dead pod, a turned-off deployment or a held-back loop
+    // must never cause.
     if let Err(answer) = check_caller(pool, caller).await {
         return answer;
     }
@@ -228,6 +227,11 @@ async fn call(pool: &PgPool, caller: Caller<'_>, span: &tracing::Span, body: &st
             return held_back;
         }
     };
+    let (config, tool) = match resolve(pool, &name).await {
+        Ok(resolved) => resolved,
+        Err(answer) => return answer,
+    };
+    span.record("smelt.mcp.server", config.name.as_str());
     let row = match db::insert_sandbox_mcp_call(pool, caller.conversation_id, caller.pod_id, caller.command_id, &config.name, &tool, None, "running").await {
         Ok(row) => row,
         // Failing closed: a call that can't be recorded can't be counted
