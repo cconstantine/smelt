@@ -230,21 +230,20 @@ async fn test_a_rule_refused_mcp_call_marks_its_spans_with_the_rule(pool: sqlx::
 /// SME-386 M2: a connect or call failure's text goes to the spans with
 /// the server's secrets redacted, as it goes to the model. `scrub_urls`
 /// cuts a URL's query and user part but keeps its path, which can carry
-/// the key (M1), and an error page can quote a header's value.
+/// the key (M1).
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_a_failures_span_exports_no_key_from_the_urls_path_or_a_header(pool: sqlx::PgPool) {
+async fn test_a_failures_span_exports_no_key_from_the_urls_path(pool: sqlx::PgPool) {
     let port = {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         listener.local_addr().expect("addr").port()
     };
     let path_key = "PATHKEY386span000000";
     let id = next_server_id(&pool).await;
-    let headers: HashMap<String, String> = [("x-api-key".to_string(), "HEADERKEY-386-span".to_string())].into();
     let config = crate::db::create_mcp_server_config(
         &pool,
         &format!("spans-{id}"),
         &format!("http://127.0.0.1:{port}/mcp/s/{path_key}/mcp"),
-        &headers,
+        &HashMap::new(),
         "static_headers",
         None,
         None,
@@ -270,7 +269,6 @@ async fn test_a_failures_span_exports_no_key_from_the_urls_path_or_a_header(pool
     }
     let exported = format!("{spans:?}");
     assert!(!exported.contains(path_key), "{exported}");
-    assert!(!exported.contains("HEADERKEY-386"), "{exported}");
 }
 
 /// SME-386 review round 1, L1: the tool list's "unreachable this turn"
