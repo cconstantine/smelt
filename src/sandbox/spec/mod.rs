@@ -33,7 +33,7 @@ pub(crate) use images::default_sandbox_image;
 #[cfg(test)]
 pub(crate) use images::OWN_SANDBOX_IMAGE;
 pub(crate) use mounts::model_volume_mount_path;
-pub(in crate::sandbox) use mounts::{normalize_mount_path, reserved_mount_path};
+pub(in crate::sandbox) use mounts::{normalize_mount_path, reserved_global_mount_path};
 // Test-only so the reserved-dir pin can iterate the list; a production
 // build never names it and would warn.
 #[cfg(test)]

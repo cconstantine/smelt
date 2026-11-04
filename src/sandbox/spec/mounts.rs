@@ -234,6 +234,17 @@ pub(crate) const RESERVED_MODEL_MOUNT_DIRS: &[&str] = &[
     "/var/lib/docker",
 ];
 
+/// The directories a global volume can't be mounted at or under: `/run`,
+/// which holds the agent's MCP socket (`/run/smelt`) and Docker's socket
+/// directory (SME-359 review round 1, L1). A global volume is the user's
+/// choice, so it isn't held to the model's whole list.
+pub(in crate::sandbox) const RESERVED_GLOBAL_MOUNT_DIRS: &[&str] = &["/run"];
+
+/// The reserved runtime directory a global volume's `path` is at or under.
+pub(in crate::sandbox) fn reserved_global_mount_path(path: &str) -> Option<&'static str> {
+    RESERVED_GLOBAL_MOUNT_DIRS.iter().find(|dir| path == **dir || path.starts_with(&format!("{dir}/"))).copied()
+}
+
 /// The reserved directory `path` is at or under, the narrowest when several
 /// match: `/etc/smelt/keys` is refused as `/etc/smelt`, not `/etc`, because
 /// that's the reason it's refused.

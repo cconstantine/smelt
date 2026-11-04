@@ -69,10 +69,11 @@ pub async fn create_volume(
 ) -> Result<i64, SandboxError> {
     let resolved_path = resolve_mount_path(mount_path);
     validate_mount_path(&resolved_path).map_err(SandboxError::InvalidMountPath)?;
-    // The directories a model volume can't sit over (SME-359 review round
-    // 1, L1): a global volume over smelt's own places in the pod breaks
-    // every pod just the same. Checked at creation; a saved one stands.
-    if let Some(dir) = reserved_mount_path(&normalize_mount_path(&resolved_path)) {
+    // `/run`, around the agent's MCP socket (SME-359 review round 1, L1):
+    // a global volume there would hide the socket in every pod. Only that:
+    // a global volume is the user's choice, so `/workspace/…` is fine.
+    // Checked at creation; a saved one stands.
+    if let Some(dir) = reserved_global_mount_path(&normalize_mount_path(&resolved_path)) {
         return Err(SandboxError::InvalidMountPath(format!(
             "{resolved_path:?} is at or under {dir:?}, which a volume can't be mounted over"
         )));
