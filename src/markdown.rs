@@ -182,8 +182,9 @@ fn split_links(text: &str, finder: &Finders, out: &mut Vec<Inline>) {
             }
             Some(LinkKind::Email) if let Some(url) = mailto(found) => push_link(out, url, found),
             // A URL with another scheme, or one that wouldn't go where it
-            // says, stays text, all of it (but its conversation references
-            // still link, `push_text`).
+            // says, stays text, all of it. It carries no conversation
+            // reference either: one needs an ASCII space before its `#`,
+            // and a linkify span never holds one.
             Some(_) => push_text(out, found),
             None => {
                 for gap in finder.www.spans(found) {
