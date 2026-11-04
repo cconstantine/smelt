@@ -80,6 +80,24 @@ pub(super) async fn scenario_notifier_leadership(t: &Scenario<'_>) {
     );
     set_focus(&a, true, true).await;
 
+    // N4: a leader on a settings page has no conversation stream, so once
+    // demoted nothing would revalidate what it showed: it closes them.
+    let held = t.conversation().await;
+    let held_tag = format!("smelt-conversation-{}", held.id);
+    set_focus(&a, false, false).await;
+    crate::turn::publish_a_test_spell(held.id, crate::events::Attention::Failed);
+    assert!(wait_tag_count(&a, &held_tag, 1, Duration::from_secs(10)).await, "the leader showed the failure");
+    set_focus(&b, true, true).await;
+    assert!(wait_until(|| leads(&b), Duration::from_secs(5)).await, "focus moved the leader to B");
+    assert!(
+        wait_last_closed(&a, &held_tag, "smelt: the turn failed", Duration::from_secs(5)).await,
+        "the demoted leader closes what it can no longer revalidate"
+    );
+    crate::turn::forget_conversation_lock(held.id);
+    set_focus(&b, false, false).await;
+    set_focus(&a, true, true).await;
+    assert!(wait_until(|| leads(&a), Duration::from_secs(5)).await, "A leads again, to turn the setting off");
+
     // Leave the browser's setting off, as the next scenario expects.
     a.evaluate("localStorage.removeItem('smelt.notifications')").await.expect("turn the setting off");
 }

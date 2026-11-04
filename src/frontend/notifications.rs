@@ -580,10 +580,19 @@ async fn notifier(
             }
             "notLeader" => {
                 leader = false;
-                // A demoted leader keeps the notifications it showed;
-                // their revalidation now rides this tab's feed.
                 if let Some(task) = leader_task.take() {
                     task.cancel();
+                }
+                // A demoted leader on a conversation keeps the
+                // notifications it showed: their revalidation now rides
+                // this tab's feed. Anywhere else nothing would revalidate
+                // them, so they close, and the count with them (SME-386
+                // N4): the user is in another smelt tab, which leads.
+                if shown.peek().is_none() {
+                    for id in std::mem::take(&mut open).into_keys() {
+                        send(serde_json::json!({ "cmd": "close", "id": id }));
+                    }
+                    needers.clear();
                 }
             }
             "click" => {
