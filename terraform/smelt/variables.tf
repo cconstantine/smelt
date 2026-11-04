@@ -207,3 +207,9 @@ variable "extra_env" {
   type        = map(string)
   default     = {}
 }
+
+variable "node_selector" {
+  description = "Node labels the server and database pods must match. Empty by default: images published from SME-360 (#248) on, and postgres:17-alpine, are multi-arch (amd64 and arm64). Set one to pin a single-arch image, such as a tag from before #248, on a mixed cluster. It reaches only the server and database pods, not sandbox pods, for example { \"kubernetes.io/arch\" = \"amd64\" }."
+  type        = map(string)
+  default     = {}
+}
