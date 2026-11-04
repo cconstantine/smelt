@@ -23,6 +23,48 @@ pub async fn save(pool: &PgPool, id: Option<i64>, config: &LanguageServerConfig)
     }
 }
 
+/// The config and version server `name` starts with, when its saved
+/// install is a GitHub release's from before SME-360, which downloads the
+/// x86-64 asset on every node: looked up in the catalog (mason's registry
+/// at `registry`, Helix's file at `helix`) under its name, and when the
+/// saved command is that package's old suggestion, unedited, the row takes
+/// the per-arch install today's suggestion has, so an arm64 node installs
+/// an arm64 binary (SME-386 A3). `None` leaves the start as saved: another
+/// install, a lookup that fails, an edited command, or an edit saved since.
+pub async fn rederive_github_install(
+    pool: &PgPool,
+    name: &str,
+    registry: &str,
+    helix: &str,
+) -> Option<(LanguageServerConfig, String)> {
+    let server = match db::list_language_servers(pool).await {
+        Ok(servers) => servers.into_iter().find(|s| s.config.name == name)?,
+        Err(e) => {
+            tracing::warn!(server = %name, error = %e, "couldn't read a language server to re-derive its install");
+            return None;
+        }
+    };
+    let was = &server.config.install_command;
+    if !crate::lsp::catalog::is_single_arch_github_install(was) {
+        return None;
+    }
+    let suggested = match crate::lsp::catalog::lookup(name, registry, helix).await {
+        Ok(suggestion) => suggestion.config.install_command,
+        Err(e) => {
+            tracing::warn!(server = %name, error = %e, "couldn't look a language server up to re-derive its install");
+            return None;
+        }
+    };
+    let install = crate::lsp::catalog::rederived_install(was, &suggested)?;
+    match db::replace_language_server_install(pool, server.id, was, &install).await {
+        Ok(updated) => updated.map(|s| (s.config, s.updated_at.to_string())),
+        Err(e) => {
+            tracing::warn!(server = %name, error = %e, "couldn't save a language server's re-derived install");
+            None
+        }
+    }
+}
+
 /// The servers whose running pods a change to a config stops: all of a
 /// deleted or disabled server's, and a renamed server's under its old name
 /// (SME-35's state model). Other edits reach a running server when it's
@@ -62,6 +104,61 @@ pub async fn stop_servers(pool: &sqlx::PgPool, names: Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const HELIX: &str = include_str!("fixtures/helix-languages-excerpt.toml");
+    /// What the catalog suggested for rust-analyzer before SME-360: the
+    /// x86-64 asset on every node.
+    const OLD_INSTALL: &str = "mkdir -p /tmp/home/bin && curl -fsSL \
+        https://github.com/rust-lang/rust-analyzer/releases/download/2026-09-21/rust-analyzer-x86_64-unknown-linux-gnu.gz \
+        | gunzip > /tmp/home/bin/rust-analyzer && chmod +x /tmp/home/bin/rust-analyzer";
+
+    /// A stand-in for mason's registry, with rust-analyzer, and Helix's file.
+    async fn catalog() -> String {
+        let router = axum::Router::new()
+            .route(
+                "/packages/rust-analyzer/package.yaml",
+                axum::routing::get(|| async { include_str!("fixtures/mason-rust-analyzer.yaml") }),
+            )
+            .route("/languages.toml", axum::routing::get(|| async { HELIX }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move { axum::serve(listener, router).await.expect("serve") });
+        format!("http://{addr}")
+    }
+
+    fn rust_analyzer(install: &str) -> LanguageServerConfig {
+        let yaml = include_str!("fixtures/mason-rust-analyzer.yaml");
+        let config = crate::lsp::catalog::suggest(yaml, HELIX).expect("a suggestion").config;
+        LanguageServerConfig { install_command: install.to_string(), ..config }
+    }
+
+    /// SME-386 A3: a rust-analyzer row saved before SME-360 still installed
+    /// the x86-64 release on an arm64 node. Its start re-derives it, and the
+    /// row keeps the per-arch install; an edited command is left as saved.
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+    async fn test_a_github_install_saved_before_multiarch_is_rederived(pool: sqlx::PgPool) {
+        let base = catalog().await;
+        let helix = format!("{base}/languages.toml");
+        let saved = save(&pool, None, &rust_analyzer(OLD_INSTALL)).await.expect("saved");
+        assert!(crate::lsp::catalog::is_single_arch_github_install(&saved.config.install_command));
+        let (config, version) = rederive_github_install(&pool, "rust-analyzer", &base, &helix)
+            .await
+            .expect("the old suggestion is re-derived");
+        assert!(config.install_command.starts_with("case \"$(uname -m)\" in x86_64) "), "{}", config.install_command);
+        assert!(config.install_command.contains("rust-analyzer-aarch64-unknown-linux-gnu.gz"), "{}", config.install_command);
+        let row = db::get_language_server(&pool, saved.id).await.expect("read").expect("the row");
+        assert_eq!(row.config, config, "the row keeps it");
+        assert_eq!(row.updated_at.to_string(), version, "the version the start labels its pod with");
+        assert_ne!(version, saved.updated_at.to_string());
+        assert_eq!(rederive_github_install(&pool, "rust-analyzer", &base, &helix).await, None, "once is enough");
+
+        // The user's own edit of a single-arch command stays theirs.
+        let edited = format!("{OLD_INSTALL} && echo mine");
+        save(&pool, Some(saved.id), &rust_analyzer(&edited)).await.expect("edited");
+        assert_eq!(rederive_github_install(&pool, "rust-analyzer", &base, &helix).await, None);
+        let row = db::get_language_server(&pool, saved.id).await.expect("read").expect("the row");
+        assert_eq!(row.config.install_command, edited);
+    }
 
     #[test]
     fn test_deleting_disabling_or_renaming_stops_a_servers_pods() {

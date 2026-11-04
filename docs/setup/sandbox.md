@@ -57,6 +57,7 @@ SME-35. The user configures language servers on the Language servers page (`/lan
 - **Images.** Server pods pull public images (`rust:1`, `node:22-slim`, `python:3-slim`, `golang:1`, `debian:trixie-slim`), so the cluster needs to reach Docker Hub, and an install command needs whatever network it downloads from.
 - **Memory.** A server that runs past its memory limit takes only its own pod down; the model is told once, and the user can raise the limit on the page.
 - **Changes.** Deleting, disabling or renaming a server stops its pods everywhere. Other changes apply when the model starts it again (it's told the settings changed).
+- **Saved before SME-360.** A GitHub-release install looked up before SME-360 downloads the x86-64 release on every node. When the model starts such a server, smelt looks its name up again, and if the saved command is that old suggestion, unedited, the row takes today's install, which picks the release by the node's architecture (SME-386 A3). An edited command, or one whose lookup fails, runs as saved.
 
 ## Pod metrics
 

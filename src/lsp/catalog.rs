@@ -345,6 +345,25 @@ fn install(purl: &Purl, source: &Source, bin: &str, notes: &mut Vec<String>) -> 
     })
 }
 
+/// Whether `install` is a GitHub-release install from before SME-360: one
+/// download, of the x86-64 asset, whatever the node's architecture.
+/// Today's (`github_install`) picks the asset by `uname -m`.
+pub fn is_single_arch_github_install(install: &str) -> bool {
+    install.contains("https://github.com/") && install.contains("/releases/download/") && !install.contains("uname -m")
+}
+
+/// The install to run instead of `saved`, a server's saved install
+/// command, given `suggested`, the catalog's suggestion for it now: the
+/// suggestion when `saved` is a pre-SME-360 single-arch install that is
+/// exactly the suggestion's x86-64 arm, so the saved command is the old
+/// suggestion, unedited (SME-386 A3). `None` for anything else: an edited
+/// command, an already per-arch one, or another package's.
+pub fn rederived_install(saved: &str, suggested: &str) -> Option<String> {
+    let saved = saved.trim();
+    (is_single_arch_github_install(saved) && suggested.contains(&format!("x86_64) {saved} ;;")))
+        .then(|| suggested.to_string())
+}
+
 /// The architectures smelt installs GitHub releases for: `uname -m`'s
 /// name for each, and the catalog's asset targets for it.
 const GITHUB_ARCHES: [(&str, [&str; 2]); 2] =
