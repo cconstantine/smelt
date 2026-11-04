@@ -63,10 +63,11 @@ jobs:
   # so there's no QEMU (a release Rust build under emulation is hours) and no
   # cross-compiling. Each arch pushes by digest; the `*-manifest` job then
   # puts both digests under the tags as one multi-arch image, so the same
-  # tag runs on an x86_64 host and an arm64 one. A tag only ever names both:
-  # if one arch's build fails, its manifest job doesn't run and the commit
-  # gets no tags at all until that job is re-run (`gh run rerun --failed`),
-  # rather than a tag that silently runs on one architecture.
+  # tag runs on an x86_64 host and an arm64 one. A tag only ever names both,
+  # and both images move together: each manifest job needs all four builds,
+  # so if any fails the commit gets no tags at all, server or sandbox, until
+  # it's re-run (`gh run rerun --failed`), rather than a tag that runs on one
+  # architecture or a `latest` server paired with an older `latest` sandbox.
   server-image:
     needs: source
     strategy:
@@ -141,7 +142,7 @@ jobs:
   # Both arches' digests under the tags: `<sha12>` of the commit built
   # always, `latest` only for a push to main, so a hand run can't move it.
   server-manifest:
-    needs: [source, server-image]
+    needs: [source, server-image, sandbox-image]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -249,7 +250,7 @@ jobs:
   # node was given through the old import route is still findable by the name
   # it had there.
   sandbox-manifest:
-    needs: [source, sandbox-image]
+    needs: [source, server-image, sandbox-image]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
