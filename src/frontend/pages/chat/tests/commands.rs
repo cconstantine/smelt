@@ -114,6 +114,7 @@ fn test_a_snapshot_finishes_a_command_the_tab_shows_running() {
                     status: "finished".to_string(),
                     exit_code: Some(1),
                     output: Vec::new(),
+                    mcp_calls: None,
                 }],
             }],
             previews: Vec::new(),

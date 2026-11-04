@@ -4,13 +4,11 @@
 //! targets build it: the panel renders it from the snapshot and from
 //! `ConversationEvent::SandboxMcpCalls`.
 
-// The web build renders it from the panel; until then only the server uses it.
-#![cfg_attr(not(feature = "server"), allow(dead_code))]
-
 use serde::{Deserialize, Serialize};
 
 /// After this long a call still `running` is taken as lost: the agent
 /// gave up on it (its 180 s wait) and its outcome is unknown.
+#[cfg(feature = "server")]
 pub const UNKNOWN_AFTER_SECS: i64 = 180;
 
 /// The most tools the line names; the rest are counted.
@@ -34,6 +32,7 @@ pub struct McpCallSummary {
 
 /// One group of recorded calls: a tool's calls with one outcome, and
 /// whether a `running` one is past `UNKNOWN_AFTER_SECS`.
+#[cfg(feature = "server")]
 #[derive(Clone, Debug, PartialEq)]
 pub struct McpCallCount {
     pub server: String,
@@ -45,6 +44,7 @@ pub struct McpCallCount {
 
 impl McpCallSummary {
     /// The summary of `counts`; `None` when there were no calls at all.
+    #[cfg(feature = "server")]
     pub fn from_counts<'a>(counts: impl IntoIterator<Item = &'a McpCallCount>) -> Option<Self> {
         let mut summary = Self::default();
         let mut tools: Vec<(String, i64)> = Vec::new();

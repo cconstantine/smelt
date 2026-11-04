@@ -399,3 +399,27 @@ async fn test_zero_calls_a_minute_turns_script_calls_off(pool: PgPool) {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(db::list_sandbox_mcp_calls(&pool, conversation).await.expect("rows").is_empty());
 }
+
+/// C7: a command's summary is published as its calls finish, but a burst
+/// of calls makes one event, not one each, and that event counts them all.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_burst_of_calls_publishes_one_summary_with_them_all(pool: PgPool) {
+    let (config, _calls) = mock_server_for_tests(&pool, "mock-c7").await;
+    let (conversation, pod) = conversation_with_pod(&pool, None).await;
+    let terminal = db::create_sandbox_terminal(&pool, pod).await.expect("terminal").id;
+    db::create_terminal_command(&pool, conversation, terminal, "cmd-c7", "python3 loop.py", 0).await.expect("command");
+    let mut events = crate::events::subscribe(conversation);
+    let mine = Caller { conversation_id: conversation, pod_id: pod, command_id: Some("cmd-c7") };
+    for _ in 0..3 {
+        assert_eq!(call_body(&pool, mine, json!({"tool": "mock-c7/second_tool"})).await.status, 200);
+    }
+    let mut published = Vec::new();
+    let deadline = tokio::time::Instant::now() + SUMMARY_EVERY * 3;
+    while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, events.recv()).await {
+        if let crate::events::ConversationEvent::SandboxMcpCalls { command_id, summary } = event {
+            published.push((command_id, summary.calls));
+        }
+    }
+    forget_mock_server(config.id).await;
+    assert_eq!(published, vec![("cmd-c7".to_string(), 3)]);
+}

@@ -110,6 +110,13 @@ pub enum ConversationEvent {
         /// snapshot already has (SME-51 B3). `None` when there's no line.
         position: Option<i64>,
     },
+    /// A terminal command's script MCP calls so far (SME-359), published
+    /// as they finish, at most every 500 ms per command (the last one
+    /// always). A tab that doesn't know the command skips it.
+    SandboxMcpCalls {
+        command_id: String,
+        summary: crate::api::mcp_calls::McpCallSummary,
+    },
     /// Published when a `turn::notify` wake or delivery (fired when a terminal
     /// command finishes, to notify the model with no further tool call
     /// needed) fails to actually reach the model — e.g. no model provider

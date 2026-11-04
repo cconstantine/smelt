@@ -119,12 +119,14 @@ fn test_merge_sandbox_snapshot_flattens_pods_and_terminals_and_hydrates_command_
                         status: "finished".to_string(),
                         exit_code: Some(0),
                         output: Vec::new(),
+                        mcp_calls: Some(mcp_summary(3)),
                     },
                     SandboxCommandSummary {
                         command_id: "cmd-2".to_string(),
                         command: "echo hi".to_string(),
                         status: "finished".to_string(),
                         exit_code: Some(0),
+                        mcp_calls: None,
                         // Deliberately interleaved (stdout, stderr, stdout) —
                         // proves the snapshot's own order survives the merge,
                         // rather than getting bucketed into "all stdout, then
@@ -166,6 +168,31 @@ fn test_merge_sandbox_snapshot_flattens_pods_and_terminals_and_hydrates_command_
         vec![("stdout", "hi"), ("stderr", "uh oh"), ("stdout", "bye")],
         "output order must match the snapshot's, not get split by stream"
     );
+    // SME-359: a command's MCP call summary comes with it.
+    assert_eq!(terminals[0].commands[0].mcp_calls, Some(mcp_summary(3)));
+    assert_eq!(terminals[0].commands[1].mcp_calls, None);
+}
+
+/// A summary of `calls` calls to one tool.
+fn mcp_summary(calls: i64) -> crate::api::mcp_calls::McpCallSummary {
+    crate::api::mcp_calls::McpCallSummary { calls, tools: vec![("linear/get".to_string(), calls)], ..Default::default() }
+}
+
+/// SME-359: a live summary lands on its command, in whichever terminal
+/// it ran, and replaces the last; one for an unknown command changes
+/// nothing.
+#[test]
+fn test_apply_sandbox_mcp_calls_puts_the_summary_on_its_command() {
+    let mut terminals = vec![test_sandbox_terminal_entry(1, 1), test_sandbox_terminal_entry(2, 1)];
+    terminals[1].commands.push(test_sandbox_command_entry("cmd-a", "python3 a.py"));
+    terminals[1].commands.push(test_sandbox_command_entry("cmd-b", "python3 b.py"));
+    apply_sandbox_mcp_calls(&mut terminals, "cmd-a", mcp_summary(2));
+    apply_sandbox_mcp_calls(&mut terminals, "cmd-a", mcp_summary(5));
+    let before = terminals.clone();
+    apply_sandbox_mcp_calls(&mut terminals, "cmd-unknown", mcp_summary(9));
+    assert_eq!(terminals, before, "an unknown command changes nothing");
+    assert_eq!(terminals[1].commands[0].mcp_calls, Some(mcp_summary(5)));
+    assert_eq!(terminals[1].commands[1].mcp_calls, None);
 }
 
 #[test]

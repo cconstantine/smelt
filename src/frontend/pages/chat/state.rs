@@ -238,6 +238,9 @@ pub(super) fn apply_event(state: Store<ConversationState>, event: ConversationEv
                 position,
             );
         }
+        ConversationEvent::SandboxMcpCalls { command_id, summary } => {
+            apply_sandbox_mcp_calls(&mut state.sandbox_terminals().write(), &command_id, summary);
+        }
         ConversationEvent::NotificationDeliveryFailed { detail } => {
             state.notification_delivery_error().set(Some(detail));
         }
@@ -428,6 +431,8 @@ pub(super) struct SandboxCommandPanelEntry {
     pub(super) status: String,
     pub(super) exit_code: Option<i32>,
     pub(super) output: Vec<SandboxOutputLinePanelEntry>,
+    /// Its scripts' MCP calls, in one line (SME-359).
+    pub(super) mcp_calls: Option<crate::api::mcp_calls::McpCallSummary>,
 }
 
 /// One terminal's widget state — a real terminal's scrollback, not just its
@@ -485,6 +490,7 @@ pub(super) fn merge_sandbox_snapshot(
                     command: cmd.command,
                     status: cmd.status,
                     exit_code: cmd.exit_code,
+                    mcp_calls: cmd.mcp_calls,
                     output: cmd
                         .output
                         .into_iter()
@@ -582,6 +588,20 @@ pub(super) fn apply_sandbox_terminal_update(
     }
 }
 
+/// Puts a command's MCP call summary (SME-359) on it, in whichever
+/// terminal it ran. A command the tab doesn't know is skipped: its next
+/// snapshot brings the summary.
+#[cfg(any(feature = "web", test))]
+pub(super) fn apply_sandbox_mcp_calls(
+    terminals: &mut [SandboxTerminalPanelEntry],
+    command_id: &str,
+    summary: crate::api::mcp_calls::McpCallSummary,
+) {
+    if let Some(command) = terminals.iter_mut().flat_map(|t| t.commands.iter_mut()).find(|c| c.command_id == command_id) {
+        command.mcp_calls = Some(summary);
+    }
+}
+
 /// Applies one live `SandboxCommandUpdate` onto the owning terminal. `Some
 /// (command)` means a *new* command just started in this terminal — pushed
 /// onto the terminal's history as a new entry, rather than overwriting
@@ -618,6 +638,7 @@ pub(super) fn apply_sandbox_command_update(
             status,
             exit_code,
             output: Vec::new(),
+            mcp_calls: None,
         });
         return;
     }

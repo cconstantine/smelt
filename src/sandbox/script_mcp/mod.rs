@@ -224,7 +224,39 @@ async fn call(pool: &PgPool, caller: Caller<'_>, span: &tracing::Span, body: &st
     if let Err(e) = db::finish_sandbox_mcp_call(pool, row, class, outcome).await {
         tracing::warn!(row, error = %e, "couldn't record how a script's MCP call ended");
     }
+    if let Some(command_id) = caller.command_id {
+        publish_summary_soon(pool, caller.conversation_id, command_id);
+    }
     answer
+}
+
+/// The most often one command's summary is published while its calls
+/// finish: a fast loop doesn't flood the event stream.
+pub(crate) const SUMMARY_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Publishes `command_id`'s summary `SUMMARY_EVERY` from now, unless that
+/// is already set to happen: the trailing edge, so the last call is
+/// always in a published summary.
+fn publish_summary_soon(pool: &PgPool, conversation_id: i64, command_id: &str) {
+    static PENDING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(Default::default);
+    if !PENDING.lock().unwrap_or_else(|e| e.into_inner()).insert(command_id.to_string()) {
+        return;
+    }
+    let (pool, command_id) = (pool.clone(), command_id.to_string());
+    tokio::spawn(async move {
+        tokio::time::sleep(SUMMARY_EVERY).await;
+        // Off the list before the read, so a call that finishes during it
+        // sets up the next publish rather than going unsaid.
+        PENDING.lock().unwrap_or_else(|e| e.into_inner()).remove(&command_id);
+        match db::command_mcp_summary(&pool, &command_id).await {
+            Ok(Some(summary)) => {
+                crate::events::publish(conversation_id, crate::events::ConversationEvent::SandboxMcpCalls { command_id, summary })
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(%command_id, error = %e, "couldn't read a command's MCP call summary to publish"),
+        }
+    });
 }
 
 /// What a script gets when the deployment has turned script calls off.
