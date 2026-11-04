@@ -81,6 +81,27 @@ pub async fn update_language_server(
         .map(|row| row.map(Into::into))
 }
 
+/// Sets `id`'s install command to `install` if it is still `was`
+/// (SME-386 A3): an edit saved since wins. `None` if it wasn't.
+pub async fn replace_language_server_install(
+    pool: &PgPool,
+    id: i64,
+    was: &str,
+    install: &str,
+) -> Result<Option<crate::models::LanguageServer>, sqlx::Error> {
+    let sql = format!(
+        "UPDATE language_servers SET install_command = $1, updated_at = now() \
+         WHERE id = $2 AND install_command = $3 RETURNING {LANGUAGE_SERVER_COLUMNS}"
+    );
+    sqlx::query_as::<_, LanguageServerRow>(&sql)
+        .bind(install)
+        .bind(id)
+        .bind(was)
+        .fetch_optional(pool)
+        .await
+        .map(|row| row.map(Into::into))
+}
+
 fn bind_language_server<'q>(
     query: sqlx::query::QueryAs<'q, sqlx::Postgres, LanguageServerRow, sqlx::postgres::PgArguments>,
     config: &'q crate::models::LanguageServerConfig,

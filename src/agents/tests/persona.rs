@@ -229,7 +229,7 @@ async fn test_a_persona_missing_or_broken_at_the_childs_ref_fails_the_start(pool
     eventually("the start fails", || async { state(&pool, missing).await.as_deref() == Some(db::AGENT_FAILED) }).await;
     assert!(
         transcript(&pool, missing).await.iter().any(|(_, t)| t.ends_with(&format!(
-            "start failed: no persona `developer` in https://example.com/team/app.git at {COMMIT}"
+            "start failed: no persona `app:developer` in https://example.com/team/app.git at {COMMIT}"
         ))),
         "{:?}",
         transcript(&pool, missing).await

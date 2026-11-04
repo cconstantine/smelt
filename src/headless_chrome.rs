@@ -31,8 +31,22 @@ const CHROME_BINARY: &str = "libs/usr/lib/chromium/chromium-headless-shell";
 
 /// Its libraries: Debian's multiarch directory for the arch smelt was built
 /// for (`x86_64-linux-gnu`, `aarch64-linux-gnu`), as setup.sh names it.
-fn lib_dir() -> String {
-    format!("libs/usr/lib/{}-linux-gnu", std::env::consts::ARCH)
+fn lib_dir() -> Result<String, String> {
+    lib_dir_for(std::env::consts::ARCH)
+}
+
+/// `lib_dir` for Rust's name of an arch. Only x86_64 and aarch64 are
+/// supported: on any other, Debian's directory isn't `<arch>-linux-gnu`
+/// (32-bit arm's is `arm-linux-gnueabihf`, x86's `i386-linux-gnu`,
+/// ppc64le's `powerpc64le-linux-gnu`, where Rust says `powerpc64`), and the
+/// launch would fail loading a library rather than say why (SME-386 A7).
+fn lib_dir_for(arch: &str) -> Result<String, String> {
+    match arch {
+        "x86_64" | "aarch64" => Ok(format!("libs/usr/lib/{arch}-linux-gnu")),
+        other => Err(format!(
+            "unsupported architecture {other}: smelt's headless Chromium runs on x86_64 and aarch64 only"
+        )),
+    }
 }
 /// The cache directory when `BROWSER_CHECK_CACHE` isn't set, relative to
 /// the checkout smelt was built from.
@@ -98,6 +112,7 @@ pub async fn launch(extra_args: &[String]) -> Result<Browser, String> {
 
 /// `launch`, with Chrome taken from the cache directory `cache`.
 async fn launch_in(cache: &Path, extra_args: &[String]) -> Result<Browser, String> {
+    let lib_dir = cache.join(lib_dir()?);
     let chrome_binary = cache.join(CHROME_BINARY);
     if !chrome_binary.is_file() {
         return Err(format!(
@@ -106,7 +121,6 @@ async fn launch_in(cache: &Path, extra_args: &[String]) -> Result<Browser, Strin
             chrome_binary.display()
         ));
     }
-    let lib_dir = cache.join(lib_dir());
     let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
     let ld_library_path = format!("{}:{}/dri:{existing}", lib_dir.display(), lib_dir.display());
 
@@ -310,6 +324,20 @@ fn remove_stale_profiles(temp_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SME-386 A7: Debian's multiarch names match Rust's only for the two
+    /// supported arches; any other is refused by name, not left to fail
+    /// loading a library from a directory that doesn't exist.
+    #[test]
+    fn test_lib_dir_is_debians_on_x86_64_and_aarch64_and_refused_elsewhere() {
+        assert_eq!(lib_dir_for("x86_64").as_deref(), Ok("libs/usr/lib/x86_64-linux-gnu"));
+        assert_eq!(lib_dir_for("aarch64").as_deref(), Ok("libs/usr/lib/aarch64-linux-gnu"));
+        // Debian: arm-linux-gnueabihf, i386-linux-gnu, powerpc64le-linux-gnu.
+        for arch in ["arm", "x86", "powerpc64", "riscv64"] {
+            let error = lib_dir_for(arch).expect_err(arch);
+            assert!(error.contains(&format!("unsupported architecture {arch}")), "{error}");
+        }
+    }
 
     #[test]
     fn test_a_set_cache_dir_is_used_as_given() {

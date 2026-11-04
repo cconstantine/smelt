@@ -66,8 +66,11 @@ jobs:
   # tag runs on an x86_64 host and an arm64 one. A tag only ever names both,
   # and both images move together: each manifest job needs all four builds,
   # so if any fails the commit gets no tags at all, server or sandbox, until
-  # it's re-run (`gh run rerun --failed`), rather than a tag that runs on one
-  # architecture or a `latest` server paired with an older `latest` sandbox.
+  # it's re-run (`gh run rerun --failed`, within a day: the digest artifacts
+  # are kept that long, and a manifest job missing one fails rather than tag
+  # one arch, so later re-run the whole workflow), rather than a tag that runs
+  # on one architecture or a `latest` server paired with an older `latest`
+  # sandbox.
   server-image:
     needs: source
     strategy:
@@ -170,6 +173,14 @@ jobs:
           tags=(-t "$name:${sha::12}")
           if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
             tags+=(-t "$name:latest")
+          fi
+          # Both arches or no tag (SME-386 A4): a digest artifact lives a day
+          # (retention-days: 1), so a re-run of one failed build after that
+          # finds only its own digest, and would tag a one-arch image.
+          digests=(*)
+          if [ "${#digests[@]}" -ne 2 ] || [ ! -e "${digests[0]}" ]; then
+            echo "::error::expected 2 digests (amd64 and arm64), found: ${digests[*]}. A digest artifact is kept for a day: re-run the whole workflow, not only its failed jobs." >&2
+            exit 1
           fi
           docker buildx imagetools create "${tags[@]}" $(printf "$name@sha256:%s " *)
           docker buildx imagetools inspect "$name:${sha::12}"
@@ -285,5 +296,13 @@ jobs:
             tags+=(-t "$name:latest")
           fi
           cd "$RUNNER_TEMP/digests"
+          # Both arches or no tag (SME-386 A4): a digest artifact lives a day
+          # (retention-days: 1), so a re-run of one failed build after that
+          # finds only its own digest, and would tag a one-arch image.
+          digests=(*)
+          if [ "${#digests[@]}" -ne 2 ] || [ ! -e "${digests[0]}" ]; then
+            echo "::error::expected 2 digests (amd64 and arm64), found: ${digests[*]}. A digest artifact is kept for a day: re-run the whole workflow, not only its failed jobs." >&2
+            exit 1
+          fi
           docker buildx imagetools create "${tags[@]}" $(printf "$name@sha256:%s " *)
           docker buildx imagetools inspect "$name:${sha::12}"

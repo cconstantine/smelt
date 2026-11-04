@@ -134,6 +134,15 @@ pub async fn start(pool: &PgPool, client: &kube::Client, sandbox: &SandboxRef, n
     if !config.enabled {
         return Err(format!("{name} is disabled on the Language servers page."));
     }
+    // A GitHub-release install saved before SME-360 gets its per-arch
+    // form (SME-386 A3).
+    let rederived = if crate::lsp::catalog::is_single_arch_github_install(&config.install_command) {
+        let (registry, helix) = crate::lsp::catalog::sources_from_env();
+        crate::lsp::config::rederive_github_install(pool, name, &registry, &helix).await
+    } else {
+        None
+    };
+    let (config, version) = rederived.as_ref().map_or((config, version), |(c, v)| (c, v));
     // A pod started with older settings is restarted.
     let stale = pods::list_with(client, sandbox.conversation_id, &sandbox.instance)
         .await?

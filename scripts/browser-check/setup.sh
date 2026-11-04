@@ -19,6 +19,16 @@ CACHE_DIR="${BROWSER_CHECK_CACHE:-$REPO_ROOT/.browser-check-cache}"
 # Debian's multiarch library directory for this machine (x86_64-linux-gnu,
 # aarch64-linux-gnu); `src/headless_chrome.rs` derives the same one.
 TRIPLET="$(uname -m)-linux-gnu"
+# Only those two: on any other arch Debian's directory is named otherwise
+# (arm-linux-gnueabihf, i386-linux-gnu, powerpc64le-linux-gnu), so the
+# fetch would end in libraries "not found" rather than say why (SME-386 A7).
+case "$(uname -m)" in
+    x86_64 | aarch64) ;;
+    *)
+        echo "error: unsupported architecture $(uname -m): smelt's headless Chromium is set up for x86_64 and aarch64 only" >&2
+        exit 1
+        ;;
+esac
 LIBDIR="$CACHE_DIR/libs/usr/lib/$TRIPLET"
 BIN="$CACHE_DIR/libs/usr/lib/chromium/chromium-headless-shell"
 
@@ -99,9 +109,13 @@ if [ ! -x "$BIN" ] || LD_LIBRARY_PATH="$LIBDIR:$LIBDIR/dri:${LD_LIBRARY_PATH:-}"
     (cd "$CACHE_DIR/debs" && printf '%s\n' "$URLS" \
         | xargs -P 4 -n 1 curl -fsSL --retry 3 --retry-connrefused --retry-delay 2 -O)
 
-    for deb in "$CACHE_DIR"/debs/*.deb; do
-        dpkg-deb -x "$deb" "$CACHE_DIR/libs"
-    done
+    # Only this run's .debs, by the names curl -O saved them under (each
+    # URL's last part): debs/ keeps every earlier run's too, and unpacking
+    # them all let an older build overwrite a newer one wherever it sorted
+    # later (2.4-1+deb13u9 after +deb13u10; SME-386 A5).
+    while IFS= read -r url; do
+        dpkg-deb -x "$CACHE_DIR/debs/${url##*/}" "$CACHE_DIR/libs"
+    done <<< "$URLS"
 
     # libpulse finds its private libpulsecommon through an absolute path to
     # the system's pulseaudio/ directory, which the cache's copy can't

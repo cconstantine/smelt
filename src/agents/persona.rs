@@ -121,7 +121,9 @@ pub(crate) async fn snapshot(
     let file = checkout
         .read_file(pool, child, &repo.dir, &rel)
         .await?
-        .ok_or_else(|| format!("no persona `{name}` in {} at {at}", repo.url))?;
+        // Named as start_agent takes it, `<repo dir>:<name>`, like the other
+        // refusals (SME-368; SME-386 A8).
+        .ok_or_else(|| format!("no persona `{}:{name}` in {} at {at}", repo.dir, repo.url))?;
     let persona = crate::personas::parse(&rel, &file.content, file.file_bytes.max(0) as u64)?;
     let checkout_dir = format!("{}/{}", crate::sandbox::WORKSPACE_DIR, repo.dir);
     let body = crate::personas::links::absolute(&persona.instructions, &format!("{checkout_dir}/.agents/personas"));

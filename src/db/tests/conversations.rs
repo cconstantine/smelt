@@ -562,3 +562,80 @@ async fn test_get_conversation_title_reads_it_and_misses_quietly(pool: PgPool) {
     let missing = get_conversation_title(&pool, 999_999_999).await.expect("query");
     assert_eq!(missing, None, "an id that isn't a conversation reads as no title");
 }
+
+/// SME-386 A6: a notice delivered as a wake turn's message while an
+/// answered question waited is saved after the answer, in one row
+/// (`create_message_taking_question`, as `deliver_notice`'s turn saves it).
+/// SME-357's migration looked at a row's first block only and left such a
+/// notice unmarked; the follow-up marks it, leaves the answer and every
+/// other row alone, and a second run changes nothing more.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_notice_saved_after_an_answer_is_marked_too(pool: PgPool) {
+    use crate::anthropic::ContentBlock;
+    let conversation = create_conversation(&pool).await.expect("conversation");
+    let words = "Terminal command c1 finished: exit code 0.";
+    let question: crate::questions::Question =
+        serde_json::from_value(serde_json::json!({"question": "Which?", "header": "Pick"})).expect("a question");
+    create_pending_question(&pool, conversation.id, "toolu_q", &[question]).await.expect("asked");
+    let answer = crate::questions::QuestionAnswer { selected: vec![], other: Some("This one".to_string()) };
+    assert!(answer_pending_question(&pool, conversation.id, "toolu_q", &[answer]).await.expect("answered"));
+    // The answer quotes the words too: a block's string is never marked.
+    let result_for = |q: &StoredQuestion| ContentBlock::ToolResult {
+        tool_use_id: q.tool_use_id.clone(),
+        content: format!("The user answered: {words}"),
+        is_error: None,
+    };
+    let (row, _) = create_message_taking_question(
+        &pool,
+        conversation.id,
+        "user",
+        vec![ContentBlock::Text { text: words.to_string() }],
+        false,
+        result_for,
+    )
+    .await
+    .expect("saved")
+    .expect("a row");
+    let typed = create_message(&pool, conversation.id, "user", &[ContentBlock::Text { text: format!("see: {words}") }])
+        .await
+        .expect("a user's own text");
+    let reply = create_message(
+        &pool,
+        conversation.id,
+        "assistant",
+        &[ContentBlock::Text { text: "ok".to_string() }, ContentBlock::Text { text: words.to_string() }],
+    )
+    .await
+    .expect("a reply quoting it");
+    let content = |id: i64| {
+        let pool = pool.clone();
+        async move {
+            let content: String =
+                sqlx::query_scalar("SELECT content FROM messages WHERE id = $1").bind(id).fetch_one(&pool).await.expect("content");
+            content
+        }
+    };
+    let (typed_before, reply_before) = (content(typed.id).await, content(reply.id).await);
+    for _ in 0..2 {
+        sqlx::raw_sql(include_str!("../../../migrations/20261104150000_mark_saved_notices.sql"))
+            .execute(&pool)
+            .await
+            .expect("run SME-357's migration");
+        sqlx::raw_sql(include_str!("../../../migrations/20261105160000_mark_notices_after_a_result.sql"))
+            .execute(&pool)
+            .await
+            .expect("run the follow-up");
+    }
+    let saved = content(row.id).await;
+    let blocks: Vec<ContentBlock> = serde_json::from_str(&saved).expect("still JSON blocks");
+    match blocks.as_slice() {
+        [ContentBlock::ToolResult { content, .. }, ContentBlock::Text { text }] => {
+            assert_eq!(content, &format!("The user answered: {words}"), "the answer is left alone");
+            assert_eq!(text, &format!("{}{words}", crate::api::chat::NOTICE_MARK), "marked once");
+        }
+        other => panic!("the answer, then the notice: {other:?}"),
+    }
+    assert!(saved.contains(r#""type":"tool_result""#), "still compact JSON: {saved}");
+    assert_eq!(content(typed.id).await, typed_before, "a user's text that only contains the words");
+    assert_eq!(content(reply.id).await, reply_before, "only the user role's rows");
+}

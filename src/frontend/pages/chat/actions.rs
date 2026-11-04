@@ -149,17 +149,9 @@ pub(super) fn send_action(
 
         let temp_id = next_temp_id();
         next_temp_id.set(temp_id - 1);
-        #[expect(clippy::expect_used, reason = "a text ContentBlock always serializes")]
-        messages.write().push(Message {
-            id: temp_id,
-            conversation_id: id,
-            role: "user".to_string(),
-            content: serde_json::to_string(&[ContentBlock::Text {
-                text: content.clone(),
-            }])
-            .expect("ContentBlock always serializes"),
-            created_at: chrono::Utc::now().naive_utc(),
-        });
+        if let Some(copy) = super::state::optimistic_copy(temp_id, id, &content) {
+            messages.write().push(copy);
+        }
 
         // The reply, and the turn's other messages, arrive on the
         // conversation's own event stream; this request only starts the

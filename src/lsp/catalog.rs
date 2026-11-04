@@ -345,6 +345,46 @@ fn install(purl: &Purl, source: &Source, bin: &str, notes: &mut Vec<String>) -> 
     })
 }
 
+/// Whether `install` is a GitHub-release install from before SME-360: one
+/// download, of the x86-64 asset, whatever the node's architecture.
+/// Today's (`github_install`) picks the asset by `uname -m`.
+pub fn is_single_arch_github_install(install: &str) -> bool {
+    install.contains("https://github.com/") && install.contains("/releases/download/") && !install.contains("uname -m")
+}
+
+/// The install to run instead of `saved`, a server's saved install
+/// command, given `suggested`, the catalog's suggestion for it now: the
+/// suggestion, at the saved release's version, when `saved` is a
+/// pre-SME-360 single-arch install that is exactly that suggestion's
+/// x86-64 arm, so the saved command is the old suggestion, unedited
+/// (SME-386 A3). The version is the saved one because mason's registry
+/// moves a package's version on, and a row looked up earlier names an
+/// older release (review M1); the user keeps the release they had. `None`
+/// for anything else: an edited command, an already per-arch one, or
+/// another package's.
+pub fn rederived_install(saved: &str, suggested: &str) -> Option<String> {
+    let saved = saved.trim();
+    if !is_single_arch_github_install(saved) {
+        return None;
+    }
+    let (was, now) = (release_version(saved)?, release_version(suggested)?);
+    // A version short enough to occur elsewhere in the command isn't
+    // swapped: only an equal one is compared then.
+    let at_saved = match (was == now, now.len() >= 3) {
+        (true, _) => suggested.to_string(),
+        (false, true) => suggested.replace(now, was),
+        (false, false) => return None,
+    };
+    at_saved.contains(&format!("x86_64) {saved} ;;")).then_some(at_saved)
+}
+
+/// The release in the first GitHub release download in `install`: `<v>`
+/// in `…/releases/download/<v>/…`.
+fn release_version(install: &str) -> Option<&str> {
+    let (_, rest) = install.split_once("/releases/download/")?;
+    rest.split('/').next().filter(|version| !version.is_empty())
+}
+
 /// The architectures smelt installs GitHub releases for: `uname -m`'s
 /// name for each, and the catalog's asset targets for it.
 const GITHUB_ARCHES: [(&str, [&str; 2]); 2] =
