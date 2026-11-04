@@ -339,9 +339,11 @@ pub(crate) fn merge_tool_class_rows(
                 annotated: Some(tool.annotated),
                 override_class: saved.map(|row| row.class.clone()),
                 listed: Some(true),
+                // Either form names it (SME-386 T4: SHA-256, or the legacy
+                // form an offer hasn't stored again yet).
                 tool_changed: saved
                     .and_then(|row| row.tool_fingerprint.as_deref())
-                    .is_some_and(|fingerprint| fingerprint != tool.fingerprint),
+                    .is_some_and(|fingerprint| fingerprint != tool.fingerprint && fingerprint != tool.legacy_fingerprint),
                 fingerprint: Some(tool.fingerprint.clone()),
                 applied_class: None,
             }
@@ -619,7 +621,7 @@ mod tests {
     }
 
     fn info(name: &str, server_class: crate::anthropic::tools::ToolClass, annotated: bool) -> crate::mcp::McpToolClassInfo {
-        crate::mcp::McpToolClassInfo { name: name.to_string(), server_class, annotated, fingerprint: format!("fp-{name}") }
+        crate::mcp::McpToolClassInfo { name: name.to_string(), server_class, annotated, fingerprint: format!("fp-{name}"), legacy_fingerprint: format!("old-{name}") }
     }
 
     /// Listed rows keep the server's own order and carry `server_class`
@@ -682,9 +684,10 @@ mod tests {
         use crate::anthropic::tools::ToolClass;
         let rows = merge_tool_class_rows(
             vec![info("a", ToolClass::ReadOnly, true), info("b", ToolClass::ReadOnly, true), info("c", ToolClass::ReadOnly, true)],
-            vec![saved("a", "destructive", Some("fp-a")), saved("b", "destructive", Some("fp-old")), saved("c", "writing", None)],
+            vec![saved("a", "destructive", Some("old-a")), saved("b", "destructive", Some("fp-old")), saved("c", "writing", None)],
         );
         let changed: Vec<(&str, bool)> = rows.iter().map(|r| (r.tool_name.as_str(), r.tool_changed)).collect();
+        // SME-386 T4: `a`'s legacy fingerprint still names it.
         assert_eq!(changed, vec![("a", false), ("b", true), ("c", false)]);
     }
 

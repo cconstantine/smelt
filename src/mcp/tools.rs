@@ -192,18 +192,40 @@ pub(crate) struct McpToolClassInfo {
     pub annotated: bool,
     /// `tool_fingerprint` of the tool listed now (SME-295).
     pub fingerprint: String,
+    /// Its `legacy_fingerprint`, which an override stored before SME-386
+    /// may still hold.
+    pub legacy_fingerprint: String,
 }
 
 /// Which tool a server lists under a name, as an override remembers it
-/// (SME-295): a hash of its description and input schema, the schema's
-/// object keys sorted at every level (review 1: not left to whether
-/// serde_json preserves order), so a different tool listed under the same
-/// name, or one whose description or arguments changed, reads as a
-/// different tool, and the same tool always reads the same.
+/// (SME-295): SHA-256, in hex, of its description and input schema, the
+/// schema's object keys sorted at every level (review 1: not left to
+/// whether serde_json preserves order), so a different tool listed under
+/// the same name, or one whose description or arguments changed, reads as
+/// a different tool, and the same tool always reads the same. A 64-bit
+/// hash a hostile server could collide was the first form (SME-386 T4;
+/// [`legacy_fingerprint`]).
 pub(crate) fn tool_fingerprint(tool: &McpTool) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(fingerprint_text(tool).as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The fingerprint SME-295 stored before SME-386: FNV-1a 64 of the same
+/// text. One stored in this form still names the tool listed now when it
+/// matches, until the next offer stores the SHA-256 form in its place.
+pub(crate) fn legacy_fingerprint(tool: &McpTool) -> String {
+    format!("{:016x}", fnv1a(fingerprint_text(tool).as_bytes()))
+}
+
+/// What a fingerprint hashes: the description, a NUL, the canonical schema.
+fn fingerprint_text(tool: &McpTool) -> String {
     let schema = canonical_json(&serde_json::Value::Object((*tool.input_schema).clone()));
-    let description = tool.description.as_deref().unwrap_or_default();
-    format!("{:016x}", fnv1a(format!("{description}\u{0}{schema}").as_bytes()))
+    format!("{}\u{0}{schema}", tool.description.as_deref().unwrap_or_default())
+}
+
+/// Whether a stored fingerprint names `tool`, in either form.
+pub(crate) fn fingerprint_names(stored: &str, tool: &McpTool) -> bool {
+    stored == tool_fingerprint(tool) || stored == legacy_fingerprint(tool)
 }
 
 /// `value` as JSON with every object's keys in sorted order.
@@ -228,7 +250,7 @@ pub(super) fn canonical_json(value: &serde_json::Value) -> String {
 pub(crate) fn override_is_current(saved: &crate::db::SavedToolClass, listed: Option<&McpTool>) -> bool {
     match saved.tool_fingerprint.as_deref() {
         None => true,
-        Some(fingerprint) => listed.is_some_and(|tool| tool_fingerprint(tool) == fingerprint),
+        Some(fingerprint) => listed.is_some_and(|tool| fingerprint_names(fingerprint, tool)),
     }
 }
 
@@ -300,6 +322,7 @@ pub(crate) async fn tool_class_report(
                 .as_ref()
                 .is_some_and(|a| a.read_only_hint.is_some() || a.destructive_hint.is_some()),
             fingerprint: tool_fingerprint(tool),
+            legacy_fingerprint: legacy_fingerprint(tool),
         })
         .collect())
 }
@@ -433,23 +456,29 @@ pub async fn offered_tools(
     // which decides for whatever tool is behind the name; from then on, a
     // change of tool can only narrow it (review 2). Best-effort, off the
     // turn.
-    let adopt: Vec<(i64, String, String)> = configs
+    // One stored in the legacy form that names the tool listed now is
+    // stored again as SHA-256 the same way (SME-386 T4).
+    let adopt: Vec<(i64, String, Option<String>, String)> = configs
         .iter()
         .filter_map(|config| registry.get(&config.id).map(|conn| (config, conn)))
         .flat_map(|(config, conn)| {
             let saved = overrides.get(&config.id);
             conn.tools
                 .iter()
-                .filter(|tool| saved.and_then(|rows| rows.get(tool.name.as_ref())).is_some_and(|row| row.tool_fingerprint.is_none()))
-                .map(|tool| (config.id, tool.name.to_string(), tool_fingerprint(tool)))
+                .filter_map(|tool| {
+                    let stored = saved.and_then(|rows| rows.get(tool.name.as_ref()))?.tool_fingerprint.clone();
+                    let fingerprint = tool_fingerprint(tool);
+                    let readopt = stored.as_deref().is_none_or(|stored| stored != fingerprint && stored == legacy_fingerprint(tool));
+                    readopt.then(|| (config.id, tool.name.to_string(), stored, fingerprint))
+                })
                 .collect::<Vec<_>>()
         })
         .collect();
     if !adopt.is_empty() {
         let pool = pool.clone();
         tokio::spawn(async move {
-            for (server_id, tool, fingerprint) in adopt {
-                if let Err(e) = crate::db::adopt_mcp_tool_fingerprint(&pool, server_id, &tool, &fingerprint).await {
+            for (server_id, tool, stored, fingerprint) in adopt {
+                if let Err(e) = crate::db::adopt_mcp_tool_fingerprint(&pool, server_id, &tool, stored.as_deref(), &fingerprint).await {
                     tracing::warn!(server_id, tool, error = %e, "couldn't record which tool a class override is for");
                 }
             }

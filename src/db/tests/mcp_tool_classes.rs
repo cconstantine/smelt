@@ -140,9 +140,9 @@ async fn test_a_save_without_a_fingerprint_keeps_the_stored_one(pool: PgPool) {
     set_mcp_tool_class(&pool, server.id, "t", ToolClass::Writing, None).await.expect("re-save, unreachable");
     let row = get_mcp_tool_class(&pool, server.id, "t").await.expect("read").expect("the row");
     assert_eq!((row.class.as_str(), row.tool_fingerprint.as_deref()), ("writing", Some("fp-1")));
-    assert!(!adopt_mcp_tool_fingerprint(&pool, server.id, "t", "fp-2").await.expect("adopt"), "a stored one stays");
+    assert!(!adopt_mcp_tool_fingerprint(&pool, server.id, "t", None, "fp-2").await.expect("adopt"), "a stored one stays");
     set_mcp_tool_class(&pool, server.id, "u", ToolClass::ReadOnly, None).await.expect("one without");
-    assert!(adopt_mcp_tool_fingerprint(&pool, server.id, "u", "fp-3").await.expect("adopt"));
+    assert!(adopt_mcp_tool_fingerprint(&pool, server.id, "u", None, "fp-3").await.expect("adopt"));
     let row = get_mcp_tool_class(&pool, server.id, "u").await.expect("read").expect("the row");
     assert_eq!(row.tool_fingerprint.as_deref(), Some("fp-3"));
 }
