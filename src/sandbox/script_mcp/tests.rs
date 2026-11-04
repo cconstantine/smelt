@@ -271,7 +271,7 @@ async fn test_a_pod_stopped_mid_call_still_finishes_its_row(pool: PgPool) {
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_listing_is_what_the_chain_allows(pool: PgPool) {
     let (config, _calls) = mock_server_for_tests(&pool, "mock.app-t13").await;
-    let chain = json!([{"origin": "t13", "allow": ["*"], "deny": ["mock.app-t13/echo"]}]);
+    let chain = json!([{"origin": "t13", "allow": ["*"], "deny": ["mock.app-t13/echo", "mock.app-t13/hang"]}]);
     let (conversation, pod) = conversation_with_pod(&pool, Some(chain)).await;
     let c = caller(conversation, pod);
     let all = handle(&pool, c, McpRequest::List { server: None }).await;
@@ -422,4 +422,25 @@ async fn test_a_burst_of_calls_publishes_one_summary_with_them_all(pool: PgPool)
     }
     forget_mock_server(config.id).await;
     assert_eq!(published, vec![("cmd-c7".to_string(), 3)]);
+}
+
+/// Review round 1, M3: a script may call only a tool its server lists,
+/// by its listed name. A name that merely maps to one (another case, a
+/// zero-width character, an embedded `/`) or one the server answers
+/// without listing is a 404, and nothing reaches the server.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_tool_the_server_doesnt_list_is_a_404_and_unsent(pool: PgPool) {
+    let (config, calls) = mock_server_for_tests(&pool, "mock-m3").await;
+    let (conversation, pod) = conversation_with_pod(&pool, None).await;
+    let c = caller(conversation, pod);
+    let mut statuses = Vec::new();
+    for tool in ["mock-m3/Echo", "mock-m3/ec\u{200b}ho", "mock-m3/echo/x", "mock-m3/fail", "mcp__mock-m3__Echo"] {
+        statuses.push((tool, call_body(&pool, c, json!({"tool": tool})).await.status));
+    }
+    let listed = call_body(&pool, c, json!({"tool": "mock-m3/echo"})).await.status;
+    forget_mock_server(config.id).await;
+    assert!(statuses.iter().all(|(_, status)| *status == 404), "{statuses:?}");
+    assert_eq!(listed, 200);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "only the listed call was sent");
+    assert_eq!(db::list_sandbox_mcp_calls(&pool, conversation).await.expect("rows").len(), 1);
 }

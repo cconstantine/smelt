@@ -128,8 +128,20 @@ async fn check_caller(pool: &PgPool, caller: Caller<'_>) -> Result<(), Answer> {
 /// (the tool-rule grammar's name; the longest configured server name
 /// before a `/` wins) or the model's `mcp__<server>__<tool>`.
 async fn resolve(pool: &PgPool, name: &str) -> Result<(db::McpServerConfig, String), Answer> {
+    let (config, part, by_model_name) = resolve_server(pool, name).await?;
+    match crate::mcp::listed_tool_for_script(pool, &config, &part, by_model_name).await {
+        Ok(Some(listed)) => Ok((config, listed)),
+        Ok(None) => Err(Answer::error(404, format!("{:?} lists no tool {name:?}: name it as `smelt-mcp tools` lists it", config.name))),
+        Err(e) => Err(Answer::error(502, e)),
+    }
+}
+
+/// The configured server `name` names, the tool's part of it, and whether
+/// it was the model's `mcp__…` form.
+async fn resolve_server(pool: &PgPool, name: &str) -> Result<(db::McpServerConfig, String, bool), Answer> {
     if crate::mcp::parse_tool_name(name).is_some() {
-        return crate::mcp::resolve_tool(pool, name).await.map_err(|e| Answer::error(404, e));
+        let (config, part) = crate::mcp::resolve_tool(pool, name).await.map_err(|e| Answer::error(404, e))?;
+        return Ok((config, part, true));
     }
     let configs = db::list_mcp_server_configs(pool)
         .await
@@ -138,9 +150,9 @@ async fn resolve(pool: &PgPool, name: &str) -> Result<(db::McpServerConfig, Stri
         .into_iter()
         .filter_map(|config| {
             let tool = name.strip_prefix(config.name.as_str())?.strip_prefix('/')?.to_string();
-            (!tool.is_empty()).then_some((config, tool))
+            (!tool.is_empty()).then_some((config, tool, false))
         })
-        .max_by_key(|(config, _)| config.name.len())
+        .max_by_key(|(config, _, _)| config.name.len())
         .ok_or_else(|| Answer::error(404, format!("no MCP tool {name:?}: name it <server>/<tool>, as `smelt-mcp tools` lists it")))
 }
 

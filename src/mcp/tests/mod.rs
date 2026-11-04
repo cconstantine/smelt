@@ -164,6 +164,12 @@ pub(crate) async fn mock_server_for_tests(pool: &sqlx::PgPool, name: &str) -> (M
     let server = MockMcpServer::new(true);
     // Before it's served, so no `tools/list_changed` marks the list stale.
     server.router.write().await.enable_route("second_tool");
+    // `hang` listed too, so a script may call it (it may call only listed
+    // tools): `call_tool` holds it before the router is asked.
+    server.router.write().await.add_route(ToolRoute::new_dyn(
+        rmcp::model::Tool::new("hang", "Never answers", Arc::new(serde_json::from_value(serde_json::json!({"type": "object"})).unwrap())),
+        |_ctx| Box::pin(async { Ok(CallToolResult::default().into()) }),
+    ));
     let server = register_mock(config.id, server).await;
     (config, server.calls)
 }

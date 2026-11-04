@@ -128,6 +128,36 @@ pub async fn call_tool_raw(
     .await
 }
 
+/// The name `config`'s server lists the tool a script asked for under
+/// (SME-359 review 1, M3): `part` exactly, or, for a model-facing
+/// `mcp__…` name (`by_model_name`), the listed tool whose model name it
+/// is. `None` when the server lists no such tool: a script calls only
+/// listed tools, by their listed names, so a name that merely maps to one
+/// (another case, a zero-width character, an embedded `/`) is never sent.
+/// An `Err` is a connect failure, its secrets redacted.
+pub async fn listed_tool_for_script(
+    pool: &sqlx::PgPool,
+    config: &McpServerConfig,
+    part: &str,
+    by_model_name: bool,
+) -> Result<Option<String>, String> {
+    if let Err(e) = ensure_connected(pool, config, Attempt::SkipRecentFailures).await {
+        return Err(redact_secrets_now(pool, config, &e.message).await);
+    }
+    let registry = REGISTRY.lock().await;
+    let Some(conn) = registry.get(&config.id) else {
+        return Err(format!("not connected to MCP server {:?}", config.name));
+    };
+    let wanted = namespaced_tool_name(&config.name, part);
+    Ok(conn
+        .tools
+        .iter()
+        .find(|tool| {
+            if by_model_name { namespaced_tool_name(&config.name, &tool.name) == wanted } else { tool.name == part }
+        })
+        .map(|tool| tool.name.to_string()))
+}
+
 /// A result's text for the model: `content[].text` blocks joined with
 /// newlines; any other block type (image, resource, ...) JSON-encoded
 /// inline rather than dropped.
