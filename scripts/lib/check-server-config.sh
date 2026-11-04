@@ -90,7 +90,9 @@ browser_check_cache() {
     local main dir
     main=$(dirname "$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)")
     for dir in "$repo/.browser-check-cache" "$main/.browser-check-cache"; do
-        if [ -d "$dir" ]; then
+        # Only a cache with the Chromium setup.sh fetches now (SME-360): one
+        # from an older setup.sh has a `chrome/` and no such binary.
+        if [ -x "$dir/libs/usr/lib/chromium/chromium-headless-shell" ]; then
             (cd "$dir" && pwd -P)
             return 0
         fi

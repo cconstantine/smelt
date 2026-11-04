@@ -206,14 +206,14 @@ fn test_each_install_kind_quotes_what_it_takes_from_the_catalog() {
     );
     assert_eq!(
         archive.install_command,
-        "mkdir -p /tmp/home/bin /tmp/home/opt && curl -fsSL 'https://github.com/owner/tool/releases/download/v1/tool-$HOME.tar.gz' | tar -xz -C /tmp/home/opt && ln -sf '/tmp/home/opt/dir with space/tool' /tmp/home/bin/tool"
+        x64_only("mkdir -p /tmp/home/bin /tmp/home/opt && curl -fsSL 'https://github.com/owner/tool/releases/download/v1/tool-$HOME.tar.gz' | tar -xz -C /tmp/home/opt && ln -sf '/tmp/home/opt/dir with space/tool' /tmp/home/bin/tool")
     );
 
     // No `bin` map: the target is named after the package.
     let plain = install("name: a;b\nsource:\n  id: pkg:github/owner/tool@v1\n  asset:\n    - target: linux_x64_gnu\n      file: tool\n");
     assert_eq!(
         plain.install_command,
-        "mkdir -p /tmp/home/bin && curl -fsSL -o '/tmp/home/bin/a;b' https://github.com/owner/tool/releases/download/v1/tool && chmod +x '/tmp/home/bin/a;b'"
+        x64_only("mkdir -p /tmp/home/bin && curl -fsSL -o '/tmp/home/bin/a;b' https://github.com/owner/tool/releases/download/v1/tool && chmod +x '/tmp/home/bin/a;b'")
     );
     assert_eq!(plain.command, "/tmp/home/bin/a;b", "the command is an argv, run with no shell: unquoted");
 }
@@ -266,6 +266,55 @@ fn test_a_refusal_note_says_why_and_shows_where() {
     assert!(empty.contains("an empty value"), "{empty}");
 }
 
+/// The install for a release with only an x86-64 asset: `command` on
+/// x86-64, and a failure naming the package on any other architecture.
+fn x64_only(command: &str) -> String {
+    format!("case \"$(uname -m)\" in x86_64) {command} ;; *) echo owner/tool@v1 has no release for \"$(uname -m)\" >&2; false ;; esac")
+}
+
+#[test]
+fn test_a_github_release_installs_the_asset_for_the_nodes_architecture() {
+    let yaml = "name: tool\nsource:\n  id: pkg:github/owner/tool@v1\n  asset:\n    - target: [darwin_arm64, linux_arm64_gnu]\n      file: tool-arm.tar.gz\n      bin: arm/tool\n    - target: linux_x64_gnu\n      file: tool-x64.tar.gz\n      bin: x64/tool\nbin:\n  tool: \"{{source.asset.bin}}\"\n";
+    let s = suggest(yaml, HELIX).expect("a suggestion");
+    let release = "https://github.com/owner/tool/releases/download/v1";
+    let get = |arch: &str| format!("mkdir -p /tmp/home/bin /tmp/home/opt && curl -fsSL {release}/tool-{arch}.tar.gz | tar -xz -C /tmp/home/opt && ln -sf /tmp/home/opt/{arch}/tool /tmp/home/bin/tool");
+    assert_eq!(
+        s.config.install_command,
+        format!(
+            "case \"$(uname -m)\" in x86_64) {} ;; aarch64) {} ;; *) echo owner/tool@v1 has no release for \"$(uname -m)\" >&2; false ;; esac",
+            get("x64"),
+            get("arm")
+        )
+    );
+    assert_eq!(s.config.command, "/tmp/home/bin/tool", "one path, whichever asset");
+
+    let none = suggest("name: tool\nsource:\n  id: pkg:github/owner/tool@v1\n  asset:\n    - target: darwin_arm64\n      file: tool\n", HELIX)
+        .expect("a partial suggestion");
+    assert_eq!(none.config.install_command, "");
+    assert!(none.notes.iter().any(|n| n.contains("no Linux x86-64 or arm64 release")), "{:?}", none.notes);
+}
+
+#[test]
+fn test_a_release_with_no_asset_for_the_node_fails_its_install_under_sh() {
+    // The node is this machine: an x86-64 one runs the arm, any other
+    // fails it, so a release for the other architecture never installs.
+    let arm = |arch: &str| {
+        let yaml = format!("name: tool\nsource:\n  id: pkg:github/owner/tool@v1\n  asset:\n    - target: {arch}\n      file: tool\n");
+        let command = suggest(&yaml, HELIX).expect("a suggestion").config.install_command;
+        let download = "mkdir -p /tmp/home/bin && curl -fsSL -o /tmp/home/bin/tool https://github.com/owner/tool/releases/download/v1/tool && chmod +x /tmp/home/bin/tool";
+        assert!(command.contains(download), "{command}");
+        let probe = command.replace(download, "echo ran");
+        std::process::Command::new("sh").args(["-c", &probe]).output().expect("sh runs")
+    };
+    let here = if std::env::consts::ARCH == "aarch64" { "linux_arm64" } else { "linux_x64" };
+    let other = if here == "linux_x64" { "linux_arm64" } else { "linux_x64" };
+    let ran = arm(here);
+    assert!(ran.status.success() && String::from_utf8_lossy(&ran.stdout).contains("ran"), "{ran:?}");
+    let refused = arm(other);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("owner/tool@v1 has no release for"), "{refused:?}");
+}
+
 /// A github package with one Linux asset.
 fn github_package(file: &str, asset_bin: Option<&str>, bin_key: &str) -> String {
     let asset_bin = asset_bin.map(|b| format!("      bin: {}\n", serde_json::to_string(b).expect("JSON"))).unwrap_or_default();
@@ -280,15 +329,15 @@ fn test_every_github_download_shape_quotes_and_every_kind_refuses() {
     let release = "https://github.com/owner/tool/releases/download/v1";
     assert_eq!(
         install(&github_package("tool $X.gz", None, "tool")),
-        format!("mkdir -p /tmp/home/bin && curl -fsSL '{release}/tool $X.gz' | gunzip > /tmp/home/bin/tool && chmod +x /tmp/home/bin/tool")
+        x64_only(&format!("mkdir -p /tmp/home/bin && curl -fsSL '{release}/tool $X.gz' | gunzip > /tmp/home/bin/tool && chmod +x /tmp/home/bin/tool"))
     );
     assert_eq!(
         install(&github_package("tool.zip", Some("a b/tool"), "tool")),
-        format!("mkdir -p /tmp/home/bin /tmp/home/opt && curl -fsSL -o /tmp/home/release.zip {release}/tool.zip && unzip -q /tmp/home/release.zip -d /tmp/home/opt && ln -sf '/tmp/home/opt/a b/tool' /tmp/home/bin/tool")
+        x64_only(&format!("mkdir -p /tmp/home/bin /tmp/home/opt && curl -fsSL -o /tmp/home/release.zip {release}/tool.zip && unzip -q /tmp/home/release.zip -d /tmp/home/opt && ln -sf '/tmp/home/opt/a b/tool' /tmp/home/bin/tool"))
     );
     assert_eq!(
         install(&github_package("tool;x.tar.xz", None, "tool")),
-        format!("mkdir -p /tmp/home/bin /tmp/home/opt && curl -fsSL '{release}/tool;x.tar.xz' | tar -xJ -C /tmp/home/opt && ln -sf /tmp/home/opt/tool /tmp/home/bin/tool")
+        x64_only(&format!("mkdir -p /tmp/home/bin /tmp/home/opt && curl -fsSL '{release}/tool;x.tar.xz' | tar -xJ -C /tmp/home/opt && ln -sf /tmp/home/opt/tool /tmp/home/bin/tool"))
     );
 
     for (yaml, why) in [
@@ -367,11 +416,23 @@ fn test_shell_word_round_trips_through_sh() {
 fn test_actionlints_unfilled_template_is_one_quoted_word() {
     let s = suggest_for("actionlint");
     let install = &s.config.install_command;
-    let url = r#"https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_{{ version | strip_prefix "v" }}_linux_amd64.tar.gz"#;
+    let url = |arch: &str| {
+        format!(r#"https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_{{{{ version | strip_prefix "v" }}}}_linux_{arch}.tar.gz"#)
+    };
+    let get = |arch: &str| {
+        format!("mkdir -p /tmp/home/bin /tmp/home/opt && curl -fsSL '{}' | tar -xz -C /tmp/home/opt && ln -sf /tmp/home/opt/actionlint /tmp/home/bin/actionlint", url(arch))
+    };
     assert_eq!(
         install,
-        &format!("mkdir -p /tmp/home/bin /tmp/home/opt && curl -fsSL '{url}' | tar -xz -C /tmp/home/opt && ln -sf /tmp/home/opt/actionlint /tmp/home/bin/actionlint")
+        &format!(
+            "case \"$(uname -m)\" in x86_64) {} ;; aarch64) {} ;; *) echo rhysd/actionlint@v1.7.12 has no release for \"$(uname -m)\" >&2; false ;; esac",
+            get("amd64"),
+            get("arm64")
+        )
     );
+    // The stubbed run below takes this machine's arm.
+    let url = url(if std::env::consts::ARCH == "aarch64" { "arm64" } else { "amd64" });
+    let url = url.as_str();
     assert!(s.notes.iter().any(|n| n.contains("template")), "the template note still fires: {:?}", s.notes);
 
     let dir = scratch("actionlint");

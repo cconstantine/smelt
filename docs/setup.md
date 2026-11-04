@@ -53,23 +53,23 @@ dx bundle --platform web
 # whose SANDBOX_IMAGE names that tag; nothing uses it by default.)
 scripts/build-sandbox-image.sh
 
-# ── Set up chrome-headless-shell, for real webfetch/browsing usage ─────────
+# ── Set up headless Chromium, for real webfetch/browsing usage ─────────────
 # The `webfetch` tool, and the persistent browsing-session tools
 # (`open_browser_session`/`browser_navigate`/... plus the live panel) built
 # on the same shared browser, all navigate a real headless browser
-# (`chromiumoxide`, driving `chrome-headless-shell` over CDP) — not just
+# (`chromiumoxide`, driving Debian's `chromium-headless-shell` over CDP) — not just
 # `src/browser_tests/`'s own test tier anymore. `scripts/browser-check/setup.sh`
-# downloads the binary plus its missing shared libraries into
+# downloads the package and its dependency closure from Debian into
 # `.browser-check-cache/` (gitignored) — no root needed, safe to re-run.
 # `BROWSER_CHECK_CACHE` moves that directory, for setup.sh and for smelt
-# alike: smelt looks for Chrome there, or, when it's unset, at
+# alike: smelt looks for Chromium there, or, when it's unset, at
 # `<checkout it was built from>/.browser-check-cache/` (the compile-time
 # `CARGO_MANIFEST_DIR`, `src/headless_chrome.rs`). So a binary running
 # anywhere but its build checkout (a deployed build, another worktree) needs
 # it set; `scripts/check-server` and `scripts/browser-tier` set it to the
 # main checkout's cache.
 # Without this, any real `webfetch`/`open_browser_session` call fails with a
-# clear "chrome-headless-shell not found" error rather than hanging or
+# clear "chromium-headless-shell not found" error rather than hanging or
 # crashing. See SME-21 and
 # SME-22.
 scripts/browser-check/setup.sh
@@ -204,8 +204,8 @@ smelt is one server binary plus a web bundle. Alongside it, it needs:
 - **A k3s cluster** for the sandboxes, with a default StorageClass (k3s ships `local-path`) — one node or several. Nodes may be x86_64 (`amd64`) or arm64, or a mix. Every image a sandbox pod runs is published for both (SME-360): the sandbox image, `docker:29-dind` and the language-server images. So smelt pins pods to no architecture. If you point `SANDBOX_IMAGE` or `SANDBOX_DOCKER_IMAGE` at a single-arch image of your own on a mixed cluster, pin the nodes yourself. A sandbox image imported with `scripts/build-sandbox-image.sh` is the machine's own arch only. smelt runs the sandboxes in the `smelt-park` namespace under a `park` service account, and [k8s/smelt-park-rbac.yaml](../k8s/smelt-park-rbac.yaml) creates both. The cluster must allow privileged pods, because each sandbox's Docker sidecar is privileged. Live memory and CPU on the Sandboxes page also need metrics-server. And the cluster's nodes must reach Docker Hub: the language-server pods pull from there, and so does the Docker sidecar's image when `SANDBOX_DOCKER_IMAGE` is left at its `docker:29-dind` default. Only the import route below adds a Docker Hub pull that a deployment can avoid — the image import's loader pod (`rancher/k3s`, pinned to k3s v1.34, whose `ctr` should match your cluster's containerd); its own run pre-imports `docker:29-dind` so the dev stack and CI don't depend on Docker Hub at pod-start time.
 - **The sandbox image**, on every node that may host a sandbox pod, by one of two routes:
   - **Imported into one node's containerd, no registry** — `scripts/build-sandbox-image.sh` builds it and hands it to the node through the loader pod and `ctr images import`, the same run also delivering `docker:29-dind`, and pods never pull (`SANDBOX_IMAGE_PULL_POLICY` stays at its `Never` default). This is the dev, CI and conversation-seat route, and the reason this page once said the cluster had to be k3s on one node: the image lands on one node, so that is the only node a sandbox pod can run on.
-  - **Pulled from a registry** — `ghcr.io/<you>/smelt-sandbox:<sha>`, published by `.github/workflows/publish-images.yml` from every push. Point `SANDBOX_IMAGE` at it and set `SANDBOX_IMAGE_PULL_POLICY=IfNotPresent` (plus `SANDBOX_IMAGE_PULL_SECRET` for a private package), and any number of amd64 nodes can host sandbox pods. This is what a real deployment runs: [Deploying from published images](#deploying-from-published-images).
-- **Headless Chrome**, for `webfetch` and browsing sessions.
+  - **Pulled from a registry** — `ghcr.io/<you>/smelt-sandbox:<sha>`, published by `.github/workflows/publish-images.yml` from every push. Point `SANDBOX_IMAGE` at it and set `SANDBOX_IMAGE_PULL_POLICY=IfNotPresent` (plus `SANDBOX_IMAGE_PULL_SECRET` for a private package), and any number of nodes, of either arch, can host sandbox pods. This is what a real deployment runs: [Deploying from published images](#deploying-from-published-images).
+- **Headless Chromium**, for `webfetch` and browsing sessions.
 
 A cluster of several nodes costs one thing worth knowing: `local-path` claims are node-local. A claim binds to the node its volume was made on, so a conversation's claims — its `/workspace` and Docker-data claims, and every shared volume it mounts, the model's volumes (SME-239) among them — pin every later pod of that conversation to that one node. Disk pressure is then a per-node question too: the kubelet deletes unused images past 85% disk, and `scripts/cluster-doctor`'s missing-image message names that as the cause, and it warns within 15 GiB of the line, before the images are gone (SME-229); and nothing yet says which node a pod and its claims landed on (SME-304).
 
@@ -213,10 +213,10 @@ The steps below build all of that yourself and take the import route. [Deploying
 
 ### Steps
 
-1. **Get a build environment.** Build inside the repo's [Dockerfile](../Dockerfile) image (its `base` stage, on `rust:1.96-trixie`), or on Debian trixie on x86_64 with the same tools: Rust, the `wasm32-unknown-unknown` target and the Dioxus CLI at the version the Dockerfile pins (`dioxus-cli@0.7.9`; a different `dx` refuses to build the project). Other hosts don't work. The sandbox agent is linked against the build host's glibc and runs in a `debian:trixie-slim` image, so a newer glibc stops every sandbox from starting. `scripts/browser-check/setup.sh` also fetches Chrome's libraries with `apt-get`. Run the server binary in a matching environment too.
+1. **Get a build environment.** Build inside the repo's [Dockerfile](../Dockerfile) image (its `base` stage, on `rust:1.96-trixie`), or on Debian trixie (x86_64 or arm64) with the same tools: Rust, the `wasm32-unknown-unknown` target and the Dioxus CLI at the version the Dockerfile pins (`dioxus-cli@0.7.9`; a different `dx` refuses to build the project). Other hosts don't work. The sandbox agent is linked against the build host's glibc and runs in a `debian:trixie-slim` image, so a newer glibc stops every sandbox from starting. `scripts/browser-check/setup.sh` also fetches Chromium and its libraries from Debian's archive with `apt-get`. Run the server binary in a matching environment too.
 2. **Set up the cluster.** Run `kubectl apply -f k8s/smelt-park-rbac.yaml`, then make a kubeconfig for the `park` service account. [scripts/k3s-bootstrap.sh](../scripts/k3s-bootstrap.sh) shows how: it mints a long-lived token secret and writes the kubeconfig. It's written for the compose stack, so use your cluster's API address, an admin kubeconfig and your own paths instead of its `k3s:6443`, `/k3s-admin/k3s.yaml`, `/k8s/` and `/out/`. Point `KUBECONFIG` at that file.
 3. **Deliver the sandbox image.** This is the import route — one node, no registry; if you're deploying from the published images instead, skip this step. With `DOCKER_HOST` and `KUBECONFIG` set, run `scripts/build-sandbox-image.sh` from the same tree as the server you build in step 5. Run it again after every upgrade of smelt. The image is named after the agent's sources (`smelt-sandbox:src-<hash>`), and a server with no `SANDBOX_IMAGE` runs the one named after the sources it was built from (SME-121), so it can't start pods from an older agent. If the image isn't on the node, `create_pod` fails within seconds with `ErrImageNeverPull`, naming the image and this command.
-4. **Install headless Chrome:** `scripts/browser-check/setup.sh`. Then set `BROWSER_CHECK_CACHE` to the absolute path of the `.browser-check-cache` directory it creates.
+4. **Install headless Chromium:** `scripts/browser-check/setup.sh`. Then set `BROWSER_CHECK_CACHE` to the absolute path of the `.browser-check-cache` directory it creates.
 5. **Build:** `dx bundle --platform web --release`. Keep the `--release`: without it dx builds a debug binary — its own output says `.../debug/web/` — which isn't what you want running for real. It puts a release server binary next to its web bundle, and dx's output says where. Run the binary from that layout: it serves the bundle from the `public/` directory beside it.
 6. **Configure and start it.** Set the environment variables in [docs/setup/environment.md](setup/environment.md#environment-variables). The ones a deployment needs are:
    - `DATABASE_URL` and `KUBECONFIG`.
@@ -230,7 +230,7 @@ The steps below build all of that yourself and take the import route. [Deploying
 
 ### Deploying from published images
 
-`.github/workflows/publish-images.yml` builds both images from one commit and pushes them to GHCR as multi-arch images, linux/amd64 and linux/arm64, so the same tag runs on an x86_64 host or an arm64 one (SME-360). Each arch is built natively on its own GitHub-hosted runner (`ubuntu-latest`, `ubuntu-24.04-arm`) and pushed by digest, then a manifest job puts both under the tags. Every branch push publishes its own `<sha>` tags, and only main moves `latest`:
+`.github/workflows/publish-images.yml` builds both images from one commit and pushes them to GHCR as multi-arch images, linux/amd64 and linux/arm64, so the same tag runs on an x86_64 host or an arm64 one (SME-360). Each arch is built natively on its own GitHub-hosted runner (`ubuntu-latest`, `ubuntu-24.04-arm`) and pushed by digest, then a manifest job puts both under the tags. Every branch push publishes its own `<sha>` tags (the commit built, which for a hand run is the `ref` it was given), and only a push to main moves `latest`. A tag always names both arches: if one arch's build fails, the commit gets no tags until that job is re-run (`gh run rerun --failed`):
 
 - `ghcr.io/<you>/smelt:<sha>` — the server: the release binary (26 MB, stripped by this repo's release profile), its web bundle, and the headless Chromium `webfetch` and browsing sessions use (Debian's `chromium-headless-shell`, the build the browser tier tests, on both arches: SME-360), already laid out the way `BROWSER_CHECK_CACHE` wants (set in the image, so a deployment doesn't set it). It listens on `8080` (and `8181` for previews), runs as uid 1000, and needs no volumes. About 1 GB, of which Chromium and the libraries it fetched are about 600 MB (Debian's build links more system libraries than Chrome for Testing did, whose cache was 492 MB).
 - `ghcr.io/<you>/smelt-sandbox:<sha>` — the sandbox agent image, built from `docker/sandbox/Dockerfile` like any other image. It carries a `src-<hash>` tag as well: the same 16 hex digits `scripts/sandbox-image-ref` prints for the sources it was built from, under a registry a pod can actually reach.

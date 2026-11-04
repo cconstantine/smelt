@@ -147,11 +147,12 @@ RUN dx bundle --platform web --release \
          mv "/app/image/smelt/$(basename "$server")" /app/image/smelt/smelt; \
          echo "server image: $server (renamed smelt) with the bundle from $public"; }
 
-# Headless Chrome for webfetch and browsing sessions, laid out the way smelt
-# reads it from BROWSER_CHECK_CACHE. Deliberately fetched on
-# debian:trixie-slim and not on `base`: setup.sh keeps its library list
-# fixed, so building it where nothing extra is installed keeps the list
-# honest. It was not always honest: python3, which setup.sh itself needs,
+# Headless Chromium (Debian's chromium-headless-shell, SME-360) for webfetch
+# and browsing sessions, laid out the way smelt reads it from
+# BROWSER_CHECK_CACHE. Deliberately fetched on debian:trixie-slim and not on
+# `base`: setup.sh fetches apt's dependency closure of the package, and
+# building it where nothing extra is installed keeps that honest. It was not
+# always honest: python3, which setup.sh itself needs,
 # installs libexpat1 and libffi8, and a check run in this stage passes on
 # them while the runtime stage below — which has no python3 — does not have
 # them at all. That's why the real check is a RUN of Chrome in the runtime

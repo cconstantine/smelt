@@ -228,7 +228,7 @@ jobs:
       - name: Start the compose stack
         uses: ./.github/actions/start-stack
 
-      - name: Browser test setup (chrome-headless-shell)
+      - name: Browser test setup (chromium-headless-shell)
         run: |
           docker compose run --rm \
             smelt scripts/browser-check/setup.sh

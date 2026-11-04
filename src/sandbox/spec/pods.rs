@@ -208,7 +208,10 @@ pub(in crate::sandbox) fn build_pod_spec(
             // is published for both linux/amd64 and linux/arm64 — the
             // sandbox image (`publish-images.yml`, from the same commit as
             // the server), `docker:29-dind`, and the language-server images
-            // — so a pod can land on a node of either. Until SME-360 every
+            // — so a pod can land on a node of either; a language server
+            // installed from a GitHub release picks the asset for its node
+            // when its pod starts (`lsp::catalog::github_install`), and one
+            // with no asset for it fails its install, saying so. Until SME-360 every
             // image was amd64 only and pods were pinned to
             // `kubernetes.io/arch: amd64`. A deployment that points
             // SANDBOX_IMAGE or SANDBOX_DOCKER_IMAGE at a single-arch image on
