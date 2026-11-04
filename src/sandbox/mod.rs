@@ -54,6 +54,7 @@ pub(crate) use self::idle_notice::*;
 pub use self::manager::*;
 pub use self::ports::*;
 pub(crate) use self::quiet_stop::*;
+pub(crate) use self::script_mcp::ScriptMcpLimits;
 pub use self::spec::*;
 pub(crate) use self::storage_grace::*;
 pub use self::watch::*;

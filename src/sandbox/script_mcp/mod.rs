@@ -302,6 +302,7 @@ async fn list(pool: &PgPool, caller: Caller<'_>, server: Option<&str>, limits: &
 
 mod limits;
 pub(crate) use limits::Limits;
+pub(crate) use limits::Limits as ScriptMcpLimits;
 
 #[cfg(test)]
 mod tests;

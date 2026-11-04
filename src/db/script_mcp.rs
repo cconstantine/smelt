@@ -114,3 +114,34 @@ pub async fn list_sandbox_mcp_calls(pool: &PgPool, conversation_id: i64) -> Resu
     .fetch_all(pool)
     .await
 }
+
+/// The recorded calls of each of `command_ids`, grouped by tool and
+/// outcome, for their summaries (`api::mcp_calls`).
+pub async fn sandbox_mcp_call_counts(
+    pool: &PgPool,
+    command_ids: &[String],
+) -> Result<std::collections::HashMap<String, Vec<crate::api::mcp_calls::McpCallCount>>, sqlx::Error> {
+    let rows: Vec<(String, String, String, String, bool, i64)> = sqlx::query_as(
+        "SELECT command_id, server, tool, outcome,
+                outcome = 'running' AND started_at < now() - make_interval(secs => $2) AS stale,
+                count(*)
+           FROM sandbox_mcp_calls
+          WHERE command_id = ANY($1)
+          GROUP BY 1, 2, 3, 4, 5",
+    )
+    .bind(command_ids)
+    .bind(crate::api::mcp_calls::UNKNOWN_AFTER_SECS as f64)
+    .fetch_all(pool)
+    .await?;
+    let mut counts: std::collections::HashMap<String, Vec<crate::api::mcp_calls::McpCallCount>> = Default::default();
+    for (command_id, server, tool, outcome, stale, count) in rows {
+        counts.entry(command_id).or_default().push(crate::api::mcp_calls::McpCallCount { server, tool, outcome, stale, count });
+    }
+    Ok(counts)
+}
+
+/// One command's summary, `None` when its scripts made no MCP calls.
+pub async fn command_mcp_summary(pool: &PgPool, command_id: &str) -> Result<Option<crate::api::mcp_calls::McpCallSummary>, sqlx::Error> {
+    let counts = sandbox_mcp_call_counts(pool, &[command_id.to_string()]).await?;
+    Ok(counts.get(command_id).and_then(|counts| crate::api::mcp_calls::McpCallSummary::from_counts(counts)))
+}

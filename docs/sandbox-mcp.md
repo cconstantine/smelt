@@ -44,3 +44,10 @@ A script's call costs no model tokens; its cost is the provider's quota, and for
 - **Per command:** `SANDBOX_MCP_CALLS_PER_COMMAND` (1,000) calls, counted in `sandbox_mcp_calls`; calls traced to no command share a budget of the same size per pod. Waiting doesn't clear it: a new command starts a new budget. Two calls racing at the edge can both pass, so it can overshoot by up to the in-flight cap less one.
 
 Each call also keeps the MCP call's own 120 s budget. The other half of a limit is being seen: each command's calls are summarized where the user and the model look (below).
+
+## What the model and the user see
+
+No call is a transcript entry of its own: a loop of 200 calls would flood the chat and cost the model a read of each, which is what this feature avoids. Instead each terminal command gets one line, built by `api::mcp_calls::McpCallSummary` from its `sandbox_mcp_calls` rows: `MCP: 14 calls · linear/list_issues ×12, linear/save_comment ×2 · 1 refused` (at most four tools named; then refusals, tool errors, failures, calls whose outcome is unknown, and calls held back by a limit). A call still `running` after 180 s (the agent's wait) counts as outcome unknown.
+
+- **The model** gets the line as `mcp_calls` in `terminal_command_status` and `read_terminal_output`, for a command that made any calls. The completion notice ("Terminal command X finished") doesn't carry it yet.
+- **The system prompt's** environment section, under the MCP servers, says scripts can call their tools with `smelt-mcp`, that the conversation's tool rules apply, and the rate. The line is the same for every turn of a deployment, so the cached prompt stays put; it is left out with no servers, or with `SANDBOX_MCP_CALLS_PER_MINUTE=0`.
