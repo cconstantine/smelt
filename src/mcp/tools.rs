@@ -365,8 +365,8 @@ pub async fn tool_definitions_for(
     configs: &[McpServerConfig],
     chain: &crate::personas::rules::RuleChain,
 ) -> Vec<ToolDefinition> {
-    offered_tools(pool, configs, chain)
-        .await
+    // Only names a call routes back to the tool offered (SME-386 T7).
+    routable_offers(offered_tools(pool, configs, chain).await, configs)
         .iter()
         .map(|offered| mcp_tool_to_definition(&offered.server, &offered.tool))
         .collect()
@@ -379,6 +379,33 @@ pub struct OfferedTool {
     pub server: String,
     pub tool: McpTool,
     pub class: ToolClass,
+}
+
+/// The tools of `offered` a call by their offered name would reach
+/// (SME-386 T7): a name only one of them has, which `server_for` (over
+/// every configured server, `configs`) routes back to its own server.
+/// Servers `a` and `a__b` can both make `mcp__a__b__c`, and a call by it
+/// reaches `a__b`; so both tools of a shared name are left out, and so is
+/// one whose name another server's longer name would catch. The model is
+/// offered no tool its call would miss.
+pub(crate) fn routable_offers(offered: Vec<OfferedTool>, configs: &[McpServerConfig]) -> Vec<OfferedTool> {
+    let names: Vec<String> = offered.iter().map(|o| namespaced_tool_name(&o.server, o.tool.name.as_ref())).collect();
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for name in &names {
+        *counts.entry(name.as_str()).or_default() += 1;
+    }
+    let keep: Vec<bool> = offered
+        .iter()
+        .zip(&names)
+        .map(|(o, name)| {
+            let routes = counts.get(name.as_str()) == Some(&1) && server_for(name, configs).is_some_and(|(config, _)| config.name == o.server);
+            if !routes {
+                tracing::warn!(server = %o.server, tool = %o.tool.name, name, "another MCP tool or server shares this tool's name; it isn't offered");
+            }
+            routes
+        })
+        .collect();
+    offered.into_iter().zip(keep).filter_map(|(o, keep)| keep.then_some(o)).collect()
 }
 
 /// [`tool_definitions_for`]'s tools before they become definitions: every

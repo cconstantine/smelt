@@ -135,3 +135,26 @@ async fn test_the_rule_check_is_handed_the_tools_real_name(pool: sqlx::PgPool) {
     assert_eq!(judged.into_inner().unwrap_or_else(|e| e.into_inner()), Some("search.web".to_string()));
     evict(config.id).await;
 }
+
+/// One offered tool for the routing tests below.
+fn offer(server: &str, tool: &str) -> OfferedTool {
+    let schema = Arc::new(serde_json::from_value(serde_json::json!({"type": "object"})).expect("a schema object"));
+    OfferedTool { server: server.to_string(), tool: McpTool::new(tool.to_string(), "t", schema), class: crate::anthropic::tools::ToolClass::ReadOnly }
+}
+
+/// SME-386 T7: servers `a` and `a__b` can both make `mcp__a__b__c` (`a`'s
+/// `b__c`, `a__b`'s `c`), and a call by it reaches `a__b`, the longest
+/// server name. So an offered tool whose name a call wouldn't route back
+/// to it is left out, and so is every tool sharing one name: the model is
+/// offered no tool its call would miss.
+#[test]
+fn test_an_offered_tool_a_call_wouldnt_reach_is_left_out() {
+    let configs = [test_config(1, "a"), test_config(2, "a__b"), test_config(3, "z")];
+    let names = |offered: Vec<OfferedTool>| {
+        routable_offers(offered, &configs).iter().map(|o| format!("{}/{}", o.server, o.tool.name)).collect::<Vec<_>>()
+    };
+    assert_eq!(names(vec![offer("a", "b__c"), offer("a__b", "c"), offer("a", "x")]), ["a/x"], "both of one name go");
+    assert_eq!(names(vec![offer("a", "b__c"), offer("a", "x")]), ["a/x"], "a call by `a`'s name would reach `a__b`");
+    assert_eq!(names(vec![offer("a__b", "c"), offer("z", "y")]), ["a__b/c", "z/y"], "a name that routes back stays");
+    assert_eq!(names(vec![offer("z", "a.b"), offer("z", "a_b_cd7a6c")]).len(), 2, "different names both stay");
+}
