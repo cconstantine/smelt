@@ -73,7 +73,7 @@ struct Recorded {
 
 /// A tab with the stub in: installed for every document the tab loads,
 /// and on the one that just loaded, before its WASM has booted.
-async fn stubbed_tab(t: &Scenario<'_>, url: impl Into<String>) -> chromiumoxide::Page {
+pub(super) async fn stubbed_tab(t: &Scenario<'_>, url: impl Into<String>) -> chromiumoxide::Page {
     let page = t.tab(url).await;
     page.evaluate_on_new_document(
         chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams::new(NOTIFICATION_STUB.to_string()),
@@ -96,14 +96,14 @@ async fn recorded(page: &chromiumoxide::Page) -> Vec<Recorded> {
 }
 
 /// Waits until `page` has recorded `count` notifications with `tag`.
-async fn wait_tag_count(page: &chromiumoxide::Page, tag: &str, count: usize, timeout: Duration) -> bool {
+pub(super) async fn wait_tag_count(page: &chromiumoxide::Page, tag: &str, count: usize, timeout: Duration) -> bool {
     let tag = tag.to_string();
     wait_until(|| async { recorded(page).await.iter().filter(|n| n.tag == tag).count() == count }, timeout).await
 }
 
 /// Waits until the last notification recorded for `tag` with `heading`
 /// has had `close()` called.
-async fn wait_last_closed(page: &chromiumoxide::Page, tag: &str, heading: &str, timeout: Duration) -> bool {
+pub(super) async fn wait_last_closed(page: &chromiumoxide::Page, tag: &str, heading: &str, timeout: Duration) -> bool {
     let (tag, heading) = (tag.to_string(), heading.to_string());
     wait_until(
         || async {
@@ -121,7 +121,7 @@ async fn wait_last_closed(page: &chromiumoxide::Page, tag: &str, heading: &str, 
 
 /// What the tab says for focus and visibility, and the events smelt's
 /// notifier listens for follow at once.
-async fn set_focus(page: &chromiumoxide::Page, focused: bool, visible: bool) {
+pub(super) async fn set_focus(page: &chromiumoxide::Page, focused: bool, visible: bool) {
     page.evaluate(format!("window.__smeltSetFocus({focused}, {visible})"))
         .await
         .expect("set the tab's focus");

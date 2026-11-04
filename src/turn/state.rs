@@ -78,6 +78,15 @@ pub(super) struct ConversationRuntime {
     /// `get_attention` to read once the spell has ended. Replaced by the
     /// next one, freed on delete.
     published_notice: Option<(u64, String)>,
+    /// The generation and kind of the last `NeedsUser` this conversation
+    /// published, until the user next acts on it (SME-386 N1): what
+    /// `get_attention` calls current. A spell that owes nothing (a wake,
+    /// a delivered notice) leaves it standing, so a notification the user
+    /// hasn't acted on isn't closed by smelt talking to itself; a newer
+    /// publish replaces it. Cleared by the user's send or answer (`admit`'s
+    /// `ByUser`), by a trust decision for a published Question
+    /// (`note_trust_decided`), and on delete.
+    published: Option<(u64, crate::events::Attention)>,
     /// The conversation was deleted (`forget_conversation_lock`) while a
     /// turn of it was still in flight: that spell's end keeps no
     /// `published_notice`, which would hold the entry for good (SME-377
@@ -119,6 +128,7 @@ impl ConversationRuntime {
             && self.attention.is_none()
             && self.notified.is_none()
             && self.published_notice.is_none()
+            && self.published.is_none()
             && self.kept.generation == 0
             && self.kept.error.is_none()
     }
@@ -176,6 +186,7 @@ pub(crate) fn forget_conversation_lock(conversation_id: i64) {
         runtime.attention = None;
         runtime.notified = None;
         runtime.published_notice = None;
+        runtime.published = None;
         runtime.forgotten = true;
         runtime.kept = KeptTurnError::default();
     });
@@ -363,6 +374,7 @@ enum Admission {
 /// Returns the counted turn, and the conversation's turn generation once
 /// it's admitted; `None` if refused, with nothing changed.
 fn admit(conversation_id: i64, admission: Admission) -> Option<(TurnInFlight, u64)> {
+    let mut cleared = false;
     let (first, stop, place, generation) = with_runtime(conversation_id, |runtime| {
         // A test's turn takes no place: tests hold counted turns that never
         // run, which would hold or block the lock for good.
@@ -375,6 +387,8 @@ fn admit(conversation_id: i64, admission: Admission) -> Option<(TurnInFlight, u6
                 runtime.paused = false;
                 runtime.kept.generation += 1;
                 runtime.kept.error = None;
+                // The user is here: what was published before is theirs now.
+                cleared = runtime.published.take().is_some();
             }
             Admission::UnlessPaused if runtime.paused => return None,
             Admission::UnlessPaused => {}
@@ -405,6 +419,11 @@ fn admit(conversation_id: i64, admission: Admission) -> Option<(TurnInFlight, u6
     if first {
         // Only tells the sidebar to fetch the busy list again.
         crate::events::publish_app(crate::events::AppEvent::TurnsChanged);
+    } else if cleared {
+        // Queued behind a running turn, the user's turn publishes no
+        // `TurnsChanged`: say so, so the notifier closes the stale one now
+        // (SME-386 review round 1, L1).
+        crate::events::publish_app(crate::events::AppEvent::QuestionsChanged);
     }
     Some((TurnInFlight { conversation_id, stop: Some(stop), place }, generation))
 }
@@ -478,6 +497,23 @@ impl Drop for TurnInFlight {
             if last {
                 owed = runtime.attention.take();
                 generation = runtime.kept.generation;
+                // A Failed while a Failed the user hasn't acted on still
+                // stands is a repeat (SME-386 N5): a provider down fails
+                // every wake and notice turn, and each would re-notify.
+                // Suppressed, so the first one stands, until the user's
+                // send or answer clears `published`.
+                let repeat = owed == Some(crate::events::Attention::Failed)
+                    && matches!(runtime.published, Some((_, crate::events::Attention::Failed)));
+                if repeat {
+                    owed = None;
+                }
+                // Not on a forgotten entry, which it would hold for good
+                // (as `published_notice` below).
+                if let Some(attention) = owed
+                    && !runtime.forgotten
+                {
+                    runtime.published = Some((generation, attention));
+                }
                 // The spell's `notify_user` message is kept for
                 // `get_attention` (SME-377), even when a stronger kind
                 // outranks it: a question resolved before the spell ended
@@ -556,6 +592,19 @@ pub(super) fn note_attention(conversation_id: i64, a: crate::events::Attention) 
     });
 }
 
+/// Drops a child's owed Failed, CutOff or Refused (SME-386 N6): its
+/// parent is told — the report, or the failure `after_last_turn` sends —
+/// and reports to the user. A Question stands: a trust card the child
+/// filed waits on the user, not the parent.
+pub(super) fn forgo_child_outcome(conversation_id: i64) {
+    use crate::events::Attention;
+    update_existing(conversation_id, |runtime| {
+        if matches!(runtime.attention, Some(Attention::Failed | Attention::CutOff | Attention::Refused)) {
+            runtime.attention = None;
+        }
+    });
+}
+
 /// Empties `conversation_id`'s owed attention: a Stop clears what the
 /// busy spell owed (the user is there), and `admit` starts a new spell
 /// clean.
@@ -592,6 +641,32 @@ pub(crate) fn published_notice(conversation_id: i64, generation: u64) -> Option<
     .flatten()
 }
 
+/// The generation of the `NeedsUser` `conversation_id` last published,
+/// while the user hasn't acted since (`ConversationRuntime::published`):
+/// `get_attention` calls an event of any other generation stale. `None`
+/// with nothing standing — a restart included.
+pub(crate) fn published_generation(conversation_id: i64) -> Option<u64> {
+    read_runtime(conversation_id, |runtime| runtime.published.map(|(generation, _)| generation)).flatten()
+}
+
+/// The user decided a repo trust card on `conversation_id` (SME-386 N1):
+/// a Question it published is answered, as a card's answer is, so it
+/// stops standing; any other kind stands. Before N1 the decision's
+/// notice turn closed it by taking a newer generation; a wake no longer
+/// does. Tells the notifier to revalidate when it cleared one.
+pub(crate) fn note_trust_decided(conversation_id: i64) {
+    let cleared = update_existing_with(conversation_id, |runtime| {
+        let question = matches!(runtime.published, Some((_, crate::events::Attention::Question)));
+        if question {
+            runtime.published = None;
+        }
+        question
+    });
+    if cleared == Some(true) {
+        crate::events::publish_app(crate::events::AppEvent::QuestionsChanged);
+    }
+}
+
 /// A turn counted as in flight for `conversation_id` until it drops, for
 /// other modules' tests (SME-78's quiet stops skip a pod whose turn runs).
 #[cfg(test)]
@@ -606,16 +681,27 @@ pub(crate) fn count_a_test_turn(conversation_id: i64) -> TestTurnInFlight {
     TestTurnInFlight { _turn: TurnInFlight::start(conversation_id) }
 }
 
+/// Runs a busy spell on `conversation_id` that owes the user `attention`
+/// and ends, publishing it as a real spell's end does; returns the
+/// generation its `NeedsUser` carried. For other modules' tests.
+#[cfg(test)]
+pub(crate) fn publish_a_test_spell(conversation_id: i64, attention: crate::events::Attention) -> u64 {
+    let turn = TurnInFlight::start(conversation_id);
+    note_attention(conversation_id, attention);
+    drop(turn);
+    turn_generation(conversation_id)
+}
+
 /// Whether `conversation_id` has a turn running or queued.
 pub(crate) fn turn_running(conversation_id: i64) -> bool {
     read_runtime(conversation_id, |runtime| runtime.turns_in_flight > 0).unwrap_or(false)
 }
 
 /// `conversation_id`'s turn generation (SME-71): what `TurnInFlight::drop`
-/// carried on the `NeedsUser` it published, for
-/// `api::notifications::get_attention` to call an event stale once its
-/// generation has moved on. 0 with no entry — a restart, or a conversation
-/// that never turned.
+/// carries on the `NeedsUser` it publishes; `get_attention` reads
+/// `published_generation` instead (SME-386 N1). 0 with no entry — a
+/// restart, or a conversation that never turned. For tests.
+#[cfg(test)]
 pub(crate) fn turn_generation(conversation_id: i64) -> u64 {
     read_runtime(conversation_id, |runtime| runtime.kept.generation).unwrap_or(0)
 }
@@ -647,13 +733,15 @@ pub(super) struct KeptTurnError {
 }
 
 /// Starts a new turn generation for `conversation_id`, clearing its kept
-/// error, and returns the new generation; for tests. The user's send or
-/// answer takes one in its admission (`TurnInFlight::start_by_user`).
+/// error and what it published, and returns the new generation; for
+/// tests. The user's send or answer does all three in its admission
+/// (`TurnInFlight::start_by_user`).
 #[cfg(test)]
 pub(crate) fn new_turn_generation(conversation_id: i64) -> u64 {
     with_runtime(conversation_id, |runtime| {
         runtime.kept.generation += 1;
         runtime.kept.error = None;
+        runtime.published = None;
         runtime.kept.generation
     })
 }
@@ -681,7 +769,12 @@ pub(super) fn take_turn_generation(conversation_id: i64, held: &Arc<tokio::sync:
 /// that found its conversation deleted: the generation it took would
 /// otherwise keep the conversation's turn state for good (SME-179 B31).
 pub(super) fn forget_turn_generation(conversation_id: i64) {
-    update_existing(conversation_id, |runtime| runtime.kept = KeptTurnError::default());
+    update_existing(conversation_id, |runtime| {
+        runtime.kept = KeptTurnError::default();
+        runtime.published = None;
+        // Its spell's end keeps nothing either, as after a delete's forget.
+        runtime.forgotten = true;
+    });
 }
 
 /// Keeps `error` as `conversation_id`'s, if `generation` is still its
