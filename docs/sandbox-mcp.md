@@ -11,7 +11,7 @@ Every terminal's `bash` has `$SMELT_MCP_SOCKET`, `/run/smelt/mcp.sock`: HTTP on 
 | `GET /v1/tools[?server=<name>]` | `200 {"tools":[{"name":"<server>/<tool>","server","tool","class","description","input_schema"}]}` |
 | `POST /v1/call {"tool":"<server>/<tool>","arguments":{…}}` | `200 {"content":[…],"structured_content":…,"text":"…"}`; the tool's own error is a `422` with `"is_error":true` |
 
-`smelt-mcp` wraps it: `smelt-mcp tools [server]`, `smelt-mcp call <server>/<tool> ['<json>' | -]`. The JSON body goes to stdout; it exits 0 for a 2xx, 1 for a tool error, 2 for a refusal or a limit (403, 429), and 3 otherwise. It is the agent binary under another name (a link in `docker/sandbox/Dockerfile`), so it ships with the agent it talks to.
+`smelt-mcp` wraps it: `smelt-mcp tools [server]`, `smelt-mcp call <server>/<tool> ['<json>' | -]`. The JSON body goes to stdout; it exits 0 for a 2xx, 1 for a tool error, 2 for a refusal or a limit (403, 429), and 3 otherwise. It is the agent binary under another name (a link in `docker/sandbox/Dockerfile`), so it ships with the agent it talks to. Without `$SMELT_MCP_SOCKET` (`sudo` and `env -i` drop it) it uses `/run/smelt/mcp.sock` when that exists (SME-386).
 
 ## The path a call takes
 

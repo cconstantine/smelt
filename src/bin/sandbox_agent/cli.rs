@@ -26,7 +26,7 @@ pub(super) fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let socket = std::env::var(MCP_SOCKET_ENV).ok();
     let mut stdin = std::io::stdin();
-    let (code, out, err) = run(&args, socket.as_deref(), &mut stdin);
+    let (code, out, err) = run(&args, socket.as_deref(), super::mcp::MCP_SOCKET_PATH, &mut stdin);
     let _ = std::io::stdout().write_all(out.as_bytes());
     if !out.is_empty() && !out.ends_with('\n') {
         println!();
@@ -37,17 +37,23 @@ pub(super) fn main() -> std::process::ExitCode {
     std::process::ExitCode::from(code)
 }
 
-/// One run: the exit code, stdout and stderr.
-pub(super) fn run(args: &[String], socket: Option<&str>, stdin: &mut dyn Read) -> (u8, String, String) {
-    let Some(socket) = socket.filter(|s| !s.is_empty()) else {
-        return (
-            3,
-            String::new(),
-            format!(
-                "${MCP_SOCKET_ENV} isn't set: this sandbox's image predates script MCP calls, or its agent couldn't open the socket; \
-                 stop and start the sandbox to get one that has them"
-            ),
-        );
+/// One run: the exit code, stdout and stderr. `socket` is
+/// `$SMELT_MCP_SOCKET`; without it (`sudo` and `env -i` drop it) the
+/// socket is `fallback`, its fixed path, when that exists (SME-386 M7).
+pub(super) fn run(args: &[String], socket: Option<&str>, fallback: &str, stdin: &mut dyn Read) -> (u8, String, String) {
+    let socket = match socket.filter(|s| !s.is_empty()) {
+        Some(socket) => socket,
+        None if std::path::Path::new(fallback).exists() => fallback,
+        None => {
+            return (
+                3,
+                String::new(),
+                format!(
+                    "${MCP_SOCKET_ENV} isn't set and there's no socket at {fallback}: this sandbox's image predates script MCP calls, \
+                     or its agent couldn't open the socket; stop and start the sandbox to get one that has them"
+                ),
+            );
+        }
     };
     let request = match args.first().map(String::as_str) {
         Some("tools") if args.len() <= 2 => {

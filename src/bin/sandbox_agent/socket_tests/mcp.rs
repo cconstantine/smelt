@@ -256,7 +256,7 @@ async fn test_the_cli_calls_the_socket_and_exits_by_the_answer() {
         let args = vec!["call".to_string(), "linear/save_comment".to_string(), "-".to_string()];
         let cli = tokio::task::spawn_blocking({
             let path = path.clone();
-            move || cli::run(&args, Some(&path), &mut std::io::Cursor::new(b" {\"body\":\"hi\"}\n".to_vec()))
+            move || cli::run(&args, Some(&path), "/nonexistent/smelt-mcp.sock", &mut std::io::Cursor::new(b" {\"body\":\"hi\"}\n".to_vec()))
         });
         let (call_id, _, request) = next_mcp_request(&mut smelt).await;
         assert_eq!(request, McpRequest::Call { body: r#"{"tool":"linear/save_comment","arguments":{"body":"hi"}}"#.into() });
@@ -265,17 +265,17 @@ async fn test_the_cli_calls_the_socket_and_exits_by_the_answer() {
     }
     let cli = tokio::task::spawn_blocking({
         let path = path.clone();
-        move || cli::run(&["tools".to_string(), "a b".to_string()], Some(&path), &mut std::io::empty())
+        move || cli::run(&["tools".to_string(), "a b".to_string()], Some(&path), "/nonexistent/smelt-mcp.sock", &mut std::io::empty())
     });
     let (call_id, _, request) = next_mcp_request(&mut smelt).await;
     assert_eq!(request, McpRequest::List { server: Some("a b".into()) }, "the server name, decoded again");
     answer(&mut smelt, call_id, 200, "{}").await;
     assert_eq!(cli.await.expect("join").0, 0);
 
-    let (code, out, err) = cli::run(&["tools".to_string()], None, &mut std::io::empty());
+    let (code, out, err) = cli::run(&["tools".to_string()], None, "/nonexistent/smelt-mcp.sock", &mut std::io::empty());
     assert_eq!((code, out.as_str()), (3, ""));
     assert!(err.contains("SMELT_MCP_SOCKET isn't set"), "{err}");
-    let (code, _, err) = cli::run(&["frobnicate".to_string()], Some(&path), &mut std::io::empty());
+    let (code, _, err) = cli::run(&["frobnicate".to_string()], Some(&path), "/nonexistent/smelt-mcp.sock", &mut std::io::empty());
     assert_eq!(code, 3);
     assert!(err.starts_with("usage:"), "{err}");
 }
@@ -345,4 +345,25 @@ async fn test_a_reused_pid_of_an_ended_shell_names_the_live_command() {
     let named = command_for_pid(&state, child).await;
     let _ = signal::kill(Pid::from_raw(child), Signal::SIGKILL);
     assert_eq!(named.as_deref(), Some("c-live"));
+}
+
+/// SME-386 M7: under `sudo` or `env -i` the script's environment has no
+/// `$SMELT_MCP_SOCKET`, and `smelt-mcp` falls back to the socket's fixed
+/// path rather than blaming the image. With neither, it says both.
+#[tokio::test]
+async fn test_the_cli_without_the_socket_variable_uses_the_fixed_path() {
+    let (addr, path, _state) = serve_agent_with_socket("fallback").await;
+    let mut smelt = connect_ready(addr).await;
+    let cli = tokio::task::spawn_blocking({
+        let path = path.clone();
+        move || cli::run(&["tools".to_string()], None, &path, &mut std::io::empty())
+    });
+    let (call_id, _, request) = tokio::time::timeout(WAIT, next_mcp_request(&mut smelt)).await.expect("the CLI reached the socket");
+    assert_eq!(request, McpRequest::List { server: None });
+    answer(&mut smelt, call_id, 200, "{}").await;
+    assert_eq!(cli.await.expect("join"), (0, "{}".to_string(), String::new()));
+
+    let (code, _, err) = cli::run(&["tools".to_string()], Some(""), "/nonexistent/smelt-mcp.sock", &mut std::io::empty());
+    assert_eq!(code, 3);
+    assert!(err.contains("SMELT_MCP_SOCKET isn't set") && err.contains("/nonexistent/smelt-mcp.sock"), "{err}");
 }
