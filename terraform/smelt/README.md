@@ -39,13 +39,24 @@ where smelt's own real-cluster test suite runs.
   binds loopback inside the pod, which is the safe default).
 - OAuth and anything else secret go in through `extra_env`; the module has no
   opinion about them.
-- **amd64 only.** Every image CI publishes is built linux/amd64
-  (`publish-images.yml` has no `platforms:`), the Docker sidecar wants the
-  node's own architecture, and the homelab's nodes are all x86_64 — so every
-  pod template here pins `kubernetes.io/arch: amd64`. Sandbox pods carry the
-  same pin in smelt's own pod spec (`src/sandbox/spec.rs`), and language-server
-  pods are bound to their sandbox pod's node, so no pod of this system ever
-  schedules off amd64.
+- **amd64 or arm64 nodes, or a mix.** Images CI publishes from SME-360
+  (#248, 6d2831d) on are built for linux/amd64 and linux/arm64, and so are
+  `postgres_image`'s default (`postgres:17-alpine`) and smelt's default Docker
+  sidecar (`docker:29-dind`, which `SANDBOX_DOCKER_IMAGE` in `extra_env`
+  changes). So no pod template here pins an architecture, and neither does
+  smelt's own sandbox pod spec.
+  - **Tags from before #248 are amd64 only.** On a mixed cluster, move `image`
+    and `sandbox_image` to a later tag in the same apply that picks up this
+    module, or set `node_selector = { "kubernetes.io/arch" = "amd64" }` until
+    you do.
+  - **`node_selector` reaches only the server and the database.** Sandbox and
+    language-server pods have no pin: a single-arch `sandbox_image` or
+    `SANDBOX_DOCKER_IMAGE` needs a single-arch cluster, or a multi-arch image.
+  - **Applying a change to `node_selector` rolls both pods at once:** the
+    database's one pod and the server (Recreate). The server's init container
+    waits about 2 minutes for Postgres, so it's a short outage. The database
+    pod returns to its node either way, since its `local-path` claim is
+    node-local.
 - The pod gets its cluster access from its own ServiceAccount token — no
   kubeconfig is mounted, and none should be.
 
