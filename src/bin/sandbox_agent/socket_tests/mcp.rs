@@ -302,3 +302,47 @@ async fn test_a_large_answer_reaches_the_script_whole() {
     assert_eq!(status, 200, "{}", &got[..got.len().min(200)]);
     assert_eq!(got.len(), body.len());
 }
+
+/// A [`Shell`] record as `start_shell` makes one, for `bash_pid`, with
+/// `stdin` from `child` (any process: nothing writes to it here).
+fn shell_record(child: &mut tokio::process::Child, bash_pid: i32, current: &str, ended: bool) -> Arc<Shell> {
+    Arc::new(Shell {
+        stdin: AsyncMutex::new(child.stdin.take().expect("stdin piped")),
+        bash_pid: bash_pid as u32,
+        current: AsyncMutex::new(Some(current.to_string())),
+        marker: Arc::new(std::sync::Mutex::new(None)),
+        ended: std::sync::atomic::AtomicBool::new(ended),
+    })
+}
+
+/// SME-386 M6: an ended shell's pid is free, and the kernel can hand it
+/// to a process in a live terminal's tree. The walk skips ended shells,
+/// so the call is the live terminal's command, not the old one's.
+#[tokio::test]
+async fn test_a_reused_pid_of_an_ended_shell_names_the_live_command() {
+    use tokio::io::AsyncBufReadExt;
+    // The live terminal's shell, and a child of it.
+    let mut live = Command::new("sh")
+        .args(["-c", "sleep 30 & echo $!; wait"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn the live shell");
+    let live_pid = live.id().expect("running") as i32;
+    let mut line = String::new();
+    let stdout = live.stdout.take().expect("stdout piped");
+    tokio::time::timeout(WAIT, tokio::io::BufReader::new(stdout).read_line(&mut line))
+        .await
+        .expect("the child's pid in time")
+        .expect("read");
+    let child: i32 = line.trim().parse().expect("a pid");
+    // The ended shell, its pid now the live shell's child's.
+    let mut stand_in = Command::new("cat").stdin(Stdio::piped()).kill_on_drop(true).spawn().expect("spawn");
+    let state = new_state();
+    state.terminals.lock().await.insert("t-old".into(), shell_record(&mut stand_in, child, "c-old", true));
+    state.terminals.lock().await.insert("t-live".into(), shell_record(&mut live, live_pid, "c-live", false));
+    let named = command_for_pid(&state, child).await;
+    let _ = signal::kill(Pid::from_raw(child), Signal::SIGKILL);
+    assert_eq!(named.as_deref(), Some("c-live"));
+}
