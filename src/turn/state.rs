@@ -78,6 +78,11 @@ pub(super) struct ConversationRuntime {
     /// `get_attention` to read once the spell has ended. Replaced by the
     /// next one, freed on delete.
     published_notice: Option<(u64, String)>,
+    /// The conversation was deleted (`forget_conversation_lock`) while a
+    /// turn of it was still in flight: that spell's end keeps no
+    /// `published_notice`, which would hold the entry for good (SME-377
+    /// review round 1, L3). Not part of `is_idle`, so the entry still goes.
+    forgotten: bool,
 }
 
 impl ConversationRuntime {
@@ -171,6 +176,7 @@ pub(crate) fn forget_conversation_lock(conversation_id: i64) {
         runtime.attention = None;
         runtime.notified = None;
         runtime.published_notice = None;
+        runtime.forgotten = true;
         runtime.kept = KeptTurnError::default();
     });
 }
@@ -476,7 +482,9 @@ impl Drop for TurnInFlight {
                 // `get_attention` (SME-377), even when a stronger kind
                 // outranks it: a question resolved before the spell ended
                 // falls back to it (review round 1, M1).
-                if let Some(message) = runtime.notified.take() {
+                if let Some(message) = runtime.notified.take()
+                    && !runtime.forgotten
+                {
                     runtime.published_notice = Some((generation, message));
                 }
                 runtime.started_at = None;

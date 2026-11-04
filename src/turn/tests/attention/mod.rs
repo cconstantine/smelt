@@ -475,6 +475,22 @@ async fn test_the_runtime_entry_is_freed_after_a_delete_and_a_published_outcome(
     forget_conversation_lock(conversation.id);
     assert!(!has_turn_state(conversation.id), "the entry goes with the conversation");
     events::forget(conversation.id);
+
+    // Review round 1, L3: the delete and its forget land while a spell is
+    // still running, before the model's notify_user notes its message
+    // (`note_notified`, what the tool's run does). The spell's end must not
+    // keep that message on the forgotten entry, or nothing ever frees it.
+    // The call is made directly: a real turn started after the forget
+    // takes a turn generation, which holds the entry with or without the
+    // fix, so it couldn't show this.
+    let raced = db::create_conversation(&pool).await.expect("conversation");
+    let spell = TurnInFlight::start(raced.id);
+    db::delete_conversation(&pool, raced.id).await.expect("delete");
+    forget_conversation_lock(raced.id);
+    note_notified(raced.id, "Done".to_string());
+    drop(spell);
+    assert!(!has_turn_state(raced.id), "a notify racing the delete strands no entry");
+    events::forget(raced.id);
 }
 
 /// `turn_generation`: 0 with no entry, and the counter the events carry.
