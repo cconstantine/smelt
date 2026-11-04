@@ -1,42 +1,31 @@
 #!/usr/bin/env bash
-# Downloads a headless Chrome-for-Testing binary and the shared libraries
-# it needs, without root and without touching system package state — see
-# docs/testing.md#browser-verification for why this exists.
+# Fetches Debian's headless Chromium (`chromium-headless-shell`) and the
+# shared libraries it needs into a cache directory, without root and without
+# touching system package state — see docs/testing.md#browser-verification
+# for why this exists. Debian's, not Google's Chrome for Testing (SME-360,
+# the user's choice): it's built for both amd64 and arm64, so the browser
+# tier and both arches' server images run the one build. trixie keeps it on
+# Chromium's stable channel through its security archive.
 #
 # Idempotent: safe to re-run; skips anything already fetched. Everything
 # lands under .browser-check-cache/ (gitignored), never in the repo itself.
+# A cache from before SME-360 (Chrome for Testing under chrome/) lacks the
+# new binary, so it is simply fetched again beside it.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CACHE_DIR="${BROWSER_CHECK_CACHE:-$REPO_ROOT/.browser-check-cache}"
-CHROME_DIR="$CACHE_DIR/chrome"
-LIBDIR="$CACHE_DIR/libs/usr/lib/x86_64-linux-gnu"
-BIN="$CHROME_DIR/chrome-headless-shell-linux64/chrome-headless-shell"
+# Debian's multiarch library directory for this machine (x86_64-linux-gnu,
+# aarch64-linux-gnu); `src/headless_chrome.rs` derives the same one.
+TRIPLET="$(uname -m)-linux-gnu"
+LIBDIR="$CACHE_DIR/libs/usr/lib/$TRIPLET"
+BIN="$CACHE_DIR/libs/usr/lib/chromium/chromium-headless-shell"
 
 mkdir -p "$CACHE_DIR"
 
-if [ ! -x "$BIN" ]; then
-    echo "Downloading chrome-headless-shell (Stable channel)..." >&2
-    URL=$(curl -sL https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json \
-        | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-for dl in d['channels']['Stable']['downloads']['chrome-headless-shell']:
-    if dl['platform'] == 'linux64':
-        print(dl['url'])
-        break
-")
-    mkdir -p "$CHROME_DIR"
-    curl -sL "$URL" -o "$CHROME_DIR/chs.zip"
-    unzip -q -o "$CHROME_DIR/chs.zip" -d "$CHROME_DIR"
-    rm "$CHROME_DIR/chs.zip"
-else
-    echo "chrome-headless-shell already present, skipping download." >&2
-fi
-
-if LD_LIBRARY_PATH="$LIBDIR:$LIBDIR/dri:${LD_LIBRARY_PATH:-}" ldd "$BIN" 2>/dev/null | grep -q "not found"; then
-    echo "Fetching missing shared libraries via non-root apt-get..." >&2
+if [ ! -x "$BIN" ] || LD_LIBRARY_PATH="$LIBDIR:$LIBDIR/dri:${LD_LIBRARY_PATH:-}" ldd "$BIN" 2>/dev/null | grep -q "not found"; then
+    echo "Fetching chromium-headless-shell and its libraries via non-root apt-get..." >&2
     APT_DIR="$CACHE_DIR/apt"
     mkdir -p "$APT_DIR/lists/partial" "$APT_DIR/archives/partial" "$CACHE_DIR/debs" "$CACHE_DIR/libs"
 
@@ -55,20 +44,22 @@ if LD_LIBRARY_PATH="$LIBDIR:$LIBDIR/dri:${LD_LIBRARY_PATH:-}" ldd "$BIN" 2>/dev/
     echo "--- fetched lists dir ---" >&2
     ls -la "$APT_DIR/lists" >&2 || true
 
-    # This list was derived by running `ldd` against chrome-headless-shell
-    # and mapping each "not found" .so to its owning Debian package
-    # (trixie). --no-install-recommends keeps this to just the ~35 actual
-    # library packages, not systemd/dbus-daemon/etc. pulled in as
-    # Recommends.
-    # libexpat1 and libffi8 are missing from the original derivation: any
-    # machine you derive it on already has both (python3 depends on them),
-    # so they never show up as "not found" — but chrome-headless-shell
-    # links both directly, and a slim image that runs Chrome without
-    # python3 (the deployment runtime stage) has neither, so Chrome dies at
-    # launch with "error while loading shared libraries: libexpat.so.1".
-    PKGS="libnspr4 libnss3 libatk1.0-0 libatk-bridge2.0-0 libdbus-1-3 \
-libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
-libxkbcommon0 libasound2 libatspi2.0-0 libexpat1 libffi8"
+    # The package and its whole dependency closure, by name, from apt itself
+    # (no Recommends), so the list follows the package on every arch and
+    # every update rather than being derived by hand. The closure, not only
+    # the direct dependencies: one the fetching machine has installed only
+    # transitively (curl brings libbrotli1 into the chrome stage) would
+    # otherwise go unfetched and missing from a slim runtime. libc6 and libgcc-s1 stay the
+    # system's: a second copy on LD_LIBRARY_PATH can't be mixed with the
+    # system's own loader. Naming each one matters (see --reinstall below):
+    # a dependency the fetching machine happens to have installed must still
+    # be fetched for a runtime that hasn't. libexpat1 and libffi8 are the two
+    # that bit before (SME-62's chrome stage: python3 installs both).
+    APT_OPTS=(-o Dir::State::lists="$APT_DIR/lists" -o Dir::Cache="$APT_DIR" -o Dir::Cache::archives="$CACHE_DIR/debs")
+    DEPS=$(apt-cache "${APT_OPTS[@]}" depends --recurse --no-recommends --no-suggests --no-conflicts --no-breaks \
+               --no-replaces --no-enhances chromium-headless-shell \
+           | awk '/^ *(Pre)?Depends:/ {print $2}' | grep -v '^<' | grep -vxE 'libc6|libgcc-s1' | sort -u)
+    PKGS="chromium-headless-shell libffi8 $(printf '%s ' $DEPS)"
 
     # --reinstall is the load-bearing flag: plain `install --print-uris`
     # silently omits any package dpkg already considers installed, so a
@@ -101,11 +92,23 @@ libxkbcommon0 libasound2 libatspi2.0-0 libexpat1 libffi8"
         exit 1
     fi
 
-    (cd "$CACHE_DIR/debs" && printf '%s\n' "$URLS" | xargs -P 8 -n 1 curl -sL -O)
+    # ~120 packages for Debian's Chromium (the old Chrome-for-Testing list was
+    # ~15): four at a time, each retried, and -f so an error page never
+    # lands as a .deb. Eight at once had deb.debian.org refusing
+    # connections ("Failed to connect … port 80") partway through.
+    (cd "$CACHE_DIR/debs" && printf '%s\n' "$URLS" \
+        | xargs -P 4 -n 1 curl -fsSL --retry 3 --retry-connrefused --retry-delay 2 -O)
 
     for deb in "$CACHE_DIR"/debs/*.deb; do
         dpkg-deb -x "$deb" "$CACHE_DIR/libs"
     done
+
+    # libpulse finds its private libpulsecommon through an absolute path to
+    # the system's pulseaudio/ directory, which the cache's copy can't
+    # follow: put copies beside the rest, where LD_LIBRARY_PATH reaches them.
+    if [ -d "$LIBDIR/pulseaudio" ]; then
+        cp -n "$LIBDIR"/pulseaudio/*.so "$LIBDIR"/ 2>/dev/null || true
+    fi
 
     # The fetch was the whole point — confirm it produced a libdir that
     # actually resolves everything Chrome links. Before this, a fetch that

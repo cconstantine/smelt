@@ -337,36 +337,7 @@ fn install(purl: &Purl, source: &Source, bin: &str, notes: &mut Vec<String>) -> 
             ),
             format!("{home}/cargo/bin/{bin}"),
         ),
-        "github" => match github_asset(source) {
-            Some((file, inner)) => {
-                let file = file.replace("{{version}}", &purl.version);
-                if file.contains("{{") {
-                    notes.push(format!("The release asset's name ({file}) has a template smelt doesn't fill in: check the install command."));
-                }
-                let target = format!("{home}/bin/{bin}");
-                let url = shell_word(&format!("https://github.com/{}/releases/download/{}/{file}", purl.path, purl.version))?
-                    .into_owned();
-                let to = shell_word(&target)?;
-                let inner = shell_word(&format!("{home}/opt/{}", inner.as_deref().unwrap_or(bin)))?.into_owned();
-                let command = if file.ends_with(".tar.gz") || file.ends_with(".tgz") {
-                    format!("mkdir -p {home}/bin {home}/opt && curl -fsSL {url} | tar -xz -C {home}/opt && ln -sf {inner} {to}")
-                } else if file.ends_with(".tar.xz") {
-                    format!("mkdir -p {home}/bin {home}/opt && curl -fsSL {url} | tar -xJ -C {home}/opt && ln -sf {inner} {to}")
-                } else if file.ends_with(".zip") {
-                    notes.push("The release is a .zip: the image needs unzip.".to_string());
-                    format!("mkdir -p {home}/bin {home}/opt && curl -fsSL -o {home}/release.zip {url} && unzip -q {home}/release.zip -d {home}/opt && ln -sf {inner} {to}")
-                } else if file.ends_with(".gz") {
-                    format!("mkdir -p {home}/bin && curl -fsSL {url} | gunzip > {to} && chmod +x {to}")
-                } else {
-                    format!("mkdir -p {home}/bin && curl -fsSL -o {to} {url} && chmod +x {to}")
-                };
-                (command, target)
-            }
-            None => {
-                notes.push("The package has no Linux x86-64 release to download: fill in the install command.".to_string());
-                (String::new(), bin.to_string())
-            }
-        },
+        "github" => github_install(purl, source, bin, notes)?,
         other => {
             notes.push(format!("smelt can't suggest an install for pkg:{other} packages: fill in the install command."));
             (String::new(), bin.to_string())
@@ -374,19 +345,81 @@ fn install(purl: &Purl, source: &Source, bin: &str, notes: &mut Vec<String>) -> 
     })
 }
 
-/// The Linux x86-64 release asset: its file, and the executable's path
-/// inside it when it's an archive.
-fn github_asset(source: &Source) -> Option<(String, Option<String>)> {
+/// The architectures smelt installs GitHub releases for: `uname -m`'s
+/// name for each, and the catalog's asset targets for it.
+const GITHUB_ARCHES: [(&str, [&str; 2]); 2] =
+    [("x86_64", ["linux_x64_gnu", "linux_x64"]), ("aarch64", ["linux_arm64_gnu", "linux_arm64"])];
+
+/// The install for a `pkg:github` package: the node's architecture picks
+/// the release asset when the pod starts, and one with no asset for it
+/// fails the install, saying so, instead of installing a binary that
+/// can't run there.
+fn github_install(purl: &Purl, source: &Source, bin: &str, notes: &mut Vec<String>) -> Result<(String, String), String> {
+    let home = POD_HOME;
+    let target = format!("{home}/bin/{bin}");
+    let mut arms = Vec::new();
+    for (arch, targets) in GITHUB_ARCHES {
+        if let Some((file, inner)) = github_asset(source, &targets) {
+            arms.push(format!("{arch}) {} ;;", github_download(purl, &file, inner.as_deref().unwrap_or(bin), &target, notes)?));
+        }
+    }
+    if arms.is_empty() {
+        notes.push("The package has no Linux x86-64 or arm64 release to download: fill in the install command.".to_string());
+        return Ok((String::new(), bin.to_string()));
+    }
+    let name = shell_word(&format!("{}@{}", purl.path, purl.version))?.into_owned();
+    let command = format!(
+        "case \"$(uname -m)\" in {} *) echo {name} has no release for \"$(uname -m)\" >&2; false ;; esac",
+        arms.join(" ")
+    );
+    Ok((command, target))
+}
+
+/// The command that downloads one release asset, `file`, to `target`,
+/// unpacking an archive and linking `inner` in it.
+fn github_download(purl: &Purl, file: &str, inner: &str, target: &str, notes: &mut Vec<String>) -> Result<String, String> {
+    let home = POD_HOME;
+    let file = file.replace("{{version}}", &purl.version);
+    if file.contains("{{") {
+        let note = format!("The release asset's name ({file}) has a template smelt doesn't fill in: check the install command.");
+        if !notes.contains(&note) {
+            notes.push(note);
+        }
+    }
+    let url = shell_word(&format!("https://github.com/{}/releases/download/{}/{file}", purl.path, purl.version))?.into_owned();
+    let to = shell_word(target)?;
+    let inner = shell_word(&format!("{home}/opt/{inner}"))?.into_owned();
+    Ok(if file.ends_with(".tar.gz") || file.ends_with(".tgz") {
+        format!("mkdir -p {home}/bin {home}/opt && curl -fsSL {url} | tar -xz -C {home}/opt && ln -sf {inner} {to}")
+    } else if file.ends_with(".tar.xz") {
+        format!("mkdir -p {home}/bin {home}/opt && curl -fsSL {url} | tar -xJ -C {home}/opt && ln -sf {inner} {to}")
+    } else if file.ends_with(".zip") {
+        let note = "The release is a .zip: the image needs unzip.".to_string();
+        if !notes.contains(&note) {
+            notes.push(note);
+        }
+        format!("mkdir -p {home}/bin {home}/opt && curl -fsSL -o {home}/release.zip {url} && unzip -q {home}/release.zip -d {home}/opt && ln -sf {inner} {to}")
+    } else if file.ends_with(".gz") {
+        format!("mkdir -p {home}/bin && curl -fsSL {url} | gunzip > {to} && chmod +x {to}")
+    } else {
+        format!("mkdir -p {home}/bin && curl -fsSL -o {to} {url} && chmod +x {to}")
+    })
+}
+
+/// The release asset for one architecture, the first whose target is
+/// one of `targets`: its file, and the executable's path inside it when
+/// it's an archive.
+fn github_asset(source: &Source, targets: &[&str]) -> Option<(String, Option<String>)> {
     let assets = source.asset.as_ref()?.as_sequence()?;
-    let for_linux = |asset: &&serde_norway::Value| {
-        let targets: Vec<&str> = match asset.get("target") {
+    let for_arch = |asset: &&serde_norway::Value| {
+        let named: Vec<&str> = match asset.get("target") {
             Some(serde_norway::Value::String(t)) => vec![t.as_str()],
             Some(serde_norway::Value::Sequence(ts)) => ts.iter().filter_map(|t| t.as_str()).collect(),
             _ => vec![],
         };
-        targets.iter().any(|t| *t == "linux_x64_gnu" || *t == "linux_x64")
+        named.iter().any(|t| targets.contains(t))
     };
-    let asset = assets.iter().find(for_linux)?;
+    let asset = assets.iter().find(for_arch)?;
     let file = asset.get("file")?.as_str()?;
     // `file` can name the archive and, after a colon, a directory in it.
     let file = file.split(':').next().unwrap_or(file).to_string();

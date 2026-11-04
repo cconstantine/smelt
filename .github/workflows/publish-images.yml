@@ -23,7 +23,8 @@ on:
   workflow_dispatch:
     inputs:
       # Build something other than what you're running on. The tags come from
-      # whatever ref this runs on.
+      # the commit this resolves to (the `source` job), and a hand run never
+      # moves `latest`.
       ref:
         description: 'Ref to build (branch, tag or sha)'
         required: false
@@ -40,8 +41,44 @@ permissions:
   packages: write
 
 jobs:
-  server-image:
+  # The one commit every job below builds and tags: a hand run's `ref` read
+  # once, so a branch that moves mid-run can't give the two arches (or the
+  # tags) different trees, and the `<sha12>` tag names what was built rather
+  # than the commit the run was started from.
+  source:
     runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.sha }}
+      - name: Resolve the commit
+        id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  # Each image is built natively on both architectures (SME-360): GitHub's
+  # hosted runners have arm64 (`ubuntu-24.04-arm`, free for a public repo),
+  # so there's no QEMU (a release Rust build under emulation is hours) and no
+  # cross-compiling. Each arch pushes by digest; the `*-manifest` job then
+  # puts both digests under the tags as one multi-arch image, so the same
+  # tag runs on an x86_64 host and an arm64 one. A tag only ever names both,
+  # and both images move together: each manifest job needs all four builds,
+  # so if any fails the commit gets no tags at all, server or sandbox, until
+  # it's re-run (`gh run rerun --failed`), rather than a tag that runs on one
+  # architecture or a `latest` server paired with an older `latest` sandbox.
+  server-image:
+    needs: source
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     # A cold build is a full release `dx bundle` of the app, with nothing
     # shared with CI's caches (those build a debug dev image, not this one).
     # Measured: 8.5 min for the release build stage on 32 cores, so the 4-core
@@ -53,7 +90,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.ref || github.sha }}
+          ref: ${{ needs.source.outputs.sha }}
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -62,32 +99,92 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # GHCR repository names must be lowercase, hence the tr. `<sha>` always;
-      # `latest` only for main, so a hand-run build of a branch can't move it.
-      - name: Image tags
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # GHCR repository names must be lowercase, hence the tr.
+      - name: Image name
         id: meta
         run: |
           org=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
-          tags="ghcr.io/$org/smelt:${GITHUB_SHA::12}"
-          [ "$GITHUB_REF" = "refs/heads/main" ] && tags="$tags,ghcr.io/$org/smelt:latest"
-          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "name=ghcr.io/$org/smelt" >> "$GITHUB_OUTPUT"
+          echo "arch=${{ matrix.platform }}" | tr '/' '-' | sed 's/^arch=linux-/arch=/' >> "$GITHUB_OUTPUT"
 
       # `--target runtime` builds the server binary and its web bundle, then
-      # copies both into a slim runtime along with headless Chrome; the build
-      # stages are dropped. A quiet build long after "Client build completed
-      # successfully" is dx's server half hanging (SME-67) — the job's
-      # timeout, not a runner limit, is what ends that.
-      - name: Build and push
+      # copies both into a slim runtime along with headless Chromium (Debian's,
+      # for both arches: scripts/browser-check/setup.sh); the build stages are
+      # dropped, and the runtime stage's own RUN starts Chromium, so an arch
+      # whose browser can't start fails here. Pushed by digest only: the tags
+      # go on in server-manifest, once both arches are built.
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
           target: runtime
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ steps.meta.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Keep the digest
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "$RUNNER_TEMP/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-digest-${{ steps.meta.outputs.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Both arches' digests under the tags: `<sha12>` of the commit built
+  # always, `latest` only for a push to main, so a hand run can't move it.
+  server-manifest:
+    needs: [source, server-image, sandbox-image]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: server-digest-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Tag the multi-arch image
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          org=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          name="ghcr.io/$org/smelt"
+          sha="${{ needs.source.outputs.sha }}"
+          tags=(-t "$name:${sha::12}")
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+            tags+=(-t "$name:latest")
+          fi
+          docker buildx imagetools create "${tags[@]}" $(printf "$name@sha256:%s " *)
+          docker buildx imagetools inspect "$name:${sha::12}"
 
   sandbox-image:
-    runs-on: ubuntu-latest
+    needs: source
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     # The agent needs the same dependency tree compiled in release, minus the
     # wasm half — and the build environment image on top of that.
     timeout-minutes: 120
@@ -95,7 +192,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.ref || github.sha }}
+          ref: ${{ needs.source.outputs.sha }}
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -104,10 +201,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
       # The agent binary, compiled in the repo's own build environment rather
       # than on the runner: the same image and toolchain the server image builds
       # with, so its glibc matches what docker/sandbox/Dockerfile runs it on
-      # (docs/setup.md). scripts/build-sandbox-agent.sh leaves the result at
+      # (docs/setup.md). On each arch's own runner, so it's that arch's binary.
+      # scripts/build-sandbox-agent.sh leaves the result at
       # target/sandbox-agent/sandbox_agent, which is the image's whole context.
       - name: Build the sandbox agent
         run: |
@@ -115,24 +216,74 @@ jobs:
           docker run --rm -v "$PWD:/app" -w /app smelt-build-env \
             scripts/build-sandbox-agent.sh --release
 
-      # As for the server image, plus the name this tree's agent sources hash
-      # to — the same 16 hex digits scripts/sandbox-image-ref prints — so the
-      # image a node was given through the old import route is still findable
-      # by the name it had there.
-      - name: Image tags
+      - name: Image name
         id: meta
         run: |
           org=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
-          hash=$(scripts/agent-sources-hash)
-          name="ghcr.io/$org/smelt-sandbox"
-          tags="$name:${GITHUB_SHA::12},$name:src-${hash:0:16}"
-          [ "$GITHUB_REF" = "refs/heads/main" ] && tags="$tags,$name:latest"
-          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "name=ghcr.io/$org/smelt-sandbox" >> "$GITHUB_OUTPUT"
+          echo "arch=${{ matrix.platform }}" | tr '/' '-' | sed 's/^arch=linux-/arch=/' >> "$GITHUB_OUTPUT"
 
-      - name: Build and push
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: target/sandbox-agent
           file: docker/sandbox/Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ steps.meta.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Keep the digest
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "$RUNNER_TEMP/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-digest-${{ steps.meta.outputs.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # As for the server image, plus the name this tree's agent sources hash to
+  # — the same 16 hex digits scripts/sandbox-image-ref prints — so the image a
+  # node was given through the old import route is still findable by the name
+  # it had there.
+  sandbox-manifest:
+    needs: [source, server-image, sandbox-image]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.source.outputs.sha }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sandbox-digest-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Tag the multi-arch image
+        run: |
+          org=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          hash=$(scripts/agent-sources-hash)
+          name="ghcr.io/$org/smelt-sandbox"
+          sha="${{ needs.source.outputs.sha }}"
+          tags=(-t "$name:${sha::12}" -t "$name:src-${hash:0:16}")
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+            tags+=(-t "$name:latest")
+          fi
+          cd "$RUNNER_TEMP/digests"
+          docker buildx imagetools create "${tags[@]}" $(printf "$name@sha256:%s " *)
+          docker buildx imagetools inspect "$name:${sha::12}"
