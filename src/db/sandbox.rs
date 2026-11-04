@@ -105,6 +105,14 @@ pub struct LivePodRow {
     pub observed_at: NaiveDateTime,
 }
 
+/// Every live pod's id, oldest first: the startup reconnect's list
+/// (SME-359).
+pub async fn live_sandbox_pod_ids(pool: &PgPool) -> Result<Vec<i64>, sqlx::Error> {
+    sqlx::query_scalar("SELECT id FROM sandbox_pods WHERE terminated_at IS NULL ORDER BY id")
+        .fetch_all(pool)
+        .await
+}
+
 /// Every live pod, oldest first — the pods view's rows.
 pub async fn list_live_pods(pool: &PgPool) -> Result<Vec<LivePodRow>, sqlx::Error> {
     sqlx::query_as::<_, LivePodRow>(&format!(

@@ -177,6 +177,9 @@ async fn start_up(dotenv_problem: Option<String>) -> tokio::net::TcpListener {
     // Conversations the user stopped stay paused across a restart
     // (SME-238): restored before anything below can wake one.
     turn::restore_pauses(pool).await;
+    // Every live pod's agent, so scripts' MCP calls work again at once
+    // (SME-359). After the pauses: a delivered exit can wake a turn.
+    sandbox::reconnect_live_pods(pool).await;
     // Keeps pod records in step with the cluster, so the sidebar's dots
     // and /pods match it. Only here, never in the browser test harness:
     // see `sandbox::watch_pods`.

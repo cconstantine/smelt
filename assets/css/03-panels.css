@@ -497,6 +497,13 @@
     font-size: 11px;
 }
 
+/* SME-359: one line of what the command's scripts did with MCP tools. */
+.sandbox-command-mcp {
+    color: var(--muted);
+    font-size: 11px;
+    margin: 2px 0;
+}
+
 .task-terminal-cursor {
     display: inline-block;
     width: 7px;

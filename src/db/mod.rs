@@ -75,6 +75,7 @@ mod language_servers;
 mod providers;
 mod secrets;
 mod storage_grace;
+mod script_mcp;
 
 pub use agents::*;
 pub use conversations::*;
@@ -89,6 +90,7 @@ pub use language_servers::*;
 pub use providers::*;
 pub use secrets::*;
 pub use storage_grace::*;
+pub use script_mcp::*;
 
 #[cfg(test)]
 mod tests;

@@ -69,6 +69,24 @@ pub async fn call_tool_classed(
     arguments: serde_json::Value,
     check_class: impl FnOnce(crate::anthropic::tools::ToolClass, &str) -> Result<(), String> + Send,
 ) -> Result<String, String> {
+    let result = call_tool_raw(pool, config, tool_name, arguments, check_class).await?;
+    let content = result_text(&result);
+    if result.is_error.unwrap_or(false) { Err(content) } else { Ok(content) }
+}
+
+/// [`call_tool_classed`]'s call, with the server's result as it came:
+/// every content block, `structured_content` and `is_error` (SME-359: a
+/// script in the sandbox reads it as data). A result with `is_error` set
+/// is `Ok` here, and marks the `mcp call` span failed without its text.
+/// An `Err` is smelt's own: the call was refused, or failed below MCP, or
+/// the server answered with a JSON-RPC error.
+pub async fn call_tool_raw(
+    pool: &sqlx::PgPool,
+    config: &McpServerConfig,
+    tool_name: &str,
+    arguments: serde_json::Value,
+    check_class: impl FnOnce(crate::anthropic::tools::ToolClass, &str) -> Result<(), String> + Send,
+) -> Result<rmcp::model::CallToolResult, String> {
     use tracing::field::Empty;
     // The server and tool, never the arguments or result (SME-137).
     let span = tracing::info_span!(
@@ -79,22 +97,80 @@ pub async fn call_tool_classed(
         otel.status_description = Empty,
     );
     crate::telemetry::in_span(span.clone(), async move {
-        call_tool_unspanned(pool, config, tool_name, arguments, check_class).await.map_err(|e| match e {
-            CallFailure::Reported(message) => {
-                crate::telemetry::mark_error(&span, CallFailure::REPORTED);
-                message
+        match call_tool_unspanned(pool, config, tool_name, arguments, check_class).await {
+            Ok(result) => {
+                if result.is_error.unwrap_or(false) {
+                    crate::telemetry::mark_error(&span, CallFailure::REPORTED);
+                }
+                Ok(result)
             }
-            CallFailure::Failed(message) => {
-                crate::telemetry::mark_error(&span, &message);
-                message
+            Err(failure) => {
+                let message = match failure {
+                    CallFailure::Reported(message) => {
+                        crate::telemetry::mark_error(&span, CallFailure::REPORTED);
+                        message
+                    }
+                    CallFailure::Failed(message) => {
+                        crate::telemetry::mark_error(&span, &message);
+                        message
+                    }
+                    CallFailure::Transport { message, description } => {
+                        crate::telemetry::mark_error(&span, &description);
+                        message
+                    }
+                };
+                // Read the grant again: a refresh during the call may have
+                // replaced the tokens `config` was read with.
+                Err(redact_secrets_now(pool, config, &message).await)
             }
-            CallFailure::Transport { message, description } => {
-                crate::telemetry::mark_error(&span, &description);
-                message
-            }
-        })
+        }
     })
     .await
+}
+
+/// The name `config`'s server lists the tool a script asked for under
+/// (SME-359 review 1, M3): `part` exactly, or, for a model-facing
+/// `mcp__…` name (`by_model_name`), the listed tool whose model name it
+/// is. `None` when the server lists no such tool: a script calls only
+/// listed tools, by their listed names, so a name that merely maps to one
+/// (another case, a zero-width character, an embedded `/`) is never sent.
+/// An `Err` is a connect failure, its secrets redacted.
+pub async fn listed_tool_for_script(
+    pool: &sqlx::PgPool,
+    config: &McpServerConfig,
+    part: &str,
+    by_model_name: bool,
+) -> Result<Option<String>, String> {
+    if let Err(e) = ensure_connected(pool, config, Attempt::SkipRecentFailures).await {
+        return Err(redact_secrets_now(pool, config, &e.message).await);
+    }
+    let registry = REGISTRY.lock().await;
+    let Some(conn) = registry.get(&config.id) else {
+        return Err(format!("not connected to MCP server {:?}", config.name));
+    };
+    let wanted = namespaced_tool_name(&config.name, part);
+    Ok(conn
+        .tools
+        .iter()
+        .find(|tool| {
+            if by_model_name { namespaced_tool_name(&config.name, &tool.name) == wanted } else { tool.name == part }
+        })
+        .map(|tool| tool.name.to_string()))
+}
+
+/// A result's text for the model: `content[].text` blocks joined with
+/// newlines; any other block type (image, resource, ...) JSON-encoded
+/// inline rather than dropped.
+pub fn result_text(result: &rmcp::model::CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .map(|block| match block {
+            McpContentBlock::Text(text) => text.text.clone(),
+            other => serde_json::to_string(other).unwrap_or_else(|_| "<unrepresentable MCP content block>".to_string()),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// How a `tools/call` failed: the tool said so, in output of its own (or
@@ -135,7 +211,7 @@ async fn call_tool_unspanned(
     tool_name: &str,
     arguments: serde_json::Value,
     check_class: impl FnOnce(crate::anthropic::tools::ToolClass, &str) -> Result<(), String>,
-) -> Result<String, CallFailure> {
+) -> Result<rmcp::model::CallToolResult, CallFailure> {
     let arguments = match arguments {
         serde_json::Value::Object(map) => Some(map),
         serde_json::Value::Null => None,
@@ -239,20 +315,109 @@ async fn call_tool_unspanned(
         }
     };
 
-    let content = result
-        .content
-        .into_iter()
-        .map(|block| match block {
-            McpContentBlock::Text(text) => text.text,
-            other => serde_json::to_string(&other)
-                .unwrap_or_else(|_| "<unrepresentable MCP content block>".to_string()),
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    Ok(result)
+}
 
-    if result.is_error.unwrap_or(false) {
-        Err(CallFailure::Reported(content))
-    } else {
-        Ok(content)
+/// [`redact_secrets`] with the grant as it is stored now, falling back to
+/// `config`'s alone when it can't be read.
+async fn redact_secrets_now(pool: &sqlx::PgPool, config: &McpServerConfig, text: &str) -> String {
+    let current = match config.auth_mode.as_str() {
+        "oauth" => crate::db::get_mcp_server_config(pool, config.id).await.ok().flatten(),
+        _ => None,
+    };
+    let text = redact_secrets(config, text);
+    match current {
+        Some(current) => redact_secrets(&current, &text),
+        None => text,
+    }
+}
+
+/// What stands in for a secret in error text.
+pub const REDACTED: &str = "<redacted>";
+
+/// `text` with every secret `config` holds replaced by [`REDACTED`]
+/// (SME-359): the URL's query (whole, and each value) and password,
+/// every extra header's value, the OAuth client secret and every token
+/// in the stored grant. An error from a call can quote any of them (a
+/// connect error quotes the URL, a server's error page the request's
+/// headers), and the text reaches the model and a script in the pod.
+/// A value under 4 characters is left alone: it can't be told apart
+/// from ordinary text, and replacing it would garble the message.
+pub fn redact_secrets(config: &McpServerConfig, text: &str) -> String {
+    let mut secrets: Vec<String> = Vec::new();
+    // The query as configured and as `url` normalizes it (reqwest prints
+    // the normalized form), and each value that looks like a key, raw and
+    // decoded. Not every value: Exa's built-in URL has
+    // `?tools=web_search_exa`, and that tool's name isn't a secret
+    // (SME-359's hands-on check found it redacted from every error).
+    // A value whose parameter's name says it's a credential goes whatever
+    // its shape (review round 1, M1).
+    let raw_query = config.url.split_once('?').map(|(_, rest)| rest.split('#').next().unwrap_or(rest).to_string());
+    secrets.extend(raw_query.clone());
+    if let Some(query) = &raw_query {
+        secrets.extend(
+            query
+                .split('&')
+                .filter_map(|pair| pair.split_once('='))
+                .filter(|(name, value)| names_a_credential(name) || looks_like_a_key(value))
+                .map(|(_, value)| value.to_string()),
+        );
+    }
+    if let Ok(url) = url::Url::parse(&config.url) {
+        secrets.extend(url.query().map(str::to_string));
+        secrets.extend(
+            url.query_pairs()
+                .filter(|(name, value)| names_a_credential(name) || looks_like_a_key(value))
+                .map(|(_, value)| value.into_owned()),
+        );
+        secrets.extend(url.password().map(str::to_string));
+        // A token can be the URL's user part (`https://ghp_…@host`).
+        secrets.extend(Some(url.username().to_string()).filter(|user| !user.is_empty()));
+    }
+    secrets.extend(config.extra_headers.values().cloned());
+    // A header's value can be quoted without its scheme ("Bearer ").
+    secrets.extend(config.extra_headers.values().filter_map(|value| value.split_once(' ').map(|(_, rest)| rest.to_string())));
+    secrets.extend(config.oauth_client_secret.clone());
+    if let Some(credentials) = &config.oauth_credentials {
+        collect_tokens(&credentials.0, &mut secrets);
+    }
+    secrets.retain(|secret| secret.chars().count() >= 4);
+    // Longest first, so a value inside a longer one doesn't leave the
+    // rest of the longer one behind.
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    secrets.dedup();
+    secrets.iter().fold(text.to_string(), |text, secret| text.replace(secret.as_str(), REDACTED))
+}
+
+/// Whether a query parameter's name says its value is a credential.
+fn names_a_credential(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    ["key", "token", "secret", "auth", "password", "passwd", "pwd", "credential", "signature"].iter().any(|word| name.contains(word))
+        || name.starts_with("api")
+}
+
+/// Whether a URL query value, seen on its own, could be a credential: 16
+/// characters or more, with both letters and digits, as API keys are and
+/// tool names and flags aren't.
+fn looks_like_a_key(value: &str) -> bool {
+    value.chars().count() >= 16 && value.chars().any(|c| c.is_ascii_digit()) && value.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// Every string under a key that names a token or secret, anywhere in a
+/// stored grant (rmcp's `StoredCredentials`).
+fn collect_tokens(value: &serde_json::Value, into: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                match value {
+                    serde_json::Value::String(text) if key.ends_with("_token") || key.ends_with("secret") => {
+                        into.push(text.clone())
+                    }
+                    other => collect_tokens(other, into),
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter().for_each(|item| collect_tokens(item, into)),
+        _ => {}
     }
 }

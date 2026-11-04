@@ -70,11 +70,13 @@ fn test_an_event_type_added_later_decodes_as_unknown() {
 /// SME-71: the notifier passes the kind it was told back to
 /// `get_attention`, so `Attention` travels as a plain string — and the
 /// server's "keep the maximum" relies on this exact priority order:
-/// a question outranks a failure, a failure outranks a finished turn.
+/// a question outranks a failure, a failure outranks the model's own
+/// `notify_user` (SME-377). `Finished`, the automatic note it replaces,
+/// no longer parses: a tab on an older bundle reloads.
 #[test]
 fn test_attention_is_a_string_on_the_wire_and_orders_by_priority() {
     for (attention, name) in [
-        (Attention::Finished, "Finished"),
+        (Attention::Notified, "Notified"),
         (Attention::CutOff, "CutOff"),
         (Attention::Refused, "Refused"),
         (Attention::Failed, "Failed"),
@@ -84,10 +86,11 @@ fn test_attention_is_a_string_on_the_wire_and_orders_by_priority() {
         assert_eq!(serde_json::to_string(&attention).expect("serialize"), json);
         assert_eq!(serde_json::from_str::<Attention>(&json).expect("deserialize"), attention);
     }
-    let by_priority = [Attention::Finished, Attention::CutOff, Attention::Refused, Attention::Failed, Attention::Question];
+    let by_priority = [Attention::Notified, Attention::CutOff, Attention::Refused, Attention::Failed, Attention::Question];
     for pair in by_priority.windows(2) {
         assert!(pair[0] < pair[1], "{:?} should rank below {:?}", pair[0], pair[1]);
     }
+    assert!(serde_json::from_str::<Attention>("\"Finished\"").is_err(), "the automatic Finished is gone");
 }
 
 /// SME-71: the exact shape the leader and the chat tabs' counts read.
@@ -199,6 +202,10 @@ fn one_of_each() -> Vec<ConversationEvent> {
                 cache_read_input_tokens: 4,
             },
             context_window: 200_000,
+        },
+        ConversationEvent::SandboxMcpCalls {
+            command_id: "cmd-1".to_string(),
+            summary: crate::api::mcp_calls::McpCallSummary { calls: 2, tools: vec![("linear/get".to_string(), 2)], refused: 1, ..Default::default() },
         },
         ConversationEvent::TodoListUpdate {
             items: vec![crate::anthropic::tools::TodoItem {

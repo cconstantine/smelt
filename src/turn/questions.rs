@@ -116,6 +116,15 @@ pub(super) async fn ask(
     Ok(())
 }
 
+/// Notes that a turn of `conversation_id` filed a repo trust card
+/// (SME-377): the card waits on the user like a question, so the busy
+/// spell owes a Question. `git::load_instructions` asking and
+/// `start_agent`'s refusal on an undecided repo call it; a child's own
+/// start-time card, which fails the start and is deleted, doesn't.
+pub(crate) fn note_trust_card(conversation_id: i64) {
+    note_attention(conversation_id, crate::events::Attention::Question);
+}
+
 /// Tells every tab on the conversation which question it waits on, and
 /// every tab's sidebar that the set of waiting conversations changed.
 fn publish_question(conversation_id: i64, question: Option<PendingQuestion>) {
@@ -133,20 +142,6 @@ pub(crate) async fn pending_question(pool: &PgPool, conversation_id: i64) -> Ser
     Ok(question
         .filter(|q| q.answer.is_none() && q.asked_of == db::ASKED_OF_USER)
         .map(|q| PendingQuestion { tool_use_id: q.tool_use_id, questions: q.questions }))
-}
-
-/// Whether `conversation_id` waits on an unanswered question of either
-/// kind — the user's card or its parent's (SME-71): a turn's Ok end owes
-/// no Finished while a wait is what it owes instead (the user-row wait
-/// already noted its Question; the parent-row wait notes nothing). The
-/// `asked_of` split — which waits on whom — stays in `pending_question`;
-/// this is the one "a row waits, unanswered" check every such call site
-/// uses.
-pub(crate) async fn question_waits(pool: &PgPool, conversation_id: i64) -> ServerFnResult<bool> {
-    let row = db::get_pending_question(pool, conversation_id)
-        .await
-        .map_err(ServerFnError::new)?;
-    Ok(row.is_some_and(|q| q.answer.is_none()))
 }
 
 /// The card's answer to question `tool_use_id`: checked, recorded once

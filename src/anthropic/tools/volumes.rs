@@ -19,7 +19,7 @@ pub(super) fn tools() -> Vec<Tool> {
                               letters, digits, `-` and `_`, and must differ from every volume you mount, your own \
                               and any passed down to you. `mount_path` is absolute (`~` is the sandbox home); it is \
                               refused at or under /workspace, /etc/smelt, /run/docker-sock, /run/docker, \
-                              /run/containerd or a system directory (/etc, /usr, /bin, /lib, /lib64, \
+                              /run/containerd, /run/smelt, /run or a system directory (/etc, /usr, /bin, /lib, /lib64, \
                               /sbin, /proc, /sys, /dev, /var/lib/docker), at a global volume's path, or \
                               where one of your other mounts already sits. Your pod's volumes are fixed \
                               when it starts: with a pod running, the volume mounts from your next start \

@@ -13,7 +13,7 @@
 //! — commands go down with `Eval::send`, everything the browser observed
 //! (its state, focus, clicks, lock changes) comes up as `dioxus.send`
 //! messages, a tick every 300 ms keeping the leader's read of the setting,
-//! the permission and the clock fresh. The JS is deliberately dumb: it
+//! and the permission fresh. The JS is deliberately dumb: it
 //! reports and
 //! constructs; every decision is one of the pure functions below, unit-
 //! tested in the server build. `live.rs` feeds conversation-relayed
@@ -31,12 +31,6 @@ use super::Route;
 
 #[cfg(test)]
 mod tests;
-
-/// A second Finished for one conversation inside 30 s is dropped, so a
-/// chain of quick command-notice turns doesn't buzz each time (decided
-/// 2026-11-03). Question, Failed, CutOff and Refused are never held back.
-/// Milliseconds against JS's clock — `Instant` isn't a thing on wasm.
-const FINISHED_COOLDOWN_MS: f64 = 30_000.0;
 
 /// What `Notification.permission` says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,46 +120,43 @@ pub(crate) fn notify_mode(
 }
 
 /// The leader's steps before showing (plan): the setting (off — another
-/// tab may have turned it off), watching this conversation with this tab
-/// visible and focused (the user is right there), and the Finished
-/// cooldown. The server's own re-check (`api::notifications`) comes
-/// after these; this is everything in front of it.
-pub(crate) fn should_notify(
-    setting_on: bool,
-    visible: bool,
-    focused: bool,
-    showing_this: bool,
-    attention: Attention,
-    ms_since_last_finished: Option<f64>,
-) -> bool {
+/// tab may have turned it off), and watching this conversation with this
+/// tab visible and focused (the user is right there). No kind has a
+/// cooldown: the one there was held back the automatic Finished, which
+/// SME-377 removed, and the model's `notify_user` is once per task. The
+/// server's own re-check (`api::notifications`) comes after these; this
+/// is everything in front of it.
+pub(crate) fn should_notify(setting_on: bool, visible: bool, focused: bool, showing_this: bool) -> bool {
     if !setting_on {
         return false;
     }
-    if visible && focused && showing_this {
-        return false;
-    }
-    if attention == Attention::Finished && ms_since_last_finished.is_some_and(|ms| ms < FINISHED_COOLDOWN_MS) {
-        return false;
-    }
-    true
+    !(visible && focused && showing_this)
 }
 
 /// The notification's heading and body per kind: the heading names what
 /// happened, the body names the conversation, plus the first question's
-/// header where there is one.
-pub(crate) fn notification_text(attention: Attention, title: &str, question_header: Option<&str>) -> (String, String) {
+/// header where there is one. The model's own `notify_user` (SME-377)
+/// puts the conversation in the heading and its `message` in the body,
+/// falling back to the title when there's none.
+pub(crate) fn notification_text(
+    attention: Attention,
+    title: &str,
+    question_header: Option<&str>,
+    message: Option<&str>,
+) -> (String, String) {
     let heading = match attention {
-        Attention::Question => "smelt has a question",
-        Attention::Failed => "smelt: the turn failed",
-        Attention::CutOff => "smelt: the reply was cut off",
-        Attention::Refused => "smelt: the model refused",
-        Attention::Finished => "smelt: done",
+        Attention::Question => "smelt has a question".to_string(),
+        Attention::Failed => "smelt: the turn failed".to_string(),
+        Attention::CutOff => "smelt: the reply was cut off".to_string(),
+        Attention::Refused => "smelt: the model refused".to_string(),
+        Attention::Notified => format!("smelt: {title}"),
     };
-    let body = match (attention, question_header) {
-        (Attention::Question, Some(header)) if !header.is_empty() => format!("{title} — {header}"),
+    let body = match (attention, question_header, message) {
+        (Attention::Question, Some(header), _) if !header.is_empty() => format!("{title} — {header}"),
+        (Attention::Notified, _, Some(message)) if !message.is_empty() => message.to_string(),
         _ => title.to_string(),
     };
-    (heading.to_string(), body)
+    (heading, body)
 }
 
 /// The `tag`, so a second event for one conversation replaces its first
@@ -385,9 +376,9 @@ function state() {
   let permission = "default";
   const hasNotification = typeof Notification === "function";
   if (hasNotification) { permission = Notification.permission; }
-  return { ev: "state", secure: !!self.isSecureContext, hasNotification, hasLocks: !!navigator.locks, permission, setting: N.setting, throws: N.throws, now: Date.now() };
+  return { ev: "state", secure: !!self.isSecureContext, hasNotification, hasLocks: !!navigator.locks, permission, setting: N.setting, throws: N.throws };
 }
-function tick() { return { ev: "tick", setting: readSetting(), focused: document.hasFocus(), visible: document.visibilityState === "visible", permission: typeof Notification === "function" ? Notification.permission : "default", now: Date.now() }; }
+function tick() { return { ev: "tick", setting: readSetting(), focused: document.hasFocus(), visible: document.visibilityState === "visible", permission: typeof Notification === "function" ? Notification.permission : "default" }; }
 function releaseLock() {
   N.intentional = true;
   if (N.heldResolve) { N.heldResolve(); N.heldResolve = null; }
@@ -492,7 +483,6 @@ struct Page {
     throws: bool,
     visible: bool,
     focused: bool,
-    now: f64,
 }
 
 #[cfg(feature = "web")]
@@ -536,7 +526,6 @@ async fn notifier(
         throws: false,
         visible: true,
         focused: false,
-        now: 0.0,
     };
     let mut leader = false;
     let mut leader_task: Option<dioxus::prelude::dioxus_core::Task> = None;
@@ -549,7 +538,6 @@ async fn notifier(
     // notification.
     let mut needers: BTreeMap<i64, (Attention, u64)> = BTreeMap::new();
     let mut open: BTreeMap<i64, (Attention, u64)> = BTreeMap::new();
-    let mut last_finished: BTreeMap<i64, f64> = BTreeMap::new();
     let mut title_sent = String::new();
     let mut revalidate_seen: u64 = 0;
     let favicon_plain = asset!("/assets/favicon.svg").to_string();
@@ -571,7 +559,6 @@ async fn notifier(
                     .unwrap_or(page.permission);
                 page.throws = flag(&from_js, "throws");
                 page.setting = flag(&from_js, "setting");
-                page.now = num(&from_js, "now").unwrap_or(page.now);
                 set_mode(&mut status, page.mode());
             }
             "tick" => {
@@ -581,7 +568,6 @@ async fn notifier(
                 if let Some(permission) = from_js.get("permission").and_then(serde_json::Value::as_str) {
                     page.permission = Permission::from_js(permission);
                 }
-                page.now = num(&from_js, "now").unwrap_or(page.now);
                 set_mode(&mut status, page.mode());
             }
             "leader" => {
@@ -633,7 +619,7 @@ async fn notifier(
                 needers.insert(event.conversation_id, (event.attention, event.generation));
             }
             if leader {
-                notify_leader(&send, &page, &shown, &mut open, &mut last_finished, event).await;
+                notify_leader(&send, &page, &shown, &mut open, event).await;
             }
         }
         let queued: Vec<crate::events::AppEvent> = app_queue.write().drain(..).collect();
@@ -644,7 +630,7 @@ async fn notifier(
                     if !(page.focused && page.visible) {
                         needers.insert(conversation_id, (attention, generation));
                     }
-                    notify_leader(&send, &page, &shown, &mut open, &mut last_finished, event).await;
+                    notify_leader(&send, &page, &shown, &mut open, event).await;
                 }
                 crate::events::AppEvent::TurnsChanged | crate::events::AppEvent::QuestionsChanged => {
                     revalidate_open(&send, &mut needers, &mut open).await;
@@ -723,12 +709,10 @@ async fn notify_leader(
     page: &Page,
     shown: &Signal<Option<i64>>,
     open: &mut std::collections::BTreeMap<i64, (Attention, u64)>,
-    last_finished: &mut std::collections::BTreeMap<i64, f64>,
     event: NeedsUserEvent,
 ) {
     let showing_this = *shown.peek() == Some(event.conversation_id);
-    let since_last = last_finished.get(&event.conversation_id).map(|then| page.now - then);
-    if !should_notify(page.setting, page.visible, page.focused, showing_this, event.attention, since_last) {
+    if !should_notify(page.setting, page.visible, page.focused, showing_this) {
         return;
     }
     // A denied or never-asked permission decides it here, in page, before
@@ -752,7 +736,10 @@ async fn notify_leader(
     else {
         return;
     };
-    let (heading, body) = notification_text(event.attention, &details.title, details.question_header.as_deref());
+    let (heading, body) =
+        // The server's kind, not the event's: a question resolved mid-spell
+        // answers with the spell's notify_user instead (SME-377 review 1).
+        notification_text(details.attention, &details.title, details.question_header.as_deref(), details.message.as_deref());
     send(serde_json::json!({
         "cmd": "notify",
         "id": event.conversation_id,
@@ -761,9 +748,6 @@ async fn notify_leader(
         "tag": notification_tag(event.conversation_id),
     }));
     open.insert(event.conversation_id, (event.attention, event.generation));
-    if event.attention == Attention::Finished {
-        last_finished.insert(event.conversation_id, page.now);
-    }
 }
 
 /// The leader's own stream: app events into the queue, reconnecting like

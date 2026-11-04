@@ -37,6 +37,10 @@ pub struct SandboxCommandSummary {
     pub status: String,
     pub exit_code: Option<i32>,
     pub output: Vec<SandboxOutputLine>,
+    /// What the command's scripts did with MCP tools (SME-359), when they
+    /// called any.
+    #[serde(default)]
+    pub mcp_calls: Option<crate::api::mcp_calls::McpCallSummary>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -118,11 +122,13 @@ async fn fetch_command_summary(
     // by `seq` into the order the lines actually happened in.
     let mut output: Vec<db::TerminalLine> = stdout.into_iter().chain(stderr).collect();
     output.sort_by_key(|line| line.seq);
+    let mcp_calls = sandbox::script_mcp_summary(pool, command.conversation_id, &command.command_id).await.ok().flatten();
     Some(SandboxCommandSummary {
         command_id: command.command_id.clone(),
         command: command.command.clone(),
         status: status.status,
         exit_code: status.exit_code,
+        mcp_calls,
         output: output
             .into_iter()
             .map(|line| SandboxOutputLine {

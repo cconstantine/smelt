@@ -5,6 +5,7 @@ smelt is an MCP client (SME-15): the model can use tools from externally hosted 
 - `src/mcp/`: the connection registry (`mod.rs`), tool naming and the model's tool list (`tools.rs`), calling a tool and turning its result into a `ToolResult` string (`call.rs`), and an OAuth server's shared `AuthClient` and sign-in check (`oauth_client.rs`).
 - `src/mcp_oauth.rs`: OAuth wiring around `rmcp::transport::auth` (SME-16).
 - `src/api/mcp.rs`: the `/mcp-servers` pages' server functions (listed in [api.md](api.md#current-endpoints)).
+- Scripts in a sandbox call these tools too, through the agent's MCP socket and `smelt-mcp`, by the model's own rules (SME-359): see [sandbox-mcp.md](sandbox-mcp.md). Every call's error text has the server's URL query, header values and OAuth tokens redacted (`call::redact_secrets`).
 
 Only remote servers over Streamable HTTP are supported; nothing runs an MCP server locally.
 

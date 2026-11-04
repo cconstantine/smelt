@@ -41,6 +41,33 @@ async fn test_finish_called_by_a_root_is_refused(pool: PgPool) {
     assert_eq!(result, Err("finish is only for an agent".to_string()));
 }
 
+/// T7 (SME-377): `notify_user` is offered to a conversation the user
+/// started and not to an agent, and a child's call (an old history, or a
+/// call to a tool it wasn't offered) is refused before it notes anything.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_notify_user_is_offered_to_a_root_only_and_refused_to_a_child(pool: PgPool) {
+    setup(&pool, vec![text_reply("ok")]).await;
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    let child = bare_child(&pool, root).await;
+    let root_tools = crate::anthropic::tools::tool_definitions(&pool, root).await;
+    assert!(names(&root_tools).contains(&"notify_user"), "{:?}", names(&root_tools));
+    let child_tools = crate::anthropic::tools::tool_definitions(&pool, child).await;
+    assert!(!names(&child_tools).contains(&"notify_user"), "{:?}", names(&child_tools));
+    let turn = crate::turn::count_a_test_turn(child);
+    let result =
+        crate::anthropic::tools::execute(&pool, child, "toolu_1", "notify_user", &serde_json::json!({"message": "done"})).await;
+    drop(turn);
+    assert_eq!(
+        result,
+        Err("notify_user is for a conversation the user started; an agent reports to its parent with finish".to_string())
+    );
+    assert_eq!(
+        crate::turn::published_notice(child, crate::turn::turn_generation(child)),
+        None,
+        "the refused call noted nothing"
+    );
+}
+
 /// `start_agent` is now an ordinary tool, so the only structural limit is
 /// the depth ceiling: a conversation with a parent but no `agents` row
 /// (only a test artifact — never one smelt started) has unknown depth and
@@ -66,18 +93,19 @@ async fn test_a_child_with_no_agent_row_is_refused_start_agent_without_running(p
     assert_eq!(grandchildren, 0, "the refused call made a conversation");
 }
 
-/// E (SME-309): the four tools a seat actually confused with MCP tools
-/// say who they belong to before saying what they do, and the message
+/// E (SME-309): the four tools a seat actually confused with MCP tools,
+/// and `notify_user` (SME-377), which reads like a chat tool's, say who
+/// they belong to before saying what they do, and the message
 /// one rules out the tracker reading outright — a seat that still
 /// reaches for a comment tool has at least read that it isn't one.
 #[test]
 fn test_the_confused_natives_carry_their_smelt_label() {
-    let confused = ["message_agent", "finish", "ask_parent", "ask_user"];
+    let confused = ["message_agent", "finish", "ask_parent", "ask_user", "notify_user"];
     let found: Vec<_> = crate::anthropic::tools::native_tool_definitions()
         .into_iter()
         .filter(|t| confused.contains(&t.name.as_str()))
         .collect();
-    assert_eq!(found.len(), confused.len(), "all four are offered: {found:?}");
+    assert_eq!(found.len(), confused.len(), "all of them are registered: {found:?}");
     for def in &found {
         assert!(
             def.description.starts_with("smelt"),

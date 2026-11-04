@@ -37,11 +37,13 @@ impl SandboxPreview {
 /// went busy (SME-71): published to the notifier, and passed back to
 /// `api::notifications::get_attention` as the kind to re-check. Ordered
 /// by priority — during one busy spell a question outranks a failure, a
-/// failure outranks a finished turn, so a later turn can't hide an
-/// earlier one. Serde as a string.
+/// failure outranks the model's own `notify_user` (`Notified`, SME-377),
+/// so a later turn can't hide an earlier one. A turn ending notes nothing
+/// by itself: `Notified` replaced the automatic `Finished`, and an older
+/// tab that can't read it reloads (`check_build_id`). Serde as a string.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Attention {
-    Finished,
+    Notified,
     CutOff,
     Refused,
     Failed,
@@ -109,6 +111,13 @@ pub enum ConversationEvent {
         /// across both streams. A tab that reconnects skips a line its
         /// snapshot already has (SME-51 B3). `None` when there's no line.
         position: Option<i64>,
+    },
+    /// A terminal command's script MCP calls so far (SME-359), published
+    /// as they finish, at most every 500 ms per command (the last one
+    /// always). A tab that doesn't know the command skips it.
+    SandboxMcpCalls {
+        command_id: String,
+        summary: crate::api::mcp_calls::McpCallSummary,
     },
     /// Published when a `turn::notify` wake or delivery (fired when a terminal
     /// command finishes, to notify the model with no further tool call
@@ -265,7 +274,9 @@ pub enum AppEvent {
     QuestionsChanged,
     /// A conversation went idle with something for the user (SME-71):
     /// published once, after `TurnsChanged`, when its last turn ended and
-    /// it had noted attention — or when `ask` paused it on a question.
+    /// it had noted attention: a question asked, a failure, a cut-off or
+    /// refused reply, or the model's own `notify_user` (SME-377). A turn
+    /// ending notes nothing by itself.
     /// `generation` is the conversation's turn generation at that end;
     /// `api::notifications::get_attention` answers `None` for a stale
     /// event, and the notifier checks it right before acting.

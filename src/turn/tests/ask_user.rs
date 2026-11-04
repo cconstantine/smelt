@@ -4,7 +4,7 @@ use super::*;
 
 /// A reply that calls each of `calls` (id, tool name, input) and stops for
 /// their results.
-fn tool_calls_body(calls: &[(&str, &str, serde_json::Value)]) -> String {
+pub(super) fn tool_calls_body(calls: &[(&str, &str, serde_json::Value)]) -> String {
     let mut events: Vec<(String, String)> = vec![("message_start".into(), r#"{"type":"message_start"}"#.into())];
     for (index, (id, name, input)) in calls.iter().enumerate() {
         events.push((

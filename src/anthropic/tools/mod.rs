@@ -53,8 +53,10 @@ struct Tool {
     class: Class,
 }
 
-/// Who a tool is offered to (SME-236): every conversation, or only one
-/// with a parent. `Linked` (SME-238) is offered to every conversation, so
+/// Who a tool is offered to (SME-236): every conversation, only one with
+/// a parent (`Child`), or only one without (`TopLevel`, SME-377: the
+/// conversations the user started, which a parent never changes, so the
+/// tool list stays stable). `Linked` (SME-238) is offered to every conversation, so
 /// the tool list doesn't change when a conversation starts its first
 /// agent (which would rewrite its whole cached prompt), but `execute`
 /// lets only one with a parent or agents of its own call it. `execute`
@@ -62,13 +64,15 @@ struct Tool {
 /// written before the conversation changed. (`Offer::Root`, which gave
 /// `start_agent` only to a parent-less conversation, is gone: SME-241
 /// made it an ordinary writing tool, kept in check by the rule chain and
-/// the depth ceiling.)
+/// the depth ceiling. `TopLevel` is the same offer for `notify_user`,
+/// which an agent has no use for: it reports with `finish`.)
 #[cfg(feature = "server")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Offer {
     All,
     Child,
     Linked,
+    TopLevel,
 }
 
 /// A tool in the registry, with who it's offered to.
@@ -126,6 +130,10 @@ mod git;
 #[cfg(feature = "server")]
 mod lsp;
 #[cfg(feature = "server")]
+mod notify;
+#[cfg(feature = "server")]
+pub(crate) use notify::NOTIFY_USER;
+#[cfg(feature = "server")]
 mod pods;
 #[cfg(feature = "server")]
 mod questions;
@@ -139,7 +147,8 @@ mod volumes;
 /// Every native tool, in the order the model is offered them. The order is
 /// part of what the model sees, so it stays fixed: changing it changes the
 /// request like adding or removing a tool would. The agent tools go last,
-/// so every older tool keeps its place.
+/// so every older tool keeps its place, and `notify_user` (SME-377) after
+/// them for the same reason.
 #[cfg(feature = "server")]
 static REGISTRY: std::sync::LazyLock<Vec<Registered>> = std::sync::LazyLock::new(|| {
     [
@@ -157,6 +166,7 @@ static REGISTRY: std::sync::LazyLock<Vec<Registered>> = std::sync::LazyLock::new
         .flatten()
         .map(|tool| Registered { tool, offer: Offer::All })
         .chain(agents::tools())
+        .chain(notify::tools())
         .collect()
 });
 
@@ -342,6 +352,58 @@ mod server {
         crate::personas::rules::RuleChain::try_from_stored(stored).map_err(refused)
     }
 
+    /// How a script's MCP call (SME-359) went: the class it was judged
+    /// at and the tool's name as its server lists it, once the call got
+    /// that far, and the server's result as it came.
+    pub struct ScriptMcpCall {
+        pub class: Option<super::ToolClass>,
+        pub tool: Option<String>,
+        pub result: Result<rmcp::model::CallToolResult, ScriptMcpError>,
+    }
+
+    /// Why a script's MCP call has no result: the rules refused it, or the
+    /// call itself failed.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum ScriptMcpError {
+        Refused(String),
+        Failed(String),
+    }
+
+    /// A script's call to MCP tool `tool` on `config`, ruled exactly as the
+    /// model's own call to it is (SME-359, Q1: "same as the model"): the
+    /// conversation's stored chain, read strictly (SME-354 B10), checked
+    /// at the class `call_tool_raw` finds on the connection the call goes
+    /// out on. Only the result differs: the server's own, uncut, for the
+    /// script to read as data.
+    pub async fn call_mcp_for_script(
+        pool: &PgPool,
+        conversation_id: i64,
+        config: &crate::db::McpServerConfig,
+        tool: &str,
+        arguments: Value,
+    ) -> ScriptMcpCall {
+        let name = format!("{}/{tool}", config.name);
+        let chain = match call_rule_chain(pool, conversation_id, &name).await {
+            Ok(chain) => chain,
+            Err(refusal) => return ScriptMcpCall { class: None, tool: None, result: Err(ScriptMcpError::Refused(refusal)) },
+        };
+        let judged = std::sync::Mutex::new(None);
+        let result = crate::mcp::call_tool_raw(pool, config, tool, arguments, |class, listed| {
+            let verdict = chain.allows_at(crate::personas::rules::ToolRef::Mcp { server: &config.name, tool: listed }, class);
+            *judged.lock().unwrap_or_else(|e| e.into_inner()) = Some((class, listed.to_string(), verdict.is_err()));
+            verdict
+        })
+        .await;
+        let judged = judged.into_inner().unwrap_or_else(|e| e.into_inner());
+        let refused = judged.as_ref().is_some_and(|(_, _, refused)| *refused);
+        let (class, tool) = match judged {
+            Some((class, tool, _)) => (Some(class), Some(tool)),
+            None => (None, None),
+        };
+        let result = result.map_err(|message| if refused { ScriptMcpError::Refused(message) } else { ScriptMcpError::Failed(message) });
+        ScriptMcpCall { class, tool, result }
+    }
+
     /// Whether this conversation's chain lets it call the question tool
     /// `name` (`ask_user`, `ask_parent`), which the turn handles itself
     /// rather than through `execute` (SME-354 B9): the same check, at the
@@ -365,6 +427,9 @@ mod server {
             .map_err(|e| format!("couldn't check who may call {name}: {e}"))?;
         match (offer, parent) {
             (super::Offer::Child, None) => Err(format!("{name} is only for an agent")),
+            (super::Offer::TopLevel, Some(_)) => Err(format!(
+                "{name} is for a conversation the user started; an agent reports to its parent with finish"
+            )),
             (super::Offer::Linked, None) if !has_children => {
                 Err(format!("{name} is only for a conversation with a parent or agents of its own"))
             }
@@ -378,6 +443,7 @@ mod server {
         match offer {
             super::Offer::All | super::Offer::Linked => true,
             super::Offer::Child => has_parent,
+            super::Offer::TopLevel => !has_parent,
         }
     }
 
@@ -398,8 +464,9 @@ mod server {
     /// `crate::mcp`). A server that fails to connect this turn is skipped
     /// rather than failing the whole request — see
     /// `crate::mcp::tool_definitions_for`. Only the tools offered to
-    /// `conversation_id` (SME-236): `finish` and `ask_parent` to an agent;
-    /// and only those its
+    /// `conversation_id` (SME-236): `finish` and `ask_parent` to an agent,
+    /// `notify_user` to a conversation without a parent (SME-377); and
+    /// only those its
     /// stored rule chain allows (SME-241). A failed read offers neither
     /// agent tools nor ruled-away narrowing: the chain falls open, warned.
     pub async fn tool_definitions(pool: &PgPool, conversation_id: i64) -> Vec<crate::anthropic::ToolDefinition> {
@@ -510,6 +577,8 @@ mod server {
 pub use server::execute;
 #[cfg(feature = "server")]
 pub use server::question_allowed;
+#[cfg(feature = "server")]
+pub use server::{ScriptMcpError, call_mcp_for_script};
 // Test-only: `turn`'s tests read the native tool names.
 #[cfg(all(feature = "server", test))]
 pub use server::native_tool_definitions;
