@@ -169,6 +169,12 @@ pub(super) fn run_turn_bounded<'a>(
                 Err(TurnFailure::Stopped) => clear_attention(conversation_id),
                 Ok(_) => {}
             }
+            // A child's failure, cut-off or refusal reaches the user
+            // through its parent's report, not the desktop (SME-386 N6).
+            // A lookup that fails counts it as a root: it notifies.
+            if matches!(db::conversation_parent(pool, conversation_id).await, Ok(Some(_))) {
+                forgo_child_outcome(conversation_id);
+            }
             // A child agent whose last turn ended without its report tells
             // its parent (SME-236), checked once this turn no longer counts.
             // Not after a stop, nor a wake that found nothing to do.
