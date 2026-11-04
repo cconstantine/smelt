@@ -110,9 +110,10 @@ impl ServerHandler for MockMcpServer {
         // error can quote the request's headers (SME-386 M3).
         if request.name == "fail_quoting" {
             let quoted = serde_json::to_string(&request.arguments).unwrap_or_default();
-            let mut result = CallToolResult::error(vec![McpContentBlock::Text(rmcp::model::TextContent::new(format!(
-                "refused the request: {quoted}"
-            )))]);
+            let mut result = CallToolResult::error(vec![
+                McpContentBlock::Text(rmcp::model::TextContent::new(format!("refused the request: {quoted}"))),
+                McpContentBlock::embedded_text("file:///request", format!("the request was {quoted}")),
+            ]);
             result.structured_content = Some(serde_json::json!({"error": "refused", "request": [request.arguments]}));
             return Ok(result.into());
         }

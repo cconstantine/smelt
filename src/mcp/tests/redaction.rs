@@ -197,6 +197,10 @@ async fn test_a_tools_own_error_doesnt_quote_a_header(pool: sqlx::PgPool) {
     REGISTRY.lock().await.remove(&config.id);
     let for_a_script = for_a_script.expect("the tool's own error is a result");
     assert_eq!(for_a_script.is_error, Some(true));
+    // Review round 1, L2: a block that isn't text (an embedded resource
+    // here) reaches the model serialized and the script whole.
+    let blocks = serde_json::to_string(&for_a_script.content).expect("serialize");
+    assert!(!blocks.contains(marker) && blocks.contains("file:///request"), "{blocks}");
     let structured = serde_json::to_string(&for_a_script.structured_content).expect("serialize");
     assert!(!structured.contains(marker) && structured.contains("refused"), "{structured}");
     let script_text = result_text(&for_a_script);

@@ -323,8 +323,8 @@ async fn call_tool_unspanned(
     Ok(result)
 }
 
-/// An `is_error` result with `config`'s secrets redacted from its text
-/// blocks and every string in its `structured_content`, the grant read
+/// An `is_error` result with `config`'s secrets redacted from every
+/// string in its content blocks and its `structured_content`, the grant read
 /// once for them all.
 async fn redact_tool_error(pool: &sqlx::PgPool, config: &McpServerConfig, result: &mut rmcp::model::CallToolResult) {
     let current = current_grant(pool, config).await;
@@ -336,8 +336,23 @@ async fn redact_tool_error(pool: &sqlx::PgPool, config: &McpServerConfig, result
         }
     };
     for block in &mut result.content {
-        if let McpContentBlock::Text(text) = block {
-            text.text = redact(&text.text);
+        match block {
+            McpContentBlock::Text(text) => text.text = redact(&text.text),
+            // Any other block (an embedded resource, a link) reaches the
+            // model serialized and a script whole (review round 1, L2):
+            // every string in it, and a block that can't be rebuilt so is
+            // replaced by a note.
+            other => {
+                let rebuilt = serde_json::to_value(&*other).ok().and_then(|mut value| {
+                    let mut strings = Vec::new();
+                    collect_strings_mut(&mut value, &mut strings);
+                    for string in strings {
+                        *string = redact(string);
+                    }
+                    serde_json::from_value::<McpContentBlock>(value).ok()
+                });
+                *other = rebuilt.unwrap_or_else(|| McpContentBlock::text(format!("{REDACTED} (an MCP content block)")));
+            }
         }
     }
     if let Some(structured) = &mut result.structured_content {
