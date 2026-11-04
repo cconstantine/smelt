@@ -147,6 +147,36 @@ async fn test_failed_beats_an_earlier_notify_user_in_one_busy_spell(pool: PgPool
     assert_eq!(published_notice(conversation.id, generation), Some("All done".to_string()), "kept, though outranked");
 }
 
+/// Review round 1, L2: every stronger kind outranks the model's
+/// `notify_user` in one spell, whichever comes first — CutOff and Refused
+/// included, which the tests above only see alone.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_every_stronger_kind_outranks_notify_user_in_either_order(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    for kind in [events::Attention::CutOff, events::Attention::Refused, events::Attention::Failed, events::Attention::Question] {
+        for notify_first in [true, false] {
+            let conversation = db::create_conversation(&pool).await.expect("conversation");
+            let recording = events::AppRecording::start();
+            let turn = TurnInFlight::start(conversation.id);
+            if notify_first {
+                note_notified(conversation.id, "Done".to_string());
+                note_attention(conversation.id, kind);
+            } else {
+                note_attention(conversation.id, kind);
+                note_notified(conversation.id, "Done".to_string());
+            }
+            drop(turn);
+            let seen = needs_user_of(&recording, conversation.id);
+            assert_eq!(
+                seen,
+                vec![(kind, turn_generation(conversation.id))],
+                "{kind:?} outranks Notified (notify first: {notify_first})"
+            );
+            forget_conversation_lock(conversation.id);
+        }
+    }
+}
+
 /// The SME-73 pair, first half: a turn that overflows once, compacts and
 /// answers is a normal ending — the recovery's refused call notes no
 /// Failed, so the spell publishes nothing (SME-377: a plain reply notes
