@@ -469,6 +469,25 @@ async fn test_calls_held_back_are_counted_without_rows(pool: PgPool) {
     assert_eq!(summary.text(), "MCP: 1 call · mock-m2/second_tool ×1 · 3 held back by a limit");
 }
 
+/// SME-386 M4: a command's summary counts only its own conversation's
+/// calls. A held-back call publishes the summary of the command id the
+/// agent named, unchecked, so an agent naming another conversation's
+/// command would otherwise read that command's counts.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_commands_summary_counts_only_its_own_conversations_calls(pool: PgPool) {
+    let (mine, _) = conversation_with_pod(&pool, None).await;
+    let (theirs, their_pod) = conversation_with_pod(&pool, None).await;
+    let terminal = db::create_sandbox_terminal(&pool, their_pod).await.expect("terminal").id;
+    db::create_terminal_command(&pool, theirs, terminal, "cmd-m4", "loop", 0).await.expect("command");
+    db::insert_sandbox_mcp_call(&pool, theirs, their_pod, Some("cmd-m4"), "linear", "list_issues", Some("read_only"), "ok")
+        .await
+        .expect("their call");
+    let theirs_read = command_summary(&pool, theirs, "cmd-m4").await.expect("read");
+    assert!(theirs_read.is_some(), "the command's own conversation sees its call");
+    let mine_read = command_summary(&pool, mine, "cmd-m4").await.expect("read");
+    assert_eq!(mine_read, None, "another conversation's command is none of mine");
+}
+
 /// Review round 1, M2: a tool name over 256 bytes is refused before
 /// anything is looked up or recorded.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]

@@ -312,7 +312,7 @@ pub(crate) async fn command_summary(
     conversation_id: i64,
     command_id: &str,
 ) -> Result<Option<crate::api::mcp_calls::McpCallSummary>, sqlx::Error> {
-    let mut counts = db::sandbox_mcp_call_counts(pool, &[command_id.to_string()]).await?.remove(command_id).unwrap_or_default();
+    let mut counts = db::sandbox_mcp_call_counts(pool, conversation_id, &[command_id.to_string()]).await?.remove(command_id).unwrap_or_default();
     let held_back = held_back(conversation_id, command_id);
     if held_back > 0 {
         counts.push(crate::api::mcp_calls::McpCallCount {
