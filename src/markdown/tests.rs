@@ -625,8 +625,8 @@ fn test_references_link_inside_blocks() {
 }
 
 /// SME-384: the autolink pass's skips are the references' skips — code
-/// spans, fenced and indented blocks, an existing link's words and a
-/// shown image's alt text — and text `MAX_DEPTH` deep in formatting
+/// spans, fenced, indented and raw HTML blocks, an existing link's words
+/// and a shown image's alt text — and text `MAX_DEPTH` deep in formatting
 /// stays text rather than taking the tree deeper.
 #[test]
 fn test_references_skip_code_links_and_deep_text() {
@@ -634,6 +634,7 @@ fn test_references_skip_code_links_and_deep_text() {
         "`agent #1234`",
         "```\nagent #1234\n```\n",
         "    agent #1234\n",
+        "<div>\nagent #1234\n</div>\n",
         "[agent #1234](https://e.com)",
         "https://e.com/#1234",
         "![conversation #1](https://e.com/a.png)",
