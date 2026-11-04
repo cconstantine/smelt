@@ -275,6 +275,54 @@ fn json_name(s: &str) -> Option<Option<String>> {
     Some(checked(rest.split_once('"')?.0))
 }
 
+/// The byte ranges of leaked reasoning in `text`: each `<think>` at a
+/// line's start (indent ≤ 3 spaces), up to the `</think>` that closes it —
+/// tags included. One elsewhere (prose, inline code) or never closed is
+/// text, so it can't hide the rest of the reply (SME-286 review 2).
+#[cfg(feature = "server")]
+fn think_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut from = 0;
+    while from < text.len() {
+        let line_end = text[from..].find('\n').map_or(text.len(), |at| from + at + 1);
+        let line = &text[from..line_end];
+        let body = line.trim_start_matches(' ');
+        if line.len() - body.len() <= 3
+            && body.starts_with("<think>")
+            && let Some(at) = text[line_end - body.len() + "<think>".len()..].find("</think>")
+        {
+            let open = line_end - body.len();
+            let close = open + "<think>".len() + at + "</think>".len();
+            ranges.push((open, close));
+            from = text[close..].find('\n').map_or(text.len(), |at| close + at + 1);
+            continue;
+        }
+        from = line_end;
+    }
+    ranges
+}
+
+/// `text` with leaked reasoning masked: each range `think_ranges` finds
+/// blanked (spaces; newlines kept, same length), and nothing else — the
+/// decision that a reply whose only text is such reasoning said nothing
+/// (SME-290). Unlike `mask_code`, code is not masked: a reply of only a
+/// fenced block is an answer.
+#[cfg(feature = "server")]
+pub fn mask_think(text: &str) -> String {
+    let mut out = text.as_bytes().to_vec();
+    for (open, close) in think_ranges(text) {
+        for byte in &mut out[open..close] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    }
+    // Each blanked range is whole characters (tags and the bytes between
+    // them, every byte made an ASCII space), as in `mask_code`.
+    #[expect(clippy::expect_used, reason = "only whole characters were replaced, each byte with an ASCII space")]
+    String::from_utf8(out).expect("only whole characters were replaced, with spaces")
+}
+
 /// `text` with its code blanked (spaces, newlines kept, same byte offsets):
 /// fenced blocks (an unclosed fence runs to the end), inline code spans
 /// (within a paragraph, so one can span a line break; a whole tag call at a
@@ -291,25 +339,12 @@ fn mask_code(text: &str) -> String {
             }
         }
     };
-    // Leaked reasoning: a `<think>` at a line's start, up to the `</think>`
-    // that closes it. One elsewhere (prose, inline code) or never closed is
-    // text, so it can't hide the rest of the reply (review 2).
-    let mut from = 0;
-    while from < text.len() {
-        let line_end = text[from..].find('\n').map_or(text.len(), |at| from + at + 1);
-        let line = &text[from..line_end];
-        let body = line.trim_start_matches(' ');
-        if line.len() - body.len() <= 3
-            && body.starts_with("<think>")
-            && let Some(at) = text[line_end - body.len() + "<think>".len()..].find("</think>")
-        {
-            let open = line_end - body.len();
-            let close = open + "<think>".len() + at + "</think>".len();
-            blank(open, close);
-            from = text[close..].find('\n').map_or(text.len(), |at| close + at + 1);
-            continue;
-        }
-        from = line_end;
+    // Leaked reasoning: the same ranges `mask_think` blanks (SME-290 moved
+    // the rule out of here; the blanking and its place in this order —
+    // before the fence/paragraph passes, on the same buffer — are what keep
+    // `find` byte-identical).
+    for (open, close) in think_ranges(text) {
+        blank(open, close);
     }
     let mut fence: Option<(char, usize)> = None;
     // The plain lines since the last blank or code line: a paragraph, whose

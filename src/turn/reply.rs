@@ -362,9 +362,11 @@ pub(super) enum NextStep {
 /// reply cut off or refused already has its notice and ends as before. A
 /// reply that makes real calls and writes one as text too gets its
 /// correction after the real calls' results (`NextStep::RunTools`). A
-/// reply with no text and no call (thinking only, or empty) gets a nudge
-/// to carry on; another before a real call ends the turn, as a model that
-/// meant to stop. A nudge, like a real call, resets the correction count.
+/// reply with no text and no call (thinking only, or empty; or whose only
+/// text is leaked `<think>` reasoning — `text_calls::mask_think` decides,
+/// SME-290) gets a nudge to carry on; another before a real call ends the
+/// turn, as a model that meant to stop. A nudge, like a real call, resets
+/// the correction count.
 #[cfg(feature = "server")]
 pub(super) async fn after_reply(
     pool: &PgPool,
@@ -408,7 +410,10 @@ pub(super) async fn after_reply(
     }
     let calls = text_calls(turn);
     if calls.is_empty() {
-        let has_text = turn.content.iter().any(|b| matches!(b, anthropic::ContentBlock::Text { text } if !text.trim().is_empty()));
+        // Leaked reasoning isn't an answer: `has_text` sees the text with
+        // `text_calls::mask_think` masking it (SME-290). Decision-only —
+        // the reply above this point saved verbatim.
+        let has_text = turn.content.iter().any(|b| matches!(b, anthropic::ContentBlock::Text { text } if !crate::text_calls::mask_think(text).trim().is_empty()));
         if has_text || streak.nudged {
             return Ok(NextStep::End);
         }

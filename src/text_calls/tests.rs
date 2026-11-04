@@ -364,3 +364,39 @@ fn test_an_unoffered_tool_of_an_offered_server_is_a_slip() {
     assert!(!is_unoffered_tool_of_an_offered_server("mcp__slack__post_message", OFFERED), "its server offers nothing");
     assert!(!is_unoffered_tool_of_an_offered_server("todosote", OFFERED), "not an MCP name");
 }
+
+/// U1 (SME-290): `mask_think` blanks leaked reasoning — a `<think>` at a
+/// line's start to the `</think>` that closes it, tags included — keeping
+/// the byte length and the newlines; an indented one (≤ 3 spaces) too.
+#[test]
+fn test_mask_think_blanks_leaked_reasoning() {
+    let text = "<think>\nreasoning\n</think>";
+    let masked = mask_think(text);
+    assert_eq!(masked.len(), text.len());
+    assert!(masked.chars().all(|c| c == ' ' || c == '\n'), "{masked:?}");
+    assert_eq!(masked.matches('\n').count(), 2, "newlines kept at their places: {masked:?}");
+    assert_eq!(mask_think("   <think>x</think>"), format!("   {}", " ".repeat(16)), "indent ≤ 3 masks, the indent itself stays");
+    assert_eq!(mask_think("<think>x</think>"), " ".repeat(16), "the tags mask too");
+}
+
+/// U2 (SME-290): only the think rule applies — a `<think>` named mid-line
+/// is left, an unclosed `<think>never closed` is left (masking it to the
+/// reply's end is SME-286 review 2's bug), real text after `</think>`
+/// stays, and code masks to the same (non-blank) text.
+#[test]
+fn test_mask_think_leaves_prose_text_after_it_and_code() {
+    for left in [
+        "I won't use a <think> block here.",
+        "<think>never closed",
+        "Answer:\n   <think>never closed either",
+        "    <think>x</think>",
+        "\t<think>x</think>",
+        "No tags at all.",
+    ] {
+        assert_eq!(mask_think(left), left, "{left:?} left as written");
+    }
+    let with_answer = "<think>r</think>\n\nThe answer is 42.";
+    assert!(mask_think(with_answer).contains("The answer is 42."), "{with_answer:?} keeps its answer");
+    let fenced = "```rust\nlet x = 1;\n```";
+    assert_eq!(mask_think(fenced), fenced, "code is an answer, not reasoning");
+}
