@@ -72,9 +72,10 @@ resource "kubernetes_deployment_v1" "smelt" {
       spec {
         service_account_name = kubernetes_service_account_v1.park.metadata[0].name
 
-        # No architecture pin (SME-373): every image smelt publishes is
-        # linux/amd64 and linux/arm64 (SME-360, `publish-images.yml`), and
-        # so are the module's other defaults (`postgres:17-alpine`). Sandbox
+        # No architecture pin (SME-373): every image smelt publishes from
+        # SME-360 (#248) on is linux/amd64 and linux/arm64, and so is
+        # `postgres_image`'s default (`postgres:17-alpine`); an older tag is
+        # amd64 only (README.md). Sandbox
         # pods carry no pin either (src/sandbox/spec/pods.rs). A deployment
         # that runs a single-arch image of its own on a mixed cluster sets
         # `node_selector`, which this pod and the database's take.
