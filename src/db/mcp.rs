@@ -395,21 +395,25 @@ pub struct SavedToolClass {
     pub tool_fingerprint: Option<String>,
 }
 
-/// Records `fingerprint` as the tool an override saved without one is for
-/// (SME-295 review 1), leaving a row that already has one as it is.
+/// Records `fingerprint` as the tool an override is for where it still
+/// holds `stored`: none (saved without one, SME-295 review 1), or the
+/// legacy form of the same tool's (SME-386 T4). A row holding anything
+/// else — a save since, say — is left as it is.
 pub async fn adopt_mcp_tool_fingerprint(
     pool: &PgPool,
     server_id: i64,
     tool_name: &str,
+    stored: Option<&str>,
     fingerprint: &str,
 ) -> Result<bool, sqlx::Error> {
     let updated = sqlx::query(
         "UPDATE mcp_tool_classes SET tool_fingerprint = $3 \
-         WHERE server_id = $1 AND tool_name = $2 AND tool_fingerprint IS NULL",
+         WHERE server_id = $1 AND tool_name = $2 AND tool_fingerprint IS NOT DISTINCT FROM $4",
     )
     .bind(server_id)
     .bind(tool_name)
     .bind(fingerprint)
+    .bind(stored)
     .execute(pool)
     .await?;
     Ok(updated.rows_affected() == 1)

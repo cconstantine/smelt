@@ -367,7 +367,7 @@ pub(super) async fn record_stop(pool: &PgPool, conversation_id: i64, stopped_by:
     let already = db::list_messages(pool, conversation_id)
         .await
         .ok()
-        .and_then(|messages| messages.last().map(|m| m.content.contains(STOP_NOTICE)))
+        .and_then(|messages| messages.last().map(is_stop_note))
         .unwrap_or(false);
     if already {
         return;
@@ -379,6 +379,17 @@ pub(super) async fn record_stop(pool: &PgPool, conversation_id: i64, stopped_by:
         Ok(saved) => record_saved(conversation_id, &mut Vec::new(), saved),
         Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't note a stop"),
     }
+}
+
+/// Whether `message` is a stop's note: a user message with a text block
+/// that is `STOP_NOTICE`, marked or in the legacy unmarked form, as
+/// compaction reads it. A message quoting the words isn't (SME-386 A2).
+#[cfg(feature = "server")]
+fn is_stop_note(message: &Message) -> bool {
+    message.role == "user"
+        && message.blocks().unwrap_or_default().iter().any(|block| {
+            matches!(block, anthropic::ContentBlock::Text { text } if crate::api::chat::users_text(text) == STOP_NOTICE)
+        })
 }
 
 /// What `send_message` does: checks the conversation exists, then runs

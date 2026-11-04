@@ -692,3 +692,23 @@ fn test_is_typed_reads_the_mark_not_the_notice_words() {
     assert!(!crate::turn::compaction::is_typed("Question from agent #9: which branch?"));
     assert!(crate::turn::compaction::is_typed("Message from your parent:\n\nUse the bare persona name."));
 }
+
+/// SME-386 T8: one long recent message that doesn't fit the budget is
+/// left out alone; the older, shorter ones still fit and are quoted.
+#[test]
+fn test_a_long_message_that_doesnt_fit_leaves_the_older_ones_quoted() {
+    let messages = vec![
+        text_message(1, "user", "The original ask."),
+        text_message(2, "assistant", "ok"),
+        text_message(3, "user", "Keep the tests green."),
+        text_message(4, "assistant", "ok"),
+        text_message(5, "user", &"z".repeat(10_000)),
+        text_message(6, "assistant", "ok"),
+    ];
+    let typed = typed_user_text(&messages, 28_672);
+    assert_eq!(
+        typed,
+        Typed { quotes: vec!["The original ask.".to_string(), "Keep the tests green.".to_string()], omitted: 1 },
+        "the long one is skipped, not the end of the quotes"
+    );
+}

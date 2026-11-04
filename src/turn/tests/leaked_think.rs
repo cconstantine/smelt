@@ -104,3 +104,26 @@ async fn test_an_unclosed_think_is_text(pool: PgPool) {
     assert_eq!(nudges(&saved), 0, "{saved:?}");
     assert_eq!(requests.lock().expect("the request log").len(), 1);
 }
+
+/// SME-386 T1: a call by a name no tool has isn't a real call, so it
+/// doesn't reset the nudge. Alternating one with a reasoning-only reply
+/// used to loop to the turn's whole bound (the unknown call cleared
+/// `nudged`, the nudge zeroed the correction count); now the second
+/// reasoning-only reply ends the turn: one nudge, four model calls.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_unknown_call_between_reasoning_only_replies_doesnt_reset_the_nudge(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let unknown = |id: &str| text_blocks_body(&[Block::Call(id, "todosote")], "tool_use");
+    let bodies: Vec<String> = (0..6).flat_map(|i| [unknown(&format!("toolu_t1_{i}")), leaked_reply()]).collect();
+    let requests = start_recording_mock_upstream(&pool, bodies).await;
+
+    let result = run_turn_bounded(&pool, TurnInFlight::start(conversation.id), Some(hello()), 12, None, false).await;
+
+    let sent = requests.lock().expect("the request log").len();
+    let saved = db::list_messages(&pool, conversation.id).await.expect("list messages");
+    assert_eq!(sent, 4, "the second reasoning-only reply ends the turn: {saved:?}");
+    assert_eq!(nudges(&saved), 1, "{saved:?}");
+    assert!(result.is_ok(), "the turn ends as a model that meant to stop: {result:?}");
+}

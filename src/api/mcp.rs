@@ -301,6 +301,11 @@ pub struct McpToolClassRow {
     /// user saw (SME-295 review 1). `None` when it isn't listed.
     #[serde(default)]
     pub fingerprint: Option<String>,
+    /// For a saved override whose tool the server doesn't list now: the
+    /// class a call under the name is judged by (SME-386 T3), which the
+    /// page shows. `None` on every other row.
+    #[serde(default)]
+    pub applied_class: Option<String>,
 }
 
 /// The edit page's Tool-classes section: one row per listed tool plus
@@ -319,7 +324,7 @@ pub struct McpToolClasses {
 /// list no longer has — the design keeps those, and the page offers them
 /// for clearing. Pure, so it's testable without a connection.
 #[cfg(feature = "server")]
-fn merge_tool_class_rows(
+pub(crate) fn merge_tool_class_rows(
     listed: Vec<crate::mcp::McpToolClassInfo>,
     saved: Vec<db::SavedToolClass>,
 ) -> Vec<McpToolClassRow> {
@@ -334,10 +339,13 @@ fn merge_tool_class_rows(
                 annotated: Some(tool.annotated),
                 override_class: saved.map(|row| row.class.clone()),
                 listed: Some(true),
+                // Either form names it (SME-386 T4: SHA-256, or the legacy
+                // form an offer hasn't stored again yet).
                 tool_changed: saved
                     .and_then(|row| row.tool_fingerprint.as_deref())
-                    .is_some_and(|fingerprint| fingerprint != tool.fingerprint),
+                    .is_some_and(|fingerprint| fingerprint != tool.fingerprint && fingerprint != tool.legacy_fingerprint),
                 fingerprint: Some(tool.fingerprint.clone()),
+                applied_class: None,
             }
         })
         .collect();
@@ -353,6 +361,8 @@ fn merge_tool_class_rows(
         listed: Some(false),
         tool_changed: false,
         fingerprint: None,
+        // The call judges it by the same rule (SME-386 T3).
+        applied_class: Some(crate::mcp::effective_override(row, None)),
     }));
     rows
 }
@@ -372,6 +382,7 @@ fn saved_only_rows(saved: Vec<db::SavedToolClass>) -> Vec<McpToolClassRow> {
             listed: None,
             tool_changed: false,
             fingerprint: None,
+            applied_class: None,
         })
         .collect()
 }
@@ -610,7 +621,7 @@ mod tests {
     }
 
     fn info(name: &str, server_class: crate::anthropic::tools::ToolClass, annotated: bool) -> crate::mcp::McpToolClassInfo {
-        crate::mcp::McpToolClassInfo { name: name.to_string(), server_class, annotated, fingerprint: format!("fp-{name}") }
+        crate::mcp::McpToolClassInfo { name: name.to_string(), server_class, annotated, fingerprint: format!("fp-{name}"), legacy_fingerprint: format!("old-{name}") }
     }
 
     /// Listed rows keep the server's own order and carry `server_class`
@@ -639,6 +650,7 @@ mod tests {
                     listed: Some(true),
                     tool_changed: false,
                     fingerprint: Some("fp-web_search_exa".to_string()),
+                    applied_class: None,
                 },
                 McpToolClassRow {
                     tool_name: "edit_thing".to_string(),
@@ -648,6 +660,7 @@ mod tests {
                     listed: Some(true),
                     tool_changed: false,
                     fingerprint: Some("fp-edit_thing".to_string()),
+                    applied_class: None,
                 },
                 McpToolClassRow {
                     tool_name: "old_tool".to_string(),
@@ -657,6 +670,7 @@ mod tests {
                     listed: Some(false),
                     tool_changed: false,
                     fingerprint: None,
+                    applied_class: Some("writing".to_string()),
                 },
             ]
         );
@@ -670,9 +684,10 @@ mod tests {
         use crate::anthropic::tools::ToolClass;
         let rows = merge_tool_class_rows(
             vec![info("a", ToolClass::ReadOnly, true), info("b", ToolClass::ReadOnly, true), info("c", ToolClass::ReadOnly, true)],
-            vec![saved("a", "destructive", Some("fp-a")), saved("b", "destructive", Some("fp-old")), saved("c", "writing", None)],
+            vec![saved("a", "destructive", Some("old-a")), saved("b", "destructive", Some("fp-old")), saved("c", "writing", None)],
         );
         let changed: Vec<(&str, bool)> = rows.iter().map(|r| (r.tool_name.as_str(), r.tool_changed)).collect();
+        // SME-386 T4: `a`'s legacy fingerprint still names it.
         assert_eq!(changed, vec![("a", false), ("b", true), ("c", false)]);
     }
 
@@ -692,6 +707,7 @@ mod tests {
                 listed: Some(true),
                 tool_changed: false,
                     fingerprint: Some("fp-t".to_string()),
+                    applied_class: None,
             }]
         );
         let rows = merge_tool_class_rows(
@@ -708,6 +724,7 @@ mod tests {
                 listed: Some(false),
                 tool_changed: false,
                     fingerprint: None,
+                    applied_class: Some("read-only".to_string()),
             }]
         );
     }
@@ -761,6 +778,7 @@ mod tests {
                     listed: Some(true),
                     tool_changed: false,
                     fingerprint: Some("fp-web_search_exa".to_string()),
+                    applied_class: None,
                 },
                 McpToolClassRow {
                     tool_name: "old_tool".to_string(),
@@ -770,6 +788,7 @@ mod tests {
                     listed: None,
                     tool_changed: false,
                     fingerprint: None,
+                    applied_class: None,
                 },
             ],
             server_note: Some("Unreachable: refused".to_string()),
