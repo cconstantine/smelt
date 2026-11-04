@@ -64,13 +64,19 @@ fn test_a_reply_that_is_only_thinking_is_recognized() {
 
 #[test]
 fn test_display_text_reads_task_notices_as_sentences() {
+    // SME-357 Q1: the saved (marked) rows convert; the tags a user typed
+    // show as written.
     assert_eq!(
-        display_text(r#"<task-notification task_id="lS9Y" tool="count">finished: Counted to 3</task-notification>"#),
+        display_text(&crate::api::chat::mark_notice(r#"<task-notification task_id="lS9Y" tool="count">finished: Counted to 3</task-notification>"#)),
         "Background task count (lS9Y) finished: Counted to 3"
     );
     assert_eq!(
-        display_text(r#"<task-output task_id="lS9Y" tool="count" stream="stdout">count: 1/3</task-output>"#),
+        display_text(&crate::api::chat::mark_notice(r#"<task-output task_id="lS9Y" tool="count" stream="stdout">count: 1/3</task-output>"#)),
         "Background task count (lS9Y) stdout: count: 1/3"
+    );
+    assert_eq!(
+        display_text(r#"<task-notification task_id="lS9Y" tool="count">finished: Counted to 3</task-notification>"#),
+        r#"<task-notification task_id="lS9Y" tool="count">finished: Counted to 3</task-notification>"#
     );
     assert_eq!(display_text("plain words <b>and a tag</b>"), "plain words <b>and a tag</b>");
 }

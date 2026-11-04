@@ -229,7 +229,13 @@ pub(in crate::frontend::pages::chat) fn reply_parts(messages: &[Message], turn_r
             for block in blocks {
                 match block {
                     ContentBlock::Text { text } => {
-                        let mid_turn_notice = in_tool_loop && text.starts_with("Terminal command ");
+                        // A terminal notice saved inside the loop belongs to
+                        // the running turn; the server's saved ones carry
+                        // `NOTICE_MARK` (SME-357), and only they count —
+                        // the same words a user typed start a reply of
+                        // their own.
+                        let mid_turn_notice = in_tool_loop
+                            && text.strip_prefix(crate::api::chat::NOTICE_MARK).is_some_and(|words| words.starts_with("Terminal command "));
                         starts_reply |= !mid_turn_notice;
                     }
                     // An answer to `ask_user` (or the user writing
@@ -368,10 +374,19 @@ fn short_command(line: &str) -> String {
 /// A notice smelt saved into the conversation for the model (a command
 /// finishing, the sandbox stopping), as the
 /// short sentence the chat shows in place of a user bubble, without
-/// internal ids. `None` for anything the user actually wrote. They used
-/// to look like the user talking (SME-41 D3). `commands` maps a terminal
-/// command's id to the command line, from `terminal_commands_by_id`.
+/// internal ids. Only text carrying `NOTICE_MARK` is one (SME-357): the
+/// same words a user typed are their own bubble, so `None` for anything
+/// the user actually wrote. They used to look like the user talking
+/// (SME-41 D3) and were told apart by their words alone until this
+/// ticket. `commands` maps a terminal command's id to the command line,
+/// from `terminal_commands_by_id`.
 pub(in crate::frontend::pages::chat) fn system_notice(text: &str, commands: &HashMap<String, String>) -> Option<String> {
+    // SME-357: the first line requires the mark and steps over it, so every
+    // word branch below reads the saved words as they start, and unmarked
+    // text — the same wording a user typed — is nobody's notice. The
+    // mark-requiring parsers (`parse_cut_off_notice` and friends) still
+    // take the whole text: they read the mark themselves.
+    let words = text.strip_prefix(crate::api::chat::NOTICE_MARK)?;
     let command = |id: &str| match commands.get(id) {
         Some(line) => format!("`{}`", short_command(line)),
         None => "A command".to_string(),
@@ -381,7 +396,7 @@ pub(in crate::frontend::pages::chat) fn system_notice(text: &str, commands: &Has
     // notices does), and the idle notice quotes it before the marker — cut at
     // the first occurrence and the sentence tears open inside the quote.
     // Everything past the notice's own marker is smelt's fixed text.
-    if let Some(rest) = text.strip_prefix("Terminal command ") {
+    if let Some(rest) = words.strip_prefix("Terminal command ") {
         if let Some((id, tail)) = rest.rsplit_once(" finished: exit code ") {
             let code = tail.trim_end_matches('.');
             return Some(format!("{} finished (exit code {code})", command(id)));
@@ -400,7 +415,7 @@ pub(in crate::frontend::pages::chat) fn system_notice(text: &str, commands: &Has
         }
     }
     // A quiet stop (SME-78), before the crash branch.
-    if let Some(rest) = text.strip_prefix("Sandbox pod ") {
+    if let Some(rest) = words.strip_prefix("Sandbox pod ") {
         if let Some((_, tail)) = rest.split_once(" was stopped after ")
             && let Some((minutes, _)) = tail.split_once(" minutes with no activity")
         {
@@ -410,7 +425,7 @@ pub(in crate::frontend::pages::chat) fn system_notice(text: &str, commands: &Has
             return Some("The sandbox stopped when this agent finished; /workspace and Docker's data are kept".to_string());
         }
     }
-    if let Some(rest) = text.strip_prefix("Sandbox pod ")
+    if let Some(rest) = words.strip_prefix("Sandbox pod ")
         && let Some((_, tail)) = rest.split_once(" stopped unexpectedly")
     {
         let reason = tail
@@ -423,27 +438,27 @@ pub(in crate::frontend::pages::chat) fn system_notice(text: &str, commands: &Has
     // The sandbox's other notices (SME-354 B20: they showed as the user's
     // own bubble). Each is the sentence the server writes, cut to what the
     // user needs; the model gets the whole of it.
-    if let Some(rest) = text.strip_prefix("Docker in sandbox pod ")
+    if let Some(rest) = words.strip_prefix("Docker in sandbox pod ")
         && let Some((head, _)) = rest.split_once(", so the containers it was running have stopped")
     {
         let why = head.split_once(" was restarted").map(|(_, why)| why).unwrap_or_default();
         return Some(format!("Docker restarted{why}, so its containers stopped; images, terminals and /workspace are kept"));
     }
-    if let Some(rest) = text.strip_prefix("Sandbox pod ")
+    if let Some(rest) = words.strip_prefix("Sandbox pod ")
         && let Some((_, tail)) = rest.split_once("'s storage was removed after ")
         && let Some((days, _)) = tail.split_once(" days stopped")
     {
         return Some(format!("The sandbox's storage was removed after {days} days stopped; the next sandbox starts fresh"));
     }
-    if text.starts_with("The user removed this conversation's sandbox storage") {
+    if words.starts_with("The user removed this conversation's sandbox storage") {
         return Some("You removed the sandbox's storage; the next sandbox starts fresh".to_string());
     }
-    if let Some(rest) = text.strip_prefix("Language server ")
+    if let Some(rest) = words.strip_prefix("Language server ")
         && let Some((head, _)) = rest.rsplit_once(". The sandbox is unaffected")
     {
         return Some(format!("Language server {head}"));
     }
-    if text == crate::api::chat::STOP_NOTICE {
+    if words == crate::api::chat::STOP_NOTICE {
         return Some("Stopped.".to_string());
     }
     if let Some((tokens, limit, cut_call)) = crate::api::chat::parse_cut_off_notice(text) {
@@ -471,7 +486,7 @@ pub(in crate::frontend::pages::chat) fn system_notice(text: &str, commands: &Has
         let call = cut_call.map(|name| format!(" in the middle of a `{name}` call, which didn't run")).unwrap_or_default();
         return Some(format!("The model's provider stopped this reply (a refusal){call}."));
     }
-    if text == crate::text_calls::EMPTY_REPLY_NOTICE {
+    if words == crate::text_calls::EMPTY_REPLY_NOTICE {
         return Some("The model's reply was empty; smelt asked it to carry on.".to_string());
     }
     // A tool call the model wrote as text, and smelt's correction (SME-286).
@@ -486,7 +501,7 @@ pub(in crate::frontend::pages::chat) fn system_notice(text: &str, commands: &Has
         };
         return Some(format!("The model wrote {calls} as text ({}), so {they} didn't run; smelt told it.", names.join(", ")));
     }
-    if text.starts_with("The user stopped sandbox pod ") {
+    if words.starts_with("The user stopped sandbox pod ") {
         return Some(
             "You stopped the sandbox; its terminals are gone, and /workspace is kept".to_string(),
         );
@@ -523,13 +538,19 @@ pub(in crate::frontend::pages::chat) fn terminal_commands_by_id(messages: &[Mess
 /// A message's text as shown in the chat. The removed background-task
 /// suite (SME-54) saved its notices in a tagged form the model reads
 /// (`<task-notification task_id=".." tool="count">finished: ..</task-notification>`);
-/// shown raw, that's markup (SME-40 F13), so old conversations' notices
-/// still read as a sentence. Everything else is shown as written.
+/// shown raw, that's markup (SME-40 F13), so the saved ones still read as
+/// a sentence — under `NOTICE_MARK` alone since SME-357 (Q1), so markup a
+/// user typed shows as written. Everything else shows as written, the
+/// invisible mark rendering nothing.
 pub(in crate::frontend::pages::chat) fn display_text(text: &str) -> String {
     task_notice_sentence(text).unwrap_or_else(|| text.to_string())
 }
 
+/// The sentence for a saved background-task notice (SME-54's tags), or
+/// `None` for any other text — its markup without `NOTICE_MARK` included
+/// (SME-357 Q1: typed markup shows as written).
 pub(in crate::frontend::pages::chat) fn task_notice_sentence(text: &str) -> Option<String> {
+    let text = text.strip_prefix(crate::api::chat::NOTICE_MARK)?;
     let attr = |open: &str, name: &str| -> Option<String> {
         let start = open.find(&format!("{name}=\""))? + name.len() + 2;
         let len = open[start..].find('"')?;

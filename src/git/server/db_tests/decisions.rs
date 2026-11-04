@@ -61,6 +61,14 @@ async fn test_trust_loads_exactly_the_file_the_card_showed(pool: PgPool) {
     let notices = decide_trust(&pool, first.id, shown.id, &shown.hash, true).await.expect("trust");
     assert_eq!(notices[0].0, first.id, "the deciding conversation's notice comes first");
     let notice = notices[0].1.clone();
+    // SME-357: the deciding trusted wording ("The user trusts …") is quoted in
+    // compaction today and stays unmarked; every other trust notice — told to
+    // the other conversations, worded as news — carries the mark.
+    assert!(notice.starts_with("The user trusts "), "{notice}");
+    assert!(
+        notices[1..].iter().all(|(_, text)| text.starts_with(crate::api::chat::NOTICE_MARK)),
+        "the told notices carry the mark: {notices:?}"
+    );
     assert!(notice.contains("/workspace/r/AGENTS.md"), "{notice}");
     assert_eq!(db::get_repo_trust(&pool, "github.com/o/r").await.expect("get"), Some(true));
     let loaded = project_instructions(&pool, first.id).await.expect("loaded");
@@ -115,6 +123,9 @@ async fn test_the_model_hears_about_its_other_requests_for_the_repo(pool: PgPool
         assert_eq!(requests.len(), 2);
         let top = requests.iter().find(|r| r.path.ends_with("/r/AGENTS.md")).expect("top-level request");
         let notice = decide_trust(&pool, conversation.id, top.id, &top.hash, trusted).await.expect("decide").remove(0).1;
+        // SME-357: the declined deciding wording carries the mark; the trusted
+        // one ("The user trusts …") is quoted in compaction today and stays unmarked.
+        assert_eq!(notice.starts_with(crate::api::chat::NOTICE_MARK), !trusted, "{trusted}: {notice}");
         assert!(notice.contains("/workspace/r/web/AGENTS.md"), "{trusted}: {notice}");
         if trusted {
             assert!(notice.contains("load_instructions again"), "{notice}");

@@ -31,6 +31,10 @@ async fn test_a_stop_right_after_a_send_ends_its_turn(pool: PgPool) {
     assert_eq!(saved.len(), 2, "the message, then the stop's note: {saved:?}");
     assert!(saved[0].content.contains("\"hi\""), "{saved:?}");
     assert!(saved[1].content.contains(STOP_NOTICE), "{saved:?}");
+    assert!(
+        saved[1].content.contains(&format!("{}{}", crate::api::chat::NOTICE_MARK, STOP_NOTICE)),
+        "SME-357: the stop note carries the mark: {saved:?}"
+    );
     let told: Vec<_> = drain_events(&mut rx).await;
     let stopped = told
         .iter()

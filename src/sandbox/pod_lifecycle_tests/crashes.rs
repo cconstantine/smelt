@@ -21,6 +21,11 @@ async fn test_a_crashed_pod_is_reported_without_a_tool_call(pool: PgPool) {
             message_arrives(&pool, conversation.id, "stopped unexpectedly", Duration::from_secs(30)).await,
             "a crash with no reason to report should get the plain pod-level notice, with no further tool call"
         );
+        // SME-357: the crash notice carries the mark before its words.
+        assert!(
+            any_message_contains(&pool, conversation.id, &format!("{}Sandbox pod", crate::api::chat::NOTICE_MARK)).await,
+            "the crash notice should carry the mark"
+        );
         // `list_terminals` lists only live terminals: a closed one is absent.
         let terminals = list_terminals(&pool, conversation.id).await.expect("list_terminals");
         assert!(
@@ -96,6 +101,11 @@ async fn test_stopping_a_pod_for_the_user_closes_everything_and_says_so(pool: Pg
         assert!(
             message_arrives(&pool, conversation.id, "The user stopped sandbox pod", Duration::from_secs(10)).await,
             "the model should be told the user stopped the pod"
+        );
+        // SME-357: the user-stop notice carries the mark before its words.
+        assert!(
+            any_message_contains(&pool, conversation.id, &format!("{}The user stopped sandbox pod", crate::api::chat::NOTICE_MARK)).await,
+            "the user-stop notice should carry the mark"
         );
         assert!(
             !any_message_contains(&pool, conversation.id, "stopped unexpectedly").await,

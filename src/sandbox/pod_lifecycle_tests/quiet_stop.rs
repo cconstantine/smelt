@@ -99,6 +99,8 @@ async fn test_a_quiet_stop_keeps_the_workspace_and_dockers_images(pool: PgPool) 
             .map(|m| m.content)
             .collect();
         assert_eq!(notices.len(), 1, "one notice: {notices:?}");
+        // SME-357: the saved quiet-stop notice carries the mark before its words.
+        assert!(notices[0].contains(&format!("{}Sandbox pod", crate::api::chat::NOTICE_MARK)), "{}", notices[0]);
 
         let next = create_pod(&pool, conversation.id, PodLimitOverrides::default()).await.expect("a new pod");
         let kept = exec_with(

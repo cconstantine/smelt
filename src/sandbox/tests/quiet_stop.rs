@@ -138,6 +138,8 @@ async fn test_an_idle_pod_with_no_running_command_is_stopped_quietly(pool: PgPoo
     let notices = notices_with(&pool, conversation, "was stopped after 60 minutes with no activity").await;
     assert_eq!(notices.len(), 1, "one notice: {notices:?}");
     assert!(notices[0].contains(&format!("Sandbox pod {pod} ")), "{}", notices[0]);
+    // SME-357: the saved quiet-stop notice carries the mark before its words.
+    assert!(notices[0].contains(&format!("{}Sandbox pod", crate::api::chat::NOTICE_MARK)), "{}", notices[0]);
     assert_eq!(updated_at(&pool, conversation).await, before, "the conversation doesn't move in the sidebar");
     let mut saw_terminated = false;
     let mut saw_notice = false;
@@ -249,6 +251,8 @@ async fn test_at_zero_an_idle_pod_stays_and_a_finished_agents_pod_still_goes(poo
     assert!(live(&pool, idle).await, "idle stops are off");
     let notices = notices_with(&pool, child, "was stopped because you finished").await;
     assert_eq!(notices.len(), 1, "the finish notice: {notices:?}");
+    // SME-357: the saved finish notice carries the mark before its words.
+    assert!(notices[0].contains(&format!("{}Sandbox pod", crate::api::chat::NOTICE_MARK)), "{}", notices[0]);
 }
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]

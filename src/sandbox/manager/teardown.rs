@@ -190,9 +190,10 @@ pub(in crate::sandbox) async fn stop_pod_for_user_with(
     // one leaves the pod running, terminals and all.
     let (conversation_id, _) = close_pod_terminals(pool, pod_id).await;
     if let Some(conversation_id) = conversation_id {
-        let notice = format!(
+        // SME-357: marked like every saved notice.
+        let notice = crate::api::chat::mark_notice(&format!(
             "The user stopped sandbox pod {pod_id}. Its terminals, and any files outside /workspace and mounted volumes, are gone. Create a new pod if you need one."
-        );
+        ));
         crate::turn::notify(pool, conversation_id, vec![crate::turn::Notice::Save(notice)]);
     }
     Ok(())

@@ -196,19 +196,19 @@ impl StopReason {
     }
 
     /// The notice the model reads, saved as a `user` message as every
-    /// notice is.
+    /// notice is — marked with `NOTICE_MARK` before its words (SME-357).
     pub(crate) fn notice(self, pod_id: i64) -> String {
         const KEPT: &str = "/workspace, Docker's images, build cache and volumes, and mounted volumes are kept; \
             terminals, background processes and containers, installed packages and files elsewhere are gone.";
         match self {
-            StopReason::Idle { minutes } => format!(
+            StopReason::Idle { minutes } => crate::api::chat::mark_notice(&format!(
                 "Sandbox pod {pod_id} was stopped after {minutes} minutes with no activity and no command running. {KEPT} \
                  create_pod (or clone_repo) starts a new pod with /workspace as it was."
-            ),
-            StopReason::Finished => format!(
+            )),
+            StopReason::Finished => crate::api::chat::mark_notice(&format!(
                 "Sandbox pod {pod_id} was stopped because you finished. {KEPT} If you're given more work, \
                  create_pod (or clone_repo) starts a new pod with /workspace as it was."
-            ),
+            )),
         }
     }
 }

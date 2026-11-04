@@ -71,7 +71,7 @@ async fn test_wake_conversation_drains_a_pending_command_and_completes_a_turn(po
     assert_eq!(
         messages[0].blocks().expect("valid blocks"),
         vec![anthropic::ContentBlock::Text {
-            text: "Terminal command cmd-1 finished: exit code 0.".to_string()
+            text: format!("{}Terminal command cmd-1 finished: exit code 0.", crate::api::chat::NOTICE_MARK)
         }]
     );
     assert_eq!(messages[1].role, "assistant");
@@ -280,6 +280,8 @@ async fn test_wake_drains_an_idle_notice_and_the_command_keeps_running(pool: PgP
     else {
         panic!("the notice is a text block: {:?}", messages[0]);
     };
+    // SME-357: the saved idle notice carries the mark before its words.
+    assert!(text.starts_with(crate::api::chat::NOTICE_MARK), "marked: {text}");
     // The plan's sentence, in parts: which command, how long it has run,
     // how long since anything touched it, what it has printed, that nothing
     // stopped it, and what the model can do.
@@ -602,5 +604,10 @@ async fn test_a_wake_drains_a_lost_command(pool: PgPool) {
 
     assert_eq!(woke.len(), 2, "the notice and the reply: {woke:?}");
     assert!(woke[0].content.contains("cmd-lost's outcome is unknown"), "{:?}", woke[0]);
+    assert!(
+        woke[0].content.contains(&format!("{}{}", crate::api::chat::NOTICE_MARK, "Terminal command cmd-lost")),
+        "SME-357: the unknown-outcome notice carries the mark: {:?}",
+        woke[0]
+    );
     assert_eq!(counter.load(Ordering::SeqCst), 1, "the wake called the model");
 }

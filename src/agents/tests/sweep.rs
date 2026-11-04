@@ -59,7 +59,11 @@ async fn test_the_sweep_fails_a_start_a_restart_cut_off(pool: PgPool) {
     let text = format!("agent #{child}'s start failed: smelt restarted during the start");
     assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_FAILED));
     assert_eq!(cards(&pool, child).await, 0, "the cut-off start's card is deleted");
-    assert_eq!(transcript(&pool, child).await, vec![("user".to_string(), text.clone())], "the child says why");
+    assert_eq!(
+        transcript(&pool, child).await,
+        vec![("user".to_string(), format!("{}{text}", crate::api::chat::NOTICE_MARK))],
+        "the child says why, in a marked notice (SME-357)"
+    );
     assert_eq!(
         transcript(&pool, root).await,
         vec![
@@ -128,7 +132,11 @@ async fn test_the_starts_exit_runs_on_done_on_failure_and_on_a_delete(pool: PgPo
     eventually("the failed start's exit ran", || async { test_hooks::starts_ended(failed) }).await;
     assert_eq!(state(&pool, failed).await.as_deref(), Some(db::AGENT_FAILED));
     let text = format!("agent #{failed}'s start failed: the clone failed: no such repo");
-    assert!(transcript(&pool, failed).await.contains(&("user".to_string(), text.clone())));
+    // SME-357: the child's own start news is a marked notice; the parent's
+    // report keeps the raw words.
+    assert!(transcript(&pool, failed)
+        .await
+        .contains(&("user".to_string(), format!("{}{text}", crate::api::chat::NOTICE_MARK))));
     eventually("the parent got the report", || async {
         transcript(&pool, root).await.iter().any(|(_, t)| *t == format!("Report from agent #{failed}:\n\n{text}"))
     })

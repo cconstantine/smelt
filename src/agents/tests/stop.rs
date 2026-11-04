@@ -163,7 +163,8 @@ async fn test_the_users_stop_on_a_child_tells_its_parent_once(pool: PgPool) {
         queued_to(&pool, root).await.into_iter().filter(|body| body.starts_with("the user stopped")).collect();
     assert_eq!(stopped, vec![notice.clone()]);
     eventually("the parent reads the notice", || async {
-        transcript(&pool, root).await.iter().any(|(_, text)| *text == format!("Notice: {notice}"))
+        // SME-357: the delivered notice carries the mark before its words.
+        transcript(&pool, root).await.iter().any(|(_, text)| *text == format!("{}Notice: {notice}", crate::api::chat::NOTICE_MARK))
     })
     .await;
 
@@ -201,7 +202,8 @@ async fn test_a_wake_or_notice_to_a_starting_child_runs_no_turn(pool: PgPool) {
     })
     .await;
     let texts: Vec<String> = transcript(&pool, child).await.into_iter().map(|(_, text)| text).collect();
-    assert!(texts.contains(&"Notice: early".to_string()), "{texts:?}");
+    // SME-357: the notice the child drains carries the mark before its words.
+    assert!(texts.contains(&format!("{}Notice: early", crate::api::chat::NOTICE_MARK)), "{texts:?}");
     eventually("its turn is over", || async { !crate::turn::turn_running(child) }).await;
 }
 

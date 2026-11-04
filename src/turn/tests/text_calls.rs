@@ -98,6 +98,7 @@ async fn test_a_call_written_as_text_gets_a_correction_and_the_turn_goes_on(pool
 
     assert_eq!(roles(&saved), ["user", "assistant", "user", "assistant", "user", "assistant"], "{saved:?}");
     let notice = notice_text(&saved[2]).expect("the notice is one text block");
+    assert!(notice.starts_with(crate::api::chat::NOTICE_MARK), "SME-357: the saved correction carries the mark: {notice}");
     assert_eq!(crate::text_calls::parse_text_call_notice(&notice), Some(vec![Some(EVIDENCE_TOOL.to_string())]), "{notice}");
     assert_eq!(requests.lock().expect("the request log").len(), 3);
     assert_eq!(last_sent(&requests, 1), ("user".to_string(), notice), "the model reads the notice next");
@@ -292,17 +293,19 @@ async fn test_tool_use_with_no_calls_is_the_end_of_the_reply(pool: PgPool) {
 async fn test_a_reply_with_no_text_and_no_call_gets_one_nudge(pool: PgPool) {
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     use crate::text_calls::EMPTY_REPLY_NOTICE;
+    // SME-357: the saved nudge carries the mark before its words.
+    let marked = format!("{}{}", crate::api::chat::NOTICE_MARK, EMPTY_REPLY_NOTICE);
     let _guard = lock_turn_tests();
     let thinking = || text_blocks_body(&[Block::Thinking("The context was compacted.")], "end_turn");
-    let nudges = |saved: &[crate::models::Message]| saved.iter().filter(|m| notice_text(m).as_deref() == Some(EMPTY_REPLY_NOTICE)).count();
+    let nudges = |saved: &[crate::models::Message]| saved.iter().filter(|m| notice_text(m).as_deref() == Some(marked.as_str())).count();
 
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     let requests = start_recording_mock_upstream(&pool, vec![thinking(), text_reply_body("Done.")]).await;
     let saved = run_turn(&pool, conversation.id, hello()).await.expect("the turn succeeds");
     assert_eq!(roles(&saved), ["user", "assistant", "user", "assistant"], "{saved:?}");
-    assert_eq!(notice_text(&saved[2]).as_deref(), Some(EMPTY_REPLY_NOTICE));
+    assert_eq!(notice_text(&saved[2]).as_deref(), Some(marked.as_str()));
     assert_eq!(requests.lock().expect("the request log").len(), 2);
-    assert_eq!(last_sent(&requests, 1), ("user".to_string(), EMPTY_REPLY_NOTICE.to_string()));
+    assert_eq!(last_sent(&requests, 1), ("user".to_string(), marked.clone()));
 
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     let requests = start_recording_mock_upstream(&pool, vec![thinking(), thinking(), text_reply_body("Never sent.")]).await;
@@ -345,7 +348,10 @@ async fn test_a_cut_off_reply_with_markup_gets_only_the_cut_off_notice(pool: PgP
     let saved = run_turn(&pool, conversation.id, hello()).await.expect("the turn succeeds");
     assert_eq!(roles(&saved), ["user", "assistant", "user"], "{saved:?}");
     let notice = notice_text(&saved[2]).expect("one text block");
-    assert!(notice.starts_with(crate::api::chat::CUT_OFF_NOTICE_START), "{notice}");
+    assert!(
+        notice.starts_with(&format!("{}{}", crate::api::chat::NOTICE_MARK, crate::api::chat::CUT_OFF_NOTICE_START)),
+        "SME-357: the saved cut-off notice carries the mark: {notice}"
+    );
     assert_eq!(requests.lock().expect("the request log").len(), 1);
 }
 

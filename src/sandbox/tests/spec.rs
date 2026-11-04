@@ -318,6 +318,32 @@ fn test_pull_secrets_are_named_one_per_comma_with_the_spaces_trimmed() {
 }
 
 #[test]
+fn test_a_node_selector_setting_pins_nothing_when_it_names_nothing() {
+    assert_eq!(node_selector_from(None), None);
+    assert_eq!(node_selector_from(Some("")), None, "an empty setting is no setting");
+    assert_eq!(node_selector_from(Some(" , ")), None, "a blank entry is no entry");
+}
+
+#[test]
+fn test_a_node_selector_is_one_label_per_comma_and_a_malformed_entry_is_dropped() {
+    let labels = |setting: &str| {
+        node_selector_from(Some(setting)).map(|m| m.into_iter().collect::<Vec<_>>()).unwrap_or_default()
+    };
+    let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+    assert_eq!(labels("kubernetes.io/arch=amd64"), [pair("kubernetes.io/arch", "amd64")]);
+    assert_eq!(
+        labels(" kubernetes.io/arch = amd64 , smelt/sandbox=yes ,"),
+        [pair("kubernetes.io/arch", "amd64"), pair("smelt/sandbox", "yes")],
+        "spaces trimmed, a trailing comma is no label"
+    );
+    // A label may be matched on an empty value; one with no `=` or no key
+    // can't be a label, and is dropped rather than failing every pod.
+    assert_eq!(labels("smelt/sandbox="), [pair("smelt/sandbox", "")]);
+    assert_eq!(labels("amd64, =x, kubernetes.io/arch=amd64"), [pair("kubernetes.io/arch", "amd64")]);
+    assert_eq!(node_selector_from(Some("amd64")), None, "nothing usable is no selector");
+}
+
+#[test]
 fn test_a_metrics_request_for_an_invalid_namespace_is_an_error_not_a_panic() {
     let result = pod_metrics_request("bad namespace");
     assert!(

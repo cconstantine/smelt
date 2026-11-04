@@ -140,6 +140,11 @@ async fn test_trust_and_decline_on_two_conversations_cards_settle_once(pool: PgP
         notices.iter().any(|(id, text)| *id == b.id && text.contains("now trusts")),
         "B's model is told: {notices:?}"
     );
+    // SME-357: what B is told carries the mark before its words.
+    assert!(
+        notices.iter().any(|(id, text)| *id == b.id && text.starts_with(crate::api::chat::NOTICE_MARK)),
+        "B's told notice carries the mark: {notices:?}"
+    );
     assert!(only_repo(&pool, a.id).await.trust_requests.is_empty(), "no card left in A");
     assert!(only_repo(&pool, b.id).await.trust_requests.is_empty(), "no card left in B");
     assert!(decline_waited, "Decline waited for Trust rather than running first");
@@ -176,6 +181,11 @@ async fn test_a_card_asked_for_while_a_decline_waits_is_dropped_by_it(pool: PgPo
     assert!(
         notices.iter().any(|(id, text)| *id == b.id && text.contains("chose not to trust")),
         "B's model is told: {notices:?}"
+    );
+    // SME-357: the declined notice carries the mark before its words.
+    assert!(
+        notices.iter().any(|(id, text)| *id == b.id && text.starts_with(crate::api::chat::NOTICE_MARK)),
+        "B's declined notice carries the mark: {notices:?}"
     );
     assert!(decline_waited, "Decline waited for the load rather than running first");
 }

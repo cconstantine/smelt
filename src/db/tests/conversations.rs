@@ -467,6 +467,91 @@ async fn test_the_failure_notice_migration_marks_the_notices_saved_before_it(poo
     assert_eq!(saved(reply.id).await, legacy, "only the user role's notices");
 }
 
+/// SME-357's migration: one saved notice per family gains the mark, so the
+/// readers that now require it keep showing them as notices — plain text,
+/// another role's rows and already-marked notices are left alone, and a
+/// second run changes nothing more.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_notice_migration_marks_every_saved_notice_family(pool: PgPool) {
+    use crate::anthropic::ContentBlock;
+    let conversation = create_conversation(&pool).await.expect("conversation");
+    let unmark = |t: &str| {
+        t.strip_prefix(crate::api::chat::NOTICE_MARK)
+            .unwrap_or_else(|| panic!("the builder marks: {t}"))
+            .to_string()
+    };
+    // One legacy row per family: the builders' saved words without the
+    // mark, and the writers' wording where no builder has one (plan §
+    // Migration: the 13 families plus Q1's task tags and Q2's `Notice: `).
+    let legacy: Vec<String> = vec![
+        crate::api::chat::STOP_NOTICE.to_string(),
+        unmark(&crate::api::chat::cut_off_notice(1024, crate::api::chat::ReplyLimit::OutputCap, None)),
+        crate::api::chat::REFUSAL_NOTICE_START.to_string(),
+        crate::text_calls::EMPTY_REPLY_NOTICE.to_string(),
+        unmark(&crate::text_calls::text_call_notice(
+            &[crate::text_calls::TextCall { name: Some("read_file".to_string()) }],
+            &["read_file"],
+        )),
+        "Terminal command c1 finished: exit code 0.".to_string(),
+        "Sandbox pod 4 was stopped after 60 minutes with no activity and no command running. create_pod (or clone_repo) starts a new pod with /workspace as it was.".to_string(),
+        "Sandbox pod 4 stopped unexpectedly (OOMKilled); every terminal running in it is no longer available.".to_string(),
+        "Sandbox pod 4's storage was removed after 7 days stopped. /workspace and Docker's images, build cache and volumes are gone. The next sandbox starts fresh with empty volumes.".to_string(),
+        "Docker in sandbox pod 4 was restarted, so the containers it was running have stopped. Images, terminals and /workspace are unaffected.".to_string(),
+        "The user stopped sandbox pod 4. Its terminals, and any files outside /workspace and mounted volumes, are gone. Create a new pod if you need one.".to_string(),
+        "The user removed this conversation's sandbox storage: /workspace and the Docker images, build cache and volumes are gone. The next sandbox starts with fresh empty volumes.".to_string(),
+        "Language server rust-analyzer stopped. The sandbox is unaffected. start_language_server starts it again.".to_string(),
+        "The user now trusts https://example.com/r.git. You can start agents on it; call start_agent again.".to_string(),
+        "The user chose not to trust https://example.com/r.git, so no agent can work on it.".to_string(),
+        r#"<task-notification task_id="t1" tool="count">finished: Counted to 3</task-notification>"#.to_string(),
+        r#"<task-output task_id="t1" tool="count" stream="stdout">3</task-output>"#.to_string(),
+        "Notice: the user deleted agent #7".to_string(),
+    ];
+    let text = |t: &str| vec![ContentBlock::Text { text: t.to_string() }];
+    let mut ids = Vec::new();
+    for words in &legacy {
+        let notice = create_message(&pool, conversation.id, "user", &text(words)).await.expect("legacy notice");
+        ids.push(notice.id);
+    }
+    let other = create_message(&pool, conversation.id, "user", &text("hello")).await.expect("plain text");
+    let reply = create_message(&pool, conversation.id, "assistant", &text(&legacy[5])).await.expect("a reply quoting a notice's words");
+    let marked = create_message(
+        &pool,
+        conversation.id,
+        "user",
+        &text(&format!("{}Sandbox pod 4 is big", crate::api::chat::NOTICE_MARK)),
+    )
+    .await
+    .expect("an already-marked notice");
+    for _ in 0..2 {
+        sqlx::raw_sql(include_str!("../../../migrations/20261104150000_mark_saved_notices.sql"))
+            .execute(&pool)
+            .await
+            .expect("run the migration");
+    }
+    let saved = |id: i64| {
+        let pool = pool.clone();
+        async move {
+            let content: String =
+                sqlx::query_scalar("SELECT content FROM messages WHERE id = $1").bind(id).fetch_one(&pool).await.expect("content");
+            let blocks: Vec<ContentBlock> = serde_json::from_str(&content).expect("still JSON blocks");
+            match blocks.as_slice() {
+                [ContentBlock::Text { text }] => text.clone(),
+                other => panic!("one text block: {other:?}"),
+            }
+        }
+    };
+    for (id, words) in ids.iter().zip(&legacy) {
+        assert_eq!(saved(*id).await, format!("{}{words}", crate::api::chat::NOTICE_MARK), "marked once: {words}");
+    }
+    assert_eq!(saved(other.id).await, "hello");
+    assert_eq!(saved(reply.id).await, legacy[5], "only the user role's notices");
+    assert_eq!(
+        saved(marked.id).await,
+        format!("{}Sandbox pod 4 is big", crate::api::chat::NOTICE_MARK),
+        "an already-marked row keeps its single mark"
+    );
+}
+
 /// SME-71: a notification names its conversation, so the attention
 /// endpoint needs its title — and `None` for an id that isn't one.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]

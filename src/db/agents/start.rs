@@ -214,7 +214,11 @@ pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChi
     .bind(credentials)
     .execute(&mut *tx)
     .await?;
-    let brief = [ContentBlock::Text { text: new.brief.to_string() }];
+    // SME-357 review 1: the brief rides the child's transcript as its opening
+    // ask — the user's side of the row — so it is saved through `users_text`
+    // like every user send: a parent can't seed a leading NOTICE_MARK into
+    // the child. The `agents.brief` column above keeps the text as written.
+    let brief = [ContentBlock::Text { text: crate::api::chat::users_text(new.brief) }];
     super::conversations::create_message_on(&mut tx, child, "user", &brief).await?;
     // Every passed volume gets the child a mount row exactly like its
     // creator's (SME-239): its pod mounts it at the volume's own path at its
@@ -396,7 +400,9 @@ pub async fn fail_start(pool: &PgPool, child: i64, parent: i64, label: &str, tex
         return Ok(false);
     }
     queue_agent_message(&mut tx, parent, Some(child), label, KIND_REPORT, text).await?;
-    super::conversations::create_message_on(&mut tx, child, "user", &[ContentBlock::Text { text: text.to_string() }]).await?;
+    // SME-357: the child's own news is marked like every saved notice; the
+    // parent's queued report keeps the raw body (a report is typed words).
+    super::conversations::create_message_on(&mut tx, child, "user", &[ContentBlock::Text { text: crate::api::chat::mark_notice(text) }]).await?;
     tx.commit().await?;
     Ok(true)
 }
