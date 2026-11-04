@@ -438,6 +438,7 @@ pub async fn offered_tools(
     let attempts = configs.iter().map(|config| {
         let (pool, config) = (pool.clone(), config.clone());
         let name = config.name.clone();
+        let for_redaction = config.clone();
         // In the caller's span, so its connect is the turn's child (SME-137).
         let task = tokio::spawn(tracing::Instrument::in_current_span(async move {
             ensure_connected(&pool, &config, Attempt::SkipRecentFailures).await
@@ -446,9 +447,10 @@ pub async fn offered_tools(
             match tokio::time::timeout(TOOL_LIST_WAIT, task).await {
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(e))) => {
-                    // Its URL's query can hold the server's key, and this
-                    // line is exported with the turn's span (SME-137).
-                    let error = crate::telemetry::scrub_urls(&e.to_string());
+                    // Its URL's query or path can hold the server's key, and
+                    // this line is exported with the turn's span (SME-137,
+                    // SME-386 review round 1, L1).
+                    let error = crate::telemetry::scrub_urls(&redact_secrets(&for_redaction, &e.to_string()));
                     tracing::warn!(server = %name, %error, "MCP server unreachable this turn; its tools are unavailable");
                 }
                 Ok(Err(e)) => {

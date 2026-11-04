@@ -272,3 +272,38 @@ async fn test_a_failures_span_exports_no_key_from_the_urls_path_or_a_header(pool
     assert!(!exported.contains(path_key), "{exported}");
     assert!(!exported.contains("HEADERKEY-386"), "{exported}");
 }
+
+/// SME-386 review round 1, L1: the tool list's "unreachable this turn"
+/// warning is an event on the turn's span, and `scrub_urls` keeps a URL's
+/// path, so a key there (M1) went with it. Neither it nor any span
+/// exports the key.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_tool_lists_warning_exports_no_key_from_the_urls_path(pool: sqlx::PgPool) {
+    let path_key = "PATHKEY386list000000";
+    let config = create_static_server(&pool, &format!("http://127.0.0.1:1/mcp/s/{path_key}/mcp")).await;
+    let console = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (_, spans) = crate::telemetry::capture_spans_with_console(console.clone(), async {
+        crate::telemetry::in_span(tracing::info_span!("caller"), async {
+            tool_definitions_for(&pool, std::slice::from_ref(&config), &unruled()).await
+        })
+        .await
+    })
+    .await;
+    evict(config.id).await;
+    lock_failures().remove(&config.id);
+    // smelt's own warning; rmcp's own log lines quote the URL too, which
+    // is filed apart (it's older than this ticket).
+    let logged = String::from_utf8_lossy(&console.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
+    let warnings: Vec<&str> = logged.lines().filter(|line| line.contains("MCP server unreachable this turn")).collect();
+    assert!(!warnings.is_empty(), "the warning was logged: {logged}");
+    for warning in warnings {
+        assert!(!warning.contains(path_key), "{warning}");
+    }
+    let events: Vec<_> = spans
+        .iter()
+        .flat_map(|span| span.events.iter())
+        .filter(|event| event.name.contains("MCP server unreachable this turn"))
+        .collect();
+    assert!(!events.is_empty(), "the warning is exported: {spans:?}");
+    assert!(!format!("{events:?}").contains(path_key), "{events:?}");
+}
