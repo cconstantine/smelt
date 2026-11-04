@@ -181,3 +181,27 @@ fn test_a_key_in_the_urls_path_is_redacted_and_its_words_stay() {
     let redacted = redact_secrets(&config, "echoed Ab12Cd34Ef56Gh78+x and Ab12Cd34Ef56Gh78%2Bx");
     assert!(!redacted.contains("Ab12Cd34"), "{redacted}");
 }
+
+/// SME-386 M3: a tool's own error (`isError`) can quote the request, its
+/// header values included, and it reaches the model and a script just as
+/// smelt's errors do, so it is redacted the same way. The tool's own
+/// words stay.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_tools_own_error_doesnt_quote_a_header(pool: sqlx::PgPool) {
+    let marker = "HEADERKEY-386-tool";
+    let config = static_server(&pool, "http://unused.invalid/mcp", &[("x-api-key", marker)]).await;
+    register_mock(config.id, MockMcpServer::new(false)).await;
+    let arguments = serde_json::json!({"x-api-key": marker});
+    let for_the_model = call_tool(&pool, &config, "fail_quoting", arguments.clone()).await.expect_err("the tool fails");
+    let for_a_script = call_tool_raw(&pool, &config, "fail_quoting", arguments, |_, _| Ok(())).await;
+    REGISTRY.lock().await.remove(&config.id);
+    let for_a_script = for_a_script.expect("the tool's own error is a result");
+    assert_eq!(for_a_script.is_error, Some(true));
+    let structured = serde_json::to_string(&for_a_script.structured_content).expect("serialize");
+    assert!(!structured.contains(marker) && structured.contains("refused"), "{structured}");
+    let script_text = result_text(&for_a_script);
+    for text in [&for_the_model, &script_text] {
+        assert!(!text.contains(marker), "{text}");
+        assert!(text.contains("refused the request"), "{text}");
+    }
+}

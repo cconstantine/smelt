@@ -98,9 +98,12 @@ pub async fn call_tool_raw(
     );
     crate::telemetry::in_span(span.clone(), async move {
         match call_tool_unspanned(pool, config, tool_name, arguments, check_class).await {
-            Ok(result) => {
+            Ok(mut result) => {
                 if result.is_error.unwrap_or(false) {
                     crate::telemetry::mark_error(&span, CallFailure::REPORTED);
+                    // The tool's own error can quote the request, a
+                    // header's value included (SME-386 M3).
+                    redact_tool_error(pool, config, &mut result).await;
                 }
                 Ok(result)
             }
@@ -320,17 +323,60 @@ async fn call_tool_unspanned(
     Ok(result)
 }
 
+/// An `is_error` result with `config`'s secrets redacted from its text
+/// blocks and every string in its `structured_content`, the grant read
+/// once for them all.
+async fn redact_tool_error(pool: &sqlx::PgPool, config: &McpServerConfig, result: &mut rmcp::model::CallToolResult) {
+    let current = current_grant(pool, config).await;
+    let redact = |text: &str| {
+        let text = redact_secrets(config, text);
+        match &current {
+            Some(current) => redact_secrets(current, &text),
+            None => text,
+        }
+    };
+    for block in &mut result.content {
+        if let McpContentBlock::Text(text) = block {
+            text.text = redact(&text.text);
+        }
+    }
+    if let Some(structured) = &mut result.structured_content {
+        let mut strings = Vec::new();
+        collect_strings_mut(structured, &mut strings);
+        for string in strings {
+            *string = redact(string);
+        }
+    }
+}
+
+/// Every string in `value`, its object keys aside.
+fn collect_strings_mut<'a>(value: &'a mut serde_json::Value, into: &mut Vec<&'a mut String>) {
+    match value {
+        serde_json::Value::String(text) => into.push(text),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(|item| collect_strings_mut(item, into)),
+        serde_json::Value::Object(map) => map.values_mut().for_each(|item| collect_strings_mut(item, into)),
+        _ => {}
+    }
+}
+
 /// [`redact_secrets`] with the grant as it is stored now, falling back to
 /// `config`'s alone when it can't be read.
 async fn redact_secrets_now(pool: &sqlx::PgPool, config: &McpServerConfig, text: &str) -> String {
-    let current = match config.auth_mode.as_str() {
-        "oauth" => crate::db::get_mcp_server_config(pool, config.id).await.ok().flatten(),
-        _ => None,
-    };
+    let current = current_grant(pool, config).await;
     let text = redact_secrets(config, text);
     match current {
         Some(current) => redact_secrets(&current, &text),
         None => text,
+    }
+}
+
+/// An OAuth server's row as it is stored now (a refresh during the call
+/// may have replaced the tokens `config` was read with); `None` for
+/// another server, or when it can't be read.
+async fn current_grant(pool: &sqlx::PgPool, config: &McpServerConfig) -> Option<McpServerConfig> {
+    match config.auth_mode.as_str() {
+        "oauth" => crate::db::get_mcp_server_config(pool, config.id).await.ok().flatten(),
+        _ => None,
     }
 }
 

@@ -106,6 +106,16 @@ impl ServerHandler for MockMcpServer {
             ))])
             .into());
         }
+        // An unlisted tool whose error quotes its input, as a server's
+        // error can quote the request's headers (SME-386 M3).
+        if request.name == "fail_quoting" {
+            let quoted = serde_json::to_string(&request.arguments).unwrap_or_default();
+            let mut result = CallToolResult::error(vec![McpContentBlock::Text(rmcp::model::TextContent::new(format!(
+                "refused the request: {quoted}"
+            )))]);
+            result.structured_content = Some(serde_json::json!({"error": "refused", "request": [request.arguments]}));
+            return Ok(result.into());
+        }
         let router = self.router.read().await;
         router
             .call(ToolCallContext::new(self, request, context))
