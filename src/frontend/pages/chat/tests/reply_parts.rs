@@ -76,7 +76,7 @@ fn test_reply_parts_a_notice_or_an_ask_user_answer_starts_a_new_reply() {
         message_with_blocks(2, "assistant", vec![text("One."), call("q1", ASK_USER)]),
         message_with_blocks(3, "user", vec![result("q1", "The user answered:\n1. Yes")]),
         message_with_blocks(4, "assistant", vec![text("Two.")]),
-        user_text(5, crate::api::chat::STOP_NOTICE),
+        user_text(5, &crate::api::chat::mark_notice(crate::api::chat::STOP_NOTICE)),
         message_with_blocks(6, "assistant", vec![text("Three.")]),
     ];
     let parts = reply_parts(&messages, false);
@@ -170,7 +170,7 @@ fn test_reply_parts_a_command_notice_inside_a_running_turn_does_not_split_its_re
         user_text(1, "run the tests"),
         message_with_blocks(2, "assistant", vec![text("Running the tests."), call("t1", "run_terminal_command")]),
         message_with_blocks(3, "user", vec![result("t1", "command sent (id: c1)")]),
-        user_text(4, "Terminal command c1 finished: exit code 0."),
+        user_text(4, &crate::api::chat::mark_notice("Terminal command c1 finished: exit code 0.")),
         message_with_blocks(5, "assistant", vec![text("All tests pass.")]),
     ];
     assert_eq!(
@@ -185,7 +185,7 @@ fn test_reply_parts_a_notice_that_starts_a_turn_still_starts_a_reply() {
     let messages = vec![
         user_text(1, "start the build"),
         message_with_blocks(2, "assistant", vec![text("Started it.")]),
-        user_text(3, "Terminal command c1 finished: exit code 0."),
+        user_text(3, &crate::api::chat::mark_notice("Terminal command c1 finished: exit code 0.")),
         message_with_blocks(4, "assistant", vec![text("The build finished.")]),
     ];
     assert_eq!(
@@ -234,7 +234,7 @@ fn test_reply_parts_a_cut_off_or_stop_after_tool_results_ends_the_reply() {
         message_with_blocks(2, "assistant", vec![text("Partway."), call("t1", "todowrite")]),
         message_with_blocks(3, "user", vec![result("t1", "not run")]),
         user_text(4, &cut_off),
-        user_text(5, "Terminal command c1 finished: exit code 0."),
+        user_text(5, &crate::api::chat::mark_notice("Terminal command c1 finished: exit code 0.")),
         message_with_blocks(6, "assistant", vec![text("Woken reply.")]),
     ];
     assert_eq!(
@@ -245,8 +245,8 @@ fn test_reply_parts_a_cut_off_or_stop_after_tool_results_ends_the_reply() {
         user_text(1, "go"),
         message_with_blocks(2, "assistant", vec![text("Working."), call("t1", "todoread")]),
         message_with_blocks(3, "user", vec![result("t1", "[]")]),
-        user_text(4, crate::api::chat::STOP_NOTICE),
-        user_text(5, "Terminal command c1 finished: exit code 0."),
+        user_text(4, &crate::api::chat::mark_notice(crate::api::chat::STOP_NOTICE)),
+        user_text(5, &crate::api::chat::mark_notice("Terminal command c1 finished: exit code 0.")),
         message_with_blocks(6, "assistant", vec![text("After the stop.")]),
     ];
     assert_eq!(

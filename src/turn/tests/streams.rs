@@ -48,6 +48,7 @@ fn is_app_relay(event: &events::ConversationEvent) -> bool {
             | events::ConversationEvent::QuestionsChanged {}
             | events::ConversationEvent::ProvidersChanged {}
             | events::ConversationEvent::ConversationsChanged {}
+            | events::ConversationEvent::NeedsUser { .. }
     )
 }
 
@@ -160,7 +161,9 @@ async fn test_a_stream_that_falls_behind_ends_instead_of_skipping() {
             match stream.next().await {
                 None => return true,
                 // App-wide events, this test's own and those of tests
-                // running alongside: all four kinds the stream relays.
+                // running alongside: every kind the stream relays,
+                // NeedsUser included (SME-71 added it to the relay, and
+                // attention tests publish it — SME-372).
                 Some(Ok(event)) if is_app_relay(&event) => continue,
                 Some(_) => return false,
             }

@@ -296,35 +296,23 @@ pub(super) fn typed_budget(context_window: u32) -> usize {
 #[cfg(feature = "server")]
 const PARENT_MESSAGE_START: &str = "Message from your parent:";
 
-/// The starts of the user-role texts smelt writes itself: notices, and what
-/// other agents send (a child's report, message or question). Anything
-/// else in a user-role text block is the user's own words. A notice this
-/// misses is quoted as if typed, which costs space, never a correction.
+/// The starts of the user-role texts smelt writes for other agents: what a
+/// child reports, messages, or asks (`Report from `, `Message from agent #`,
+/// `Question from `). They're another agent's typed words, shown as bubbles
+/// as written, so they carry no `NOTICE_MARK` — marking them would grey
+/// real agent messages in the transcript (SME-357's trade-off). Everything
+/// smelt writes itself now carries the mark and is excluded by it, not by
+/// words — one exception: the deciding `"The user trusts …"` wording in
+/// `git::server::trust` stays unmarked on purpose, quoted as the user's own
+/// news. A text this list misses is quoted as if typed, which costs space,
+/// never a correction.
 #[cfg(feature = "server")]
-const SERVER_TEXT_STARTS: &[&str] = &[
-    crate::api::chat::STOP_NOTICE,
-    crate::api::chat::CUT_OFF_NOTICE_START,
-    crate::api::chat::REFUSAL_NOTICE_START,
-    crate::text_calls::TEXT_CALL_NOTICE_START,
-    crate::text_calls::EMPTY_REPLY_NOTICE,
-    "Terminal command ",
-    "Sandbox pod ",
-    "Docker in sandbox pod ",
-    "Report from ",
-    "Message from agent #",
-    "Question from ",
-    "Notice: ",
-    // Notices worded as news about the user (review 1). They carry no
-    // NOTICE_MARK yet (SME-357 would mark them all), so their starts are
-    // listed: quoted, they'd read as the user asking again.
-    "The user stopped sandbox pod ",
-    "The user removed this conversation's sandbox storage",
-    "The user now trusts ",
-    "The user chose not to trust ",
-];
+const SERVER_TEXT_STARTS: &[&str] = &["Report from ", "Message from agent #", "Question from "];
 
 /// Whether a user-role text is the user's own words or a parent's message:
-/// not a marked notice (`NOTICE_MARK`), and not one of `SERVER_TEXT_STARTS`.
+/// not a marked notice (every notice smelt saves into a transcript carries
+/// `NOTICE_MARK` since SME-357, its deciding unmarked `"The user trusts …"`
+/// wording excepted), and not one of `SERVER_TEXT_STARTS`.
 #[cfg(feature = "server")]
 pub(super) fn is_typed(text: &str) -> bool {
     if text.starts_with(PARENT_MESSAGE_START) {
@@ -376,14 +364,20 @@ pub(super) fn typed_user_text(messages: &[Message], context_window: u32) -> Type
         }
         // The unanswered tail is quoted as such; only its stops count here
         // (review 2: a stop there still calls the earlier request off).
+        // The stop's note is compared through `users_text` so both saved
+        // forms count: the marked one written since SME-357 and the legacy
+        // unmarked row.
         let in_tail = index >= answered;
-        let stops_here = blocks.iter().any(|b| matches!(b, anthropic::ContentBlock::Text { text } if text == STOP_NOTICE));
+        let stops_here = blocks.iter().any(|b| {
+            matches!(b, anthropic::ContentBlock::Text { text }
+                if crate::api::chat::users_text(text) == STOP_NOTICE)
+        });
         if !stops_here {
             last_was_final = false;
         }
         for block in blocks {
             let text = match block {
-                anthropic::ContentBlock::Text { text } if text == STOP_NOTICE => {
+                anthropic::ContentBlock::Text { text } if crate::api::chat::users_text(&text) == STOP_NOTICE => {
                     let upto = if last_was_final { answered_before } else { answered_upto };
                     all.truncate(upto);
                     answered_upto = all.len();
@@ -449,7 +443,8 @@ pub(super) fn unanswered_user_text(messages: &[Message]) -> Vec<String> {
         .collect();
     texts.reverse();
     // What came before the user's last stop was called off (SME-51 B10).
-    if let Some(stop) = texts.iter().rposition(|text| text == STOP_NOTICE) {
+    // Both saved stop notes count, marked (since SME-357) and legacy.
+    if let Some(stop) = texts.iter().rposition(|text| crate::api::chat::users_text(text) == STOP_NOTICE) {
         texts.drain(..=stop);
     }
     texts

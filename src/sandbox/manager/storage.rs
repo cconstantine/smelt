@@ -247,10 +247,10 @@ pub(in crate::sandbox) async fn remove_conversation_storage_locked(
         crate::turn::notify(
             pool,
             conversation_id,
-            vec![crate::turn::Notice::Save(
-                "The user removed this conversation's sandbox storage: /workspace and the Docker images, build cache and volumes are gone. Repos there need cloning again; the next sandbox starts with fresh empty volumes."
-                    .to_string(),
-            )],
+            // SME-357: marked like every saved notice.
+            vec![crate::turn::Notice::Save(crate::api::chat::mark_notice(
+                "The user removed this conversation's sandbox storage: /workspace and the Docker images, build cache and volumes are gone. Repos there need cloning again; the next sandbox starts with fresh empty volumes.",
+            ))],
         );
     }
     // Reuse the pods event rather than add an `AppEvent` variant: an

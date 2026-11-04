@@ -83,7 +83,11 @@ async fn test_deleting_a_child_tells_its_parent_and_a_failed_delete_tells_nothin
     let queued = queued_to(&pool, root).await;
     assert_eq!(queued.last().map(String::as_str), Some(format!("the user deleted agent #{child}").as_str()));
     eventually("the parent reads it", || async {
-        transcript(&pool, root).await.iter().any(|(_, text)| *text == format!("Notice: the user deleted agent #{child}"))
+        // SME-357: the delivered notice carries the mark before its words.
+        transcript(&pool, root)
+            .await
+            .iter()
+            .any(|(_, text)| *text == format!("{}Notice: the user deleted agent #{child}", crate::api::chat::NOTICE_MARK))
     })
     .await;
     eventually("the parent's turns are over", || async { !crate::turn::turn_running(root) }).await;

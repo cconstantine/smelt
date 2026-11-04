@@ -496,10 +496,11 @@ pub fn note_server_stop(seen: &mut std::collections::HashSet<String>, pod: &Pod,
     let why = stop_explanation(stop_reason(pod).as_deref());
     Some(ServerStopped {
         conversation_id,
-        notice: format!(
+        // SME-357: marked like every saved notice.
+        notice: crate::api::chat::mark_notice(&format!(
             "Language server {server} stopped{why}. The sandbox is unaffected. start_language_server \
              starts it again."
-        ),
+        )),
     })
 }
 

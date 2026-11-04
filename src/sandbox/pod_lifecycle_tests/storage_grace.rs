@@ -58,6 +58,8 @@ async fn test_the_pass_removes_the_claims_a_quiet_stop_kept(pool: PgPool) {
         let notices = removal_notices(&pool, id).await;
         assert_eq!(notices.len(), 1, "one notice: {notices:?}");
         assert!(notices[0].contains("starts fresh with empty volumes"), "{}", notices[0]);
+        // SME-357: the saved storage-removal notice carries the mark before its words.
+        assert!(notices[0].contains(&format!("{}Sandbox pod", crate::api::chat::NOTICE_MARK)), "{}", notices[0]);
 
         let settled = remove_expired_storage_once_with(&pool, 7, STORAGE_REMOVAL_TIMEOUT, |conversation_id| {
             remove_conversation_storage_locked(&pool, conversation_id)

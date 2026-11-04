@@ -21,7 +21,7 @@ fn test_format_elapsed_counts_seconds_then_minutes() {
 #[test]
 fn test_a_stop_reads_as_stopped() {
     assert_eq!(
-        system_notice(crate::api::chat::STOP_NOTICE, &HashMap::new()).as_deref(),
+        system_notice(&crate::api::chat::mark_notice(crate::api::chat::STOP_NOTICE), &HashMap::new()).as_deref(),
         Some("Stopped.")
     );
 }
@@ -66,7 +66,7 @@ fn test_a_text_call_notice_names_the_calls() {
 #[test]
 fn test_the_empty_reply_nudge_reads_as_a_notice() {
     assert_eq!(
-        system_notice(crate::text_calls::EMPTY_REPLY_NOTICE, &HashMap::new()).as_deref(),
+        system_notice(&crate::text_calls::empty_reply_notice(), &HashMap::new()).as_deref(),
         Some("The model's reply was empty; smelt asked it to carry on.")
     );
 }
@@ -75,10 +75,15 @@ fn test_the_empty_reply_nudge_reads_as_a_notice() {
 /// dropped call, and round-trips.
 #[test]
 fn test_a_refusal_notice_says_the_provider_stopped_the_reply() {
-    use crate::api::chat::{parse_refusal_notice, refusal_notice};
+    use crate::api::chat::{parse_refusal_notice, refusal_notice, REFUSAL_NOTICE_START};
     assert_eq!(parse_refusal_notice(&refusal_notice(None)), Some(None));
     assert_eq!(parse_refusal_notice(&refusal_notice(Some("write_file"))), Some(Some("write_file".to_string())));
     assert_eq!(parse_refusal_notice("Something else."), None);
+    assert_eq!(
+        parse_refusal_notice(REFUSAL_NOTICE_START),
+        None,
+        "the words without the mark are nobody's notice (SME-357)"
+    );
     assert_eq!(
         system_notice(&refusal_notice(None), &HashMap::new()).as_deref(),
         Some("The model's provider stopped this reply (a refusal).")
@@ -133,15 +138,18 @@ fn test_the_users_own_text_starting_like_a_failure_notice_is_their_bubble() {
 }
 
 /// SME-126: a notice for a reply cut off in the middle of a tool call
-/// names the call, for the model and in the chat, and round-trips; a
-/// notice saved before SME-126 still parses and reads as it did.
+/// names the call, for the model and in the chat, and round-trips.
+/// SME-357: the mark is part of a notice — the builder adds it, the parser
+/// requires it, and unmarked wording parses as no notice at all.
 #[test]
 fn test_a_cut_off_notice_names_the_call_it_was_cut_in() {
-    use crate::api::chat::{ReplyLimit, cut_off_notice, parse_cut_off_notice};
+    use crate::api::chat::{ReplyLimit, cut_off_notice, parse_cut_off_notice, NOTICE_MARK};
     let notice = cut_off_notice(16_384, ReplyLimit::OutputCap, Some("write_file"));
     assert_eq!(
         notice,
-        "Your last reply was cut off: it reached its limit of 16384 tokens (the model's maximum reply length) before it finished. It stopped in the middle of a call to `write_file`, which was dropped and not run."
+        format!(
+            "{NOTICE_MARK}Your last reply was cut off: it reached its limit of 16384 tokens (the model's maximum reply length) before it finished. It stopped in the middle of a call to `write_file`, which was dropped and not run."
+        )
     );
     assert_eq!(parse_cut_off_notice(&notice), Some((16_384, ReplyLimit::OutputCap, Some("write_file".to_string()))));
     assert_eq!(
@@ -150,10 +158,11 @@ fn test_a_cut_off_notice_names_the_call_it_was_cut_in() {
     );
 
     let old = "Your last reply was cut off: it reached its limit of 8192 tokens (half the context window) before it finished.";
-    assert_eq!(cut_off_notice(8_192, ReplyLimit::HalfWindow, None), old);
-    assert_eq!(parse_cut_off_notice(old), Some((8_192, ReplyLimit::HalfWindow, None)));
-    assert_eq!(parse_cut_off_notice(&format!("{old} It stopped in the middle of a call to ``, which was dropped and not run.")), None);
-    assert_eq!(parse_cut_off_notice(&format!("{old} And more.")), None);
+    assert_eq!(cut_off_notice(8_192, ReplyLimit::HalfWindow, None), format!("{NOTICE_MARK}{old}"));
+    assert_eq!(parse_cut_off_notice(&format!("{NOTICE_MARK}{old}")), Some((8_192, ReplyLimit::HalfWindow, None)));
+    assert_eq!(parse_cut_off_notice(old), None, "the words without the mark are nobody's notice (SME-357)");
+    assert_eq!(parse_cut_off_notice(&format!("{NOTICE_MARK}{old} It stopped in the middle of a call to ``, which was dropped and not run.")), None);
+    assert_eq!(parse_cut_off_notice(&format!("{NOTICE_MARK}{old} And more.")), None);
 }
 
 /// SME-123 DR6: a long or multi-line command was repeated whole in its
@@ -166,10 +175,11 @@ fn test_a_long_command_is_cut_short_in_its_notice() {
         ("long".to_string(), long.to_string()),
         ("lines".to_string(), "set -e\npython3 -m pytest -q".to_string()),
     ]);
-    let shown = system_notice("Terminal command long finished: exit code 0.", &commands).expect("a notice");
+    // SME-357: the saved notice is marked; the mark is stripped for the sentence.
+    let shown = system_notice(&crate::api::chat::mark_notice("Terminal command long finished: exit code 0."), &commands).expect("a notice");
     assert_eq!(shown, "`cd /workspace/smelt && git diff --stat && echo \"--- proof: c\u{2026}` finished (exit code 0)");
     assert_eq!(
-        system_notice("Terminal command lines finished: exit code 1.", &commands).as_deref(),
+        system_notice(&crate::api::chat::mark_notice("Terminal command lines finished: exit code 1."), &commands).as_deref(),
         Some("`set -e \u{2026}` finished (exit code 1)")
     );
 }
@@ -177,7 +187,9 @@ fn test_a_long_command_is_cut_short_in_its_notice() {
 #[test]
 fn test_system_notices_read_as_short_sentences() {
     let commands = HashMap::from([("abc123".to_string(), "python3 primes.py".to_string())]);
-    let notice = |t: &str| system_notice(t, &commands);
+    // SME-357: every fixture here is a saved notice, so it carries the mark;
+    // the two `None` cases are text that only looks like one, marked or not.
+    let notice = |t: &str| system_notice(&crate::api::chat::mark_notice(t), &commands);
     assert_eq!(
         notice("Terminal command abc123 finished: exit code 0.").as_deref(),
         Some("`python3 primes.py` finished (exit code 0)")
@@ -236,9 +248,10 @@ fn test_an_idle_notice_splits_at_its_own_marker() {
     // leading and trailing spaces and all — the marker the sentence is cut at.
     let marker = " is still running and hasn't been touched in ";
     let line = format!(r#"grep -c "{marker}" agent.log"#);
-    let notice = format!(
+    // SME-357: the saved idle notice carries the mark before its words.
+    let notice = crate::api::chat::mark_notice(&format!(
         r#"Terminal command abc123 ("{line}", running for 1 minute){marker}5 minutes: 0 lines on stdout, 0 on stderr. Nothing stopped it and smelt won't stop it."#
-    );
+    ));
     let commands = HashMap::from([("abc123".to_string(), line.clone())]);
     assert_eq!(
         system_notice(&notice, &commands).as_deref(),
@@ -529,7 +542,9 @@ fn test_repo_error_shown_escapes_a_remotes_error_as_the_model_sees_it() {
 #[test]
 fn test_a_quiet_stop_notice_reads_as_a_sentence() {
     let commands = HashMap::new();
-    let notice = |t: &str| system_notice(t, &commands);
+    // SME-357: the saved quiet-stop notice carries the mark; the sentence is
+    // read from the words under it.
+    let notice = |t: &str| system_notice(&crate::api::chat::mark_notice(t), &commands);
     assert_eq!(
         notice("Sandbox pod 12 was stopped after 60 minutes with no activity and no command running. /workspace, Docker's images, build cache and volumes, and mounted volumes are kept; terminals, background processes and containers, installed packages and files elsewhere are gone. create_pod (or clone_repo) starts a new pod with /workspace as it was.").as_deref(),
         Some("The sandbox stopped after 60 minutes idle; /workspace and Docker's data are kept")
@@ -545,7 +560,9 @@ fn test_a_quiet_stop_notice_reads_as_a_sentence() {
 #[test]
 fn test_the_quiet_stop_notices_smelt_saves_are_summarized() {
     let commands = HashMap::new();
+    // SME-357: the builder's marked output, as saved, is what the reader reads.
     let idle = crate::sandbox::StopReason::Idle { minutes: 3 }.notice(5);
+    assert!(idle.starts_with(crate::api::chat::NOTICE_MARK), "{idle}");
     assert_eq!(
         system_notice(&idle, &commands).as_deref(),
         Some("The sandbox stopped after 3 minutes idle; /workspace and Docker's data are kept")
@@ -664,24 +681,26 @@ fn test_a_debug_literal_reads_back_to_its_text() {
 #[test]
 fn test_the_sandboxs_own_notices_read_as_notices_not_the_users_words() {
     let none = HashMap::new();
-    let docker = "Docker in sandbox pod 41 was restarted (OOMKilled), so the containers it was running have stopped. Images, terminals and /workspace are unaffected. Every container shares Docker's memory limit; a pod created with a larger docker_memory_limit gives them more.";
+    // SME-357: each saved notice carries the mark; the sentence reads from
+    // the words under it.
+    let docker = crate::api::chat::mark_notice("Docker in sandbox pod 41 was restarted (OOMKilled), so the containers it was running have stopped. Images, terminals and /workspace are unaffected. Every container shares Docker's memory limit; a pod created with a larger docker_memory_limit gives them more.");
     assert_eq!(
-        system_notice(docker, &none).as_deref(),
+        system_notice(&docker, &none).as_deref(),
         Some("Docker restarted (OOMKilled), so its containers stopped; images, terminals and /workspace are kept")
     );
-    let grace = "Sandbox pod 41's storage was removed after 7 days stopped. /workspace and Docker's images, build cache and volumes are gone; repos cloned there need cloning again. The next sandbox starts fresh with empty volumes.";
+    let grace = crate::api::chat::mark_notice("Sandbox pod 41's storage was removed after 7 days stopped. /workspace and Docker's images, build cache and volumes are gone; repos cloned there need cloning again. The next sandbox starts fresh with empty volumes.");
     assert_eq!(
-        system_notice(grace, &none).as_deref(),
+        system_notice(&grace, &none).as_deref(),
         Some("The sandbox's storage was removed after 7 days stopped; the next sandbox starts fresh")
     );
-    let removed = "The user removed this conversation's sandbox storage: /workspace and the Docker images, build cache and volumes are gone. Repos there need cloning again; the next sandbox starts with fresh empty volumes.";
+    let removed = crate::api::chat::mark_notice("The user removed this conversation's sandbox storage: /workspace and the Docker images, build cache and volumes are gone. Repos there need cloning again; the next sandbox starts with fresh empty volumes.");
     assert_eq!(
-        system_notice(removed, &none).as_deref(),
+        system_notice(&removed, &none).as_deref(),
         Some("You removed the sandbox's storage; the next sandbox starts fresh")
     );
-    let lsp = "Language server rust-analyzer stopped (it ran out of memory). The sandbox is unaffected. start_language_server starts it again.";
+    let lsp = crate::api::chat::mark_notice("Language server rust-analyzer stopped (it ran out of memory). The sandbox is unaffected. start_language_server starts it again.");
     assert_eq!(
-        system_notice(lsp, &none).as_deref(),
+        system_notice(&lsp, &none).as_deref(),
         Some("Language server rust-analyzer stopped (it ran out of memory)")
     );
 }

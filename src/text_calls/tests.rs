@@ -190,7 +190,11 @@ fn test_the_notice_round_trips() {
     ];
     for calls in cases {
         let notice = text_call_notice(&calls, OFFERED);
-        assert!(notice.starts_with(TEXT_CALL_NOTICE_START), "{notice}");
+        // SME-357: the saved notice carries the invisible mark before its words.
+        assert!(
+            notice.strip_prefix(crate::api::chat::NOTICE_MARK).is_some_and(|t| t.starts_with(TEXT_CALL_NOTICE_START)),
+            "the notice starts with NOTICE_MARK and its words: {notice}"
+        );
         let names: Vec<Option<String>> = calls.iter().map(|c| c.name.clone()).collect();
         assert_eq!(parse_text_call_notice(&notice), Some(names), "{notice}");
     }
@@ -201,7 +205,9 @@ fn test_the_notice_round_trips() {
     assert!(text_call_notice(&[call(None)], OFFERED).contains("couldn't be read"));
 }
 
-/// U4: other notices and plain text aren't text-call notices.
+/// U4: other notices and plain text aren't text-call notices. SME-357: a
+/// full notice *without* the mark isn't one either — a user typing these
+/// words wrote their own sentence.
 #[test]
 fn test_other_text_is_not_a_text_call_notice() {
     for text in [
@@ -211,6 +217,7 @@ fn test_other_text_is_not_a_text_call_notice() {
         TEXT_CALL_NOTICE_START,
         crate::api::chat::STOP_NOTICE,
         &format!("{TEXT_CALL_NOTICE_START} `a b` is offered."),
+        &format!("{TEXT_CALL_NOTICE_START} `read_file` is offered, but a call written in a reply's text isn't made.{TEXT_CALL_NOTICE_END}"),
     ] {
         assert_eq!(parse_text_call_notice(text), None, "{text:?}");
     }

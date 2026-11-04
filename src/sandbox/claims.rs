@@ -261,11 +261,12 @@ pub(super) async fn report_docker_restart(pool: &PgPool, pod_id: i64, reason: Op
         }
     };
     let why = reason.map(|r| format!(" ({r})")).unwrap_or_default();
-    let notice = format!(
+    // SME-357: marked like every saved notice.
+    let notice = crate::api::chat::mark_notice(&format!(
         "Docker in sandbox pod {pod_id} was restarted{why}, so the containers it was running \
          have stopped. Images, terminals and /workspace are unaffected. Every container shares \
          Docker's memory limit; a pod created with a larger docker_memory_limit gives them more."
-    );
+    ));
     crate::turn::notify(pool, conversation_id, vec![crate::turn::Notice::Deliver(notice)]);
 }
 

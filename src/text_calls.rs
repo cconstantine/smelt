@@ -43,6 +43,13 @@ const UNREADABLE: &str = "One call's tool name couldn't be read";
 pub const EMPTY_REPLY_NOTICE: &str =
     "Your last reply had no text and no tool call. Carry on: make the tool call you need, or answer.";
 
+/// `EMPTY_REPLY_NOTICE` as the server saves it, with `NOTICE_MARK` before
+/// its words like every transcript notice (SME-357).
+#[cfg(any(feature = "server", test))]
+pub fn empty_reply_notice() -> String {
+    crate::api::chat::mark_notice(EMPTY_REPLY_NOTICE)
+}
+
 /// How many corrections in a row a turn sends before the next reply with a
 /// call written as text ends it with an error.
 #[cfg(feature = "server")]
@@ -542,10 +549,11 @@ pub fn similar(name: &str, offered: &[&str]) -> Vec<String> {
 
 /// The notice saved after a reply that wrote `calls` as text: each call by
 /// name, whether it's offered, and the offered tools with similar names.
-/// It quotes only tool names, never a call's parameters.
+/// It quotes only tool names, never a call's parameters. Marked like every
+/// saved notice (SME-357).
 #[cfg(feature = "server")]
 pub fn text_call_notice(calls: &[TextCall], offered: &[&str]) -> String {
-    let mut notice = TEXT_CALL_NOTICE_START.to_string();
+    let mut notice = crate::api::chat::mark_notice(TEXT_CALL_NOTICE_START);
     for call in calls {
         let Some(name) = &call.name else {
             notice.push_str(&format!(" {UNREADABLE}."));
@@ -654,9 +662,13 @@ pub fn bound_error(calls: &[TextCall]) -> String {
 }
 
 /// A text-call notice's calls, by name (`None` for one whose name couldn't
-/// be read), for the transcript; `None` for any other text.
+/// be read), for the transcript; `None` for any other text, its words
+/// without the mark included (SME-357).
 pub fn parse_text_call_notice(text: &str) -> Option<Vec<Option<String>>> {
-    let body = text.strip_prefix(TEXT_CALL_NOTICE_START)?.strip_suffix(TEXT_CALL_NOTICE_END)?;
+    let body = text
+        .strip_prefix(crate::api::chat::NOTICE_MARK)?
+        .strip_prefix(TEXT_CALL_NOTICE_START)?
+        .strip_suffix(TEXT_CALL_NOTICE_END)?;
     let body = body.strip_prefix(' ')?.strip_suffix('.')?;
     body.split(". ")
         .map(|sentence| {

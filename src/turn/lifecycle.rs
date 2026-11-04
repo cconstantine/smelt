@@ -396,7 +396,9 @@ pub(super) async fn record_stop(pool: &PgPool, conversation_id: i64, stopped_by:
     if already {
         return;
     }
-    let notice = [anthropic::ContentBlock::Text { text: STOP_NOTICE.to_string() }];
+    // SME-357: the note carries `NOTICE_MARK` before its words, like every
+    // saved notice, so a user typing them isn't answered with a notice.
+    let notice = [anthropic::ContentBlock::Text { text: crate::api::chat::mark_notice(STOP_NOTICE) }];
     match db::create_message(pool, conversation_id, "user", &notice).await {
         Ok(saved) => record_saved(conversation_id, &mut Vec::new(), saved),
         Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't note a stop"),

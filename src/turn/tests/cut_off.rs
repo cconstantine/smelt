@@ -100,7 +100,11 @@ async fn test_an_empty_reply_is_not_saved_and_the_next_turn_works(pool: PgPool) 
     let saved = run_turn(&pool, conversation.id, hello()).await.expect("an empty reply doesn't fail the turn");
     let roles: Vec<&str> = saved.iter().map(|m| m.role.as_str()).collect();
     assert_eq!(roles, ["user", "user"], "nothing saved for the empty or the blank reply, only the nudge: {saved:?}");
-    assert_eq!(only_text(&saved[1]), crate::text_calls::EMPTY_REPLY_NOTICE);
+    assert_eq!(
+        only_text(&saved[1]),
+        format!("{}{}", crate::api::chat::NOTICE_MARK, crate::text_calls::EMPTY_REPLY_NOTICE),
+        "SME-357: the saved nudge carries the mark before its words"
+    );
 
     run_turn(&pool, conversation.id, hello()).await.expect("the next turn");
     let roles: Vec<String> = sent_messages(&requests, 2).into_iter().map(|(role, _)| role).collect();

@@ -228,13 +228,16 @@ pub(super) async fn handle_crash_cleanup(pool: &PgPool, pod_id: i64, reason: Opt
         // already ran) a harmless no-op — no separate dedup state needed. See
         // SME-12's "Detection design": the reason string, when Kubernetes
         // gave one, is passed straight through rather than guessed at.
-        let notice = found_live_terminal.then(|| match reason {
+        let notice = found_live_terminal.then(|| {
+            // SME-357: the crash notice is marked before its words.
+            crate::api::chat::mark_notice(&match reason {
             Some(reason) => format!(
                 "Sandbox pod {pod_id} stopped unexpectedly ({reason}); every terminal running in it is no longer available."
             ),
             None => format!(
                 "Sandbox pod {pod_id} stopped unexpectedly; every terminal running in it is no longer available."
             ),
+        })
         });
         // Then the same active wake as a normal command exit (see
         // `handle_agent_message`'s "exit" branch) — a crash can leave a

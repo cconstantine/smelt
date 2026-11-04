@@ -169,7 +169,9 @@ async fn test_two_restarts_in_a_row_queue_one_notice(pool: PgPool) {
     assert_eq!(restart_notices(&pool, child).await, 1);
     restart(&pool, &[root, child]).await;
     assert_eq!(restart_notices(&pool, child).await, 1);
-    let told = transcript(&pool, child).await.into_iter().filter(|(_, text)| text == NOTICE).count();
+    // SME-357: what the child is told carries the mark before its words.
+    let marked = format!("{}{NOTICE}", crate::api::chat::NOTICE_MARK);
+    let told = transcript(&pool, child).await.into_iter().filter(|(_, text)| text == &marked).count();
     assert_eq!(told, 1);
     eventually("every turn is over", || async { !crate::turn::turn_running(root) && !crate::turn::turn_running(child) }).await;
 }
