@@ -39,9 +39,9 @@ Dark mode follows the system setting:
 
 ## Deploying
 
-smelt is one server binary plus a web bundle. It needs Postgres, a k3s cluster that allows privileged pods (for the sandboxes), the sandbox image on the nodes that host them — imported into one node, or pulled from GHCR — and headless Chrome. It must be built on Debian trixie x86_64 or in the repo's [Dockerfile](Dockerfile) image. [Deploying in docs/setup.md](docs/setup.md#deploying) has the requirements and the steps, from the build environment to the first model provider.
+smelt is one server binary plus a web bundle. It needs Postgres, a k3s cluster that allows privileged pods (for the sandboxes), the sandbox image on the nodes that host them — imported into one node, or pulled from GHCR — and headless Chromium. It must be built on Debian trixie (x86_64 or arm64) or in the repo's [Dockerfile](Dockerfile) image. [Deploying in docs/setup.md](docs/setup.md#deploying) has the requirements and the steps, from the build environment to the first model provider.
 
-Or pull the two images instead of building either: `.github/workflows/publish-images.yml` builds the server (with its web bundle and headless Chrome) and the sandbox agent from one commit and publishes them to GHCR. [Deploying from published images](docs/setup.md#deploying-from-published-images) says what a deployment sets to run them, including the pull policy sandbox pods need.
+Or pull the two images instead of building either: `.github/workflows/publish-images.yml` builds the server (with its web bundle and headless Chromium) for amd64 and arm64 and the sandbox agent from one commit and publishes them to GHCR. [Deploying from published images](docs/setup.md#deploying-from-published-images) says what a deployment sets to run them, including the pull policy sandbox pods need.
 
 **Before you expose it:** smelt has **no login**, and it listens on every interface. Anyone who can reach it can use your model keys and run commands in your sandboxes, and the sandboxes' privileged Docker sidecar lets those commands become root on the k3s node. The model itself can be talked into the same by a page or repo it reads. So put smelt behind a VPN or an authenticating proxy, firewall its ports, and give the cluster a machine of its own. [Before you expose it](docs/setup.md#before-you-expose-it) has the details; read it before deploying.
 

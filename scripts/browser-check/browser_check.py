@@ -27,6 +27,7 @@ Actions run in the order given on the command line:
 import argparse
 import base64
 import os
+import platform
 import subprocess
 import sys
 import time
@@ -39,9 +40,9 @@ DEFAULT_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..
 
 
 def find_chrome_binary(cache_dir):
-    bin_path = os.path.join(cache_dir, "chrome", "chrome-headless-shell-linux64", "chrome-headless-shell")
+    bin_path = os.path.join(cache_dir, "libs", "usr", "lib", "chromium", "chromium-headless-shell")
     if not os.path.isfile(bin_path):
-        sys.exit(f"chrome-headless-shell not found at {bin_path} -- run scripts/browser-check/setup.sh first")
+        sys.exit(f"chromium-headless-shell not found at {bin_path} -- run scripts/browser-check/setup.sh first")
     return bin_path
 
 
@@ -71,7 +72,7 @@ def launch_chrome(binary, libdir, port, profile_dir):
         except Exception:
             time.sleep(0.2)
     proc.kill()
-    sys.exit("chrome-headless-shell did not come up within 10s")
+    sys.exit("chromium-headless-shell did not come up within 10s")
 
 
 def run_action(conn, session, action):
@@ -143,7 +144,7 @@ def main():
 
     cache_dir = os.path.abspath(args.cache_dir)
     binary = find_chrome_binary(cache_dir)
-    libdir = os.path.join(cache_dir, "libs", "usr", "lib", "x86_64-linux-gnu")
+    libdir = os.path.join(cache_dir, "libs", "usr", "lib", platform.machine() + "-linux-gnu")
     profile_dir = os.path.join(cache_dir, "profile")
 
     # Reuse an already-listening instance on this port (e.g. from a prior

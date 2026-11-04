@@ -204,23 +204,18 @@ pub(in crate::sandbox) fn build_pod_spec(
             // pod-level setting covers the pair, as SANDBOX_IMAGE_PULL_POLICY
             // does.
             image_pull_secrets: default_image_pull_secrets(),
-            // Every image the system runs — server, sandbox agent, dind
-            // sidecar, and the language-server pod images — is built for
-            // linux/amd64 only (`publish-images.yml` builds natively on
-            // ubuntu-latest; nothing in the project cross-compiles), and the
-            // nodes it runs on are all x86_64. So a pod must never reach a
-            // node of another architecture: an amd64-only image has no
-            // arm64 manifest, and the pod would sit `Pending` on a platform
-            // mismatch instead of starting. `kubernetes.io/arch` is a label
-            // every kubelet sets itself, so this is a hard pin, not a
-            // preference. Language-server pods need no matching pin: they're
-            // bound to their sandbox pod's node by `nodeName`
-            // (`lsp::pods::server_pod_spec`), and so land wherever the
-            // sandbox pod did.
-            node_selector: Some(std::collections::BTreeMap::from([(
-                "kubernetes.io/arch".to_string(),
-                "amd64".to_string(),
-            )])),
+            // No architecture pin (SME-360): every image a sandbox pod runs
+            // is published for both linux/amd64 and linux/arm64 — the
+            // sandbox image (`publish-images.yml`, from the same commit as
+            // the server), `docker:29-dind`, and the language-server images
+            // — so a pod can land on a node of either; a language server
+            // installed from a GitHub release picks the asset for its node
+            // when its pod starts (`lsp::catalog::github_install`), and one
+            // with no asset for it fails its install, saying so. Until SME-360 every
+            // image was amd64 only and pods were pinned to
+            // `kubernetes.io/arch: amd64`. A deployment that points
+            // SANDBOX_IMAGE or SANDBOX_DOCKER_IMAGE at a single-arch image on
+            // a mixed cluster has to pin its nodes itself (docs/setup.md).
             restart_policy: Some("Never".to_string()),
             ..Default::default()
         }),

@@ -45,13 +45,16 @@ case "$url" in *\?*) query="?${url#*\?}"; url=${url%%\?*} ;; esac
 name=smelt_browser_tier_$(basename "$PWD" | tr -c 'a-zA-Z0-9\n' '_')
 scratch="${url%/*}/$name$query"
 
-if [ -z "${BROWSER_CHECK_CACHE:-}" ] && [ ! -e .browser-check-cache ]; then
+# A cache counts only once it holds the Chromium setup.sh fetches now: one
+# left by an older setup.sh (a `chrome/` from before SME-360) doesn't.
+chromium=libs/usr/lib/chromium/chromium-headless-shell
+if [ -z "${BROWSER_CHECK_CACHE:-}" ] && [ ! -x ".browser-check-cache/$chromium" ]; then
     main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
-    if [ -d "$main/.browser-check-cache" ]; then
+    if [ -x "$main/.browser-check-cache/$chromium" ]; then
         export BROWSER_CHECK_CACHE="$main/.browser-check-cache"
         echo "using $BROWSER_CHECK_CACHE"
     else
-        echo "no .browser-check-cache: run scripts/browser-check/setup.sh first" >&2
+        echo "no .browser-check-cache with $chromium: run scripts/browser-check/setup.sh first" >&2
         exit 1
     fi
 fi

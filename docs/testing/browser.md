@@ -54,7 +54,7 @@ Before Playwright was added to the image, UI verification in this sandbox had no
 
 ```bash
 scripts/browser-check/setup.sh                     # once — downloads a headless
-                                                     # Chrome-for-Testing binary and
+                                                     # Chromium (Debian's) binary and
                                                      # its shared libraries into
                                                      # .browser-check-cache/ (gitignored,
                                                      # never committed); idempotent,
@@ -68,7 +68,7 @@ python3 scripts/browser-check/browser_check.py \
     --action "scroll:.messages"
 ```
 
-`scripts/browser-check/cdp.py` hand-rolls just enough raw WebSocket framing (RFC6455) to speak the Chrome DevTools Protocol directly, and `setup.sh` fetches Chrome for Testing plus its missing shared libraries (nss, atk, dbus, X11, mesa, ...) via non-root `apt-get --print-uris` + `dpkg-deb -x` into a local prefix — no root, no system package state touched. `--action` runs steps in order: `click:SELECTOR`, `type:SELECTOR=TEXT`, `wait:SELECTOR` (poll up to 10s), `scroll:SELECTOR` (scrolls to bottom), `sleep:MS`, `eval:JS` (escape hatch — also handy for injecting synthetic markup to preview CSS for a state you don't have live data for, e.g. an error variant when nothing's currently failing). Each run launches its own Chrome and kills it on exit unless `--keep-open` is passed, so repeated runs don't leak orphaned Chrome processes.
+`scripts/browser-check/cdp.py` hand-rolls just enough raw WebSocket framing (RFC6455) to speak the Chrome DevTools Protocol directly, and `setup.sh` fetches Debian's `chromium-headless-shell` and its whole dependency closure (named by `apt-cache depends --recurse`, so it follows the package on amd64 and arm64 alike; SME-360 moved off Chrome for Testing, which has no arm64 build) via non-root `apt-get --print-uris` + `dpkg-deb -x` into a local prefix — no root, no system package state touched. `--action` runs steps in order: `click:SELECTOR`, `type:SELECTOR=TEXT`, `wait:SELECTOR` (poll up to 10s), `scroll:SELECTOR` (scrolls to bottom), `sleep:MS`, `eval:JS` (escape hatch — also handy for injecting synthetic markup to preview CSS for a state you don't have live data for, e.g. an error variant when nothing's currently failing). Each run launches its own Chrome and kills it on exit unless `--keep-open` is passed, so repeated runs don't leak orphaned Chrome processes.
 
 ## `src/browser_tests/` (automated)
 
