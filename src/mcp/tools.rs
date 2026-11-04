@@ -217,6 +217,17 @@ pub(crate) fn legacy_fingerprint(tool: &McpTool) -> String {
     format!("{:016x}", fnv1a(fingerprint_text(tool).as_bytes()))
 }
 
+/// What an offer stores in place of a legacy fingerprint that names a
+/// different tool than the one listed now (SME-386 review 1, M2): no hash
+/// is spelled like it, so the override keeps narrowing and a server can't
+/// later forge a tool to the 64-bit value.
+pub(crate) const LEGACY_CHANGED: &str = "changed-before-sha256";
+
+/// Whether `stored` is in the legacy fingerprint's form: 16 hex digits.
+fn is_legacy_form(stored: &str) -> bool {
+    stored.len() == 16 && stored.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// What a fingerprint hashes: the description, a NUL, the canonical schema.
 fn fingerprint_text(tool: &McpTool) -> String {
     let schema = canonical_json(&serde_json::Value::Object((*tool.input_schema).clone()));
@@ -495,8 +506,16 @@ pub async fn offered_tools(
                 .filter_map(|tool| {
                     let stored = saved.and_then(|rows| rows.get(tool.name.as_ref()))?.tool_fingerprint.clone();
                     let fingerprint = tool_fingerprint(tool);
-                    let readopt = stored.as_deref().is_none_or(|stored| stored != fingerprint && stored == legacy_fingerprint(tool));
-                    readopt.then(|| (config.id, tool.name.to_string(), stored, fingerprint))
+                    match stored.as_deref() {
+                        None => Some((config.id, tool.name.to_string(), stored, fingerprint)),
+                        Some(legacy) if legacy == legacy_fingerprint(tool) => Some((config.id, tool.name.to_string(), stored, fingerprint)),
+                        // Legacy, for another tool: marked so no forged
+                        // tool can match it later (review 1, M2).
+                        Some(legacy) if is_legacy_form(legacy) => {
+                            Some((config.id, tool.name.to_string(), stored, LEGACY_CHANGED.to_string()))
+                        }
+                        Some(_) => None,
+                    }
                 })
                 .collect::<Vec<_>>()
         })

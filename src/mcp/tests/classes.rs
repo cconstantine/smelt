@@ -435,3 +435,31 @@ async fn test_a_legacy_fingerprint_is_adopted_again_as_sha256(pool: sqlx::PgPool
     REGISTRY.lock().await.remove(&config.id);
     assert_eq!(adopted.ok(), Some(want), "the offer stored the SHA-256 fingerprint");
 }
+
+/// SME-386 review 1, M2: an override still holding a legacy fingerprint
+/// that doesn't name the tool listed now is marked by the next offer as
+/// one no tool can match, so a server can't later forge a tool to its
+/// 64-bit value: it keeps narrowing.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_legacy_fingerprint_for_a_changed_tool_can_no_longer_be_matched(pool: sqlx::PgPool) {
+    let config = create_static_server(&pool, &test_config(0, "unused").url).await;
+    let _server = register_test_connection(config.id, true).await;
+    let stale = "0123456789abcdef";
+    crate::db::set_mcp_tool_class(&pool, config.id, "echo", ReadOnly, Some(stale)).await.expect("a legacy override for another tool");
+    let _ = tool_definitions_for(&pool, std::slice::from_ref(&config), &crate::personas::rules::RuleChain::default()).await;
+    let marked = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let row = crate::db::get_mcp_tool_class(&pool, config.id, "echo").await.expect("read the row");
+            if let Some(fingerprint) = row.and_then(|r| r.tool_fingerprint).filter(|f| f != stale) {
+                return fingerprint;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let class = class_of_call_on(&pool, &config, "echo").await;
+    REGISTRY.lock().await.remove(&config.id);
+    let marked = marked.ok().expect("the offer replaced the legacy value");
+    assert!(!marked.chars().all(|c| c.is_ascii_hexdigit()), "no hash of any tool can equal it: {marked}");
+    assert_eq!(class, Some(Destructive), "it still narrows the unannotated echo");
+}
