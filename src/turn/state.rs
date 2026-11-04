@@ -374,6 +374,7 @@ enum Admission {
 /// Returns the counted turn, and the conversation's turn generation once
 /// it's admitted; `None` if refused, with nothing changed.
 fn admit(conversation_id: i64, admission: Admission) -> Option<(TurnInFlight, u64)> {
+    let mut cleared = false;
     let (first, stop, place, generation) = with_runtime(conversation_id, |runtime| {
         // A test's turn takes no place: tests hold counted turns that never
         // run, which would hold or block the lock for good.
@@ -387,7 +388,7 @@ fn admit(conversation_id: i64, admission: Admission) -> Option<(TurnInFlight, u6
                 runtime.kept.generation += 1;
                 runtime.kept.error = None;
                 // The user is here: what was published before is theirs now.
-                runtime.published = None;
+                cleared = runtime.published.take().is_some();
             }
             Admission::UnlessPaused if runtime.paused => return None,
             Admission::UnlessPaused => {}
@@ -418,6 +419,11 @@ fn admit(conversation_id: i64, admission: Admission) -> Option<(TurnInFlight, u6
     if first {
         // Only tells the sidebar to fetch the busy list again.
         crate::events::publish_app(crate::events::AppEvent::TurnsChanged);
+    } else if cleared {
+        // Queued behind a running turn, the user's turn publishes no
+        // `TurnsChanged`: say so, so the notifier closes the stale one now
+        // (SME-386 review round 1, L1).
+        crate::events::publish_app(crate::events::AppEvent::QuestionsChanged);
     }
     Some((TurnInFlight { conversation_id, stop: Some(stop), place }, generation))
 }

@@ -158,3 +158,44 @@ async fn test_a_wake_while_a_question_waits_leaves_the_notification_standing(poo
     assert_eq!(after.and_then(|d| d.question_header), Some("Which".to_string()), "standing after the wake");
     forget_conversation_lock(conversation.id);
 }
+
+/// Review round 1, L1 (SME-386): the user's send queued behind a running
+/// wake clears what was published, and tells the notifier to revalidate
+/// then — not only at the wake's end — since a queued admission publishes
+/// no `TurnsChanged` of its own. (Red before the fix: no app event between
+/// the send and the wake's release.)
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_send_queued_behind_a_wake_revalidates_at_once(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    start_mock_upstream(&pool, vec![notify_body("Built"), done_body("Ok.")]).await;
+    let recording = events::AppRecording::start();
+    start_turn(pool.clone(), conversation.id, "hi".to_string()).await.expect("send");
+    let (attention, generation) = wait_needs_user(&recording, conversation.id).await;
+    wait_turn_done(conversation.id).await;
+
+    untouched_running_command(&pool, conversation.id, "cmd-idle", 601).await;
+    let (reached, release) = test_hooks::pause_after_notice_admitted(conversation.id);
+    let wake = tokio::spawn({
+        let pool = pool.clone();
+        async move { wake_conversation(&pool, conversation.id).await.map(|_| ()) }
+    });
+    tokio::time::timeout(Duration::from_secs(10), reached).await.expect("the wake was admitted").expect("the hook fired");
+    let before = recording.events().len();
+    start_turn(pool.clone(), conversation.id, "and now?".to_string()).await.expect("the queued send");
+    let after_send: Vec<_> = recording.events().into_iter().skip(before).collect();
+    let revalidates = after_send
+        .iter()
+        .any(|e| matches!(e, events::AppEvent::QuestionsChanged | events::AppEvent::TurnsChanged));
+    assert_eq!(
+        crate::api::notifications::attention_details(&pool, conversation.id, generation, attention).await.expect("query"),
+        None,
+        "the user's send made the notification stale"
+    );
+    assert!(revalidates, "the notifier was told to revalidate at the send, saw {after_send:?}");
+    let _ = release.send(());
+    tokio::time::timeout(Duration::from_secs(10), wake).await.expect("the wake ended").expect("its task").expect("the wake");
+    wait_turn_done(conversation.id).await;
+    forget_conversation_lock(conversation.id);
+}
