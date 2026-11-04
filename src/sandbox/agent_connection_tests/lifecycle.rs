@@ -325,3 +325,28 @@ async fn test_a_lost_mark_that_fails_announces_nothing(pool: PgPool) {
     let row = db::get_terminal_command(&pool, "cmd-unmarked").await.expect("read").expect("the row");
     assert_eq!(row.status, "running");
 }
+
+
+/// SME-359 T17 (Q4): at startup smelt connects to every live pod's agent,
+/// and to no stopped one.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_startup_connects_to_every_live_pod(pool: PgPool) {
+    let (_, live) = pod_row(&pool).await;
+    let (_, stopped) = pod_row(&pool).await;
+    sqlx::query("UPDATE sandbox_pods SET terminated_at = now() WHERE id = $1").bind(stopped).execute(&pool).await.expect("stop");
+    let mut live_agent = fake_agent(live, current(), Duration::ZERO).await;
+    let stopped_agent = fake_agent(stopped, current(), Duration::ZERO).await;
+    reconnect_live_pods(&pool).await;
+    let _connection = live_agent.next_connection().await;
+    // Registered once the hello is read, after the fake agent accepted.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !registry_contains(live) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the live pod's connection is registered");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(stopped_agent.dials.load(Ordering::SeqCst), 0, "a stopped pod isn't dialed");
+    assert!(!registry_contains(stopped));
+}

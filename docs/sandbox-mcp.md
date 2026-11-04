@@ -21,6 +21,8 @@ Every terminal's `bash` has `$SMELT_MCP_SOCKET`, `/run/smelt/mcp.sock`: HTTP on 
 
 The agent's own answers: no connection from smelt is a `503` with `"outcome":"not_sent"`; a call waiting when the connection closes, or a newer one replaces it, or after 180 s, is a `503` with `"outcome":"unknown"` (the call may have run); more than 16 waiting is a `429`.
 
+**After a smelt restart** smelt connects to every live pod's agent at startup (`sandbox::reconnect_live_pods`, SME-359's Q4), so a script's calls work again within the restart itself rather than after the model's next sandbox call. A side effect, accepted: command exits the agent queued while smelt was down are delivered at startup and wake their conversations then.
+
 A Unix socket rather than a port: no port-forward, preview or `webfetch` route reaches it, and the pod never needs a network path to smelt. The pod's Docker containers can't reach it either, so a script that calls MCP tools runs in a terminal, not in `docker run`.
 
 ## smelt's side: the same rules as the model

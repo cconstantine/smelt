@@ -459,6 +459,29 @@ pub(super) async fn clean_up_and_terminate_pod(pool: &PgPool, pod_id: i64, reaso
     }
 }
 
+/// Connects to every live pod's agent at startup (SME-359, Q4), each in a
+/// task of its own, so a script in a pod that outlived a restart can call
+/// MCP tools again at once rather than after the model's next sandbox
+/// call. A pod that turns out dead is cleaned up as a reconnect would on
+/// the next touch, and a command exit the agent queued while smelt was
+/// down is delivered now, waking its conversation. Only this database's
+/// pods are listed, and the dial reads each pod first and refuses one
+/// that isn't ours (`refuse_foreign`).
+pub async fn reconnect_live_pods(pool: &PgPool) {
+    let pods = match db::live_sandbox_pod_ids(pool).await {
+        Ok(pods) => pods,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't list the live pods to reconnect to at startup");
+            return;
+        }
+    };
+    tracing::info!(pods = pods.len(), "reconnecting to the live pods' agents");
+    for pod_id in pods {
+        let pool = pool.clone();
+        tokio::spawn(async move { try_reconnect(&pool, pod_id).await });
+    }
+}
+
 /// Best-effort `reconnect_if_needed`, for callers that want the connection
 /// registry to reflect current reality *before* reporting status — e.g.
 /// `get_sandbox_state` on page load, so a terminal whose pod survived a
