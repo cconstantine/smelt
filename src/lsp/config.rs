@@ -23,6 +23,11 @@ pub async fn save(pool: &PgPool, id: Option<i64>, config: &LanguageServerConfig)
     }
 }
 
+/// The language servers (id, saved at) `rederive_github_install` has
+/// looked up.
+static LOOKED_UP: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(i64, chrono::NaiveDateTime)>>> =
+    std::sync::LazyLock::new(Default::default);
+
 /// The config and version server `name` starts with, when its saved
 /// install is a GitHub release's from before SME-360, which downloads the
 /// x86-64 asset on every node: looked up in the catalog (mason's registry
@@ -48,6 +53,14 @@ pub async fn rederive_github_install(
     if !crate::lsp::catalog::is_single_arch_github_install(was) {
         return None;
     }
+    // One lookup per row as saved, not one per start (review M1): a row
+    // that didn't qualify is looked up again once it's edited (or smelt
+    // restarts).
+    let looked_up = (server.id, server.updated_at);
+    if LOOKED_UP.lock().unwrap_or_else(|e| e.into_inner()).contains(&looked_up) {
+        return None;
+    }
+    LOOKED_UP.lock().unwrap_or_else(|e| e.into_inner()).insert(looked_up);
     let suggested = match crate::lsp::catalog::lookup(name, registry, helix).await {
         Ok(suggestion) => suggestion.config.install_command,
         Err(e) => {
@@ -114,10 +127,18 @@ mod tests {
 
     /// A stand-in for mason's registry, with rust-analyzer, and Helix's file.
     async fn catalog() -> String {
+        catalog_counting(Default::default()).await
+    }
+
+    /// `catalog`, counting the package lookups in `lookups`.
+    async fn catalog_counting(lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> String {
         let router = axum::Router::new()
             .route(
                 "/packages/rust-analyzer/package.yaml",
-                axum::routing::get(|| async { include_str!("fixtures/mason-rust-analyzer.yaml") }),
+                axum::routing::get(move || async move {
+                    lookups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    include_str!("fixtures/mason-rust-analyzer.yaml")
+                }),
             )
             .route("/languages.toml", axum::routing::get(|| async { HELIX }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -158,6 +179,42 @@ mod tests {
         assert_eq!(rederive_github_install(&pool, "rust-analyzer", &base, &helix).await, None);
         let row = db::get_language_server(&pool, saved.id).await.expect("read").expect("the row");
         assert_eq!(row.config.install_command, edited);
+    }
+
+    /// SME-386 review M1: mason's registry moves a package's version, so
+    /// a row saved from an earlier lookup names an older release than
+    /// today's suggestion. It is still the old suggestion, unedited: it is
+    /// re-derived, and keeps its own version.
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+    async fn test_a_github_install_saved_at_an_older_version_is_rederived_at_that_version(pool: sqlx::PgPool) {
+        let base = catalog().await;
+        let helix = format!("{base}/languages.toml");
+        let older = OLD_INSTALL.replace("/2026-09-21/", "/2026-08-31/");
+        save(&pool, None, &rust_analyzer(&older)).await.expect("saved");
+        let (config, _) = rederive_github_install(&pool, "rust-analyzer", &base, &helix)
+            .await
+            .expect("an older version's suggestion is re-derived too");
+        let install = &config.install_command;
+        assert!(install.contains(&format!("x86_64) {older} ;;")), "{install}");
+        assert!(
+            install.contains("/releases/download/2026-08-31/rust-analyzer-aarch64-unknown-linux-gnu.gz"),
+            "the saved version, for arm64 too: {install}"
+        );
+        assert!(!install.contains("2026-09-21"), "not moved to today's version: {install}");
+    }
+
+    /// SME-386 review M1: a single-arch row that isn't re-derived (here,
+    /// edited) is looked up once, not again on every start.
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+    async fn test_a_server_that_isnt_rederived_is_looked_up_once(pool: sqlx::PgPool) {
+        let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let base = catalog_counting(lookups.clone()).await;
+        let helix = format!("{base}/languages.toml");
+        save(&pool, None, &rust_analyzer(&format!("{OLD_INSTALL} && echo mine"))).await.expect("saved");
+        for _ in 0..3 {
+            assert_eq!(rederive_github_install(&pool, "rust-analyzer", &base, &helix).await, None);
+        }
+        assert_eq!(lookups.load(std::sync::atomic::Ordering::SeqCst), 1, "one lookup for the row as saved");
     }
 
     #[test]
