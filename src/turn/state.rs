@@ -491,6 +491,16 @@ impl Drop for TurnInFlight {
             if last {
                 owed = runtime.attention.take();
                 generation = runtime.kept.generation;
+                // A Failed while a Failed the user hasn't acted on still
+                // stands is a repeat (SME-386 N5): a provider down fails
+                // every wake and notice turn, and each would re-notify.
+                // Suppressed, so the first one stands, until the user's
+                // send or answer clears `published`.
+                let repeat = owed == Some(crate::events::Attention::Failed)
+                    && matches!(runtime.published, Some((_, crate::events::Attention::Failed)));
+                if repeat {
+                    owed = None;
+                }
                 // Not on a forgotten entry, which it would hold for good
                 // (as `published_notice` below).
                 if let Some(attention) = owed
