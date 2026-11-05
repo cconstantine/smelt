@@ -388,3 +388,34 @@ async fn test_a_roots_child_carries_the_git_ssh_bit_before_any_key_is_stored(poo
     let child = child_of(&pool, root).await;
     assert_eq!(child_credentials(&pool, child).await, vec!["git-ssh".to_string()], "the install decides, not the start");
 }
+
+/// SME-389 B: `finish_agent` refuses while the seat has a tracked command
+/// running, and names it; the seat stays `active` and nothing is queued.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_finish_agent_refuses_while_a_terminal_command_runs(pool: PgPool) {
+    let root = test_conversation(&pool).await.id;
+    let child = agent(&pool, root, AGENT_ACTIVE, None).await;
+    let terminal = test_terminal(&pool, child).await;
+    create_terminal_command(&pool, child, terminal, "cmd-7", "python3 -m http.server", 0)
+        .await
+        .expect("a running command");
+
+    let outcome = finish_agent(&pool, child, &format!("agent #{child}"), "Done.").await.expect("finish");
+    match outcome {
+        Finish::CommandsRunning(ref commands) => assert!(
+            matches!(&commands[..], [(id, command, secs)] if id == "cmd-7" && command == "python3 -m http.server" && *secs >= 0),
+            "{commands:?}"
+        ),
+        other => panic!("a running command refuses the first finish, got: {other:?}"),
+    }
+    assert_eq!(
+        agent_state(&pool, child).await.expect("state").as_deref(),
+        Some(AGENT_ACTIVE),
+        "the refusal wrote no state"
+    );
+    let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_messages")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(queued, 0, "the refusal queued nothing");
+}

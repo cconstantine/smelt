@@ -29,6 +29,19 @@ pub(crate) async fn finish(pool: &PgPool, child: i64, input: &serde_json::Value)
              stop_agent, then finish",
             running.iter().map(|(id, state)| format!("{} ({state})", label(*id, None))).collect::<Vec<_>>().join(", ")
         )),
+        db::Finish::CommandsRunning(commands) => Err(format!(
+            "you can't finish while your terminal commands still run: {}. End them with send_signal, or end \
+             your turn — each command's finished notice will wake you — then finish",
+            commands
+                .iter()
+                .map(|(id, command, secs)| format!(
+                    "{id} ({}, running for {})",
+                    crate::anthropic::tools::shown_command(command),
+                    crate::turn::format_duration(*secs)
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
         db::Finish::MessageWaiting => Err("a message arrived since your last step; read it, then finish".to_string()),
         db::Finish::NotActive(Some(state)) if state == db::AGENT_FINISHED => {
             Err("you've already finished: your report was sent".to_string())

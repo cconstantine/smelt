@@ -239,6 +239,12 @@ pub enum Finish {
     /// their ids and states, in ascending id. Their reports would reach
     /// a finished agent, whose turn sends nothing on.
     AgentsRunning(Vec<(i64, String)>),
+    /// A `terminal_commands` row of its own still runs (SME-389 B): a
+    /// *first* finish is refused, and these name why — command id,
+    /// command line, seconds running, in ascending id. Its command
+    /// notices would wake a `finished` seat to nothing, and the seat that
+    /// finishes mid-work spends its one report on a placeholder.
+    CommandsRunning(Vec<(String, String, i64)>),
 }
 
 /// `finish`'s transaction: the child `finished` and its report queued to
@@ -275,6 +281,25 @@ pub async fn finish_agent(pool: &PgPool, child: i64, label: &str, report: &str) 
             .await?;
         return Ok(Finish::NotActive(state));
     }
+    // SME-389 B: a first finish with a tracked command still running is
+    // refused — the command's finished notice would wake a `finished`
+    // seat to nothing, and the seat that finishes mid-work spends its one
+    // report on a placeholder (the ticket's incident). Read here, after
+    // the state is proven finishable and inside this transaction, so a
+    // refusal and any enqueue can't interleave; the update above rolls
+    // back with it. Commands a seat detached (`&`, nohup) make no rows
+    // and are not gated, as in the pod rules. Same predicate as
+    // `idle_agent_without_report`'s running-command clause.
+    let running_commands = sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT command_id, command, EXTRACT(EPOCH FROM (now() - created_at))::BIGINT
+         FROM terminal_commands WHERE conversation_id = $1 AND status = 'running' ORDER BY id",
+    )
+    .bind(child)
+    .fetch_all(&mut *tx)
+    .await?;
+    if !running_commands.is_empty() {
+        return Ok(Finish::CommandsRunning(running_commands));
+    }
     // Its own agents still running would report to a finished agent,
     // which sends nothing on (SME-354 B2): it waits for them or stops
     // them first. One of them finishing at the same moment is read
@@ -299,6 +324,8 @@ pub async fn finish_agent(pool: &PgPool, child: i64, label: &str, report: &str) 
     }
     queue_agent_message(&mut tx, parent, Some(child), label, KIND_REPORT, report).await?;
     tx.commit().await?;
+    #[cfg(test)]
+    crate::agents::test_hooks::reach(crate::agents::test_hooks::FINISH_COMMITTED, child).await;
     Ok(Finish::Queued { parent })
 }
 

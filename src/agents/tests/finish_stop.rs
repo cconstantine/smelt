@@ -82,9 +82,30 @@ async fn test_a_childs_finish_stops_its_pod_and_leaves_its_volumes(pool: PgPool)
     assert_eq!(mounts, vec![root, child], "the stop touches neither the owner's nor the child's mount row");
 }
 
+/// Whether `child`'s transcript carries an errored tool result naming
+/// `phrase`.
+async fn tool_error_names(pool: &PgPool, child: i64, phrase: &str) -> bool {
+    db::list_messages(pool, child)
+        .await
+        .expect("list messages")
+        .iter()
+        .any(|m| {
+            m.blocks().expect("blocks").iter().any(|b| {
+                matches!(b, ContentBlock::ToolResult { content, is_error: Some(true), .. } if content.contains(phrase))
+            })
+        })
+}
+
+/// SME-389 B: a *first* `finish` is refused while a tracked command runs.
+/// The refusal names it, the seat stays `active`, its pod is untouched and
+/// nothing reaches its parent — and ending the turn after the refusal says
+/// nothing either, while the command runs (`idle_agent_without_report`'s
+/// running-command clause). This fixture is where SME-78's answer 1 used
+/// to reach its success head-on; the keep through finish is re-pinned by
+/// the next test, through the window B admits.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_a_child_that_finishes_with_a_command_running_keeps_its_pod_until_it_ends(pool: PgPool) {
-    let (_, child, pod, ready) = finishing_child_with_pod(&pool).await;
+async fn test_a_child_cannot_finish_while_a_command_runs(pool: PgPool) {
+    let (root, child, pod, ready) = finishing_child_with_pod(&pool).await;
     let terminal = db::create_sandbox_terminal(&pool, pod).await.expect("terminal");
     let command = format!("left-up-{child}");
     db::create_terminal_command(&pool, child, terminal.id, &command, "python3 -m http.server", 0)
@@ -93,12 +114,71 @@ async fn test_a_child_that_finishes_with_a_command_running_keeps_its_pod_until_i
     crate::sandbox::fake_delete::succeed(pod);
 
     ready.notify_one();
+    eventually("the refusal names the running command", || async {
+        tool_error_names(&pool, child, &format!("terminal commands still run: {command}")).await
+    })
+    .await;
+    eventually("the seat's turn is over", || async { !crate::turn::turn_running(child) }).await;
+    assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_ACTIVE), "the refusal wrote no state");
+    assert!(live(&pool, pod).await, "the refusal touches no pod");
+    let sent: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1")
+        .bind(root)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(sent, 0, "a refused finish sends nothing to the parent");
+    assert_eq!(finish_notices(&pool, child).await, 0, "it didn't finish, so no stop was due");
+}
+
+/// SME-78's answer 1, re-pinned through finish after SME-389 B: a command
+/// that starts while the finish lands — after its commit, before its turn
+/// ends, the window B necessarily admits — keeps the pod at the turn end.
+/// One recorded reality-check the plan's rewrite missed: a command started
+/// *after* the finish also keeps the pod out of the backstop's `Finished`
+/// bucket (review 1's A2 rule, `pod_finished()`'s `tc.created_at >
+/// state_changed_at` exclusion), so the one-minute backstop pass skips it
+/// and only the idle rule would take it. The pass's first call pins that;
+/// the second re-dates the past (the move the R2-1 test below makes) so
+/// the command reads as started before the finish, and answer 1's backstop
+/// takes it verbatim.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_command_started_after_the_finish_commits_keeps_its_pod_until_it_ends(pool: PgPool) {
+    let (_, child, pod, ready) = finishing_child_with_pod(&pool).await;
+    let (reached, release) = test_hooks::pause(test_hooks::FINISH_COMMITTED, child);
+    crate::sandbox::fake_delete::succeed(pod);
+
+    ready.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), reached).await.expect("the finish reaches its commit").expect("hook");
+    let terminal = db::create_sandbox_terminal(&pool, pod).await.expect("terminal");
+    let command = format!("left-up-{child}");
+    db::create_terminal_command(&pool, child, terminal.id, &command, "python3 -m http.server", 0)
+        .await
+        .expect("a command started as the finish committed");
+    release.send(()).expect("release the finish");
+
     eventually("the child finished", || async { state(&pool, child).await.as_deref() == Some(db::AGENT_FINISHED) }).await;
     eventually("after_last_turn ran", || async { test_hooks::last_turns_checked(child) >= 1 }).await;
     assert!(live(&pool, pod).await, "a running command keeps the pod (the user's answer 1)");
     assert_eq!(finish_notices(&pool, child).await, 0);
 
     db::mark_terminal_command_finished(&pool, &command, 0).await.expect("it ends");
+    let after_window = crate::sandbox::stop_idle_pods_once_with(&pool, 60, &crate::sandbox::ActivityNotes::default(), |_| async {
+        Ok::<(), crate::sandbox::SandboxError>(())
+    })
+    .await;
+    assert!(after_window.is_empty(), "a command started after the finish is a used-after-the-finish pod (review 1, A2): not the Finished pass's");
+    // Re-date the past, as the R2-1 test below does — the command's
+    // `finished_at` stays at now, as there: review 2's grace covers the
+    // finish turn's own live note only while the command's end reads as
+    // the newest event. With the command read as started before the
+    // finish, answer 1's backstop rule stands.
+    for statement in [
+        "UPDATE agents SET state_changed_at = state_changed_at - interval '40 minutes' WHERE conversation_id = $1",
+        "UPDATE sandbox_pods SET created_at = created_at - interval '50 minutes' WHERE conversation_id = $1",
+        "UPDATE terminal_commands SET created_at = created_at - interval '45 minutes' WHERE conversation_id = $1",
+    ] {
+        sqlx::query(statement).bind(child).execute(&pool).await.expect("move the past back");
+    }
     let stopped = crate::sandbox::stop_idle_pods_once_with(&pool, 60, &crate::sandbox::ActivityNotes::default(), |_| async {
         Ok::<(), crate::sandbox::SandboxError>(())
     })
@@ -291,12 +371,21 @@ async fn test_a_failed_flush_skips_the_finish_stop(pool: PgPool) {
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_left_running_commands_end_still_stops_the_pod_after_a_failed_delete(pool: PgPool) {
     let (_, child, pod, ready) = finishing_child_with_pod(&pool).await;
+    // SME-389 B: finish is refused while a command runs, so the head-on
+    // route (command created before the finish) no longer reaches a
+    // success; the command starts in the window B admits instead. The
+    // past is re-dated just below, as this test already did — with the
+    // command read as started before the finish, this is SME-78 review 2's
+    // scenario unchanged.
+    let (reached, release) = test_hooks::pause(test_hooks::FINISH_COMMITTED, child);
+    ready.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), reached).await.expect("the finish reaches its commit").expect("hook");
     let terminal = db::create_sandbox_terminal(&pool, pod).await.expect("terminal");
     let command = format!("left-up-{child}");
     db::create_terminal_command(&pool, child, terminal.id, &command, "python3 -m http.server", 0)
         .await
-        .expect("a command left running");
-    ready.notify_one();
+        .expect("a command started as the finish committed");
+    release.send(()).expect("release the finish");
     eventually("the child finished", || async { state(&pool, child).await.as_deref() == Some(db::AGENT_FINISHED) }).await;
     eventually("its finish turn's check", || async { test_hooks::last_turns_checked(child) >= 1 }).await;
     assert!(live(&pool, pod).await, "the running command keeps it");
