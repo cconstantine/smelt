@@ -446,7 +446,7 @@ async fn forget_earlier_saves(page: &chromiumoxide::Page) {
 /// response has been read so far.
 async fn row_missing_report(t: &Scenario<'_>, page: &chromiumoxide::Page, what: &str, name: &str) -> String {
     let seen: String = page
-        .evaluate("(() => [document.querySelectorAll('.secret-row').length, document.querySelector('#secret-value')?.value ?? 'no field', document.querySelector('.secrets-add-form button')?.textContent ?? 'no button', performance.getEntriesByType('resource').filter(e => e.name.endsWith('/api/secrets/save')).length, (window.__smeltErrors ?? ['no error hook']).join(' ; '), document.querySelector('#__dx-toast')?.getAttribute('aria-hidden') ?? 'no toast', document.querySelector('#main')?.innerText.slice(0, 400) ?? 'no #main'].join(' | '))()")
+        .evaluate("(() => [document.querySelectorAll('.secret-row').length, document.querySelector('#secret-value')?.value ?? 'no field', document.querySelector('.secrets-add-form button')?.textContent ?? 'no button', performance.getEntriesByType('resource').filter(e => e.name.endsWith('/api/secrets/save')).length, (window.__smeltErrors ?? ['no error hook']).join(' ; '), document.querySelector('#__dx-toast')?.getAttribute('aria-hidden') ?? 'no toast', document.querySelector('#main')?.innerText.slice(0, 800) ?? 'no #main'].join(' | '))()")
         .await
         .ok()
         .and_then(|v| v.into_value().ok())
