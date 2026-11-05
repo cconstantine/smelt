@@ -8,12 +8,14 @@
 
 use super::*;
 
-/// What a recovery ends with: the retry's reply and recorder, and the
-/// budget of the request that got it — the one `save_stop_notice` reads.
+/// What a recovery ends with: the retry's reply and recorder, the budget
+/// of the request that got it — the one `save_stop_notice` reads — and, when
+/// it compacted, the size of the refused request (`CompactionProgress`).
 pub(super) struct Recovered {
     pub(super) turn: anthropic::stream::StreamedTurn,
     pub(super) recorder: CallRecorder,
     pub(super) budget: ReplyBudget,
+    pub(super) compacted_from: Option<u64>,
 }
 
 /// One recovery from an overflow refusal. `turn_model` is the turn's own
@@ -78,7 +80,7 @@ pub(super) async fn recover(
     test_hooks::before_retry(conversation_id).await;
     let (mut request, budget) = build_request(pool, conversation_id, turn_model, usage.as_ref(), pending_new_content).await?;
     match call_model(pool, conversation_id, turn_model, &mut request, slot).await {
-        Ok((turn, recorder)) => Ok(Recovered { turn, recorder, budget }),
+        Ok((turn, recorder)) => Ok(Recovered { turn, recorder, budget, compacted_from: compacted.then_some(input) }),
         // Refused again: the turn fails — but a window this second
         // refusal names is still learned, so the next turn starts right.
         Err(CallError::Overflow(again)) => {

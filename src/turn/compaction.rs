@@ -65,9 +65,15 @@ pub(super) fn should_compact(
     let Some(projected) = projected_input(last_usage, new_content_estimate) else {
         return false;
     };
+    projected >= compaction_ceiling(context_window)
+}
+
+/// The size of request that triggers a compaction: the context window less
+/// what's kept for the reply.
+#[cfg(feature = "server")]
+pub(super) fn compaction_ceiling(context_window: u32) -> u64 {
     let reserved = MIN_REPLY_TOKENS.max(COMPACTION_SAFETY_BUFFER) as u64;
-    let ceiling = (context_window as u64).saturating_sub(reserved);
-    projected >= ceiling
+    (context_window as u64).saturating_sub(reserved)
 }
 
 /// The next request's input as the last real usage measured it, plus an
@@ -511,6 +517,10 @@ pub(super) async fn describe_live_state(pool: &PgPool, conversation_id: i64) -> 
     }
 }
 
+/// The most a summary may write.
+#[cfg(feature = "server")]
+pub(super) const SUMMARY_MAX_TOKENS: u32 = 2048;
+
 /// The conversation as plain text, for the summarization call: the latest
 /// compaction's summary and everything since (what came before it is
 /// already in that summary — including it again made every later
@@ -726,7 +736,7 @@ async fn summarize(
 
     let summarization_request = anthropic::CreateMessageRequest {
         model: turn_model.model.clone(),
-        max_tokens: 2048,
+        max_tokens: SUMMARY_MAX_TOKENS,
         system: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
         messages: vec![anthropic::AnthropicMessage {
             role: "user".to_string(),

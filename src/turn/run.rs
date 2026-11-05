@@ -152,6 +152,7 @@ fn run_turn_steps<'a: 'b, 'b>(
         }
 
         let mut streak = TextCallStreak::default();
+        let mut progress = CompactionProgress::default();
         for _ in 0..max_turns {
             // Checked at the top of every loop iteration, not just once per
             // `run_turn_bounded` call — this is what gives same-turn visibility: if
@@ -242,9 +243,16 @@ fn run_turn_steps<'a: 'b, 'b>(
                 estimate_tokens(&pending_new_content),
                 turn_model.context_window,
             ) {
+                // Compacting again would only repeat what the last one
+                // showed: the turn ends, saying why (SME-386 F10).
+                if let Some(why) = progress.why_stuck(&turn_model.model, turn_model.context_window) {
+                    return Err(ServerFnError::new(why));
+                }
                 // A proactive compaction: no refusal to name on the
                 // divider (SME-73).
                 compact_conversation(pool, conversation_id, turn_model, slot.held(), None).await?;
+                let before = projected_input(last_known_usage.as_ref(), estimate_tokens(&pending_new_content));
+                progress.compacted(before.unwrap_or_default());
                 // The last usage measured the history just summarized: the
                 // reply budget below estimates the new one instead.
                 last_known_usage = None;
@@ -282,6 +290,9 @@ fn run_turn_steps<'a: 'b, 'b>(
                         &overflow,
                     )
                     .await?;
+                    if let Some(before) = recovered.compacted_from {
+                        progress.compacted(before);
+                    }
                     (recovered.turn, recovered.recorder, recovered.budget)
                 }
                 Err(CallError::Failed(e)) => return Err(e),
@@ -303,6 +314,7 @@ fn run_turn_steps<'a: 'b, 'b>(
             // everything up through this response is now accounted for, so
             // `pending_new_content` resets — only what's persisted after
             // this point is "new" again (SME-18).
+            progress.measured(&turn.usage);
             last_known_usage = Some(turn.usage);
             pending_new_content.clear();
             save_stop_notice(pool, conversation_id, turn_model, &turn, &budget, &mut persisted).await?;

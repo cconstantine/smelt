@@ -117,7 +117,7 @@ fn ollama_refused() -> Answer {
 }
 
 /// The summaries of every compaction saved in conversation `id`.
-async fn compaction_summaries(pool: &PgPool, id: i64) -> Vec<String> {
+pub(super) async fn compaction_summaries(pool: &PgPool, id: i64) -> Vec<String> {
     compaction_blocks(pool, id).await.into_iter().map(|(summary, _)| summary).collect()
 }
 
