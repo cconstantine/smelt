@@ -42,6 +42,61 @@ async fn test_an_install_into_another_conversation_doesnt_wait() {
     slow.await.expect("the first install");
 }
 
+/// SME-371: an install that won't finish doesn't hold the answer, the
+/// answer counts the pods not known written (the stuck one and the one that
+/// failed, not the one that finished), and the stuck install isn't called
+/// off: it lands after the answer. An answer that cancelled its installs at
+/// the deadline would leave the pod with its old files until its next create.
+#[tokio::test]
+async fn test_the_answer_doesnt_wait_for_a_stuck_install_and_the_install_still_lands() {
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let released = std::sync::Arc::new(tokio::sync::Mutex::new(Some(released)));
+    let (landed, did_land) = tokio::sync::oneshot::channel::<i64>();
+    let landed = std::sync::Arc::new(std::sync::Mutex::new(Some(landed)));
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        installs_answered_within(std::time::Duration::from_millis(200), vec![1, 2, 3], move |pod_id| {
+            let released = released.clone();
+            let landed = landed.clone();
+            async move {
+                match pod_id {
+                    1 => Ok(()),
+                    2 => {
+                        if let Some(released) = released.lock().await.take() {
+                            let _ = released.await;
+                        }
+                        if let Some(landed) = landed.lock().expect("the landed lock").take() {
+                            let _ = landed.send(pod_id);
+                        }
+                        Ok(())
+                    }
+                    _ => Err("this pod can't be reached".to_string()),
+                }
+            }
+        }),
+    )
+    .await;
+    let _ = release.send(());
+    let mut missed = answer.expect("the answer waited for the stuck install");
+    missed.sort_unstable();
+    assert_eq!(missed, vec![2, 3], "the stuck and the failed install aren't known written; the finished one is");
+    let landed = tokio::time::timeout(std::time::Duration::from_secs(5), did_land).await;
+    assert_eq!(landed.expect("the stuck install never landed").expect("the install was called off"), 2);
+}
+
+/// Every install finished: the answer doesn't sit out the deadline, and
+/// nothing is missed. The normal save, which still answers with its pods
+/// written.
+#[tokio::test]
+async fn test_the_answer_comes_as_soon_as_every_install_finishes() {
+    let missed = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        installs_answered_within(std::time::Duration::from_secs(60), vec![1, 2], |_| async { Ok(()) }),
+    )
+    .await;
+    assert_eq!(missed.expect("the answer sat out its deadline"), Vec::<i64>::new());
+}
+
 fn file<'a>(files: &'a [PodFile], path: &str) -> Option<&'a PodFile> {
     files.iter().find(|f| f.path == path)
 }

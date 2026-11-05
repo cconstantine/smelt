@@ -149,6 +149,8 @@ pub async fn list_secrets() -> ServerFnResult<Vec<SecretSummary>> {
 /// name never changes — renaming is delete and add, Trade-off 7). Every
 /// successful write runs the live-pod install, the way a key's does: a
 /// persona naming this name gets the file (or loses it) while it runs.
+/// The answer doesn't wait long for that (`credentials::ANSWER_WITHIN`): the
+/// value is stored by then, and the page shouldn't say otherwise (SME-371).
 #[post("/api/secrets/save")]
 pub async fn save_secret(id: Option<i64>, name: String, value: String) -> ServerFnResult<SecretSummary> {
     save_secret_of(db::get(), id, &name, &value).await.map_err(ServerFnError::new)

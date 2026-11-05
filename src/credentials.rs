@@ -433,9 +433,11 @@ pub async fn install_into_new_pod(pool: &PgPool, pod_id: i64) -> Result<(), Stri
 /// never re-granted by the loop's blanket reach. A pod that can't be
 /// reached is logged and skipped (it may be starting or ending); it
 /// keeps its old files until its next create (Trade-off 2, today's
-/// behaviour). The pods it couldn't write to, so a delete can say a
-/// removed key or secret may still be in them (SME-354 B5); `None` when
-/// the live pods couldn't even be listed, so none is known written.
+/// behaviour). The pods not known written when it answers, so a delete can
+/// say a removed key or secret may still be in them (SME-354 B5): those it
+/// couldn't reach, and those still installing at `ANSWER_WITHIN`, which go
+/// on after it (SME-371). `None` when the live pods couldn't even be listed,
+/// so none is known written.
 pub async fn install_into_live_pods(pool: &PgPool) -> Option<Vec<i64>> {
     let pods = match db::list_live_pods(pool).await {
         Ok(pods) => pods,
@@ -444,21 +446,59 @@ pub async fn install_into_live_pods(pool: &PgPool) -> Option<Vec<i64>> {
             return None;
         }
     };
-    // Side by side, a few at a time: one pod after another made a save wait
-    // on every live pod in turn, about 1.3 s each under load, and with eight
-    // live pods the secrets page sat on "Adding..." for 11 s (SME-341).
-    // Each conversation's install takes only its own lock, and the caller
-    // still answers once they're all done.
-    let missed = std::sync::Mutex::new(Vec::new());
-    let missed_ref = &missed;
-    futures_util::StreamExt::for_each_concurrent(futures_util::stream::iter(pods), INSTALLS_AT_ONCE, |pod| async move {
-        if let Err(e) = install_into_pod(pool, pod.pod_id).await {
-            tracing::warn!(pod_id = pod.pod_id, error = %e, "couldn't install credentials");
-            missed_ref.lock().unwrap_or_else(|e| e.into_inner()).push(pod.pod_id);
-        }
-    })
-    .await;
-    Some(missed.into_inner().unwrap_or_else(|e| e.into_inner()))
+    let pods = pods.into_iter().map(|pod| pod.pod_id).collect();
+    let pool = pool.clone();
+    Some(
+        installs_answered_within(ANSWER_WITHIN, pods, move |pod_id| {
+            let pool = pool.clone();
+            async move { install_into_pod(&pool, pod_id).await }
+        })
+        .await,
+    )
+}
+
+/// Runs `install` for each pod, a few at a time, and answers with the pods
+/// not known written: at once if they all finish, else at `answer_within`,
+/// with the rest still going (SME-371). A change has committed before this
+/// starts, so a pod that won't answer must not read as a change that didn't
+/// happen: a stalled exec held "Adding..." on the page for up to its minute.
+///
+/// One piece of state, the pods not known written. It starts as all of them.
+/// A finished install takes its pod out; a failed one leaves it. The answer
+/// reads it once, so an install landing later changes nothing the caller was
+/// told. The installs own the task they run in, so neither
+/// the deadline nor a dropped request calls one off: each ends on its own
+/// `INSTALL_TIMEOUT`, and takes its conversation's lock, so one that lands
+/// late can't write over a newer change's files.
+async fn installs_answered_within<F, Fut>(answer_within: std::time::Duration, pods: Vec<i64>, install: F) -> Vec<i64>
+where
+    F: Fn(i64) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
+    let unconfirmed = std::sync::Arc::new(std::sync::Mutex::new(pods.clone()));
+    let tracker = unconfirmed.clone();
+    let (finished, all_finished) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(tracing::Instrument::in_current_span(async move {
+        // Dropped at the end, a panicking install's included.
+        let _finished = finished;
+        // Side by side, a few at a time: one pod after another made a save
+        // wait on every live pod in turn, about 1.3 s each under load, and
+        // with eight live pods the secrets page sat on "Adding..." for 11 s
+        // (SME-341). Each conversation's install takes only its own lock.
+        let (install, tracker) = (&install, &tracker);
+        futures_util::StreamExt::for_each_concurrent(futures_util::stream::iter(pods), INSTALLS_AT_ONCE, |pod_id| async move {
+            match install(pod_id).await {
+                Ok(()) => tracker.lock().unwrap_or_else(|e| e.into_inner()).retain(|pod| *pod != pod_id),
+                Err(e) => tracing::warn!(pod_id, error = %e, "couldn't install credentials"),
+            }
+        })
+        .await;
+    }));
+    if tokio::time::timeout(answer_within, all_finished).await.is_err() {
+        tracing::warn!(after = ?answer_within, "answering before every live pod's credentials install finished");
+    }
+    let unconfirmed = unconfirmed.lock().unwrap_or_else(|e| e.into_inner());
+    unconfirmed.clone()
 }
 
 /// What a delete tells the page about the live pods it couldn't prune
@@ -474,6 +514,10 @@ pub async fn prune_live_pods(pool: &PgPool) -> Option<u32> {
     };
     (missed > 0).then(|| u32::try_from(missed).unwrap_or(u32::MAX))
 }
+
+/// How long a change's answer waits for its live-pod installs (SME-371).
+/// Well under the 10 s the browser tier gives a page to show a saved row.
+pub(crate) const ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How many live pods `install_into_live_pods` writes to at once.
 const INSTALLS_AT_ONCE: usize = 8;

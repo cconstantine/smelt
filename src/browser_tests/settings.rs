@@ -574,20 +574,39 @@ pub(super) async fn scenario_secrets_page(t: &Scenario<'_>) {
         }
         assert!(tokio::time::Instant::now() < paste_deadline, "the pasted newlines did not survive the field: {pasted:?}");
     }
+    // SME-371: a live pod whose install won't finish, across the save. Its
+    // conversation's install lock is held, as a stalled exec holds it for up
+    // to a minute. A save has committed before it starts on the pods, so the
+    // page sat on "Adding..." with the value still in the field. Kept in the
+    // scenario so the fix is shown to hold where the flake struck.
+    let stuck = t.conversation().await;
+    let stuck_pod = db::create_sandbox_pod(t.pool, stuck.id).await.expect("a live pod row");
+    let (release_install, released) = tokio::sync::oneshot::channel::<()>();
+    let (install_held, is_held) = tokio::sync::oneshot::channel::<()>();
+    let stuck_install = tokio::spawn(crate::credentials::with_install_lock(stuck.id, async move {
+        let _ = install_held.send(());
+        let _ = released.await;
+    }));
+    is_held.await.expect("the install lock is held");
     click_when_present(&page, ".secrets-add-form button[type=\"submit\"]", Duration::from_secs(5)).await;
     if !wait_for_count(&page, ".secret-row", 1, Duration::from_secs(10)).await {
         // SME-371: say what the page and the store held, so a flake names
         // its mechanism: refused on the page (the value signal empty at
-        // the submit), failed at the server, or saved but never shown.
+        // the submit), failed at the server, or saved but never shown. The
+        // answers the browser finished telling the last two apart: none
+        // means the response never came, one means the page never used it.
         let seen: String = page
-            .evaluate("(() => [document.querySelectorAll('.secret-row').length, document.querySelector('#secret-value')?.value ?? 'no field', document.querySelector('.secrets-add-form button')?.textContent ?? 'no button', document.querySelector('main')?.innerText.slice(0, 400) ?? ''].join(' | '))()")
+            .evaluate("(() => [document.querySelectorAll('.secret-row').length, document.querySelector('#secret-value')?.value ?? 'no field', document.querySelector('.secrets-add-form button')?.textContent ?? 'no button', performance.getEntriesByType('resource').filter(e => e.name.endsWith('/api/secrets/save')).length, document.querySelector('main')?.innerText.slice(0, 400) ?? ''].join(' | '))()")
             .await
             .ok()
             .and_then(|v| v.into_value().ok())
             .unwrap_or_default();
         let stored = crate::db::list_named_secrets(t.pool).await.map(|s| s.iter().any(|s| s.name == paste_name));
-        panic!("the pasted secret's row should appear; rows | field | button | page text: {seen:?}; stored: {stored:?}");
+        panic!("the pasted secret's row should appear; rows | field | button | save answers finished | page text: {seen:?}; stored: {stored:?}");
     }
+    let _ = release_install.send(());
+    stuck_install.await.expect("the held install lock");
+    db::terminate_sandbox_pod(t.pool, stuck_pod.id).await.expect("end the stuck pod's row");
     let pasted_row: Vec<String> = page
         .evaluate("(() => { const r = document.querySelector('.secret-row'); return [r.querySelector('.secret-shown').textContent, r.querySelector('.secret-lines')?.textContent ?? 'no .secret-lines', r.title]; })()")
         .await
