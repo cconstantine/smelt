@@ -23,10 +23,16 @@ pub async fn save(pool: &PgPool, id: Option<i64>, config: &LanguageServerConfig)
     }
 }
 
-/// The language servers (id, saved at) `rederive_github_install` has
-/// looked up.
-static LOOKED_UP: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(i64, chrono::NaiveDateTime)>>> =
-    std::sync::LazyLock::new(Default::default);
+/// The (database, language server (id, saved at)) `rederive_github_install`
+/// has looked up. The row's database leads the key (SME-395): `(id,
+/// updated_at)` is unique only inside one database, and this static outlives
+/// any one — each `#[sqlx::test]` database of this process has its own
+/// rust-analyzer row at id 1 — so one database's lookup must not answer for
+/// another's row. The id is `smelt_instance`'s UUID, which already names the
+/// database a cluster object belongs to (SME-115).
+static LOOKED_UP: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<(String, i64, chrono::NaiveDateTime)>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// The config and version server `name` starts with, when its saved
 /// install is a GitHub release's from before SME-360, which downloads the
@@ -55,8 +61,16 @@ pub async fn rederive_github_install(
     }
     // One lookup per row as saved, not one per start (review M1): a row
     // that didn't qualify is looked up again once it's edited (or smelt
-    // restarts).
-    let looked_up = (server.id, server.updated_at);
+    // restarts). The key's database id is what makes that cache honest
+    // across databases (SME-395); reading it is one indexed read of a
+    // one-row table, and only for a row that needs the lookup at all.
+    let looked_up = match db::smelt_instance(pool).await {
+        Ok(instance) => (instance.id, server.id, server.updated_at),
+        Err(e) => {
+            tracing::warn!(server = %name, error = %e, "couldn't read this database's instance to look a language server up");
+            return None;
+        }
+    };
     if LOOKED_UP.lock().unwrap_or_else(|e| e.into_inner()).contains(&looked_up) {
         return None;
     }
