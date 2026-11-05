@@ -184,21 +184,24 @@ async fn test_one_tight_compaction_in_a_row_learns_nothing(pool: PgPool) {
     assert_eq!(summaries(&pool, conversation.id).await, 8, "it never stopped compacting");
 }
 
-/// A request that can't fit even compacted ends the turn, saying why.
+/// A request that can't fit even compacted ends the turn, saying why. The
+/// limit at 20,000 is 13,856: each step's 14,000 reaches it, 12,000 leaves under
+/// 2,048 below it, and an estimate of about 11,000 leaves the model room to be
+/// called, so what's measured decides this, not the floor.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_compacted_request_that_cant_fit_ends_the_turn_saying_why(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
-    stepping_mock(&pool, vec![step(12_000, 100); 12]).await;
-    set_context_window(&pool, 16_000, None).await;
+    stepping_mock(&pool, vec![step(12_000, 2_000); 12]).await;
+    set_context_window(&pool, 20_000, None).await;
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
 
     let error = run_turn(&pool, conversation.id, hello()).await.expect_err("it can't fit");
 
     let error = error.to_string();
     assert_eq!(summaries(&pool, conversation.id).await, 3, "{error}");
-    assert!(error.contains("(16,000 tokens) is too small for this conversation"), "{error}");
-    assert!(error.contains("about "), "it names what a compacted request takes: {error}");
+    assert!(error.contains("(20,000 tokens) is too small for this conversation"), "{error}");
+    assert!(error.contains("about 12,000 tokens"), "it names what a compacted request measured: {error}");
 }
 
 /// H1: what a turn learned holds for the wakes after it: a command's finish
@@ -227,8 +230,8 @@ async fn test_a_wake_remembers_that_compacting_cant_help(pool: PgPool) {
 async fn test_wakes_after_a_turn_that_couldnt_fit_call_nothing(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
-    let seen = stepping_mock(&pool, vec![step(12_000, 100); 30]).await;
-    set_context_window(&pool, 16_000, None).await;
+    let seen = stepping_mock(&pool, vec![step(12_000, 2_000); 30]).await;
+    set_context_window(&pool, 20_000, None).await;
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     run_turn(&pool, conversation.id, hello()).await.expect_err("it can't fit");
     let (calls, summarized) = (seen.count(), summaries(&pool, conversation.id).await);
@@ -253,18 +256,17 @@ async fn test_wakes_after_a_turn_that_couldnt_fit_call_nothing(pool: PgPool) {
 async fn test_the_users_send_tries_again(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
-    stepping_mock(&pool, vec![step(12_000, 100); 30]).await;
-    set_context_window(&pool, 16_000, None).await;
+    let seen = stepping_mock(&pool, vec![step(12_000, 2_000); 30]).await;
+    set_context_window(&pool, 20_000, None).await;
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     run_turn(&pool, conversation.id, hello()).await.expect_err("it can't fit");
-    let summarized = summaries(&pool, conversation.id).await;
+    let (calls, summarized) = (seen.count(), summaries(&pool, conversation.id).await);
     let mut rx = events::subscribe(conversation.id);
 
     start_turn(pool.clone(), conversation.id, "Try again.".to_string()).await.expect("send");
     wait_until_idle(&mut rx).await;
 
-    // The summary is the try. Whether the model is called after it depends on
-    // how much of this window the system prompt takes.
+    assert!(seen.count() > calls, "the model was called");
     assert_eq!(summaries(&pool, conversation.id).await, summarized + 1);
     let reason = last_failure_reason(&pool, conversation.id).await.expect("the conversation says why");
     assert!(reason.contains("is too small for this conversation"), "{reason}");
@@ -276,8 +278,8 @@ async fn test_the_users_send_tries_again(pool: PgPool) {
 async fn test_a_new_window_forgets_what_was_learned(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
-    let seen = stepping_mock(&pool, vec![step(12_000, 100); 4]).await;
-    set_context_window(&pool, 16_000, None).await;
+    let seen = stepping_mock(&pool, vec![step(12_000, 2_000); 4]).await;
+    set_context_window(&pool, 20_000, None).await;
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     run_turn(&pool, conversation.id, hello()).await.expect_err("it can't fit");
     let calls = seen.count();
@@ -436,8 +438,8 @@ async fn failure_notices(pool: &PgPool, id: i64) -> usize {
 async fn test_a_root_whose_wakes_cant_fit_says_why_once(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
-    stepping_mock(&pool, vec![step(12_000, 100); 30]).await;
-    set_context_window(&pool, 16_000, None).await;
+    stepping_mock(&pool, vec![step(12_000, 2_000); 30]).await;
+    set_context_window(&pool, 20_000, None).await;
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     // A wake's turn, with no user's turn to save the reason for it.
     run_turn(&pool, conversation.id, hello()).await.expect_err("it can't fit");
@@ -461,8 +463,8 @@ async fn test_a_root_whose_wakes_cant_fit_says_why_once(pool: PgPool) {
 async fn test_each_of_the_users_failed_sends_says_why(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
-    stepping_mock(&pool, vec![step(12_000, 100); 30]).await;
-    set_context_window(&pool, 16_000, None).await;
+    stepping_mock(&pool, vec![step(12_000, 2_000); 30]).await;
+    set_context_window(&pool, 20_000, None).await;
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     let mut rx = events::subscribe(conversation.id);
     for send in 1..=2 {
