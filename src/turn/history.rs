@@ -295,8 +295,9 @@ pub(crate) fn system_prompt(env: &PromptEnvironment) -> String {
         prompt.push_str(&format!(
             "- You are agent #{}, started by conversation #{} (your parent) with the brief that \
              starts this conversation. Call finish with your report when your work is done; it's \
-             final: refused while a command still runs (end your turn — its finished notice wakes \
-             you), and a finish after you finished sends your parent a follow-up report. \
+             final: a first finish is refused while a command still runs (end your turn — its \
+             finished notice wakes you), and a finish after you finished sends your parent a \
+             follow-up report, never gated by a running command. \
              message_agent with to \"parent\" writes to your parent at any time, and ask_parent \
              asks it a question and waits for the answer. The user can also write to you.\n",
             agent.id, agent.parent_id

@@ -107,13 +107,15 @@ pub(super) fn tools() -> Vec<Registered> {
                          did, what you found and anything left undone; your parent reads only this. \
                          Up to {} characters. The user may still write to you afterwards. Your sandbox \
                          pod is stopped when you finish, unless a command is still running; /workspace \
-                         and volumes are kept. `finish` is final — never call it as a wait. You can't \
-                         finish while one of your terminal commands still runs: the refusal names them; \
+                         and volumes are kept. `finish` is final — never call it as a wait. You \
+                         can't finish (for the first time) while one of your terminal commands \
+                         still runs: the refusal names them; \
                          end one with `send_signal`, or end your reply and let its finished notice wake \
                          you (`read_terminal_output`, `terminal_command_status` and `set_idle_notice` \
                          are how you wait). If you finish and then carry on working, call `finish` \
                          again when truly done — that late report reaches your parent as a follow-up \
-                         to your first and ends your turn again: a rescue, not a pause.",
+                         to your first (a finished seat is never gated, command running or not) and \
+                         ends your turn again: a rescue, not a pause.",
                         crate::agents::MAX_REPORT_CHARS
                     ),
                     input_schema: serde_json::json!({
