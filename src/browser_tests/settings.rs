@@ -426,6 +426,12 @@ const PAGE_ERRORS: &str = "window.__smeltErrors = [];\
     addEventListener('unhandledrejection', e => window.__smeltErrors.push(String(e.reason)));\
     { const original = console.error; console.error = (...args) => { let said; try { said = args.join(' ').slice(0, 300); } catch { said = 'unprintable console.error'; } window.__smeltErrors.push(said); original(...args); }; }";
 
+/// Clears the browser's finished requests, so `row_missing_report`'s count is
+/// this save's alone and not an earlier save's on the same document.
+async fn forget_earlier_saves(page: &chromiumoxide::Page) {
+    page.evaluate("performance.clearResourceTimings()").await.expect("clear the resource timings");
+}
+
 /// SME-371: what the page and the store held when a saved secret's row didn't
 /// appear, so a flake names its mechanism: refused on the page (the value
 /// signal empty at the submit), failed at the server, or saved but never
@@ -615,6 +621,7 @@ pub(super) async fn scenario_secrets_page(t: &Scenario<'_>) {
         }
         assert!(tokio::time::Instant::now() < paste_deadline, "the pasted newlines did not survive the field: {pasted:?}");
     }
+    forget_earlier_saves(&page).await;
     click_when_present(&page, ".secrets-add-form button[type=\"submit\"]", Duration::from_secs(5)).await;
     if !wait_for_count(&page, ".secret-row", 1, Duration::from_secs(10)).await {
         panic!("{}", row_missing_report(t, &page, "pasted secret", &paste_name).await);
@@ -674,6 +681,7 @@ pub(super) async fn scenario_secrets_page(t: &Scenario<'_>) {
         let _ = released.await;
     }));
     is_held.await.expect("the install lock is held");
+    forget_earlier_saves(&page).await;
     click_when_present(&page, ".secrets-add-form button[type=\"submit\"]", Duration::from_secs(5)).await;
     // Read while the install is still held, and said only after it's released.
     let missing = if wait_for_count(&page, ".secret-row", 1, Duration::from_secs(10)).await {
