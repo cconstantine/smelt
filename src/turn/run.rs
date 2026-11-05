@@ -24,6 +24,22 @@ pub(super) const CLONE_WAIT: std::time::Duration = std::time::Duration::from_sec
 #[cfg(feature = "server")]
 pub(super) const MIN_REPLY_TOKENS: u32 = 16_384;
 
+/// Whether the conversation has said `reason` as a failure since the model
+/// last replied: a wake failing as the last one did has nothing to add
+/// (SME-386 review L6), though a notice may have come between (a command's
+/// finish is what woke it).
+#[cfg(feature = "server")]
+async fn already_said(pool: &PgPool, conversation_id: i64, reason: &str) -> bool {
+    let Ok(messages) = db::list_messages(pool, conversation_id).await else {
+        return false;
+    };
+    messages.iter().rev().take_while(|m| m.role == "user").any(|m| {
+        m.blocks().unwrap_or_default().iter().any(|block| {
+            matches!(block, anthropic::ContentBlock::Text { text } if crate::api::chat::parse_failure_notice(text) == Some(reason))
+        })
+    })
+}
+
 /// Saves the failure notice for a turn that failed with `reason`
 /// (`api::chat::failure_notice`). Whether it was saved: if not, the page
 /// still shows the error itself.
@@ -96,11 +112,18 @@ pub(super) fn run_turn_body<'a: 'b, 'b>(
         // asked for (review 2 L1, accepted). Any of a child's turns does too,
         // whoever's they are: they run with no tab open, the banner is live
         // only, and the user can open the child and write to it (SME-386
-        // F7). A lookup that fails counts it as a root, as elsewhere.
+        // F7). A lookup that fails counts it as a root, as elsewhere. And a
+        // conversation that doesn't fit its window says so, on a root's wake
+        // too: nothing else will tell the user why (SME-386 F10, review L4).
+        // The user's own send always gets its answer; another turn failing
+        // as the last one did says nothing new (review L6).
         let is_child = matches!(db::conversation_parent(pool, conversation_id).await, Ok(Some(_)));
-        if users_turn || is_child {
+        let doesnt_fit = with_compaction_progress(conversation_id, |p| p.is_stuck());
+        if users_turn || is_child || doesnt_fit {
             let reason = chat_error_text(&e);
-            if note_failure(pool, conversation_id, &reason).await {
+            if (!users_turn && already_said(pool, conversation_id, &reason).await)
+                || note_failure(pool, conversation_id, &reason).await
+            {
                 return Err(TurnFailure::Noted { reason });
             }
         }

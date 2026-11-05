@@ -418,3 +418,69 @@ async fn test_what_a_continuation_quotes_of_unanswered_messages_has_a_total_cap(
     assert!(continuation.contains("hello"), "the newest is the one to answer");
     assert!(continuation.contains("left out here"), "it says what it left out: {}", &continuation[continuation.len() - 300..]);
 }
+
+/// How many failure notices `id` has.
+async fn failure_notices(pool: &PgPool, id: i64) -> usize {
+    let messages = db::list_messages(pool, id).await.expect("messages");
+    messages
+        .iter()
+        .flat_map(|m| m.blocks().unwrap_or_default())
+        .filter(|block| matches!(block, anthropic::ContentBlock::Text { text } if crate::api::chat::parse_failure_notice(text).is_some()))
+        .count()
+}
+
+/// L4: F10's "nothing tells the user why", on a root's wake: the banner is
+/// live only, so the conversation says it, and once, however many wakes.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_root_whose_wakes_cant_fit_says_why_once(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    stepping_mock(&pool, vec![step(12_000, 100); 30]).await;
+    set_context_window(&pool, 16_000, None).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    // A wake's turn, with no user's turn to save the reason for it.
+    run_turn(&pool, conversation.id, hello()).await.expect_err("it can't fit");
+    let reason = last_failure_reason(&pool, conversation.id).await.expect("the conversation says why");
+    assert!(reason.contains("is too small for this conversation"), "{reason}");
+
+    let pod = db::create_sandbox_pod(&pool, conversation.id).await.expect("create sandbox pod");
+    let terminal = db::create_sandbox_terminal(&pool, pod.id).await.expect("create sandbox terminal");
+    for round in 0..3 {
+        let command = format!("sme-386-l4-{round}");
+        db::create_terminal_command(&pool, conversation.id, terminal.id, &command, "echo hi", 300).await.expect("create terminal command");
+        db::mark_terminal_command_finished(&pool, &command, 0).await.expect("mark terminal command finished");
+        wake_conversation(&pool, conversation.id).await.expect_err("it still can't fit");
+    }
+
+    assert_eq!(failure_notices(&pool, conversation.id).await, 1);
+}
+
+/// What the user writes gets its own answer, the same words or not.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_each_of_the_users_failed_sends_says_why(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    stepping_mock(&pool, vec![step(12_000, 100); 30]).await;
+    set_context_window(&pool, 16_000, None).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let mut rx = events::subscribe(conversation.id);
+    for send in 1..=2 {
+        start_turn(pool.clone(), conversation.id, "Try.".to_string()).await.expect("send");
+        wait_until_idle(&mut rx).await;
+        assert_eq!(failure_notices(&pool, conversation.id).await, send);
+    }
+}
+
+/// A root's wake failing for any other reason is as it was: the banner.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_roots_wake_failing_otherwise_saves_no_notice(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    start_refusal_mock(&pool, vec![Err((axum::http::StatusCode::BAD_REQUEST, "MOCK-FAILURE".to_string()))]).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    unnotified_finished_command(&pool, conversation.id, "sme-386-l4-other").await;
+
+    wake_conversation(&pool, conversation.id).await.expect_err("the model call fails");
+
+    assert_eq!(failure_notices(&pool, conversation.id).await, 0);
+}

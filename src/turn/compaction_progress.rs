@@ -206,6 +206,11 @@ impl CompactionProgress {
         }
     }
 
+    /// Whether the conversation doesn't fit.
+    pub(super) fn is_stuck(&self) -> bool {
+        self.stuck
+    }
+
     /// The user wrote: they may try again. One result short of `stuck`, so a
     /// conversation that still doesn't fit costs them one summary, not three.
     pub(super) fn user_wrote(&mut self) {

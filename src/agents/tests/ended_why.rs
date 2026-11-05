@@ -117,4 +117,12 @@ async fn test_a_childs_failed_wake_is_saved_on_its_own_page(pool: PgPool) {
     eventually("the wake's failure is saved", || async { !failures_in(&pool, child).await.is_empty() }).await;
     eventually("every turn is over", || async { !crate::turn::turn_running(root) && !crate::turn::turn_running(child) }).await;
     assert_eq!(failures_in(&pool, child).await.len(), 1);
+
+    // Review L6: another wake failing the same way says nothing new.
+    let before = queued_to(&pool, root).await.len();
+    db::queue_notice(&pool, child, root, "agent", "And now?").await.expect("a notice");
+    crate::turn::notify(&pool, child, vec![crate::turn::Notice::Wake]);
+    eventually("the wake's failure tells the parent", || async { queued_to(&pool, root).await.len() > before }).await;
+    eventually("every turn is over", || async { !crate::turn::turn_running(root) && !crate::turn::turn_running(child) }).await;
+    assert_eq!(failures_in(&pool, child).await.len(), 1);
 }
