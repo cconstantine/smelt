@@ -479,6 +479,7 @@ mod compaction_progress;
 mod transcript;
 mod room_limited;
 mod named_refusal;
+mod escape;
 
 /// The reason in conversation `id`'s last failure notice (SME-123 DR3),
 /// where a user's failed turn now says why.

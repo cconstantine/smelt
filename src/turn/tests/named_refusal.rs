@@ -1,6 +1,7 @@
 //! SME-386 final review: what a turn does with a server that counts the
 //! input and `max_tokens` against its window and says so when they don't
-//! fit, as Anthropic does.
+//! fit, as Anthropic does. Each test is a case the property test in
+//! `escape.rs` found or the review named, against a server.
 
 use super::ask_user::tool_calls_body;
 use super::overflow::too_long;
@@ -233,4 +234,30 @@ async fn test_wakes_after_too_small_for_the_system_prompt_call_nothing(pool: PgP
     assert_eq!(mock.calls(), calls, "the wake called nothing");
     send(&pool, conversation.id, "Again.").await;
     assert_eq!(mock.calls(), calls + 1, "the user's send tries");
+}
+
+/// L-4: the floor's own compaction learns a smaller window from its refused
+/// summary. What was learned of the room was about the old window, so the
+/// request after it is built for the new one, not refused by the floor.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_window_the_floors_compaction_learns_is_read_again(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    // Learns it's tight, then a step compacts and its call fails, leaving no
+    // usage row: the next request is under the floor, and compacts there.
+    let mock = counting_mock(&pool, None, vec![(3_000, 10), (3_000, 10), (3_000, 10), (7_000, 2_000), FAILS, (3_000, 10)]).await;
+    let window = window_leaving(&pool, conversation.id, 100).await;
+    set_context_window(&pool, window as i32, None).await;
+    run_turn(&pool, conversation.id, hello()).await.expect_err("the call fails");
+    let smaller = window - 2_000;
+    *mock.refuse_summary.lock().expect("the summary refusal") = Some(smaller);
+
+    send(&pool, conversation.id, "Again.").await;
+
+    assert_eq!(last_failure_reason(&pool, conversation.id).await, None);
+    let saved = db::list_messages(&pool, conversation.id).await.expect("messages");
+    assert_eq!(last_reply(&saved).as_deref(), Some("Done."));
+    let budget = *mock.taken_budgets().last().expect("a step taken");
+    assert!(budget >= u64::from(smaller / 2), "built for the {smaller} window: {budget}");
 }

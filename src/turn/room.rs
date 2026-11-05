@@ -1,7 +1,8 @@
 //! What a turn decides about the room a reply gets, as plain functions of
 //! `CompactionProgress` and sizes (SME-386 review). The turn's own steps
-//! (`build_request_with_room`, `overflow::recover`) call these, so a test
-//! can drive them through long random sequences without a database.
+//! (`build_request_with_room`, `overflow::recover`) call these, and so does
+//! the property test in `tests/escape.rs`, which drives them through long
+//! random sequences without a database.
 
 use super::*;
 
