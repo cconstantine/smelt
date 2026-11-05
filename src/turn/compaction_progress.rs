@@ -297,6 +297,7 @@ impl CompactionProgress {
         self.stuck = false;
         self.refused_out = false;
         self.room_retried = false;
+        self.compact_for_room = false;
         self.at_limit = self.at_limit.min(MAX_AT_LIMIT - 1);
         self.refusal_compactions = self.refusal_compactions.min(MAX_REFUSAL_COMPACTIONS - 1);
     }
@@ -609,6 +610,14 @@ mod tests {
         progress.user_wrote();
         progress.user_wrote();
         assert_eq!(progress.floor_fired(99_000, "m", WINDOW), FloorAnswer::TryAnyway);
+    }
+
+    #[test]
+    fn test_the_users_send_drops_a_compaction_owed_for_the_room() {
+        let mut progress = tight();
+        assert!(progress.cut_for_room(Some(90_000), WINDOW));
+        progress.user_wrote();
+        assert_eq!(step(&mut progress, 0), CompactionStep::Go);
     }
 
     #[test]
