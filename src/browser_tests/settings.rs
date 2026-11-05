@@ -424,7 +424,25 @@ pub(super) async fn scenario_oauth_callback_error_link(t: &Scenario<'_>) {
 const PAGE_ERRORS: &str = "window.__smeltErrors = [];\
     addEventListener('error', e => window.__smeltErrors.push(String(e.message)));\
     addEventListener('unhandledrejection', e => window.__smeltErrors.push(String(e.reason)));\
-    { const original = console.error; console.error = (...args) => { window.__smeltErrors.push(args.join(' ').slice(0, 300)); original(...args); }; }";
+    { const original = console.error; console.error = (...args) => { let said; try { said = args.join(' ').slice(0, 300); } catch { said = 'unprintable console.error'; } window.__smeltErrors.push(said); original(...args); }; }";
+
+/// SME-371: what the page and the store held when a saved secret's row didn't
+/// appear, so a flake names its mechanism: refused on the page (the value
+/// signal empty at the submit), failed at the server, or saved but never
+/// shown. The answers the browser finished should tell the last two apart:
+/// none should mean the response never came, one that the page never used it.
+/// Its errors may say why it wouldn't: a panic ends the page's WASM, leaving
+/// the DOM as it stood.
+async fn row_missing_report(t: &Scenario<'_>, page: &chromiumoxide::Page, what: &str, name: &str) -> String {
+    let seen: String = page
+        .evaluate("(() => [document.querySelectorAll('.secret-row').length, document.querySelector('#secret-value')?.value ?? 'no field', document.querySelector('.secrets-add-form button')?.textContent ?? 'no button', performance.getEntriesByType('resource').filter(e => e.name.endsWith('/api/secrets/save')).length, (window.__smeltErrors ?? ['no error hook']).join(' ; '), document.body.innerText.slice(0, 400)].join(' | '))()")
+        .await
+        .ok()
+        .and_then(|v| v.into_value().ok())
+        .unwrap_or_default();
+    let stored = crate::db::list_named_secrets(t.pool).await.map(|s| s.iter().any(|s| s.name == name));
+    format!("the {what}'s row should appear; rows | field | button | save answers finished | page errors | page text: {seen:?}; stored: {stored:?}")
+}
 
 /// T12 (SME-242): the Secrets page adds a secret, changes its value in
 /// place, lists only the server's display prefix — never the value —
@@ -539,6 +557,16 @@ pub(super) async fn scenario_secrets_page(t: &Scenario<'_>) {
     // through the helper doubles as the hydration check.
     page.reload().await.expect("reload the page");
     wait_for_resource(&page, "/api/secrets").await;
+    // The error hook keeps something, and the page's own call doesn't throw,
+    // for what can't be joined into a string (SME-371). This reload is where
+    // the hook first applies. Emptied, so it isn't reported as the page's.
+    let unjoinable: String = page
+        .evaluate("(() => { try { console.error(Symbol('s')); console.error(Object.create(null)); return window.__smeltErrors.splice(0).join(' ; '); } catch (e) { return 'threw: ' + e; } })()")
+        .await
+        .expect("call the hook")
+        .into_value()
+        .expect("a string");
+    assert_eq!(unjoinable, "unprintable console.error ; unprintable console.error");
     let empty_name = unique_id("empty");
     type_and_read_back(&page, "#secret-name", &empty_name).await;
     click_when_present(&page, ".secrets-add-form button[type=\"submit\"]", Duration::from_secs(5)).await;
@@ -589,21 +617,7 @@ pub(super) async fn scenario_secrets_page(t: &Scenario<'_>) {
     }
     click_when_present(&page, ".secrets-add-form button[type=\"submit\"]", Duration::from_secs(5)).await;
     if !wait_for_count(&page, ".secret-row", 1, Duration::from_secs(10)).await {
-        // SME-371: say what the page and the store held, so a flake names
-        // its mechanism: refused on the page (the value signal empty at
-        // the submit), failed at the server, or saved but never shown. The
-        // answers the browser finished tell the last two apart: none means
-        // the response never came, one that the page never used it. Its
-        // errors say why it wouldn't: a panic ends the page's WASM, leaving
-        // the DOM as it stood.
-        let seen: String = page
-            .evaluate("(() => [document.querySelectorAll('.secret-row').length, document.querySelector('#secret-value')?.value ?? 'no field', document.querySelector('.secrets-add-form button')?.textContent ?? 'no button', performance.getEntriesByType('resource').filter(e => e.name.endsWith('/api/secrets/save')).length, (window.__smeltErrors ?? ['no error hook']).join(' ; '), document.body.innerText.slice(0, 400)].join(' | '))()")
-            .await
-            .ok()
-            .and_then(|v| v.into_value().ok())
-            .unwrap_or_default();
-        let stored = crate::db::list_named_secrets(t.pool).await.map(|s| s.iter().any(|s| s.name == paste_name));
-        panic!("the pasted secret's row should appear; rows | field | button | save answers finished | page errors | page text: {seen:?}; stored: {stored:?}");
+        panic!("{}", row_missing_report(t, &page, "pasted secret", &paste_name).await);
     }
     // Said on a pass too: an error the page survived is a lead on the one it
     // wouldn't (SME-371).
@@ -661,11 +675,18 @@ pub(super) async fn scenario_secrets_page(t: &Scenario<'_>) {
     }));
     is_held.await.expect("the install lock is held");
     click_when_present(&page, ".secrets-add-form button[type=\"submit\"]", Duration::from_secs(5)).await;
-    let answered = wait_for_count(&page, ".secret-row", 1, Duration::from_secs(10)).await;
+    // Read while the install is still held, and said only after it's released.
+    let missing = if wait_for_count(&page, ".secret-row", 1, Duration::from_secs(10)).await {
+        None
+    } else {
+        Some(row_missing_report(t, &page, "held save", &held_name).await)
+    };
     let _ = release_install.send(());
     stuck_install.await.expect("the held install lock");
     db::terminate_sandbox_pod(t.pool, stuck_pod.id).await.expect("end the stuck pod's row");
-    assert!(answered, "a stuck install held the save's answer: the row should appear while it's stuck");
+    if let Some(missing) = missing {
+        panic!("{missing}");
+    }
     // The leg proves nothing unless its hold really outlasted the deadline.
     let firings = crate::credentials::install_deadline_firings_besides(&[]);
     assert!(firings.iter().any(|pods| pods.contains(&stuck_pod.id)), "the hold never fired the deadline: {firings:?}");
