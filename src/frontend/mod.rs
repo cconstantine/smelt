@@ -10,63 +10,50 @@ use pages::{
     SandboxVolumeNew, SandboxVolumesIndex,
 };
 
-// Every route sits inside the `Shell` layout (SME-71): its `Notifier`
+// Every route sits inside the one `Shell` layout (SME-71): its `Notifier`
 // stays mounted across navigation, so one tab keeps one leader election,
 // one eval channel and one title count — on Home and the settings pages
 // included, which is the point (a tab with no conversation open still
-// notifies).
+// notifies). One `#[layout]` covers every route after it, up to an
+// `#[end_layout]`; a second one nests inside the first, so one before each
+// route gave the Nth route N `Shell`s, each with its own `Notifier`, and a
+// route change mounted or dropped the difference (SME-386 F1, F2).
 #[derive(Routable, Clone, PartialEq, Debug)]
 pub(crate) enum Route {
     #[layout(Shell)]
     #[route("/")]
     Home {},
-    #[layout(Shell)]
     #[route("/conversation/:id")]
     ConversationRoute { id: i64 },
-    #[layout(Shell)]
     #[route("/mcp-servers")]
     McpServersRoute {},
-    #[layout(Shell)]
     #[route("/mcp-servers/new")]
     McpServerNewRoute {},
-    #[layout(Shell)]
     #[route("/mcp-servers/:id")]
     McpServerEditRoute { id: i64 },
-    #[layout(Shell)]
     #[route("/sandbox-volumes")]
     SandboxVolumesRoute {},
-    #[layout(Shell)]
     #[route("/sandbox-volumes/new")]
     SandboxVolumeNewRoute {},
-    #[layout(Shell)]
     #[route("/pods")]
     PodsRoute {},
-    #[layout(Shell)]
     #[route("/git")]
     GitRoute {},
-    #[layout(Shell)]
     #[route("/secrets")]
     SecretsRoute {},
-    #[layout(Shell)]
     #[route("/language-servers")]
     LanguageServersRoute {},
-    #[layout(Shell)]
     #[route("/language-servers/new")]
     LanguageServerNewRoute {},
-    #[layout(Shell)]
     #[route("/language-servers/:id")]
     LanguageServerEditRoute { id: i64 },
-    #[layout(Shell)]
     #[route("/providers")]
     ProvidersRoute {},
-    #[layout(Shell)]
     #[route("/providers/new")]
     ProviderNewRoute {},
-    #[layout(Shell)]
     #[route("/providers/:id")]
     ProviderEditRoute { id: i64 },
     // Anything else, including a conversation id that isn't a number.
-    #[layout(Shell)]
     #[route("/:..segments")]
     NotFound { segments: Vec<String> },
 }

@@ -382,13 +382,17 @@ pub(super) async fn record_stop(pool: &PgPool, conversation_id: i64, stopped_by:
 }
 
 /// Whether `message` is a stop's note: a user message with a text block
-/// that is `STOP_NOTICE`, marked or in the legacy unmarked form, as
-/// compaction reads it. A message quoting the words isn't (SME-386 A2).
+/// that is `STOP_NOTICE`, marked. A message quoting the words isn't
+/// (SME-386 A2), and neither is one typing them exactly (F4). Nothing can
+/// tell a legacy unmarked note from that typing, so a stop right after one
+/// notes itself again: a second note, which compaction reads as no more
+/// than the first.
 #[cfg(feature = "server")]
 fn is_stop_note(message: &Message) -> bool {
+    let note = crate::api::chat::mark_notice(STOP_NOTICE);
     message.role == "user"
         && message.blocks().unwrap_or_default().iter().any(|block| {
-            matches!(block, anthropic::ContentBlock::Text { text } if crate::api::chat::users_text(text) == STOP_NOTICE)
+            matches!(block, anthropic::ContentBlock::Text { text } if *text == note)
         })
 }
 

@@ -27,6 +27,12 @@ const NOTIFICATION_STUB: &str = r#"
   if (window.__smeltNotifierStubbed) return;
   window.__smeltNotifierStubbed = true;
   window.__notifications = [];
+  window.__unhandled = [];
+  // Holds every interval's callback while set: the notifier's tick is what
+  // wakes its Rust loop, so a test can let an event sit in its queue.
+  const realSetInterval = window.setInterval.bind(window);
+  window.setInterval = (run, ms, ...rest) => realSetInterval((...args) => { if (!window.__smeltTicksPaused) run(...args); }, ms, ...rest);
+  window.addEventListener("unhandledrejection", (e) => window.__unhandled.push(String(e.reason)));
   class FakeNotification {
     static permission = "granted";
     static async requestPermission() { return "granted"; }
@@ -95,6 +101,21 @@ async fn recorded(page: &chromiumoxide::Page) -> Vec<Recorded> {
     serde_json::from_str(&json).expect("the stub's records")
 }
 
+/// How many notifications `page` has recorded with `tag`.
+pub(super) async fn tag_count(page: &chromiumoxide::Page, tag: &str) -> usize {
+    recorded(page).await.iter().filter(|n| n.tag == tag).count()
+}
+
+/// The promise rejections nothing handled in this document (SME-386 F9):
+/// each is a `pageerror` in a real page.
+pub(super) async fn unhandled_rejections(page: &chromiumoxide::Page) -> Vec<String> {
+    page.evaluate("window.__unhandled")
+        .await
+        .expect("read the stub's rejections")
+        .into_value()
+        .expect("a list of strings")
+}
+
 /// Waits until `page` has recorded `count` notifications with `tag`.
 pub(super) async fn wait_tag_count(page: &chromiumoxide::Page, tag: &str, count: usize, timeout: Duration) -> bool {
     let tag = tag.to_string();
@@ -146,7 +167,7 @@ async fn toggle_state(page: &chromiumoxide::Page) -> (String, bool, bool) {
 }
 
 /// Waits for the button to read `label` and returns disabled/pressed then.
-async fn wait_toggle_label(page: &chromiumoxide::Page, label: &str, timeout: Duration) -> (bool, bool) {
+pub(super) async fn wait_toggle_label(page: &chromiumoxide::Page, label: &str, timeout: Duration) -> (bool, bool) {
     let want = label.to_string();
     let found = wait_until(|| async { toggle_state(page).await.0 == want }, timeout).await;
     assert!(found, "the toggle never read {want:?}");
@@ -156,7 +177,7 @@ async fn wait_toggle_label(page: &chromiumoxide::Page, label: &str, timeout: Dur
 
 /// Waits until the tab's app is showing `path` — in-app navigation, the
 /// way `click_conversation` checks its own click landed.
-async fn wait_pathname(page: &chromiumoxide::Page, path: &str, timeout: Duration) -> bool {
+pub(super) async fn wait_pathname(page: &chromiumoxide::Page, path: &str, timeout: Duration) -> bool {
     let want = path.to_string();
     wait_until(
         || async {
@@ -174,7 +195,7 @@ async fn wait_pathname(page: &chromiumoxide::Page, path: &str, timeout: Duration
 }
 
 /// Waits for the tab's `document.title`.
-async fn wait_title(page: &chromiumoxide::Page, title: &str, timeout: Duration) -> bool {
+pub(super) async fn wait_title(page: &chromiumoxide::Page, title: &str, timeout: Duration) -> bool {
     let want = title.to_string();
     wait_until(
         || async {
