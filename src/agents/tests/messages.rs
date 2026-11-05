@@ -369,16 +369,19 @@ async fn test_message_agent_racing_stop_agent(pool: PgPool) {
             let pool = pool.clone();
             tokio::spawn(async move { message(&pool, root, serde_json::json!(child), "Race.").await })
         };
-        // SME-398 red-first: force the MESSAGE ahead of the stop, as named
-        // lock waiters — the order the stop-first iteration does not assert.
-        let first = send();
-        until_lock_waiter_running(&pool, "SELECT state FROM agents").await;
-        let other = stop();
-        until_lock_waiter_running(&pool, "UPDATE agents SET state").await;
+        // Queue order, not luck: the expected winner is queued first and
+        // waited for as the named head of the row's lock queue, then the
+        // other, before the rollback frees it (SME-398 — the waiter COUNT
+        // proved nothing while user_stop's parent notice keeps a root turn
+        // in flight through these windows).
+        let first = if stop_first { stop() } else { send() };
+        until_lock_waiter_running(&pool, if stop_first { "UPDATE agents SET state" } else { "SELECT state FROM agents" }).await;
+        let other = if stop_first { send() } else { stop() };
+        until_lock_waiter_running(&pool, if stop_first { "SELECT state FROM agents" } else { "UPDATE agents SET state" }).await;
         holding.rollback().await.expect("release the row");
         let first = tokio::time::timeout(Duration::from_secs(10), first).await.expect("no deadlock").expect("task");
         let other = tokio::time::timeout(Duration::from_secs(10), other).await.expect("no deadlock").expect("task");
-        let (stopped, sent) = (other, first);
+        let (stopped, sent) = if stop_first { (first, other) } else { (other, first) };
         assert_eq!(stopped, Ok(format!("Stopped agent #{child}.")));
         assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_STOPPED));
         if stop_first {
