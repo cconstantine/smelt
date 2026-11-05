@@ -37,18 +37,20 @@ pub(super) async fn recover(
 ) -> ServerFnResult<Recovered> {
     let named = learn(pool, conversation_id, turn_model, overflow.window).await;
     let input = overflow.input_tokens.unwrap_or_else(|| estimate_request_tokens(refused));
-    // What every retry must still leave room for on top of the input:
-    // a reply and the estimate's headroom.
+    // What a retry with the budget's usual reply must leave room for on top
+    // of the input, a reply and the estimate's headroom: short of it, the
+    // history is what has to go (below).
     let needs = u64::from(MIN_REPLY_TOKENS) + u64::from(COMPACTION_SAFETY_BUFFER);
     let believed = turn_model.context_window;
 
     if named.is_some() {
         // Can't help: what no compaction can take away — the system
         // prompt and the tool definitions — already leaves this window
-        // no room to answer in. Don't compact; fail at once, and say
-        // what to change.
+        // no room to answer in, even a short reply, which is all a request
+        // gets once compacting can't help (SME-386 review M-B). Don't
+        // compact; fail at once, and say what to change.
         let alone = estimate_request_tokens(&without_messages(refused));
-        if alone + needs > u64::from(turn_model.context_window) {
+        if alone + u64::from(MIN_USEFUL_REPLY) + u64::from(COMPACTION_SAFETY_BUFFER) > u64::from(turn_model.context_window) {
             return Err(ServerFnError::new(too_small(&turn_model.model, turn_model.context_window, alone)));
         }
     } else {

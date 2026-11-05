@@ -404,3 +404,32 @@ async fn test_a_send_after_the_floor_fired_reaches_the_server(pool: PgPool) {
     let last = db::list_messages(&pool, conversation.id).await.expect("messages");
     assert_eq!(last_reply(&last).as_deref(), Some("Done."));
 }
+
+/// Review M-B: a refusal naming the window, in the state where compacting
+/// can't help, isn't "too small for smelt's system prompt and tools": they
+/// leave room for a short reply, and the compaction goes ahead.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_refusal_naming_the_window_compacts_when_a_short_reply_fits(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let tool = |input| -> Answer { Ok(with_usage(&tool_calls_body(&[("toolu_01", "todoread", serde_json::json!({}))]), input, 0, 100)) };
+    let summary = || -> Answer { Ok(text_reply_body("The summary.")) };
+    let answers = vec![
+        tool(12_380),
+        summary(),
+        tool(12_380),
+        summary(),
+        tool(12_380),
+        too_long(20_000, 28_000),
+        summary(),
+        Ok(text_reply_body("Done.")),
+    ];
+    let mock = start_refusal_mock(&pool, answers).await;
+    set_context_window(&pool, 28_000, None).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("the compaction answers the refusal");
+
+    assert_eq!(last_reply(&saved).as_deref(), Some("Done."));
+    assert_eq!(mock.count(), 8);
+}
