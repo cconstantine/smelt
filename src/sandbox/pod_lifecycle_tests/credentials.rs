@@ -347,7 +347,14 @@ async fn test_a_childs_pod_holds_only_what_its_persona_left_it(pool: PgPool) {
         crate::git::save_identity(&pool, &crate::git::GitIdentity { name: "U".into(), email: "u@example.com".into() })
             .await
             .expect("save_identity");
-        sh_ok(&client, pod, "test -e /etc/smelt/gitconfig").await;
+        // Polled: the save's answer no longer promises its install is done
+        // (`credentials::ANSWER_WITHIN`, SME-371). The name is what this
+        // save wrote, and git's config is written after the ssh config.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        while sh(&client, pod, "grep -q 'email = \"u@example.com\"' /etc/smelt/gitconfig").await.0 != 0 {
+            assert!(tokio::time::Instant::now() < deadline, "the saved identity never reached the pod");
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
         assert_eq!(sh_ok(&client, pod, "grep -c IdentityFile /etc/smelt/ssh_config || true").await, "0");
         let (code, _) = sh(&client, pod, "test -e /etc/smelt/keys/id_ed25519").await;
         assert_eq!(code, 1, "the loop never re-grants");

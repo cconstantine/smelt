@@ -27,7 +27,8 @@ fn trust_row_notice(decision: &RepoTrustSummary) -> Option<String> {
 }
 
 /// Git settings (SME-32): the commit identity and the SSH keys every
-/// sandbox pod gets. A change reaches running pods straight away.
+/// sandbox pod gets. A change is sent to running pods straight away, and a
+/// pod that's slow to take it gets it after the page has its answer (SME-371).
 #[component]
 pub fn GitSettingsPage() -> Element {
     let initial = use_resource(get_git_settings);
@@ -59,7 +60,7 @@ pub fn GitSettingsPage() -> Element {
                 Link { to: Route::Home {}, class: "sandbox-volumes-back-link", "\u{2190} Back to conversations" }
                 h1 { "Git" }
                 p { class: "muted",
-                    "Every sandbox gets these keys and this name and email, so the model can clone and push. Changes reach running sandboxes straight away."
+                    "Every sandbox gets these keys and this name and email, so the model can clone and push. Changes are sent to running sandboxes straight away."
                 }
             }
             super::ErrorText { message: load_error() }
