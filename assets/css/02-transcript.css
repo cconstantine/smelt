@@ -82,6 +82,19 @@
     unicode-bidi: isolate;
 }
 
+/* An `agent #N` reference (SME-384) in smelt's own plain words reads like
+   the links above. A user bubble is inverted, and the accent is made for
+   the page's ground, so there it takes the bubble's own text colour and
+   the underline says it's a link (SME-386 F3). */
+.agent-ref {
+    color: var(--accent);
+}
+
+.message-user .agent-ref {
+    color: inherit;
+    text-decoration: underline;
+}
+
 .markdown .md-inline-code {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 0.9em;

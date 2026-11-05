@@ -52,7 +52,7 @@ pub fn App() -> Element {
 
 Without the viewport tag a phone lays the page out at desktop width and shrinks it (SME-40 F8; browser scenario 17 checks it).
 
-The routes (`Route` in `frontend/mod.rs`). Every route sits inside the `Shell` layout (`frontend/notifications.rs`, SME-71), so the `Notifier` — leader election, notifications, title count — stays mounted across navigation:
+The routes (`Route` in `frontend/mod.rs`). Every route sits inside the one `Shell` layout (`frontend/notifications.rs`, SME-71; `#[layout(Shell)]` once, before the first route, since a second one nests: SME-386 F1), so the `Notifier` — leader election, notifications, title count — stays mounted across navigation:
 
 | Path | Page |
 |---|---|

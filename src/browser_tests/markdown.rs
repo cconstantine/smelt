@@ -302,6 +302,37 @@ async fn deep_code_at(t: &Scenario<'_>, depth: usize) -> Vec<String> {
     problems
 }
 
+/// What the tab says `prefers-color-scheme` is; an empty value lifts it.
+async fn set_color_scheme(page: &chromiumoxide::Page, scheme: &str) {
+    page.execute(
+        chromiumoxide::cdp::browser_protocol::emulation::SetEmulatedMediaParams::builder()
+            .feature(chromiumoxide::cdp::browser_protocol::emulation::MediaFeature::new("prefers-color-scheme", scheme))
+            .build(),
+    )
+    .await
+    .expect("set the colour scheme");
+}
+
+/// SME-386 F3: the link in a user bubble is underlined and meets WCAG
+/// AA's 4.5:1 against the bubble. It was the browser's default blue on
+/// the bubble's near-black, 2.01:1.
+async fn assert_user_bubble_link_reads(page: &chromiumoxide::Page, link: &str, scheme: &str) {
+    let facts: serde_json::Value = page
+        .evaluate(format!(
+            "(() => {{ const lum = c => {{ const [r, g, b] = c.match(/[\\d.]+/g).slice(0, 3).map(Number).map(v => {{ v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; }}); return 0.2126 * r + 0.7152 * g + 0.0722 * b; }}; \
+             const a = document.querySelector({link:?}); const fg = getComputedStyle(a).color; const bg = getComputedStyle(a.closest('.message-user')).backgroundColor; \
+             const [hi, lo] = [lum(fg), lum(bg)].sort((x, y) => y - x); \
+             return {{ fg, bg, ratio: (hi + 0.05) / (lo + 0.05), line: getComputedStyle(a).textDecorationLine }}; }})()"
+        ))
+        .await
+        .expect("read the link's colours")
+        .into_value()
+        .expect("facts");
+    let ratio = facts["ratio"].as_f64().expect("a ratio");
+    assert!(ratio >= 4.5, "{scheme}: a reference in a user bubble is too faint: {facts}");
+    assert_eq!(facts["line"], "underline", "{scheme}: it should read as a link: {facts}");
+}
+
 /// SME-384: `agent #N` / `conversation #N` references render as links
 /// to that conversation — in an assistant reply (the markdown path) and
 /// in a report header shown as a plain user bubble (the path smelt's
@@ -352,6 +383,10 @@ pub(super) async fn scenario_agent_reference_links(t: &Scenario<'_>) {
     // one text node with no anchor anywhere in the bubble.
     let header_link = format!(".message-user .message-text a[href=\"/conversation/{b_id}\"]");
     wait_for_element(&page, &header_link, Duration::from_secs(10)).await;
+    assert_user_bubble_link_reads(&page, &header_link, "light").await;
+    set_color_scheme(&page, "dark").await;
+    assert_user_bubble_link_reads(&page, &header_link, "dark").await;
+    set_color_scheme(&page, "").await;
 
     let facts: serde_json::Value = page
         .evaluate(

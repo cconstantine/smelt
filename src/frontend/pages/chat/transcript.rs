@@ -208,10 +208,10 @@ pub(super) fn render_block_element(
         // folded in: the raw input and result are one click away, and a
         // failed call starts open (SME-41 D2).
         ContentBlock::ToolUse { id, name, input } => {
-            let summary = tool_summary(name, input);
             let pretty_input = format_tool_input(input);
             let result = tool_results.get(id).cloned();
             let failed = result.as_ref().is_some_and(|(_, failed)| *failed);
+            let summary = tool_row_text(name, input, failed);
             rsx! {
                 details {
                     key: "{key}",
