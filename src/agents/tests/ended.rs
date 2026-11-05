@@ -142,6 +142,13 @@ async fn test_no_ended_notice_after_the_users_stop(pool: PgPool) {
     })
     .await;
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    // SME-390 red-first: hold the Stop notice's wake just past its admission —
+    // the stage `eventually("the parent reads the Stop's notice")` races — and
+    // never release it. Nothing but that wake can save the root's reply, so
+    // the unfixed test fails with the gate's signature every time:
+    // `panicked at src/agents/tests/mod.rs:139:9: the parent reads the Stop's
+    // notice: not within 10 s` (:139 is the ticket's :138 after SME-357).
+    let (_held, _release) = crate::turn::test_hooks::pause_after_notice_admitted(root);
     let child = start_child(&pool, root, "Work.").await;
     eventually("the child's turn is in flight", || async { crate::turn::turn_running(child) }).await;
     user_stop(&pool, child).await.expect("the Stop goes through");
