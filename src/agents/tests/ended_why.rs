@@ -56,3 +56,65 @@ async fn test_a_plain_end_gives_no_reason(pool: PgPool) {
     let (child, notice) = notice_for_a_child_stopped_with(&pool, "end_turn").await;
     assert_eq!(notice, format!("agent #{child}'s turn ended without a report; its last message: Here is how to"));
 }
+
+/// How an agent's failing call answers: the stream ends in an error.
+const OVERLOADED: &str = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+
+/// The failure notices saved in `id`, as their reasons.
+async fn failures_in(pool: &PgPool, id: i64) -> Vec<String> {
+    transcript(pool, id)
+        .await
+        .into_iter()
+        .filter_map(|(_, text)| crate::api::chat::parse_failure_notice(&text).map(str::to_string))
+        .collect()
+}
+
+/// SME-386 F7: the red banner is live only, and a child's first turn runs
+/// with no tab open on it, so its page has to say so itself.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_childs_failed_first_turn_is_saved_on_its_own_page(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    mock_with(&pool, |request| {
+        let reply = if agent_of(request).is_some() { OVERLOADED.to_string() } else { text_reply("Noted.") };
+        Box::pin(async move { reply })
+    })
+    .await;
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    let child = start_child(&pool, root, "Work.").await;
+
+    eventually("the parent is told", || async { !queued_to(&pool, root).await.is_empty() }).await;
+    let failures = failures_in(&pool, child).await;
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(failures[0].contains("Overloaded"), "{failures:?}");
+    let queued = queued_to(&pool, root).await;
+    assert!(queued[0].contains("(it failed: ") && queued[0].contains("Overloaded"), "the parent still hears why: {queued:?}");
+    eventually("every turn is over", || async { !crate::turn::turn_running(root) && !crate::turn::turn_running(child) }).await;
+    assert!(failures_in(&pool, root).await.is_empty(), "the failure was the child's");
+}
+
+/// A later turn the user didn't send, a wake, fails the same way, and each
+/// failure is saved once.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_childs_failed_wake_is_saved_on_its_own_page(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    mock_with(&pool, move |request| {
+        let is_agent = agent_of(request).is_some();
+        let call = if is_agent { calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) } else { 0 };
+        let reply = if is_agent && call > 0 { OVERLOADED.to_string() } else { text_reply("Noted.") };
+        Box::pin(async move { reply })
+    })
+    .await;
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    let child = start_child(&pool, root, "Work.").await;
+    eventually("the first turn tells the parent", || async { !queued_to(&pool, root).await.is_empty() }).await;
+    eventually("every turn is over", || async { !crate::turn::turn_running(root) && !crate::turn::turn_running(child) }).await;
+    assert!(failures_in(&pool, child).await.is_empty(), "its first turn went fine");
+
+    db::queue_notice(&pool, child, root, "agent", "Anything else?").await.expect("a notice");
+    crate::turn::notify(&pool, child, vec![crate::turn::Notice::Wake]);
+
+    eventually("the wake's failure is saved", || async { !failures_in(&pool, child).await.is_empty() }).await;
+    eventually("every turn is over", || async { !crate::turn::turn_running(root) && !crate::turn::turn_running(child) }).await;
+    assert_eq!(failures_in(&pool, child).await.len(), 1);
+}

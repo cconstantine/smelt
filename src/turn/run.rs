@@ -24,7 +24,7 @@ pub(super) const CLONE_WAIT: std::time::Duration = std::time::Duration::from_sec
 #[cfg(feature = "server")]
 pub(super) const MIN_REPLY_TOKENS: u32 = 16_384;
 
-/// Saves the failure notice for a user's turn that failed with `reason`
+/// Saves the failure notice for a turn that failed with `reason`
 /// (`api::chat::failure_notice`). Whether it was saved: if not, the page
 /// still shows the error itself.
 #[cfg(feature = "server")]
@@ -93,8 +93,12 @@ pub(super) fn run_turn_body<'a: 'b, 'b>(
         // behind this one saves (SME-123 DR3, review 1 M1). A Stop landing
         // during this one insert drops it with the body: the turn then ends
         // as stopped, with the stop's own notice, which is what the user
-        // asked for (review 2 L1, accepted).
-        if users_turn {
+        // asked for (review 2 L1, accepted). Any of a child's turns does too,
+        // whoever's they are: they run with no tab open, the banner is live
+        // only, and the user can open the child and write to it (SME-386
+        // F7). A lookup that fails counts it as a root, as elsewhere.
+        let is_child = matches!(db::conversation_parent(pool, conversation_id).await, Ok(Some(_)));
+        if users_turn || is_child {
             let reason = chat_error_text(&e);
             if note_failure(pool, conversation_id, &reason).await {
                 return Err(TurnFailure::Noted { reason });
