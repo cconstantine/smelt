@@ -172,6 +172,14 @@ impl CompactionProgress {
         self.believing = false;
     }
 
+    /// The server took the retry after a refusal: the try and what was
+    /// believed are spent, but the refusal count holds, or a server refusing
+    /// every step would compact at every step (review L2).
+    pub(super) fn retry_taken(&mut self) {
+        self.try_anyway = false;
+        self.believing = false;
+    }
+
     /// The server refused a request, saying it held `input` tokens if it
     /// said. One whose budget came from a measured `after` shows that size is
     /// out of date (the system prompt or tools grew since), so it's believed

@@ -293,6 +293,8 @@ fn run_turn_steps<'a: 'b, 'b>(
                 &mut last_known_usage,
                 &pending_new_content,
                 &mut compacted,
+                false,
+                None,
             )
             .await?;
             // What a compaction would have to free, for a cut-off reply below.

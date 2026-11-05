@@ -39,12 +39,16 @@ pub(super) async fn recover(
     let input = overflow.input_tokens.unwrap_or_else(|| estimate_request_tokens(refused));
     let believed = turn_model.context_window;
 
-    let compacted = match named {
+    let (mut compacted, hold_to_room) = match named {
         Some(_) => {
             let alone = estimate_request_tokens(&without_messages(refused));
             match after_named_refusal(&turn_model.model, turn_model.context_window, alone, input) {
                 NamedRefusal::TooSmall(why) => return Err(ServerFnError::new(why)),
-                NamedRefusal::Retry { compact } => compact,
+                // A window named is a window to keep to: the retry gets no
+                // more than the room it leaves, whatever's been learned, or
+                // the usual reply would be refused again on every send
+                // (final review L-1).
+                NamedRefusal::Retry { compact } => (compact, true),
             }
         }
         None => {
@@ -55,7 +59,7 @@ pub(super) async fn recover(
                 turn_model.context_window = assumed;
                 with_compaction_progress(conversation_id, |p| p.guessed(believed, assumed));
             }
-            true
+            (true, false)
         }
     };
     if compacted {
@@ -74,13 +78,29 @@ pub(super) async fn recover(
     #[cfg(test)]
     test_hooks::before_retry(conversation_id).await;
     // Keeps to the room as the refused request did (round 2 L1), unless this
-    // refusal changed the window or a guess is in force, and to the floor
-    // (review L-2). The floor takes no further compaction here: only a request
-    // that just compacted can be under it.
-    let (mut request, budget) =
-        build_request_with_room(pool, conversation_id, turn_model, slot, &mut usage, pending_new_content, &mut true).await?;
+    // refusal changed the window or a guess is in force, or as `hold_to_room`
+    // says; and to the floor (review L-2), which compacts a retry that didn't,
+    // counting it as answering this refusal (final review L-3).
+    let reason = refused_reason(named);
+    let (mut request, budget) = build_request_with_room(
+        pool,
+        conversation_id,
+        turn_model,
+        slot,
+        &mut usage,
+        pending_new_content,
+        &mut compacted,
+        hold_to_room,
+        Some(&reason),
+    )
+    .await?;
     match call_model(pool, conversation_id, turn_model, &mut request, slot).await {
-        Ok((turn, recorder)) => Ok(Recovered { turn, recorder, budget, compacted }),
+        Ok((turn, recorder)) => {
+            // The server took it (final review L-2). Not a step taken for the
+            // refusal count, which a server refusing every step needs (review L2).
+            with_compaction_progress(conversation_id, CompactionProgress::retry_taken);
+            Ok(Recovered { turn, recorder, budget, compacted })
+        }
         // Refused again: the turn fails — but a window this second
         // refusal names is still learned, so the next turn starts right.
         Err(CallError::Overflow(again)) => {

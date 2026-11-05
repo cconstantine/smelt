@@ -28,6 +28,10 @@ impl Counting {
         let log = self.requests.lock().expect("the request log");
         log.iter().filter(|r| r["taken"].as_bool() == Some(true)).filter_map(|r| r["max_tokens"].as_u64()).collect()
     }
+
+    fn calls(&self) -> usize {
+        self.requests.lock().expect("the request log").len()
+    }
 }
 
 /// A step whose stream fails.
@@ -128,4 +132,21 @@ async fn test_a_size_measured_before_the_tools_grew_isnt_believed_after_a_refusa
     assert_eq!(mock.taken_budgets().last(), Some(&u64::from(MIN_USEFUL_REPLY)), "the short reply went: {:?}", mock.taken_budgets());
     let saved = db::list_messages(&pool, conversation.id).await.expect("messages");
     assert_eq!(last_reply(&saved).as_deref(), Some("Done."));
+}
+
+/// L-1: a refusal naming a smaller window, before anything's learned of it:
+/// the retry keeps to the room it leaves, rather than the usual reply,
+/// which is half this window and would be refused again on every send.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_retry_after_a_window_is_named_keeps_to_its_room(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let mock = counting_mock(&pool, Some(20_000), vec![(10_900, 10)]).await;
+    set_context_window(&pool, 100_000, None).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("the retry fits");
+
+    assert_eq!(last_reply(&saved).as_deref(), Some("Done."));
+    assert_eq!(mock.calls(), 2, "one refusal, one retry");
 }

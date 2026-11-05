@@ -60,7 +60,9 @@ fn apply_budget(request: &mut anthropic::CreateMessageRequest, turn_model: &crat
 }
 
 /// `build_request`, held to the floor (`room::before_sending`) when
-/// compacting can't help and the request gets only the room left.
+/// compacting can't help, or `hold_to_room` says so, and the request gets
+/// only the room left. `refused` is the refusal a retry answers, which a
+/// compaction here names and counts.
 #[cfg(feature = "server")]
 pub(super) async fn build_request_with_room(
     pool: &PgPool,
@@ -70,9 +72,11 @@ pub(super) async fn build_request_with_room(
     last_known_usage: &mut Option<anthropic::TokenUsage>,
     pending_new_content: &[anthropic::ContentBlock],
     compacted: &mut bool,
+    hold_to_room: bool,
+    refused: Option<&str>,
 ) -> ServerFnResult<(anthropic::CreateMessageRequest, ReplyBudget)> {
     loop {
-        let room_only = with_compaction_progress(conversation_id, |p| p.room_only_at(turn_model.context_window));
+        let room_only = with_compaction_progress(conversation_id, |p| p.room_only_at(turn_model.context_window)) || hold_to_room;
         let (mut request, budget) = build_request(pool, conversation_id, turn_model, last_known_usage.as_ref(), pending_new_content, room_only).await?;
         let size = estimate_request_tokens(&request);
         let (window, cap) = (turn_model.context_window, turn_model.output_cap);
@@ -88,8 +92,10 @@ pub(super) async fn build_request_with_room(
             // by the floor. Compacting can learn a smaller window, which the
             // next pass reads again.
             BeforeSending::Compact => {
-                compact_conversation(pool, conversation_id, turn_model, slot, None).await?;
-                with_compaction_progress(conversation_id, |p| p.compacted(turn_model.context_window));
+                compact_conversation(pool, conversation_id, turn_model, slot, refused.map(str::to_string)).await?;
+                // One answering a refusal counts as one (round 2 M4).
+                let window = turn_model.context_window;
+                with_compaction_progress(conversation_id, |p| if refused.is_some() { p.refusal_compacted(window) } else { p.compacted(window) });
                 *compacted = true;
                 *last_known_usage = None;
             }
