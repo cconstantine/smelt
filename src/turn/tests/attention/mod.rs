@@ -73,7 +73,7 @@ async fn wait_turn_done(conversation_id: i64) {
 
 /// Waits (up to 10 s) for `conversation_id`'s busy spell to end and says
 /// what, if anything, it published: the nothing-published tests' judge.
-async fn published_after_done(recording: &events::AppRecording, conversation_id: i64) -> Vec<(events::Attention, u64)> {
+pub(super) async fn published_after_done(recording: &events::AppRecording, conversation_id: i64) -> Vec<(events::Attention, u64)> {
     wait_turn_done(conversation_id).await;
     // The last drop's publishes happen after the count goes to 0, so
     // give them this runtime's next turns.

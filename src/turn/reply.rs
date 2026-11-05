@@ -13,6 +13,7 @@ pub(super) async fn build_request(
     last_known_usage: Option<&anthropic::TokenUsage>,
     pending_new_content: &[anthropic::ContentBlock],
     room_only: bool,
+    undercount: u64,
 ) -> ServerFnResult<(anthropic::CreateMessageRequest, ReplyBudget)> {
     let history = history_for_request(
         db::list_messages(pool, conversation_id)
@@ -42,16 +43,70 @@ pub(super) async fn build_request(
     // As long as the conversation has room for, computed per
     // request: each tool round's from its own usage (SME-111).
     // Thinking shares it with the reply.
+    // `undercount` corrects the estimate, not a count a reply measured.
     let projected = projected_input(last_known_usage, estimate_tokens(pending_new_content))
-        .unwrap_or_else(|| estimate_request_tokens(&request));
-    let budget = reply_budget(turn_model.context_window, projected, turn_model.output_cap);
-    let budget = if room_only { budget_within_room(budget, turn_model.context_window, projected) } else { budget };
+        .unwrap_or_else(|| estimate_request_tokens(&request) + undercount);
+    let budget = budget_for(turn_model.context_window, projected, turn_model.output_cap, room_only);
+    apply_budget(&mut request, turn_model, budget);
+    Ok((request, budget))
+}
+
+/// Puts a reply `budget` on `request`, with the thinking it allows.
+#[cfg(feature = "server")]
+fn apply_budget(request: &mut anthropic::CreateMessageRequest, turn_model: &crate::providers::TurnModel, budget: ReplyBudget) {
     request.max_tokens = budget.tokens;
     request.thinking = turn_model.thinking_config(request.max_tokens);
     // A budget with no room to think in turned thinking off: the
     // template is told too (SME-111 review 1).
     request.chat_template_kwargs = turn_model.chat_template_kwargs(request.thinking.is_some());
-    Ok((request, budget))
+}
+
+/// `build_request`, held to the floor (`room::before_sending`) when
+/// compacting can't help, or `hold_to_room` says so, and the request gets
+/// only the room left. `refused` is the refusal a retry answers, which a
+/// compaction here names and counts; `undercount` is how far short of the
+/// server's count the estimate of the refused request fell, added to this
+/// one's.
+#[cfg(feature = "server")]
+pub(super) async fn build_request_with_room(
+    pool: &PgPool,
+    conversation_id: i64,
+    turn_model: &mut crate::providers::TurnModel,
+    slot: anthropic::stream::SlotPolicy<'_>,
+    last_known_usage: &mut Option<anthropic::TokenUsage>,
+    pending_new_content: &[anthropic::ContentBlock],
+    compacted: &mut bool,
+    hold_to_room: bool,
+    refused: Option<&str>,
+    undercount: u64,
+) -> ServerFnResult<(anthropic::CreateMessageRequest, ReplyBudget)> {
+    loop {
+        let room_only = with_compaction_progress(conversation_id, |p| p.room_only_at(turn_model.context_window)) || hold_to_room;
+        let (mut request, budget) = build_request(pool, conversation_id, turn_model, last_known_usage.as_ref(), pending_new_content, room_only, undercount).await?;
+        let size = estimate_request_tokens(&request) + undercount;
+        let (window, cap) = (turn_model.context_window, turn_model.output_cap);
+        let decided = with_compaction_progress(conversation_id, |p| before_sending(p, &turn_model.model, window, cap, room_only, budget, size, *compacted));
+        match decided {
+            BeforeSending::Send(sent) => {
+                if sent != budget {
+                    apply_budget(&mut request, turn_model, sent);
+                }
+                return Ok((request, sent));
+            }
+            // Only once: `compacted` is set now, and the next pass is settled
+            // by the floor. Compacting can learn a smaller window, which the
+            // next pass reads again.
+            BeforeSending::Compact => {
+                compact_conversation(pool, conversation_id, turn_model, slot, refused.map(str::to_string)).await?;
+                // One answering a refusal counts as one (round 2 M4).
+                let window = turn_model.context_window;
+                with_compaction_progress(conversation_id, |p| if refused.is_some() { p.refusal_compacted(window) } else { p.compacted(window) });
+                *compacted = true;
+                *last_known_usage = None;
+            }
+            BeforeSending::Refuse(why) => return Err(ServerFnError::new(why)),
+        }
+    }
 }
 
 /// Saves a model call's reply, and, for a reply cut off or refused, a
@@ -130,6 +185,7 @@ pub(super) async fn save_stop_notice(
     turn_model: &crate::providers::TurnModel,
     turn: &anthropic::stream::StreamedTurn,
     budget: &ReplyBudget,
+    carries_on: bool,
     persisted: &mut Vec<Message>,
 ) -> ServerFnResult<()> {
     let cut_off = anthropic::stream::is_cut_off(&turn.stop_reason);
@@ -171,15 +227,18 @@ pub(super) async fn save_stop_notice(
         // SME-71: a reply smelt stopped and won't continue needs the user:
         // CutOff for a cut-off reply (budget or window), Refused for a
         // refused one. The note follows the save: if the save failed,
-        // there's no notice to act on and the turn fails, so Failed.
-        note_attention(
-            conversation_id,
-            if cut_off {
-                crate::events::Attention::CutOff
-            } else {
-                crate::events::Attention::Refused
-            },
-        );
+        // there's no notice to act on and the turn fails, so Failed. A turn
+        // that carries on past it (`carries_on`) doesn't need them.
+        if !carries_on {
+            note_attention(
+                conversation_id,
+                if cut_off {
+                    crate::events::Attention::CutOff
+                } else {
+                    crate::events::Attention::Refused
+                },
+            );
+        }
     }
     Ok(())
 }

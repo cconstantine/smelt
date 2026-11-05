@@ -16,11 +16,13 @@ pub(super) const MAX_TURNS: usize = 10_000;
 #[cfg(feature = "server")]
 pub(super) const CLONE_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// The smallest reply budget a turn asks for (SME-111, until then every
-/// turn's fixed `max_tokens`): the auto-compaction trigger reserves at
+/// The smallest reply budget a turn usually asks for (SME-111, until then
+/// every turn's fixed `max_tokens`): the auto-compaction trigger reserves at
 /// least this much off the context window before deciding a request is
 /// too big, so a turn that doesn't compact has room for it. The budget
-/// itself grows with the room left (`reply_budget`).
+/// itself grows with the room left (`reply_budget`). Past the trigger, where
+/// compacting can't help, a request gets only the room left, which can be
+/// less (`budget_within_room`, SME-386).
 #[cfg(feature = "server")]
 pub(super) const MIN_REPLY_TOKENS: u32 = 16_384;
 
@@ -265,6 +267,7 @@ fn run_turn_steps<'a: 'b, 'b>(
             // the oversized request compaction exists to prevent — see
             // SME-18's "Resolved" decisions.
             let projected = projected_input(last_known_usage.as_ref(), estimate_tokens(&pending_new_content));
+            let mut compacted = false;
             match with_compaction_progress(conversation_id, |p| p.step(&turn_model.model, turn_model.context_window, projected)) {
                 CompactionStep::Go => {}
                 // Compacting again would only repeat what the last ones
@@ -275,16 +278,28 @@ fn run_turn_steps<'a: 'b, 'b>(
                     // divider (SME-73).
                     compact_conversation(pool, conversation_id, turn_model, slot.held(), None).await?;
                     with_compaction_progress(conversation_id, |p| p.compacted(turn_model.context_window));
+                    compacted = true;
                     // The last usage measured the history just summarized: the
                     // reply budget below estimates the new one instead.
                     last_known_usage = None;
                 }
             }
 
-            let room_only = with_compaction_progress(conversation_id, |p| p.room_only());
-            let (mut request, budget) =
-                build_request(pool, conversation_id, turn_model, last_known_usage.as_ref(), &pending_new_content, room_only)
-                    .await?;
+            let (mut request, budget) = build_request_with_room(
+                pool,
+                conversation_id,
+                turn_model,
+                slot.held(),
+                &mut last_known_usage,
+                &pending_new_content,
+                &mut compacted,
+                false,
+                None,
+                0,
+            )
+            .await?;
+            // What a compaction would have to free, for a cut-off reply below.
+            let mut sized = projected_input(last_known_usage.as_ref(), estimate_tokens(&pending_new_content));
             let offered: Vec<String> = request.tools.iter().map(|tool| tool.name.clone()).collect();
             // A refusal meaning "this didn't fit" answers itself once:
             // learn the window, shrink, send again (SME-73). Every
@@ -309,7 +324,7 @@ fn run_turn_steps<'a: 'b, 'b>(
                     if let Some(why) = with_compaction_progress(conversation_id, |p| p.why_refused_out(&turn_model.model, turn_model.context_window)) {
                         return Err(ServerFnError::new(why));
                     }
-                    let believed = turn_model.context_window;
+                    with_compaction_progress(conversation_id, |p| p.refused(overflow.input_tokens));
                     let recovered = overflow_recovery(
                         pool,
                         conversation_id,
@@ -321,14 +336,9 @@ fn run_turn_steps<'a: 'b, 'b>(
                         &overflow,
                     )
                     .await?;
-                    with_compaction_progress(conversation_id, |p| {
-                        if let Some(guess) = recovered.guessed {
-                            p.guessed(believed, guess);
-                        }
-                        if recovered.compacted {
-                            p.refusal_compacted(turn_model.context_window);
-                        }
-                    });
+                    if recovered.compacted {
+                        sized = None;
+                    }
                     (recovered.turn, recovered.recorder, recovered.budget)
                 }
                 Err(CallError::Failed(e)) => return Err(e),
@@ -337,8 +347,8 @@ fn run_turn_steps<'a: 'b, 'b>(
             // budget, measured the room the server really has: when the
             // whole call came in far below the window this turn believed,
             // believe less now (SME-73). Kept as it stands — a cut-off
-            // reply isn't retried or continued — and this runs before the
-            // meter is published below, so it reads the new window too.
+            // reply isn't continued — and this runs before the meter is
+            // published below, so it reads the new window too.
             if super::overflow::window_stop(turn_model.kind, &turn.stop_reason, turn.usage.output_tokens, budget.tokens) {
                 super::overflow::learn_window_stop(pool, conversation_id, turn_model, &turn.usage).await;
             }
@@ -353,7 +363,25 @@ fn run_turn_steps<'a: 'b, 'b>(
             with_compaction_progress(conversation_id, |p| p.measured(&turn.usage, turn_model.context_window));
             last_known_usage = Some(turn.usage);
             pending_new_content.clear();
-            save_stop_notice(pool, conversation_id, turn_model, &turn, &budget, &mut persisted).await?;
+            // The room cut this reply off, where a compaction would free it:
+            // that's the cost of going past the usual trigger, not the end of
+            // the turn (SME-386 round 2 M1). It's told, compacts, and goes again.
+            let cut_off = anthropic::stream::is_cut_off(&turn.stop_reason);
+            let carries_on = with_compaction_progress(conversation_id, |p| {
+                if !cut_off {
+                    p.reply_finished();
+                }
+                cut_off && budget.limit == crate::api::chat::ReplyLimit::RoomLeft && p.cut_for_room(sized, turn_model.context_window)
+            });
+            save_stop_notice(pool, conversation_id, turn_model, &turn, &budget, carries_on, &mut persisted).await?;
+            if carries_on {
+                continue;
+            }
+            // A cut-off reply ends the turn before any next step could say it
+            // doesn't fit, which this reply's measure just showed (round 2 M2).
+            if cut_off && let Some(why) = with_compaction_progress(conversation_id, |p| p.why_if_stuck(&turn_model.model, turn_model.context_window)) {
+                return Err(ServerFnError::new(why));
+            }
 
             // A call written as text gets a correction, and the model is
             // called again (SME-286).

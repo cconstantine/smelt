@@ -24,6 +24,7 @@ mod overflow;
 mod outside_turn;
 mod questions;
 mod reply;
+mod room;
 mod run;
 mod state;
 #[cfg(test)]
@@ -33,7 +34,7 @@ pub(crate) mod tests;
 
 use self::call::*;
 use self::compaction::*;
-use self::compaction_progress::{CompactionProgress, CompactionStep};
+use self::compaction_progress::{CompactionProgress, CompactionStep, FloorAnswer, MIN_USEFUL_REPLY};
 use self::compaction_transcript::*;
 pub(crate) use self::failure::*;
 pub(crate) use self::history::*;
@@ -43,5 +44,6 @@ use self::overflow::recover as overflow_recovery;
 pub(crate) use self::outside_turn::*;
 pub(crate) use self::questions::*;
 use self::reply::*;
+use self::room::*;
 use self::run::*;
 pub(crate) use self::state::*;

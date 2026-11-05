@@ -9,14 +9,13 @@
 use super::*;
 
 /// What a recovery ends with: the retry's reply and recorder, the budget
-/// of the request that got it — the one `save_stop_notice` reads — and, for
-/// `CompactionProgress`, whether it compacted and any window it guessed.
+/// of the request that got it — the one `save_stop_notice` reads — and
+/// whether it compacted.
 pub(super) struct Recovered {
     pub(super) turn: anthropic::stream::StreamedTurn,
     pub(super) recorder: CallRecorder,
     pub(super) budget: ReplyBudget,
     pub(super) compacted: bool,
-    pub(super) guessed: Option<u32>,
 }
 
 /// One recovery from an overflow refusal. `turn_model` is the turn's own
@@ -38,55 +37,94 @@ pub(super) async fn recover(
 ) -> ServerFnResult<Recovered> {
     let named = learn(pool, conversation_id, turn_model, overflow.window).await;
     let input = overflow.input_tokens.unwrap_or_else(|| estimate_request_tokens(refused));
-    // What every retry must still leave room for on top of the input:
-    // a reply and the estimate's headroom.
-    let needs = u64::from(MIN_REPLY_TOKENS) + u64::from(COMPACTION_SAFETY_BUFFER);
-    let mut guessed = None;
+    let believed = turn_model.context_window;
 
-    if named.is_some() {
-        // Can't help: what no compaction can take away — the system
-        // prompt and the tool definitions — already leaves this window
-        // no room to answer in. Don't compact; fail at once, and say
-        // what to change.
-        let alone = estimate_request_tokens(&without_messages(refused));
-        if alone + needs > u64::from(turn_model.context_window) {
-            return Err(ServerFnError::new(too_small(&turn_model.model, turn_model.context_window, alone)));
+    let (mut compacted, hold_to_room) = match named {
+        Some(_) => {
+            let alone = estimate_request_tokens(&without_messages(refused));
+            match after_named_refusal(&turn_model.model, turn_model.context_window, alone, input) {
+                NamedRefusal::TooSmall(why) => {
+                    // Wakes say so after this without calling.
+                    with_compaction_progress(conversation_id, |p| p.too_small(alone, turn_model.context_window));
+                    return Err(ServerFnError::new(why));
+                }
+                // A window named is a window to keep to: the retry gets no
+                // more than the room it leaves, whatever's been learned, or
+                // the usual reply would be refused again on every send
+                // (final review L-1).
+                NamedRefusal::Retry { compact } => (compact, true),
+            }
         }
-    } else {
-        // The assumption for this turn's compaction and retry — three
-        // quarters of the refused request's size. A guess, so it never
-        // leaves the turn. Provider-supplied sizes are saturating here
-        // and upstream: `anthropic::overflow` drops implausible ones,
-        // and these are the last two spots one could still reach (SME-73 review).
-        let assumed = u32::try_from(input.saturating_mul(3) / 4).unwrap_or(u32::MAX);
-        if assumed < turn_model.context_window {
-            turn_model.context_window = assumed;
-            guessed = Some(assumed);
+        None => {
+            // The assumption for this turn's compaction and retry. A guess,
+            // so it never leaves the turn; and with no window named, the
+            // history is what has to go.
+            if let Some(assumed) = guessed_window(input, believed) {
+                turn_model.context_window = assumed;
+                with_compaction_progress(conversation_id, |p| p.guessed(believed, assumed));
+            }
+            (true, false)
         }
-    }
-
-    // Budget only when the input fits the window the turn now holds:
-    // then the reply budget was the whole problem, and the same history
-    // goes again as it stands. It doesn't, or no window was named:
-    // summarize first, with the window now known.
-    let compacted = named.is_none() || input.saturating_add(needs) > u64::from(turn_model.context_window);
+    };
     if compacted {
         #[cfg(test)]
         test_hooks::before_summary_call(conversation_id).await;
         compact_conversation(pool, conversation_id, turn_model, slot, Some(refused_reason(named))).await?;
+        // Counted here, not by the caller: a retry refused too ends the turn
+        // without returning to it, and every wake would pay for another
+        // summary (SME-386 round 2 M4).
+        with_compaction_progress(conversation_id, |p| p.refusal_compacted(turn_model.context_window));
     }
 
     // Once more. A compaction summarized the history the old usage
-    // measured, so the rebuild projects from nothing instead.
-    let usage = (!compacted).then_some(last_known_usage).flatten();
+    // measured, so the rebuild projects from nothing instead. Without one,
+    // the budget comes from the larger of the last usage's projection and
+    // what the server counted: from the usage alone it would be the refused
+    // request's budget again whenever something the usage doesn't see (the
+    // tools, the system prompt) grew (SME-386 final review, the property
+    // test).
+    let projected = projected_input(last_known_usage.as_ref(), estimate_tokens(pending_new_content));
+    let mut usage = (!compacted).then(|| anthropic::TokenUsage {
+        input_tokens: i64::try_from(projected.map_or(input, |projected| projected.max(input))).unwrap_or(i64::MAX),
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+    });
     #[cfg(test)]
     test_hooks::before_retry(conversation_id).await;
-    let (mut request, budget) = build_request(pool, conversation_id, turn_model, usage.as_ref(), pending_new_content, false).await?;
+    // Keeps to the room as the refused request did (round 2 L1), unless this
+    // refusal changed the window or a guess is in force, or as `hold_to_room`
+    // says; and to the floor (review L-2), which compacts a retry that didn't,
+    // counting it as answering this refusal (final review L-3).
+    let reason = refused_reason(named);
+    // The estimate fell short of what the server counted by this much: the
+    // retry's is taken to, or its budget would be refused again on every
+    // send (SME-386 final review, the property test).
+    let undercount = overflow.input_tokens.map_or(0, |input| input.saturating_sub(estimate_request_tokens(refused)));
+    let (mut request, budget) = build_request_with_room(
+        pool,
+        conversation_id,
+        turn_model,
+        slot,
+        &mut usage,
+        &[],
+        &mut compacted,
+        hold_to_room,
+        Some(&reason),
+        undercount,
+    )
+    .await?;
     match call_model(pool, conversation_id, turn_model, &mut request, slot).await {
-        Ok((turn, recorder)) => Ok(Recovered { turn, recorder, budget, compacted, guessed }),
+        Ok((turn, recorder)) => {
+            // The server took it (final review L-2). Not a step taken for the
+            // refusal count, which a server refusing every step needs (review L2).
+            with_compaction_progress(conversation_id, CompactionProgress::retry_taken);
+            Ok(Recovered { turn, recorder, budget, compacted })
+        }
         // Refused again: the turn fails — but a window this second
         // refusal names is still learned, so the next turn starts right.
         Err(CallError::Overflow(again)) => {
+            with_compaction_progress(conversation_id, |p| p.refused(again.input_tokens));
             learn(pool, conversation_id, turn_model, again.window).await;
             Err(ServerFnError::new(still_did_not_fit(
                 &turn_model.model,
@@ -133,8 +171,8 @@ pub(super) fn window_stop(kind: crate::providers::ProviderKind, stop_reason: &st
 /// When that came in below this turn's believed window by more than
 /// `COMPACTION_SAFETY_BUFFER` the belief was too big: learn the measured
 /// size (the write only ever lowers), and the next request compacts
-/// before it is refused. The reply is kept either way and nothing is
-/// retried; a save that doesn't land says nothing more (`learn`).
+/// before it is refused. The reply is kept either way and this retries
+/// nothing itself; a save that doesn't land says nothing more (`learn`).
 pub(super) async fn learn_window_stop(
     pool: &PgPool,
     conversation_id: i64,
@@ -273,7 +311,7 @@ fn still_did_not_fit(model: &str, window: Option<u32>, compacted: bool, said: &s
 
 /// The failed turn's words when the window can't hold the system prompt
 /// and tools, leave alone a conversation.
-fn too_small(model: &str, window: u32, alone: u64) -> String {
+pub(super) fn too_small(model: &str, window: u32, alone: u64) -> String {
     format!(
         "`{model}`'s context window ({} tokens) is too small for smelt's system prompt and tools (about {} tokens). \
          Give the model a larger context on its server, or pick another model.",

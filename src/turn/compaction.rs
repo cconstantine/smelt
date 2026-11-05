@@ -105,7 +105,8 @@ pub(super) fn budget_within_room(budget: ReplyBudget, context_window: u32, proje
 /// less `COMPACTION_SAFETY_BUFFER`; and half the window, so a single reply
 /// can't crowd the rest of the history out of the next compaction. Never
 /// below `MIN_REPLY_TOKENS` (or half a smaller window), as every turn
-/// asked for before; the compaction trigger keeps that much room.
+/// asked for before; the compaction trigger keeps that much room. A request
+/// let past the trigger gets `budget_within_room` on top, which can be less.
 #[cfg(feature = "server")]
 pub(super) fn reply_budget(context_window: u32, projected_input: u64, output_cap: Option<u32>) -> ReplyBudget {
     let half = context_window / 2;

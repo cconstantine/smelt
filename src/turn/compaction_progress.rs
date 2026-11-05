@@ -33,6 +33,19 @@
 //! - the server refuses a request and a compaction answers it
 //!   (`refusal_compacted`), no usage needed (review L2): three in a row, with
 //!   no step the server took between, set `stuck` too;
+//! - a reply the room cut off, past the usual trigger, with history a
+//!   compaction would free (`cut_for_room`, round 2 M1): the next step
+//!   compacts whatever its size, and the model is called again. Once: a second
+//!   cut in a row ends the turn as any cut-off reply does, and a reply that
+//!   wasn't cut (`reply_finished`) or the user's send allows it again;
+//! - a compacted request is under the floor (`floor_fired`, review M-A): what
+//!   a reply measured after a compaction is believed over the estimate if it
+//!   shows room. If not, `stuck`, unless the user has written since it last
+//!   was (`try_anyway`), which lets one request through: only the server's
+//!   answer can show anything new, so the user always has a way out;
+//! - the server refuses a request whose budget that measured size gave
+//!   (`refused`, final review M-1): the size is out of date, and the larger
+//!   of it and the refusal's count is what's believed from then on;
 //! - a restart or a delete: all of it goes, and the next compaction learns it.
 
 use super::*;
@@ -50,6 +63,10 @@ const TIGHT_RESULTS: u32 = 2;
 /// The room left for a reply at `limit`, on top of the buffer.
 const SHORT_REPLY_TOKENS: u64 = 2048;
 
+/// The least room worth sending a request for: under it a compacted request
+/// can't do anything but be cut off, which is no answer to the user.
+pub(super) const MIN_USEFUL_REPLY: u32 = 1024;
+
 /// How many compactions in a row may leave too little room under `limit`
 /// before the conversation is judged not to fit. Past it the turn ends, even
 /// if the request would still go out with a very short reply.
@@ -66,6 +83,17 @@ pub(super) enum CompactionStep {
     Compact,
     /// The turn ends, for this reason.
     Stuck(String),
+}
+
+/// What to do with a compacted request the estimate leaves under the floor.
+#[derive(Debug, PartialEq)]
+pub(super) enum FloorAnswer {
+    /// A reply measured this size after a compaction, and it leaves room.
+    Believe(u64),
+    /// The user wrote since this conversation was last judged not to fit.
+    TryAnyway,
+    /// It doesn't fit, for this reason.
+    NoRoom(String),
 }
 
 /// A conversation's record of what its compactions left.
@@ -91,6 +119,17 @@ pub(super) struct CompactionProgress {
     refusal_compactions: u32,
     /// `stuck` because of those, so no size or window is known to name.
     refused_out: bool,
+    /// The next step compacts, for the reply the room just cut off.
+    compact_for_room: bool,
+    /// That's been tried, and no reply has finished since.
+    room_retried: bool,
+    /// The user wrote after `stuck`: one request goes, whatever the floor says.
+    try_anyway: bool,
+    /// The request out now has the budget a measured `after` gave it.
+    believing: bool,
+    /// `stuck` because the system prompt and tools take about this much,
+    /// which leaves this window no room for a reply.
+    too_small: Option<u64>,
 }
 
 /// How near the window a request may come once compacting can't help.
@@ -132,6 +171,36 @@ impl CompactionProgress {
     /// The server took a request as it was sent.
     pub(super) fn step_taken(&mut self) {
         self.refusal_compactions = 0;
+        self.try_anyway = false;
+        self.believing = false;
+    }
+
+    /// The server took the retry after a refusal: the try and what was
+    /// believed are spent, but the refusal count holds, or a server refusing
+    /// every step would compact at every step (review L2).
+    pub(super) fn retry_taken(&mut self) {
+        self.try_anyway = false;
+        self.believing = false;
+    }
+
+    /// The server refused a request, saying it held `input` tokens if it
+    /// said. One whose budget came from a measured `after` shows that size is
+    /// out of date (the system prompt or tools grew since), so it's believed
+    /// no longer (SME-386 final review M-1): the floor then refuses, and the
+    /// user's next send tries with a short reply.
+    pub(super) fn refused(&mut self, input: Option<u64>) {
+        if std::mem::take(&mut self.believing) {
+            self.after = input.map(|input| self.after.map_or(input, |after| after.max(input)));
+        }
+    }
+
+    /// The system prompt and tools, about `alone` tokens, leave this window
+    /// no room for a reply: wakes say so without calling, until the user
+    /// writes or the window changes (final review, the property test).
+    pub(super) fn too_small(&mut self, alone: u64, context_window: u32) {
+        self.sync(context_window);
+        self.too_small = Some(alone);
+        self.stuck = true;
     }
 
     /// The server refused a request: the reason, if another compaction
@@ -152,6 +221,9 @@ impl CompactionProgress {
         self.sync(context_window);
         if self.stuck {
             return CompactionStep::Stuck(self.why_stuck(model, context_window));
+        }
+        if std::mem::take(&mut self.compact_for_room) {
+            return CompactionStep::Compact;
         }
         // Against a guess, a compaction that can't get under it is no sign
         // of anything: the server says when a request really doesn't fit.
@@ -206,6 +278,50 @@ impl CompactionProgress {
         }
     }
 
+    /// A reply held to the room left was cut off at it, on a request of
+    /// about `sized` tokens (`None`: straight after a compaction, so there's
+    /// nothing more to free). Whether to compact and call the model again:
+    /// compacting has to buy room, at least what `limit` keeps for a reply.
+    pub(super) fn cut_for_room(&mut self, sized: Option<u64>, context_window: u32) -> bool {
+        self.sync(context_window);
+        let frees_room = sized.zip(self.after).is_some_and(|(sized, after)| after + SHORT_REPLY_TOKENS < sized);
+        if !self.room_only() || self.room_retried || !frees_room {
+            return false;
+        }
+        self.compact_for_room = true;
+        self.room_retried = true;
+        true
+    }
+
+    /// A reply finished rather than being cut off.
+    pub(super) fn reply_finished(&mut self) {
+        self.room_retried = false;
+    }
+
+    /// A request of about `size` tokens, compacted just now, leaves no useful
+    /// room by the estimate.
+    pub(super) fn floor_fired(&mut self, size: u64, model: &str, context_window: u32) -> FloorAnswer {
+        self.sync(context_window);
+        let fits = |after: &u64| after + u64::from(COMPACTION_SAFETY_BUFFER) + u64::from(MIN_USEFUL_REPLY) <= u64::from(context_window);
+        if let Some(after) = self.after.filter(fits) {
+            self.believing = true;
+            return FloorAnswer::Believe(after);
+        }
+        if std::mem::take(&mut self.try_anyway) {
+            return FloorAnswer::TryAnyway;
+        }
+        // What a reply measured, if any, is the better number to name.
+        self.after.get_or_insert(size);
+        self.stuck = true;
+        FloorAnswer::NoRoom(self.why_stuck(model, context_window))
+    }
+
+    /// The reason, if the conversation doesn't fit: for a reply cut off on
+    /// the result that shows it, whose turn never gets to `step`.
+    pub(super) fn why_if_stuck(&self, model: &str, context_window: u32) -> Option<String> {
+        self.stuck.then(|| self.why_stuck(model, context_window))
+    }
+
     /// Whether the conversation doesn't fit.
     pub(super) fn is_stuck(&self) -> bool {
         self.stuck
@@ -214,10 +330,21 @@ impl CompactionProgress {
     /// The user wrote: they may try again. One result short of `stuck`, so a
     /// conversation that still doesn't fit costs them one summary, not three.
     pub(super) fn user_wrote(&mut self) {
+        // A send whose turn ended before it got that far keeps its try for the next.
+        self.try_anyway |= self.stuck;
         self.stuck = false;
         self.refused_out = false;
+        self.too_small = None;
+        self.room_retried = false;
+        self.compact_for_room = false;
         self.at_limit = self.at_limit.min(MAX_AT_LIMIT - 1);
         self.refusal_compactions = self.refusal_compactions.min(MAX_REFUSAL_COMPACTIONS - 1);
+    }
+
+    /// `room_only`, for a window that may have just changed.
+    pub(super) fn room_only_at(&mut self, context_window: u32) -> bool {
+        self.sync(context_window);
+        self.room_only()
     }
 
     /// Whether a request past the usual trigger has to keep inside the room
@@ -227,6 +354,9 @@ impl CompactionProgress {
     }
 
     fn why_stuck(&self, model: &str, context_window: u32) -> String {
+        if let Some(alone) = self.too_small {
+            return super::overflow::too_small(model, context_window, alone);
+        }
         if self.refused_out {
             return format!(
                 "`{model}`'s server kept refusing this conversation as too big for its context window, however much \
@@ -275,6 +405,17 @@ mod tests {
         assert_eq!(step(&mut progress, TRIGGER - 1), CompactionStep::Go);
         assert_eq!(step(&mut progress, TRIGGER), CompactionStep::Compact);
         assert_eq!(progress.step("m", WINDOW, None), CompactionStep::Go, "nothing measured");
+    }
+
+    /// The value itself, in numbers: the integration tests would pass for
+    /// anything from 617 to 5,616.
+    #[test]
+    fn test_a_compaction_has_to_leave_4096_tokens_under_the_trigger() {
+        let mut progress = CompactionProgress::default();
+        after_compaction(&mut progress, 79_520);
+        assert_eq!(progress.tight_results, 0, "83,616 less 4,096 is enough");
+        after_compaction(&mut progress, 79_521);
+        assert_eq!(progress.tight_results, 1, "one token more isn't");
     }
 
     #[test]
@@ -415,6 +556,110 @@ mod tests {
         assert_eq!(step(&mut progress, 0), CompactionStep::Go);
         progress.refusal_compacted(WINDOW);
         assert!(progress.why_refused_out("m", WINDOW).is_some(), "a user's retry gets one more");
+    }
+
+    fn tight() -> CompactionProgress {
+        let mut progress = CompactionProgress::default();
+        for _ in 0..2 {
+            after_compaction(&mut progress, 80_000);
+        }
+        assert!(progress.room_only());
+        progress
+    }
+
+    #[test]
+    fn test_a_reply_the_room_cut_off_compacts_next_whatever_its_size_then_once_only() {
+        let mut progress = tight();
+        assert!(progress.cut_for_room(Some(90_000), WINDOW));
+        assert_eq!(step(&mut progress, 0), CompactionStep::Compact);
+        assert_eq!(step(&mut progress, 0), CompactionStep::Go, "the one compaction");
+        assert!(!progress.cut_for_room(Some(90_000), WINDOW), "a second cut in a row ends the turn");
+        progress.reply_finished();
+        assert!(progress.cut_for_room(Some(90_000), WINDOW), "a reply finished between");
+        let mut progress = tight();
+        assert!(progress.cut_for_room(Some(90_000), WINDOW));
+        progress.user_wrote();
+        assert!(progress.cut_for_room(Some(90_000), WINDOW), "the user's send too");
+    }
+
+    #[test]
+    fn test_a_cut_is_only_answered_when_compacting_would_buy_room() {
+        assert!(!tight().cut_for_room(None, WINDOW), "straight after a compaction");
+        assert!(!tight().cut_for_room(Some(82_048), WINDOW), "exactly a short reply's worth isn't more");
+        assert!(tight().cut_for_room(Some(82_049), WINDOW));
+        let mut untight = CompactionProgress::default();
+        after_compaction(&mut untight, 10_000);
+        assert!(!untight.cut_for_room(Some(90_000), WINDOW), "the usual trigger kept the reply its room");
+        let mut guessing = tight();
+        guessing.guessed(WINDOW, 40_000);
+        assert!(!guessing.cut_for_room(Some(39_000), 40_000));
+        assert!(!tight().cut_for_room(Some(90_000), 500_000), "a window learned since");
+    }
+
+    #[test]
+    fn test_the_floor_is_stuck_and_names_what_was_measured_not_the_estimate() {
+        let mut progress = tight();
+        after_compaction(&mut progress, 96_000);
+        let FloorAnswer::NoRoom(why) = progress.floor_fired(99_000, "m", WINDOW) else {
+            panic!("no room by either number");
+        };
+        assert!(why.contains("(100,000 tokens) is too small") && why.contains("about 96,000 tokens"), "{why}");
+        assert!(progress.is_stuck());
+        assert_eq!(progress.why_if_stuck("m", WINDOW).as_deref(), Some(why.as_str()));
+        progress.user_wrote();
+        assert_eq!(progress.why_if_stuck("m", WINDOW), None);
+    }
+
+    #[test]
+    fn test_what_was_measured_outweighs_the_estimate_when_it_shows_room() {
+        let mut progress = tight();
+        assert_eq!(progress.floor_fired(99_000, "m", WINDOW), FloorAnswer::Believe(80_000));
+        assert!(!progress.is_stuck());
+        // Exactly the buffer and the floor, then one token over.
+        after_compaction(&mut progress, 94_880);
+        assert_eq!(progress.floor_fired(99_000, "m", WINDOW), FloorAnswer::Believe(94_880));
+        after_compaction(&mut progress, 94_881);
+        assert!(matches!(progress.floor_fired(99_000, "m", WINDOW), FloorAnswer::NoRoom(_)));
+    }
+
+    #[test]
+    fn test_with_nothing_measured_the_estimate_is_the_number_to_name() {
+        let mut progress = CompactionProgress::default();
+        let FloorAnswer::NoRoom(why) = progress.floor_fired(99_000, "m", WINDOW) else {
+            panic!("no room");
+        };
+        assert!(why.contains("about 99,000 tokens"), "{why}");
+    }
+
+    #[test]
+    fn test_the_users_send_after_stuck_lets_one_request_through() {
+        let mut progress = tight();
+        after_compaction(&mut progress, 96_000);
+        assert!(matches!(progress.floor_fired(99_000, "m", WINDOW), FloorAnswer::NoRoom(_)));
+        progress.user_wrote();
+        assert_eq!(progress.floor_fired(99_000, "m", WINDOW), FloorAnswer::TryAnyway);
+        assert!(matches!(progress.floor_fired(99_000, "m", WINDOW), FloorAnswer::NoRoom(_)), "one");
+        progress.user_wrote();
+        progress.step_taken();
+        assert!(matches!(progress.floor_fired(99_000, "m", WINDOW), FloorAnswer::NoRoom(_)), "a step taken uses it up");
+    }
+
+    #[test]
+    fn test_a_send_whose_turn_never_got_to_the_floor_keeps_its_try() {
+        let mut progress = tight();
+        after_compaction(&mut progress, 96_000);
+        assert!(matches!(progress.floor_fired(99_000, "m", WINDOW), FloorAnswer::NoRoom(_)));
+        progress.user_wrote();
+        progress.user_wrote();
+        assert_eq!(progress.floor_fired(99_000, "m", WINDOW), FloorAnswer::TryAnyway);
+    }
+
+    #[test]
+    fn test_the_users_send_drops_a_compaction_owed_for_the_room() {
+        let mut progress = tight();
+        assert!(progress.cut_for_room(Some(90_000), WINDOW));
+        progress.user_wrote();
+        assert_eq!(step(&mut progress, 0), CompactionStep::Go);
     }
 
     #[test]
