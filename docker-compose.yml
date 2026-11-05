@@ -168,6 +168,10 @@ services:
       # Docker Hub right now; the LSP catalog tests then live-pull as they
       # always did — SME-391). Passed from the caller's environment.
       - SMELT_SKIP_PREPULL=${SMELT_SKIP_PREPULL:-}
+      # How long each pre-pull image may wait, in seconds (default 1800,
+      # per image — SME-391's tightener). Passed from the caller's
+      # environment.
+      - SMELT_PREPULL_WAIT=${SMELT_PREPULL_WAIT:-}
     volumes:
       - k3s-config:/k3s-admin:ro
       - k3s-out:/out
