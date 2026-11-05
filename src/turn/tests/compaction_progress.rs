@@ -484,3 +484,20 @@ async fn test_a_roots_wake_failing_otherwise_saves_no_notice(pool: PgPool) {
 
     assert_eq!(failure_notices(&pool, conversation.id).await, 0);
 }
+
+/// The same reason twice, with no model reply between, which only a failing
+/// call gives: the user's send still gets its answer. Each is its own turn,
+/// and `already_said` would otherwise see the first.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_users_send_failing_like_the_last_still_says_why(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    start_refusal_mock(&pool, vec![Err((axum::http::StatusCode::BAD_REQUEST, "MOCK-FAILURE".to_string()))]).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let mut rx = events::subscribe(conversation.id);
+    for send in 1..=2 {
+        start_turn(pool.clone(), conversation.id, "Try.".to_string()).await.expect("send");
+        wait_until_idle(&mut rx).await;
+        assert_eq!(failure_notices(&pool, conversation.id).await, send);
+    }
+}
