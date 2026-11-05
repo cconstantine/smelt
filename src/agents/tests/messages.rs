@@ -410,8 +410,13 @@ async fn test_message_agent_racing_a_delete(pool: PgPool) {
     release.send(()).expect("release the delete");
     tokio::time::timeout(Duration::from_secs(10), deleting).await.expect("no deadlock").expect("task").expect("the delete");
 
-    // SME-398 red-first: force the queue order the flaky run drew — the
-    // delete's marking queued ahead of the message's row read.
+    // The message holds the child's row first; the delete's marking waits.
+    // Queue order, not luck: each racer is waited for as a NAMED lock waiter
+    // — the message's row read, then the delete's marking — so the rollback
+    // frees a queue whose front it has named. The waiter COUNT proved
+    // nothing: this phase runs while phase 1's delete has woken the root,
+    // and any lock wait of that in-flight turn could satisfy it while the
+    // delete still queued first (SME-398).
     let child = active_child(&pool, root).await;
     let mut holding = pool.begin().await.expect("begin");
     sqlx::query("SELECT 1 FROM agents WHERE conversation_id = $1 FOR UPDATE")
@@ -419,16 +424,16 @@ async fn test_message_agent_racing_a_delete(pool: PgPool) {
         .execute(&mut *holding)
         .await
         .expect("hold the child's row");
-    let deleting = tokio::spawn({
-        let pool = pool.clone();
-        async move { delete_subtree(&pool, child).await }
-    });
-    until_lock_waiter_running(&pool, "UPDATE agents SET state").await;
     let sending = tokio::spawn({
         let pool = pool.clone();
         async move { message(&pool, root, serde_json::json!(child), "Hi.").await }
     });
     until_lock_waiter_running(&pool, "SELECT state FROM agents").await;
+    let deleting = tokio::spawn({
+        let pool = pool.clone();
+        async move { delete_subtree(&pool, child).await }
+    });
+    until_lock_waiter_running(&pool, "UPDATE agents SET state").await;
     holding.rollback().await.expect("release the row");
     let sent = tokio::time::timeout(Duration::from_secs(10), sending).await.expect("no deadlock").expect("task");
     tokio::time::timeout(Duration::from_secs(10), deleting).await.expect("no deadlock").expect("task").expect("the delete");
