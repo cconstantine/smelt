@@ -3,7 +3,12 @@
 # so a missing sandbox image is one clear message instead of every
 # real-cluster test failing with ErrImageNeverPull: the node must have the
 # image the tests will use and the Docker sidecar's, via the read-only
-# `sandbox_image_import --check`. The kubelet deletes unused images once
+# `sandbox_image_import --check`, and (SME-391) warns, without failing, when
+# it lacks one of `scripts/cluster-prepull-images.txt` — the catalog images
+# `scripts/k3s-bootstrap.sh` pre-pulls, so a missing one reads here as a hint
+# to re-run the bootstrap rather than mid-suite as the flake it was.
+# `SMELT_SKIP_PREPULL=1` opts out of that check as it does of the pre-pull.
+# The kubelet deletes unused images once
 # its disk is over 85% full, so the check also warns (on stderr, without
 # failing) when the node's image disk is within 15 GiB of that, naming the
 # images no container uses (SME-229).
@@ -39,3 +44,20 @@ if ! "${check[@]}" --check "$image" "$docker_image"; then
     exit 1
 fi
 echo "cluster-doctor: the cluster has $image"
+
+# The catalog images the test pods start from (SME-391): the bootstrap
+# pre-pulls them; warn, without failing, when the node has lost one (the
+# kubelet GCs unused images), since the tests then live-pull mid-suite and
+# can meet the flake SME-391 filed. SMELT_SKIP_PREPULL=1 opted out of the
+# pre-pull on a machine that can't reach Docker Hub — don't nag about it.
+if [ "${SMELT_SKIP_PREPULL:-}" != 1 ]; then
+    mapfile -t prepull < <(grep -Ev '^[[:space:]]*(#|$)' scripts/cluster-prepull-images.txt)
+    if [ "${#prepull[@]}" -gt 0 ]; then
+        out=$("${check[@]}" --check "${prepull[@]}" 2>&1) \
+            || {
+                echo "cluster-doctor: warning: the node lacks a pre-pulled test image:" >&2
+                sed 's/^/  /' <<<"$out" >&2
+                echo "  the LSP catalog tests will live-pull from Docker Hub and may flake (SME-391); re-run: docker compose up --exit-code-from k3s-bootstrap k3s-bootstrap" >&2
+            }
+    fi
+fi
