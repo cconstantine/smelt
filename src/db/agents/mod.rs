@@ -346,6 +346,61 @@ async fn unread_by(conn: &mut sqlx::PgConnection, child: i64) -> Result<bool, sq
     .await
 }
 
+/// `report_after_finish`'s outcome (SME-389 A).
+#[derive(Debug, PartialEq)]
+pub enum FollowUp {
+    /// The follow-up report is queued to this parent.
+    Queued { parent: i64 },
+    /// The seat isn't `finished` after all (a `message_agent` or a stop
+    /// landed while its report was in flight): this state, named.
+    StateChanged(String),
+    /// The seat, its parent, or either's row is gone.
+    Gone,
+}
+
+/// A late `finish`'s follow-up (SME-389 A): the report of a seat already
+/// `finished` queued to its parent anyway, so no call a seat makes as
+/// `finish` disappears quietly (the ticket's 42-minute stall). Locks the
+/// same rows in the same order as `finish_agent` — `conversations` rows
+/// ascending `KEY SHARE`, then the seat's `agents` row `FOR NO KEY UPDATE`,
+/// the lock `message_agent` takes on a finished recipient — so every
+/// interleaving resolves by row locks, and writes no state: the seat stays
+/// `finished`. B's running-command rule is a first-finish rule only; a
+/// follow-up is never gated, the seat has nothing left to spend.
+pub async fn report_after_finish(pool: &PgPool, child: i64, label: &str, report: &str) -> Result<FollowUp, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let Some(parent) = sqlx::query_scalar::<_, Option<i64>>("SELECT parent_id FROM conversations WHERE id = $1")
+        .bind(child)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten()
+    else {
+        return Ok(FollowUp::Gone);
+    };
+    if !lock_conversations(&mut tx, &[(parent, RowLock::KeyShare), (child, RowLock::KeyShare)]).await? {
+        return Ok(FollowUp::Gone);
+    }
+    // The lock `message_agent` takes on a finished recipient, so one that
+    // reactivated the seat mid-flight reads here `active` (not yet
+    // committed) and refuses with the state named, exactly as a normal
+    // `finish` would.
+    let state = sqlx::query_scalar::<_, String>("SELECT state FROM agents WHERE conversation_id = $1 FOR NO KEY UPDATE")
+        .bind(child)
+        .fetch_optional(&mut *tx)
+        .await?;
+    match state.as_deref() {
+        Some(AGENT_FINISHED) => {}
+        Some(other) => return Ok(FollowUp::StateChanged(other.to_string())),
+        None => return Ok(FollowUp::Gone),
+    }
+    // A follow-up is never gated by a running command (the doc above):
+    // the seat has already given up its turn, and there is no second
+    // report left to spend on a placeholder.
+    queue_agent_message(&mut tx, parent, Some(child), label, KIND_REPORT, report).await?;
+    tx.commit().await?;
+    Ok(FollowUp::Queued { parent })
+}
+
 /// `stop_subtree`'s outcome.
 #[derive(Debug, PartialEq)]
 pub enum StopSubtree {

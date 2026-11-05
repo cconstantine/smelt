@@ -202,6 +202,51 @@ async fn test_a_child_with_no_pod_finishes_with_no_stop_and_no_notice(pool: PgPo
     assert!(!crate::sandbox::stop_finished_agent_pod_with(&pool, child, &crate::sandbox::ActivityNotes::default(), |_| async { Ok(()) }).await, "nothing to stop");
 }
 
+/// SME-389 A: a finished seat woken by a notice (not a message: messages
+/// flip it `active` and take the normal path) keeps working and finishes
+/// again — the report reaches its parent as a follow-up and the seat stays
+/// `finished`. The incident's shape: finish, notice, more work, finish.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_notice_woken_finished_seat_finishes_as_a_follow_up(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let child_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let child_calls = child_calls.clone();
+        mock_with(&pool, move |request| {
+            if agent_of(request).is_none() {
+                return Box::pin(async { text_reply("Thanks.") });
+            }
+            // The notice-woken turn finishes once; if that is refused (red),
+            // the refusal doesn't end the turn — answer text, so the red is
+            // a missing row, not a loop.
+            let body = match child_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => tool_call_reply("finish", serde_json::json!({"report": "one"})),
+                1 => tool_call_reply("finish", serde_json::json!({"report": "two"})),
+                _ => text_reply("stuck."),
+            };
+            Box::pin(async move { body })
+        })
+        .await;
+    }
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    let child = start_child(&pool, root, "Work.").await;
+    eventually("the first report reaches the parent", || async {
+        transcript(&pool, root).await.iter().any(|(_, text)| text.contains("one"))
+    })
+    .await;
+    assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_FINISHED));
+
+    crate::turn::notify(&pool, child, vec![crate::turn::Notice::Deliver(
+        "Terminal command cmd-1 finished: exit code 0.".to_string(),
+    )]);
+    eventually("the follow-up report reaches the parent", || async {
+        transcript(&pool, root).await.iter().filter(|(_, text)| text.contains("Report from agent")).count() == 2
+    })
+    .await;
+    assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_FINISHED), "the follow-up wrote no state");
+    eventually("every turn is over", || async { !crate::turn::turn_running(root) && !crate::turn::turn_running(child) }).await;
+}
+
 /// The stop wins: it holds the turn lock and has re-checked when the
 /// message lands, so the woken turn runs after it with no pod, reading the
 /// notice and then the message.

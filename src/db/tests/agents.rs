@@ -419,3 +419,56 @@ async fn test_finish_agent_refuses_while_a_terminal_command_runs(pool: PgPool) {
         .expect("count");
     assert_eq!(queued, 0, "the refusal queued nothing");
 }
+
+/// SME-389 A: `report_after_finish` queues the finished seat's report to
+/// its parent, writes no state, and is never gated by a running command
+/// (B's refusal is a first-finish rule).
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_report_after_finish_queues_a_follow_up_with_no_state_write(pool: PgPool) {
+    let root = test_conversation(&pool).await.id;
+    let child = agent(&pool, root, AGENT_FINISHED, None).await;
+    let terminal = test_terminal(&pool, child).await;
+    create_terminal_command(&pool, child, terminal, "cmd-9", "sleep 30", 0).await.expect("a running command");
+
+    let outcome = report_after_finish(&pool, child, &format!("agent #{child}"), "More.").await.expect("follow-up");
+    assert_eq!(outcome, FollowUp::Queued { parent: root }, "a running command never gates a follow-up");
+    assert_eq!(agent_state(&pool, child).await.expect("state").as_deref(), Some(AGENT_FINISHED), "no state write");
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT kind, body FROM agent_messages WHERE to_conversation_id = $1 ORDER BY id")
+            .bind(root)
+            .fetch_all(&pool)
+            .await
+            .expect("rows");
+    assert_eq!(rows, vec![("report".to_string(), "More.".to_string())]);
+}
+
+/// SME-389 A: `report_after_finish` refuses by name when the moment has
+/// passed — a reactivated or stopped seat names its state (the locks make
+/// a `message_agent` landing mid-flight read here), and a seat with no
+/// parent, or no agent row at all, is `Gone`. Nothing is queued either way.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_report_after_finish_refuses_by_name_when_the_moment_passed(pool: PgPool) {
+    let root = test_conversation(&pool).await.id;
+    let active = agent(&pool, root, AGENT_ACTIVE, None).await;
+    assert_eq!(
+        report_after_finish(&pool, active, "l", "r").await.expect("reactivated"),
+        FollowUp::StateChanged(AGENT_ACTIVE.to_string())
+    );
+    let stopped = agent(&pool, root, AGENT_STOPPED, None).await;
+    assert_eq!(
+        report_after_finish(&pool, stopped, "l", "r").await.expect("stopped"),
+        FollowUp::StateChanged(AGENT_STOPPED.to_string())
+    );
+    let bare = sqlx::query_scalar::<_, i64>("INSERT INTO conversations (title, parent_id) VALUES ('bare', $1) RETURNING id")
+        .bind(root)
+        .fetch_one(&pool)
+        .await
+        .expect("a bare child row");
+    assert_eq!(report_after_finish(&pool, bare, "l", "r").await.expect("no agent row"), FollowUp::Gone);
+    assert_eq!(report_after_finish(&pool, root, "l", "r").await.expect("no parent"), FollowUp::Gone);
+    let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_messages")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(queued, 0, "a refusal queues nothing");
+}
