@@ -565,14 +565,16 @@ pub(super) async fn scenario_secrets_page(t: &Scenario<'_>) {
     wait_for_resource(&page, "/api/secrets").await;
     // The error hook keeps something, and the page's own call doesn't throw,
     // for what can't be joined into a string (SME-371). This reload is where
-    // the hook first applies. Emptied, so it isn't reported as the page's.
+    // the hook first applies. Only this check's own entries are taken back:
+    // an error the page survived before it stays for the report below, as
+    // the one it seeds here shows, before taking that back too.
     let unjoinable: String = page
-        .evaluate("(() => { try { console.error(Symbol('s')); console.error(Object.create(null)); return window.__smeltErrors.splice(0).join(' ; '); } catch (e) { return 'threw: ' + e; } })()")
+        .evaluate("(() => { try { console.error('an error the page survived'); const before = window.__smeltErrors.length; console.error(Symbol('s')); console.error(Object.create(null)); const added = window.__smeltErrors.splice(before).join(' ; '); return added + ' | kept: ' + window.__smeltErrors.pop(); } catch (e) { return 'threw: ' + e; } })()")
         .await
         .expect("call the hook")
         .into_value()
         .expect("a string");
-    assert_eq!(unjoinable, "unprintable console.error ; unprintable console.error");
+    assert_eq!(unjoinable, "unprintable console.error ; unprintable console.error | kept: an error the page survived");
     let empty_name = unique_id("empty");
     type_and_read_back(&page, "#secret-name", &empty_name).await;
     click_when_present(&page, ".secrets-add-form button[type=\"submit\"]", Duration::from_secs(5)).await;
