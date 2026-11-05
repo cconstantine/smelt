@@ -155,10 +155,9 @@ async fn test_the_restart_notice_is_only_for_an_active_child_cut_off_mid_turn(po
     .expect("an answered question for its parent");
 
     let ids = [root, paused, asking, finished, stopped, replied, saved, answered];
-    // SME-287's fixture guards, read before the restart: the sweep's awaited
-    // wake set is exactly the answered child — the root is not in it — and
-    // nothing is starting, so the root's wake, when it comes, comes from the
-    // chain, not the sweep.
+    // The sweep's awaited wake set and the fixture it reads, checked before
+    // the restart: exactly the answered child, nothing starting — the root's
+    // wake comes from the chain below, not from the sweep (SME-287).
     let before = test_hooks::last_turns_checked(answered);
     assert_eq!(
         db::conversations_with_queued_messages(&pool).await.expect("the wake set"),
@@ -170,14 +169,19 @@ async fn test_the_restart_notice_is_only_for_an_active_child_cut_off_mid_turn(po
     for id in ids {
         assert_eq!(restart_notices(&pool, id).await, 0, "#{id} was told");
     }
-    // The answered child is woken for its answer; nobody else is.
-    for id in [None, Some(paused), Some(asking), Some(finished), Some(stopped), Some(replied), Some(saved)] {
-        assert_eq!(requests_for(&requests, id).len(), 0, "{id:?} was woken");
-    }
-    // SME-287: the chain this claim denies — hop 1, the answered child's
-    // end-of-turn check, and the notice it queues for the root.
+    // The answered child is woken for its answer, and its turn ending
+    // without a report tells its root and wakes it (SME-236): the root IS
+    // woken, exactly once, and none of the other six is (SME-287). Both hops
+    // run unawaited — the end-of-turn check after the child's turn, the
+    // root's wake after that — so wait each out before counting.
     eventually("the answered child's end-of-turn check ran", || async { test_hooks::last_turns_checked(answered) > before }).await;
     assert_eq!(notices_to(&pool, root, answered).await, 1, "the child's end-of-turn notice to the root");
+    eventually("the root's turn for the notice is over", || async { requests_for(&requests, None).len() == 1 && !crate::turn::turn_running(root) }).await;
+    assert_eq!(requests_for(&requests, None).len(), 1, "None wasn't woken for the notice");
+    // The six others were never woken — settled, these see nothing.
+    for id in [Some(paused), Some(asking), Some(finished), Some(stopped), Some(replied), Some(saved)] {
+        assert_eq!(requests_for(&requests, id).len(), 0, "{id:?} was woken");
+    }
     for id in ids {
         crate::turn::forget_conversation_lock(id);
     }
