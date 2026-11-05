@@ -212,3 +212,25 @@ async fn test_a_window_inside_the_buffer_lets_the_next_send_try(pool: PgPool) {
     assert!(reason.contains("is too small for this conversation"), "{reason}");
     assert_eq!(mock.taken_budgets(), vec![u64::from(MIN_USEFUL_REPLY)]);
 }
+
+/// Found by the property test: a window too small for the system prompt
+/// and tools was said on every wake, each after a refused call. It's said
+/// without calling now, until the user writes.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_wakes_after_too_small_for_the_system_prompt_call_nothing(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let mock = counting_mock(&pool, Some(2_000), vec![(5_000, 10)]).await;
+    set_context_window(&pool, 2_000, None).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    run_turn(&pool, conversation.id, hello()).await.expect_err("too small");
+    let calls = mock.calls();
+
+    unnotified_finished_command(&pool, conversation.id, "sme-386-too-small").await;
+    let error = wake_conversation(&pool, conversation.id).await.expect_err("still too small");
+
+    assert!(error.to_string().contains("too small for smelt's system prompt and tools"), "{error}");
+    assert_eq!(mock.calls(), calls, "the wake called nothing");
+    send(&pool, conversation.id, "Again.").await;
+    assert_eq!(mock.calls(), calls + 1, "the user's send tries");
+}

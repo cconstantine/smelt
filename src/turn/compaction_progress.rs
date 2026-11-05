@@ -127,6 +127,9 @@ pub(super) struct CompactionProgress {
     try_anyway: bool,
     /// The request out now has the budget a measured `after` gave it.
     believing: bool,
+    /// `stuck` because the system prompt and tools take about this much,
+    /// which leaves this window no room for a reply.
+    too_small: Option<u64>,
 }
 
 /// How near the window a request may come once compacting can't help.
@@ -189,6 +192,15 @@ impl CompactionProgress {
         if std::mem::take(&mut self.believing) {
             self.after = input.map(|input| self.after.map_or(input, |after| after.max(input)));
         }
+    }
+
+    /// The system prompt and tools, about `alone` tokens, leave this window
+    /// no room for a reply: wakes say so without calling, until the user
+    /// writes or the window changes (final review, the property test).
+    pub(super) fn too_small(&mut self, alone: u64, context_window: u32) {
+        self.sync(context_window);
+        self.too_small = Some(alone);
+        self.stuck = true;
     }
 
     /// The server refused a request: the reason, if another compaction
@@ -322,6 +334,7 @@ impl CompactionProgress {
         self.try_anyway |= self.stuck;
         self.stuck = false;
         self.refused_out = false;
+        self.too_small = None;
         self.room_retried = false;
         self.compact_for_room = false;
         self.at_limit = self.at_limit.min(MAX_AT_LIMIT - 1);
@@ -341,6 +354,9 @@ impl CompactionProgress {
     }
 
     fn why_stuck(&self, model: &str, context_window: u32) -> String {
+        if let Some(alone) = self.too_small {
+            return super::overflow::too_small(model, context_window, alone);
+        }
         if self.refused_out {
             return format!(
                 "`{model}`'s server kept refusing this conversation as too big for its context window, however much \

@@ -43,7 +43,11 @@ pub(super) async fn recover(
         Some(_) => {
             let alone = estimate_request_tokens(&without_messages(refused));
             match after_named_refusal(&turn_model.model, turn_model.context_window, alone, input) {
-                NamedRefusal::TooSmall(why) => return Err(ServerFnError::new(why)),
+                NamedRefusal::TooSmall(why) => {
+                    // Wakes say so after this without calling.
+                    with_compaction_progress(conversation_id, |p| p.too_small(alone, turn_model.context_window));
+                    return Err(ServerFnError::new(why));
+                }
                 // A window named is a window to keep to: the retry gets no
                 // more than the room it leaves, whatever's been learned, or
                 // the usual reply would be refused again on every send
