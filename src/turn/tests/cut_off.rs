@@ -434,3 +434,28 @@ async fn test_an_unsized_anthropic_models_reply_budget_stays_as_it_was(pool: PgP
     let requests = requests.lock().expect("the request log");
     assert_eq!(requests[0]["max_tokens"], 16_384);
 }
+
+/// SME-386 F6: what a parent's notice says of a reply smelt stopped, read
+/// off the turn's last saved message.
+#[test]
+fn test_why_a_reply_stopped_is_read_from_the_turns_last_message() {
+    use crate::api::chat::{ReplyLimit, cut_off_notice, mark_notice, refusal_notice};
+    let saved = |text: &str| vec![message_with_blocks(1, "user", vec![text_block(text)])];
+    assert_eq!(
+        why_reply_stopped(&saved(&cut_off_notice(4_096, ReplyLimit::HalfWindow, None))).as_deref(),
+        Some("its reply was cut off at 4096 tokens, half the context window")
+    );
+    assert_eq!(
+        why_reply_stopped(&saved(&refusal_notice(Some("write_file")))).as_deref(),
+        Some("the model provider's safety system refused its reply, in the middle of a call to `write_file`, which didn't run")
+    );
+    assert_eq!(why_reply_stopped(&[]), None);
+    assert_eq!(why_reply_stopped(&saved("All done.")), None);
+    assert_eq!(why_reply_stopped(&saved(&mark_notice("Terminal command c1 finished: exit code 0."))), None);
+    // A refusal earlier in the turn is not what ended it.
+    let mut later = saved(&refusal_notice(None));
+    later.push(message_with_blocks(2, "assistant", vec![text_block("Carried on.")]));
+    assert_eq!(why_reply_stopped(&later), None);
+    // The words alone, unmarked, are nobody's notice (SME-357).
+    assert_eq!(why_reply_stopped(&saved(crate::api::chat::REFUSAL_NOTICE_START)), None);
+}

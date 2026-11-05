@@ -100,4 +100,7 @@ sqlx database create --database-url "$scratch" || exit 1
 trap 'sqlx database drop -y --database-url "$scratch" >/dev/null 2>&1' EXIT
 
 echo "== browser tier"
-DATABASE_URL="$scratch" scripts/with-cluster-lock cargo test --features "server browser-test" -- --ignored --test-threads=1
+# A passing test's prints shown, as CI shows them: the live-pod install
+# deadline's line and a page's errors are said only there, so a soak with them
+# hidden would look clean without having checked anything (SME-371).
+RUST_TEST_NOCAPTURE=1 DATABASE_URL="$scratch" scripts/with-cluster-lock cargo test --features "server browser-test" -- --ignored --test-threads=1

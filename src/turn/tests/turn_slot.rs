@@ -290,7 +290,7 @@ async fn test_compaction_inside_a_turn_reuses_its_slot(pool: PgPool) {
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     // Usage close to the 200,000 assumed window: the second iteration's
-    // `should_compact` fires (the ceiling is 200,000 − 16,384).
+    // compaction fires (the ceiling is 200,000 − 16,384).
     let near_limit_tool = with_usage(&unknown_tool_call_body("Thinking.", "no_such_tool_343"), 190_000, 0, 10);
     let (addr, gate) = start_slot_gate(vec![
         GateResponse::Sse(near_limit_tool),

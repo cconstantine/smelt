@@ -159,7 +159,8 @@ pub async fn save_secret(id: Option<i64>, name: String, value: String) -> Server
 }
 
 /// Removes a secret; its file goes from every live pod with it. How many
-/// running sandboxes it couldn't be removed from, if any (SME-354 B5).
+/// running sandboxes it isn't confirmed removed from, if any (SME-354 B5,
+/// SME-371).
 #[post("/api/secrets/delete")]
 pub async fn delete_secret(id: i64) -> ServerFnResult<Option<u32>> {
     delete_secret_of(db::get(), id).await.map_err(ServerFnError::new)
