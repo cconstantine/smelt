@@ -150,3 +150,24 @@ async fn test_the_retry_after_a_window_is_named_keeps_to_its_room(pool: PgPool) 
     assert_eq!(last_reply(&saved).as_deref(), Some("Done."));
     assert_eq!(mock.calls(), 2, "one refusal, one retry");
 }
+
+/// Found by the property test: a budget-only retry was built from the last
+/// usage, which doesn't see the tools growing, so it had the refused
+/// request's budget again. It's sized from what the server counted.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_budget_only_retry_is_sized_from_the_servers_count(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    // The first step measures 5,000; the second counts 60,000, with a budget
+    // of half the window from the 5,000.
+    let mock = counting_mock(&pool, Some(100_000), vec![(5_000, 10), (60_000, 10)]).await;
+    // A cap above the half window, so the budget is that.
+    set_context_window(&pool, 100_000, Some(60_000)).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("the retry fits");
+
+    assert_eq!(last_reply(&saved).as_deref(), Some("Done."));
+    assert_eq!(mock.calls(), 3);
+    assert_eq!(mock.summaries.load(Ordering::SeqCst), 0, "the budget was the whole problem");
+}

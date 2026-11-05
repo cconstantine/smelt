@@ -73,8 +73,19 @@ pub(super) async fn recover(
     }
 
     // Once more. A compaction summarized the history the old usage
-    // measured, so the rebuild projects from nothing instead.
-    let mut usage = (!compacted).then_some(last_known_usage).flatten();
+    // measured, so the rebuild projects from nothing instead. Without one,
+    // the budget comes from the larger of the last usage's projection and
+    // what the server counted: from the usage alone it would be the refused
+    // request's budget again whenever something the usage doesn't see (the
+    // tools, the system prompt) grew (SME-386 final review, the property
+    // test).
+    let projected = projected_input(last_known_usage.as_ref(), estimate_tokens(pending_new_content));
+    let mut usage = (!compacted).then(|| anthropic::TokenUsage {
+        input_tokens: i64::try_from(projected.map_or(input, |projected| projected.max(input))).unwrap_or(i64::MAX),
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+    });
     #[cfg(test)]
     test_hooks::before_retry(conversation_id).await;
     // Keeps to the room as the refused request did (round 2 L1), unless this
@@ -88,7 +99,7 @@ pub(super) async fn recover(
         turn_model,
         slot,
         &mut usage,
-        pending_new_content,
+        &[],
         &mut compacted,
         hold_to_room,
         Some(&reason),
