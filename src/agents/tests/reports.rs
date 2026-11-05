@@ -25,6 +25,18 @@ async fn test_a_childs_report_lands_in_its_parent_and_wakes_it(pool: PgPool) {
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let child = start_child(&pool, root, "Find the answer.").await;
 
+    // SME-390: the report row, then the root's request, then its answer —
+    // one wait racing the whole wake chain lost under full-gate load.
+    eventually("the report is queued", || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1 AND kind = 'report'")
+            .bind(root)
+            .fetch_one(&pool)
+            .await
+            .expect("count")
+            == 1
+    })
+    .await;
+    eventually("the root's request runs", || async { requests_for(&requests, None).len() == 1 }).await;
     eventually("the parent answers the report", || async {
         transcript(&pool, root).await.iter().any(|(role, text)| role == "assistant" && text == "Thanks.")
     })

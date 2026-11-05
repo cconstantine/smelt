@@ -33,6 +33,9 @@ async fn test_a_childs_turn_ending_with_text_tells_its_parent(pool: PgPool) {
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let child = start_child(&pool, root, "Work.").await;
 
+    // SME-390: wait for the notice row first, then for the parent's reply —
+    // one wait racing the whole wake chain lost under full-gate load.
+    eventually("the notice is queued", || async { queued_to(&pool, root).await.len() == 1 }).await;
     eventually("the parent reads the notice", || async {
         transcript(&pool, root).await.iter().any(|(role, _)| role == "assistant")
     })
@@ -113,6 +116,9 @@ async fn test_no_notice_when_the_child_waits_on_something_or_finished(pool: PgPo
         .await;
     }
     checked_after(commands, before).await;
+    // SME-390: the report row first, then the root's turn over it — one
+    // wait racing the wake chain and the turn together lost under load.
+    eventually("the report is queued", || async { queued_to(&pool, root).await == vec!["Done.".to_string()] }).await;
     // The root's own turn, for the report, is checked too and tells no one.
     eventually("the root's turn is over", || async {
         transcript(&pool, root).await.iter().any(|(role, _)| role == "assistant") && test_hooks::last_turns_checked(root) > 0
@@ -131,7 +137,7 @@ async fn test_no_notice_when_the_child_waits_on_something_or_finished(pool: PgPo
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_no_ended_notice_after_the_users_stop(pool: PgPool) {
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
-    mock_with(&pool, |request| {
+    let requests = mock_with(&pool, |request| {
         let hang = agent_of(request).is_some();
         Box::pin(async move {
             if hang {
@@ -142,17 +148,27 @@ async fn test_no_ended_notice_after_the_users_stop(pool: PgPool) {
     })
     .await;
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
-    // SME-390 red-first: hold the Stop notice's wake just past its admission —
-    // the stage `eventually("the parent reads the Stop's notice")` races — and
-    // never release it. Nothing but that wake can save the root's reply, so
-    // the unfixed test fails with the gate's signature every time:
-    // `panicked at src/agents/tests/mod.rs:139:9: the parent reads the Stop's
-    // notice: not within 10 s` (:139 is the ticket's :138 after SME-357).
-    let (_held, _release) = crate::turn::test_hooks::pause_after_notice_admitted(root);
+    // SME-390: one wait for the whole wake chain raced it under full-gate
+    // load and lost — `the parent reads the Stop's notice: not within 10 s`
+    // (src/agents/tests/mod.rs:138). Hold the notice's wake at its admission
+    // and drive the chain hop by hop instead: each hop races one stage, and
+    // the held wake proves the queued notice waits, lost nothing, and is
+    // delivered the moment it's released.
+    let (admitted, release) = crate::turn::test_hooks::pause_after_notice_admitted(root);
     let child = start_child(&pool, root, "Work.").await;
     eventually("the child's turn is in flight", || async { crate::turn::turn_running(child) }).await;
     user_stop(&pool, child).await.expect("the Stop goes through");
     eventually("the child's turn ends", || async { !crate::turn::turn_running(child) }).await;
+    eventually("the Stop's notice is queued", || async { queued_to(&pool, root).await.len() == 1 }).await;
+    tokio::time::timeout(Duration::from_secs(30), admitted).await.expect("the notice's wake reaches the hold").expect("held");
+    let still_queued = sqlx::query_scalar::<_, bool>("SELECT delivered_at IS NULL FROM agent_messages WHERE to_conversation_id = $1")
+        .bind(root)
+        .fetch_one(&pool)
+        .await
+        .expect("the queued row");
+    assert!(still_queued, "the notice stays queued while its wake waits, not lost");
+    release.send(()).expect("release the notice's wake");
+    eventually("the root's request carries the notice", || async { requests_for(&requests, None).len() == 1 }).await;
     eventually("the parent reads the Stop's notice", || async {
         transcript(&pool, root).await.iter().any(|(role, _)| role == "assistant")
     })
