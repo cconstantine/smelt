@@ -168,7 +168,11 @@ async fn test_no_ended_notice_after_the_users_stop(pool: PgPool) {
         .expect("the queued row");
     assert!(still_queued, "the notice stays queued while its wake waits, not lost");
     release.send(()).expect("release the notice's wake");
-    eventually("the root's request carries the notice", || async { requests_for(&requests, None).len() == 1 }).await;
+    eventually("the root's request carries the notice", || async {
+        let notice = format!("the user stopped agent #{child}");
+        requests_for(&requests, None).iter().any(|r| r.to_string().contains(&notice))
+    })
+    .await;
     eventually("the parent reads the Stop's notice", || async {
         transcript(&pool, root).await.iter().any(|(role, _)| role == "assistant")
     })
