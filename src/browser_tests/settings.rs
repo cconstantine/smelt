@@ -666,6 +666,9 @@ pub(super) async fn scenario_secrets_page(t: &Scenario<'_>) {
     stuck_install.await.expect("the held install lock");
     db::terminate_sandbox_pod(t.pool, stuck_pod.id).await.expect("end the stuck pod's row");
     assert!(answered, "a stuck install held the save's answer: the row should appear while it's stuck");
+    // The leg proves nothing unless its hold really outlasted the deadline.
+    let firings = crate::credentials::install_deadline_firings_besides(&[]);
+    assert!(firings.iter().any(|pods| pods.contains(&stuck_pod.id)), "the hold never fired the deadline: {firings:?}");
     click_when_present(&page, ".secret-row .secret-delete", Duration::from_secs(5)).await;
     click_when_present(&page, ".secret-row .secret-delete-confirm", Duration::from_secs(5)).await;
     assert!(wait_for_count(&page, ".secret-row", 0, Duration::from_secs(10)).await, "the held save's row deletes again");

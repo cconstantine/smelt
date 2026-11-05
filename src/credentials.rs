@@ -474,11 +474,13 @@ pub async fn install_into_live_pods(pool: &PgPool) -> Option<Vec<i64>> {
 /// starts, so a pod that won't answer must not read as a change that didn't
 /// happen: a stalled exec held "Adding..." on the page for up to its minute.
 ///
-/// One piece of state, the pods not known written. It starts as all of them.
-/// A finished install takes its pod out; a failed one leaves it. The answer
-/// reads it once, so an install landing later changes nothing the caller was
-/// told. The installs own the task they run in, so neither
-/// the deadline nor a dropped request calls one off: each ends on its own
+/// Two pieces of state, `PodInstalls`: every pod starts in flight, and leaves
+/// when its install ends, for the failed list if it failed. The pods not known
+/// written are the two together. The answer reads them once, so an install
+/// landing later changes nothing the caller was told. Only a pod still in
+/// flight at the deadline counts as outlasting it, in the warning and the
+/// tier's report. The installs own the task they run in, so neither the
+/// deadline nor a dropped request calls one off: each ends on its own
 /// `INSTALL_TIMEOUT`, and reads its files under its conversation's lock, so
 /// no install in this process can write over a newer change's files. A
 /// command already running in the pod when `INSTALL_TIMEOUT` drops its future
@@ -488,8 +490,8 @@ where
     F: Fn(i64) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
 {
-    let unconfirmed = std::sync::Arc::new(std::sync::Mutex::new(pods.clone()));
-    let tracker = unconfirmed.clone();
+    let installs = std::sync::Arc::new(std::sync::Mutex::new(PodInstalls { in_flight: pods.clone(), failed: Vec::new() }));
+    let tracker = installs.clone();
     let (finished, all_finished) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(tracing::Instrument::in_current_span(async move {
         // Dropped at the end, a panicking install's included.
@@ -500,24 +502,38 @@ where
         // (SME-341). Each conversation's install takes only its own lock.
         let (install, tracker) = (&install, &tracker);
         futures_util::StreamExt::for_each_concurrent(futures_util::stream::iter(pods), INSTALLS_AT_ONCE, |pod_id| async move {
-            match install(pod_id).await {
-                Ok(()) => tracker.lock().unwrap_or_else(|e| e.into_inner()).retain(|pod| *pod != pod_id),
-                Err(e) => tracing::warn!(pod_id, error = %e, "couldn't install credentials"),
+            let result = install(pod_id).await;
+            let mut installs = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            installs.in_flight.retain(|pod| *pod != pod_id);
+            if let Err(e) = result {
+                tracing::warn!(pod_id, error = %e, "couldn't install credentials");
+                installs.failed.push(pod_id);
             }
         })
         .await;
     }));
     let deadline_fired = tokio::time::timeout(answer_within, all_finished).await.is_err();
-    let unconfirmed = unconfirmed.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if deadline_fired {
-        tracing::warn!(after = ?answer_within, pods = ?unconfirmed, "answering before these live pods' credentials installs finished");
+    let PodInstalls { in_flight, failed } = installs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    // Empty when the last one finished just as the deadline passed: nothing
+    // outlasted it.
+    if deadline_fired && !in_flight.is_empty() {
+        tracing::warn!(after = ?answer_within, pods = ?in_flight, ?failed, "answering before these live pods' credentials installs finished");
         #[cfg(test)]
-        INSTALL_DEADLINE_FIRINGS.lock().unwrap_or_else(|e| e.into_inner()).push(unconfirmed.clone());
+        INSTALL_DEADLINE_FIRINGS.lock().unwrap_or_else(|e| e.into_inner()).push(in_flight.clone());
     }
-    unconfirmed
+    in_flight.into_iter().chain(failed).collect()
 }
 
-/// The pods each firing of the deadline left unconfirmed, for the browser
+/// Where a round's installs stand. An install that outlasted the deadline
+/// and one that failed quickly both leave a pod not known written, which is
+/// all a delete's answer needs, but only the first is a stall (SME-371).
+#[derive(Clone)]
+struct PodInstalls {
+    in_flight: Vec<i64>,
+    failed: Vec<i64>,
+}
+
+/// The pods still installing at each firing of the deadline, for the browser
 /// tier's report: its in-process server has no log to warn into.
 #[cfg(test)]
 static INSTALL_DEADLINE_FIRINGS: std::sync::Mutex<Vec<Vec<i64>>> = std::sync::Mutex::new(Vec::new());
