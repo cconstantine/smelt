@@ -83,13 +83,15 @@ pub(super) async fn recover(
 
     // Once more. A compaction summarized the history the old usage
     // measured, so the rebuild projects from nothing instead.
-    let usage = (!compacted).then_some(last_known_usage).flatten();
+    let mut usage = (!compacted).then_some(last_known_usage).flatten();
     #[cfg(test)]
     test_hooks::before_retry(conversation_id).await;
-    // Keeps to the room as the refused request did (round 2 L1). A window
-    // this refusal changed, or a guess, says nothing about the room.
-    let room_only = with_compaction_progress(conversation_id, |p| p.room_only_at(turn_model.context_window));
-    let (mut request, budget) = build_request(pool, conversation_id, turn_model, usage.as_ref(), pending_new_content, room_only).await?;
+    // Keeps to the room as the refused request did (round 2 L1), unless this
+    // refusal changed the window or a guess is in force, and to the floor
+    // (review L-2). The floor takes no further compaction here: only a request
+    // that just compacted can be under it.
+    let (mut request, budget) =
+        build_request_with_room(pool, conversation_id, turn_model, slot, &mut usage, pending_new_content, &mut true).await?;
     match call_model(pool, conversation_id, turn_model, &mut request, slot).await {
         Ok((turn, recorder)) => Ok(Recovered { turn, recorder, budget, compacted }),
         // Refused again: the turn fails — but a window this second

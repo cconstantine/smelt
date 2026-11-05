@@ -433,3 +433,35 @@ async fn test_a_refusal_naming_the_window_compacts_when_a_short_reply_fits(pool:
     assert_eq!(last_reply(&saved).as_deref(), Some("Done."));
     assert_eq!(mock.count(), 8);
 }
+
+/// Review L-2: `recover`'s retry has the floor too. A longer summary than the
+/// one before has left no useful room, and no call goes out for one token.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_retry_after_a_refusal_has_the_floor_too(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let tool = || -> Answer { Ok(with_usage(&tool_calls_body(&[("toolu_01", "todoread", serde_json::json!({}))]), 20_000, 0, 10)) };
+    let summary = || -> Answer { Ok(text_reply_body("The summary.")) };
+    // The refusal names a window it doesn't lower, so the turn's own stands.
+    let answers = vec![
+        tool(),
+        summary(),
+        tool(),
+        summary(),
+        tool(),
+        summary(),
+        too_long(20_000, 900_000),
+        Ok(text_reply_body(&"long ".repeat(4_000))),
+        Ok(text_reply_body("Should never be asked.")),
+    ];
+    let mock = start_refusal_mock(&pool, answers).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let window = window_leaving(&pool, conversation.id, 1_600).await;
+    set_context_window(&pool, window, None).await;
+
+    let error = run_turn(&pool, conversation.id, hello()).await.expect_err("no room after the second summary");
+
+    assert_eq!(mock.count(), 8, "no retry with no room");
+    let error = error.to_string();
+    assert!(error.contains("is too small for this conversation") && error.contains("about 20,000 tokens"), "{error}");
+}
