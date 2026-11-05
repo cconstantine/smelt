@@ -335,6 +335,17 @@ mod tests {
         assert_eq!(progress.step("m", WINDOW, None), CompactionStep::Go, "nothing measured");
     }
 
+    /// The value itself, in numbers: the integration tests would pass for
+    /// anything from 617 to 5,616.
+    #[test]
+    fn test_a_compaction_has_to_leave_4096_tokens_under_the_trigger() {
+        let mut progress = CompactionProgress::default();
+        after_compaction(&mut progress, 79_520);
+        assert_eq!(progress.tight_results, 0, "83,616 less 4,096 is enough");
+        after_compaction(&mut progress, 79_521);
+        assert_eq!(progress.tight_results, 1, "one token more isn't");
+    }
+
     #[test]
     fn test_two_tight_results_in_a_row_move_the_trigger_to_the_limit() {
         let mut progress = CompactionProgress::default();

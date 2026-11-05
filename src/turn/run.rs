@@ -16,11 +16,13 @@ pub(super) const MAX_TURNS: usize = 10_000;
 #[cfg(feature = "server")]
 pub(super) const CLONE_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// The smallest reply budget a turn asks for (SME-111, until then every
-/// turn's fixed `max_tokens`): the auto-compaction trigger reserves at
+/// The smallest reply budget a turn usually asks for (SME-111, until then
+/// every turn's fixed `max_tokens`): the auto-compaction trigger reserves at
 /// least this much off the context window before deciding a request is
 /// too big, so a turn that doesn't compact has room for it. The budget
-/// itself grows with the room left (`reply_budget`).
+/// itself grows with the room left (`reply_budget`). Past the trigger, where
+/// compacting can't help, a request gets only the room left, which can be
+/// less (`budget_within_room`, SME-386).
 #[cfg(feature = "server")]
 pub(super) const MIN_REPLY_TOKENS: u32 = 16_384;
 
