@@ -321,6 +321,7 @@ fn run_turn_steps<'a: 'b, 'b>(
                     if let Some(why) = with_compaction_progress(conversation_id, |p| p.why_refused_out(&turn_model.model, turn_model.context_window)) {
                         return Err(ServerFnError::new(why));
                     }
+                    with_compaction_progress(conversation_id, |p| p.refused(overflow.input_tokens));
                     let recovered = overflow_recovery(
                         pool,
                         conversation_id,

@@ -84,6 +84,7 @@ pub(super) async fn recover(
         // Refused again: the turn fails — but a window this second
         // refusal names is still learned, so the next turn starts right.
         Err(CallError::Overflow(again)) => {
+            with_compaction_progress(conversation_id, |p| p.refused(again.input_tokens));
             learn(pool, conversation_id, turn_model, again.window).await;
             Err(ServerFnError::new(still_did_not_fit(
                 &turn_model.model,

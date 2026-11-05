@@ -43,6 +43,9 @@
 //!   shows room. If not, `stuck`, unless the user has written since it last
 //!   was (`try_anyway`), which lets one request through: only the server's
 //!   answer can show anything new, so the user always has a way out;
+//! - the server refuses a request whose budget that measured size gave
+//!   (`refused`, final review M-1): the size is out of date, and the larger
+//!   of it and the refusal's count is what's believed from then on;
 //! - a restart or a delete: all of it goes, and the next compaction learns it.
 
 use super::*;
@@ -122,6 +125,8 @@ pub(super) struct CompactionProgress {
     room_retried: bool,
     /// The user wrote after `stuck`: one request goes, whatever the floor says.
     try_anyway: bool,
+    /// The request out now has the budget a measured `after` gave it.
+    believing: bool,
 }
 
 /// How near the window a request may come once compacting can't help.
@@ -164,6 +169,18 @@ impl CompactionProgress {
     pub(super) fn step_taken(&mut self) {
         self.refusal_compactions = 0;
         self.try_anyway = false;
+        self.believing = false;
+    }
+
+    /// The server refused a request, saying it held `input` tokens if it
+    /// said. One whose budget came from a measured `after` shows that size is
+    /// out of date (the system prompt or tools grew since), so it's believed
+    /// no longer (SME-386 final review M-1): the floor then refuses, and the
+    /// user's next send tries with a short reply.
+    pub(super) fn refused(&mut self, input: Option<u64>) {
+        if std::mem::take(&mut self.believing) {
+            self.after = input.map(|input| self.after.map_or(input, |after| after.max(input)));
+        }
     }
 
     /// The server refused a request: the reason, if another compaction
@@ -267,6 +284,7 @@ impl CompactionProgress {
         self.sync(context_window);
         let fits = |after: &u64| after + u64::from(COMPACTION_SAFETY_BUFFER) + u64::from(MIN_USEFUL_REPLY) <= u64::from(context_window);
         if let Some(after) = self.after.filter(fits) {
+            self.believing = true;
             return FloorAnswer::Believe(after);
         }
         if std::mem::take(&mut self.try_anyway) {
