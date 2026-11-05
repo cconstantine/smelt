@@ -326,3 +326,46 @@ pub(super) async fn scenario_notifier_setting_off_then_leaving(t: &Scenario<'_>)
     assert_eq!(unhandled_rejections(&page).await, Vec::<String>::new(), "route changes stay quiet");
     crate::turn::forget_conversation_lock(other.id);
 }
+
+/// Review round 1's L1: an event already in the leader's queue when it's
+/// demoted. Nothing but the leader's own stream carried it, and the next
+/// leader's stream has no catch-up, so if this tab drops it, no tab shows
+/// it. It shows here, then closes on the next message, as anything a
+/// demoted tab holds away from a conversation does. Ticks are held so the
+/// event waits in the queue until the demotion's own message wakes the loop.
+pub(super) async fn scenario_notifier_event_queued_at_demotion(t: &Scenario<'_>) {
+    const HEADING: &str = "smelt: the reply was cut off";
+    let warm = t.conversation().await;
+    let queued = t.conversation().await;
+    let tag = format!("smelt-conversation-{}", queued.id);
+    let a = settings_tab_notifying(t).await;
+    assert!(wait_until(|| leads(&a), Duration::from_secs(10)).await, "the first tab leads");
+    set_focus(&a, false, false).await;
+    let b = settings_tab_notifying(t).await;
+    set_focus(&b, false, false).await;
+    assert!(
+        wait_until(|| async { queued_requests(&a).await == 1 }, Duration::from_secs(10)).await,
+        "the second tab queues behind the first"
+    );
+    assert!(spell_notifies(&a, warm.id).await, "A's stream is live");
+
+    a.evaluate("window.__smeltTicksPaused = true").await.expect("hold A's ticks");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    crate::turn::new_turn_generation(queued.id);
+    crate::turn::publish_a_test_spell(queued.id, crate::events::Attention::CutOff);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(tag_count(&a, &tag).await, 0, "the event waits in A's queue");
+
+    set_focus(&b, true, true).await;
+    assert!(wait_until(|| leads(&b), Duration::from_secs(5)).await, "focus moved the leader to B");
+    let shown_somewhere = wait_until(|| async { tag_count(&a, &tag).await == 1 }, Duration::from_secs(3)).await;
+    assert_eq!(tag_count(&b, &tag).await, 0, "B's stream has no catch-up");
+    assert!(shown_somewhere, "the event reached no tab");
+
+    a.evaluate("window.__smeltTicksPaused = false").await.expect("let A's ticks go");
+    assert!(wait_last_closed(&a, &tag, HEADING, Duration::from_secs(5)).await, "the demoted tab closes it");
+    crate::turn::forget_conversation_lock(warm.id);
+    crate::turn::forget_conversation_lock(queued.id);
+    set_focus(&b, false, false).await;
+    a.evaluate("localStorage.removeItem('smelt.notifications')").await.expect("turn the setting off");
+}

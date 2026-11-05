@@ -28,6 +28,10 @@ const NOTIFICATION_STUB: &str = r#"
   window.__smeltNotifierStubbed = true;
   window.__notifications = [];
   window.__unhandled = [];
+  // Holds every interval's callback while set: the notifier's tick is what
+  // wakes its Rust loop, so a test can let an event sit in its queue.
+  const realSetInterval = window.setInterval.bind(window);
+  window.setInterval = (run, ms, ...rest) => realSetInterval((...args) => { if (!window.__smeltTicksPaused) run(...args); }, ms, ...rest);
   window.addEventListener("unhandledrejection", (e) => window.__unhandled.push(String(e.reason)));
   class FakeNotification {
     static permission = "granted";

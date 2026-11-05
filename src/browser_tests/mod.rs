@@ -268,6 +268,7 @@ fn scenarios() -> Vec<Entry> {
         entry("notifier_after_navigation", 120, Runs::Alone, |t| Box::pin(scenario_notifier_after_navigation(t))),
         entry("notifier_keeps_state_across_navigation", 120, Runs::Alone, |t| Box::pin(scenario_notifier_keeps_state_across_navigation(t))),
         entry("notifier_setting_off_then_leaving", 60, Runs::Alone, |t| Box::pin(scenario_notifier_setting_off_then_leaving(t))),
+        entry("notifier_event_queued_at_demotion", 60, Runs::Alone, |t| Box::pin(scenario_notifier_event_queued_at_demotion(t))),
         entry("agent_reference_links", 90, Runs::Beside, |t| Box::pin(scenario_agent_reference_links(t))),
     ]
 }
