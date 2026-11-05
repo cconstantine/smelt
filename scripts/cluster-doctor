@@ -55,9 +55,13 @@ if [ "${SMELT_SKIP_PREPULL:-}" != 1 ]; then
     if [ "${#prepull[@]}" -gt 0 ]; then
         out=$("${check[@]}" --check "${prepull[@]}" 2>&1) \
             || {
-                echo "cluster-doctor: warning: the node lacks a pre-pulled test image:" >&2
-                sed 's/^/  /' <<<"$out" >&2
-                echo "  the LSP catalog tests will live-pull from Docker Hub and may flake (SME-391); re-run: docker compose up --exit-code-from k3s-bootstrap k3s-bootstrap" >&2
+                echo "cluster-doctor: warning: the node lacks a pre-pulled test image; the LSP catalog tests will live-pull from Docker Hub and may flake (SME-391); re-run: docker compose up --exit-code-from k3s-bootstrap k3s-bootstrap" >&2
+                # The tool's message names what's missing and why, but its own
+                # remedy is scripts/build-sandbox-image.sh — right for the
+                # sandbox image, wrong for images the bootstrap pre-pulls.
+                # Keep the diagnosis, drop that clause; the remedy above is
+                # this check's.
+                sed -e 's/; free up space if need be, then run scripts\/build-sandbox-image\.sh/; free up space if need be/' <<<"$out" | sed 's/^/  /' >&2
             }
     fi
 fi
