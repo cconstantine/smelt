@@ -247,6 +247,16 @@ pub enum Finish {
     CommandsRunning(Vec<(String, String, i64)>),
 }
 
+/// B's read (SME-389): the seat's still-running tracked commands, `$1` its
+/// conversation. Same predicate as `idle_agent_without_report`'s
+/// running-command clause; both are answered from
+/// `idx_terminal_commands_conversation_running` — the index the plan
+/// believed still existed (review round 1's Low), `terminal_commands`
+/// keeping its finished rows.
+pub(crate) const FINISH_RUNNING_COMMANDS_SQL: &str =
+    "SELECT command_id, command, EXTRACT(EPOCH FROM (now() - created_at))::BIGINT
+     FROM terminal_commands WHERE conversation_id = $1 AND status = 'running' ORDER BY id";
+
 /// `finish`'s transaction: the child `finished` and its report queued to
 /// its parent, so one lands only if the other does. `label` names the
 /// child to its parent.
@@ -290,13 +300,10 @@ pub async fn finish_agent(pool: &PgPool, child: i64, label: &str, report: &str) 
     // back with it. Commands a seat detached (`&`, nohup) make no rows
     // and are not gated, as in the pod rules. Same predicate as
     // `idle_agent_without_report`'s running-command clause.
-    let running_commands = sqlx::query_as::<_, (String, String, i64)>(
-        "SELECT command_id, command, EXTRACT(EPOCH FROM (now() - created_at))::BIGINT
-         FROM terminal_commands WHERE conversation_id = $1 AND status = 'running' ORDER BY id",
-    )
-    .bind(child)
-    .fetch_all(&mut *tx)
-    .await?;
+    let running_commands = sqlx::query_as::<_, (String, String, i64)>(FINISH_RUNNING_COMMANDS_SQL)
+        .bind(child)
+        .fetch_all(&mut *tx)
+        .await?;
     if !running_commands.is_empty() {
         return Ok(Finish::CommandsRunning(running_commands));
     }
@@ -536,23 +543,27 @@ pub async fn queue_notice(pool: &PgPool, to: i64, from: i64, from_label: &str, b
     queue_agent_message(&mut conn, to, Some(from), from_label, KIND_NOTICE, body).await
 }
 
+/// The idle check's own query (`$1` the conversation id, `$2` active,
+/// `$3` starting), a constant so the running-command clause is
+/// EXPLAIN-tested as written, not paraphrased (SME-389 R1-1).
+pub(crate) const IDLE_AGENT_WITHOUT_REPORT_SQL: &str =
+    "SELECT c.parent_id,
+            (SELECT m.content FROM messages m WHERE m.conversation_id = c.id AND m.role = 'assistant'
+             ORDER BY m.id DESC LIMIT 1)
+     FROM conversations c JOIN agents a ON a.conversation_id = c.id
+     WHERE c.id = $1 AND c.parent_id IS NOT NULL AND a.state = $2
+       AND NOT EXISTS (SELECT 1 FROM pending_questions q WHERE q.conversation_id = c.id AND q.answer IS NULL)
+       AND NOT EXISTS (SELECT 1 FROM instruction_requests r WHERE r.conversation_id = c.id)
+       AND NOT EXISTS (SELECT 1 FROM terminal_commands t WHERE t.conversation_id = c.id AND t.status = 'running')
+       AND NOT EXISTS (SELECT 1 FROM agents g JOIN conversations gc ON gc.id = g.conversation_id
+                       WHERE gc.parent_id = c.id AND g.state IN ($3, $2))";
+
 /// Whether `id` is an `active` agent with nothing to wait on: no question
 /// to the user unanswered, no AGENTS.md card, no terminal command running
 /// and no agent of its own still starting or active. Its parent then, and
 /// the first 500 characters of its last reply's text. `None` otherwise.
 pub async fn idle_agent_without_report(pool: &PgPool, id: i64) -> Result<Option<(i64, String)>, sqlx::Error> {
-    let row = sqlx::query_as::<_, (i64, Option<String>)>(
-        "SELECT c.parent_id,
-                (SELECT m.content FROM messages m WHERE m.conversation_id = c.id AND m.role = 'assistant'
-                 ORDER BY m.id DESC LIMIT 1)
-         FROM conversations c JOIN agents a ON a.conversation_id = c.id
-         WHERE c.id = $1 AND c.parent_id IS NOT NULL AND a.state = $2
-           AND NOT EXISTS (SELECT 1 FROM pending_questions q WHERE q.conversation_id = c.id AND q.answer IS NULL)
-           AND NOT EXISTS (SELECT 1 FROM instruction_requests r WHERE r.conversation_id = c.id)
-           AND NOT EXISTS (SELECT 1 FROM terminal_commands t WHERE t.conversation_id = c.id AND t.status = 'running')
-           AND NOT EXISTS (SELECT 1 FROM agents g JOIN conversations gc ON gc.id = g.conversation_id
-                           WHERE gc.parent_id = c.id AND g.state IN ($3, $2))",
-    )
+    let row = sqlx::query_as::<_, (i64, Option<String>)>(IDLE_AGENT_WITHOUT_REPORT_SQL)
     .bind(id)
     .bind(AGENT_ACTIVE)
     .bind(AGENT_STARTING)

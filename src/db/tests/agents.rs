@@ -472,3 +472,47 @@ async fn test_report_after_finish_refuses_by_name_when_the_moment_passed(pool: P
         .expect("count");
     assert_eq!(queued, 0, "a refusal queues nothing");
 }
+
+/// SME-389 review round 1 (R1-1): B's finish-time read and
+/// `idle_agent_without_report`'s NOT EXISTS share the predicate
+/// `conversation_id = $ AND status = 'running'`. The index that served it
+/// was dropped at `20260812041850`; `idx_terminal_commands_running_idle`
+/// can't serve it (the query doesn't imply `idle_notice_secs > 0`) and
+/// `idx_terminal_commands_terminal_running` has no `conversation_id`, so
+/// the predicate is answered only by a seq scan (or a bitmap over every
+/// running row with a heap filter) of a table that keeps its finished rows.
+/// With sequential scans priced out the reads must be served by the named
+/// partial index the migration recreates (SME-386 M5's shape, by name: a
+/// scan of some other index passes a bare "uses an index" check).
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_running_command_reads_use_an_index(pool: PgPool) {
+    let mut conn = pool.acquire().await.expect("a connection");
+    sqlx::query("SET enable_seqscan = off").execute(&mut *conn).await.expect("set");
+    let plan: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN {FINISH_RUNNING_COMMANDS_SQL}"))
+        .bind(2_i64)
+        .fetch_all(&mut *conn)
+        .await
+        .expect("explain B's read");
+    let plan = plan.join("\n");
+    assert!(!plan.contains("Seq Scan on terminal_commands"), "B's read scans the table:\n{plan}");
+    // By name, not merely "Index": with seqscans priced out and `ORDER BY
+    // id`, a full primary-key scan satisfies a bare Index check (SME-122's
+    // substring trap) while still reading every row.
+    assert!(plan.contains("idx_terminal_commands_conversation_running"), "B's read is not served by the running-commands index:\n{plan}");
+    let plan: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN {IDLE_AGENT_WITHOUT_REPORT_SQL}"))
+        .bind(2_i64)
+        .bind(AGENT_ACTIVE)
+        .bind(AGENT_STARTING)
+        .fetch_all(&mut *conn)
+        .await
+        .expect("explain the idle read");
+    let plan = plan.join("\n");
+    assert!(
+        !plan.contains("Seq Scan on terminal_commands"),
+        "the idle read's running-command clause scans the table:\n{plan}"
+    );
+    assert!(
+        plan.contains("idx_terminal_commands_conversation_running"),
+        "the idle read's running-command clause is not served by the index:\n{plan}"
+    );
+}
