@@ -131,6 +131,39 @@ async fn test_an_install_reads_its_files_only_once_it_holds_the_lock(pool: PgPoo
     assert!(file(&files, "/etc/smelt/secrets/linear-key").is_none(), "a deleted secret came back with a late install");
 }
 
+/// SME-371 review 1: the deadline leaves a record naming its pods, for the
+/// browser tier's report, and a scenario's own hold can be told from the
+/// rest, even when both fire at once. A finished install leaves no record.
+#[tokio::test]
+async fn test_the_deadline_records_the_pods_it_left() {
+    let held = crate::id_alloc::FIXTURE_IDS.next_base();
+    let stalled = crate::id_alloc::FIXTURE_IDS.next_base();
+    let finished = crate::id_alloc::FIXTURE_IDS.next_base();
+    let (release, released) = tokio::sync::watch::channel(false);
+    let answer = |pods: Vec<i64>| {
+        let released = released.clone();
+        installs_answered_within(std::time::Duration::from_millis(50), pods, move |pod_id| {
+            let mut released = released.clone();
+            async move {
+                if pod_id != finished {
+                    let _ = released.wait_for(|go| *go).await;
+                }
+                Ok(())
+            }
+        })
+    };
+    assert_eq!(answer(vec![held]).await, vec![held]);
+    let mut both = answer(vec![held, stalled, finished]).await;
+    both.sort_unstable();
+    let mut expected = vec![held, stalled];
+    expected.sort_unstable();
+    assert_eq!(both, expected);
+    let _ = release.send(true);
+    let firings = install_deadline_firings_besides(&[held]);
+    let mine: Vec<&Vec<i64>> = firings.iter().filter(|pods| pods.contains(&stalled) || pods.contains(&held) || pods.contains(&finished)).collect();
+    assert_eq!(mine, vec![&vec![stalled]], "the hold alone reports nothing; a stall beside it reports only itself");
+}
+
 /// Every install finished: the answer doesn't sit out the deadline, and
 /// nothing is missed. The normal save, which still answers with its pods
 /// written.

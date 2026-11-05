@@ -294,6 +294,23 @@ fn selected_scenarios() -> Option<Vec<String>> {
     (!names.is_empty()).then_some(names)
 }
 
+/// Pods a scenario holds on purpose, whose firing of the live-pod install
+/// deadline says nothing.
+static DELIBERATELY_HELD: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
+
+fn deliberately_held(pod_id: i64) {
+    DELIBERATELY_HELD.lock().expect("the held pods lock").push(pod_id);
+}
+
+/// SME-371: a stall on the way to a save's answer no longer fails a scenario,
+/// and the tier's in-process server has no log. So it says here, greppable in
+/// every run's log, which real pods outlasted the deadline.
+fn report_install_deadlines() {
+    let held = DELIBERATELY_HELD.lock().expect("the held pods lock").clone();
+    let firings = crate::credentials::install_deadline_firings_besides(&held);
+    eprintln!("browser tier: live-pod install deadline fired {} time(s) besides the deliberate hold; pods: {firings:?}", firings.len());
+}
+
 #[tokio::test]
 #[ignore]
 async fn test_end_to_end_browser_scenarios() {
@@ -403,6 +420,7 @@ async fn test_end_to_end_browser_scenarios() {
         leftovers.push(format!("model provider {} in the database", mock_provider.id));
     }
     harness.shutdown().await;
+    report_install_deadlines();
     assert!(
         failures.is_empty(),
         "{} of {} browser scenarios failed:\n  {}",

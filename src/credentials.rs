@@ -507,11 +507,32 @@ where
         })
         .await;
     }));
-    if tokio::time::timeout(answer_within, all_finished).await.is_err() {
-        tracing::warn!(after = ?answer_within, "answering before every live pod's credentials install finished");
+    let deadline_fired = tokio::time::timeout(answer_within, all_finished).await.is_err();
+    let unconfirmed = unconfirmed.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if deadline_fired {
+        tracing::warn!(after = ?answer_within, pods = ?unconfirmed, "answering before these live pods' credentials installs finished");
+        #[cfg(test)]
+        INSTALL_DEADLINE_FIRINGS.lock().unwrap_or_else(|e| e.into_inner()).push(unconfirmed.clone());
     }
-    let unconfirmed = unconfirmed.lock().unwrap_or_else(|e| e.into_inner());
-    unconfirmed.clone()
+    unconfirmed
+}
+
+/// The pods each firing of the deadline left unconfirmed, for the browser
+/// tier's report: its in-process server has no log to warn into.
+#[cfg(test)]
+static INSTALL_DEADLINE_FIRINGS: std::sync::Mutex<Vec<Vec<i64>>> = std::sync::Mutex::new(Vec::new());
+
+/// Each firing's pods without those in `held`, and without the firings that
+/// held nothing else: what a scenario's own hold can't explain.
+#[cfg(test)]
+pub(crate) fn install_deadline_firings_besides(held: &[i64]) -> Vec<Vec<i64>> {
+    INSTALL_DEADLINE_FIRINGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|pods| pods.iter().copied().filter(|pod| !held.contains(pod)).collect::<Vec<_>>())
+        .filter(|pods| !pods.is_empty())
+        .collect()
 }
 
 /// What a delete tells the page about the live pods not confirmed pruned
