@@ -277,9 +277,16 @@ fn run_turn_steps<'a: 'b, 'b>(
                     // runs before the meter publish below, so the meter
                     // reads the new window with this reply's own usage.
                     super::overflow::learn_ollama_window(pool, conversation_id, turn_model, &request, &turn.usage).await;
+                    with_compaction_progress(conversation_id, CompactionProgress::step_taken);
                     (turn, recorder, budget)
                 }
                 Err(CallError::Overflow(overflow)) => {
+                    // Compacting at every step, with nothing a server's silence
+                    // on usage could stop (SME-386 review L2).
+                    if let Some(why) = with_compaction_progress(conversation_id, |p| p.why_refused_out(&turn_model.model, turn_model.context_window)) {
+                        return Err(ServerFnError::new(why));
+                    }
+                    let believed = turn_model.context_window;
                     let recovered = overflow_recovery(
                         pool,
                         conversation_id,
@@ -291,9 +298,14 @@ fn run_turn_steps<'a: 'b, 'b>(
                         &overflow,
                     )
                     .await?;
-                    if recovered.compacted {
-                        with_compaction_progress(conversation_id, |p| p.compacted(turn_model.context_window));
-                    }
+                    with_compaction_progress(conversation_id, |p| {
+                        if let Some(guess) = recovered.guessed {
+                            p.guessed(believed, guess);
+                        }
+                        if recovered.compacted {
+                            p.refusal_compacted(turn_model.context_window);
+                        }
+                    });
                     (recovered.turn, recovered.recorder, recovered.budget)
                 }
                 Err(CallError::Failed(e)) => return Err(e),

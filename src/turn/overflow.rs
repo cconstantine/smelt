@@ -9,13 +9,14 @@
 use super::*;
 
 /// What a recovery ends with: the retry's reply and recorder, the budget
-/// of the request that got it — the one `save_stop_notice` reads — and
-/// whether it compacted (`CompactionProgress`).
+/// of the request that got it — the one `save_stop_notice` reads — and, for
+/// `CompactionProgress`, whether it compacted and any window it guessed.
 pub(super) struct Recovered {
     pub(super) turn: anthropic::stream::StreamedTurn,
     pub(super) recorder: CallRecorder,
     pub(super) budget: ReplyBudget,
     pub(super) compacted: bool,
+    pub(super) guessed: Option<u32>,
 }
 
 /// One recovery from an overflow refusal. `turn_model` is the turn's own
@@ -40,6 +41,7 @@ pub(super) async fn recover(
     // What every retry must still leave room for on top of the input:
     // a reply and the estimate's headroom.
     let needs = u64::from(MIN_REPLY_TOKENS) + u64::from(COMPACTION_SAFETY_BUFFER);
+    let mut guessed = None;
 
     if named.is_some() {
         // Can't help: what no compaction can take away — the system
@@ -59,6 +61,7 @@ pub(super) async fn recover(
         let assumed = u32::try_from(input.saturating_mul(3) / 4).unwrap_or(u32::MAX);
         if assumed < turn_model.context_window {
             turn_model.context_window = assumed;
+            guessed = Some(assumed);
         }
     }
 
@@ -80,7 +83,7 @@ pub(super) async fn recover(
     test_hooks::before_retry(conversation_id).await;
     let (mut request, budget) = build_request(pool, conversation_id, turn_model, usage.as_ref(), pending_new_content, false).await?;
     match call_model(pool, conversation_id, turn_model, &mut request, slot).await {
-        Ok((turn, recorder)) => Ok(Recovered { turn, recorder, budget, compacted }),
+        Ok((turn, recorder)) => Ok(Recovered { turn, recorder, budget, compacted, guessed }),
         // Refused again: the turn fails — but a window this second
         // refusal names is still learned, so the next turn starts right.
         Err(CallError::Overflow(again)) => {

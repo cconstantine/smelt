@@ -26,6 +26,13 @@
 //!   window learned mid-turn alike): all of it goes, being about the old one;
 //! - the user's send or answer (`user_wrote`): `stuck` goes, so they can try
 //!   again, one result short of it. `tight` stays: it only delays a compaction;
+//! - a refusal naming no window has the turn guess one, for that turn alone
+//!   (`guessed`): nothing it shows is about the real window, so nothing is
+//!   learned or failed against it (review M2), the usual trigger gives way
+//!   to `limit`, and it's dropped at the next turn;
+//! - the server refuses a request and a compaction answers it
+//!   (`refusal_compacted`), no usage needed (review L2): three in a row, with
+//!   no step the server took between, set `stuck` too;
 //! - a restart or a delete: all of it goes, and the next compaction learns it.
 
 use super::*;
@@ -47,6 +54,10 @@ const SHORT_REPLY_TOKENS: u64 = 2048;
 /// before the conversation is judged not to fit. Past it the turn ends, even
 /// if the request would still go out with a very short reply.
 const MAX_AT_LIMIT: u32 = 3;
+
+/// How many compactions answering a refusal may come in a row, with no step
+/// the server took between them.
+const MAX_REFUSAL_COMPACTIONS: u32 = 3;
 
 /// What a turn does about compacting before a model call.
 #[derive(Debug, PartialEq)]
@@ -74,6 +85,12 @@ pub(super) struct CompactionProgress {
     at_limit: u32,
     /// The conversation doesn't fit: end the turn.
     stuck: bool,
+    /// This turn's guess at the window, in place of `window`.
+    guess: Option<u32>,
+    /// Compactions answering a refusal in a row.
+    refusal_compactions: u32,
+    /// `stuck` because of those, so no size or window is known to name.
+    refused_out: bool,
 }
 
 /// How near the window a request may come once compacting can't help.
@@ -83,9 +100,50 @@ fn limit(context_window: u32) -> u64 {
 
 impl CompactionProgress {
     fn sync(&mut self, context_window: u32) {
+        if self.guess == Some(context_window) {
+            return;
+        }
         if self.window != Some(context_window) {
             *self = Self { window: Some(context_window), ..Self::default() };
+        } else if self.guess.take().is_some() {
+            // The turn that guessed is over, and what it saw was against the guess.
+            self.forget_measures();
         }
+    }
+
+    fn forget_measures(&mut self) {
+        (self.after, self.awaiting, self.tight, self.tight_results, self.at_limit) = (None, false, false, 0, 0);
+    }
+
+    /// A refusal naming no window has the turn believe `guess` instead of
+    /// `believed`, for this turn alone.
+    pub(super) fn guessed(&mut self, believed: u32, guess: u32) {
+        self.sync(believed);
+        self.guess = Some(guess);
+        self.forget_measures();
+    }
+
+    /// A compaction just answered a refusal.
+    pub(super) fn refusal_compacted(&mut self, context_window: u32) {
+        self.compacted(context_window);
+        self.refusal_compactions += 1;
+    }
+
+    /// The server took a request as it was sent.
+    pub(super) fn step_taken(&mut self) {
+        self.refusal_compactions = 0;
+    }
+
+    /// The server refused a request: the reason, if another compaction
+    /// wouldn't be worth asking for.
+    pub(super) fn why_refused_out(&mut self, model: &str, context_window: u32) -> Option<String> {
+        self.sync(context_window);
+        if self.refusal_compactions < MAX_REFUSAL_COMPACTIONS {
+            return None;
+        }
+        self.stuck = true;
+        self.refused_out = true;
+        Some(self.why_stuck(model, context_window))
     }
 
     /// What to do before a model call with a request of about `projected`
@@ -95,7 +153,12 @@ impl CompactionProgress {
         if self.stuck {
             return CompactionStep::Stuck(self.why_stuck(model, context_window));
         }
-        let trigger = if self.tight { limit(context_window) } else { compaction_ceiling(context_window) };
+        // Against a guess, a compaction that can't get under it is no sign
+        // of anything: the server says when a request really doesn't fit.
+        if self.guess.is_some() && self.after.is_some_and(|after| after >= limit(context_window)) {
+            return CompactionStep::Go;
+        }
+        let trigger = if self.tight || self.guess.is_some() { limit(context_window) } else { compaction_ceiling(context_window) };
         if projected.is_some_and(|projected| projected >= trigger) {
             CompactionStep::Compact
         } else {
@@ -124,6 +187,9 @@ impl CompactionProgress {
         }
         self.awaiting = false;
         self.after = Some(input);
+        if self.guess.is_some() {
+            return;
+        }
         if input + MIN_ROOM_TO_WORK <= compaction_ceiling(context_window) {
             self.tight_results = 0;
             self.tight = false;
@@ -144,16 +210,24 @@ impl CompactionProgress {
     /// conversation that still doesn't fit costs them one summary, not three.
     pub(super) fn user_wrote(&mut self) {
         self.stuck = false;
+        self.refused_out = false;
         self.at_limit = self.at_limit.min(MAX_AT_LIMIT - 1);
+        self.refusal_compactions = self.refusal_compactions.min(MAX_REFUSAL_COMPACTIONS - 1);
     }
 
     /// Whether a request past the usual trigger has to keep inside the room
     /// left: the reply budget's floor assumes the trigger kept that room.
     pub(super) fn room_only(&self) -> bool {
-        self.tight
+        self.tight && self.guess.is_none()
     }
 
     fn why_stuck(&self, model: &str, context_window: u32) -> String {
+        if self.refused_out {
+            return format!(
+                "`{model}`'s server kept refusing this conversation as too big for its context window, however much \
+                 smelt compacted it. Give the model a larger context on its server, or pick another model."
+            );
+        }
         let size = self.after.map_or_else(String::new, |after| format!(" about {} tokens,", super::overflow::grouped(after)));
         format!(
             "`{model}`'s context window ({} tokens) is too small for this conversation: even compacted, a request takes{size} \
@@ -280,6 +354,62 @@ mod tests {
         progress.compacted(500_000);
         progress.measured(&input(LIMIT), 90_000);
         assert_eq!(progress.after, None);
+    }
+
+    #[test]
+    fn test_nothing_is_learned_or_failed_against_a_guess() {
+        let mut progress = CompactionProgress::default();
+        progress.guessed(WINDOW, 40_000);
+        for _ in 0..4 {
+            progress.compacted(40_000);
+            progress.measured(&input(39_000), 40_000);
+        }
+        assert_eq!(progress.step("m", 40_000, Some(39_000)), CompactionStep::Go, "the server says when it doesn't fit");
+        assert!(!progress.room_only(), "and how much reply fits isn't known");
+        // The next turn believes the real window again, and nothing carries.
+        assert_eq!(step(&mut progress, TRIGGER - 1), CompactionStep::Go);
+        assert_eq!(progress.after, None);
+        assert_eq!(step(&mut progress, TRIGGER), CompactionStep::Compact);
+    }
+
+    #[test]
+    fn test_a_guess_compacts_at_its_limit_not_its_trigger() {
+        let mut progress = CompactionProgress::default();
+        progress.guessed(WINDOW, 40_000);
+        assert_eq!(progress.step("m", 40_000, Some(33_855)), CompactionStep::Go);
+        assert_eq!(progress.step("m", 40_000, Some(33_856)), CompactionStep::Compact);
+        progress.compacted(40_000);
+        progress.measured(&input(10_000), 40_000);
+        assert_eq!(progress.step("m", 40_000, Some(33_855)), CompactionStep::Go);
+    }
+
+    #[test]
+    fn test_a_real_window_replacing_a_guess_starts_afresh() {
+        let mut progress = CompactionProgress::default();
+        progress.guessed(WINDOW, 40_000);
+        assert_eq!(progress.step("m", 60_000, Some(43_616)), CompactionStep::Compact);
+        assert_eq!(progress.guess, None);
+    }
+
+    #[test]
+    fn test_the_fourth_refusal_in_a_row_ends_it_and_a_step_starts_the_count_again() {
+        let mut progress = CompactionProgress::default();
+        for _ in 0..3 {
+            assert_eq!(progress.why_refused_out("m", WINDOW), None);
+            progress.refusal_compacted(WINDOW);
+        }
+        progress.step_taken();
+        assert_eq!(progress.why_refused_out("m", WINDOW), None);
+        for _ in 0..3 {
+            progress.refusal_compacted(WINDOW);
+        }
+        let why = progress.why_refused_out("m", WINDOW).expect("three in a row");
+        assert!(why.contains("kept refusing") && !why.contains("100,000"), "{why}");
+        assert!(matches!(step(&mut progress, 0), CompactionStep::Stuck(_)), "a wake doesn't start it over");
+        progress.user_wrote();
+        assert_eq!(step(&mut progress, 0), CompactionStep::Go);
+        progress.refusal_compacted(WINDOW);
+        assert!(progress.why_refused_out("m", WINDOW).is_some(), "a user's retry gets one more");
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! on as often as the turn needs it.
 
 use super::ask_user::tool_calls_body;
-use super::overflow::{Answer, compaction_summaries, start_refusal_mock, too_long};
+use super::overflow::{Answer, compaction_summaries, ollama_refused, start_refusal_mock, too_long};
 use super::window_stop::set_context_window;
 use super::*;
 
@@ -312,4 +312,76 @@ async fn test_a_compaction_answering_a_refusal_counts_too(pool: PgPool) {
     run_turn(&pool, conversation.id, hello()).await.expect("the request still fits");
 
     assert_eq!(summaries(&pool, conversation.id).await, 2);
+}
+
+/// M2: a refusal naming no window has the turn assume one, and a healthy turn
+/// is never failed against that guess, nor shown it.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_guessed_window_never_fails_a_turn(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let summary = || -> Answer { Ok(text_reply_body("The summary.")) };
+    // The refused request is about 16,500 tokens plus the prompt, so the
+    // guess is under 22,000 and its limit under 16,000.
+    let mut answers = vec![ollama_refused(), summary()];
+    answers.extend(std::iter::repeat_with(|| Ok(step(16_000, 100))).take(6));
+    answers.push(Ok(text_reply_body("Done.")));
+    let mock = start_refusal_mock(&pool, answers).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    db::create_message(&pool, conversation.id, "user", &[text_block(&"x".repeat(66_000))]).await.expect("a paste");
+    db::create_message(&pool, conversation.id, "assistant", &[text_block("Read it.")]).await.expect("a reply");
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("nothing was refused after the first");
+
+    assert_eq!(last_reply(&saved).as_deref(), Some("Done."));
+    assert_eq!(summaries(&pool, conversation.id).await, 1, "and it asked for no more summaries against a guess");
+    assert_eq!(mock.count(), 9);
+}
+
+/// L2: a server reporting no usage that refuses every step, naming nothing:
+/// no measure can stop this, so the refusals themselves do.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_refusals_at_every_step_end_the_turn_without_naming_a_guess(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let tool = || tool_calls_body(&[("toolu_01", "todoread", serde_json::json!({}))]);
+    let mut answers = Vec::new();
+    for _ in 0..8 {
+        answers.extend([ollama_refused(), Ok(text_reply_body("The summary.")), Ok(tool())]);
+    }
+    answers.push(Ok(text_reply_body("Done.")));
+    let mock = start_refusal_mock(&pool, answers).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+
+    let error = run_turn(&pool, conversation.id, hello()).await.expect_err("it keeps being refused");
+
+    let error = error.to_string();
+    assert_eq!(summaries(&pool, conversation.id).await, 3, "{error}");
+    assert!(error.contains("kept refusing"), "{error}");
+    assert!(!error.contains(" tokens)"), "a guess is never named: {error}");
+
+    // And a wake doesn't start it over.
+    let calls = mock.count();
+    unnotified_finished_command(&pool, conversation.id, "sme-386-l2").await;
+    wake_conversation(&pool, conversation.id).await.expect_err("still");
+    assert_eq!(mock.count(), calls);
+}
+
+/// A refusal now and then, many steps apart, is the window doing its job.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_step_the_server_took_starts_the_refusal_count_again(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let tool = || tool_calls_body(&[("toolu_01", "todoread", serde_json::json!({}))]);
+    let mut answers = Vec::new();
+    for _ in 0..5 {
+        answers.extend([ollama_refused(), Ok(text_reply_body("The summary.")), Ok(tool()), Ok(tool())]);
+    }
+    answers.push(Ok(text_reply_body("Done.")));
+    start_refusal_mock(&pool, answers).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the server takes a step between");
+
+    assert_eq!(summaries(&pool, conversation.id).await, 5);
 }
