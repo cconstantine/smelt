@@ -369,14 +369,16 @@ async fn test_message_agent_racing_stop_agent(pool: PgPool) {
             let pool = pool.clone();
             tokio::spawn(async move { message(&pool, root, serde_json::json!(child), "Race.").await })
         };
-        let first = if stop_first { stop() } else { send() };
-        until_waiters(&pool, 1).await;
-        let other = if stop_first { send() } else { stop() };
-        until_waiters(&pool, 2).await;
+        // SME-398 red-first: force the MESSAGE ahead of the stop, as named
+        // lock waiters — the order the stop-first iteration does not assert.
+        let first = send();
+        until_lock_waiter_running(&pool, "SELECT state FROM agents").await;
+        let other = stop();
+        until_lock_waiter_running(&pool, "UPDATE agents SET state").await;
         holding.rollback().await.expect("release the row");
         let first = tokio::time::timeout(Duration::from_secs(10), first).await.expect("no deadlock").expect("task");
         let other = tokio::time::timeout(Duration::from_secs(10), other).await.expect("no deadlock").expect("task");
-        let (stopped, sent) = if stop_first { (first, other) } else { (other, first) };
+        let (stopped, sent) = (other, first);
         assert_eq!(stopped, Ok(format!("Stopped agent #{child}.")));
         assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_STOPPED));
         if stop_first {
