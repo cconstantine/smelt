@@ -1,0 +1,30 @@
+# Images the test cluster's node must hold before the suite starts (SME-391).
+# scripts/k3s-bootstrap.sh pulls each of these through the kubelet at cluster
+# bootstrap, into the containerd store the pods read, so no test pays a live
+# Docker Hub pull mid-suite: the LSP catalog tests start server pods from the
+# catalog's own images, and one flaked pull (`tls: bad record MAC`) cost a
+# full gate on a fresh cluster. With the image already on the node, the
+# server pods' `imagePullPolicy: IfNotPresent` (src/lsp/pods.rs) means no
+# test touches Docker Hub for its image at all.
+#
+# Keep in step with the images the cluster tests name
+# (src/lsp/manager/cluster.rs, src/browser_tests/) and what
+# src/lsp/catalog.rs's `image_for` can suggest. `scripts/cluster-doctor`
+# checks this same list before the tests run. The sandbox image and the
+# Docker sidecar's are delivered by scripts/build-sandbox-image.sh, not here.
+#
+# python:3-slim and buildpack-deps:trixie-curl, the two images
+# `image_for` can name that no test pod starts from, are deliberately not
+# listed: no gate pays their bytes unless a test starts using one, at which
+# time it joins this list (SME-391's inventory).
+docker.io/library/rust:1
+docker.io/library/node:22-slim
+docker.io/library/golang:1
+docker.io/library/debian:trixie-slim
+# The local-path provisioner's helper pod — one starts per volume the
+# provisioner binds, and on a fresh node it pulled busybox live from Docker
+# Hub mid-suite, pod claims and all (SME-391: the block that proved the
+# rust:1 flake caught this one stalling a stand-in sandbox's PVC too). The
+# version is the one the compose k3s image's local-path chart names; a k3s
+# bump moves it, and cluster-doctor's check is what catches that.
+docker.io/rancher/mirrored-library-busybox:1.37.0

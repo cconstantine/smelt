@@ -45,7 +45,10 @@ cargo clippy --features server $lints unlocked
 cargo clippy --no-default-features --features web --target wasm32-unknown-unknown $lints unlocked
 cargo test --features server --no-run unlocked
 import unlocked
+import unlocked
 cargo test --features server locked"
+# Two `import`s since SME-391: the doctor checks the sandbox image and then
+# the pre-pull list, both through the same read-only tool.
 [ "$(cat "$CALLS")" = "$expected" ] || fail "check.sh's calls: $(cat "$CALLS")"
 # A test build that fails stops check.sh before the lock.
 : >"$CALLS"
@@ -94,6 +97,7 @@ if ! out=$(timeout 60 "${gate_env[@]}" scripts/browser-tier 2>&1); then
 fi
 tier_db=postgres://u@localhost/smelt_browser_tier_$(basename "$PWD" | tr -c 'a-zA-Z0-9\n' '_')
 expected="import unlocked
+import unlocked
 dx build --platform web unlocked
 cargo test --features server browser-test --no-run unlocked
 sqlx database drop -y --database-url $tier_db unlocked

@@ -16,13 +16,20 @@ fail() { echo "FAIL: $*"; failures=$((failures + 1)); }
 stub="$tmp/import-stub"
 cat >"$stub" <<'EOF'
 #!/usr/bin/env bash
-echo "$*" >"$STUB_ARGS"
-[ "${STUB_FAIL:-}" = 1 ] && { echo "missing $2" >&2; exit 1; }
+echo "$*" >>"$STUB_ARGS"
+count=$(wc -l <"$STUB_ARGS")
+[ "${STUB_FAIL:-}" = "$count" ] && { printf '%s\n' "${STUB_MSG:-missing $2}" >&2; exit 1; }
 exit 0
 EOF
 chmod +x "$stub"
 export STUB_ARGS="$tmp/args"
 dind=docker.io/library/docker:29-dind
+# The pre-pull list the doctor must pass on verbatim. Read from the list
+# file itself, so a k3s bump moving the helper busybox (say) updates this
+# test's expectation with it — what must not silently regress is the doctor
+# asking the node for every line the file names, checked next.
+mapfile -t prepull < <(grep -Ev '^[[:space:]]*(#|$)' scripts/cluster-prepull-images.txt)
+[ "${#prepull[@]}" -ge 5 ] || fail "the pre-pull list is unexpectedly short (${#prepull[@]} images)"
 
 # The reference names the working tree's agent sources.
 ref=$(scripts/sandbox-image-ref)
@@ -54,21 +61,45 @@ for f in $(cd "$copy" && find src/bin/sandbox_agent -name '*.rs' -type f | LC_AL
     cp "$tmp/agent-file" "$copy/$f"
 done
 
-# With no SANDBOX_IMAGE, the doctor checks that reference and the sidecar's.
+# With no SANDBOX_IMAGE, the doctor checks that reference and the sidecar's,
+# then the pre-pull list (SME-391).
 rm -f "$STUB_ARGS"
 if ! out=$(env -u SANDBOX_IMAGE SANDBOX_IMAGE_IMPORT="$stub" scripts/cluster-doctor 2>&1); then
     fail "the doctor failed with the image present: $out"
 fi
-[ "$(cat "$STUB_ARGS" 2>/dev/null)" = "--check $ref $dind" ] || fail "checked '$(cat "$STUB_ARGS" 2>/dev/null)', wanted '--check $ref $dind'"
+[ "$(head -1 "$STUB_ARGS" 2>/dev/null)" = "--check $ref $dind" ] || fail "checked '$(head -1 "$STUB_ARGS" 2>/dev/null)', wanted '--check $ref $dind'"
+[ "$(tail -n +2 "$STUB_ARGS" 2>/dev/null)" = "--check ${prepull[*]}" ] \
+    || fail "didn't also check the pre-pull list: '$(tail -n +2 "$STUB_ARGS" 2>/dev/null)'"
+
+# SMELT_SKIP_PREPULL=1 opted out of the pre-pull — no nagging check either.
+rm -f "$STUB_ARGS"
+if ! out=$(env -u SANDBOX_IMAGE SMELT_SKIP_PREPULL=1 SANDBOX_IMAGE_IMPORT="$stub" scripts/cluster-doctor 2>&1); then
+    fail "the doctor failed with SMELT_SKIP_PREPULL=1: $out"
+fi
+[ "$(wc -l <"$STUB_ARGS")" = 1 ] || fail "with SMELT_SKIP_PREPULL=1 it still checked: $(cat "$STUB_ARGS")"
+
+# A missing pre-pull image warns — naming the images and the bootstrap to
+# re-run — without failing the gate: the suite still runs, just live-pulls.
+# And the tool's own remedy (build-sandbox-image.sh, right for the sandbox
+# image) must not reach the warning: these images come from the bootstrap.
+rm -f "$STUB_ARGS"
+stub_msg="sandbox_image_import: the cluster's node is missing docker.io/library/rust:1 (the kubelet deletes unused images when its disk is over 85% full); free up space if need be, then run scripts/build-sandbox-image.sh"
+if ! out=$(env -u SANDBOX_IMAGE STUB_FAIL=2 STUB_MSG="$stub_msg" SANDBOX_IMAGE_IMPORT="$stub" scripts/cluster-doctor 2>&1); then
+    fail "the doctor failed the gate over a missing pre-pull image: $out"
+fi
+grep -q "rust:1" <<<"$out" || fail "the pre-pull warning doesn't name the images: $out"
+grep -q "k3s-bootstrap" <<<"$out" || fail "the pre-pull warning doesn't name the bootstrap to re-run: $out"
+grep -q "build-sandbox-image" <<<"$out" && fail "the pre-pull warning repeats the sandbox-image remedy: $out"
 
 # SANDBOX_IMAGE picks the image to check.
 rm -f "$STUB_ARGS"
 SANDBOX_IMAGE=docker.io/library/smelt-sandbox:mine SANDBOX_IMAGE_IMPORT="$stub" scripts/cluster-doctor >/dev/null 2>&1 \
     || fail "the doctor failed with SANDBOX_IMAGE present"
-[ "$(cat "$STUB_ARGS" 2>/dev/null)" = "--check docker.io/library/smelt-sandbox:mine $dind" ] \
-    || fail "with SANDBOX_IMAGE set, checked '$(cat "$STUB_ARGS" 2>/dev/null)'"
+[ "$(head -1 "$STUB_ARGS" 2>/dev/null)" = "--check docker.io/library/smelt-sandbox:mine $dind" ] \
+    || fail "with SANDBOX_IMAGE set, checked '$(head -1 "$STUB_ARGS" 2>/dev/null)'"
 
 # Missing: fails, naming the reference and how to build it.
+rm -f "$STUB_ARGS"
 if out=$(env -u SANDBOX_IMAGE STUB_FAIL=1 SANDBOX_IMAGE_IMPORT="$stub" scripts/cluster-doctor 2>&1); then
     fail "the doctor passed with the image missing"
 fi
