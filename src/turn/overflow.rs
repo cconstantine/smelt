@@ -93,6 +93,10 @@ pub(super) async fn recover(
     // says; and to the floor (review L-2), which compacts a retry that didn't,
     // counting it as answering this refusal (final review L-3).
     let reason = refused_reason(named);
+    // The estimate fell short of what the server counted by this much: the
+    // retry's is taken to, or its budget would be refused again on every
+    // send (SME-386 final review, the property test).
+    let undercount = overflow.input_tokens.map_or(0, |input| input.saturating_sub(estimate_request_tokens(refused)));
     let (mut request, budget) = build_request_with_room(
         pool,
         conversation_id,
@@ -103,6 +107,7 @@ pub(super) async fn recover(
         &mut compacted,
         hold_to_room,
         Some(&reason),
+        undercount,
     )
     .await?;
     match call_model(pool, conversation_id, turn_model, &mut request, slot).await {

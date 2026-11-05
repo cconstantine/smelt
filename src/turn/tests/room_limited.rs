@@ -243,7 +243,7 @@ async fn test_a_reply_cut_off_at_its_output_cap_ends_the_turn(pool: PgPool) {
 /// request leaves `room` tokens for a reply.
 async fn window_leaving(pool: &PgPool, id: i64, room: u64) -> i32 {
     let model = crate::providers::resolve_turn_model(pool, id).await.expect("a model");
-    let (request, _) = build_request(pool, id, &model, None, &[], false).await.expect("a request");
+    let (request, _) = build_request(pool, id, &model, None, &[], false, 0).await.expect("a request");
     (estimate_request_tokens(&request) + u64::from(COMPACTION_SAFETY_BUFFER) + room) as i32
 }
 

@@ -295,6 +295,7 @@ fn run_turn_steps<'a: 'b, 'b>(
                 &mut compacted,
                 false,
                 None,
+                0,
             )
             .await?;
             // What a compaction would have to free, for a cut-off reply below.

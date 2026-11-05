@@ -13,6 +13,7 @@ pub(super) async fn build_request(
     last_known_usage: Option<&anthropic::TokenUsage>,
     pending_new_content: &[anthropic::ContentBlock],
     room_only: bool,
+    undercount: u64,
 ) -> ServerFnResult<(anthropic::CreateMessageRequest, ReplyBudget)> {
     let history = history_for_request(
         db::list_messages(pool, conversation_id)
@@ -42,8 +43,9 @@ pub(super) async fn build_request(
     // As long as the conversation has room for, computed per
     // request: each tool round's from its own usage (SME-111).
     // Thinking shares it with the reply.
+    // `undercount` corrects the estimate, not a count a reply measured.
     let projected = projected_input(last_known_usage, estimate_tokens(pending_new_content))
-        .unwrap_or_else(|| estimate_request_tokens(&request));
+        .unwrap_or_else(|| estimate_request_tokens(&request) + undercount);
     let budget = budget_for(turn_model.context_window, projected, turn_model.output_cap, room_only);
     apply_budget(&mut request, turn_model, budget);
     Ok((request, budget))
@@ -62,7 +64,9 @@ fn apply_budget(request: &mut anthropic::CreateMessageRequest, turn_model: &crat
 /// `build_request`, held to the floor (`room::before_sending`) when
 /// compacting can't help, or `hold_to_room` says so, and the request gets
 /// only the room left. `refused` is the refusal a retry answers, which a
-/// compaction here names and counts.
+/// compaction here names and counts; `undercount` is how far short of the
+/// server's count the estimate of the refused request fell, added to this
+/// one's.
 #[cfg(feature = "server")]
 pub(super) async fn build_request_with_room(
     pool: &PgPool,
@@ -74,11 +78,12 @@ pub(super) async fn build_request_with_room(
     compacted: &mut bool,
     hold_to_room: bool,
     refused: Option<&str>,
+    undercount: u64,
 ) -> ServerFnResult<(anthropic::CreateMessageRequest, ReplyBudget)> {
     loop {
         let room_only = with_compaction_progress(conversation_id, |p| p.room_only_at(turn_model.context_window)) || hold_to_room;
-        let (mut request, budget) = build_request(pool, conversation_id, turn_model, last_known_usage.as_ref(), pending_new_content, room_only).await?;
-        let size = estimate_request_tokens(&request);
+        let (mut request, budget) = build_request(pool, conversation_id, turn_model, last_known_usage.as_ref(), pending_new_content, room_only, undercount).await?;
+        let size = estimate_request_tokens(&request) + undercount;
         let (window, cap) = (turn_model.context_window, turn_model.output_cap);
         let decided = with_compaction_progress(conversation_id, |p| before_sending(p, &turn_model.model, window, cap, room_only, budget, size, *compacted));
         match decided {

@@ -95,7 +95,7 @@ async fn counting_mock(pool: &PgPool, window: Option<u32>, plans: Vec<(i64, i64)
 /// request leaves `room` tokens for a reply.
 async fn window_leaving(pool: &PgPool, id: i64, room: u64) -> u32 {
     let model = crate::providers::resolve_turn_model(pool, id).await.expect("a model");
-    let (request, _) = build_request(pool, id, &model, None, &[], false).await.expect("a request");
+    let (request, _) = build_request(pool, id, &model, None, &[], false, 0).await.expect("a request");
     u32::try_from(estimate_request_tokens(&request) + u64::from(COMPACTION_SAFETY_BUFFER) + room).expect("a window")
 }
 
@@ -170,4 +170,22 @@ async fn test_a_budget_only_retry_is_sized_from_the_servers_count(pool: PgPool) 
     assert_eq!(last_reply(&saved).as_deref(), Some("Done."));
     assert_eq!(mock.calls(), 3);
     assert_eq!(mock.summaries.load(Ordering::SeqCst), 0, "the budget was the whole problem");
+}
+
+/// Found by the property test: the server counted far more than the
+/// estimate, and the compacted retry's budget, from the estimate alone, was
+/// refused again on every send. The shortfall is added to the retry's.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_compacted_retry_allows_for_what_the_estimate_missed(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    // The estimate is about 10,900; the server counts 20,000.
+    let mock = counting_mock(&pool, Some(32_768), vec![(20_000, 10)]).await;
+    set_context_window(&pool, 32_768, None).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("the retry fits");
+
+    assert_eq!(last_reply(&saved).as_deref(), Some("Done."));
+    assert_eq!(mock.calls(), 2);
 }
