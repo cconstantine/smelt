@@ -46,30 +46,11 @@ pub(super) fn estimate_tokens(blocks: &[anthropic::ContentBlock]) -> u64 {
     (chars / 4) as u64
 }
 
-/// Whether the upcoming request's real size looks likely to eat into the
-/// reserved ceiling (model output allowance + a safety buffer, subtracted
-/// from the context window) — opencode's own trigger mechanism, checked
-/// *before* a request is sent rather than reacting to a real rejection.
-/// `last_usage` is the last real response's usage (the ground truth for
-/// everything already in the conversation — see `stream::StreamedTurn`'s
-/// own doc comment); `new_content_estimate` is `estimate_tokens` applied
-/// to whatever's freshly being added this turn. `None` `last_usage`
-/// (nothing sent yet) never triggers — there's nothing to compact. See
-/// SME-18.
-#[cfg(feature = "server")]
-pub(super) fn should_compact(
-    last_usage: Option<&anthropic::TokenUsage>,
-    new_content_estimate: u64,
-    context_window: u32,
-) -> bool {
-    let Some(projected) = projected_input(last_usage, new_content_estimate) else {
-        return false;
-    };
-    projected >= compaction_ceiling(context_window)
-}
-
 /// The size of request that triggers a compaction: the context window less
-/// what's kept for the reply.
+/// what's kept for the reply (model output allowance + a safety buffer) —
+/// opencode's own trigger mechanism, checked *before* a request is sent
+/// rather than reacting to a real rejection. See SME-18. Once compacting
+/// can't help, `CompactionProgress` moves it nearer the window.
 #[cfg(feature = "server")]
 pub(super) fn compaction_ceiling(context_window: u32) -> u64 {
     let reserved = MIN_REPLY_TOKENS.max(COMPACTION_SAFETY_BUFFER) as u64;
@@ -100,6 +81,23 @@ pub(super) fn estimate_request_tokens(request: &anthropic::CreateMessageRequest)
     let system = request.system.as_ref().map_or(0, |s| s.len() / 4) as u64;
     let tools = serde_json::to_string(&request.tools).map_or(0, |t| t.len() / 4) as u64;
     messages + system + tools
+}
+
+/// `budget` held to the room a request of `projected_input` tokens really
+/// leaves, for one past the trigger because compacting can't help: the
+/// floor in `reply_budget` counts on the trigger having kept that room, and
+/// a reply it doesn't have is a refusal (SME-386 M3).
+#[cfg(feature = "server")]
+pub(super) fn budget_within_room(budget: ReplyBudget, context_window: u32, projected_input: u64) -> ReplyBudget {
+    let room = (context_window as u64)
+        .saturating_sub(projected_input)
+        .saturating_sub(COMPACTION_SAFETY_BUFFER as u64);
+    let room = u32::try_from(room).unwrap_or(u32::MAX).max(1);
+    if room < budget.tokens {
+        ReplyBudget { tokens: room, limit: crate::api::chat::ReplyLimit::RoomLeft }
+    } else {
+        budget
+    }
 }
 
 /// How many tokens a reply may use (SME-111): the smallest of the model's

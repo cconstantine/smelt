@@ -280,6 +280,7 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
         // again (SME-236 review 2). A parent's stop isn't undone.
         if users_turn {
             crate::agents::resume_finished(pool, conversation_id).await;
+            with_compaction_progress(conversation_id, CompactionProgress::user_wrote);
         }
         // Checked after the generation is taken, both under the lock: a
         // delete landing before the check is seen here, and one landing

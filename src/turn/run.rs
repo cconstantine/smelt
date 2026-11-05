@@ -127,7 +127,7 @@ fn run_turn_steps<'a: 'b, 'b>(
         let mut steps = TurnSteps { span: tracing::Span::current(), count: 0 };
         // Tracks what's been persisted since the last *real* Anthropic
         // response — the compaction trigger's cheap size estimate (see
-        // `should_compact`) is computed over exactly this, added to that
+        // `CompactionProgress::step`) is computed over exactly this, added to that
         // last response's own real `usage`. Reset to empty every time a
         // real response lands (below); grows with the new user message,
         // any drained notifications, and (on a later loop iteration) the
@@ -156,7 +156,6 @@ fn run_turn_steps<'a: 'b, 'b>(
         }
 
         let mut streak = TextCallStreak::default();
-        let mut progress = CompactionProgress::default();
         for _ in 0..max_turns {
             // Checked at the top of every loop iteration, not just once per
             // `run_turn_bounded` call — this is what gives same-turn visibility: if
@@ -238,32 +237,30 @@ fn run_turn_steps<'a: 'b, 'b>(
             // Proactive, not reactive: checked *before* building the
             // request that would be too big, using the last real
             // response's own usage plus a cheap estimate of what's new
-            // since then — see `should_compact`/`estimate_tokens`. A
+            // since then — see `CompactionProgress::step`/`estimate_tokens`. A
             // failure here fails the whole turn loudly rather than risking
             // the oversized request compaction exists to prevent — see
             // SME-18's "Resolved" decisions.
-            if should_compact(
-                last_known_usage.as_ref(),
-                estimate_tokens(&pending_new_content),
-                turn_model.context_window,
-            ) {
-                // Compacting again would only repeat what the last one
+            let projected = projected_input(last_known_usage.as_ref(), estimate_tokens(&pending_new_content));
+            match with_compaction_progress(conversation_id, |p| p.step(&turn_model.model, turn_model.context_window, projected)) {
+                CompactionStep::Go => {}
+                // Compacting again would only repeat what the last ones
                 // showed: the turn ends, saying why (SME-386 F10).
-                if let Some(why) = progress.why_stuck(&turn_model.model, turn_model.context_window) {
-                    return Err(ServerFnError::new(why));
+                CompactionStep::Stuck(why) => return Err(ServerFnError::new(why)),
+                CompactionStep::Compact => {
+                    // A proactive compaction: no refusal to name on the
+                    // divider (SME-73).
+                    compact_conversation(pool, conversation_id, turn_model, slot.held(), None).await?;
+                    with_compaction_progress(conversation_id, |p| p.compacted(turn_model.context_window));
+                    // The last usage measured the history just summarized: the
+                    // reply budget below estimates the new one instead.
+                    last_known_usage = None;
                 }
-                // A proactive compaction: no refusal to name on the
-                // divider (SME-73).
-                compact_conversation(pool, conversation_id, turn_model, slot.held(), None).await?;
-                let before = projected_input(last_known_usage.as_ref(), estimate_tokens(&pending_new_content));
-                progress.compacted(before.unwrap_or_default());
-                // The last usage measured the history just summarized: the
-                // reply budget below estimates the new one instead.
-                last_known_usage = None;
             }
 
+            let room_only = with_compaction_progress(conversation_id, |p| p.room_only());
             let (mut request, budget) =
-                build_request(pool, conversation_id, turn_model, last_known_usage.as_ref(), &pending_new_content)
+                build_request(pool, conversation_id, turn_model, last_known_usage.as_ref(), &pending_new_content, room_only)
                     .await?;
             let offered: Vec<String> = request.tools.iter().map(|tool| tool.name.clone()).collect();
             // A refusal meaning "this didn't fit" answers itself once:
@@ -294,8 +291,8 @@ fn run_turn_steps<'a: 'b, 'b>(
                         &overflow,
                     )
                     .await?;
-                    if let Some(before) = recovered.compacted_from {
-                        progress.compacted(before);
+                    if recovered.compacted {
+                        with_compaction_progress(conversation_id, |p| p.compacted(turn_model.context_window));
                     }
                     (recovered.turn, recovered.recorder, recovered.budget)
                 }
@@ -318,7 +315,7 @@ fn run_turn_steps<'a: 'b, 'b>(
             // everything up through this response is now accounted for, so
             // `pending_new_content` resets — only what's persisted after
             // this point is "new" again (SME-18).
-            progress.measured(&turn.usage);
+            with_compaction_progress(conversation_id, |p| p.measured(&turn.usage, turn_model.context_window));
             last_known_usage = Some(turn.usage);
             pending_new_content.clear();
             save_stop_notice(pool, conversation_id, turn_model, &turn, &budget, &mut persisted).await?;

@@ -92,6 +92,11 @@ pub(super) struct ConversationRuntime {
     /// `published_notice`, which would hold the entry for good (SME-377
     /// review round 1, L3). Not part of `is_idle`, so the entry still goes.
     forgotten: bool,
+    /// What compacting has got this conversation (`CompactionProgress`,
+    /// SME-386). Kept with the generation, so it outlasts its turn, until
+    /// the conversation is deleted; lost in a restart, which costs a summary
+    /// or two to learn again.
+    compaction: CompactionProgress,
 }
 
 impl ConversationRuntime {
@@ -188,8 +193,14 @@ pub(crate) fn forget_conversation_lock(conversation_id: i64) {
         runtime.published_notice = None;
         runtime.published = None;
         runtime.forgotten = true;
+        runtime.compaction = CompactionProgress::default();
         runtime.kept = KeptTurnError::default();
     });
+}
+
+/// Runs `f` on `conversation_id`'s `CompactionProgress`.
+pub(super) fn with_compaction_progress<R>(conversation_id: i64, f: impl FnOnce(&mut CompactionProgress) -> R) -> R {
+    with_runtime(conversation_id, |runtime| f(&mut runtime.compaction))
 }
 
 /// `conversation_id`'s reply so far, if a model call is streaming one.

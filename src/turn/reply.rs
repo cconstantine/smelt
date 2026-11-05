@@ -12,6 +12,7 @@ pub(super) async fn build_request(
     turn_model: &crate::providers::TurnModel,
     last_known_usage: Option<&anthropic::TokenUsage>,
     pending_new_content: &[anthropic::ContentBlock],
+    room_only: bool,
 ) -> ServerFnResult<(anthropic::CreateMessageRequest, ReplyBudget)> {
     let history = history_for_request(
         db::list_messages(pool, conversation_id)
@@ -44,6 +45,7 @@ pub(super) async fn build_request(
     let projected = projected_input(last_known_usage, estimate_tokens(pending_new_content))
         .unwrap_or_else(|| estimate_request_tokens(&request));
     let budget = reply_budget(turn_model.context_window, projected, turn_model.output_cap);
+    let budget = if room_only { budget_within_room(budget, turn_model.context_window, projected) } else { budget };
     request.max_tokens = budget.tokens;
     request.thinking = turn_model.thinking_config(request.max_tokens);
     // A budget with no room to think in turned thinking off: the
