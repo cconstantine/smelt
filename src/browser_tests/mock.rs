@@ -24,16 +24,17 @@ struct Lane {
     open: Arc<AtomicUsize>,
     reply_words: Arc<AtomicUsize>,
     hurried: Arc<AtomicBool>,
-    /// A refusal `refuse_next` armed: how many requests are still owed a
-    /// 400, and the body to answer them with. Cleared when the count runs
-    /// out and when the arming guard drops (SME-73's recovery scenario).
-    refusals: Arc<std::sync::Mutex<Option<(usize, String)>>>,
-    /// A tool call `tool_call_next` armed: the tool's name, the tool_use
-    /// id and the call's input JSON, answered by the lane's next request
-    /// and then gone (SME-71's notifications scenario — the question has
+    /// A refusal `refuse_next` armed: the text its request's last message
+    /// holds, how many such requests are still owed a 400, and the body to
+    /// answer them with. Cleared when the count runs out and when the arming
+    /// guard drops (SME-73's recovery scenario).
+    refusals: Arc<std::sync::Mutex<Option<(String, usize, String)>>>,
+    /// A tool call `tool_call_next` armed: the text its request's last
+    /// message holds, the tool's name, the tool_use id and the call's input
+    /// JSON, answered by the first such request and then gone (SME-71's notifications scenario — the question has
     /// to come from a real turn ending on a real card, not from a seeded
     /// row; SME-377's `notify_user` from a real call).
-    tool_call: Arc<std::sync::Mutex<Option<(String, String, String)>>>,
+    tool_call: Arc<std::sync::Mutex<Option<(String, String, String, String)>>>,
 }
 
 impl Lane {
@@ -83,7 +84,7 @@ impl Drop for Hurried {
 /// A refusal armed on a lane by `MockUpstream::refuse_next`. Dropping it
 /// re-arms nothing: a scenario that failed partway leaves the lane's next
 /// scenario answering normally.
-pub(super) struct RefusalsArmed(Arc<std::sync::Mutex<Option<(usize, String)>>>);
+pub(super) struct RefusalsArmed(Arc<std::sync::Mutex<Option<(String, usize, String)>>>);
 
 impl Drop for RefusalsArmed {
     fn drop(&mut self) {
@@ -93,7 +94,7 @@ impl Drop for RefusalsArmed {
 
 /// A tool call armed on a lane by `MockUpstream::tool_call_next`.
 /// Dropping it clears an armed call a failed scenario never sent.
-pub(super) struct ToolCallArmed(Arc<std::sync::Mutex<Option<(String, String, String)>>>);
+pub(super) struct ToolCallArmed(Arc<std::sync::Mutex<Option<(String, String, String, String)>>>);
 
 impl Drop for ToolCallArmed {
     fn drop(&mut self) {
@@ -111,25 +112,38 @@ pub(super) fn exceed_context_size(input: u32, window: u32) -> String {
     )
 }
 
-/// Take one armed refusal if the lane owes one: the 400 to answer with.
-fn take_refusal(lane: &Lane) -> Option<axum::response::Response> {
+/// Take one armed refusal if this request is one it was armed for: the 400
+/// to answer with.
+fn take_refusal(lane: &Lane, last_message: &str) -> Option<axum::response::Response> {
     let mut armed = lane.refusals.lock().expect("the refusal lock");
-    let (remaining, _) = armed.as_mut()?;
+    let (for_message, remaining, _) = armed.as_mut()?;
+    if !last_message.contains(for_message.as_str()) {
+        return None;
+    }
     if *remaining == 0 {
         *armed = None;
         return None;
     }
     *remaining -= 1;
     let body = if *remaining == 0 {
-        armed.take().expect("the armed refusal").1
+        armed.take().expect("the armed refusal").2
     } else {
-        armed.as_ref().expect("the armed refusal").1.clone()
+        armed.as_ref().expect("the armed refusal").2.clone()
     };
     Some(axum::response::IntoResponse::into_response((
         axum::http::StatusCode::BAD_REQUEST,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,
     )))
+}
+
+/// Take the armed tool call if this request is the one it was armed for.
+fn take_tool_call(lane: &Lane, last_message: &str) -> Option<(String, String, String)> {
+    let mut armed = lane.tool_call.lock().expect("the tool call lock");
+    if !armed.as_ref().is_some_and(|(for_message, ..)| last_message.contains(for_message.as_str())) {
+        return None;
+    }
+    armed.take().map(|(_, name, id, input)| (name, id, input))
 }
 
 /// Counts one open reply for as long as its body stream lives: the body is
@@ -228,18 +242,22 @@ impl MockUpstream {
         let router = axum::Router::new().route(
             "/v1/messages",
             axum::routing::post(move |body: axum::body::Bytes| {
-                let model = serde_json::from_slice::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string));
+                let request = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default();
+                let model = request.get("model").and_then(|m| m.as_str()).map(str::to_string);
+                let last_message = request
+                    .get("messages")
+                    .and_then(|m| m.as_array())
+                    .and_then(|m| m.last())
+                    .map(|m| m.to_string())
+                    .unwrap_or_default();
                 let lane = model.and_then(|m| by_model.get(&m).cloned()).unwrap_or_else(|| first.clone());
                 async move {
-                    let armed = lane.tool_call.lock().expect("the tool call lock").take();
-                    match take_refusal(&lane) {
-                        Some(refused) => refused,
-                        None => match armed {
-                            Some((name, id, input)) => stream_chunks(lane, tool_call_chunks(&name, &id, &input)),
-                            None => reply(lane),
-                        },
+                    if let Some(refused) = take_refusal(&lane, &last_message) {
+                        return refused;
+                    }
+                    match take_tool_call(&lane, &last_message) {
+                        Some((name, id, input)) => stream_chunks(lane, tool_call_chunks(&name, &id, &input)),
+                        None => reply(lane),
                     }
                 }
             }),
@@ -279,32 +297,58 @@ impl MockUpstream {
         self.lane.open.load(Ordering::SeqCst)
     }
 
-    /// Answer this lane's next `times` requests with a 400 and `body` —
-    /// an overflow refusal (see `exceed_context_size`) for a scenario
-    /// whose turn recovers (SME-73) — then stream normally again, as the
-    /// recovery's summary call and retry do. The guard re-arms the lane
-    /// on drop, failures included.
-    pub(super) fn refuse_next(&self, times: usize, body: impl Into<String>) -> RefusalsArmed {
-        *self.lane.refusals.lock().expect("the refusal lock") = Some((times, body.into()));
+    /// Answer the next `times` requests whose last message holds `for_message`
+    /// with a 400 and `body` — an overflow refusal (see `exceed_context_size`)
+    /// for a scenario whose turn recovers (SME-73) — then stream normally
+    /// again, as the recovery's summary call and retry do. Tied to the message
+    /// because the lane isn't this scenario's alone: an earlier scenario's
+    /// conversation wakes on it whenever a terminal command of its ends, and
+    /// that request mustn't use this up. The guard re-arms the lane on drop,
+    /// failures included.
+    pub(super) fn refuse_next(&self, for_message: &str, times: usize, body: impl Into<String>) -> RefusalsArmed {
+        *self.lane.refusals.lock().expect("the refusal lock") = Some((for_message.to_string(), times, body.into()));
         RefusalsArmed(self.lane.refusals.clone())
     }
 
-    /// Answer this lane's next request with an `ask_user` tool call — id
-    /// `tool_use_id`, input `input` — instead of a text reply, so the
-    /// scenario's question comes from a real turn ending on a real card
-    /// (`tool_call_next`).
-    pub(super) fn ask_user_next(&self, tool_use_id: &str, input: &serde_json::Value) -> ToolCallArmed {
-        self.tool_call_next("ask_user", tool_use_id, input)
+    /// Whether `refuse_next`'s refusal is still waiting for its request.
+    pub(super) fn refusal_armed(&self) -> bool {
+        self.lane.refusals.lock().expect("the refusal lock").is_some()
     }
 
-    /// Answer this lane's next request with a call to tool `name` — id
-    /// `tool_use_id`, input `input` — instead of a text reply. The guard
-    /// re-arms nothing on drop: an armed call a failed scenario never
-    /// sent dies with it, not the lane's next scenario.
-    pub(super) fn tool_call_next(&self, name: &str, tool_use_id: &str, input: &serde_json::Value) -> ToolCallArmed {
+    /// Answer the next request whose last message holds `for_message` with an
+    /// `ask_user` tool call — id `tool_use_id`, input `input` — instead of a
+    /// text reply, so the scenario's question comes from a real turn ending on
+    /// a real card (`tool_call_next`).
+    pub(super) fn ask_user_next(&self, for_message: &str, tool_use_id: &str, input: &serde_json::Value) -> ToolCallArmed {
+        self.tool_call_next(for_message, "ask_user", tool_use_id, input)
+    }
+
+    /// Answer the next request whose last message holds `for_message` with a
+    /// call to tool `name` — id `tool_use_id`, input `input` — instead of a
+    /// text reply; tied to the message as `refuse_next` is, and for the same
+    /// reason. The guard re-arms nothing on drop: an armed call a failed
+    /// scenario never sent dies with it, not the lane's next scenario.
+    pub(super) fn tool_call_next(&self, for_message: &str, name: &str, tool_use_id: &str, input: &serde_json::Value) -> ToolCallArmed {
         *self.lane.tool_call.lock().expect("the tool call lock") =
-            Some((name.to_string(), tool_use_id.to_string(), input.to_string()));
+            Some((for_message.to_string(), name.to_string(), tool_use_id.to_string(), input.to_string()));
         ToolCallArmed(self.lane.tool_call.clone())
+    }
+
+    /// A request from none of the scenario's conversations, as the lane gets
+    /// when a terminal command an earlier scenario ran ends and wakes that
+    /// conversation, at no moment a scenario can know. Its reply is hung up
+    /// on at once. Called while something is armed, it pins that interleaving.
+    pub(super) async fn stray_request(&self) {
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": [{ "role": "user", "content": [{ "type": "text", "text": "a wake from an earlier scenario" }] }],
+        });
+        reqwest::Client::new()
+            .post(format!("http://{}/v1/messages", self.addr))
+            .json(&body)
+            .send()
+            .await
+            .expect("the mock upstream answers a stray request");
     }
 
     /// Waits until the call `tool_call_next` armed has been sent (a

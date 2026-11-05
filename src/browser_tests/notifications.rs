@@ -318,7 +318,9 @@ pub(super) async fn scenario_desktop_notifications(t: &Scenario<'_>) {
 
     // 2. A turn ending on a question notifies — exactly one browser, one
     //    tab, and it says what the card says.
-    let _asked1 = t.mock.ask_user_next(&unique_id("toolu_ask"), &ask_input("Delete the build directory?", "Delete"));
+    let _asked1 = t.mock.ask_user_next("tidy the build", &unique_id("toolu_ask"), &ask_input("Delete the build directory?", "Delete"));
+    // A stray request on the lane mustn't take the armed call (SME-371).
+    t.mock.stray_request().await;
     let c = stubbed_tab(t, t.url(&format!("conversation/{}", asking.id))).await;
     wait_for_live_client(&c, asking.id).await;
     set_focus(&c, false, true).await;
@@ -368,7 +370,7 @@ pub(super) async fn scenario_desktop_notifications(t: &Scenario<'_>) {
     click_when_present(&c, ".question-option", Duration::from_secs(5)).await;
     assert!(wait_turn_ended(t, asking.id, chunks_answered).await, "the answer's reply ended");
 
-    let _asked2 = t.mock.ask_user_next(&unique_id("toolu_ask"), &ask_input("Commit the result?", "Commit"));
+    let _asked2 = t.mock.ask_user_next("ask me again", &unique_id("toolu_ask"), &ask_input("Commit the result?", "Commit"));
     send_from(&c, "ask me again").await;
     let shown2 = wait_until(
         || async {
@@ -411,7 +413,7 @@ pub(super) async fn scenario_desktop_notifications(t: &Scenario<'_>) {
         tab.evaluate("window.__notifications.length = 0").await.expect("clear the records");
     }
     set_focus(&a, true, true).await; // the leader, looking at another conversation
-    let _asked_watched = t.mock.ask_user_next(&unique_id("toolu_ask"), &ask_input("Archive the logs?", "Archive"));
+    let _asked_watched = t.mock.ask_user_next("peek at the logs", &unique_id("toolu_ask"), &ask_input("Archive the logs?", "Archive"));
     click_conversation(&c, watched.id).await;
     send_from(&c, "peek at the logs").await;
     assert!(
@@ -440,7 +442,7 @@ pub(super) async fn scenario_desktop_notifications(t: &Scenario<'_>) {
     wait_for_live_client(&a, asking.id).await;
     click_conversation(&c, home.id).await;
     let notify = |message: &str| serde_json::json!({ "message": message });
-    let _notified = t.mock.tool_call_next("notify_user", &unique_id("toolu_notify"), &notify("Wrapped up"));
+    let _notified = t.mock.tool_call_next("wrap up", "notify_user", &unique_id("toolu_notify"), &notify("Wrapped up"));
     send_from(&c, "wrap up").await;
     assert!(t.mock.wait_until_tool_call_sent(Duration::from_secs(15)).await, "the notifying turn ended");
     let (leader_after, understudy) = if wait_tag_count(&b, &home_tag, 1, Duration::from_secs(15)).await {
@@ -481,7 +483,7 @@ pub(super) async fn scenario_desktop_notifications(t: &Scenario<'_>) {
     click_when_present(&a, ".notifications-toggle", Duration::from_secs(5)).await;
     let (disabled, _) = wait_toggle_label(&a, "Turn on notifications", Duration::from_secs(10)).await;
     assert!(!disabled);
-    let _notified = t.mock.tool_call_next("notify_user", &unique_id("toolu_notify"), &notify("All done"));
+    let _notified = t.mock.tool_call_next("and done", "notify_user", &unique_id("toolu_notify"), &notify("All done"));
     send_from(&c, "and done").await;
     assert!(t.mock.wait_until_tool_call_sent(Duration::from_secs(15)).await, "the turn ended");
     tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -516,7 +518,7 @@ pub(super) async fn scenario_desktop_notifications(t: &Scenario<'_>) {
     assert!(t.mock.wait_until_idle(Duration::from_secs(15)).await, "the plain turn ended");
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(wait_title(&d, "smelt", Duration::from_secs(1)).await, "a plain reply adds nothing to the count");
-    let _notified = t.mock.tool_call_next("notify_user", &unique_id("toolu_notify"), &notify("Ready again"));
+    let _notified = t.mock.tool_call_next("one more", "notify_user", &unique_id("toolu_notify"), &notify("Ready again"));
     send_from(&c, "one more").await;
     assert!(t.mock.wait_until_tool_call_sent(Duration::from_secs(15)).await, "the notifying turn ended");
     assert!(wait_title(&d, "(1) smelt", Duration::from_secs(15)).await, "the unfocused tab counts in its title");

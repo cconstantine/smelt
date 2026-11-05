@@ -154,14 +154,15 @@ async fn user_stopped(pool: &PgPool, child: i64) {
     }
 }
 
-/// After a child's last turn ends (`failure`: why, when it failed): if it's
+/// After a child's last turn ends (`why`: what ended it, when something
+/// other than the model did): if it's
 /// `active` with nothing to wait on and not paused by the user, its parent
 /// is told its turn ended without a report, with the start of its last
 /// reply, and woken; otherwise the parent would wait for a report that
 /// won't come. A conversation that isn't an agent does nothing. Something
 /// arriving just after the check wakes the child again, which is fine: the
 /// notice says the turn ended, not the work.
-pub(crate) async fn after_last_turn(pool: &PgPool, conversation_id: i64, failure: Option<String>) {
+pub(crate) async fn after_last_turn(pool: &PgPool, conversation_id: i64, why: Option<String>) {
     // A finished agent's turn ended with its report: its pod stops at once,
     // unless a command still runs (SME-78). It didn't end "without a report".
     match db::agent_state(pool, conversation_id).await {
@@ -187,8 +188,8 @@ pub(crate) async fn after_last_turn(pool: &PgPool, conversation_id: i64, failure
     };
     let (parent, last) = parent;
     let label = label_of(pool, conversation_id).await;
-    let failed = failure.map(|why| format!(" (it failed: {why})")).unwrap_or_default();
-    let body = format!("{label}'s turn ended without a report{failed}; its last message: {last}");
+    let why = why.map(|why| format!(" ({why})")).unwrap_or_default();
+    let body = format!("{label}'s turn ended without a report{why}; its last message: {last}");
     match db::queue_notice(pool, parent, conversation_id, &label, &body).await {
         Ok(()) => {
             crate::turn::notify(pool, parent, vec![crate::turn::Notice::Wake]);
