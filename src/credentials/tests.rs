@@ -84,6 +84,53 @@ async fn test_the_answer_doesnt_wait_for_a_stuck_install_and_the_install_still_l
     assert_eq!(landed.expect("the stuck install never landed").expect("the install was called off"), 2);
 }
 
+/// SME-371 review 1: the whole claim that a late install can't bring a
+/// deleted secret back rests on this. An install waiting for its
+/// conversation's lock reads the pod's files only once it holds the lock, so
+/// a secret deleted while it waited isn't in what it writes. Red if the read
+/// moves before the lock.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_install_reads_its_files_only_once_it_holds_the_lock(pool: PgPool) {
+    let saved = crate::db::create_named_secret(&pool, "linear-key", "value-1234567890").await.expect("a stored secret");
+    let holder_conversation = agent(&pool, Some(&[]), Some(&["linear-key"])).await;
+    let pod = crate::db::create_sandbox_pod(&pool, holder_conversation).await.expect("a live pod row");
+    assert!(
+        file(&pod_files(&pool, holder_conversation).await.expect("pod files"), "/etc/smelt/secrets/linear-key").is_some(),
+        "the secret is granted, so its absence below is the delete's doing"
+    );
+
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let (is_held, held) = tokio::sync::oneshot::channel::<()>();
+    let lock = tokio::spawn(with_install_lock(holder_conversation, async move {
+        let _ = is_held.send(());
+        let _ = released.await;
+    }));
+    held.await.expect("the lock is held");
+
+    let (written, wrote) = tokio::sync::oneshot::channel::<Vec<PodFile>>();
+    let install = {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            install_into_pod_with(&pool, pod.id, |_, files| async move {
+                let _ = written.send(files);
+                Ok(())
+            })
+            .await
+        })
+    };
+    // Let the install run up to the lock, then delete under it.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    crate::db::delete_named_secret(&pool, saved.id).await.expect("delete");
+    let _ = release.send(());
+    lock.await.expect("the holder");
+    let files = tokio::time::timeout(std::time::Duration::from_secs(10), wrote)
+        .await
+        .expect("the install never wrote")
+        .expect("the writer ran");
+    install.await.expect("the install").expect("installed");
+    assert!(file(&files, "/etc/smelt/secrets/linear-key").is_none(), "a deleted secret came back with a late install");
+}
+
 /// Every install finished: the answer doesn't sit out the deadline, and
 /// nothing is missed. The normal save, which still answers with its pods
 /// written.

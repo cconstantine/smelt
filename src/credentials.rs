@@ -348,6 +348,17 @@ pub(crate) async fn with_install_lock<F: std::future::Future>(conversation: i64,
 /// one, and a secret reaches the persona that named it. A pod with no
 /// row — gone mid-install — installs nothing rather than everything.
 pub async fn install_into_pod(pool: &PgPool, pod_id: i64) -> Result<(), String> {
+    install_into_pod_with(pool, pod_id, |pod_id, files| async move { write_pod_files(pool, pod_id, &files).await }).await
+}
+
+/// `install_into_pod` with the write passed in, so a test can see what it
+/// would write. The files are read after the lock is taken: an install that
+/// waited on it can't bring back what a change made meanwhile removed.
+async fn install_into_pod_with<F, Fut>(pool: &PgPool, pod_id: i64, write: F) -> Result<(), String>
+where
+    F: FnOnce(i64, Vec<PodFile>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
     // Read before the lock, which is the conversation's: a pod's
     // conversation never changes.
     let conversation = db::sandbox_pod_conversation_id(pool, pod_id).await.map_err(|e| e.to_string())?;
@@ -356,7 +367,7 @@ pub async fn install_into_pod(pool: &PgPool, pod_id: i64) -> Result<(), String> 
     };
     with_install_lock(conversation, async {
         let files = pod_files(pool, conversation).await.map_err(|e| e.to_string())?;
-        write_pod_files(pool, pod_id, &files).await
+        write(pod_id, files).await
     })
     .await
 }
