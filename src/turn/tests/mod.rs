@@ -476,6 +476,7 @@ mod turn_slot;
 mod overflow;
 mod window_stop;
 mod compaction_progress;
+mod transcript;
 
 /// The reason in conversation `id`'s last failure notice (SME-123 DR3),
 /// where a user's failed turn now says why.

@@ -260,7 +260,7 @@ fn quote(text: &str) -> String {
 
 /// `quote` to at most `max` characters of `text`.
 #[cfg(feature = "server")]
-fn quote_to(text: &str, max: usize) -> String {
+pub(super) fn quote_to(text: &str, max: usize) -> String {
     match crate::fetch_guard::truncate(text.to_string(), max) {
         (kept, true) => format!("{kept}\n[cut to its first {max} characters; the summary covers the rest]"),
         (whole, false) => whole,
@@ -269,7 +269,7 @@ fn quote_to(text: &str, max: usize) -> String {
 
 /// Between two quoted typed messages; counted in the budget.
 #[cfg(feature = "server")]
-const QUOTE_SEPARATOR: &str = "\n\n---\n\n";
+pub(super) const QUOTE_SEPARATOR: &str = "\n\n---\n\n";
 
 /// What a continuation quotes of the user's and the parent's own words
 /// (SME-367): `quotes`, oldest first and already cut to size, and how many
@@ -339,6 +339,11 @@ pub(super) fn is_typed(text: &str) -> bool {
 /// `typed_budget(context_window)`, then put back in order.
 #[cfg(feature = "server")]
 pub(super) fn typed_user_text(messages: &[Message], context_window: u32) -> Typed {
+    typed_within(messages, typed_budget(context_window))
+}
+
+/// `typed_user_text` in `budget` characters.
+pub(super) fn typed_within(messages: &[Message], budget: usize) -> Typed {
     let answered = messages.len() - messages.iter().rev().take_while(|m| m.role == "user").count();
     let mut questions = std::collections::HashSet::new();
     let mut all: Vec<String> = Vec::new();
@@ -407,7 +412,6 @@ pub(super) fn typed_user_text(messages: &[Message], context_window: u32) -> Type
     let Some((first, rest)) = all.split_first() else {
         return Typed::default();
     };
-    let budget = typed_budget(context_window);
     let first = quote_to(first, (budget / 2).max(1));
     let mut used = first.chars().count();
     let mut newest: Vec<String> = Vec::new();
@@ -520,73 +524,6 @@ pub(super) async fn describe_live_state(pool: &PgPool, conversation_id: i64) -> 
 /// The most a summary may write.
 #[cfg(feature = "server")]
 pub(super) const SUMMARY_MAX_TOKENS: u32 = 2048;
-
-/// The conversation as plain text, for the summarization call: the latest
-/// compaction's summary and everything since (what came before it is
-/// already in that summary — including it again made every later
-/// compaction bigger than the last, until the summarization call couldn't
-/// fit at all), cut to `max_chars` by dropping the oldest part.
-#[cfg(feature = "server")]
-pub(super) fn compaction_transcript(messages: &[Message], max_chars: usize) -> String {
-    let latest_boundary = messages
-        .iter()
-        .filter_map(|m| m.blocks().ok())
-        .flatten()
-        .filter_map(|block| match block {
-            anthropic::ContentBlock::CompactionSummary {
-                covers_through_message_id,
-                ..
-            } => Some(covers_through_message_id),
-            _ => None,
-        })
-        .max();
-    let mut transcript = String::new();
-    for message in messages
-        .iter()
-        .filter(|m| latest_boundary.is_none_or(|boundary| m.id > boundary))
-    {
-        let Ok(blocks) = message.blocks() else {
-            continue;
-        };
-        for block in blocks {
-            let text = match block {
-                anthropic::ContentBlock::Text { text } => text,
-                anthropic::ContentBlock::ToolUse { name, input, .. } => {
-                    format!("[called tool {name} with {input}]")
-                }
-                anthropic::ContentBlock::ToolResult { content, .. } => {
-                    format!("[tool result: {content}]")
-                }
-                anthropic::ContentBlock::Thinking { .. } => continue,
-                anthropic::ContentBlock::CompactionSummary { summary, .. } => summary,
-                // Purely structural (see its own doc comment) — noise for
-                // a *later* compaction's own summarization transcript, not
-                // real prior dialogue worth feeding back in.
-                anthropic::ContentBlock::CompactionPlaceholder { .. } => continue,
-            };
-            transcript.push_str(&message.role);
-            transcript.push_str(": ");
-            transcript.push_str(&text);
-            transcript.push('\n');
-        }
-    }
-    let total = transcript.chars().count();
-    if total <= max_chars {
-        return transcript;
-    }
-    const OMITTED: &str = "[earlier conversation omitted]\n";
-    let keep = max_chars.saturating_sub(OMITTED.chars().count());
-    let tail: String = transcript.chars().skip(total - keep).collect();
-    format!("{OMITTED}{tail}")
-}
-
-/// How much transcript the summarization call can take: the context window
-/// less room for its instructions, the live-state listing and its own
-/// output, at a conservative 3 characters per token.
-#[cfg(feature = "server")]
-pub(super) fn compaction_transcript_budget(context_window: u32) -> usize {
-    (context_window as usize).saturating_sub(8_192) * 3
-}
 
 /// Runs one compaction pass: summarizes everything currently persisted (up
 /// through and including whatever's pending — the size trigger fired
