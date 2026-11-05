@@ -46,28 +46,15 @@ pub(super) fn estimate_tokens(blocks: &[anthropic::ContentBlock]) -> u64 {
     (chars / 4) as u64
 }
 
-/// Whether the upcoming request's real size looks likely to eat into the
-/// reserved ceiling (model output allowance + a safety buffer, subtracted
-/// from the context window) — opencode's own trigger mechanism, checked
-/// *before* a request is sent rather than reacting to a real rejection.
-/// `last_usage` is the last real response's usage (the ground truth for
-/// everything already in the conversation — see `stream::StreamedTurn`'s
-/// own doc comment); `new_content_estimate` is `estimate_tokens` applied
-/// to whatever's freshly being added this turn. `None` `last_usage`
-/// (nothing sent yet) never triggers — there's nothing to compact. See
-/// SME-18.
+/// The size of request that triggers a compaction: the context window less
+/// what's kept for the reply (model output allowance + a safety buffer) —
+/// opencode's own trigger mechanism, checked *before* a request is sent
+/// rather than reacting to a real rejection. See SME-18. Once compacting
+/// can't help, `CompactionProgress` moves it nearer the window.
 #[cfg(feature = "server")]
-pub(super) fn should_compact(
-    last_usage: Option<&anthropic::TokenUsage>,
-    new_content_estimate: u64,
-    context_window: u32,
-) -> bool {
-    let Some(projected) = projected_input(last_usage, new_content_estimate) else {
-        return false;
-    };
+pub(super) fn compaction_ceiling(context_window: u32) -> u64 {
     let reserved = MIN_REPLY_TOKENS.max(COMPACTION_SAFETY_BUFFER) as u64;
-    let ceiling = (context_window as u64).saturating_sub(reserved);
-    projected >= ceiling
+    (context_window as u64).saturating_sub(reserved)
 }
 
 /// The next request's input as the last real usage measured it, plus an
@@ -94,6 +81,23 @@ pub(super) fn estimate_request_tokens(request: &anthropic::CreateMessageRequest)
     let system = request.system.as_ref().map_or(0, |s| s.len() / 4) as u64;
     let tools = serde_json::to_string(&request.tools).map_or(0, |t| t.len() / 4) as u64;
     messages + system + tools
+}
+
+/// `budget` held to the room a request of `projected_input` tokens really
+/// leaves, for one past the trigger because compacting can't help: the
+/// floor in `reply_budget` counts on the trigger having kept that room, and
+/// a reply it doesn't have is a refusal (SME-386 M3).
+#[cfg(feature = "server")]
+pub(super) fn budget_within_room(budget: ReplyBudget, context_window: u32, projected_input: u64) -> ReplyBudget {
+    let room = (context_window as u64)
+        .saturating_sub(projected_input)
+        .saturating_sub(COMPACTION_SAFETY_BUFFER as u64);
+    let room = u32::try_from(room).unwrap_or(u32::MAX).max(1);
+    if room < budget.tokens {
+        ReplyBudget { tokens: room, limit: crate::api::chat::ReplyLimit::RoomLeft }
+    } else {
+        budget
+    }
 }
 
 /// How many tokens a reply may use (SME-111): the smallest of the model's
@@ -249,21 +253,27 @@ pub(super) fn continuation_prompt(typed: &Typed, unanswered: &[String]) -> Strin
 /// compaction was for, and the summary already covers it (SME-51 B10).
 #[cfg(feature = "server")]
 fn quote(text: &str) -> String {
-    quote_to(text, CONTINUATION_QUOTE_MAX_CHARS)
+    quote_to(text, CONTINUATION_QUOTE_MAX_CHARS, SUMMARY_COVERS_THE_REST)
 }
 
-/// `quote` to at most `max` characters of `text`.
+/// What a continuation's cut quote says of the rest. Not for the
+/// summariser's own input, where there's no summary yet.
 #[cfg(feature = "server")]
-fn quote_to(text: &str, max: usize) -> String {
+pub(super) const SUMMARY_COVERS_THE_REST: &str = "; the summary covers the rest";
+
+/// `text` cut to at most `max` characters, the cut marked, with `rest` saying
+/// where the rest went.
+#[cfg(feature = "server")]
+pub(super) fn quote_to(text: &str, max: usize, rest: &str) -> String {
     match crate::fetch_guard::truncate(text.to_string(), max) {
-        (kept, true) => format!("{kept}\n[cut to its first {max} characters; the summary covers the rest]"),
+        (kept, true) => format!("{kept}\n[cut to its first {max} characters{rest}]"),
         (whole, false) => whole,
     }
 }
 
 /// Between two quoted typed messages; counted in the budget.
 #[cfg(feature = "server")]
-const QUOTE_SEPARATOR: &str = "\n\n---\n\n";
+pub(super) const QUOTE_SEPARATOR: &str = "\n\n---\n\n";
 
 /// What a continuation quotes of the user's and the parent's own words
 /// (SME-367): `quotes`, oldest first and already cut to size, and how many
@@ -333,6 +343,11 @@ pub(super) fn is_typed(text: &str) -> bool {
 /// `typed_budget(context_window)`, then put back in order.
 #[cfg(feature = "server")]
 pub(super) fn typed_user_text(messages: &[Message], context_window: u32) -> Typed {
+    typed_within(messages, typed_budget(context_window), SUMMARY_COVERS_THE_REST)
+}
+
+/// `typed_user_text` in `budget` characters, a cut quote saying `after_cut`.
+pub(super) fn typed_within(messages: &[Message], budget: usize, after_cut: &str) -> Typed {
     let answered = messages.len() - messages.iter().rev().take_while(|m| m.role == "user").count();
     let mut questions = std::collections::HashSet::new();
     let mut all: Vec<String> = Vec::new();
@@ -401,12 +416,11 @@ pub(super) fn typed_user_text(messages: &[Message], context_window: u32) -> Type
     let Some((first, rest)) = all.split_first() else {
         return Typed::default();
     };
-    let budget = typed_budget(context_window);
-    let first = quote_to(first, (budget / 2).max(1));
+    let first = quote_to(first, (budget / 2).max(1), after_cut);
     let mut used = first.chars().count();
     let mut newest: Vec<String> = Vec::new();
     for text in rest.iter().rev() {
-        let quoted = quote_to(text, CONTINUATION_QUOTE_MAX_CHARS.min(budget));
+        let quoted = quote_to(text, CONTINUATION_QUOTE_MAX_CHARS.min(budget), after_cut);
         let size = quoted.chars().count() + QUOTE_SEPARATOR.len();
         // One that doesn't fit is left out alone: older, shorter ones may
         // still fit (SME-386 T8).
@@ -450,6 +464,39 @@ pub(super) fn unanswered_user_text(messages: &[Message]) -> Vec<String> {
         texts.drain(..=stop);
     }
     texts
+}
+
+/// `texts` (`unanswered_user_text`) held to `budget` characters in all, so a
+/// compaction with many messages waiting doesn't leave its next request
+/// over the trigger for that alone (SME-386 review L1). The newest are kept:
+/// it's what the model answers. What's left out is said at the start.
+#[cfg(feature = "server")]
+pub(super) fn cap_unanswered(texts: Vec<String>, budget: usize) -> Vec<String> {
+    let mut left = budget;
+    let mut kept = Vec::new();
+    let total = texts.len();
+    for text in texts.into_iter().rev() {
+        let size = text.chars().count().min(CONTINUATION_QUOTE_MAX_CHARS);
+        if size <= left {
+            left -= size;
+            kept.push(text);
+        } else if kept.is_empty() {
+            // The one to answer gets what there is.
+            left = 0;
+            kept.push(quote_to(&text, budget, SUMMARY_COVERS_THE_REST));
+        } else {
+            break;
+        }
+    }
+    if kept.len() < total {
+        let omitted = total - kept.len();
+        kept.push(format!("({omitted} earlier {} left out here; the summary covers {}.)",
+            if omitted == 1 { "message is" } else { "messages are" },
+            if omitted == 1 { "it" } else { "them" },
+        ));
+    }
+    kept.reverse();
+    kept
 }
 
 /// The system prompt for the dedicated summarization call `compact_conversation`
@@ -511,72 +558,9 @@ pub(super) async fn describe_live_state(pool: &PgPool, conversation_id: i64) -> 
     }
 }
 
-/// The conversation as plain text, for the summarization call: the latest
-/// compaction's summary and everything since (what came before it is
-/// already in that summary — including it again made every later
-/// compaction bigger than the last, until the summarization call couldn't
-/// fit at all), cut to `max_chars` by dropping the oldest part.
+/// The most a summary may write.
 #[cfg(feature = "server")]
-pub(super) fn compaction_transcript(messages: &[Message], max_chars: usize) -> String {
-    let latest_boundary = messages
-        .iter()
-        .filter_map(|m| m.blocks().ok())
-        .flatten()
-        .filter_map(|block| match block {
-            anthropic::ContentBlock::CompactionSummary {
-                covers_through_message_id,
-                ..
-            } => Some(covers_through_message_id),
-            _ => None,
-        })
-        .max();
-    let mut transcript = String::new();
-    for message in messages
-        .iter()
-        .filter(|m| latest_boundary.is_none_or(|boundary| m.id > boundary))
-    {
-        let Ok(blocks) = message.blocks() else {
-            continue;
-        };
-        for block in blocks {
-            let text = match block {
-                anthropic::ContentBlock::Text { text } => text,
-                anthropic::ContentBlock::ToolUse { name, input, .. } => {
-                    format!("[called tool {name} with {input}]")
-                }
-                anthropic::ContentBlock::ToolResult { content, .. } => {
-                    format!("[tool result: {content}]")
-                }
-                anthropic::ContentBlock::Thinking { .. } => continue,
-                anthropic::ContentBlock::CompactionSummary { summary, .. } => summary,
-                // Purely structural (see its own doc comment) — noise for
-                // a *later* compaction's own summarization transcript, not
-                // real prior dialogue worth feeding back in.
-                anthropic::ContentBlock::CompactionPlaceholder { .. } => continue,
-            };
-            transcript.push_str(&message.role);
-            transcript.push_str(": ");
-            transcript.push_str(&text);
-            transcript.push('\n');
-        }
-    }
-    let total = transcript.chars().count();
-    if total <= max_chars {
-        return transcript;
-    }
-    const OMITTED: &str = "[earlier conversation omitted]\n";
-    let keep = max_chars.saturating_sub(OMITTED.chars().count());
-    let tail: String = transcript.chars().skip(total - keep).collect();
-    format!("{OMITTED}{tail}")
-}
-
-/// How much transcript the summarization call can take: the context window
-/// less room for its instructions, the live-state listing and its own
-/// output, at a conservative 3 characters per token.
-#[cfg(feature = "server")]
-pub(super) fn compaction_transcript_budget(context_window: u32) -> usize {
-    (context_window as usize).saturating_sub(8_192) * 3
-}
+pub(super) const SUMMARY_MAX_TOKENS: u32 = 2048;
 
 /// Runs one compaction pass: summarizes everything currently persisted (up
 /// through and including whatever's pending — the size trigger fired
@@ -689,7 +673,7 @@ async fn compact(
         Err(e) => return Err(ServerFnError::new(e)),
     };
 
-    let unanswered = unanswered_user_text(&messages);
+    let unanswered = cap_unanswered(unanswered_user_text(&messages), typed_budget(turn_model.context_window));
     let typed = typed_user_text(&messages, turn_model.context_window);
     for (role, content) in compaction_messages(summary, covers_through_message_id, &typed, &unanswered, refused) {
         let saved = db::create_message(pool, conversation_id, role, &content)
@@ -726,7 +710,7 @@ async fn summarize(
 
     let summarization_request = anthropic::CreateMessageRequest {
         model: turn_model.model.clone(),
-        max_tokens: 2048,
+        max_tokens: SUMMARY_MAX_TOKENS,
         system: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
         messages: vec![anthropic::AnthropicMessage {
             role: "user".to_string(),

@@ -14,6 +14,8 @@ use crate::{anthropic, db};
 
 mod call;
 mod compaction;
+mod compaction_progress;
+mod compaction_transcript;
 mod failure;
 mod history;
 mod lifecycle;
@@ -31,6 +33,8 @@ pub(crate) mod tests;
 
 use self::call::*;
 use self::compaction::*;
+use self::compaction_progress::{CompactionProgress, CompactionStep};
+use self::compaction_transcript::*;
 pub(crate) use self::failure::*;
 pub(crate) use self::history::*;
 pub(crate) use self::lifecycle::*;

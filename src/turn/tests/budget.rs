@@ -37,6 +37,11 @@ fn test_estimate_tokens_sums_every_block_and_every_category() {
     assert_eq!(estimate_tokens(&blocks), 20);
 }
 
+/// The usual trigger, as `CompactionProgress::step` reads it.
+fn should_compact(last_usage: Option<&anthropic::TokenUsage>, new_content_estimate: u64, context_window: u32) -> bool {
+    projected_input(last_usage, new_content_estimate).is_some_and(|projected| projected >= compaction_ceiling(context_window))
+}
+
 #[test]
 fn test_should_compact_false_when_nothing_sent_yet() {
     assert!(!should_compact(None, 1000, 200_000));
@@ -85,6 +90,19 @@ fn test_the_reply_budget_says_what_bound_it() {
     assert_eq!(reply_budget(262_144, 250_000, None).limit, ReplyLimit::RoomLeft, "the floor: nearly full");
     assert_eq!(reply_budget(262_144, 250_000, Some(8_192)).limit, ReplyLimit::OutputCap);
     assert_eq!(reply_budget(4_096, 1_000, None).limit, ReplyLimit::HalfWindow);
+}
+
+/// SME-386 M3: past the trigger, a reply gets only the room that's there.
+#[test]
+fn test_a_budget_within_room_holds_a_request_past_the_trigger_inside_the_window() {
+    use crate::api::chat::ReplyLimit;
+    let floor = reply_budget(28_000, 20_000, None);
+    assert_eq!(floor.tokens, 14_000, "the floor alone would ask for more than fits");
+    let held = budget_within_room(floor, 28_000, 20_000);
+    assert_eq!(held, ReplyBudget { tokens: 3_904, limit: ReplyLimit::RoomLeft });
+    let roomy = reply_budget(200_000, 10_000, None);
+    assert_eq!(budget_within_room(roomy, 200_000, 10_000), roomy, "a smaller budget stands");
+    assert_eq!(budget_within_room(floor, 28_000, 40_000).tokens, 1, "never zero, which the API refuses");
 }
 
 #[test]

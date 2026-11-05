@@ -24,7 +24,23 @@ pub(super) const CLONE_WAIT: std::time::Duration = std::time::Duration::from_sec
 #[cfg(feature = "server")]
 pub(super) const MIN_REPLY_TOKENS: u32 = 16_384;
 
-/// Saves the failure notice for a user's turn that failed with `reason`
+/// Whether the conversation has said `reason` as a failure since the model
+/// last replied: a wake failing as the last one did has nothing to add
+/// (SME-386 review L6), though a notice may have come between (a command's
+/// finish is what woke it).
+#[cfg(feature = "server")]
+async fn already_said(pool: &PgPool, conversation_id: i64, reason: &str) -> bool {
+    let Ok(messages) = db::list_messages(pool, conversation_id).await else {
+        return false;
+    };
+    messages.iter().rev().take_while(|m| m.role == "user").any(|m| {
+        m.blocks().unwrap_or_default().iter().any(|block| {
+            matches!(block, anthropic::ContentBlock::Text { text } if crate::api::chat::parse_failure_notice(text) == Some(reason))
+        })
+    })
+}
+
+/// Saves the failure notice for a turn that failed with `reason`
 /// (`api::chat::failure_notice`). Whether it was saved: if not, the page
 /// still shows the error itself.
 #[cfg(feature = "server")]
@@ -93,10 +109,21 @@ pub(super) fn run_turn_body<'a: 'b, 'b>(
         // behind this one saves (SME-123 DR3, review 1 M1). A Stop landing
         // during this one insert drops it with the body: the turn then ends
         // as stopped, with the stop's own notice, which is what the user
-        // asked for (review 2 L1, accepted).
-        if users_turn {
+        // asked for (review 2 L1, accepted). Any of a child's turns does too,
+        // whoever's they are: they run with no tab open, the banner is live
+        // only, and the user can open the child and write to it (SME-386
+        // F7). A lookup that fails counts it as a root, as elsewhere. And a
+        // conversation that doesn't fit its window says so, on a root's wake
+        // too: nothing else will tell the user why (SME-386 F10, review L4).
+        // The user's own send always gets its answer; another turn failing
+        // as the last one did says nothing new (review L6).
+        let is_child = matches!(db::conversation_parent(pool, conversation_id).await, Ok(Some(_)));
+        let doesnt_fit = with_compaction_progress(conversation_id, |p| p.is_stuck());
+        if users_turn || is_child || doesnt_fit {
             let reason = chat_error_text(&e);
-            if note_failure(pool, conversation_id, &reason).await {
+            if (!users_turn && already_said(pool, conversation_id, &reason).await)
+                || note_failure(pool, conversation_id, &reason).await
+            {
                 return Err(TurnFailure::Noted { reason });
             }
         }
@@ -123,7 +150,7 @@ fn run_turn_steps<'a: 'b, 'b>(
         let mut steps = TurnSteps { span: tracing::Span::current(), count: 0 };
         // Tracks what's been persisted since the last *real* Anthropic
         // response — the compaction trigger's cheap size estimate (see
-        // `should_compact`) is computed over exactly this, added to that
+        // `CompactionProgress::step`) is computed over exactly this, added to that
         // last response's own real `usage`. Reset to empty every time a
         // real response lands (below); grows with the new user message,
         // any drained notifications, and (on a later loop iteration) the
@@ -233,25 +260,30 @@ fn run_turn_steps<'a: 'b, 'b>(
             // Proactive, not reactive: checked *before* building the
             // request that would be too big, using the last real
             // response's own usage plus a cheap estimate of what's new
-            // since then — see `should_compact`/`estimate_tokens`. A
+            // since then — see `CompactionProgress::step`/`estimate_tokens`. A
             // failure here fails the whole turn loudly rather than risking
             // the oversized request compaction exists to prevent — see
             // SME-18's "Resolved" decisions.
-            if should_compact(
-                last_known_usage.as_ref(),
-                estimate_tokens(&pending_new_content),
-                turn_model.context_window,
-            ) {
-                // A proactive compaction: no refusal to name on the
-                // divider (SME-73).
-                compact_conversation(pool, conversation_id, turn_model, slot.held(), None).await?;
-                // The last usage measured the history just summarized: the
-                // reply budget below estimates the new one instead.
-                last_known_usage = None;
+            let projected = projected_input(last_known_usage.as_ref(), estimate_tokens(&pending_new_content));
+            match with_compaction_progress(conversation_id, |p| p.step(&turn_model.model, turn_model.context_window, projected)) {
+                CompactionStep::Go => {}
+                // Compacting again would only repeat what the last ones
+                // showed: the turn ends, saying why (SME-386 F10).
+                CompactionStep::Stuck(why) => return Err(ServerFnError::new(why)),
+                CompactionStep::Compact => {
+                    // A proactive compaction: no refusal to name on the
+                    // divider (SME-73).
+                    compact_conversation(pool, conversation_id, turn_model, slot.held(), None).await?;
+                    with_compaction_progress(conversation_id, |p| p.compacted(turn_model.context_window));
+                    // The last usage measured the history just summarized: the
+                    // reply budget below estimates the new one instead.
+                    last_known_usage = None;
+                }
             }
 
+            let room_only = with_compaction_progress(conversation_id, |p| p.room_only());
             let (mut request, budget) =
-                build_request(pool, conversation_id, turn_model, last_known_usage.as_ref(), &pending_new_content)
+                build_request(pool, conversation_id, turn_model, last_known_usage.as_ref(), &pending_new_content, room_only)
                     .await?;
             let offered: Vec<String> = request.tools.iter().map(|tool| tool.name.clone()).collect();
             // A refusal meaning "this didn't fit" answers itself once:
@@ -268,9 +300,16 @@ fn run_turn_steps<'a: 'b, 'b>(
                     // runs before the meter publish below, so the meter
                     // reads the new window with this reply's own usage.
                     super::overflow::learn_ollama_window(pool, conversation_id, turn_model, &request, &turn.usage).await;
+                    with_compaction_progress(conversation_id, CompactionProgress::step_taken);
                     (turn, recorder, budget)
                 }
                 Err(CallError::Overflow(overflow)) => {
+                    // Compacting at every step, with nothing a server's silence
+                    // on usage could stop (SME-386 review L2).
+                    if let Some(why) = with_compaction_progress(conversation_id, |p| p.why_refused_out(&turn_model.model, turn_model.context_window)) {
+                        return Err(ServerFnError::new(why));
+                    }
+                    let believed = turn_model.context_window;
                     let recovered = overflow_recovery(
                         pool,
                         conversation_id,
@@ -282,6 +321,14 @@ fn run_turn_steps<'a: 'b, 'b>(
                         &overflow,
                     )
                     .await?;
+                    with_compaction_progress(conversation_id, |p| {
+                        if let Some(guess) = recovered.guessed {
+                            p.guessed(believed, guess);
+                        }
+                        if recovered.compacted {
+                            p.refusal_compacted(turn_model.context_window);
+                        }
+                    });
                     (recovered.turn, recovered.recorder, recovered.budget)
                 }
                 Err(CallError::Failed(e)) => return Err(e),
@@ -303,6 +350,7 @@ fn run_turn_steps<'a: 'b, 'b>(
             // everything up through this response is now accounted for, so
             // `pending_new_content` resets — only what's persisted after
             // this point is "new" again (SME-18).
+            with_compaction_progress(conversation_id, |p| p.measured(&turn.usage, turn_model.context_window));
             last_known_usage = Some(turn.usage);
             pending_new_content.clear();
             save_stop_notice(pool, conversation_id, turn_model, &turn, &budget, &mut persisted).await?;

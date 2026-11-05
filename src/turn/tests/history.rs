@@ -95,9 +95,10 @@ fn test_compaction_transcript_starts_from_the_latest_summary() {
     assert!(transcript.contains("the earlier summary"), "got {transcript}");
     assert!(transcript.contains("recent question"), "got {transcript}");
     assert!(
-        !transcript.contains("ancient"),
+        !transcript.contains("ancient answer"),
         "messages an earlier compaction already replaced came back: {transcript}"
     );
+    assert!(transcript.contains("ancient question"), "only the user's own words stay (SME-386 F11): {transcript}");
 }
 
 #[test]
@@ -110,7 +111,8 @@ fn test_compaction_transcript_keeps_the_most_recent_part_within_its_budget() {
     assert!(transcript.chars().count() <= 5_000, "{} chars", transcript.chars().count());
     assert!(transcript.contains("the very latest"));
     assert!(transcript.contains("omitted"), "the cut should be marked");
-    assert!(!transcript.contains("message 1 "), "the oldest part should be what's dropped");
+    assert!(!transcript.contains("message 2 "), "the oldest part should be what's dropped");
+    assert!(transcript.contains("message 1 "), "after the user's first ask, which stays (SME-386 F11)");
 }
 
 /// SME-40 F3: compaction runs after the new user message is saved, so

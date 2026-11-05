@@ -108,7 +108,7 @@ fn llama_refused(input: u32, window: u32) -> Answer {
 
 /// Ollama's refusal with context shift off — an overflow that names
 /// neither window nor input.
-fn ollama_refused() -> Answer {
+pub(super) fn ollama_refused() -> Answer {
     Err((
         axum::http::StatusCode::BAD_REQUEST,
         r#"{"error":{"type":"invalid_request_error","message":"the prompt is longer than the context length currently available to the model; shorten the prompt, or make num_ctx larger"}}"#
@@ -117,7 +117,7 @@ fn ollama_refused() -> Answer {
 }
 
 /// The summaries of every compaction saved in conversation `id`.
-async fn compaction_summaries(pool: &PgPool, id: i64) -> Vec<String> {
+pub(super) async fn compaction_summaries(pool: &PgPool, id: i64) -> Vec<String> {
     compaction_blocks(pool, id).await.into_iter().map(|(summary, _)| summary).collect()
 }
 

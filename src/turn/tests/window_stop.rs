@@ -8,7 +8,7 @@ use super::*;
 
 /// Saves `mock-model`'s Context window (and Max reply tokens, if given),
 /// as the provider page's field would.
-async fn set_context_window(pool: &PgPool, window: i32, max_output: Option<i32>) {
+pub(super) async fn set_context_window(pool: &PgPool, window: i32, max_output: Option<i32>) {
     sqlx::query("INSERT INTO provider_models (provider_id, model, context_window, max_output) SELECT id, $1, $2, $3 FROM inference_providers")
         .bind(crate::providers::test_support::MOCK_MODEL)
         .bind(window)
