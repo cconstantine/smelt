@@ -256,7 +256,7 @@ async fn test_the_cli_calls_the_socket_and_exits_by_the_answer() {
         let args = vec!["call".to_string(), "linear/save_comment".to_string(), "-".to_string()];
         let cli = tokio::task::spawn_blocking({
             let path = path.clone();
-            move || cli::run(&args, Some(&path), &mut std::io::Cursor::new(b" {\"body\":\"hi\"}\n".to_vec()))
+            move || cli::run(&args, Some(&path), "/nonexistent/smelt-mcp.sock", &mut std::io::Cursor::new(b" {\"body\":\"hi\"}\n".to_vec()))
         });
         let (call_id, _, request) = next_mcp_request(&mut smelt).await;
         assert_eq!(request, McpRequest::Call { body: r#"{"tool":"linear/save_comment","arguments":{"body":"hi"}}"#.into() });
@@ -265,17 +265,17 @@ async fn test_the_cli_calls_the_socket_and_exits_by_the_answer() {
     }
     let cli = tokio::task::spawn_blocking({
         let path = path.clone();
-        move || cli::run(&["tools".to_string(), "a b".to_string()], Some(&path), &mut std::io::empty())
+        move || cli::run(&["tools".to_string(), "a b".to_string()], Some(&path), "/nonexistent/smelt-mcp.sock", &mut std::io::empty())
     });
     let (call_id, _, request) = next_mcp_request(&mut smelt).await;
     assert_eq!(request, McpRequest::List { server: Some("a b".into()) }, "the server name, decoded again");
     answer(&mut smelt, call_id, 200, "{}").await;
     assert_eq!(cli.await.expect("join").0, 0);
 
-    let (code, out, err) = cli::run(&["tools".to_string()], None, &mut std::io::empty());
+    let (code, out, err) = cli::run(&["tools".to_string()], None, "/nonexistent/smelt-mcp.sock", &mut std::io::empty());
     assert_eq!((code, out.as_str()), (3, ""));
     assert!(err.contains("SMELT_MCP_SOCKET isn't set"), "{err}");
-    let (code, _, err) = cli::run(&["frobnicate".to_string()], Some(&path), &mut std::io::empty());
+    let (code, _, err) = cli::run(&["frobnicate".to_string()], Some(&path), "/nonexistent/smelt-mcp.sock", &mut std::io::empty());
     assert_eq!(code, 3);
     assert!(err.starts_with("usage:"), "{err}");
 }
@@ -301,4 +301,90 @@ async fn test_a_large_answer_reaches_the_script_whole() {
     let (status, got) = tokio::time::timeout(WAIT * 4, call).await.expect("answered").expect("join");
     assert_eq!(status, 200, "{}", &got[..got.len().min(200)]);
     assert_eq!(got.len(), body.len());
+}
+
+/// A [`Shell`] record as `start_shell` makes one, for `bash_pid`, with
+/// `stdin` from `child` (any process: nothing writes to it here).
+fn shell_record(child: &mut tokio::process::Child, bash_pid: i32, current: &str, ended: bool) -> Arc<Shell> {
+    Arc::new(Shell {
+        stdin: AsyncMutex::new(child.stdin.take().expect("stdin piped")),
+        bash_pid: bash_pid as u32,
+        current: AsyncMutex::new(Some(current.to_string())),
+        marker: Arc::new(std::sync::Mutex::new(None)),
+        ended: std::sync::atomic::AtomicBool::new(ended),
+    })
+}
+
+/// SME-386 M6: an ended shell's pid is free, and the kernel can hand it
+/// to a process in a live terminal's tree. The walk skips ended shells,
+/// so the call is the live terminal's command, not the old one's.
+#[tokio::test]
+async fn test_a_reused_pid_of_an_ended_shell_names_the_live_command() {
+    use tokio::io::AsyncBufReadExt;
+    // The live terminal's shell, and a child of it.
+    let mut live = Command::new("sh")
+        .args(["-c", "sleep 30 & echo $!; wait"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn the live shell");
+    let live_pid = live.id().expect("running") as i32;
+    let mut line = String::new();
+    let stdout = live.stdout.take().expect("stdout piped");
+    tokio::time::timeout(WAIT, tokio::io::BufReader::new(stdout).read_line(&mut line))
+        .await
+        .expect("the child's pid in time")
+        .expect("read");
+    let child: i32 = line.trim().parse().expect("a pid");
+    // The ended shell, its pid now the live shell's child's.
+    let mut stand_in = Command::new("cat").stdin(Stdio::piped()).kill_on_drop(true).spawn().expect("spawn");
+    let state = new_state();
+    state.terminals.lock().await.insert("t-old".into(), shell_record(&mut stand_in, child, "c-old", true));
+    state.terminals.lock().await.insert("t-live".into(), shell_record(&mut live, live_pid, "c-live", false));
+    let named = command_for_pid(&state, child).await;
+    let _ = signal::kill(Pid::from_raw(child), Signal::SIGKILL);
+    assert_eq!(named.as_deref(), Some("c-live"));
+}
+
+/// SME-386 M7: under `sudo` or `env -i` the script's environment has no
+/// `$SMELT_MCP_SOCKET`, and `smelt-mcp` falls back to the socket's fixed
+/// path rather than blaming the image. With neither, it says both.
+#[tokio::test]
+async fn test_the_cli_without_the_socket_variable_uses_the_fixed_path() {
+    let (addr, path, _state) = serve_agent_with_socket("fallback").await;
+    let mut smelt = connect_ready(addr).await;
+    let cli = tokio::task::spawn_blocking({
+        let path = path.clone();
+        move || cli::run(&["tools".to_string()], None, &path, &mut std::io::empty())
+    });
+    let (call_id, _, request) = tokio::time::timeout(WAIT, next_mcp_request(&mut smelt)).await.expect("the CLI reached the socket");
+    assert_eq!(request, McpRequest::List { server: None });
+    answer(&mut smelt, call_id, 200, "{}").await;
+    assert_eq!(cli.await.expect("join"), (0, "{}".to_string(), String::new()));
+
+    let (code, _, err) = cli::run(&["tools".to_string()], Some(""), "/nonexistent/smelt-mcp.sock", &mut std::io::empty());
+    assert_eq!(code, 3);
+    assert!(err.contains("SMELT_MCP_SOCKET isn't set") && err.contains("/nonexistent/smelt-mcp.sock"), "{err}");
+}
+
+/// SME-386 M8: arguments that aren't a JSON object (an empty `''`, a
+/// typo, an array) are the CLI's own usage error, said plainly, and
+/// nothing is sent; smelt's 400 for the body they made read as smelt's.
+#[test]
+fn test_the_cli_refuses_arguments_that_arent_a_json_object() {
+    let unused = "/nonexistent/smelt-mcp.sock";
+    for (arguments, says) in [("", "aren't JSON"), ("{\"q\": ", "aren't JSON"), ("[1]", "must be a JSON object"), ("-", "aren't JSON")] {
+        let args = vec!["call".to_string(), "exa/web_search_exa".to_string(), arguments.to_string()];
+        let (code, out, err) = cli::run(&args, Some(unused), unused, &mut std::io::empty());
+        assert_eq!((code, out.as_str()), (3, ""), "{arguments:?}: {err}");
+        assert!(err.contains(says), "{arguments:?}: {err}");
+        assert!(!err.contains("couldn't reach"), "{arguments:?}: nothing is sent: {err}");
+    }
+    // Review round 1, N2: the arguments' error comes first, with no socket
+    // to be found either.
+    let args = vec!["call".to_string(), "exa/web_search_exa".to_string(), String::new()];
+    let (code, _, err) = cli::run(&args, None, unused, &mut std::io::empty());
+    assert_eq!(code, 3);
+    assert!(err.contains("aren't JSON"), "{err}");
 }

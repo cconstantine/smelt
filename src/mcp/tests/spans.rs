@@ -226,3 +226,82 @@ async fn test_a_rule_refused_mcp_call_marks_its_spans_with_the_rule(pool: sqlx::
     let exported = format!("{spans:?}");
     assert!(!exported.contains("SECRET"), "{exported}");
 }
+
+/// SME-386 M2: a connect or call failure's text goes to the spans with
+/// the server's secrets redacted, as it goes to the model. `scrub_urls`
+/// cuts a URL's query and user part but keeps its path, which can carry
+/// the key (M1).
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_failures_span_exports_no_key_from_the_urls_path(pool: sqlx::PgPool) {
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.local_addr().expect("addr").port()
+    };
+    let path_key = "PATHKEY386span000000";
+    let id = next_server_id(&pool).await;
+    let config = crate::db::create_mcp_server_config(
+        &pool,
+        &format!("spans-{id}"),
+        &format!("http://127.0.0.1:{port}/mcp/s/{path_key}/mcp"),
+        &HashMap::new(),
+        "static_headers",
+        None,
+        None,
+    )
+    .await
+    .expect("create mcp server config");
+    let ((checked, called), spans) = crate::telemetry::capture_spans(async {
+        let checked = connection_check(&pool, &config).await;
+        evict(config.id).await;
+        lock_failures().remove(&config.id);
+        let called = call_tool(&pool, &config, "echo", serde_json::json!({})).await;
+        (checked, called)
+    })
+    .await;
+    evict(config.id).await;
+    lock_failures().remove(&config.id);
+    assert!(checked.is_err() && called.is_err(), "{checked:?} {called:?}");
+    for name in ["mcp connect", "mcp connection_check", "mcp call"] {
+        assert!(
+            spans.iter().any(|span| span.name == name && matches!(span.status, opentelemetry::trace::Status::Error { .. })),
+            "a failed {name} span: {spans:?}"
+        );
+    }
+    let exported = format!("{spans:?}");
+    assert!(!exported.contains(path_key), "{exported}");
+}
+
+/// SME-386 review round 1, L1: the tool list's "unreachable this turn"
+/// warning is an event on the turn's span, and `scrub_urls` keeps a URL's
+/// path, so a key there (M1) went with it. Neither it nor any span
+/// exports the key.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_tool_lists_warning_exports_no_key_from_the_urls_path(pool: sqlx::PgPool) {
+    let path_key = "PATHKEY386list000000";
+    let config = create_static_server(&pool, &format!("http://127.0.0.1:1/mcp/s/{path_key}/mcp")).await;
+    let console = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (_, spans) = crate::telemetry::capture_spans_with_console(console.clone(), async {
+        crate::telemetry::in_span(tracing::info_span!("caller"), async {
+            tool_definitions_for(&pool, std::slice::from_ref(&config), &unruled()).await
+        })
+        .await
+    })
+    .await;
+    evict(config.id).await;
+    lock_failures().remove(&config.id);
+    // smelt's own warning; rmcp's own log lines quote the URL too, which
+    // is filed apart (it's older than this ticket).
+    let logged = String::from_utf8_lossy(&console.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
+    let warnings: Vec<&str> = logged.lines().filter(|line| line.contains("MCP server unreachable this turn")).collect();
+    assert!(!warnings.is_empty(), "the warning was logged: {logged}");
+    for warning in warnings {
+        assert!(!warning.contains(path_key), "{warning}");
+    }
+    let events: Vec<_> = spans
+        .iter()
+        .flat_map(|span| span.events.iter())
+        .filter(|event| event.name.contains("MCP server unreachable this turn"))
+        .collect();
+    assert!(!events.is_empty(), "the warning is exported: {spans:?}");
+    assert!(!format!("{events:?}").contains(path_key), "{events:?}");
+}

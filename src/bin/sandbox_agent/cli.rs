@@ -26,7 +26,7 @@ pub(super) fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let socket = std::env::var(MCP_SOCKET_ENV).ok();
     let mut stdin = std::io::stdin();
-    let (code, out, err) = run(&args, socket.as_deref(), &mut stdin);
+    let (code, out, err) = run(&args, socket.as_deref(), super::mcp::MCP_SOCKET_PATH, &mut stdin);
     let _ = std::io::stdout().write_all(out.as_bytes());
     if !out.is_empty() && !out.ends_with('\n') {
         println!();
@@ -37,18 +37,10 @@ pub(super) fn main() -> std::process::ExitCode {
     std::process::ExitCode::from(code)
 }
 
-/// One run: the exit code, stdout and stderr.
-pub(super) fn run(args: &[String], socket: Option<&str>, stdin: &mut dyn Read) -> (u8, String, String) {
-    let Some(socket) = socket.filter(|s| !s.is_empty()) else {
-        return (
-            3,
-            String::new(),
-            format!(
-                "${MCP_SOCKET_ENV} isn't set: this sandbox's image predates script MCP calls, or its agent couldn't open the socket; \
-                 stop and start the sandbox to get one that has them"
-            ),
-        );
-    };
+/// One run: the exit code, stdout and stderr. `socket` is
+/// `$SMELT_MCP_SOCKET`; without it (`sudo` and `env -i` drop it) the
+/// socket is `fallback`, its fixed path, when that exists (SME-386 M7).
+pub(super) fn run(args: &[String], socket: Option<&str>, fallback: &str, stdin: &mut dyn Read) -> (u8, String, String) {
     let request = match args.first().map(String::as_str) {
         Some("tools") if args.len() <= 2 => {
             let path = match args.get(1) {
@@ -69,8 +61,26 @@ pub(super) fn run(args: &[String], socket: Option<&str>, stdin: &mut dyn Read) -
                 }
                 Some(text) => text.to_string(),
             };
-            // The arguments as the script wrote them: smelt reads them, and
-            // says what's wrong with them.
+            // Read here, so arguments that aren't an object are a usage
+            // error of the CLI's own (SME-386 M8): spliced in as they were,
+            // `''` made a body smelt could only call malformed. They go up
+            // as the script wrote them, not re-serialized.
+            match serde_json::from_str::<serde_json::Value>(&arguments) {
+                Ok(serde_json::Value::Object(_)) => {}
+                Ok(other) => {
+                    let kind = match other {
+                        serde_json::Value::Array(_) => "an array",
+                        serde_json::Value::String(_) => "a string",
+                        serde_json::Value::Number(_) => "a number",
+                        serde_json::Value::Bool(_) => "a boolean",
+                        _ => "null",
+                    };
+                    return (3, String::new(), format!("the arguments must be a JSON object, like '{{\"query\":\"x\"}}', not {kind}"));
+                }
+                Err(e) => {
+                    return (3, String::new(), format!("the arguments aren't JSON ({e}); pass an object, like '{{\"query\":\"x\"}}', or none for {{}}"));
+                }
+            }
             let body = format!("{{\"tool\":{},\"arguments\":{}}}", json_string(&args[1]), arguments.trim());
             format!(
                 "POST /v1/call HTTP/1.1\r\nHost: smelt\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -78,6 +88,22 @@ pub(super) fn run(args: &[String], socket: Option<&str>, stdin: &mut dyn Read) -
             )
         }
         _ => return (3, String::new(), USAGE.to_string()),
+    };
+    // After the request is built, so a usage or arguments error is said
+    // first (review round 1, N2).
+    let socket = match socket.filter(|s| !s.is_empty()) {
+        Some(socket) => socket,
+        None if std::path::Path::new(fallback).exists() => fallback,
+        None => {
+            return (
+                3,
+                String::new(),
+                format!(
+                    "${MCP_SOCKET_ENV} isn't set and there's no socket at {fallback}: this sandbox's image predates script MCP calls, \
+                     or its agent couldn't open the socket; stop and start the sandbox to get one that has them"
+                ),
+            );
+        }
     };
     match exchange(socket, &request) {
         Ok((status, body)) => (exit_code(status), body, String::new()),

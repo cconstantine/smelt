@@ -182,7 +182,8 @@ fn parent_of(pid: i32) -> Option<i32> {
 /// terminal whose `bash` is its nearest ancestor. The walk stops at pid 1
 /// (the agent in a pod, and the reaper of orphans), at this process, or
 /// after `MAX_ANCESTRY` steps. A process double-forked away from its
-/// shell belongs to none.
+/// shell belongs to none. An ended shell is skipped (SME-386 M6): its pid
+/// is free, and a process the kernel gave it to is some other tree's.
 pub(super) async fn command_for_pid(state: &AppState, pid: i32) -> Option<String> {
     let shells: Vec<Arc<Shell>> = state.terminals.lock().await.values().cloned().collect();
     let own = std::process::id() as i32;
@@ -191,7 +192,7 @@ pub(super) async fn command_for_pid(state: &AppState, pid: i32) -> Option<String
         if at <= 1 || at == own {
             return None;
         }
-        if let Some(shell) = shells.iter().find(|shell| shell.bash_pid as i32 == at) {
+        if let Some(shell) = shells.iter().find(|shell| shell.bash_pid as i32 == at && !shell.ended.load(Ordering::SeqCst)) {
             return shell.current.lock().await.clone();
         }
         at = parent_of(at)?;

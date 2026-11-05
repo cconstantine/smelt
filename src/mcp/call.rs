@@ -98,9 +98,12 @@ pub async fn call_tool_raw(
     );
     crate::telemetry::in_span(span.clone(), async move {
         match call_tool_unspanned(pool, config, tool_name, arguments, check_class).await {
-            Ok(result) => {
+            Ok(mut result) => {
                 if result.is_error.unwrap_or(false) {
                     crate::telemetry::mark_error(&span, CallFailure::REPORTED);
+                    // The tool's own error can quote the request, a
+                    // header's value included (SME-386 M3).
+                    redact_tool_error(pool, config, &mut result).await;
                 }
                 Ok(result)
             }
@@ -111,7 +114,9 @@ pub async fn call_tool_raw(
                         message
                     }
                     CallFailure::Failed(message) => {
-                        crate::telemetry::mark_error(&span, &message);
+                        // Redacted as the model's copy is (SME-386 M2):
+                        // `mark_error` cuts a URL's query, not its path.
+                        crate::telemetry::mark_error(&span, &redact_secrets(config, &message));
                         message
                     }
                     CallFailure::Transport { message, description } => {
@@ -318,13 +323,61 @@ async fn call_tool_unspanned(
     Ok(result)
 }
 
+/// An `is_error` result with `config`'s secrets redacted from every
+/// string in its content blocks and its `structured_content`, the grant read
+/// once for them all.
+async fn redact_tool_error(pool: &sqlx::PgPool, config: &McpServerConfig, result: &mut rmcp::model::CallToolResult) {
+    let current = current_grant(pool, config).await;
+    let redact = |text: &str| {
+        let text = redact_secrets(config, text);
+        match &current {
+            Some(current) => redact_secrets(current, &text),
+            None => text,
+        }
+    };
+    for block in &mut result.content {
+        match block {
+            McpContentBlock::Text(text) => text.text = redact(&text.text),
+            // Any other block (an embedded resource, a link) reaches the
+            // model serialized and a script whole (review round 1, L2):
+            // every string in it, and a block that can't be rebuilt so is
+            // replaced by a note.
+            other => {
+                let rebuilt = serde_json::to_value(&*other).ok().and_then(|mut value| {
+                    let mut strings = Vec::new();
+                    collect_strings_mut(&mut value, &mut strings);
+                    for string in strings {
+                        *string = redact(string);
+                    }
+                    serde_json::from_value::<McpContentBlock>(value).ok()
+                });
+                *other = rebuilt.unwrap_or_else(|| McpContentBlock::text(format!("{REDACTED} (an MCP content block)")));
+            }
+        }
+    }
+    if let Some(structured) = &mut result.structured_content {
+        let mut strings = Vec::new();
+        collect_strings_mut(structured, &mut strings);
+        for string in strings {
+            *string = redact(string);
+        }
+    }
+}
+
+/// Every string in `value`, its object keys aside.
+fn collect_strings_mut<'a>(value: &'a mut serde_json::Value, into: &mut Vec<&'a mut String>) {
+    match value {
+        serde_json::Value::String(text) => into.push(text),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(|item| collect_strings_mut(item, into)),
+        serde_json::Value::Object(map) => map.values_mut().for_each(|item| collect_strings_mut(item, into)),
+        _ => {}
+    }
+}
+
 /// [`redact_secrets`] with the grant as it is stored now, falling back to
 /// `config`'s alone when it can't be read.
 async fn redact_secrets_now(pool: &sqlx::PgPool, config: &McpServerConfig, text: &str) -> String {
-    let current = match config.auth_mode.as_str() {
-        "oauth" => crate::db::get_mcp_server_config(pool, config.id).await.ok().flatten(),
-        _ => None,
-    };
+    let current = current_grant(pool, config).await;
     let text = redact_secrets(config, text);
     match current {
         Some(current) => redact_secrets(&current, &text),
@@ -332,11 +385,22 @@ async fn redact_secrets_now(pool: &sqlx::PgPool, config: &McpServerConfig, text:
     }
 }
 
+/// An OAuth server's row as it is stored now (a refresh during the call
+/// may have replaced the tokens `config` was read with); `None` for
+/// another server, or when it can't be read.
+async fn current_grant(pool: &sqlx::PgPool, config: &McpServerConfig) -> Option<McpServerConfig> {
+    match config.auth_mode.as_str() {
+        "oauth" => crate::db::get_mcp_server_config(pool, config.id).await.ok().flatten(),
+        _ => None,
+    }
+}
+
 /// What stands in for a secret in error text.
 pub const REDACTED: &str = "<redacted>";
 
 /// `text` with every secret `config` holds replaced by [`REDACTED`]
-/// (SME-359): the URL's query (whole, and each value) and password,
+/// (SME-359): the URL's query (whole, and each value), password and
+/// key-shaped path segments (SME-386),
 /// every extra header's value, the OAuth client secret and every token
 /// in the stored grant. An error from a call can quote any of them (a
 /// connect error quotes the URL, a server's error page the request's
@@ -370,6 +434,18 @@ pub fn redact_secrets(config: &McpServerConfig, text: &str) -> String {
                 .filter(|(name, value)| names_a_credential(name) || looks_like_a_key(value))
                 .map(|(_, value)| value.into_owned()),
         );
+        // A key can be a path segment (`…/mcp/s/<key>/mcp`, SME-386 M1),
+        // and reqwest's connect error quotes the path: each segment that
+        // looks like a key, as `url` prints it and decoded. The path's
+        // words (`mcp`, `s`) stay.
+        if let Some(segments) = url.path_segments() {
+            for segment in segments.filter(|segment| looks_like_a_key(segment)) {
+                secrets.push(segment.to_string());
+                if let Ok(decoded) = percent_encoding::percent_decode_str(segment).decode_utf8() {
+                    secrets.push(decoded.into_owned());
+                }
+            }
+        }
         secrets.extend(url.password().map(str::to_string));
         // A token can be the URL's user part (`https://ghp_…@host`).
         secrets.extend(Some(url.username().to_string()).filter(|user| !user.is_empty()));

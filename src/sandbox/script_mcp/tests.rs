@@ -469,6 +469,25 @@ async fn test_calls_held_back_are_counted_without_rows(pool: PgPool) {
     assert_eq!(summary.text(), "MCP: 1 call · mock-m2/second_tool ×1 · 3 held back by a limit");
 }
 
+/// SME-386 M4: a command's summary counts only its own conversation's
+/// calls. A held-back call publishes the summary of the command id the
+/// agent named, unchecked, so an agent naming another conversation's
+/// command would otherwise read that command's counts.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_commands_summary_counts_only_its_own_conversations_calls(pool: PgPool) {
+    let (mine, _) = conversation_with_pod(&pool, None).await;
+    let (theirs, their_pod) = conversation_with_pod(&pool, None).await;
+    let terminal = db::create_sandbox_terminal(&pool, their_pod).await.expect("terminal").id;
+    db::create_terminal_command(&pool, theirs, terminal, "cmd-m4", "loop", 0).await.expect("command");
+    db::insert_sandbox_mcp_call(&pool, theirs, their_pod, Some("cmd-m4"), "linear", "list_issues", Some("read_only"), "ok")
+        .await
+        .expect("their call");
+    let theirs_read = command_summary(&pool, theirs, "cmd-m4").await.expect("read");
+    assert!(theirs_read.is_some(), "the command's own conversation sees its call");
+    let mine_read = command_summary(&pool, mine, "cmd-m4").await.expect("read");
+    assert_eq!(mine_read, None, "another conversation's command is none of mine");
+}
+
 /// Review round 1, M2: a tool name over 256 bytes is refused before
 /// anything is looked up or recorded.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
@@ -500,6 +519,24 @@ async fn test_the_budget_counts_use_an_index(pool: PgPool) {
         assert!(!plan.contains("Seq Scan on sandbox_mcp_calls"), "the {name} count scans the table:\n{plan}");
         assert!(plan.contains("Index") || plan.contains("Bitmap"), "the {name} count uses no index:\n{plan}");
     }
+}
+
+/// SME-386 M5: deleting a pod cascades to its calls, and the cascade's
+/// own delete (Postgres runs `DELETE FROM ONLY … WHERE $1 = pod_id`) is
+/// answered from an index. The partial index on command-less calls
+/// can't serve it, so every pod delete scanned every call.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_pods_cascade_to_its_calls_uses_an_index(pool: PgPool) {
+    let mut conn = pool.acquire().await.expect("a connection");
+    sqlx::query("SET enable_seqscan = off").execute(&mut *conn).await.expect("set");
+    let plan: Vec<String> = sqlx::query_scalar("EXPLAIN DELETE FROM ONLY sandbox_mcp_calls WHERE $1 = pod_id")
+        .bind(2_i64)
+        .fetch_all(&mut *conn)
+        .await
+        .expect("explain");
+    let plan = plan.join("\n");
+    assert!(!plan.contains("Seq Scan on sandbox_mcp_calls"), "the cascade scans the table:\n{plan}");
+    assert!(plan.contains("Index") || plan.contains("Bitmap"), "the cascade uses no index:\n{plan}");
 }
 
 /// Review round 1, L4: listing the tools takes a rate token like a call,

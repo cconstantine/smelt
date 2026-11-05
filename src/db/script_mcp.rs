@@ -131,9 +131,12 @@ pub async fn list_sandbox_mcp_calls(pool: &PgPool, conversation_id: i64) -> Resu
 }
 
 /// The recorded calls of each of `command_ids`, grouped by tool and
-/// outcome, for their summaries (`api::mcp_calls`).
+/// outcome, for their summaries (`api::mcp_calls`): `conversation_id`'s
+/// alone, since a command id can come from the pod's agent unchecked
+/// (SME-386 M4).
 pub async fn sandbox_mcp_call_counts(
     pool: &PgPool,
+    conversation_id: i64,
     command_ids: &[String],
 ) -> Result<std::collections::HashMap<String, Vec<crate::api::mcp_calls::McpCallCount>>, sqlx::Error> {
     let rows: Vec<(String, String, String, String, bool, i64)> = sqlx::query_as(
@@ -141,11 +144,12 @@ pub async fn sandbox_mcp_call_counts(
                 outcome = 'running' AND started_at < now() - make_interval(secs => $2) AS stale,
                 count(*)
            FROM sandbox_mcp_calls
-          WHERE command_id = ANY($1)
+          WHERE command_id = ANY($1) AND conversation_id = $3
           GROUP BY 1, 2, 3, 4, 5",
     )
     .bind(command_ids)
     .bind(crate::api::mcp_calls::UNKNOWN_AFTER_SECS as f64)
+    .bind(conversation_id)
     .fetch_all(pool)
     .await?;
     let mut counts: std::collections::HashMap<String, Vec<crate::api::mcp_calls::McpCallCount>> = Default::default();

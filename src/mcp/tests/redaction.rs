@@ -149,3 +149,63 @@ fn test_a_credential_named_parameter_and_a_username_token_are_redacted() {
         assert!(redacted.contains("web_search_exa"), "{url}: a tool name isn't a secret: {redacted}");
     }
 }
+
+/// SME-386 M1: a key carried in the URL's path (`…/mcp/s/<key>/mcp`, as
+/// some hosted servers give it) is quoted by reqwest's connect error just
+/// as a query is, so a path segment that looks like a key goes too.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_connect_error_doesnt_quote_a_key_in_the_urls_path(pool: sqlx::PgPool) {
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.local_addr().expect("addr").port()
+    };
+    let marker = "PATHKEY386closed0000";
+    let config = static_server(&pool, &format!("http://127.0.0.1:{port}/mcp/s/{marker}/mcp"), &[]).await;
+    let texts = error_texts(&pool, &config).await;
+    assert_no_marker(&texts, marker);
+}
+
+/// SME-386 M1: a key-shaped path segment goes, raw and percent-decoded;
+/// the path's ordinary words stay.
+#[test]
+fn test_a_key_in_the_urls_path_is_redacted_and_its_words_stay() {
+    let key = "3f2a9c1e-77b4-4d0e-9a31-5c8e2b6f0d47";
+    let mut config = test_config(-386_001, "hosted");
+    config.url = format!("https://mcp.example.com/mcp/s/{key}/mcp");
+    let text = format!("error sending request for url (https://mcp.example.com/mcp/s/{key}/mcp): connection refused");
+    let redacted = redact_secrets(&config, &text);
+    assert!(!redacted.contains("3f2a9c1e"), "{redacted}");
+    assert!(redacted.contains("https://mcp.example.com/mcp/s/"), "the path's words stay: {redacted}");
+
+    config.url = "https://mcp.example.com/mcp/s/Ab12Cd34Ef56Gh78%2Bx/mcp".to_string();
+    let redacted = redact_secrets(&config, "echoed Ab12Cd34Ef56Gh78+x and Ab12Cd34Ef56Gh78%2Bx");
+    assert!(!redacted.contains("Ab12Cd34"), "{redacted}");
+}
+
+/// SME-386 M3: a tool's own error (`isError`) can quote the request, its
+/// header values included, and it reaches the model and a script just as
+/// smelt's errors do, so it is redacted the same way. The tool's own
+/// words stay.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_tools_own_error_doesnt_quote_a_header(pool: sqlx::PgPool) {
+    let marker = "HEADERKEY-386-tool";
+    let config = static_server(&pool, "http://unused.invalid/mcp", &[("x-api-key", marker)]).await;
+    register_mock(config.id, MockMcpServer::new(false)).await;
+    let arguments = serde_json::json!({"x-api-key": marker});
+    let for_the_model = call_tool(&pool, &config, "fail_quoting", arguments.clone()).await.expect_err("the tool fails");
+    let for_a_script = call_tool_raw(&pool, &config, "fail_quoting", arguments, |_, _| Ok(())).await;
+    REGISTRY.lock().await.remove(&config.id);
+    let for_a_script = for_a_script.expect("the tool's own error is a result");
+    assert_eq!(for_a_script.is_error, Some(true));
+    // Review round 1, L2: a block that isn't text (an embedded resource
+    // here) reaches the model serialized and the script whole.
+    let blocks = serde_json::to_string(&for_a_script.content).expect("serialize");
+    assert!(!blocks.contains(marker) && blocks.contains("file:///request"), "{blocks}");
+    let structured = serde_json::to_string(&for_a_script.structured_content).expect("serialize");
+    assert!(!structured.contains(marker) && structured.contains("refused"), "{structured}");
+    let script_text = result_text(&for_a_script);
+    for text in [&for_the_model, &script_text] {
+        assert!(!text.contains(marker), "{text}");
+        assert!(text.contains("refused the request"), "{text}");
+    }
+}
