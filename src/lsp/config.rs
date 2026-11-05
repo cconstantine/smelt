@@ -260,6 +260,9 @@ mod tests {
         let server = url.rsplit_once('/').expect("a URL naming a database").0;
         let other = format!("_sqlx_test_sme395_{}", std::process::id());
         let maint = sqlx::PgPool::connect(&url).await.expect("a connection to the test database");
+        // A mid-test panic skips the DROP at the end, and a CI runner can
+        // hand this pid to another run: clear the name before claiming it.
+        sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS \"{other}\" WITH (FORCE)")).execute(&maint).await.expect("a clear name");
         sqlx::raw_sql(&format!("CREATE DATABASE \"{other}\"")).execute(&maint).await.expect("a second database");
         let scratch = sqlx::PgPool::connect(&format!("{server}/{other}")).await.expect("the second database");
         crate::test_lock::MIGRATOR.run(&scratch).await.expect("migrated");
