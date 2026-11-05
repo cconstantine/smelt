@@ -433,21 +433,26 @@ async fn forget_earlier_saves(page: &chromiumoxide::Page) {
 }
 
 /// SME-371: what the page and the store held when a saved secret's row didn't
-/// appear, so a flake names its mechanism: refused on the page (the value
-/// signal empty at the submit), failed at the server, or saved but never
-/// shown. The answers the browser finished should tell the last two apart:
-/// none should mean the response never came, one that the page never used it.
-/// Its errors may say why it wouldn't: a panic ends the page's WASM, leaving
-/// the DOM as it stood.
+/// appear within its wait. Read together, the fields should name the mechanism,
+/// none of them alone. `stored` with the button still on "Adding..." and no
+/// finished answer: the save committed and its response hadn't come by then.
+/// No finished answer and not stored: the request may never have left. A
+/// finished answer the page then used shows in the button and the page text, a
+/// server's error among them; one with the button still on "Adding..." was never
+/// used. In this debug build a Rust panic goes through Dioxus's hook, so it
+/// should show first as its text in the page errors, with the toast shown:
+/// `aria-hidden` is the difference between `dx`'s dev template, always in the
+/// DOM off-screen, and a toast shown at runtime. Only a deliberately held
+/// response has been read so far.
 async fn row_missing_report(t: &Scenario<'_>, page: &chromiumoxide::Page, what: &str, name: &str) -> String {
     let seen: String = page
-        .evaluate("(() => [document.querySelectorAll('.secret-row').length, document.querySelector('#secret-value')?.value ?? 'no field', document.querySelector('.secrets-add-form button')?.textContent ?? 'no button', performance.getEntriesByType('resource').filter(e => e.name.endsWith('/api/secrets/save')).length, (window.__smeltErrors ?? ['no error hook']).join(' ; '), document.body.innerText.slice(0, 400)].join(' | '))()")
+        .evaluate("(() => [document.querySelectorAll('.secret-row').length, document.querySelector('#secret-value')?.value ?? 'no field', document.querySelector('.secrets-add-form button')?.textContent ?? 'no button', performance.getEntriesByType('resource').filter(e => e.name.endsWith('/api/secrets/save')).length, (window.__smeltErrors ?? ['no error hook']).join(' ; '), document.querySelector('#__dx-toast')?.getAttribute('aria-hidden') ?? 'no toast', document.querySelector('#main')?.innerText.slice(0, 400) ?? 'no #main'].join(' | '))()")
         .await
         .ok()
         .and_then(|v| v.into_value().ok())
         .unwrap_or_default();
     let stored = crate::db::list_named_secrets(t.pool).await.map(|s| s.iter().any(|s| s.name == name));
-    format!("the {what}'s row should appear; rows | field | button | save answers finished | page errors | page text: {seen:?}; stored: {stored:?}")
+    format!("the {what}'s row should appear; rows | field | button | save answers finished | page errors | toast aria-hidden | page text: {seen:?}; stored: {stored:?}")
 }
 
 /// T12 (SME-242): the Secrets page adds a secret, changes its value in
