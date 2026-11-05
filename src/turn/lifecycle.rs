@@ -138,8 +138,8 @@ pub(super) fn run_turn_bounded<'a>(
             }
             // Its own words, for a parent's report below.
             let failed_with = match &result {
-                Err(TurnFailure::Failed(e)) => Some(chat_error_text(e)),
-                Err(TurnFailure::Noted { reason }) => Some(reason.clone()),
+                Err(TurnFailure::Failed(e)) => Some(format!("it failed: {}", chat_error_text(e))),
+                Err(TurnFailure::Noted { reason }) => Some(format!("it failed: {reason}")),
                 _ => None,
             };
             // Kept for a tab that reconnects, unless a newer turn has started
@@ -185,16 +185,18 @@ pub(super) fn run_turn_bounded<'a>(
             drop(in_flight);
             let ended = match &result {
                 Ok(saved) if saved.is_empty() => None,
-                Ok(_) => Some(None),
+                // A refusal or a cut-off ends a turn without failing it, and
+                // the parent, who reports to the user (N6), hears why (F6).
+                Ok(saved) => Some(why_reply_stopped(saved)),
                 Err(TurnFailure::Failed(_) | TurnFailure::Noted { .. }) => Some(failed_with),
                 Err(TurnFailure::Stopped) => None,
             };
-            if let Some(failure) = ended
+            if let Some(why) = ended
                 && !turn_running(conversation_id)
             {
                 let pool = pool.clone();
                 tokio::spawn(tracing::Instrument::in_current_span(async move {
-                    crate::agents::after_last_turn(&pool, conversation_id, failure).await;
+                    crate::agents::after_last_turn(&pool, conversation_id, why).await;
                 }));
             }
             result

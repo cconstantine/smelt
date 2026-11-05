@@ -182,6 +182,25 @@ pub(super) async fn save_stop_notice(
     Ok(())
 }
 
+/// Why a turn that saved `saved` ended on a reply smelt stopped, in the words
+/// a parent's notice carries (SME-386 F6): its last message is the notice
+/// `save_stop_notice` saved. `None` for a turn that ended any other way.
+#[cfg(feature = "server")]
+pub(super) fn why_reply_stopped(saved: &[Message]) -> Option<String> {
+    let blocks = saved.last()?.blocks().ok()?;
+    let [anthropic::ContentBlock::Text { text }] = blocks.as_slice() else {
+        return None;
+    };
+    let dropped = |call: Option<String>| {
+        call.map(|name| format!(", in the middle of a call to `{name}`, which didn't run")).unwrap_or_default()
+    };
+    if let Some(call) = crate::api::chat::parse_refusal_notice(text) {
+        return Some(format!("the model provider's safety system refused its reply{}", dropped(call)));
+    }
+    let (tokens, limit, call) = crate::api::chat::parse_cut_off_notice(text)?;
+    Some(format!("its reply was cut off at {tokens} tokens, {}{}", limit.reason(), dropped(call)))
+}
+
 /// Runs a reply's tool calls and returns their results, and whether the
 /// turn ends here: the reply asked the user a question, or an agent's
 /// `finish` (SME-236) or the model's `notify_user` (SME-377) went
