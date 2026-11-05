@@ -272,7 +272,8 @@ impl CompactionProgress {
         if std::mem::take(&mut self.try_anyway) {
             return FloorAnswer::TryAnyway;
         }
-        self.after = Some(size);
+        // What a reply measured, if any, is the better number to name.
+        self.after.get_or_insert(size);
         self.stuck = true;
         FloorAnswer::NoRoom(self.why_stuck(model, context_window))
     }
@@ -553,13 +554,13 @@ mod tests {
     }
 
     #[test]
-    fn test_the_floor_with_no_measured_room_is_stuck_and_says_why() {
+    fn test_the_floor_is_stuck_and_names_what_was_measured_not_the_estimate() {
         let mut progress = tight();
         after_compaction(&mut progress, 96_000);
         let FloorAnswer::NoRoom(why) = progress.floor_fired(99_000, "m", WINDOW) else {
             panic!("no room by either number");
         };
-        assert!(why.contains("(100,000 tokens) is too small"), "{why}");
+        assert!(why.contains("(100,000 tokens) is too small") && why.contains("about 96,000 tokens"), "{why}");
         assert!(progress.is_stuck());
         assert_eq!(progress.why_if_stuck("m", WINDOW).as_deref(), Some(why.as_str()));
         progress.user_wrote();
