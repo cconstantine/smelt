@@ -501,9 +501,10 @@ where
     unconfirmed.clone()
 }
 
-/// What a delete tells the page about the live pods it couldn't prune
-/// (SME-354 B5): `None` when every one was, else how many may still hold
-/// the deleted file — every live pod when they couldn't be listed.
+/// What a delete tells the page about the live pods not confirmed pruned
+/// (SME-354 B5, SME-371): `None` when every one was, else how many may still
+/// hold the deleted file, those still installing at the answer included —
+/// every live pod when they couldn't be listed.
 pub async fn prune_live_pods(pool: &PgPool) -> Option<u32> {
     let missed = match install_into_live_pods(pool).await {
         Some(missed) => missed.len(),

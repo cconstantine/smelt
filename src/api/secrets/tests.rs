@@ -176,7 +176,7 @@ async fn test_a_delete_that_cant_reach_a_live_pod_says_how_many(pool: PgPool) {
     assert!(list_secrets_of(pool).await.expect("listed").is_empty(), "the row is deleted all the same");
     assert_eq!(
         unpruned_sandboxes_notice(1),
-        "Deleted, but couldn't remove it from 1 running sandbox; stop them to be sure."
+        "Deleted, but not yet confirmed removed from 1 running sandbox; stop them to be sure."
     );
 }
 
@@ -212,6 +212,11 @@ async fn test_a_stuck_install_doesnt_hold_a_saves_answer_or_a_deletes(pool: PgPo
         .expect("the delete's answer waited on the stuck install")
         .expect("deleted");
     assert_eq!(unpruned, Some(1), "the pod still installing isn't known pruned");
+    // Said as what's known: it may still finish, so never "couldn't".
+    assert_eq!(
+        unpruned_sandboxes_notice(3),
+        "Deleted, but not yet confirmed removed from 3 running sandboxes; stop them to be sure."
+    );
     let _ = held.send(());
     holder.await.expect("the holder");
 }
