@@ -267,6 +267,7 @@ fn run_turn_steps<'a: 'b, 'b>(
             // the oversized request compaction exists to prevent — see
             // SME-18's "Resolved" decisions.
             let projected = projected_input(last_known_usage.as_ref(), estimate_tokens(&pending_new_content));
+            let mut compacted = false;
             match with_compaction_progress(conversation_id, |p| p.step(&turn_model.model, turn_model.context_window, projected)) {
                 CompactionStep::Go => {}
                 // Compacting again would only repeat what the last ones
@@ -277,26 +278,25 @@ fn run_turn_steps<'a: 'b, 'b>(
                     // divider (SME-73).
                     compact_conversation(pool, conversation_id, turn_model, slot.held(), None).await?;
                     with_compaction_progress(conversation_id, |p| p.compacted(turn_model.context_window));
+                    compacted = true;
                     // The last usage measured the history just summarized: the
                     // reply budget below estimates the new one instead.
                     last_known_usage = None;
                 }
             }
 
+            let (mut request, budget) = build_request_with_room(
+                pool,
+                conversation_id,
+                turn_model,
+                slot.held(),
+                &mut last_known_usage,
+                &pending_new_content,
+                &mut compacted,
+            )
+            .await?;
             // What a compaction would have to free, for a cut-off reply below.
             let mut sized = projected_input(last_known_usage.as_ref(), estimate_tokens(&pending_new_content));
-            let room_only = with_compaction_progress(conversation_id, |p| p.room_only());
-            let (mut request, budget) =
-                build_request(pool, conversation_id, turn_model, last_known_usage.as_ref(), &pending_new_content, room_only)
-                    .await?;
-            // Compacted, and still no room to answer in: only straight after a
-            // compaction can this be, the step above having just compacted
-            // anything nearer the limit (SME-386 round 2 M2).
-            if room_only && budget.limit == crate::api::chat::ReplyLimit::RoomLeft && budget.tokens < MIN_USEFUL_REPLY {
-                let size = estimate_request_tokens(&request);
-                let why = with_compaction_progress(conversation_id, |p| p.no_room(size, &turn_model.model, turn_model.context_window));
-                return Err(ServerFnError::new(why));
-            }
             let offered: Vec<String> = request.tools.iter().map(|tool| tool.name.clone()).collect();
             // A refusal meaning "this didn't fit" answers itself once:
             // learn the window, shrink, send again (SME-73). Every

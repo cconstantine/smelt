@@ -54,6 +54,48 @@ pub(super) async fn build_request(
     Ok((request, budget))
 }
 
+/// `build_request`, held to the floor (`MIN_USEFUL_REPLY`) when compacting
+/// can't help and the request gets only the room left. A request under it
+/// that hasn't just compacted (`compacted`) does now, whatever got it there
+/// (a big paste, or the usage row a compaction clears until a reply lands),
+/// and is built again (SME-386 review M-A). Only one that has is refused.
+#[cfg(feature = "server")]
+pub(super) async fn build_request_with_room(
+    pool: &PgPool,
+    conversation_id: i64,
+    turn_model: &mut crate::providers::TurnModel,
+    slot: anthropic::stream::SlotPolicy<'_>,
+    last_known_usage: &mut Option<anthropic::TokenUsage>,
+    pending_new_content: &[anthropic::ContentBlock],
+    compacted: &mut bool,
+) -> ServerFnResult<(anthropic::CreateMessageRequest, ReplyBudget)> {
+    let mut room_only = with_compaction_progress(conversation_id, |p| p.room_only_at(turn_model.context_window));
+    let (mut request, mut budget) = build_request(pool, conversation_id, turn_model, last_known_usage.as_ref(), pending_new_content, room_only).await?;
+    if under_the_floor(room_only, budget) && !*compacted {
+        compact_conversation(pool, conversation_id, turn_model, slot, None).await?;
+        // Compacting can learn a smaller window, which forgets what `room_only` read.
+        room_only = with_compaction_progress(conversation_id, |p| {
+            p.compacted(turn_model.context_window);
+            p.room_only_at(turn_model.context_window)
+        });
+        *compacted = true;
+        *last_known_usage = None;
+        (request, budget) = build_request(pool, conversation_id, turn_model, None, pending_new_content, room_only).await?;
+    }
+    if under_the_floor(room_only, budget) {
+        let size = estimate_request_tokens(&request);
+        let why = with_compaction_progress(conversation_id, |p| p.no_room(size, &turn_model.model, turn_model.context_window));
+        return Err(ServerFnError::new(why));
+    }
+    Ok((request, budget))
+}
+
+/// Whether a request's budget is what's left of the room, and too little.
+#[cfg(feature = "server")]
+fn under_the_floor(room_only: bool, budget: ReplyBudget) -> bool {
+    room_only && budget.limit == crate::api::chat::ReplyLimit::RoomLeft && budget.tokens < MIN_USEFUL_REPLY
+}
+
 /// Saves a model call's reply, and, for a reply cut off or refused, a
 /// "not run" result for each whole call in it.
 #[cfg(feature = "server")]

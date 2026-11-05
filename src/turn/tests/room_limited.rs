@@ -36,6 +36,10 @@ impl Honest {
     }
 }
 
+/// A step that fails, its stream ending in an error.
+const FAILS: i64 = -1;
+const OVERLOADED: &str = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+
 /// Answers each model step from `plans`, in order, then "Done.", and each
 /// summary request with a summary.
 pub(super) async fn honest_mock(pool: &PgPool, plans: Vec<Plan>) -> Arc<Honest> {
@@ -58,6 +62,7 @@ pub(super) async fn honest_mock(pool: &PgPool, plans: Vec<Plan>) -> Arc<Honest> 
                     let mut steps = log.steps.lock().expect("the request log");
                     steps.push(parsed);
                     match plans.get(steps.len() - 1) {
+                        Some(Plan { wants: FAILS, .. }) => OVERLOADED.to_string(),
                         Some(Plan { input, wants }) if *wants > max_tokens => with_usage(
                             &text_reply_body("Half a thought").replace("end_turn", "max_tokens"),
                             *input,
@@ -322,4 +327,30 @@ async fn test_the_retry_after_a_refusal_keeps_to_the_room(pool: PgPool) {
     // The retry goes out at about 30,100 of 40,000.
     let retried = mock.request(7)["max_tokens"].as_u64().expect("max_tokens");
     assert!(retried + 30_100 + u64::from(COMPACTION_SAFETY_BUFFER) <= 40_000, "{retried} reply tokens");
+}
+
+/// Review M-A: a compaction clears the usage row until a reply lands, so a
+/// request can look over the floor with nothing compacted yet. The paste
+/// below would be capped by the compaction: the turn compacts and goes on,
+/// rather than saying compacting wouldn't help.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_big_paste_after_a_failed_call_compacts_rather_than_refusing(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let mut plans = learn_its_tight();
+    plans.extend([plan(27_000, 100), plan(0, FAILS), plan(13_600, 100)]);
+    let seen = honest_mock(&pool, plans).await;
+    set_context_window(&pool, 32_768, None).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    run_turn(&pool, conversation.id, hello()).await.expect_err("the call fails, just after a compaction");
+    let (calls, summarized) = (seen.count(), seen.summary_calls());
+    assert_eq!(summarized, 3);
+    let mut rx = events::subscribe(conversation.id);
+
+    start_turn(pool.clone(), conversation.id, format!("Look at this. {}", "x".repeat(80_000))).await.expect("send");
+    wait_until_idle(&mut rx).await;
+
+    assert_eq!(last_failure_reason(&pool, conversation.id).await, None);
+    assert_eq!(seen.summary_calls(), summarized + 1, "it compacted");
+    assert_eq!(seen.count(), calls + 2, "the planned step, and the final reply");
 }
