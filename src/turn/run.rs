@@ -319,7 +319,6 @@ fn run_turn_steps<'a: 'b, 'b>(
                     if let Some(why) = with_compaction_progress(conversation_id, |p| p.why_refused_out(&turn_model.model, turn_model.context_window)) {
                         return Err(ServerFnError::new(why));
                     }
-                    let believed = turn_model.context_window;
                     let recovered = overflow_recovery(
                         pool,
                         conversation_id,
@@ -331,14 +330,6 @@ fn run_turn_steps<'a: 'b, 'b>(
                         &overflow,
                     )
                     .await?;
-                    with_compaction_progress(conversation_id, |p| {
-                        if let Some(guess) = recovered.guessed {
-                            p.guessed(believed, guess);
-                        }
-                        if recovered.compacted {
-                            p.refusal_compacted(turn_model.context_window);
-                        }
-                    });
                     if recovered.compacted {
                         sized = None;
                     }

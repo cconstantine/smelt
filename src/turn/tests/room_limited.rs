@@ -5,7 +5,7 @@
 
 use super::ask_user::tool_calls_body;
 use super::attention::published_after_done;
-use super::overflow::compaction_summaries;
+use super::overflow::{Answer, compaction_summaries, ollama_refused, start_refusal_mock, too_long};
 use super::window_stop::set_context_window;
 use super::*;
 
@@ -260,4 +260,66 @@ async fn test_a_small_output_cap_isnt_a_lack_of_room(pool: PgPool) {
     run_turn(&pool, conversation.id, hello()).await.expect("a small cap is no failure");
 
     assert_eq!(seen.count(), 6);
+}
+
+/// Round 2 M4: a recovery whose retry is refused ends the turn, and still
+/// counts its compaction, or every wake pays for another summary.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_retry_refused_again_counts_its_compaction(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let mut answers = Vec::new();
+    for _ in 0..8 {
+        answers.extend([ollama_refused(), Ok(text_reply_body("The summary.")), ollama_refused()]);
+    }
+    let mock = start_refusal_mock(&pool, answers).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    run_turn(&pool, conversation.id, hello()).await.expect_err("refused twice");
+    assert_eq!(compaction_summaries(&pool, conversation.id).await.len(), 1);
+
+    let pod = db::create_sandbox_pod(&pool, conversation.id).await.expect("create sandbox pod");
+    let terminal = db::create_sandbox_terminal(&pool, pod.id).await.expect("create sandbox terminal");
+    for round in 0..5 {
+        let command = format!("sme-386-m4-{round}");
+        db::create_terminal_command(&pool, conversation.id, terminal.id, &command, "echo hi", 300).await.expect("create terminal command");
+        db::mark_terminal_command_finished(&pool, &command, 0).await.expect("mark terminal command finished");
+        wake_conversation(&pool, conversation.id).await.expect_err("still refused");
+    }
+
+    assert_eq!(compaction_summaries(&pool, conversation.id).await.len(), 3, "the rule of three holds for failed retries");
+    // The turn and two wakes compact; the third wake is refused and stops
+    // there; the last two call nothing.
+    assert_eq!(mock.count(), 3 * 3 + 1);
+}
+
+/// Round 2 L1: a retry after a refusal keeps to the room as the request
+/// before it did.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_retry_after_a_refusal_keeps_to_the_room(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let tool = |input, output| -> Answer { Ok(with_usage(&tool_calls_body(&[("toolu_01", "todoread", serde_json::json!({}))]), input, 0, output)) };
+    let summary = || -> Answer { Ok(text_reply_body("The summary.")) };
+    // The trigger at 40,000 is 23,616; 21,000 leaves too little room under it.
+    let answers = vec![
+        tool(24_000, 100),
+        summary(),
+        tool(21_000, 3_000),
+        summary(),
+        tool(21_000, 100),
+        tool(30_000, 100),
+        // Naming the same window and a small input: the budget's the problem.
+        too_long(5_000, 40_000),
+        Ok(text_reply_body("Done.")),
+    ];
+    let mock = start_refusal_mock(&pool, answers).await;
+    set_context_window(&pool, 40_000, None).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the retry is taken");
+
+    assert_eq!(mock.count(), 8);
+    // The retry goes out at about 30,100 of 40,000.
+    let retried = mock.request(7)["max_tokens"].as_u64().expect("max_tokens");
+    assert!(retried + 30_100 + u64::from(COMPACTION_SAFETY_BUFFER) <= 40_000, "{retried} reply tokens");
 }

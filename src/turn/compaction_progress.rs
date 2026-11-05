@@ -272,6 +272,12 @@ impl CompactionProgress {
         self.refusal_compactions = self.refusal_compactions.min(MAX_REFUSAL_COMPACTIONS - 1);
     }
 
+    /// `room_only`, for a window that may have just changed.
+    pub(super) fn room_only_at(&mut self, context_window: u32) -> bool {
+        self.sync(context_window);
+        self.room_only()
+    }
+
     /// Whether a request past the usual trigger has to keep inside the room
     /// left: the reply budget's floor assumes the trigger kept that room.
     pub(super) fn room_only(&self) -> bool {

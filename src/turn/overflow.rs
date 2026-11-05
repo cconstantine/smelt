@@ -9,14 +9,13 @@
 use super::*;
 
 /// What a recovery ends with: the retry's reply and recorder, the budget
-/// of the request that got it — the one `save_stop_notice` reads — and, for
-/// `CompactionProgress`, whether it compacted and any window it guessed.
+/// of the request that got it — the one `save_stop_notice` reads — and
+/// whether it compacted.
 pub(super) struct Recovered {
     pub(super) turn: anthropic::stream::StreamedTurn,
     pub(super) recorder: CallRecorder,
     pub(super) budget: ReplyBudget,
     pub(super) compacted: bool,
-    pub(super) guessed: Option<u32>,
 }
 
 /// One recovery from an overflow refusal. `turn_model` is the turn's own
@@ -41,7 +40,7 @@ pub(super) async fn recover(
     // What every retry must still leave room for on top of the input:
     // a reply and the estimate's headroom.
     let needs = u64::from(MIN_REPLY_TOKENS) + u64::from(COMPACTION_SAFETY_BUFFER);
-    let mut guessed = None;
+    let believed = turn_model.context_window;
 
     if named.is_some() {
         // Can't help: what no compaction can take away — the system
@@ -61,7 +60,7 @@ pub(super) async fn recover(
         let assumed = u32::try_from(input.saturating_mul(3) / 4).unwrap_or(u32::MAX);
         if assumed < turn_model.context_window {
             turn_model.context_window = assumed;
-            guessed = Some(assumed);
+            with_compaction_progress(conversation_id, |p| p.guessed(believed, assumed));
         }
     }
 
@@ -74,6 +73,10 @@ pub(super) async fn recover(
         #[cfg(test)]
         test_hooks::before_summary_call(conversation_id).await;
         compact_conversation(pool, conversation_id, turn_model, slot, Some(refused_reason(named))).await?;
+        // Counted here, not by the caller: a retry refused too ends the turn
+        // without returning to it, and every wake would pay for another
+        // summary (SME-386 round 2 M4).
+        with_compaction_progress(conversation_id, |p| p.refusal_compacted(turn_model.context_window));
     }
 
     // Once more. A compaction summarized the history the old usage
@@ -81,9 +84,12 @@ pub(super) async fn recover(
     let usage = (!compacted).then_some(last_known_usage).flatten();
     #[cfg(test)]
     test_hooks::before_retry(conversation_id).await;
-    let (mut request, budget) = build_request(pool, conversation_id, turn_model, usage.as_ref(), pending_new_content, false).await?;
+    // Keeps to the room as the refused request did (round 2 L1). A window
+    // this refusal changed, or a guess, says nothing about the room.
+    let room_only = with_compaction_progress(conversation_id, |p| p.room_only_at(turn_model.context_window));
+    let (mut request, budget) = build_request(pool, conversation_id, turn_model, usage.as_ref(), pending_new_content, room_only).await?;
     match call_model(pool, conversation_id, turn_model, &mut request, slot).await {
-        Ok((turn, recorder)) => Ok(Recovered { turn, recorder, budget, compacted, guessed }),
+        Ok((turn, recorder)) => Ok(Recovered { turn, recorder, budget, compacted }),
         // Refused again: the turn fails — but a window this second
         // refusal names is still learned, so the next turn starts right.
         Err(CallError::Overflow(again)) => {
