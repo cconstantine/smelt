@@ -23,10 +23,16 @@ pub async fn save(pool: &PgPool, id: Option<i64>, config: &LanguageServerConfig)
     }
 }
 
-/// The language servers (id, saved at) `rederive_github_install` has
-/// looked up.
-static LOOKED_UP: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(i64, chrono::NaiveDateTime)>>> =
-    std::sync::LazyLock::new(Default::default);
+/// The (database, language server (id, saved at)) `rederive_github_install`
+/// has looked up. The row's database leads the key (SME-395): `(id,
+/// updated_at)` is unique only inside one database, and this static outlives
+/// any one — each `#[sqlx::test]` database of this process has its own
+/// rust-analyzer row at id 1 — so one database's lookup must not answer for
+/// another's row. The id is `smelt_instance`'s UUID, which already names the
+/// database a cluster object belongs to (SME-115).
+static LOOKED_UP: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<(String, i64, chrono::NaiveDateTime)>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// The config and version server `name` starts with, when its saved
 /// install is a GitHub release's from before SME-360, which downloads the
@@ -55,8 +61,16 @@ pub async fn rederive_github_install(
     }
     // One lookup per row as saved, not one per start (review M1): a row
     // that didn't qualify is looked up again once it's edited (or smelt
-    // restarts).
-    let looked_up = (server.id, server.updated_at);
+    // restarts). The key's database id is what makes that cache honest
+    // across databases (SME-395); reading it is one read of a one-row
+    // table, and only for a row that needs the lookup at all.
+    let looked_up = match db::smelt_instance(pool).await {
+        Ok(instance) => (instance.id, server.id, server.updated_at),
+        Err(e) => {
+            tracing::warn!(server = %name, error = %e, "couldn't read this database's instance to look a language server up");
+            return None;
+        }
+    };
     if LOOKED_UP.lock().unwrap_or_else(|e| e.into_inner()).contains(&looked_up) {
         return None;
     }
@@ -215,6 +229,53 @@ mod tests {
             assert_eq!(rederive_github_install(&pool, "rust-analyzer", &base, &helix).await, None);
         }
         assert_eq!(lookups.load(std::sync::atomic::Ordering::SeqCst), 1, "one lookup for the row as saved");
+    }
+
+    /// SME-395: the re-derive cache answers from a process-wide set, but its
+    /// key — `(id, updated_at)` — is unique only inside one database: every
+    /// `#[sqlx::test]` database of this process restarts row ids at 1, and two
+    /// of them can save at the same stored microsecond. This test pins that
+    /// collision rather than waiting for it: a second migrated database, the
+    /// same rust-analyzer row at id 1 and the same `updated_at`, looked up
+    /// after this one. Its own row must still be re-derived.
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+    async fn test_a_row_looked_up_in_another_database_is_looked_up_here_too(pool: sqlx::PgPool) {
+        let base = catalog().await;
+        let helix = format!("{base}/languages.toml");
+        // Both databases' rows claim to have been saved at this instant.
+        let pin = "UPDATE language_servers SET updated_at = '2026-08-31 12:00:00'";
+
+        // This database's row: looked up, once.
+        save(&pool, None, &rust_analyzer(OLD_INSTALL)).await.expect("saved");
+        sqlx::raw_sql(pin).execute(&pool).await.expect("pinned");
+        let (config, _) = rederive_github_install(&pool, "rust-analyzer", &base, &helix)
+            .await
+            .expect("this database's row is re-derived");
+        assert!(config.install_command.starts_with("case \"$(uname -m)\" in x86_64) "), "{}", config.install_command);
+        assert_eq!(rederive_github_install(&pool, "rust-analyzer", &base, &helix).await, None, "once here");
+
+        // A second database — every row id restarts there, so its row is id 1
+        // too, and `pin` matches this one's to the stored microsecond.
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let server = url.rsplit_once('/').expect("a URL naming a database").0;
+        let other = format!("_sqlx_test_sme395_{}", std::process::id());
+        let maint = sqlx::PgPool::connect(&url).await.expect("a connection to the test database");
+        // A mid-test panic skips the DROP at the end, and a CI runner can
+        // hand this pid to another run: clear the name before claiming it.
+        sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS \"{other}\" WITH (FORCE)")).execute(&maint).await.expect("a clear name");
+        sqlx::raw_sql(&format!("CREATE DATABASE \"{other}\"")).execute(&maint).await.expect("a second database");
+        let scratch = sqlx::PgPool::connect(&format!("{server}/{other}")).await.expect("the second database");
+        crate::test_lock::MIGRATOR.run(&scratch).await.expect("migrated");
+        save(&scratch, None, &rust_analyzer(OLD_INSTALL)).await.expect("saved there");
+        sqlx::raw_sql(pin).execute(&scratch).await.expect("pinned there");
+        let (config, _) = rederive_github_install(&scratch, "rust-analyzer", &base, &helix)
+            .await
+            .expect("another database's lookup doesn't answer for this row");
+        assert!(config.install_command.starts_with("case \"$(uname -m)\" in x86_64) "), "{}", config.install_command);
+        assert_eq!(rederive_github_install(&scratch, "rust-analyzer", &base, &helix).await, None, "once there too");
+        scratch.close().await;
+        sqlx::raw_sql(&format!("DROP DATABASE \"{other}\" WITH (FORCE)")).execute(&maint).await.expect("dropped");
+        maint.close().await;
     }
 
     #[test]
