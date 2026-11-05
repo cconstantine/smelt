@@ -62,8 +62,8 @@ pub async fn rederive_github_install(
     // One lookup per row as saved, not one per start (review M1): a row
     // that didn't qualify is looked up again once it's edited (or smelt
     // restarts). The key's database id is what makes that cache honest
-    // across databases (SME-395); reading it is one indexed read of a
-    // one-row table, and only for a row that needs the lookup at all.
+    // across databases (SME-395); reading it is one read of a one-row
+    // table, and only for a row that needs the lookup at all.
     let looked_up = match db::smelt_instance(pool).await {
         Ok(instance) => (instance.id, server.id, server.updated_at),
         Err(e) => {
