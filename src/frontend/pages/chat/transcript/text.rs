@@ -47,13 +47,6 @@ pub(in crate::frontend::pages::chat) fn diff_lines(old: &str, new: &str) -> Vec<
         .collect()
 }
 
-/// Label for a `ToolResult` card's header, distinguishing a normal result
-/// from an error at a glance without repeating "error"/"result" as raw text
-/// the caller has to style around.
-/// A tool call described the way a person would say it ("Wrote
-/// /home/sandbox/primes.py", "Ran `python3 primes.py`"), for the compact
-/// row that replaces a raw card per call and per result (SME-41 D2). The
-/// raw input and result stay one click away.
 /// A tool row's line: `tool_summary`, which says what a call did, except
 /// where that claim reaches the user: a refused `notify_user` notified
 /// nobody (SME-386 F8).
@@ -68,6 +61,10 @@ pub(in crate::frontend::pages::chat) fn tool_row_text(name: &str, input: &serde_
 /// How a `notify_user` row's summary starts.
 const NOTIFIED_YOU: &str = "Notified you: ";
 
+/// A tool call described the way a person would say it ("Wrote
+/// /home/sandbox/primes.py", "Ran `python3 primes.py`"), for the compact
+/// row that replaces a raw card per call and per result (SME-41 D2). The
+/// raw input and result stay one click away.
 pub(in crate::frontend::pages::chat) fn tool_summary(name: &str, input: &serde_json::Value) -> String {
     let field = |key: &str| -> String {
         match input.get(key) {
