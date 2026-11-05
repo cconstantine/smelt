@@ -21,12 +21,14 @@ use crate::{credentials, db};
 #[cfg(feature = "server")]
 use sqlx::PgPool;
 
-/// What the Secrets and Git pages say after a delete that couldn't reach
-/// `pods` running sandboxes (SME-354 B5): the deleted file may still be
-/// in them until they stop. Out of `cfg(server)`: the page says it.
+/// What the Secrets and Git pages say after a delete not confirmed in
+/// `pods` running sandboxes (SME-354 B5): one it couldn't reach, or one
+/// still installing when the delete answered (SME-371), which may finish
+/// any moment. So the deleted file may still be in them until they stop,
+/// and "couldn't" would overstate it. Out of `cfg(server)`: the page says it.
 pub fn unpruned_sandboxes_notice(pods: u32) -> String {
     let sandboxes = if pods == 1 { "1 running sandbox".to_string() } else { format!("{pods} running sandboxes") };
-    format!("Deleted, but couldn't remove it from {sandboxes}; stop them to be sure.")
+    format!("Deleted, but not yet confirmed removed from {sandboxes}; stop them to be sure.")
 }
 
 /// One row of the page: name, dates, and D7's capped display. There is
@@ -149,6 +151,8 @@ pub async fn list_secrets() -> ServerFnResult<Vec<SecretSummary>> {
 /// name never changes — renaming is delete and add, Trade-off 7). Every
 /// successful write runs the live-pod install, the way a key's does: a
 /// persona naming this name gets the file (or loses it) while it runs.
+/// The answer doesn't wait long for that (`credentials::ANSWER_WITHIN`): the
+/// value is stored by then, and the page shouldn't say otherwise (SME-371).
 #[post("/api/secrets/save")]
 pub async fn save_secret(id: Option<i64>, name: String, value: String) -> ServerFnResult<SecretSummary> {
     save_secret_of(db::get(), id, &name, &value).await.map_err(ServerFnError::new)

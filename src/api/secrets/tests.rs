@@ -176,6 +176,47 @@ async fn test_a_delete_that_cant_reach_a_live_pod_says_how_many(pool: PgPool) {
     assert!(list_secrets_of(pool).await.expect("listed").is_empty(), "the row is deleted all the same");
     assert_eq!(
         unpruned_sandboxes_notice(1),
-        "Deleted, but couldn't remove it from 1 running sandbox; stop them to be sure."
+        "Deleted, but not yet confirmed removed from 1 running sandbox; stop them to be sure."
     );
+}
+
+/// SME-371: the failure the page showed as "Adding..." after a save that had
+/// committed. A live pod's install that won't finish (here it can't take its
+/// conversation's lock, which a stalled exec holds for up to a minute) doesn't
+/// hold a save's answer or a delete's, and the delete counts that pod as not
+/// known pruned. The real caller's shape, through the real path.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_stuck_install_doesnt_hold_a_saves_answer_or_a_deletes(pool: PgPool) {
+    crate::sandbox::test_support::use_unreachable_test_manager();
+    let pool = &pool;
+    // An id no other test's database uses: the install lock is the process's.
+    let id = crate::id_alloc::FIXTURE_IDS.next_base();
+    crate::db::create_conversation_with_id(pool, id).await.expect("conversation");
+    crate::db::create_sandbox_pod(pool, id).await.expect("a live pod row");
+    let (held, release) = tokio::sync::oneshot::channel::<()>();
+    let (started, is_held) = tokio::sync::oneshot::channel::<()>();
+    let holder = tokio::spawn(crate::credentials::with_install_lock(id, async move {
+        let _ = started.send(());
+        let _ = release.await;
+    }));
+    is_held.await.expect("the install lock is held");
+
+    let limit = crate::credentials::ANSWER_WITHIN + std::time::Duration::from_secs(4);
+    let saved = tokio::time::timeout(limit, save_secret_of(pool, None, "linear-key", "value-1234567890"))
+        .await
+        .expect("the save's answer waited on the stuck install")
+        .expect("saved");
+    assert_eq!(list_secrets_of(pool).await.expect("listed").len(), 1, "the save committed");
+    let unpruned = tokio::time::timeout(limit, delete_secret_of(pool, saved.id))
+        .await
+        .expect("the delete's answer waited on the stuck install")
+        .expect("deleted");
+    assert_eq!(unpruned, Some(1), "the pod still installing isn't known pruned");
+    // Said as what's known: it may still finish, so never "couldn't".
+    assert_eq!(
+        unpruned_sandboxes_notice(3),
+        "Deleted, but not yet confirmed removed from 3 running sandboxes; stop them to be sure."
+    );
+    let _ = held.send(());
+    holder.await.expect("the holder");
 }
