@@ -40,6 +40,28 @@ async fn until_waiters(pool: &PgPool, n: i64) {
     eventually(&format!("{n} lock waiters"), || async { lock_waiters(pool).await >= n }).await;
 }
 
+/// Whether a session of this test's database waits on a lock with `statement`
+/// as its running query. The count of lock waiters says nothing about who
+/// queues on which row or in which order — other sessions of the same test
+/// (a delete's wake of the parent writes too) raise lock waits of their own,
+/// and the rollback a test releases on that count can then free a queue whose
+/// front it did not mean to name. Waiting on the statement waits on the very
+/// queue the test is about to release. (SME-398)
+async fn lock_waiter_running(pool: &PgPool, statement: &str) -> bool {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%' || $1 || '%'",
+    )
+    .bind(statement)
+    .fetch_one(pool)
+    .await
+    .expect("pg_stat_activity");
+    n > 0
+}
+
+async fn until_lock_waiter_running(pool: &PgPool, statement: &str) {
+    eventually(&format!("a lock waiter running {statement:?}"), || async { lock_waiter_running(pool, statement).await }).await;
+}
+
 /// A mock upstream whose first reply to an agent waits for a permit on
 /// `gate` and then is `first`; every other reply is "Noted.".
 async fn gated_mock(pool: &PgPool, first: String) -> (Arc<Mutex<Vec<serde_json::Value>>>, Arc<tokio::sync::Semaphore>) {
@@ -388,7 +410,8 @@ async fn test_message_agent_racing_a_delete(pool: PgPool) {
     release.send(()).expect("release the delete");
     tokio::time::timeout(Duration::from_secs(10), deleting).await.expect("no deadlock").expect("task").expect("the delete");
 
-    // The message holds the child's row first; the delete's marking waits.
+    // SME-398 red-first: force the queue order the flaky run drew — the
+    // delete's marking queued ahead of the message's row read.
     let child = active_child(&pool, root).await;
     let mut holding = pool.begin().await.expect("begin");
     sqlx::query("SELECT 1 FROM agents WHERE conversation_id = $1 FOR UPDATE")
@@ -396,16 +419,16 @@ async fn test_message_agent_racing_a_delete(pool: PgPool) {
         .execute(&mut *holding)
         .await
         .expect("hold the child's row");
-    let sending = tokio::spawn({
-        let pool = pool.clone();
-        async move { message(&pool, root, serde_json::json!(child), "Hi.").await }
-    });
-    until_waiters(&pool, 1).await;
     let deleting = tokio::spawn({
         let pool = pool.clone();
         async move { delete_subtree(&pool, child).await }
     });
-    until_waiters(&pool, 2).await;
+    until_lock_waiter_running(&pool, "UPDATE agents SET state").await;
+    let sending = tokio::spawn({
+        let pool = pool.clone();
+        async move { message(&pool, root, serde_json::json!(child), "Hi.").await }
+    });
+    until_lock_waiter_running(&pool, "SELECT state FROM agents").await;
     holding.rollback().await.expect("release the row");
     let sent = tokio::time::timeout(Duration::from_secs(10), sending).await.expect("no deadlock").expect("task");
     tokio::time::timeout(Duration::from_secs(10), deleting).await.expect("no deadlock").expect("task").expect("the delete");
