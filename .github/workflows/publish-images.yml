@@ -5,8 +5,9 @@ name: Publish images
 # CI (ci.yml) tests a tree against its own images built locally; this is the
 # one that makes images other machines can pull.
 #
-# Nothing here waits on CI: every branch push publishes its own images, tests
-# or no, and only main moves `latest`. Both are plain Docker builds — the
+# Nothing here waits on CI: every push to main publishes its images and moves
+# `latest`. Any other branch or PR publishes only when someone runs this by
+# hand, which never moves `latest`. Both are plain Docker builds — the
 # sandbox image is a normal image (docker/sandbox/Dockerfile needs nothing but
 # its own binary in its context), and publishing it is what retires the
 # registry-free `ctr images import` delivery in scripts/build-sandbox-image.sh
@@ -15,20 +16,21 @@ name: Publish images
 # package); docs/setup.md's "Deploying" covers it.
 
 on:
-  # Every branch publishes its own images — the `<sha>` tag is what a
-  # deployment pins, and publishing from a branch is how a deployment gets
-  # tried before anything merges. Only main moves `latest`.
+  # Only main publishes on its own: the `<sha>` tag is what a deployment pins,
+  # and deployments run images built off main.
   push:
-    branches: ['**']
+    branches: [main]
+  # To try a deployment of a PR before it merges, run this by hand on its
+  # branch: `gh workflow run publish-images.yml --ref <branch>`.
   workflow_dispatch:
     inputs:
-      # Build something other than what you're running on. The tags come from
-      # the commit this resolves to (the `source` job), and a hand run never
-      # moves `latest`.
+      # Build something other than the branch this run was started on. The tags
+      # come from the commit this resolves to (the `source` job), and a hand run
+      # never moves `latest`.
       ref:
-        description: 'Ref to build (branch, tag or sha)'
+        description: 'Ref to build (branch, tag or sha); empty builds the branch you ran this on'
         required: false
-        default: 'main'
+        default: ''
 
 concurrency:
   # Queue, don't cancel: two pushes landing together should each end with an
