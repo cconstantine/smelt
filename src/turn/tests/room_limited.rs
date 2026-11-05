@@ -35,6 +35,10 @@ impl Honest {
         self.steps.lock().expect("the request log")[i]["max_tokens"].as_u64().expect("max_tokens")
     }
 
+    pub(super) fn request(&self, i: usize) -> String {
+        self.steps.lock().expect("the request log")[i]["messages"].to_string()
+    }
+
     pub(super) fn summary_calls(&self) -> usize {
         self.summaries.load(Ordering::SeqCst)
     }
@@ -42,7 +46,20 @@ impl Honest {
 
 /// A step that fails, its stream ending in an error.
 const FAILS: i64 = -1;
+/// A step cut off in the middle of a call to `write_file`.
+const CUT_IN_WRITE_FILE: i64 = -2;
 const OVERLOADED: &str = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+
+fn cut_in_write_file(input: i64, output: i64) -> String {
+    let body = sse_body(&[
+        ("message_start", r#"{"type":"message_start"}"#),
+        ("content_block_start", r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_w","name":"write_file","input":{}}}"#),
+        ("content_block_delta", r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.txt\",\"cont"}}"#),
+        ("message_delta", r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"}}"#),
+        ("message_stop", r#"{"type":"message_stop"}"#),
+    ]);
+    with_usage(&body, input, 0, output)
+}
 
 /// Answers each model step from `plans`, in order, then "Done.", and each
 /// summary request with a summary.
@@ -67,6 +84,7 @@ pub(super) async fn honest_mock(pool: &PgPool, plans: Vec<Plan>) -> Arc<Honest> 
                     steps.push(parsed);
                     match plans.get(steps.len() - 1) {
                         Some(Plan { wants: FAILS, .. }) => OVERLOADED.to_string(),
+                        Some(Plan { input, wants: CUT_IN_WRITE_FILE }) => cut_in_write_file(*input, max_tokens),
                         Some(Plan { input, wants }) if *wants > max_tokens => with_usage(
                             &text_reply_body("Half a thought").replace("end_turn", "max_tokens"),
                             *input,
@@ -124,6 +142,27 @@ async fn test_a_reply_the_room_cut_off_compacts_and_goes_on(pool: PgPool) {
     assert_eq!(seen.count(), 7, "every planned step ran, and the final reply");
     assert_eq!(compaction_summaries(&pool, conversation.id).await.len(), 3, "two to learn it, one for the room");
     assert_eq!(cut_off_notices(&pool, conversation.id).await, 1, "the model and the user are told it was cut");
+    assert!(seen.request(5).contains(crate::api::chat::CUT_OFF_NOTICE_START), "the retry carries the notice: {}", seen.request(5));
+}
+
+/// The case M1 is for: a big `write_file` cut in the middle. Its call is
+/// dropped, the retry says which, and the model can write it again.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_write_file_the_room_cut_off_can_be_written_again(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let mut plans = learn_its_tight();
+    plans.extend([plan(24_000, 100), plan(24_000, CUT_IN_WRITE_FILE), plan(13_600, 6_000)]);
+    let seen = honest_mock(&pool, plans).await;
+    set_context_window(&pool, 32_768, None).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("the turn goes on");
+
+    assert_eq!(last_reply(&saved).as_deref(), Some("Done."));
+    assert_eq!(seen.count(), 7);
+    let retry = seen.request(5);
+    assert!(retry.contains("in the middle of a call to `write_file`") && retry.contains("dropped and not run"), "{retry}");
 }
 
 /// It carries on, so nobody is called over to it.
@@ -464,4 +503,29 @@ async fn test_the_retry_after_a_refusal_has_the_floor_too(pool: PgPool) {
     assert_eq!(mock.count(), 8, "no retry with no room");
     let error = error.to_string();
     assert!(error.contains("is too small for this conversation") && error.contains("about 20,000 tokens"), "{error}");
+}
+
+/// Once: the guard outlasts the turn. The retry's own cut ends the turn at the
+/// cap, so `room_retried` is still set. The wake's request, at about 21,600,
+/// has room for less than the cap, so the room cuts it, with plenty a
+/// compaction would free, and it still doesn't get a second go until a reply
+/// has finished.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_later_wake_doesnt_retry_until_a_reply_finishes(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let mut plans = learn_its_tight();
+    plans.extend([plan(24_000, 100), plan(24_000, 7_000), plan(13_600, 1_000_000), plan(13_600, 1_000_000)]);
+    let seen = honest_mock(&pool, plans).await;
+    set_context_window(&pool, 32_768, Some(8_000)).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    run_turn(&pool, conversation.id, hello()).await.expect("ends as a cut-off reply does");
+    let (calls, summarized) = (seen.count(), seen.summary_calls());
+
+    unnotified_finished_command(&pool, conversation.id, "sme-386-guard").await;
+    wake_conversation(&pool, conversation.id).await.expect("ends as a cut-off reply does");
+
+    assert_eq!(seen.count(), calls + 1, "one call, cut off");
+    assert_eq!(seen.summary_calls(), summarized, "and no compaction for it");
+    assert_eq!(cut_off_notices(&pool, conversation.id).await, 3);
 }
