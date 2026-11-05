@@ -33,6 +33,11 @@
 //! - the server refuses a request and a compaction answers it
 //!   (`refusal_compacted`), no usage needed (review L2): three in a row, with
 //!   no step the server took between, set `stuck` too;
+//! - a reply the room cut off, past the usual trigger, with history a
+//!   compaction would free (`cut_for_room`, round 2 M1): the next step
+//!   compacts whatever its size, and the model is called again. Once: a second
+//!   cut in a row ends the turn as any cut-off reply does, and a reply that
+//!   wasn't cut (`reply_finished`) or the user's send allows it again;
 //! - a restart or a delete: all of it goes, and the next compaction learns it.
 
 use super::*;
@@ -91,6 +96,10 @@ pub(super) struct CompactionProgress {
     refusal_compactions: u32,
     /// `stuck` because of those, so no size or window is known to name.
     refused_out: bool,
+    /// The next step compacts, for the reply the room just cut off.
+    compact_for_room: bool,
+    /// That's been tried, and no reply has finished since.
+    room_retried: bool,
 }
 
 /// How near the window a request may come once compacting can't help.
@@ -153,6 +162,9 @@ impl CompactionProgress {
         if self.stuck {
             return CompactionStep::Stuck(self.why_stuck(model, context_window));
         }
+        if std::mem::take(&mut self.compact_for_room) {
+            return CompactionStep::Compact;
+        }
         // Against a guess, a compaction that can't get under it is no sign
         // of anything: the server says when a request really doesn't fit.
         if self.guess.is_some() && self.after.is_some_and(|after| after >= limit(context_window)) {
@@ -206,6 +218,26 @@ impl CompactionProgress {
         }
     }
 
+    /// A reply held to the room left was cut off at it, on a request of
+    /// about `sized` tokens (`None`: straight after a compaction, so there's
+    /// nothing more to free). Whether to compact and call the model again:
+    /// compacting has to buy room, at least what `limit` keeps for a reply.
+    pub(super) fn cut_for_room(&mut self, sized: Option<u64>, context_window: u32) -> bool {
+        self.sync(context_window);
+        let frees_room = sized.zip(self.after).is_some_and(|(sized, after)| after + SHORT_REPLY_TOKENS < sized);
+        if !self.room_only() || self.room_retried || !frees_room {
+            return false;
+        }
+        self.compact_for_room = true;
+        self.room_retried = true;
+        true
+    }
+
+    /// A reply finished rather than being cut off.
+    pub(super) fn reply_finished(&mut self) {
+        self.room_retried = false;
+    }
+
     /// Whether the conversation doesn't fit.
     pub(super) fn is_stuck(&self) -> bool {
         self.stuck
@@ -216,6 +248,7 @@ impl CompactionProgress {
     pub(super) fn user_wrote(&mut self) {
         self.stuck = false;
         self.refused_out = false;
+        self.room_retried = false;
         self.at_limit = self.at_limit.min(MAX_AT_LIMIT - 1);
         self.refusal_compactions = self.refusal_compactions.min(MAX_REFUSAL_COMPACTIONS - 1);
     }
@@ -415,6 +448,44 @@ mod tests {
         assert_eq!(step(&mut progress, 0), CompactionStep::Go);
         progress.refusal_compacted(WINDOW);
         assert!(progress.why_refused_out("m", WINDOW).is_some(), "a user's retry gets one more");
+    }
+
+    fn tight() -> CompactionProgress {
+        let mut progress = CompactionProgress::default();
+        for _ in 0..2 {
+            after_compaction(&mut progress, 80_000);
+        }
+        assert!(progress.room_only());
+        progress
+    }
+
+    #[test]
+    fn test_a_reply_the_room_cut_off_compacts_next_whatever_its_size_then_once_only() {
+        let mut progress = tight();
+        assert!(progress.cut_for_room(Some(90_000), WINDOW));
+        assert_eq!(step(&mut progress, 0), CompactionStep::Compact);
+        assert_eq!(step(&mut progress, 0), CompactionStep::Go, "the one compaction");
+        assert!(!progress.cut_for_room(Some(90_000), WINDOW), "a second cut in a row ends the turn");
+        progress.reply_finished();
+        assert!(progress.cut_for_room(Some(90_000), WINDOW), "a reply finished between");
+        let mut progress = tight();
+        assert!(progress.cut_for_room(Some(90_000), WINDOW));
+        progress.user_wrote();
+        assert!(progress.cut_for_room(Some(90_000), WINDOW), "the user's send too");
+    }
+
+    #[test]
+    fn test_a_cut_is_only_answered_when_compacting_would_buy_room() {
+        assert!(!tight().cut_for_room(None, WINDOW), "straight after a compaction");
+        assert!(!tight().cut_for_room(Some(82_048), WINDOW), "exactly a short reply's worth isn't more");
+        assert!(tight().cut_for_room(Some(82_049), WINDOW));
+        let mut untight = CompactionProgress::default();
+        after_compaction(&mut untight, 10_000);
+        assert!(!untight.cut_for_room(Some(90_000), WINDOW), "the usual trigger kept the reply its room");
+        let mut guessing = tight();
+        guessing.guessed(WINDOW, 40_000);
+        assert!(!guessing.cut_for_room(Some(39_000), 40_000));
+        assert!(!tight().cut_for_room(Some(90_000), 500_000), "a window learned since");
     }
 
     #[test]

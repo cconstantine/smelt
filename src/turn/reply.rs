@@ -130,6 +130,7 @@ pub(super) async fn save_stop_notice(
     turn_model: &crate::providers::TurnModel,
     turn: &anthropic::stream::StreamedTurn,
     budget: &ReplyBudget,
+    carries_on: bool,
     persisted: &mut Vec<Message>,
 ) -> ServerFnResult<()> {
     let cut_off = anthropic::stream::is_cut_off(&turn.stop_reason);
@@ -171,15 +172,18 @@ pub(super) async fn save_stop_notice(
         // SME-71: a reply smelt stopped and won't continue needs the user:
         // CutOff for a cut-off reply (budget or window), Refused for a
         // refused one. The note follows the save: if the save failed,
-        // there's no notice to act on and the turn fails, so Failed.
-        note_attention(
-            conversation_id,
-            if cut_off {
-                crate::events::Attention::CutOff
-            } else {
-                crate::events::Attention::Refused
-            },
-        );
+        // there's no notice to act on and the turn fails, so Failed. A turn
+        // that carries on past it (`carries_on`) doesn't need them.
+        if !carries_on {
+            note_attention(
+                conversation_id,
+                if cut_off {
+                    crate::events::Attention::CutOff
+                } else {
+                    crate::events::Attention::Refused
+                },
+            );
+        }
     }
     Ok(())
 }
