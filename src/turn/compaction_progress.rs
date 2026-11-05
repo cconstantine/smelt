@@ -38,6 +38,11 @@
 //!   compacts whatever its size, and the model is called again. Once: a second
 //!   cut in a row ends the turn as any cut-off reply does, and a reply that
 //!   wasn't cut (`reply_finished`) or the user's send allows it again;
+//! - a compacted request is under the floor (`floor_fired`, review M-A): what
+//!   a reply measured after a compaction is believed over the estimate if it
+//!   shows room. If not, `stuck`, unless the user has written since it last
+//!   was (`try_anyway`), which lets one request through: only the server's
+//!   answer can show anything new, so the user always has a way out;
 //! - a restart or a delete: all of it goes, and the next compaction learns it.
 
 use super::*;
@@ -82,6 +87,8 @@ pub(super) enum CompactionStep {
 pub(super) enum FloorAnswer {
     /// A reply measured this size after a compaction, and it leaves room.
     Believe(u64),
+    /// The user wrote since this conversation was last judged not to fit.
+    TryAnyway,
     /// It doesn't fit, for this reason.
     NoRoom(String),
 }
@@ -113,6 +120,8 @@ pub(super) struct CompactionProgress {
     compact_for_room: bool,
     /// That's been tried, and no reply has finished since.
     room_retried: bool,
+    /// The user wrote after `stuck`: one request goes, whatever the floor says.
+    try_anyway: bool,
 }
 
 /// How near the window a request may come once compacting can't help.
@@ -154,6 +163,7 @@ impl CompactionProgress {
     /// The server took a request as it was sent.
     pub(super) fn step_taken(&mut self) {
         self.refusal_compactions = 0;
+        self.try_anyway = false;
     }
 
     /// The server refused a request: the reason, if another compaction
@@ -259,6 +269,9 @@ impl CompactionProgress {
         if let Some(after) = self.after.filter(fits) {
             return FloorAnswer::Believe(after);
         }
+        if std::mem::take(&mut self.try_anyway) {
+            return FloorAnswer::TryAnyway;
+        }
         self.after = Some(size);
         self.stuck = true;
         FloorAnswer::NoRoom(self.why_stuck(model, context_window))
@@ -278,6 +291,8 @@ impl CompactionProgress {
     /// The user wrote: they may try again. One result short of `stuck`, so a
     /// conversation that still doesn't fit costs them one summary, not three.
     pub(super) fn user_wrote(&mut self) {
+        // A send whose turn ended before it got that far keeps its try for the next.
+        self.try_anyway |= self.stuck;
         self.stuck = false;
         self.refused_out = false;
         self.room_retried = false;
@@ -570,6 +585,29 @@ mod tests {
             panic!("no room");
         };
         assert!(why.contains("about 99,000 tokens"), "{why}");
+    }
+
+    #[test]
+    fn test_the_users_send_after_stuck_lets_one_request_through() {
+        let mut progress = tight();
+        after_compaction(&mut progress, 96_000);
+        assert!(matches!(progress.floor_fired(99_000, "m", WINDOW), FloorAnswer::NoRoom(_)));
+        progress.user_wrote();
+        assert_eq!(progress.floor_fired(99_000, "m", WINDOW), FloorAnswer::TryAnyway);
+        assert!(matches!(progress.floor_fired(99_000, "m", WINDOW), FloorAnswer::NoRoom(_)), "one");
+        progress.user_wrote();
+        progress.step_taken();
+        assert!(matches!(progress.floor_fired(99_000, "m", WINDOW), FloorAnswer::NoRoom(_)), "a step taken uses it up");
+    }
+
+    #[test]
+    fn test_a_send_whose_turn_never_got_to_the_floor_keeps_its_try() {
+        let mut progress = tight();
+        after_compaction(&mut progress, 96_000);
+        assert!(matches!(progress.floor_fired(99_000, "m", WINDOW), FloorAnswer::NoRoom(_)));
+        progress.user_wrote();
+        progress.user_wrote();
+        assert_eq!(progress.floor_fired(99_000, "m", WINDOW), FloorAnswer::TryAnyway);
     }
 
     #[test]

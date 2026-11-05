@@ -94,6 +94,7 @@ pub(super) async fn build_request_with_room(
         let window = turn_model.context_window;
         budget = match with_compaction_progress(conversation_id, |p| p.floor_fired(size, &turn_model.model, window)) {
             FloorAnswer::Believe(after) => budget_within_room(reply_budget(window, after, turn_model.output_cap), window, after),
+            FloorAnswer::TryAnyway => ReplyBudget { tokens: MIN_USEFUL_REPLY, limit: crate::api::chat::ReplyLimit::RoomLeft },
             FloorAnswer::NoRoom(why) => return Err(ServerFnError::new(why)),
         };
         apply_budget(&mut request, turn_model, budget);

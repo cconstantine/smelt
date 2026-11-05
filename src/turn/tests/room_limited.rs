@@ -381,3 +381,26 @@ async fn test_a_measured_size_outweighs_a_high_estimate(pool: PgPool) {
     assert!(u64::from(MIN_USEFUL_REPLY) <= reply, "{reply} reply tokens");
     assert!(reply + 3_000 + u64::from(COMPACTION_SAFETY_BUFFER) <= window as u64, "{reply} reply tokens, in {window}");
 }
+
+/// Review M-A: however the floor fired, the user's next send reaches the
+/// server, whose answer is what can move things.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_send_after_the_floor_fired_reaches_the_server(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let seen = honest_mock(&pool, vec![plan(20_000, 10), plan(20_000, 10), plan(20_000, 10), plan(2_000, 10)]).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let window = window_leaving(&pool, conversation.id, 100).await;
+    set_context_window(&pool, window, None).await;
+    let mut rx = events::subscribe(conversation.id);
+    start_turn(pool.clone(), conversation.id, "hi".to_string()).await.expect("send");
+    wait_until_idle(&mut rx).await;
+    assert_eq!(seen.count(), 3, "the floor fired");
+
+    start_turn(pool.clone(), conversation.id, "Again.".to_string()).await.expect("send");
+    wait_until_idle(&mut rx).await;
+
+    assert_eq!(seen.count(), 5, "the planned step, and the final reply");
+    let last = db::list_messages(&pool, conversation.id).await.expect("messages");
+    assert_eq!(last_reply(&last).as_deref(), Some("Done."));
+}
