@@ -239,7 +239,23 @@ pub enum Finish {
     /// their ids and states, in ascending id. Their reports would reach
     /// a finished agent, whose turn sends nothing on.
     AgentsRunning(Vec<(i64, String)>),
+    /// A `terminal_commands` row of its own still runs (SME-389 B): a
+    /// *first* finish is refused, and these name why — command id,
+    /// command line, seconds running, in ascending id. Its command
+    /// notices would wake a `finished` seat to nothing, and the seat that
+    /// finishes mid-work spends its one report on a placeholder.
+    CommandsRunning(Vec<(String, String, i64)>),
 }
+
+/// B's read (SME-389): the seat's still-running tracked commands, `$1` its
+/// conversation. Same predicate as `idle_agent_without_report`'s
+/// running-command clause; both are answered from
+/// `idx_terminal_commands_conversation_running` — the index the plan
+/// believed still existed (review round 1's Low), `terminal_commands`
+/// keeping its finished rows.
+pub(crate) const FINISH_RUNNING_COMMANDS_SQL: &str =
+    "SELECT command_id, command, EXTRACT(EPOCH FROM (now() - created_at))::BIGINT
+     FROM terminal_commands WHERE conversation_id = $1 AND status = 'running' ORDER BY id";
 
 /// `finish`'s transaction: the child `finished` and its report queued to
 /// its parent, so one lands only if the other does. `label` names the
@@ -275,6 +291,22 @@ pub async fn finish_agent(pool: &PgPool, child: i64, label: &str, report: &str) 
             .await?;
         return Ok(Finish::NotActive(state));
     }
+    // SME-389 B: a first finish with a tracked command still running is
+    // refused — the command's finished notice would wake a `finished`
+    // seat to nothing, and the seat that finishes mid-work spends its one
+    // report on a placeholder (the ticket's incident). Read here, after
+    // the state is proven finishable and inside this transaction, so a
+    // refusal and any enqueue can't interleave; the update above rolls
+    // back with it. Commands a seat detached (`&`, nohup) make no rows
+    // and are not gated, as in the pod rules. Same predicate as
+    // `idle_agent_without_report`'s running-command clause.
+    let running_commands = sqlx::query_as::<_, (String, String, i64)>(FINISH_RUNNING_COMMANDS_SQL)
+        .bind(child)
+        .fetch_all(&mut *tx)
+        .await?;
+    if !running_commands.is_empty() {
+        return Ok(Finish::CommandsRunning(running_commands));
+    }
     // Its own agents still running would report to a finished agent,
     // which sends nothing on (SME-354 B2): it waits for them or stops
     // them first. One of them finishing at the same moment is read
@@ -299,6 +331,8 @@ pub async fn finish_agent(pool: &PgPool, child: i64, label: &str, report: &str) 
     }
     queue_agent_message(&mut tx, parent, Some(child), label, KIND_REPORT, report).await?;
     tx.commit().await?;
+    #[cfg(test)]
+    crate::agents::test_hooks::reach(crate::agents::test_hooks::FINISH_COMMITTED, child).await;
     Ok(Finish::Queued { parent })
 }
 
@@ -317,6 +351,61 @@ async fn unread_by(conn: &mut sqlx::PgConnection, child: i64) -> Result<bool, sq
     .bind(KIND_REPORT)
     .fetch_one(&mut *conn)
     .await
+}
+
+/// `report_after_finish`'s outcome (SME-389 A).
+#[derive(Debug, PartialEq)]
+pub enum FollowUp {
+    /// The follow-up report is queued to this parent.
+    Queued { parent: i64 },
+    /// The seat isn't `finished` after all (a `message_agent` or a stop
+    /// landed while its report was in flight): this state, named.
+    StateChanged(String),
+    /// The seat, its parent, or either's row is gone.
+    Gone,
+}
+
+/// A late `finish`'s follow-up (SME-389 A): the report of a seat already
+/// `finished` queued to its parent anyway, so no call a seat makes as
+/// `finish` disappears quietly (the ticket's 42-minute stall). Locks the
+/// same rows in the same order as `finish_agent` — `conversations` rows
+/// ascending `KEY SHARE`, then the seat's `agents` row `FOR NO KEY UPDATE`,
+/// the lock `message_agent` takes on a finished recipient — so every
+/// interleaving resolves by row locks, and writes no state: the seat stays
+/// `finished`. B's running-command rule is a first-finish rule only; a
+/// follow-up is never gated, the seat has nothing left to spend.
+pub async fn report_after_finish(pool: &PgPool, child: i64, label: &str, report: &str) -> Result<FollowUp, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let Some(parent) = sqlx::query_scalar::<_, Option<i64>>("SELECT parent_id FROM conversations WHERE id = $1")
+        .bind(child)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten()
+    else {
+        return Ok(FollowUp::Gone);
+    };
+    if !lock_conversations(&mut tx, &[(parent, RowLock::KeyShare), (child, RowLock::KeyShare)]).await? {
+        return Ok(FollowUp::Gone);
+    }
+    // The lock `message_agent` takes on a finished recipient, so one that
+    // reactivated the seat mid-flight reads here `active` (not yet
+    // committed) and refuses with the state named, exactly as a normal
+    // `finish` would.
+    let state = sqlx::query_scalar::<_, String>("SELECT state FROM agents WHERE conversation_id = $1 FOR NO KEY UPDATE")
+        .bind(child)
+        .fetch_optional(&mut *tx)
+        .await?;
+    match state.as_deref() {
+        Some(AGENT_FINISHED) => {}
+        Some(other) => return Ok(FollowUp::StateChanged(other.to_string())),
+        None => return Ok(FollowUp::Gone),
+    }
+    // A follow-up is never gated by a running command (the doc above):
+    // the seat has already given up its turn, and there is no second
+    // report left to spend on a placeholder.
+    queue_agent_message(&mut tx, parent, Some(child), label, KIND_REPORT, report).await?;
+    tx.commit().await?;
+    Ok(FollowUp::Queued { parent })
 }
 
 /// `stop_subtree`'s outcome.
@@ -454,23 +543,27 @@ pub async fn queue_notice(pool: &PgPool, to: i64, from: i64, from_label: &str, b
     queue_agent_message(&mut conn, to, Some(from), from_label, KIND_NOTICE, body).await
 }
 
+/// The idle check's own query (`$1` the conversation id, `$2` active,
+/// `$3` starting), a constant so the running-command clause is
+/// EXPLAIN-tested as written, not paraphrased (SME-389 R1-1).
+pub(crate) const IDLE_AGENT_WITHOUT_REPORT_SQL: &str =
+    "SELECT c.parent_id,
+            (SELECT m.content FROM messages m WHERE m.conversation_id = c.id AND m.role = 'assistant'
+             ORDER BY m.id DESC LIMIT 1)
+     FROM conversations c JOIN agents a ON a.conversation_id = c.id
+     WHERE c.id = $1 AND c.parent_id IS NOT NULL AND a.state = $2
+       AND NOT EXISTS (SELECT 1 FROM pending_questions q WHERE q.conversation_id = c.id AND q.answer IS NULL)
+       AND NOT EXISTS (SELECT 1 FROM instruction_requests r WHERE r.conversation_id = c.id)
+       AND NOT EXISTS (SELECT 1 FROM terminal_commands t WHERE t.conversation_id = c.id AND t.status = 'running')
+       AND NOT EXISTS (SELECT 1 FROM agents g JOIN conversations gc ON gc.id = g.conversation_id
+                       WHERE gc.parent_id = c.id AND g.state IN ($3, $2))";
+
 /// Whether `id` is an `active` agent with nothing to wait on: no question
 /// to the user unanswered, no AGENTS.md card, no terminal command running
 /// and no agent of its own still starting or active. Its parent then, and
 /// the first 500 characters of its last reply's text. `None` otherwise.
 pub async fn idle_agent_without_report(pool: &PgPool, id: i64) -> Result<Option<(i64, String)>, sqlx::Error> {
-    let row = sqlx::query_as::<_, (i64, Option<String>)>(
-        "SELECT c.parent_id,
-                (SELECT m.content FROM messages m WHERE m.conversation_id = c.id AND m.role = 'assistant'
-                 ORDER BY m.id DESC LIMIT 1)
-         FROM conversations c JOIN agents a ON a.conversation_id = c.id
-         WHERE c.id = $1 AND c.parent_id IS NOT NULL AND a.state = $2
-           AND NOT EXISTS (SELECT 1 FROM pending_questions q WHERE q.conversation_id = c.id AND q.answer IS NULL)
-           AND NOT EXISTS (SELECT 1 FROM instruction_requests r WHERE r.conversation_id = c.id)
-           AND NOT EXISTS (SELECT 1 FROM terminal_commands t WHERE t.conversation_id = c.id AND t.status = 'running')
-           AND NOT EXISTS (SELECT 1 FROM agents g JOIN conversations gc ON gc.id = g.conversation_id
-                           WHERE gc.parent_id = c.id AND g.state IN ($3, $2))",
-    )
+    let row = sqlx::query_as::<_, (i64, Option<String>)>(IDLE_AGENT_WITHOUT_REPORT_SQL)
     .bind(id)
     .bind(AGENT_ACTIVE)
     .bind(AGENT_STARTING)

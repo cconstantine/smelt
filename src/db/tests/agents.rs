@@ -388,3 +388,131 @@ async fn test_a_roots_child_carries_the_git_ssh_bit_before_any_key_is_stored(poo
     let child = child_of(&pool, root).await;
     assert_eq!(child_credentials(&pool, child).await, vec!["git-ssh".to_string()], "the install decides, not the start");
 }
+
+/// SME-389 B: `finish_agent` refuses while the seat has a tracked command
+/// running, and names it; the seat stays `active` and nothing is queued.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_finish_agent_refuses_while_a_terminal_command_runs(pool: PgPool) {
+    let root = test_conversation(&pool).await.id;
+    let child = agent(&pool, root, AGENT_ACTIVE, None).await;
+    let terminal = test_terminal(&pool, child).await;
+    create_terminal_command(&pool, child, terminal, "cmd-7", "python3 -m http.server", 0)
+        .await
+        .expect("a running command");
+
+    let outcome = finish_agent(&pool, child, &format!("agent #{child}"), "Done.").await.expect("finish");
+    match outcome {
+        Finish::CommandsRunning(ref commands) => assert!(
+            matches!(&commands[..], [(id, command, secs)] if id == "cmd-7" && command == "python3 -m http.server" && *secs >= 0),
+            "{commands:?}"
+        ),
+        other => panic!("a running command refuses the first finish, got: {other:?}"),
+    }
+    assert_eq!(
+        agent_state(&pool, child).await.expect("state").as_deref(),
+        Some(AGENT_ACTIVE),
+        "the refusal wrote no state"
+    );
+    let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_messages")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(queued, 0, "the refusal queued nothing");
+}
+
+/// SME-389 A: `report_after_finish` queues the finished seat's report to
+/// its parent, writes no state, and is never gated by a running command
+/// (B's refusal is a first-finish rule).
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_report_after_finish_queues_a_follow_up_with_no_state_write(pool: PgPool) {
+    let root = test_conversation(&pool).await.id;
+    let child = agent(&pool, root, AGENT_FINISHED, None).await;
+    let terminal = test_terminal(&pool, child).await;
+    create_terminal_command(&pool, child, terminal, "cmd-9", "sleep 30", 0).await.expect("a running command");
+
+    let outcome = report_after_finish(&pool, child, &format!("agent #{child}"), "More.").await.expect("follow-up");
+    assert_eq!(outcome, FollowUp::Queued { parent: root }, "a running command never gates a follow-up");
+    assert_eq!(agent_state(&pool, child).await.expect("state").as_deref(), Some(AGENT_FINISHED), "no state write");
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT kind, body FROM agent_messages WHERE to_conversation_id = $1 ORDER BY id")
+            .bind(root)
+            .fetch_all(&pool)
+            .await
+            .expect("rows");
+    assert_eq!(rows, vec![("report".to_string(), "More.".to_string())]);
+}
+
+/// SME-389 A: `report_after_finish` refuses by name when the moment has
+/// passed — a reactivated or stopped seat names its state (the locks make
+/// a `message_agent` landing mid-flight read here), and a seat with no
+/// parent, or no agent row at all, is `Gone`. Nothing is queued either way.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_report_after_finish_refuses_by_name_when_the_moment_passed(pool: PgPool) {
+    let root = test_conversation(&pool).await.id;
+    let active = agent(&pool, root, AGENT_ACTIVE, None).await;
+    assert_eq!(
+        report_after_finish(&pool, active, "l", "r").await.expect("reactivated"),
+        FollowUp::StateChanged(AGENT_ACTIVE.to_string())
+    );
+    let stopped = agent(&pool, root, AGENT_STOPPED, None).await;
+    assert_eq!(
+        report_after_finish(&pool, stopped, "l", "r").await.expect("stopped"),
+        FollowUp::StateChanged(AGENT_STOPPED.to_string())
+    );
+    let bare = sqlx::query_scalar::<_, i64>("INSERT INTO conversations (title, parent_id) VALUES ('bare', $1) RETURNING id")
+        .bind(root)
+        .fetch_one(&pool)
+        .await
+        .expect("a bare child row");
+    assert_eq!(report_after_finish(&pool, bare, "l", "r").await.expect("no agent row"), FollowUp::Gone);
+    assert_eq!(report_after_finish(&pool, root, "l", "r").await.expect("no parent"), FollowUp::Gone);
+    let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_messages")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(queued, 0, "a refusal queues nothing");
+}
+
+/// SME-389 review round 1 (R1-1): B's finish-time read and
+/// `idle_agent_without_report`'s NOT EXISTS share the predicate
+/// `conversation_id = $ AND status = 'running'`. The index that served it
+/// was dropped at `20260812041850`; `idx_terminal_commands_running_idle`
+/// can't serve it (the query doesn't imply `idle_notice_secs > 0`) and
+/// `idx_terminal_commands_terminal_running` has no `conversation_id`, so
+/// the predicate is answered only by a seq scan (or a bitmap over every
+/// running row with a heap filter) of a table that keeps its finished rows.
+/// With sequential scans priced out the reads must be served by the named
+/// partial index the migration recreates (SME-386 M5's shape, by name: a
+/// scan of some other index passes a bare "uses an index" check).
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_running_command_reads_use_an_index(pool: PgPool) {
+    let mut conn = pool.acquire().await.expect("a connection");
+    sqlx::query("SET enable_seqscan = off").execute(&mut *conn).await.expect("set");
+    let plan: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN {FINISH_RUNNING_COMMANDS_SQL}"))
+        .bind(2_i64)
+        .fetch_all(&mut *conn)
+        .await
+        .expect("explain B's read");
+    let plan = plan.join("\n");
+    assert!(!plan.contains("Seq Scan on terminal_commands"), "B's read scans the table:\n{plan}");
+    // By name, not merely "Index": with seqscans priced out and `ORDER BY
+    // id`, a full primary-key scan satisfies a bare Index check (SME-122's
+    // substring trap) while still reading every row.
+    assert!(plan.contains("idx_terminal_commands_conversation_running"), "B's read is not served by the running-commands index:\n{plan}");
+    let plan: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN {IDLE_AGENT_WITHOUT_REPORT_SQL}"))
+        .bind(2_i64)
+        .bind(AGENT_ACTIVE)
+        .bind(AGENT_STARTING)
+        .fetch_all(&mut *conn)
+        .await
+        .expect("explain the idle read");
+    let plan = plan.join("\n");
+    assert!(
+        !plan.contains("Seq Scan on terminal_commands"),
+        "the idle read's running-command clause scans the table:\n{plan}"
+    );
+    assert!(
+        plan.contains("idx_terminal_commands_conversation_running"),
+        "the idle read's running-command clause is not served by the index:\n{plan}"
+    );
+}

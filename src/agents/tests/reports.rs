@@ -168,7 +168,7 @@ async fn test_two_reports_at_once_arrive_in_one_parent_turn_in_order(pool: PgPoo
 }
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_finish_twice_is_refused_the_second_time(pool: PgPool) {
+async fn test_late_finishes_deliver_follow_up_reports(pool: PgPool) {
     setup(&pool, vec![text_reply("Working.")]).await;
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let child = start_child(&pool, root, "Work.").await;
@@ -178,12 +178,15 @@ async fn test_finish_twice_is_refused_the_second_time(pool: PgPool) {
     let first = crate::anthropic::tools::execute(&pool, child, "toolu_f1", "finish", &input).await;
     assert!(first.as_deref().is_ok_and(|r| r.contains("Your report was sent")), "{first:?}");
     let second = crate::anthropic::tools::execute(&pool, child, "toolu_f2", "finish", &input).await;
-    assert_eq!(second, Err("you've already finished: your report was sent".to_string()));
+    assert!(second.as_deref().is_ok_and(|r| r.contains("follow-up") && r.contains("Your turn ends here")), "{second:?}");
+    let third = crate::anthropic::tools::execute(&pool, child, "toolu_f3", "finish", &input).await;
+    assert!(third.as_deref().is_ok_and(|r| r.contains("follow-up")), "{third:?}");
     let reports = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM agent_messages WHERE kind = 'report'")
         .fetch_one(&pool)
         .await
         .expect("count");
-    assert_eq!(reports, 1);
+    assert_eq!(reports, 3, "every finish a seat makes delivers one row");
+    assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_FINISHED), "the follow-ups wrote no state");
     eventually("the parent's turns are over", || async { !crate::turn::turn_running(root) && !crate::turn::turn_running(child) }).await;
 }
 
