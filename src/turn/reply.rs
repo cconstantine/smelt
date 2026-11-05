@@ -46,19 +46,26 @@ pub(super) async fn build_request(
         .unwrap_or_else(|| estimate_request_tokens(&request));
     let budget = reply_budget(turn_model.context_window, projected, turn_model.output_cap);
     let budget = if room_only { budget_within_room(budget, turn_model.context_window, projected) } else { budget };
+    apply_budget(&mut request, turn_model, budget);
+    Ok((request, budget))
+}
+
+/// Puts a reply `budget` on `request`, with the thinking it allows.
+#[cfg(feature = "server")]
+fn apply_budget(request: &mut anthropic::CreateMessageRequest, turn_model: &crate::providers::TurnModel, budget: ReplyBudget) {
     request.max_tokens = budget.tokens;
     request.thinking = turn_model.thinking_config(request.max_tokens);
     // A budget with no room to think in turned thinking off: the
     // template is told too (SME-111 review 1).
     request.chat_template_kwargs = turn_model.chat_template_kwargs(request.thinking.is_some());
-    Ok((request, budget))
 }
 
 /// `build_request`, held to the floor (`MIN_USEFUL_REPLY`) when compacting
 /// can't help and the request gets only the room left. A request under it
 /// that hasn't just compacted (`compacted`) does now, whatever got it there
 /// (a big paste, or the usage row a compaction clears until a reply lands),
-/// and is built again (SME-386 review M-A). Only one that has is refused.
+/// and is built again (SME-386 review M-A). One that has is settled by
+/// `CompactionProgress::floor_fired`.
 #[cfg(feature = "server")]
 pub(super) async fn build_request_with_room(
     pool: &PgPool,
@@ -84,8 +91,12 @@ pub(super) async fn build_request_with_room(
     }
     if under_the_floor(room_only, budget) {
         let size = estimate_request_tokens(&request);
-        let why = with_compaction_progress(conversation_id, |p| p.no_room(size, &turn_model.model, turn_model.context_window));
-        return Err(ServerFnError::new(why));
+        let window = turn_model.context_window;
+        budget = match with_compaction_progress(conversation_id, |p| p.floor_fired(size, &turn_model.model, window)) {
+            FloorAnswer::Believe(after) => budget_within_room(reply_budget(window, after, turn_model.output_cap), window, after),
+            FloorAnswer::NoRoom(why) => return Err(ServerFnError::new(why)),
+        };
+        apply_budget(&mut request, turn_model, budget);
     }
     Ok((request, budget))
 }

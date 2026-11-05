@@ -77,6 +77,15 @@ pub(super) enum CompactionStep {
     Stuck(String),
 }
 
+/// What to do with a compacted request the estimate leaves under the floor.
+#[derive(Debug, PartialEq)]
+pub(super) enum FloorAnswer {
+    /// A reply measured this size after a compaction, and it leaves room.
+    Believe(u64),
+    /// It doesn't fit, for this reason.
+    NoRoom(String),
+}
+
 /// A conversation's record of what its compactions left.
 #[derive(Clone, Debug, Default)]
 pub(super) struct CompactionProgress {
@@ -242,13 +251,17 @@ impl CompactionProgress {
         self.room_retried = false;
     }
 
-    /// A compacted request of about `size` tokens leaves no useful room for
-    /// a reply: the conversation doesn't fit, and here's the reason.
-    pub(super) fn no_room(&mut self, size: u64, model: &str, context_window: u32) -> String {
+    /// A request of about `size` tokens, compacted just now, leaves no useful
+    /// room by the estimate.
+    pub(super) fn floor_fired(&mut self, size: u64, model: &str, context_window: u32) -> FloorAnswer {
         self.sync(context_window);
+        let fits = |after: &u64| after + u64::from(COMPACTION_SAFETY_BUFFER) + u64::from(MIN_USEFUL_REPLY) <= u64::from(context_window);
+        if let Some(after) = self.after.filter(fits) {
+            return FloorAnswer::Believe(after);
+        }
         self.after = Some(size);
         self.stuck = true;
-        self.why_stuck(model, context_window)
+        FloorAnswer::NoRoom(self.why_stuck(model, context_window))
     }
 
     /// The reason, if the conversation doesn't fit: for a reply cut off on
@@ -525,14 +538,38 @@ mod tests {
     }
 
     #[test]
-    fn test_no_room_is_stuck_and_says_the_size() {
+    fn test_the_floor_with_no_measured_room_is_stuck_and_says_why() {
         let mut progress = tight();
-        let why = progress.no_room(95_000, "m", WINDOW);
-        assert!(why.contains("(100,000 tokens) is too small") && why.contains("about 95,000 tokens"), "{why}");
+        after_compaction(&mut progress, 96_000);
+        let FloorAnswer::NoRoom(why) = progress.floor_fired(99_000, "m", WINDOW) else {
+            panic!("no room by either number");
+        };
+        assert!(why.contains("(100,000 tokens) is too small"), "{why}");
         assert!(progress.is_stuck());
         assert_eq!(progress.why_if_stuck("m", WINDOW).as_deref(), Some(why.as_str()));
         progress.user_wrote();
         assert_eq!(progress.why_if_stuck("m", WINDOW), None);
+    }
+
+    #[test]
+    fn test_what_was_measured_outweighs_the_estimate_when_it_shows_room() {
+        let mut progress = tight();
+        assert_eq!(progress.floor_fired(99_000, "m", WINDOW), FloorAnswer::Believe(80_000));
+        assert!(!progress.is_stuck());
+        // Exactly the buffer and the floor, then one token over.
+        after_compaction(&mut progress, 94_880);
+        assert_eq!(progress.floor_fired(99_000, "m", WINDOW), FloorAnswer::Believe(94_880));
+        after_compaction(&mut progress, 94_881);
+        assert!(matches!(progress.floor_fired(99_000, "m", WINDOW), FloorAnswer::NoRoom(_)));
+    }
+
+    #[test]
+    fn test_with_nothing_measured_the_estimate_is_the_number_to_name() {
+        let mut progress = CompactionProgress::default();
+        let FloorAnswer::NoRoom(why) = progress.floor_fired(99_000, "m", WINDOW) else {
+            panic!("no room");
+        };
+        assert!(why.contains("about 99,000 tokens"), "{why}");
     }
 
     #[test]

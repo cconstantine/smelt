@@ -31,6 +31,10 @@ impl Honest {
         self.steps.lock().expect("the request log").len()
     }
 
+    pub(super) fn max_tokens(&self, i: usize) -> u64 {
+        self.steps.lock().expect("the request log")[i]["max_tokens"].as_u64().expect("max_tokens")
+    }
+
     pub(super) fn summary_calls(&self) -> usize {
         self.summaries.load(Ordering::SeqCst)
     }
@@ -353,4 +357,27 @@ async fn test_a_big_paste_after_a_failed_call_compacts_rather_than_refusing(pool
     assert_eq!(last_failure_reason(&pool, conversation.id).await, None);
     assert_eq!(seen.summary_calls(), summarized + 1, "it compacted");
     assert_eq!(seen.count(), calls + 2, "the planned step, and the final reply");
+}
+
+/// Review M-A: an estimate above real usage. What a reply measured after a
+/// compaction is what's believed, and the request gets the room that shows.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_measured_size_outweighs_a_high_estimate(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    // The window leaves the estimate about 100 tokens, and each reply measures
+    // 3,000. Two results learn it's tight; the 9,000 has it compact again.
+    let plans = vec![plan(3_000, 10), plan(3_000, 10), plan(3_000, 10), plan(9_000, 10), plan(3_000, 10)];
+    let seen = honest_mock(&pool, plans).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let window = window_leaving(&pool, conversation.id, 100).await;
+    set_context_window(&pool, window, None).await;
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("what was measured says it fits");
+
+    assert_eq!(last_reply(&saved).as_deref(), Some("Done."));
+    assert_eq!(seen.count(), 6);
+    let reply = seen.max_tokens(4);
+    assert!(u64::from(MIN_USEFUL_REPLY) <= reply, "{reply} reply tokens");
+    assert!(reply + 3_000 + u64::from(COMPACTION_SAFETY_BUFFER) <= window as u64, "{reply} reply tokens, in {window}");
 }
