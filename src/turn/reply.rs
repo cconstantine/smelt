@@ -44,8 +44,7 @@ pub(super) async fn build_request(
     // Thinking shares it with the reply.
     let projected = projected_input(last_known_usage, estimate_tokens(pending_new_content))
         .unwrap_or_else(|| estimate_request_tokens(&request));
-    let budget = reply_budget(turn_model.context_window, projected, turn_model.output_cap);
-    let budget = if room_only { budget_within_room(budget, turn_model.context_window, projected) } else { budget };
+    let budget = budget_for(turn_model.context_window, projected, turn_model.output_cap, room_only);
     apply_budget(&mut request, turn_model, budget);
     Ok((request, budget))
 }
@@ -60,12 +59,8 @@ fn apply_budget(request: &mut anthropic::CreateMessageRequest, turn_model: &crat
     request.chat_template_kwargs = turn_model.chat_template_kwargs(request.thinking.is_some());
 }
 
-/// `build_request`, held to the floor (`MIN_USEFUL_REPLY`) when compacting
-/// can't help and the request gets only the room left. A request under it
-/// that hasn't just compacted (`compacted`) does now, whatever got it there
-/// (a big paste, or the usage row a compaction clears until a reply lands),
-/// and is built again (SME-386 review M-A). One that has is settled by
-/// `CompactionProgress::floor_fired`.
+/// `build_request`, held to the floor (`room::before_sending`) when
+/// compacting can't help and the request gets only the room left.
 #[cfg(feature = "server")]
 pub(super) async fn build_request_with_room(
     pool: &PgPool,
@@ -76,36 +71,31 @@ pub(super) async fn build_request_with_room(
     pending_new_content: &[anthropic::ContentBlock],
     compacted: &mut bool,
 ) -> ServerFnResult<(anthropic::CreateMessageRequest, ReplyBudget)> {
-    let mut room_only = with_compaction_progress(conversation_id, |p| p.room_only_at(turn_model.context_window));
-    let (mut request, mut budget) = build_request(pool, conversation_id, turn_model, last_known_usage.as_ref(), pending_new_content, room_only).await?;
-    if under_the_floor(room_only, budget) && !*compacted {
-        compact_conversation(pool, conversation_id, turn_model, slot, None).await?;
-        // Compacting can learn a smaller window, which forgets what `room_only` read.
-        room_only = with_compaction_progress(conversation_id, |p| {
-            p.compacted(turn_model.context_window);
-            p.room_only_at(turn_model.context_window)
-        });
-        *compacted = true;
-        *last_known_usage = None;
-        (request, budget) = build_request(pool, conversation_id, turn_model, None, pending_new_content, room_only).await?;
-    }
-    if under_the_floor(room_only, budget) {
+    loop {
+        let room_only = with_compaction_progress(conversation_id, |p| p.room_only_at(turn_model.context_window));
+        let (mut request, budget) = build_request(pool, conversation_id, turn_model, last_known_usage.as_ref(), pending_new_content, room_only).await?;
         let size = estimate_request_tokens(&request);
-        let window = turn_model.context_window;
-        budget = match with_compaction_progress(conversation_id, |p| p.floor_fired(size, &turn_model.model, window)) {
-            FloorAnswer::Believe(after) => budget_within_room(reply_budget(window, after, turn_model.output_cap), window, after),
-            FloorAnswer::TryAnyway => ReplyBudget { tokens: MIN_USEFUL_REPLY, limit: crate::api::chat::ReplyLimit::RoomLeft },
-            FloorAnswer::NoRoom(why) => return Err(ServerFnError::new(why)),
-        };
-        apply_budget(&mut request, turn_model, budget);
+        let (window, cap) = (turn_model.context_window, turn_model.output_cap);
+        let decided = with_compaction_progress(conversation_id, |p| before_sending(p, &turn_model.model, window, cap, room_only, budget, size, *compacted));
+        match decided {
+            BeforeSending::Send(sent) => {
+                if sent != budget {
+                    apply_budget(&mut request, turn_model, sent);
+                }
+                return Ok((request, sent));
+            }
+            // Only once: `compacted` is set now, and the next pass is settled
+            // by the floor. Compacting can learn a smaller window, which the
+            // next pass reads again.
+            BeforeSending::Compact => {
+                compact_conversation(pool, conversation_id, turn_model, slot, None).await?;
+                with_compaction_progress(conversation_id, |p| p.compacted(turn_model.context_window));
+                *compacted = true;
+                *last_known_usage = None;
+            }
+            BeforeSending::Refuse(why) => return Err(ServerFnError::new(why)),
+        }
     }
-    Ok((request, budget))
-}
-
-/// Whether a request's budget is what's left of the room, and too little.
-#[cfg(feature = "server")]
-fn under_the_floor(room_only: bool, budget: ReplyBudget) -> bool {
-    room_only && budget.limit == crate::api::chat::ReplyLimit::RoomLeft && budget.tokens < MIN_USEFUL_REPLY
 }
 
 /// Saves a model call's reply, and, for a reply cut off or refused, a

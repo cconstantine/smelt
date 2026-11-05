@@ -37,40 +37,27 @@ pub(super) async fn recover(
 ) -> ServerFnResult<Recovered> {
     let named = learn(pool, conversation_id, turn_model, overflow.window).await;
     let input = overflow.input_tokens.unwrap_or_else(|| estimate_request_tokens(refused));
-    // What a retry with the budget's usual reply must leave room for on top
-    // of the input, a reply and the estimate's headroom: short of it, the
-    // history is what has to go (below).
-    let needs = u64::from(MIN_REPLY_TOKENS) + u64::from(COMPACTION_SAFETY_BUFFER);
     let believed = turn_model.context_window;
 
-    if named.is_some() {
-        // Can't help: what no compaction can take away — the system
-        // prompt and the tool definitions — already leaves this window
-        // no room to answer in, even a short reply, which is all a request
-        // gets once compacting can't help (SME-386 review M-B). Don't
-        // compact; fail at once, and say what to change.
-        let alone = estimate_request_tokens(&without_messages(refused));
-        if alone + u64::from(MIN_USEFUL_REPLY) + u64::from(COMPACTION_SAFETY_BUFFER) > u64::from(turn_model.context_window) {
-            return Err(ServerFnError::new(too_small(&turn_model.model, turn_model.context_window, alone)));
+    let compacted = match named {
+        Some(_) => {
+            let alone = estimate_request_tokens(&without_messages(refused));
+            match after_named_refusal(&turn_model.model, turn_model.context_window, alone, input) {
+                NamedRefusal::TooSmall(why) => return Err(ServerFnError::new(why)),
+                NamedRefusal::Retry { compact } => compact,
+            }
         }
-    } else {
-        // The assumption for this turn's compaction and retry — three
-        // quarters of the refused request's size. A guess, so it never
-        // leaves the turn. Provider-supplied sizes are saturating here
-        // and upstream: `anthropic::overflow` drops implausible ones,
-        // and these are the last two spots one could still reach (SME-73 review).
-        let assumed = u32::try_from(input.saturating_mul(3) / 4).unwrap_or(u32::MAX);
-        if assumed < turn_model.context_window {
-            turn_model.context_window = assumed;
-            with_compaction_progress(conversation_id, |p| p.guessed(believed, assumed));
+        None => {
+            // The assumption for this turn's compaction and retry. A guess,
+            // so it never leaves the turn; and with no window named, the
+            // history is what has to go.
+            if let Some(assumed) = guessed_window(input, believed) {
+                turn_model.context_window = assumed;
+                with_compaction_progress(conversation_id, |p| p.guessed(believed, assumed));
+            }
+            true
         }
-    }
-
-    // Budget only when the input fits the window the turn now holds:
-    // then the reply budget was the whole problem, and the same history
-    // goes again as it stands. It doesn't, or no window was named:
-    // summarize first, with the window now known.
-    let compacted = named.is_none() || input.saturating_add(needs) > u64::from(turn_model.context_window);
+    };
     if compacted {
         #[cfg(test)]
         test_hooks::before_summary_call(conversation_id).await;
@@ -283,7 +270,7 @@ fn still_did_not_fit(model: &str, window: Option<u32>, compacted: bool, said: &s
 
 /// The failed turn's words when the window can't hold the system prompt
 /// and tools, leave alone a conversation.
-fn too_small(model: &str, window: u32, alone: u64) -> String {
+pub(super) fn too_small(model: &str, window: u32, alone: u64) -> String {
     format!(
         "`{model}`'s context window ({} tokens) is too small for smelt's system prompt and tools (about {} tokens). \
          Give the model a larger context on its server, or pick another model.",
