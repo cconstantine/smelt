@@ -217,6 +217,50 @@ mod tests {
         assert_eq!(lookups.load(std::sync::atomic::Ordering::SeqCst), 1, "one lookup for the row as saved");
     }
 
+    /// SME-395: the re-derive cache answers from a process-wide set, but its
+    /// key — `(id, updated_at)` — is unique only inside one database: every
+    /// `#[sqlx::test]` database of this process restarts row ids at 1, and two
+    /// of them can save at the same stored microsecond. This test pins that
+    /// collision rather than waiting for it: a second migrated database, the
+    /// same rust-analyzer row at id 1 and the same `updated_at`, looked up
+    /// after this one. Its own row must still be re-derived.
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+    async fn test_a_row_looked_up_in_another_database_is_looked_up_here_too(pool: sqlx::PgPool) {
+        let base = catalog().await;
+        let helix = format!("{base}/languages.toml");
+        // Both databases' rows claim to have been saved at this instant.
+        let pin = "UPDATE language_servers SET updated_at = '2026-08-31 12:00:00'";
+
+        // This database's row: looked up, once.
+        save(&pool, None, &rust_analyzer(OLD_INSTALL)).await.expect("saved");
+        sqlx::raw_sql(pin).execute(&pool).await.expect("pinned");
+        let (config, _) = rederive_github_install(&pool, "rust-analyzer", &base, &helix)
+            .await
+            .expect("this database's row is re-derived");
+        assert!(config.install_command.starts_with("case \"$(uname -m)\" in x86_64) "), "{}", config.install_command);
+        assert_eq!(rederive_github_install(&pool, "rust-analyzer", &base, &helix).await, None, "once here");
+
+        // A second database — every row id restarts there, so its row is id 1
+        // too, and `pin` matches this one's to the stored microsecond.
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let server = url.rsplit_once('/').expect("a URL naming a database").0;
+        let other = format!("_sqlx_test_sme395_{}", std::process::id());
+        let maint = sqlx::PgPool::connect(&url).await.expect("a connection to the test database");
+        sqlx::raw_sql(&format!("CREATE DATABASE \"{other}\"")).execute(&maint).await.expect("a second database");
+        let scratch = sqlx::PgPool::connect(&format!("{server}/{other}")).await.expect("the second database");
+        crate::test_lock::MIGRATOR.run(&scratch).await.expect("migrated");
+        save(&scratch, None, &rust_analyzer(OLD_INSTALL)).await.expect("saved there");
+        sqlx::raw_sql(pin).execute(&scratch).await.expect("pinned there");
+        let (config, _) = rederive_github_install(&scratch, "rust-analyzer", &base, &helix)
+            .await
+            .expect("another database's lookup doesn't answer for this row");
+        assert!(config.install_command.starts_with("case \"$(uname -m)\" in x86_64) "), "{}", config.install_command);
+        assert_eq!(rederive_github_install(&scratch, "rust-analyzer", &base, &helix).await, None, "once there too");
+        scratch.close().await;
+        sqlx::raw_sql(&format!("DROP DATABASE \"{other}\" WITH (FORCE)")).execute(&maint).await.expect("dropped");
+        maint.close().await;
+    }
+
     #[test]
     fn test_deleting_disabling_or_renaming_stops_a_servers_pods() {
         let on = pyright();
