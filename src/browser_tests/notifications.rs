@@ -27,6 +27,8 @@ const NOTIFICATION_STUB: &str = r#"
   if (window.__smeltNotifierStubbed) return;
   window.__smeltNotifierStubbed = true;
   window.__notifications = [];
+  window.__unhandled = [];
+  window.addEventListener("unhandledrejection", (e) => window.__unhandled.push(String(e.reason)));
   class FakeNotification {
     static permission = "granted";
     static async requestPermission() { return "granted"; }
@@ -98,6 +100,16 @@ async fn recorded(page: &chromiumoxide::Page) -> Vec<Recorded> {
 /// How many notifications `page` has recorded with `tag`.
 pub(super) async fn tag_count(page: &chromiumoxide::Page, tag: &str) -> usize {
     recorded(page).await.iter().filter(|n| n.tag == tag).count()
+}
+
+/// The promise rejections nothing handled in this document (SME-386 F9):
+/// each is a `pageerror` in a real page.
+pub(super) async fn unhandled_rejections(page: &chromiumoxide::Page) -> Vec<String> {
+    page.evaluate("window.__unhandled")
+        .await
+        .expect("read the stub's rejections")
+        .into_value()
+        .expect("a list of strings")
 }
 
 /// Waits until `page` has recorded `count` notifications with `tag`.

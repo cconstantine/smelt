@@ -399,8 +399,12 @@ function requestLock(steal) {
   const ac = steal ? null : new AbortController();
   if (ac) { N.abort = ac; }
   N.pending = true;
+  // Settled only by `heldResolve`, which is what lets a granted lock go. The
+  // signal cancels a request still queued (`locks.request` rejects for that),
+  // and a promise rejected by it too would have no handler before the grant:
+  // an uncaught `Event` on every dropped request (SME-386 F9).
   let resolveHeld;
-  const held = new Promise((res, rej) => { resolveHeld = res; if (ac) { ac.signal.addEventListener("abort", rej); } });
+  const held = new Promise((res) => { resolveHeld = res; });
   navigator.locks.request(LOCK, ac ? { signal: ac.signal } : { steal: true }, () => {
     if (N.dead) { throw new DOMException("replaced", "AbortError"); }
     N.pending = false; N.intentional = false; N.leader = true; N.heldResolve = resolveHeld;

@@ -60,6 +60,8 @@ pub(super) async fn scenario_notifier_leadership(t: &Scenario<'_>) {
     assert!(wait_until(|| leads(&b), Duration::from_secs(5)).await, "focus moved the leader to B");
     assert!(!leads(&a).await, "A stopped leading");
     assert_eq!(queued_requests(&b).await, 1, "A queues once, and B's repeated focus queued nothing");
+    // F9: dropping B's queued request for the steal is no page error.
+    assert_eq!(unhandled_rejections(&b).await, Vec::<String>::new(), "B's steal raised an uncaught error");
     // And back: focusing A takes it again.
     set_focus(&b, false, false).await;
     set_focus(&a, true, true).await;
@@ -99,6 +101,10 @@ pub(super) async fn scenario_notifier_leadership(t: &Scenario<'_>) {
     set_focus(&b, false, false).await;
     set_focus(&a, true, true).await;
     assert!(wait_until(|| leads(&a), Duration::from_secs(5)).await, "A leads again, to turn the setting off");
+
+    for tab in [&a, &b] {
+        assert_eq!(unhandled_rejections(tab).await, Vec::<String>::new(), "every lock move stays quiet");
+    }
 
     // Leave the browser's setting off, as the next scenario expects.
     a.evaluate("localStorage.removeItem('smelt.notifications')").await.expect("turn the setting off");
@@ -275,5 +281,8 @@ pub(super) async fn scenario_notifier_keeps_state_across_navigation(t: &Scenario
 
     crate::turn::forget_conversation_lock(demoted.id);
     crate::turn::forget_conversation_lock(clicked.id);
+    for tab in [&a, &b] {
+        assert_eq!(unhandled_rejections(tab).await, Vec::<String>::new(), "route changes stay quiet");
+    }
     a.evaluate("localStorage.removeItem('smelt.notifications')").await.expect("turn the setting off");
 }
