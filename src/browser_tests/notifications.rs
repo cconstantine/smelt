@@ -95,6 +95,11 @@ async fn recorded(page: &chromiumoxide::Page) -> Vec<Recorded> {
     serde_json::from_str(&json).expect("the stub's records")
 }
 
+/// How many notifications `page` has recorded with `tag`.
+pub(super) async fn tag_count(page: &chromiumoxide::Page, tag: &str) -> usize {
+    recorded(page).await.iter().filter(|n| n.tag == tag).count()
+}
+
 /// Waits until `page` has recorded `count` notifications with `tag`.
 pub(super) async fn wait_tag_count(page: &chromiumoxide::Page, tag: &str, count: usize, timeout: Duration) -> bool {
     let tag = tag.to_string();
@@ -156,7 +161,7 @@ async fn wait_toggle_label(page: &chromiumoxide::Page, label: &str, timeout: Dur
 
 /// Waits until the tab's app is showing `path` — in-app navigation, the
 /// way `click_conversation` checks its own click landed.
-async fn wait_pathname(page: &chromiumoxide::Page, path: &str, timeout: Duration) -> bool {
+pub(super) async fn wait_pathname(page: &chromiumoxide::Page, path: &str, timeout: Duration) -> bool {
     let want = path.to_string();
     wait_until(
         || async {
@@ -174,7 +179,7 @@ async fn wait_pathname(page: &chromiumoxide::Page, path: &str, timeout: Duration
 }
 
 /// Waits for the tab's `document.title`.
-async fn wait_title(page: &chromiumoxide::Page, title: &str, timeout: Duration) -> bool {
+pub(super) async fn wait_title(page: &chromiumoxide::Page, title: &str, timeout: Duration) -> bool {
     let want = title.to_string();
     wait_until(
         || async {

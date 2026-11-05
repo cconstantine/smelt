@@ -2,6 +2,8 @@
 //! leader's own app stream reaches a tab — N2's focus steal. Uses the
 //! `Notification` stub and the focus override of `notifications.rs`.
 //!
+//! F1 and F2 too: the notifier across a client-side route change.
+//!
 //! `Runs::Alone`, as `desktop_notifications`: the leader's app-wide
 //! stream hears every lane's turns, and the setting is browser-wide.
 
@@ -99,5 +101,179 @@ pub(super) async fn scenario_notifier_leadership(t: &Scenario<'_>) {
     assert!(wait_until(|| leads(&a), Duration::from_secs(5)).await, "A leads again, to turn the setting off");
 
     // Leave the browser's setting off, as the next scenario expects.
+    a.evaluate("localStorage.removeItem('smelt.notifications')").await.expect("turn the setting off");
+}
+
+/// Opens a stubbed tab on a conversation with notifications on, out of
+/// focus, leading.
+async fn conversation_tab_notifying(t: &Scenario<'_>, id: i64) -> chromiumoxide::Page {
+    let page = stubbed_tab(t, t.url(&format!("conversation/{id}"))).await;
+    wait_for_live_client(&page, id).await;
+    page.evaluate("localStorage.setItem('smelt.notifications', 'on')").await.expect("turn the setting on");
+    page.reload().await.expect("boot with the setting on");
+    wait_for_live_client(&page, id).await;
+    assert!(wait_until(|| leads(&page), Duration::from_secs(10)).await, "the tab leads");
+    set_focus(&page, false, false).await;
+    page
+}
+
+/// Whether a spell owing the user on `id` makes `page` show a new
+/// notification. The stream a new leader opens has no catch-up, so a
+/// publish can come before it connects: this publishes again until one
+/// shows, each a new generation, as the user's send would start.
+async fn spell_notifies(page: &chromiumoxide::Page, id: i64) -> bool {
+    let tag = format!("smelt-conversation-{id}");
+    let before = tag_count(page, &tag).await;
+    for _ in 0..6 {
+        crate::turn::new_turn_generation(id);
+        crate::turn::publish_a_test_spell(id, crate::events::Attention::CutOff);
+        if wait_until(|| async { tag_count(page, &tag).await > before }, Duration::from_millis(1500)).await {
+            return true;
+        }
+    }
+    false
+}
+
+/// A sidebar link to the providers page, and that page having loaded.
+async fn to_providers(page: &chromiumoxide::Page) {
+    click_when_present(page, ".providers-link", Duration::from_secs(10)).await;
+    assert!(wait_pathname(page, "/providers", Duration::from_secs(10)).await, "the sidebar link didn't open /providers");
+    wait_for_element(page, ".mcp-back-link", Duration::from_secs(10)).await;
+    // Whatever the route change was going to do to the notifier, done.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+}
+
+/// The browser's Back, and whatever it did settled.
+async fn browser_back(page: &chromiumoxide::Page, path: &str) {
+    page.evaluate("history.back()").await.expect("go back");
+    assert!(wait_pathname(page, path, Duration::from_secs(10)).await, "Back didn't return to {path}");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+}
+
+/// The settings page's own link back to Home, and it settled.
+async fn back_link_home(page: &chromiumoxide::Page) {
+    click_when_present(page, ".mcp-back-link", Duration::from_secs(10)).await;
+    assert!(wait_pathname(page, "/", Duration::from_secs(10)).await, "the back link didn't open Home");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+}
+
+/// F1: a tab that went to a settings page and back still notifies. It
+/// used to keep the lock, say "Notifications on", and notify nothing.
+pub(super) async fn scenario_notifier_after_navigation(t: &Scenario<'_>) {
+    let shown = t.conversation().await;
+    let other = t.conversation().await;
+    let page = conversation_tab_notifying(t, shown.id).await;
+    assert!(spell_notifies(&page, other.id).await, "a fresh load notifies");
+
+    to_providers(&page).await;
+    assert!(spell_notifies(&page, other.id).await, "a settings page notifies");
+    browser_back(&page, &format!("/conversation/{}", shown.id)).await;
+    assert!(leads(&page).await, "the tab still holds the lock");
+    assert!(spell_notifies(&page, other.id).await, "the tab notifies after a settings page and the browser's Back");
+
+    to_providers(&page).await;
+    back_link_home(&page).await;
+    assert!(leads(&page).await, "the tab still holds the lock");
+    assert!(spell_notifies(&page, other.id).await, "the tab notifies after a settings page and the link to Home");
+
+    crate::turn::forget_conversation_lock(other.id);
+    page.evaluate("localStorage.removeItem('smelt.notifications')").await.expect("turn the setting off");
+}
+
+/// The state a route change must leave alone, read from the tab: its
+/// notifier instance (`mark` is set on it by the scenario), how many
+/// notifications it tracks, and its title.
+async fn assert_state_kept(page: &chromiumoxide::Page, other: &chromiumoxide::Page, tracked: usize, title: &str, leg: &str) {
+    let facts: serde_json::Value = page
+        .evaluate("({ mark: window.__smeltNotifier.mark ?? null, tracked: window.__smeltNotifier.notifications.size, title: document.title })")
+        .await
+        .expect("read the notifier")
+        .into_value()
+        .expect("an object");
+    assert_eq!(
+        facts,
+        serde_json::json!({ "mark": "first", "tracked": tracked, "title": title }),
+        "{leg}: the route change forgot the tab's notifier"
+    );
+    assert!(leads(page).await, "{leg}: the tab lost the lock");
+    assert!(!leads(other).await, "{leg}: leadership moved with no focus change");
+}
+
+/// F2: a route change keeps the tab's one notifier, so its open
+/// notifications stay tracked (and close when they go stale), its count
+/// stays, and it stays the leader. A route used to be a new notifier.
+pub(super) async fn scenario_notifier_keeps_state_across_navigation(t: &Scenario<'_>) {
+    const HEADING: &str = "smelt: the reply was cut off";
+    let shown = t.conversation().await;
+    let first = t.conversation().await;
+    let clicked = t.conversation().await;
+    let demoted = t.conversation().await;
+    let first_tag = format!("smelt-conversation-{}", first.id);
+    let clicked_tag = format!("smelt-conversation-{}", clicked.id);
+    let demoted_tag = format!("smelt-conversation-{}", demoted.id);
+    let shown_path = format!("/conversation/{}", shown.id);
+    let clicked_path = format!("/conversation/{}", clicked.id);
+
+    let a = conversation_tab_notifying(t, shown.id).await;
+    let b = settings_tab_notifying(t).await;
+    set_focus(&b, false, false).await;
+    assert!(
+        wait_until(|| async { queued_requests(&a).await == 1 }, Duration::from_secs(10)).await,
+        "the second tab queues behind the first"
+    );
+    assert!(spell_notifies(&a, first.id).await, "the leader notifies");
+    assert!(wait_title(&a, "(1) smelt", Duration::from_secs(5)).await, "the count shows");
+    a.evaluate("window.__smeltNotifier.mark = 'first'").await.expect("mark the notifier");
+
+    // Every kind of route change the notifier used to fall to.
+    to_providers(&a).await;
+    assert_state_kept(&a, &b, 1, "(1) smelt", "conversation to settings").await;
+    browser_back(&a, &shown_path).await;
+    assert_state_kept(&a, &b, 1, "(1) smelt", "settings to conversation").await;
+    to_providers(&a).await;
+    back_link_home(&a).await;
+    assert_state_kept(&a, &b, 1, "(1) smelt", "settings to Home").await;
+
+    // What it tracked before the route changes still closes when stale.
+    assert!(spell_notifies(&a, clicked.id).await, "Home's leader notifies");
+    assert!(wait_title(&a, "(2) smelt", Duration::from_secs(5)).await, "the count grows");
+    crate::api::chat::delete_conversation(first.id).await.expect("delete the conversation");
+    assert!(
+        wait_last_closed(&a, &first_tag, HEADING, Duration::from_secs(10)).await,
+        "a notification from before the route changes closes when it goes stale"
+    );
+    assert!(wait_title(&a, "(1) smelt", Duration::from_secs(5)).await, "and the count drops");
+
+    // A click from Home opens the conversation and closes the notification.
+    a.evaluate(format!(
+        "window.__notifications.filter(n => n.tag === {clicked_tag:?}).at(-1).onclick()"
+    ))
+    .await
+    .expect("click the notification");
+    assert!(wait_pathname(&a, &clicked_path, Duration::from_secs(10)).await, "the click opened the conversation");
+    assert!(wait_last_closed(&a, &clicked_tag, HEADING, Duration::from_secs(10)).await, "the click closed it");
+    assert!(wait_title(&a, "smelt", Duration::from_secs(5)).await, "and the count empties");
+
+    // Demoted on a conversation, a tab keeps what it showed: the
+    // conversation's stream revalidates it. Leaving for a page with no
+    // stream, nothing would, so it closes them (N4's rule, on a route
+    // change).
+    assert!(spell_notifies(&a, demoted.id).await, "the leader notifies");
+    assert!(wait_title(&a, "(1) smelt", Duration::from_secs(5)).await, "the count shows");
+    set_focus(&b, true, true).await;
+    assert!(wait_until(|| leads(&b), Duration::from_secs(5)).await, "focus moved the leader to B");
+    assert!(wait_until(|| async { !leads(&a).await }, Duration::from_secs(5)).await, "A stopped leading");
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(tag_count(&a, &demoted_tag).await, 1);
+    assert!(wait_title(&a, "(1) smelt", Duration::from_secs(1)).await, "demoted on a conversation, it keeps the count");
+    to_providers(&a).await;
+    assert!(
+        wait_last_closed(&a, &demoted_tag, HEADING, Duration::from_secs(5)).await,
+        "leaving the conversation closes what only its stream could revalidate"
+    );
+    assert!(wait_title(&a, "smelt", Duration::from_secs(5)).await, "and the count goes with them");
+
+    crate::turn::forget_conversation_lock(demoted.id);
+    crate::turn::forget_conversation_lock(clicked.id);
     a.evaluate("localStorage.removeItem('smelt.notifications')").await.expect("turn the setting off");
 }

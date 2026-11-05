@@ -354,14 +354,12 @@ const NOTIFIER_JS: &str = r#"
 const KEY = "smelt.notifications";
 const LOCK = "smelt-notifier";
 const N = { notifications: new Map(), leader: false, pending: false, intentional: false, abort: null, throws: false, setting: false, dead: false, heldResolve: null };
-// One notifier per page, newest wins: an early render-remount burst can
-// boot this script several times before the page settles, and the older
-// instances' lock requests (or even a granted `held` whose Rust task was
-// cancelled under remount) would otherwise queue or hold behind a ghost
+// One notifier per page, newest wins: `Shell` mounts this once a page, but
+// if anything else ever boots it again, the older instance's lock request
+// (or a granted `held` whose Rust task is gone) must not hold behind a ghost
 // forever. A new boot releases the previous instance's lock outright; the
 // old loop quits at its next message and its catch neither posts nor
-// re-requests (measured: 14 boots in ~350 ms on the providers page, 2 on
-// a conversation page).
+// re-requests.
 const prev = window.__smeltNotifier;
 if (prev) {
   prev.dead = true;
@@ -583,17 +581,6 @@ async fn notifier(
                 if let Some(task) = leader_task.take() {
                     task.cancel();
                 }
-                // A demoted leader on a conversation keeps the
-                // notifications it showed: their revalidation now rides
-                // this tab's feed. Anywhere else nothing would revalidate
-                // them, so they close, and the count with them (SME-386
-                // N4): the user is in another smelt tab, which leads.
-                if shown.peek().is_none() {
-                    for id in std::mem::take(&mut open).into_keys() {
-                        send(serde_json::json!({ "cmd": "close", "id": id }));
-                    }
-                    needers.clear();
-                }
             }
             "click" => {
                 if let Some(id) = num(&from_js, "id").map(|id| id as i64) {
@@ -617,6 +604,18 @@ async fn notifier(
                 ToggleRequest::On { granted: false } => send(serde_json::json!({ "cmd": "state" })),
                 ToggleRequest::Off => send(serde_json::json!({ "cmd": "setting", "on": false })),
             }
+        }
+
+        // A tab that doesn't lead keeps what it showed only on a
+        // conversation: their revalidation rides this tab's feed. Anywhere
+        // else nothing would revalidate them, whether it was demoted there
+        // (SME-386 N4) or left the conversation since (F2), so they close,
+        // and the count with them.
+        if !leader && shown.peek().is_none() {
+            for id in std::mem::take(&mut open).into_keys() {
+                send(serde_json::json!({ "cmd": "close", "id": id }));
+            }
+            needers.clear();
         }
 
         // Relayed `NeedsUser`s from this tab's conversation stream, and
