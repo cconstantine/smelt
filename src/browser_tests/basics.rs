@@ -278,7 +278,10 @@ pub(super) async fn scenario_overflow_compacts(t: &Scenario<'_>) {
     let before = db::get_provider_model(pool, provider, &model).await.expect("read the lane model's row");
 
     let _fast = t.mock.hurry();
-    let _refused_first = t.mock.refuse_next(1, exceed_context_size(120_000, 131_072));
+    let _refused_first = t.mock.refuse_next("overflow me", 1, exceed_context_size(120_000, 131_072));
+    // SME-371's flake, pinned: a stray request on the lane while the refusal
+    // is armed mustn't use it up, or this turn never compacts.
+    t.mock.stray_request().await;
     let conversation = t.conversation().await;
     let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
     wait_for_live_client(&page, conversation.id).await;
@@ -291,7 +294,8 @@ pub(super) async fn scenario_overflow_compacts(t: &Scenario<'_>) {
             Duration::from_secs(20)
         )
         .await,
-        "the refused request should compact, and its divider should read the refusal and the window it named"
+        "the refused request should compact, and its divider should read the refusal and the window it named; the refusal still armed: {}",
+        t.mock.refusal_armed()
     );
     assert!(
         wait_for_text(&page, "zebra0", Duration::from_secs(20)).await,
