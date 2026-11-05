@@ -33,7 +33,7 @@ pub(crate) mod tests;
 
 use self::call::*;
 use self::compaction::*;
-use self::compaction_progress::{CompactionProgress, CompactionStep};
+use self::compaction_progress::{CompactionProgress, CompactionStep, MIN_USEFUL_REPLY};
 use self::compaction_transcript::*;
 pub(crate) use self::failure::*;
 pub(crate) use self::history::*;

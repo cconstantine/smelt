@@ -55,6 +55,10 @@ const TIGHT_RESULTS: u32 = 2;
 /// The room left for a reply at `limit`, on top of the buffer.
 const SHORT_REPLY_TOKENS: u64 = 2048;
 
+/// The least room worth sending a request for: under it a compacted request
+/// can't do anything but be cut off, which is no answer to the user.
+pub(super) const MIN_USEFUL_REPLY: u32 = 1024;
+
 /// How many compactions in a row may leave too little room under `limit`
 /// before the conversation is judged not to fit. Past it the turn ends, even
 /// if the request would still go out with a very short reply.
@@ -236,6 +240,21 @@ impl CompactionProgress {
     /// A reply finished rather than being cut off.
     pub(super) fn reply_finished(&mut self) {
         self.room_retried = false;
+    }
+
+    /// A compacted request of about `size` tokens leaves no useful room for
+    /// a reply: the conversation doesn't fit, and here's the reason.
+    pub(super) fn no_room(&mut self, size: u64, model: &str, context_window: u32) -> String {
+        self.sync(context_window);
+        self.after = Some(size);
+        self.stuck = true;
+        self.why_stuck(model, context_window)
+    }
+
+    /// The reason, if the conversation doesn't fit: for a reply cut off on
+    /// the result that shows it, whose turn never gets to `step`.
+    pub(super) fn why_if_stuck(&self, model: &str, context_window: u32) -> Option<String> {
+        self.stuck.then(|| self.why_stuck(model, context_window))
     }
 
     /// Whether the conversation doesn't fit.
@@ -486,6 +505,17 @@ mod tests {
         guessing.guessed(WINDOW, 40_000);
         assert!(!guessing.cut_for_room(Some(39_000), 40_000));
         assert!(!tight().cut_for_room(Some(90_000), 500_000), "a window learned since");
+    }
+
+    #[test]
+    fn test_no_room_is_stuck_and_says_the_size() {
+        let mut progress = tight();
+        let why = progress.no_room(95_000, "m", WINDOW);
+        assert!(why.contains("(100,000 tokens) is too small") && why.contains("about 95,000 tokens"), "{why}");
+        assert!(progress.is_stuck());
+        assert_eq!(progress.why_if_stuck("m", WINDOW).as_deref(), Some(why.as_str()));
+        progress.user_wrote();
+        assert_eq!(progress.why_if_stuck("m", WINDOW), None);
     }
 
     #[test]

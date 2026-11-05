@@ -190,3 +190,74 @@ async fn test_a_reply_cut_off_at_its_output_cap_ends_the_turn(pool: PgPool) {
     assert_eq!(seen.count(), 5);
     assert_eq!(seen.summary_calls(), 2);
 }
+
+/// The window at which, with this conversation's fixed content, a compacted
+/// request leaves `room` tokens for a reply.
+async fn window_leaving(pool: &PgPool, id: i64, room: u64) -> i32 {
+    let model = crate::providers::resolve_turn_model(pool, id).await.expect("a model");
+    let (request, _) = build_request(pool, id, &model, None, &[], false).await.expect("a request");
+    (estimate_request_tokens(&request) + u64::from(COMPACTION_SAFETY_BUFFER) + room) as i32
+}
+
+/// Round 2 M2: a request with no useful room isn't sent for one token of
+/// reply. The user hears the window is too small, not "cut off at 1 tokens".
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_compacted_request_with_no_room_says_so_instead_of_calling(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let seen = honest_mock(&pool, vec![plan(20_000, 10), plan(20_000, 10), plan(20_000, 10), plan(20_000, 3_000)]).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let window = window_leaving(&pool, conversation.id, 100).await;
+    set_context_window(&pool, window, None).await;
+    let mut rx = events::subscribe(conversation.id);
+
+    start_turn(pool.clone(), conversation.id, "hi".to_string()).await.expect("send");
+    wait_until_idle(&mut rx).await;
+
+    assert_eq!(seen.count(), 3, "no call with no room");
+    assert_eq!(seen.summary_calls(), 3);
+    assert_eq!(cut_off_notices(&pool, conversation.id).await, 0);
+    let reason = last_failure_reason(&pool, conversation.id).await.expect("the conversation says why");
+    assert!(reason.contains("is too small for this conversation"), "{reason}");
+}
+
+/// Enough room to send, too little for the reply, on the result that shows
+/// the conversation doesn't fit: that's said now, not at a next step a
+/// cut-off reply never reaches.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_cut_off_reply_that_shows_it_doesnt_fit_says_why(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let seen = honest_mock(&pool, vec![plan(20_000, 10), plan(20_000, 10), plan(20_000, 10), plan(20_000, 3_000)]).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let window = window_leaving(&pool, conversation.id, 1_500).await;
+    set_context_window(&pool, window, None).await;
+    let mut rx = events::subscribe(conversation.id);
+
+    start_turn(pool.clone(), conversation.id, "hi".to_string()).await.expect("send");
+    wait_until_idle(&mut rx).await;
+
+    assert_eq!(seen.count(), 4);
+    assert_eq!(cut_off_notices(&pool, conversation.id).await, 1, "what happened to the reply is still said");
+    let reason = last_failure_reason(&pool, conversation.id).await.expect("the conversation says why");
+    assert!(reason.contains("is too small for this conversation") && reason.contains("about 20,000 tokens"), "{reason}");
+}
+
+/// A window this small with a cap under the floor is the cap's doing.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_small_output_cap_isnt_a_lack_of_room(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let mut plans = learn_its_tight();
+    plans.extend([plan(13_600, 100), plan(13_600, 100)]);
+    plans.iter_mut().for_each(|p| p.wants = p.wants.min(500));
+    plans[0].input = 16_500;
+    plans[1].input = 16_500;
+    let seen = honest_mock(&pool, plans).await;
+    set_context_window(&pool, 32_768, Some(512)).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+
+    run_turn(&pool, conversation.id, hello()).await.expect("a small cap is no failure");
+
+    assert_eq!(seen.count(), 6);
+}
