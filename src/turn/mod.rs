@@ -28,7 +28,7 @@ mod room;
 mod run;
 mod state;
 #[cfg(test)]
-mod test_hooks;
+pub(crate) mod test_hooks;
 #[cfg(test)]
 pub(crate) mod tests;
 
