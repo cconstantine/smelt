@@ -102,6 +102,13 @@ pub const CREATE_CHILD_LOCKED: &str = "create_child_locked";
 /// `finish` by child `id`, after its state's update and before its report.
 pub const FINISH_UPDATED: &str = "finish_updated";
 
+/// `finish` by child `id`, after its transaction committed and before it
+/// returns: the window SME-389 B necessarily admits, where a command
+/// starts while the finish is landing and keeps the seat's pod (SME-78's
+/// answer 1). Pausing here changes the seat's state nothing — its row is
+/// already `finished` and committed.
+pub const FINISH_COMMITTED: &str = "finish_committed";
+
 static FAIL_DELETES: LazyLock<Mutex<std::collections::HashSet<i64>>> = LazyLock::new(Default::default);
 
 /// Makes the next delete of `id` fail after queuing its notice.

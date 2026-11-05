@@ -29,9 +29,43 @@ pub(crate) async fn finish(pool: &PgPool, child: i64, input: &serde_json::Value)
              stop_agent, then finish",
             running.iter().map(|(id, state)| format!("{} ({state})", label(*id, None))).collect::<Vec<_>>().join(", ")
         )),
+        db::Finish::CommandsRunning(commands) => Err(format!(
+            "you can't finish while your terminal commands still run: {}. End them with send_signal, or end \
+             your turn — each command's finished notice will wake you — then finish",
+            commands
+                .iter()
+                .map(|(id, command, secs)| format!(
+                    "{id} ({}, running for {})",
+                    crate::anthropic::tools::shown_command(command),
+                    crate::turn::format_duration(*secs)
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
         db::Finish::MessageWaiting => Err("a message arrived since your last step; read it, then finish".to_string()),
         db::Finish::NotActive(Some(state)) if state == db::AGENT_FINISHED => {
-            Err("you've already finished: your report was sent".to_string())
+            // SME-389 A: a late `finish` delivers. Whatever made the seat
+            // keep working after it finished, its report reaches its
+            // parent as a follow-up and its turn ends again — Ok, so
+            // `run_tools` ends the turn like the normal path's.
+            let outcome = db::report_after_finish(pool, child, &label_of(pool, child).await, report)
+                .await
+                .map_err(|e| format!("couldn't send your report: {e}"))?;
+            match outcome {
+                db::FollowUp::Queued { parent } => {
+                    crate::turn::notify(pool, parent, vec![crate::turn::Notice::Wake]);
+                    Ok(
+                        "Your report was sent to your parent. You had already finished, so it arrives as a \
+                         follow-up to your first report. To wait on a running command, end your turn instead — \
+                         the command's finished notice will wake you. Your turn ends here."
+                            .to_string(),
+                    )
+                }
+                db::FollowUp::StateChanged(state) => {
+                    Err(format!("you can't finish now (your state is {state})"))
+                }
+                db::FollowUp::Gone => Err("your parent is gone, so there's no one to report to".to_string()),
+            }
         }
         db::Finish::NotActive(Some(state)) if state == db::AGENT_STOPPED => {
             Err("you were stopped by your parent, so there's no one to report to".to_string())
