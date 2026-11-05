@@ -143,8 +143,8 @@ pub(super) fn window_stop(kind: crate::providers::ProviderKind, stop_reason: &st
 /// When that came in below this turn's believed window by more than
 /// `COMPACTION_SAFETY_BUFFER` the belief was too big: learn the measured
 /// size (the write only ever lowers), and the next request compacts
-/// before it is refused. The reply is kept either way and nothing is
-/// retried; a save that doesn't land says nothing more (`learn`).
+/// before it is refused. The reply is kept either way and this retries
+/// nothing itself; a save that doesn't land says nothing more (`learn`).
 pub(super) async fn learn_window_stop(
     pool: &PgPool,
     conversation_id: i64,
