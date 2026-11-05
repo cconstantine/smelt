@@ -39,6 +39,20 @@ async fn restart_notices(pool: &PgPool, id: i64) -> i64 {
         .expect("count")
 }
 
+/// The notices `from` has queued to `to`, counted by kind and sender.
+/// Never by wording: Bug bash 6 will reword this very notice (SME-287).
+async fn notices_to(pool: &PgPool, to: i64, from: i64) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1 AND from_conversation_id = $2 AND kind = $3",
+    )
+    .bind(to)
+    .bind(from)
+    .bind(db::KIND_NOTICE)
+    .fetch_one(pool)
+    .await
+    .expect("count")
+}
+
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_child_cut_off_mid_turn_gets_the_restart_notice_and_carries_on(pool: PgPool) {
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -141,6 +155,17 @@ async fn test_the_restart_notice_is_only_for_an_active_child_cut_off_mid_turn(po
     .expect("an answered question for its parent");
 
     let ids = [root, paused, asking, finished, stopped, replied, saved, answered];
+    // SME-287's fixture guards, read before the restart: the sweep's awaited
+    // wake set is exactly the answered child — the root is not in it — and
+    // nothing is starting, so the root's wake, when it comes, comes from the
+    // chain, not the sweep.
+    let before = test_hooks::last_turns_checked(answered);
+    assert_eq!(
+        db::conversations_with_queued_messages(&pool).await.expect("the wake set"),
+        vec![answered],
+        "the sweep's wake set"
+    );
+    assert_eq!(db::starting_agents(&pool).await.expect("starting").len(), 0, "a starting agent");
     restart(&pool, &ids).await;
     for id in ids {
         assert_eq!(restart_notices(&pool, id).await, 0, "#{id} was told");
@@ -149,6 +174,10 @@ async fn test_the_restart_notice_is_only_for_an_active_child_cut_off_mid_turn(po
     for id in [None, Some(paused), Some(asking), Some(finished), Some(stopped), Some(replied), Some(saved)] {
         assert_eq!(requests_for(&requests, id).len(), 0, "{id:?} was woken");
     }
+    // SME-287: the chain this claim denies — hop 1, the answered child's
+    // end-of-turn check, and the notice it queues for the root.
+    eventually("the answered child's end-of-turn check ran", || async { test_hooks::last_turns_checked(answered) > before }).await;
+    assert_eq!(notices_to(&pool, root, answered).await, 1, "the child's end-of-turn notice to the root");
     for id in ids {
         crate::turn::forget_conversation_lock(id);
     }
