@@ -253,14 +253,20 @@ pub(super) fn continuation_prompt(typed: &Typed, unanswered: &[String]) -> Strin
 /// compaction was for, and the summary already covers it (SME-51 B10).
 #[cfg(feature = "server")]
 fn quote(text: &str) -> String {
-    quote_to(text, CONTINUATION_QUOTE_MAX_CHARS)
+    quote_to(text, CONTINUATION_QUOTE_MAX_CHARS, SUMMARY_COVERS_THE_REST)
 }
 
-/// `quote` to at most `max` characters of `text`.
+/// What a continuation's cut quote says of the rest. Not for the
+/// summariser's own input, where there's no summary yet.
 #[cfg(feature = "server")]
-pub(super) fn quote_to(text: &str, max: usize) -> String {
+pub(super) const SUMMARY_COVERS_THE_REST: &str = "; the summary covers the rest";
+
+/// `text` cut to at most `max` characters, the cut marked, with `rest` saying
+/// where the rest went.
+#[cfg(feature = "server")]
+pub(super) fn quote_to(text: &str, max: usize, rest: &str) -> String {
     match crate::fetch_guard::truncate(text.to_string(), max) {
-        (kept, true) => format!("{kept}\n[cut to its first {max} characters; the summary covers the rest]"),
+        (kept, true) => format!("{kept}\n[cut to its first {max} characters{rest}]"),
         (whole, false) => whole,
     }
 }
@@ -337,11 +343,11 @@ pub(super) fn is_typed(text: &str) -> bool {
 /// `typed_budget(context_window)`, then put back in order.
 #[cfg(feature = "server")]
 pub(super) fn typed_user_text(messages: &[Message], context_window: u32) -> Typed {
-    typed_within(messages, typed_budget(context_window))
+    typed_within(messages, typed_budget(context_window), SUMMARY_COVERS_THE_REST)
 }
 
-/// `typed_user_text` in `budget` characters.
-pub(super) fn typed_within(messages: &[Message], budget: usize) -> Typed {
+/// `typed_user_text` in `budget` characters, a cut quote saying `after_cut`.
+pub(super) fn typed_within(messages: &[Message], budget: usize, after_cut: &str) -> Typed {
     let answered = messages.len() - messages.iter().rev().take_while(|m| m.role == "user").count();
     let mut questions = std::collections::HashSet::new();
     let mut all: Vec<String> = Vec::new();
@@ -410,11 +416,11 @@ pub(super) fn typed_within(messages: &[Message], budget: usize) -> Typed {
     let Some((first, rest)) = all.split_first() else {
         return Typed::default();
     };
-    let first = quote_to(first, (budget / 2).max(1));
+    let first = quote_to(first, (budget / 2).max(1), after_cut);
     let mut used = first.chars().count();
     let mut newest: Vec<String> = Vec::new();
     for text in rest.iter().rev() {
-        let quoted = quote_to(text, CONTINUATION_QUOTE_MAX_CHARS.min(budget));
+        let quoted = quote_to(text, CONTINUATION_QUOTE_MAX_CHARS.min(budget), after_cut);
         let size = quoted.chars().count() + QUOTE_SEPARATOR.len();
         // One that doesn't fit is left out alone: older, shorter ones may
         // still fit (SME-386 T8).
@@ -458,6 +464,39 @@ pub(super) fn unanswered_user_text(messages: &[Message]) -> Vec<String> {
         texts.drain(..=stop);
     }
     texts
+}
+
+/// `texts` (`unanswered_user_text`) held to `budget` characters in all, so a
+/// compaction with many messages waiting doesn't leave its next request
+/// over the trigger for that alone (SME-386 review L1). The newest are kept:
+/// it's what the model answers. What's left out is said at the start.
+#[cfg(feature = "server")]
+pub(super) fn cap_unanswered(texts: Vec<String>, budget: usize) -> Vec<String> {
+    let mut left = budget;
+    let mut kept = Vec::new();
+    let total = texts.len();
+    for text in texts.into_iter().rev() {
+        let size = text.chars().count().min(CONTINUATION_QUOTE_MAX_CHARS);
+        if size <= left {
+            left -= size;
+            kept.push(text);
+        } else if kept.is_empty() {
+            // The one to answer gets what there is.
+            left = 0;
+            kept.push(quote_to(&text, budget, SUMMARY_COVERS_THE_REST));
+        } else {
+            break;
+        }
+    }
+    if kept.len() < total {
+        let omitted = total - kept.len();
+        kept.push(format!("({omitted} earlier {} left out here; the summary covers {}.)",
+            if omitted == 1 { "message is" } else { "messages are" },
+            if omitted == 1 { "it" } else { "them" },
+        ));
+    }
+    kept.reverse();
+    kept
 }
 
 /// The system prompt for the dedicated summarization call `compact_conversation`
@@ -634,7 +673,7 @@ async fn compact(
         Err(e) => return Err(ServerFnError::new(e)),
     };
 
-    let unanswered = unanswered_user_text(&messages);
+    let unanswered = cap_unanswered(unanswered_user_text(&messages), typed_budget(turn_model.context_window));
     let typed = typed_user_text(&messages, turn_model.context_window);
     for (role, content) in compaction_messages(summary, covers_through_message_id, &typed, &unanswered, refused) {
         let saved = db::create_message(pool, conversation_id, role, &content)

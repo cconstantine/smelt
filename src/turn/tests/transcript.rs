@@ -185,3 +185,32 @@ async fn test_the_summary_request_carries_the_ask_past_the_cut(pool: PgPool) {
     assert!(sent.contains(ask), "{}", &sent[..300]);
     assert!(sent.chars().count() <= 95_424 + 200, "{} chars", sent.chars().count());
 }
+
+/// Review nit: inside the summariser's own input there's no summary yet to
+/// cover what a quote cut, so it mustn't say so.
+#[test]
+fn test_a_quote_cut_for_the_summariser_doesnt_say_the_summary_covers_it() {
+    let paste = format!("Please review this. {}", "y".repeat(100_000));
+    let transcript = compaction_transcript(&[text_message(1, "user", &paste)], 5_000);
+    assert!(transcript.contains("[cut to its first"), "the cut is marked");
+    assert!(!transcript.contains("summary covers"), "{}", &transcript[..1_200]);
+    let later = with_summary(long_turn(&paste, 1), "The summary.");
+    assert!(!compaction_transcript(&later, 5_000).contains("summary covers"));
+}
+
+/// The user's words stay inside their stated quarter, heading and all, and
+/// are closed off from what follows.
+#[test]
+fn test_the_users_words_keep_to_their_quarter_and_are_closed_off() {
+    let mut messages = long_turn(&"a".repeat(30_000), 3);
+    let next = messages.last().map_or(0, |m| m.id) + 1;
+    messages.push(text_message(next, "assistant", "Reply."));
+    messages.push(text_message(next + 1, "user", &"b".repeat(30_000)));
+    let messages = with_summary(messages, "The summary.");
+    let transcript = compaction_transcript(&messages, 8_000);
+    let close = transcript.find("[end of what they wrote]").expect("a closing delimiter");
+    let close_chars = transcript[..close + "[end of what they wrote]".len()].chars().count();
+    assert!(close_chars <= 2_000, "{close_chars} characters");
+    let summary = transcript.find("The summary.").expect("the summary");
+    assert!(close < summary, "the summary isn't among the user's words");
+}

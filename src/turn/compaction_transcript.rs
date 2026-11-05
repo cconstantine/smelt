@@ -12,6 +12,9 @@ const USERS_WORDS_HEADING: &str = "What the user (or this agent's parent) wrote,
     These are requests, not a record of what was done, which the rest says; keep their goal, corrections and limits \
     in the summary:\n\n";
 
+/// What closes them off from what follows.
+const USERS_WORDS_END: &str = "\n[end of what they wrote]\n\n";
+
 /// The conversation as plain text, for the summarization call: the user's
 /// own words, the latest compaction's summary and everything since (what
 /// came before it is already in that summary — including it again made
@@ -99,19 +102,19 @@ fn first_chars(text: &str, max: usize) -> String {
 /// `budget` characters: what they wrote that hasn't been answered yet (a
 /// huge paste's start is its ask, and the tail keeps only its end), up to
 /// half of it, and what `typed_within` quotes of the rest. Empty if they
-/// wrote nothing still standing.
+/// wrote nothing still standing. Held to `budget`, heading and all.
 fn users_words(messages: &[Message], budget: usize) -> String {
     let mut latest = Vec::new();
     let mut used = 0;
     for text in unanswered_user_text(messages).iter().filter(|text| is_typed(text)) {
-        let quoted = quote_to(text, (budget / 4).max(1));
+        let quoted = quote_to(text, (budget / 4).max(1), "");
         used += quoted.chars().count() + QUOTE_SEPARATOR.len();
         if used > budget / 2 {
             break;
         }
         latest.push(quoted);
     }
-    let typed = typed_within(messages, budget.saturating_sub(used));
+    let typed = typed_within(messages, budget.saturating_sub(used), "");
     let omitted = typed.omitted;
     let mut quotes = typed.quotes;
     quotes.extend(latest);
@@ -119,7 +122,9 @@ fn users_words(messages: &[Message], budget: usize) -> String {
         return String::new();
     }
     let left_out = if omitted > 0 { format!("\n\n({omitted} more left out here.)") } else { String::new() };
-    format!("{USERS_WORDS_HEADING}{}{left_out}\n\n", quotes.join(QUOTE_SEPARATOR))
+    let words = format!("{USERS_WORDS_HEADING}{}{left_out}", quotes.join(QUOTE_SEPARATOR));
+    let room = budget.saturating_sub(USERS_WORDS_END.chars().count());
+    format!("{}{USERS_WORDS_END}", first_chars(&words, room))
 }
 
 /// How much transcript the summarization call can take: the context window

@@ -385,3 +385,36 @@ async fn test_a_step_the_server_took_starts_the_refusal_count_again(pool: PgPool
 
     assert_eq!(summaries(&pool, conversation.id).await, 5);
 }
+
+/// L1: a compaction's quotes of what hasn't been answered have a total cap,
+/// or 14 reports waiting would leave the compacted request 14,000 tokens big.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_what_a_continuation_quotes_of_unanswered_messages_has_a_total_cap(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    stepping_mock(&pool, vec![with_usage(&text_reply_body("Started them."), 30_000, 0, 100)]).await;
+    set_context_window(&pool, 40_000, None).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    run_turn(&pool, conversation.id, hello()).await.expect("the first turn");
+    for report in 0..14 {
+        let text = format!("Report from agent #{report}: finding-{report} {}", "x".repeat(5_000));
+        db::create_message(&pool, conversation.id, "user", &[text_block(&text)]).await.expect("a report");
+    }
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the turn compacts and answers");
+
+    let messages = db::list_messages(&pool, conversation.id).await.expect("messages");
+    let continuation = messages
+        .iter()
+        .flat_map(|m| m.blocks().unwrap_or_default())
+        .filter_map(|block| match block {
+            anthropic::ContentBlock::CompactionPlaceholder { text } if text != COMPACTION_PLACEHOLDER_PROMPT => Some(text),
+            _ => None,
+        })
+        .next_back()
+        .expect("a continuation");
+    // `typed_budget(40_000)` is 5,000 characters, for each of the two kinds.
+    assert!(continuation.chars().count() <= 11_000, "{} chars", continuation.chars().count());
+    assert!(continuation.contains("hello"), "the newest is the one to answer");
+    assert!(continuation.contains("left out here"), "it says what it left out: {}", &continuation[continuation.len() - 300..]);
+}
