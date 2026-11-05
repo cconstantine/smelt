@@ -71,8 +71,10 @@ pub(super) fn after_named_refusal(model: &str, context_window: u32, alone: u64, 
     let window = u64::from(context_window);
     // Can't help: what no compaction can take away already leaves this
     // window no room to answer in, even a short reply, which is all a
-    // request gets once compacting can't help (SME-386 review M-B).
-    if alone + u64::from(MIN_USEFUL_REPLY) + u64::from(COMPACTION_SAFETY_BUFFER) > window {
+    // request gets once compacting can't help (SME-386 review M-B). Without
+    // the estimate's buffer: inside it, the floor (`before_sending`) answers,
+    // and lets the user's next send try (final review, the property test).
+    if alone + u64::from(MIN_USEFUL_REPLY) > window {
         return NamedRefusal::TooSmall(super::overflow::too_small(model, context_window, alone));
     }
     // Budget only when the input fits with the budget's usual reply: then

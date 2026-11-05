@@ -189,3 +189,26 @@ async fn test_a_compacted_retry_allows_for_what_the_estimate_missed(pool: PgPool
     assert_eq!(last_reply(&saved).as_deref(), Some("Done."));
     assert_eq!(mock.calls(), 2);
 }
+
+/// Found by the property test: inside the estimate's buffer a short reply
+/// still fits, so a named window there isn't "too small for smelt's system
+/// prompt and tools", which no send could get past. The floor says the
+/// conversation doesn't fit, and the next send tries a short reply.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_window_inside_the_buffer_lets_the_next_send_try(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let mock = counting_mock(&pool, None, vec![(0, 10)]).await;
+    let window = window_leaving(&pool, conversation.id, 0).await - 1_000;
+    *mock.window.lock().expect("the window") = Some(window);
+    *mock.plans.lock().expect("the plans") = vec![(i64::from(window) - 2_000, 10)];
+    set_context_window(&pool, window as i32, None).await;
+
+    send(&pool, conversation.id, "hi").await;
+    let reason = last_failure_reason(&pool, conversation.id).await.expect("the first send doesn't fit");
+    send(&pool, conversation.id, "Again.").await;
+
+    assert!(reason.contains("is too small for this conversation"), "{reason}");
+    assert_eq!(mock.taken_budgets(), vec![u64::from(MIN_USEFUL_REPLY)]);
+}
