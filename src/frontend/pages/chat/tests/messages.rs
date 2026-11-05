@@ -316,6 +316,17 @@ fn test_tool_summary_shows_the_notify_user_message_escaped() {
     );
 }
 
+/// SME-386 F8: a refused `notify_user` notified nobody, and its row says
+/// so; every other row, and an accepted one, reads as `tool_summary` does.
+#[test]
+fn test_a_failed_notify_user_row_doesnt_claim_it_notified() {
+    let input = serde_json::json!({"message": "from child\u{202e}"});
+    assert_eq!(tool_row_text("notify_user", &input, true), "Couldn't notify you: from child\\u{202e}");
+    assert_eq!(tool_row_text("notify_user", &input, false), "Notified you: from child\\u{202e}");
+    let read = serde_json::json!({"path": "/etc/hosts"});
+    assert_eq!(tool_row_text("read_file", &read, true), "Read /etc/hosts");
+}
+
 /// SME-386 A1: a send that starts with `NOTICE_MARK` (typed, or pasted
 /// from a copied notice) shows as the user's own bubble at once, and the
 /// saved row, which the server saved through `users_text`, replaces it.

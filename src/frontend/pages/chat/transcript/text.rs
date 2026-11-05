@@ -54,6 +54,20 @@ pub(in crate::frontend::pages::chat) fn diff_lines(old: &str, new: &str) -> Vec<
 /// /home/sandbox/primes.py", "Ran `python3 primes.py`"), for the compact
 /// row that replaces a raw card per call and per result (SME-41 D2). The
 /// raw input and result stay one click away.
+/// A tool row's line: `tool_summary`, which says what a call did, except
+/// where that claim reaches the user: a refused `notify_user` notified
+/// nobody (SME-386 F8).
+pub(in crate::frontend::pages::chat) fn tool_row_text(name: &str, input: &serde_json::Value, failed: bool) -> String {
+    let summary = tool_summary(name, input);
+    match summary.strip_prefix(NOTIFIED_YOU) {
+        Some(message) if failed && name == "notify_user" => format!("Couldn't notify you: {message}"),
+        _ => summary,
+    }
+}
+
+/// How a `notify_user` row's summary starts.
+const NOTIFIED_YOU: &str = "Notified you: ";
+
 pub(in crate::frontend::pages::chat) fn tool_summary(name: &str, input: &serde_json::Value) -> String {
     let field = |key: &str| -> String {
         match input.get(key) {
@@ -110,7 +124,7 @@ pub(in crate::frontend::pages::chat) fn tool_summary(name: &str, input: &serde_j
         // break the line, reorder it or hide in it escaped (SME-276's rule):
         // a refused call's input is saved as the model sent it.
         "notify_user" => format!(
-            "Notified you: {}",
+            "{NOTIFIED_YOU}{}",
             field("message")
                 .chars()
                 .map(|c| if crate::git::not_plain(c) { c.escape_unicode().to_string() } else { c.to_string() })
