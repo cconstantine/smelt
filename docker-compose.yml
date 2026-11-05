@@ -163,11 +163,17 @@ services:
       - k3s
     entrypoint: sh
     command: ["/scripts/k3s-bootstrap.sh"]
+    environment:
+      # `1` skips the test images' pre-pull (a machine that can't reach
+      # Docker Hub right now; the LSP catalog tests then live-pull as they
+      # always did — SME-391). Passed from the caller's environment.
+      - SMELT_SKIP_PREPULL=${SMELT_SKIP_PREPULL:-}
     volumes:
       - k3s-config:/k3s-admin:ro
       - k3s-out:/out
       - ./k8s:/k8s:ro
       - ./scripts/k3s-bootstrap.sh:/scripts/k3s-bootstrap.sh:ro
+      - ./scripts/cluster-prepull-images.txt:/scripts/cluster-prepull-images.txt:ro
     restart: "no"
 
   # Dev only: HTTPS (and so HTTP/2) in front of the dev server, at

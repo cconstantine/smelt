@@ -115,3 +115,91 @@ tune_provisioner || case $? in
     2) echo "warning: rolling the local-path provisioner back failed; check it (kubectl -n kube-system get deployment local-path-provisioner)" >&2 ;;
     *) echo "warning: the local-path provisioner is left as k3s set it up; the pod tests' claims bind slower" >&2 ;;
 esac
+
+# Pre-pull the images test pods start from (SME-391). The LSP catalog tests
+# create server pods from the catalog's own images (rust:1, node:22-slim,
+# golang:1, debian:trixie-slim), and every claim the tests bind is served by
+# the local-path provisioner's helper pod — scripts/cluster-prepull-images.txt
+# lists those plus the helper's own busybox; on a
+# fresh cluster those pulled live from Docker Hub mid-suite, and one flaked
+# pull (`tls: bad record MAC`) cost a full gate. Pulling them here, before
+# any test runs, moves that download to where a failure is loud and a retry
+# cheap; once the node holds an image, the server pods'
+# `imagePullPolicy: IfNotPresent` means no test touches the network for it —
+# the proof is in SME-391's trail: with Docker Hub blocked at the mirror
+# after bootstrap, the catalog test goes green; on the unfixed tree, red.
+#
+# The pull is the kubelet's own, through one small pod per image that just
+# starts and exits: same store, same resolution and pull policy the real
+# pods will use, no registry client to add to this image and no containerd
+# socket to mount. On a warm cluster the pod's image is already present and
+# it exits unseen — this stays cheap enough to run on every `compose up`.
+#
+# Unlike the provisioner tune this DOES fail the bootstrap: a node missing
+# these images is the suite's exact SME-391 failure, minutes deeper in.
+# Fail loudly, name the image, say what to do; `SMELT_SKIP_PREPULL=1`
+# opts out for a machine that can't reach Docker Hub right now (the LSP
+# catalog tests will then behave as they always did).
+PREPULL_WAIT=${SMELT_PREPULL_WAIT:-1800}
+prepull_images() {
+    # `default` namespace: none of smelt's listings look there. Small
+    # explicit requests and limits throughout (SME-314), kept under what a
+    # namespace LimitRange could fill in.
+    pkctl() { kctl --request-timeout=15s -n default "$@"; }
+    n=0
+    while read -r ref _; do
+        case "$ref" in ''|'#'*) continue ;; esac
+        n=$((n + 1))
+        name="smelt-prepull-$n"
+        echo "pre-pulling $ref onto the test node..."
+        pkctl delete pod "$name" --ignore-not-found --grace-period=0 --wait >/dev/null 2>&1
+        pkctl apply -f - <<EOF || return 1
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $name
+  labels:
+    app: smelt-prepull
+spec:
+  restartPolicy: Never
+  activeDeadlineSeconds: $PREPULL_WAIT
+  automountServiceAccountToken: false
+  containers:
+  - name: prepull
+    image: $ref
+    imagePullPolicy: IfNotPresent
+    command: ["sh", "-c", "echo pre-pulled"]
+    resources:
+      requests: {cpu: 100m, memory: 64Mi}
+      limits: {cpu: 500m, memory: 256Mi}
+EOF
+        waited=0
+        while :; do
+            phase=$(pkctl get pod "$name" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+            [ "$phase" = "Succeeded" ] && break
+            if [ "$phase" = "Failed" ]; then
+                pkctl describe "$name" | sed -e '/^Events:/,$p' >&2
+                echo "the pre-pull pod for $ref Failed (its events above; usually Docker Hub is unreachable from this cluster)" >&2
+                return 1
+            fi
+            # The pod caps itself at activeDeadlineSeconds; this wait caps a
+            # pod that never gets that far, and says which image it was for.
+            waited=$((waited + 5))
+            if [ "$waited" -ge $((PREPULL_WAIT + 60)) ]; then
+                pkctl describe "$name" | sed -e '/^Events:/,$p' >&2
+                echo "pre-pulling $ref didn't finish within ${PREPULL_WAIT}s (Docker Hub slow or unreachable from this cluster?)" >&2
+                return 1
+            fi
+            sleep 5
+        done
+        pkctl delete pod "$name" --grace-period=0 >/dev/null 2>&1
+    done < /scripts/cluster-prepull-images.txt
+    echo "pre-pulled $n image(s) onto the test node"
+}
+if [ "${SMELT_SKIP_PREPULL:-}" = 1 ]; then
+    echo "SMELT_SKIP_PREPULL=1: skipping the test images' pre-pull"
+elif ! prepull_images; then
+    echo "the test cluster couldn't pre-pull its images (above): check that Docker Hub is reachable from it," >&2
+    echo "then re-run: docker compose up --exit-code-from k3s-bootstrap k3s-bootstrap" >&2
+    exit 1
+fi
