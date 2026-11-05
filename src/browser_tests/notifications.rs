@@ -163,7 +163,7 @@ async fn toggle_state(page: &chromiumoxide::Page) -> (String, bool, bool) {
 }
 
 /// Waits for the button to read `label` and returns disabled/pressed then.
-async fn wait_toggle_label(page: &chromiumoxide::Page, label: &str, timeout: Duration) -> (bool, bool) {
+pub(super) async fn wait_toggle_label(page: &chromiumoxide::Page, label: &str, timeout: Duration) -> (bool, bool) {
     let want = label.to_string();
     let found = wait_until(|| async { toggle_state(page).await.0 == want }, timeout).await;
     assert!(found, "the toggle never read {want:?}");

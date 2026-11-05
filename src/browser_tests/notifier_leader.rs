@@ -181,6 +181,7 @@ pub(super) async fn scenario_notifier_after_navigation(t: &Scenario<'_>) {
     back_link_home(&page).await;
     assert!(leads(&page).await, "the tab still holds the lock");
     assert!(spell_notifies(&page, other.id).await, "the tab notifies after a settings page and the link to Home");
+    assert_eq!(unhandled_rejections(&page).await, Vec::<String>::new(), "route changes stay quiet");
 
     crate::turn::forget_conversation_lock(other.id);
     page.evaluate("localStorage.removeItem('smelt.notifications')").await.expect("turn the setting off");
@@ -266,11 +267,12 @@ pub(super) async fn scenario_notifier_keeps_state_across_navigation(t: &Scenario
     // change).
     assert!(spell_notifies(&a, demoted.id).await, "the leader notifies");
     assert!(wait_title(&a, "(1) smelt", Duration::from_secs(5)).await, "the count shows");
+    let shown_before = tag_count(&a, &demoted_tag).await;
     set_focus(&b, true, true).await;
     assert!(wait_until(|| leads(&b), Duration::from_secs(5)).await, "focus moved the leader to B");
     assert!(wait_until(|| async { !leads(&a).await }, Duration::from_secs(5)).await, "A stopped leading");
     tokio::time::sleep(Duration::from_millis(700)).await;
-    assert_eq!(tag_count(&a, &demoted_tag).await, 1);
+    assert_eq!(tag_count(&a, &demoted_tag).await, shown_before, "the demotion showed nothing more");
     assert!(wait_title(&a, "(1) smelt", Duration::from_secs(1)).await, "demoted on a conversation, it keeps the count");
     to_providers(&a).await;
     assert!(
@@ -285,4 +287,42 @@ pub(super) async fn scenario_notifier_keeps_state_across_navigation(t: &Scenario
         assert_eq!(unhandled_rejections(tab).await, Vec::<String>::new(), "route changes stay quiet");
     }
     a.evaluate("localStorage.removeItem('smelt.notifications')").await.expect("turn the setting off");
+}
+
+/// How many notifications `page`'s notifier tracks now.
+async fn tracked(page: &chromiumoxide::Page) -> usize {
+    page.evaluate("window.__smeltNotifier.notifications.size")
+        .await
+        .expect("read the notifier")
+        .into_value()
+        .expect("a count")
+}
+
+/// F2 through a real route to not leading: a click on another tab's page
+/// fires `focus`, which takes the lock back, but the sidebar button lets
+/// go of it for good. On the conversation the tab keeps what it showed,
+/// which its stream revalidates; leaving it, nothing would, so they close.
+pub(super) async fn scenario_notifier_setting_off_then_leaving(t: &Scenario<'_>) {
+    const HEADING: &str = "smelt: the reply was cut off";
+    let shown = t.conversation().await;
+    let other = t.conversation().await;
+    let tag = format!("smelt-conversation-{}", other.id);
+    let page = conversation_tab_notifying(t, shown.id).await;
+    assert!(spell_notifies(&page, other.id).await, "the leader notifies");
+    assert!(wait_title(&page, "(1) smelt", Duration::from_secs(5)).await, "the count shows");
+
+    wait_toggle_label(&page, "Notifications on", Duration::from_secs(10)).await;
+    click_when_present(&page, ".notifications-toggle", Duration::from_secs(5)).await;
+    wait_toggle_label(&page, "Turn on notifications", Duration::from_secs(10)).await;
+    assert!(wait_until(|| async { !leads(&page).await }, Duration::from_secs(5)).await, "the setting off let the lock go");
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(tracked(&page).await, 1, "on the conversation the tab keeps what it showed");
+    assert!(wait_title(&page, "(1) smelt", Duration::from_secs(1)).await, "and its count");
+
+    to_providers(&page).await;
+    assert!(wait_last_closed(&page, &tag, HEADING, Duration::from_secs(5)).await, "leaving the conversation closes it");
+    assert_eq!(tracked(&page).await, 0, "and forgets it");
+    assert!(wait_title(&page, "smelt", Duration::from_secs(5)).await, "and the count goes with it");
+    assert_eq!(unhandled_rejections(&page).await, Vec::<String>::new(), "route changes stay quiet");
+    crate::turn::forget_conversation_lock(other.id);
 }
