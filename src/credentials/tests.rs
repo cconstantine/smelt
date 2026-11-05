@@ -42,6 +42,141 @@ async fn test_an_install_into_another_conversation_doesnt_wait() {
     slow.await.expect("the first install");
 }
 
+/// SME-371: an install that won't finish doesn't hold the answer, the
+/// answer counts the pods not known written (the stuck one and the one that
+/// failed, not the one that finished), and the stuck install isn't called
+/// off: it lands after the answer. An answer that cancelled its installs at
+/// the deadline would leave the pod with its old files until its next create.
+#[tokio::test]
+async fn test_the_answer_doesnt_wait_for_a_stuck_install_and_the_install_still_lands() {
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let released = std::sync::Arc::new(tokio::sync::Mutex::new(Some(released)));
+    let (landed, did_land) = tokio::sync::oneshot::channel::<i64>();
+    let landed = std::sync::Arc::new(std::sync::Mutex::new(Some(landed)));
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        installs_answered_within(std::time::Duration::from_millis(200), vec![1, 2, 3], move |pod_id| {
+            let released = released.clone();
+            let landed = landed.clone();
+            async move {
+                match pod_id {
+                    1 => Ok(()),
+                    2 => {
+                        if let Some(released) = released.lock().await.take() {
+                            let _ = released.await;
+                        }
+                        if let Some(landed) = landed.lock().expect("the landed lock").take() {
+                            let _ = landed.send(pod_id);
+                        }
+                        Ok(())
+                    }
+                    _ => Err("this pod can't be reached".to_string()),
+                }
+            }
+        }),
+    )
+    .await;
+    let _ = release.send(());
+    let mut missed = answer.expect("the answer waited for the stuck install");
+    missed.sort_unstable();
+    assert_eq!(missed, vec![2, 3], "the stuck and the failed install aren't known written; the finished one is");
+    let landed = tokio::time::timeout(std::time::Duration::from_secs(5), did_land).await;
+    assert_eq!(landed.expect("the stuck install never landed").expect("the install was called off"), 2);
+}
+
+/// SME-371 review 1: the whole claim that a late install can't bring a
+/// deleted secret back rests on this. An install waiting for its
+/// conversation's lock reads the pod's files only once it holds the lock, so
+/// a secret deleted while it waited isn't in what it writes. Red if the read
+/// moves before the lock.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_install_reads_its_files_only_once_it_holds_the_lock(pool: PgPool) {
+    let saved = crate::db::create_named_secret(&pool, "linear-key", "value-1234567890").await.expect("a stored secret");
+    let holder_conversation = agent(&pool, Some(&[]), Some(&["linear-key"])).await;
+    let pod = crate::db::create_sandbox_pod(&pool, holder_conversation).await.expect("a live pod row");
+    assert!(
+        file(&pod_files(&pool, holder_conversation).await.expect("pod files"), "/etc/smelt/secrets/linear-key").is_some(),
+        "the secret is granted, so its absence below is the delete's doing"
+    );
+
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let (is_held, held) = tokio::sync::oneshot::channel::<()>();
+    let lock = tokio::spawn(with_install_lock(holder_conversation, async move {
+        let _ = is_held.send(());
+        let _ = released.await;
+    }));
+    held.await.expect("the lock is held");
+
+    let (written, wrote) = tokio::sync::oneshot::channel::<Vec<PodFile>>();
+    let install = {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            install_into_pod_with(&pool, pod.id, |_, files| async move {
+                let _ = written.send(files);
+                Ok(())
+            })
+            .await
+        })
+    };
+    // Let the install run up to the lock, then delete under it.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    crate::db::delete_named_secret(&pool, saved.id).await.expect("delete");
+    let _ = release.send(());
+    lock.await.expect("the holder");
+    let files = tokio::time::timeout(std::time::Duration::from_secs(10), wrote)
+        .await
+        .expect("the install never wrote")
+        .expect("the writer ran");
+    install.await.expect("the install").expect("installed");
+    assert!(file(&files, "/etc/smelt/secrets/linear-key").is_none(), "a deleted secret came back with a late install");
+}
+
+/// SME-371 review 1: the deadline leaves a record naming its pods, for the
+/// browser tier's report, and a scenario's own hold can be told from the
+/// rest, even when both fire at once. A finished install leaves no record.
+#[tokio::test]
+async fn test_the_deadline_records_the_pods_it_left() {
+    let held = crate::id_alloc::FIXTURE_IDS.next_base();
+    let stalled = crate::id_alloc::FIXTURE_IDS.next_base();
+    let finished = crate::id_alloc::FIXTURE_IDS.next_base();
+    let (release, released) = tokio::sync::watch::channel(false);
+    let answer = |pods: Vec<i64>| {
+        let released = released.clone();
+        installs_answered_within(std::time::Duration::from_millis(50), pods, move |pod_id| {
+            let mut released = released.clone();
+            async move {
+                if pod_id != finished {
+                    let _ = released.wait_for(|go| *go).await;
+                }
+                Ok(())
+            }
+        })
+    };
+    assert_eq!(answer(vec![held]).await, vec![held]);
+    let mut both = answer(vec![held, stalled, finished]).await;
+    both.sort_unstable();
+    let mut expected = vec![held, stalled];
+    expected.sort_unstable();
+    assert_eq!(both, expected);
+    let _ = release.send(true);
+    let firings = install_deadline_firings_besides(&[held]);
+    let mine: Vec<&Vec<i64>> = firings.iter().filter(|pods| pods.contains(&stalled) || pods.contains(&held) || pods.contains(&finished)).collect();
+    assert_eq!(mine, vec![&vec![stalled]], "the hold alone reports nothing; a stall beside it reports only itself");
+}
+
+/// Every install finished: the answer doesn't sit out the deadline, and
+/// nothing is missed. The normal save, which still answers with its pods
+/// written.
+#[tokio::test]
+async fn test_the_answer_comes_as_soon_as_every_install_finishes() {
+    let missed = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        installs_answered_within(std::time::Duration::from_secs(60), vec![1, 2], |_| async { Ok(()) }),
+    )
+    .await;
+    assert_eq!(missed.expect("the answer sat out its deadline"), Vec::<i64>::new());
+}
+
 fn file<'a>(files: &'a [PodFile], path: &str) -> Option<&'a PodFile> {
     files.iter().find(|f| f.path == path)
 }

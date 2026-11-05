@@ -420,6 +420,12 @@ pub(super) async fn scenario_oauth_callback_error_link(t: &Scenario<'_>) {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
+/// Keeps what a page reports going wrong, where a scenario can read it.
+const PAGE_ERRORS: &str = "window.__smeltErrors = [];\
+    addEventListener('error', e => window.__smeltErrors.push(String(e.message)));\
+    addEventListener('unhandledrejection', e => window.__smeltErrors.push(String(e.reason)));\
+    { const original = console.error; console.error = (...args) => { window.__smeltErrors.push(args.join(' ').slice(0, 300)); original(...args); }; }";
+
 /// T12 (SME-242): the Secrets page adds a secret, changes its value in
 /// place, lists only the server's display prefix — never the value —
 /// and deletes it; and a row fits 375px.
@@ -453,6 +459,13 @@ pub(super) async fn scenario_secrets_page(t: &Scenario<'_>) {
     let value = "top-scenario-secret-value-0123456789"; // 36 bytes: prefix "top-", 32 hidden
     let name = unique_id("key");
     let page = t.tab(t.url("secrets")).await;
+    // Every document this tab loads keeps its errors, for the paste leg's
+    // report below (the reload before it picks this up).
+    page.evaluate_on_new_document(
+        chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams::new(PAGE_ERRORS.to_string()),
+    )
+    .await
+    .expect("keep the page's errors");
     wait_for_resource(&page, "/api/secrets").await;
     type_and_read_back(&page, "#secret-name", &name).await;
     type_and_read_back(&page, "#secret-value", value).await;
@@ -578,15 +591,30 @@ pub(super) async fn scenario_secrets_page(t: &Scenario<'_>) {
     if !wait_for_count(&page, ".secret-row", 1, Duration::from_secs(10)).await {
         // SME-371: say what the page and the store held, so a flake names
         // its mechanism: refused on the page (the value signal empty at
-        // the submit), failed at the server, or saved but never shown.
+        // the submit), failed at the server, or saved but never shown. The
+        // answers the browser finished tell the last two apart: none means
+        // the response never came, one that the page never used it. Its
+        // errors say why it wouldn't: a panic ends the page's WASM, leaving
+        // the DOM as it stood.
         let seen: String = page
-            .evaluate("(() => [document.querySelectorAll('.secret-row').length, document.querySelector('#secret-value')?.value ?? 'no field', document.querySelector('.secrets-add-form button')?.textContent ?? 'no button', document.querySelector('main')?.innerText.slice(0, 400) ?? ''].join(' | '))()")
+            .evaluate("(() => [document.querySelectorAll('.secret-row').length, document.querySelector('#secret-value')?.value ?? 'no field', document.querySelector('.secrets-add-form button')?.textContent ?? 'no button', performance.getEntriesByType('resource').filter(e => e.name.endsWith('/api/secrets/save')).length, (window.__smeltErrors ?? ['no error hook']).join(' ; '), document.body.innerText.slice(0, 400)].join(' | '))()")
             .await
             .ok()
             .and_then(|v| v.into_value().ok())
             .unwrap_or_default();
         let stored = crate::db::list_named_secrets(t.pool).await.map(|s| s.iter().any(|s| s.name == paste_name));
-        panic!("the pasted secret's row should appear; rows | field | button | page text: {seen:?}; stored: {stored:?}");
+        panic!("the pasted secret's row should appear; rows | field | button | save answers finished | page errors | page text: {seen:?}; stored: {stored:?}");
+    }
+    // Said on a pass too: an error the page survived is a lead on the one it
+    // wouldn't (SME-371).
+    let page_errors: String = page
+        .evaluate("(window.__smeltErrors ?? ['no error hook']).join(' ; ')")
+        .await
+        .expect("read the page's errors")
+        .into_value()
+        .expect("a string");
+    if !page_errors.is_empty() {
+        eprintln!("browser tier: secrets_page: page errors after the paste: {page_errors}");
     }
     let pasted_row: Vec<String> = page
         .evaluate("(() => { const r = document.querySelector('.secret-row'); return [r.querySelector('.secret-shown').textContent, r.querySelector('.secret-lines')?.textContent ?? 'no .secret-lines', r.title]; })()")
@@ -612,6 +640,35 @@ pub(super) async fn scenario_secrets_page(t: &Scenario<'_>) {
     click_when_present(&page, ".secret-row .secret-delete", Duration::from_secs(5)).await;
     click_when_present(&page, ".secret-row .secret-delete-confirm", Duration::from_secs(5)).await;
     assert!(wait_for_count(&page, ".secret-row", 0, Duration::from_secs(10)).await, "the pasted secret's row deletes again");
+
+    // SME-371: a save with a live pod whose install won't finish. Its
+    // conversation's install lock is held, as a stalled exec holds it for up
+    // to a minute. A save has committed before it starts on the pods, so on
+    // the unfixed code the page sat on "Adding..." with the value still in
+    // the field. A leg of its own: the hold spends the answer's whole
+    // deadline, which the paste leg's window shouldn't have to pay for.
+    let held_name = unique_id("held");
+    type_and_read_back(&page, "#secret-name", &held_name).await;
+    type_and_read_back(&page, "#secret-value", value).await;
+    let stuck = t.conversation().await;
+    let stuck_pod = db::create_sandbox_pod(t.pool, stuck.id).await.expect("a live pod row");
+    super::deliberately_held(stuck_pod.id);
+    let (release_install, released) = tokio::sync::oneshot::channel::<()>();
+    let (install_held, is_held) = tokio::sync::oneshot::channel::<()>();
+    let stuck_install = tokio::spawn(crate::credentials::with_install_lock(stuck.id, async move {
+        let _ = install_held.send(());
+        let _ = released.await;
+    }));
+    is_held.await.expect("the install lock is held");
+    click_when_present(&page, ".secrets-add-form button[type=\"submit\"]", Duration::from_secs(5)).await;
+    let answered = wait_for_count(&page, ".secret-row", 1, Duration::from_secs(10)).await;
+    let _ = release_install.send(());
+    stuck_install.await.expect("the held install lock");
+    db::terminate_sandbox_pod(t.pool, stuck_pod.id).await.expect("end the stuck pod's row");
+    assert!(answered, "a stuck install held the save's answer: the row should appear while it's stuck");
+    click_when_present(&page, ".secret-row .secret-delete", Duration::from_secs(5)).await;
+    click_when_present(&page, ".secret-row .secret-delete-confirm", Duration::from_secs(5)).await;
+    assert!(wait_for_count(&page, ".secret-row", 0, Duration::from_secs(10)).await, "the held save's row deletes again");
 
     // A seeded row at 375px: it renders, and the page doesn't scroll sideways.
     let seeded = db::create_named_secret(t.pool, &unique_id("phone"), "phone-value-0123456789").await.expect("seed a secret");
