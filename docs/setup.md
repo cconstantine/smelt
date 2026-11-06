@@ -226,7 +226,7 @@ The steps below build all of that yourself and take the import route. [Deploying
    - `SMELT_PREVIEW_URL` and `SMELT_PREVIEW_ADDR`: where sandbox previews live.
    - `BROWSER_CHECK_CACHE`: from step 4.
 7. **Put it behind TLS.** Use a reverse proxy that speaks HTTP/2: each tab holds an open event stream, and HTTP/1.1 allows only six connections per host. Route the preview host names (for example `{port}-{conversation}-smelt.example.com`) to `SMELT_PREVIEW_ADDR`'s port. They need wildcard DNS and a wildcard TLS certificate. The proxy must pass the browser's `Host` header through unchanged (in nginx, `proxy_set_header Host $host;`), since the preview listener reads the conversation and port from it, and must pass WebSocket upgrades through for a dev server's live reload. See [Sandbox previews](setup/sandbox.md#sandbox-previews).
-8. **Add a model provider.** Open smelt, go to **Model providers** in the sidebar, and add one with its key. Nothing about the model is read from the environment.
+8. **Add a model provider.** Open smelt, go to **Model providers** in the sidebar, and add one with its key. Nothing about the model is read from the environment, except a Claude Code provider's sign-in, `CLAUDE_CODE_OAUTH_TOKEN`: see [docs/setup/claude-code.md](setup/claude-code.md).
 
 ### Deploying from published images
 
