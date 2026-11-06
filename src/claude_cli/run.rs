@@ -137,6 +137,8 @@ struct Run {
     /// Whether the last reply's results are in `answers`, until the CLI's
     /// next API call starts.
     delivered: bool,
+    /// Calls with an id the streaming reply hasn't shown yet (L12).
+    held: Vec<ParkedCall>,
     /// Whether it was given smelt's tools (an `--mcp-config`).
     has_tools: bool,
     /// The reply cap it was launched with.
@@ -325,6 +327,7 @@ impl Run {
             gone: false,
             max_tokens: request.max_tokens,
             has_tools: !request.tools.is_empty(),
+            held: Vec::new(),
             streaming_ids: std::collections::HashSet::new(),
             answered: std::collections::HashSet::new(),
             delivered: false,

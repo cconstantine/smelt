@@ -146,6 +146,7 @@ impl Run {
                 })
                 .collect();
             self.state = State::Parked;
+            self.settle_held();
             return Ok(turn);
         }
         if crate::anthropic::stream::is_cut_off(&turn.stop_reason) {
@@ -154,6 +155,7 @@ impl Run {
                 self.healthy = false;
             }
         }
+        self.settle_held();
         self.await_result(extra).await;
         Ok(turn)
     }

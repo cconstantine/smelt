@@ -64,6 +64,23 @@ impl Run {
     /// A call from the CLI: answered now if smelt has its result, else
     /// kept until it does. One without a tool-use id is matched to a call
     /// of the reply by name and input, first come first served.
+    /// The calls held while the reply streamed, at its `message_stop`:
+    /// each one of its calls waits for smelt's result; any other is
+    /// refused (review 2 L12).
+    pub(super) fn settle_held(&mut self) {
+        for parked in std::mem::take(&mut self.held) {
+            let ours = parked.tool_use_id.as_ref().is_some_and(|id| self.expected.iter().any(|e| &e.id == id));
+            match (ours, parked.tool_use_id.clone()) {
+                (true, Some(id)) => {
+                    self.arrived.insert(id, parked);
+                }
+                _ => {
+                    let _ = parked.reply.send(ToolReply { text: vec![NOT_THE_REPLYS.to_string()], is_error: true });
+                }
+            }
+        }
+    }
+
     pub(super) fn take_call(&mut self, parked: ParkedCall) {
         let id = parked.tool_use_id.clone().or_else(|| {
             self.expected
@@ -85,6 +102,14 @@ impl Run {
                 None if self.expected.iter().any(|e| e.id == id) || self.streaming_ids.contains(&id) => {
                     self.arrived.insert(id, parked);
                 }
+                // While a new reply streams (the last one's results all
+                // delivered and a new API call begun, or none yet), its own
+                // first call can reach the bridge before smelt has read its
+                // block from stdout: held until the reply's `message_stop`
+                // (review 2 L12). Between the delivery and the next API call
+                // the CLI makes only the last reply's calls, so an unknown id
+                // then is a stray, refused at once (L1).
+                None if self.state == State::Streaming && !self.delivered => self.held.push(parked),
                 // Not one of the reply's calls: refused at once (review 1 L1).
                 None => refuse(parked),
             },

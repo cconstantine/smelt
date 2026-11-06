@@ -158,6 +158,8 @@ struct Fake {
     stdout: tokio::io::Stdout,
     mcp: Option<(String, String)>,
     client: Option<super::bridge::Client>,
+    /// Calls started by `call_early`, awaited by `join`.
+    early: Vec<tokio::task::JoinHandle<(Value, String, bool)>>,
 }
 
 /// What reading stdin came to.
@@ -263,6 +265,7 @@ async fn play(dir: &Path) -> i32 {
         stdout: tokio::io::stdout(),
         mcp,
         client: None,
+        early: Vec::new(),
     };
     let mut i = 0;
     while i < steps.len() {
@@ -299,6 +302,28 @@ async fn play(dir: &Path) -> i32 {
                 }
             }
             stopped
+        } else if let Some(call) = step.get("call_early") {
+            // A call made before the reply's lines are written, as the
+            // CLI makes a reply's first call before stdout shows its block
+            // (review 2 L12).
+            let peer = fake.peer().await;
+            let call = call.clone();
+            fake.early.push(tokio::spawn(async move {
+                let short = call["name"].as_str().unwrap_or_default().trim_start_matches("mcp__smelt__").to_string();
+                let (text, is_error) = super::bridge::call(&peer, &short, call["input"].clone(), call["id"].as_str()).await;
+                (call["id"].clone(), text, is_error)
+            }));
+            false
+        } else if step.get("join").is_some() {
+            for early in std::mem::take(&mut fake.early) {
+                let (id, text, is_error) = early.await.expect("the early call");
+                fake.log("results", &json!({"id": id, "text": text, "is_error": is_error}));
+                fake.emit(&json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": [{"type": "text", "text": text}]}]}})).await;
+            }
+            false
+        } else if let Some(ms) = step["sleep_ms"].as_u64() {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            false
         } else if step.get("await_interrupt").is_some() {
             loop {
                 match fake.read().await {
