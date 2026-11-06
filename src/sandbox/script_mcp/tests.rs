@@ -415,6 +415,21 @@ async fn next_summary(events: &mut crate::events::Subscription, command_id: &str
     panic!("no summary of {command_id:?} within 10 s");
 }
 
+/// The summaries published until `quiet` passes with none. A lagged or
+/// closed channel panics: only quiet may end a "no more publishes" wait.
+async fn drain_summaries(events: &mut crate::events::Subscription, quiet: std::time::Duration) -> Vec<(String, i64)> {
+    let deadline = tokio::time::Instant::now() + quiet;
+    let mut published = Vec::new();
+    loop {
+        match tokio::time::timeout_at(deadline, events.recv()).await {
+            Ok(Ok(crate::events::ConversationEvent::SandboxMcpCalls { command_id, summary })) => published.push((command_id, summary.calls)),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => panic!("summary events ended early: {e:?}"),
+            Err(_) => return published,
+        }
+    }
+}
+
 /// C7: a command's summary is published as its calls finish, but a burst
 /// of calls makes one event, not one each, and that event counts them all.
 ///
@@ -451,13 +466,7 @@ async fn test_a_burst_of_calls_publishes_one_summary_with_them_all(pool: PgPool)
         let status = tokio::time::timeout(std::time::Duration::from_secs(10), call).await.expect("the call ends").expect("no panic");
         assert_eq!(status, 200);
     }
-    let mut published = Vec::new();
-    let deadline = tokio::time::Instant::now() + SUMMARY_EVERY * 3;
-    while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, events.recv()).await {
-        if let crate::events::ConversationEvent::SandboxMcpCalls { command_id, summary } = event {
-            published.push((command_id, summary.calls));
-        }
-    }
+    let published = drain_summaries(&mut events, SUMMARY_EVERY * 3).await;
     forget_mock_server(config.id).await;
     assert_eq!(published, vec![("cmd-c7".to_string(), 3)]);
 }
@@ -514,12 +523,7 @@ async fn test_calls_held_across_a_summary_window_publishes_the_latest_count_twic
     // the trailing edge, with the latest count again.
     published.push(next_summary(&mut events, "cmd-c7b").await);
     // And that is all of them: two summaries for the whole run.
-    let deadline = tokio::time::Instant::now() + SUMMARY_EVERY * 2;
-    while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, events.recv()).await {
-        if let crate::events::ConversationEvent::SandboxMcpCalls { command_id, summary } = event {
-            published.push((command_id, summary.calls));
-        }
-    }
+    published.extend(drain_summaries(&mut events, SUMMARY_EVERY * 2).await);
     forget_mock_server(config.id).await;
     assert_eq!(published, vec![("cmd-c7b".to_string(), 3), ("cmd-c7b".to_string(), 3)]);
 }
