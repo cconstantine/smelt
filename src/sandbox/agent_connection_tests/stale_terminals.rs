@@ -170,3 +170,31 @@ async fn test_a_stale_terminal_with_no_live_pod_points_at_create_pod(pool: PgPoo
         "a refused run wrote a command row"
     );
 }
+
+/// Part 2's interleaving, forced: a live-status terminal on the ended pod,
+/// and `send_command` called directly — it has no up-front gate, as the
+/// gate's race with a pod's stop lands calls here anyway. The dial fails,
+/// cleanup closes the pod, and the advice must then name the conversation's
+/// live pod, not `create_pod`. Green only with part 2's re-check in.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_losing_the_pods_row_after_the_up_front_check_still_names_the_live_pod(pool: PgPool) {
+    let (_conversation, old_pod, live_pod) = two_pods(&pool).await;
+    gone_dialer(old_pod);
+    let terminal = db::create_sandbox_terminal(&pool, old_pod).await.expect("terminal").id;
+
+    let message = send_command(&pool, terminal, "cmd-stale-r5", "echo hi")
+        .await
+        .expect_err("dialling an ended pod's terminal is refused")
+        .to_string();
+    for wanted in [
+        &format!("pod {old_pod} has stopped"),
+        &format!("pod {live_pod} is running"),
+        "list_terminals",
+        "create_terminal",
+    ] {
+        assert!(message.contains(wanted), "{wanted:?} missing from: {message}");
+    }
+    for forbidden in ["create_pod", "terminate_pod"] {
+        assert!(!message.contains(forbidden), "{forbidden} must not be advised: {message}");
+    }
+}

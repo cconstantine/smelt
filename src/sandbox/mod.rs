@@ -253,7 +253,19 @@ pub enum TerminalError {
     AgentTooOld { needs: ProtocolVersion, found: ProtocolVersion },
     /// Every attempt to reach the pod's agent failed, so its pod was
     /// cleaned up and stopped, as after a crash.
+    ///
+    /// The variant's remaining true meaning (SME-425): the pod dialled was
+    /// the conversation's live one, its crash cleanup just closed it, and no
+    /// pod runs — so create_pod is right. Where a live pod does run,
+    /// `StaleTerminal` (checked up front) or `StalePod` (after a cleanup
+    /// that found the replacement) answers instead.
     AgentUnreachable,
+    /// The pod dialled was cleaned up as gone, as after a crash — but the
+    /// conversation has another live pod (its row ended past the up-front
+    /// staleness check, in the race that ends a pod between that check and
+    /// the dial), so `AgentUnreachable`'s create_pod advice would be wrong
+    /// (SME-425).
+    StalePod { pod_id: i64, live_pod: i64 },
     /// A request to open one of the sandbox agent's own ports (`AGENT_PORT`,
     /// `RELAY_PORT`) from a route into the pod — see `check_reachable_port`.
     AgentPort(u16),
@@ -357,6 +369,11 @@ impl std::fmt::Display for TerminalError {
                 f,
                 "the sandbox's agent couldn't be reached, so its pod was stopped (a notice says why, if \
                  the cluster gave a reason). Call create_pod for a new one."
+            ),
+            TerminalError::StalePod { pod_id, live_pod } => write!(
+                f,
+                "pod {pod_id} has stopped; your pod {live_pod} is running — use list_terminals to see \
+                 your terminals, or create_terminal for a new one."
             ),
             TerminalError::AgentPort(port) => write!(
                 f,

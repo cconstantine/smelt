@@ -425,7 +425,7 @@ pub(super) fn connect_with_retry(
                     if mode != ConnectMode::First {
                         if let Some(reason) = dialer.death_reason(pod_id).await {
                             clean_up_and_terminate_pod(&pool, pod_id, reason).await;
-                            return Err(TerminalError::AgentUnreachable);
+                            return Err(stale_pod_or_unreachable(&pool, pod_id).await);
                         }
                     }
                     last_err = Some(e);
@@ -448,7 +448,7 @@ pub(super) fn connect_with_retry(
                 // unreachable, say). Its terminals are unusable either way,
                 // so clean up and stop it the same as a confirmed crash.
                 clean_up_and_terminate_pod(&pool, pod_id, None).await;
-                Err(TerminalError::AgentUnreachable)
+                Err(stale_pod_or_unreachable(&pool, pod_id).await)
             }
         }
     })
@@ -467,6 +467,24 @@ pub(super) async fn clean_up_and_terminate_pod(pool: &PgPool, pod_id: i64, reaso
     if let Err(e) = force_terminate_pod(pool, pod_id).await {
         tracing::warn!(pod_id, error = %e, "best-effort pod termination failed after a crash");
     }
+}
+
+/// SME-425: what to answer once `connect_with_retry` has cleaned up a pod
+/// it couldn't reach. `AgentUnreachable`'s create_pod advice is true only
+/// when no live pod is left — but a caller that dialled an ended pod's
+/// terminal (the pod ending between the up-front staleness check and the
+/// dial, say) meets a conversation that has one, and that advice routes
+/// there on to `terminate_pod` — killing a healthy pod. One indexed read
+/// on this error path decides; cleanup has already ended `pod_id`'s row,
+/// so a live pod found here is always another.
+async fn stale_pod_or_unreachable(pool: &PgPool, pod_id: i64) -> TerminalError {
+    if let Some(conversation_id) = db::sandbox_pod_conversation_id(pool, pod_id).await.unwrap_or(None)
+        && let Ok(live_pod) = conversation_pod_id(pool, conversation_id).await
+        && live_pod != pod_id
+    {
+        return TerminalError::StalePod { pod_id, live_pod };
+    }
+    TerminalError::AgentUnreachable
 }
 
 /// Connects to every live pod's agent at startup (SME-359, Q4), each in a
