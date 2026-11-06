@@ -370,6 +370,24 @@ async fn saved_context_window(pool: &PgPool) -> Option<i32> {
     .flatten()
 }
 
+/// The **learned** Context window `mock-model` was saved with (SME-439),
+/// its when/why/which-conversation record beside it.
+async fn learned_window_record(pool: &PgPool) -> (Option<i32>, Option<String>, Option<i64>) {
+    sqlx::query_as::<_, (Option<i32>, Option<String>, Option<i64>)>(
+        "SELECT learned_context_window, learned_context_window_reason, learned_context_window_conversation FROM provider_models WHERE provider_id = (SELECT id FROM inference_providers ORDER BY id) AND model = $1",
+    )
+    .bind(crate::providers::test_support::MOCK_MODEL)
+    .fetch_optional(pool)
+    .await
+    .expect("the model row")
+    .unwrap_or_default()
+}
+
+/// The learned window alone — the learner's column, never the user's.
+async fn saved_learned_context_window(pool: &PgPool) -> Option<i32> {
+    learned_window_record(pool).await.0
+}
+
 /// The text of the last assistant message.
 fn last_reply(messages: &[Message]) -> Option<String> {
     messages.iter().rev().find(|m| m.role == "assistant").and_then(|m| {
@@ -475,6 +493,7 @@ mod pod_activity;
 mod turn_slot;
 mod overflow;
 mod window_stop;
+mod window_learning;
 mod compaction_progress;
 mod transcript;
 mod room_limited;

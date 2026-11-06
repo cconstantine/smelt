@@ -328,22 +328,27 @@ pub async fn set_provider_model_reported(
     Ok(())
 }
 
-/// Saves the context window an overflow refusal named (SME-73), for the
-/// model the turn ran on. One statement: the row is added if it has
-/// none, and `context_window` is set only where `window` is below the
-/// model's effective window — the saved one, else the reported one, else
-/// `unsized_window` (the window `providers::context_window` gives a model with
-/// no row) — so it only ever lowers what turns use (SME-386 T5), and two
-/// learners settle on the smaller; and only while the provider still
-/// answers at `base_url`, so a provider moved to another server mid-turn
-/// isn't given the old server's window. Returns whether anything was
-/// written.
-pub async fn lower_model_context_window(
+/// Saves the context window a learner settled on (SME-439: an overflow
+/// refusal, a window stop, or Ollama's loaded window) for the model the
+/// turn ran on. One statement: the row is added if it has none, and
+/// `learned_context_window` — never the user's `context_window` — is set
+/// to `window` only where it is below the model's effective window, the
+/// saved learning first (learners settle on the smaller and never raise
+/// their own), else the user's, else the reported one, else
+/// `unsized_window` (the window `providers::context_window` gives a model
+/// with no row); and only while the provider still answers at
+/// `base_url`, so a provider moved to another server mid-turn isn't given
+/// the old server's window. `reason` (`providers::WindowSource`) and
+/// `conversation_id` are recorded beside it — the when/why/source triple
+/// PR 2 shows. Returns whether anything was written.
+pub async fn save_learned_context_window(
     pool: &PgPool,
     provider_id: i64,
     base_url: &str,
     model: &str,
     window: u32,
+    reason: &str,
+    conversation_id: i64,
     unsized_window: u32,
 ) -> Result<bool, sqlx::Error> {
     let window = i32::try_from(window).unwrap_or(i32::MAX);
@@ -352,16 +357,21 @@ pub async fn lower_model_context_window(
     // reads it. The SELECT's guard reads an existing row's effective
     // window too: a SELECT that yields no row reaches no conflict branch,
     // so a guard on `$5` alone kept a model above the unsized window from
-    // learning anything (review 1, M1).
+    // learning anything (SME-386 review 1, M1).
     let written = sqlx::query(
-        "INSERT INTO provider_models (provider_id, model, context_window)\n\
-         SELECT $1, $2, $3 FROM inference_providers WHERE id = $1 AND base_url = $4\n\
-           AND $3 < COALESCE((SELECT COALESCE(NULLIF(GREATEST(m.context_window, 0), 0),\n\
+        "INSERT INTO provider_models (provider_id, model, learned_context_window, learned_context_window_at, learned_context_window_reason, learned_context_window_conversation)\n\
+         SELECT $1, $2, $3, now(), $6, $7 FROM inference_providers WHERE id = $1 AND base_url = $4\n\
+           AND $3 < COALESCE((SELECT COALESCE(NULLIF(GREATEST(m.learned_context_window, 0), 0),\n\
+                                              NULLIF(GREATEST(m.context_window, 0), 0),\n\
                                               NULLIF(GREATEST(m.reported_context_window, 0), 0))\n\
                               FROM provider_models m WHERE m.provider_id = $1 AND m.model = $2), $5)\n\
          ON CONFLICT (provider_id, model) DO UPDATE\n\
-         SET context_window = $3\n\
-         WHERE $3 < COALESCE(NULLIF(GREATEST(provider_models.context_window, 0), 0),\n\
+         SET learned_context_window = $3,\n\
+             learned_context_window_at = now(),\n\
+             learned_context_window_reason = $6,\n\
+             learned_context_window_conversation = $7\n\
+         WHERE $3 < COALESCE(NULLIF(GREATEST(provider_models.learned_context_window, 0), 0),\n\
+                             NULLIF(GREATEST(provider_models.context_window, 0), 0),\n\
                              NULLIF(GREATEST(provider_models.reported_context_window, 0), 0), $5)\n\
            AND EXISTS (SELECT 1 FROM inference_providers WHERE id = $1 AND base_url = $4)",
     )
@@ -370,6 +380,8 @@ pub async fn lower_model_context_window(
     .bind(window)
     .bind(base_url)
     .bind(unsized_window)
+    .bind(reason)
+    .bind(conversation_id)
     .execute(pool)
     .await?;
     Ok(written.rows_affected() > 0)

@@ -23,23 +23,25 @@ fn turn_model(provider_id: i64, base_url: &'static str) -> TurnModel {
     }
 }
 
-/// A learned window is saved for the model and `ProvidersChanged` goes
-/// out; the same or a larger one next changes nothing.
+/// A learned window is saved for the model — in the learned column, the
+/// user's own field never (SME-439) — and `ProvidersChanged` goes out;
+/// the same or a larger one next changes nothing.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_learning_a_window_saves_it_and_tells_the_app(pool: PgPool) {
     let ollama = provider(&pool, "home", "api_key").await;
     let mut app = crate::events::subscribe_app();
     let model = turn_model(ollama.id, "http://ollama:11434");
 
-    assert!(learn_context_window(&pool, &model, 32_768).await.expect("learn"), "a null window is set");
+    assert!(learn_context_window(&pool, &model, 32_768, WindowSource::Refusal, 1).await.expect("learn"), "a null window is set");
     assert!(received(&mut app, &crate::events::AppEvent::ProvidersChanged), "the page and pickers refresh");
     let row = db::get_provider_model(&pool, ollama.id, "flash-next").await.expect("get").expect("exists");
-    assert_eq!(row.context_window, Some(32_768));
+    assert_eq!(row.learned_context_window, Some(32_768));
+    assert_eq!(row.context_window, None, "the user's column is a learner's to leave alone");
 
-    assert!(!learn_context_window(&pool, &model, 65_536).await.expect("learn again"), "it only ever lowers: nothing to save");
-    assert!(!learn_context_window(&pool, &model, 32_768).await.expect("learn again"), "the same window: nothing changed");
+    assert!(!learn_context_window(&pool, &model, 65_536, WindowSource::Refusal, 1).await.expect("learn again"), "it only ever lowers: nothing to save");
+    assert!(!learn_context_window(&pool, &model, 32_768, WindowSource::Refusal, 1).await.expect("learn again"), "the same window: nothing changed");
     let row = db::get_provider_model(&pool, ollama.id, "flash-next").await.expect("get").expect("exists");
-    assert_eq!(row.context_window, Some(32_768));
+    assert_eq!(row.learned_context_window, Some(32_768));
 }
 
 /// A turn on a provider that moved mid-flight teaches the old server's
@@ -50,6 +52,6 @@ async fn test_a_window_learned_after_the_provider_moved_changes_nothing(pool: Pg
     let ollama = provider(&pool, "home", "api_key").await;
     let model = turn_model(ollama.id, "http://was-here-before");
 
-    assert!(!learn_context_window(&pool, &model, 32_768).await.expect("stale learn"), "the provider isn't there anymore");
+    assert!(!learn_context_window(&pool, &model, 32_768, WindowSource::WindowStop, 1).await.expect("stale learn"), "the provider isn't there anymore");
     assert_eq!(db::get_provider_model(&pool, ollama.id, "flash-next").await.expect("get"), None);
 }

@@ -6,6 +6,9 @@
 //! gentler half lives here too: a reply the *window* stopped rather than
 //! its budget is kept as it stands and leaves its measured size behind.
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+
 use super::*;
 
 /// What a recovery ends with: the retry's reply and recorder, the budget
@@ -169,30 +172,240 @@ pub(super) fn window_stop(kind: crate::providers::ProviderKind, stop_reason: &st
     }
 }
 
+/// How close to the server's reported per-request window a window stop's
+/// measurement must come for the stop to plausibly have filled that
+/// window (SME-439): it absorbs llama.cpp's per-slot rounding and
+/// usage-count jitter, and it is small next to any real window. Equal to
+/// `COMPACTION_SAFETY_BUFFER` by taste; its own number.
+const WINDOW_STOP_MARGIN: i64 = 4_096;
+
+/// A stop that wrote less than this is "very short": it measured almost
+/// nothing of the room (below the 64-token slack usage rounding lives
+/// under). 32 and not 355 on purpose: a genuine fill can stop with only
+/// a little room left (SME-73's W1 story); the floor only rejects
+/// near-empty replies (SME-439).
+const MIN_WINDOW_STOP_OUTPUT: i64 = 32;
+
+/// How many of a reply's last tokens the repetition-loop tell reads, and
+/// how many of them one token must fill to be a loop (SME-439): the
+/// incident's reply babbled `…finish.finish.finish…` to its stop.
+/// Documented misses: unspaced CJK loops, whole repeated code lines with
+/// distinct content, loops shorter than the tail — acceptable because
+/// the proximity rule is the primary guard and this only vetoes.
+const DEGENERATE_TAIL_TOKENS: usize = 40;
+const DEGENERATE_REPEATS: usize = 24;
+
+/// What a request to one of a llama.cpp server's slots gets is its
+/// `n_ctx` split across its slots (`n_ctx_slot = n_ctx / total_slots` in
+/// llama.cpp's own server code); every other kind reports per model, so
+/// its window passes whole. An uneven split (`--slot-context`, upstream
+/// proposal) breaks the even division — the margin and the repeat rule
+/// are the guard. `None` reported stays `None`.
+pub(super) fn reported_per_request(
+    reported: Option<i32>,
+    kind: crate::providers::ProviderKind,
+    total_slots: Option<u32>,
+) -> Option<i64> {
+    let reported = i64::from(reported.filter(|w| *w > 0)?);
+    if kind == crate::providers::ProviderKind::LlamaCpp {
+        if let Some(slots) = total_slots.filter(|s| *s > 1) {
+            return Some(reported / i64::from(slots));
+        }
+    }
+    Some(reported)
+}
+
+/// Whether a window stop's measured size plausibly *is* the reported
+/// per-request window: within [`WINDOW_STOP_MARGIN`] of it. Nothing
+/// reported proves nothing (SME-439).
+pub(super) fn stop_reads_plausible(measured: i64, reported: Option<i64>) -> bool {
+    reported.is_some_and(|w| measured.abs_diff(w) <= WINDOW_STOP_MARGIN as u64)
+}
+
+/// The repetition-loop tell: of the reply's last [`DEGENERATE_TAIL_TOKENS`]
+/// whitespace-or-punctuation-delimited tokens, one appears
+/// [`DEGENERATE_REPEATS`] times. A token scan, not a word scan, so the
+/// incident's periods split `finish.finish.finish` into tokens.
+pub(super) fn looks_degenerate(text: &str) -> bool {
+    let words: Vec<&str> = text
+        .split(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let tail = &words[words.len().saturating_sub(DEGENERATE_TAIL_TOKENS)..];
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    tail.iter().copied().any(|t| {
+        let n = counts.entry(t).or_insert(0);
+        *n += 1;
+        *n >= DEGENERATE_REPEATS
+    })
+}
+
+/// The reply's text, for the degenerate tell — thinking and tool blocks
+/// say nothing a loop of words would repeat.
+fn reply_text(content: &[anthropic::ContentBlock]) -> String {
+    content
+        .iter()
+        .filter_map(|block| match block {
+            anthropic::ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// One `window_learn` span per learning *decision* (SME-439's Expected
+/// 6): a records-carrier, ended on the spot, never a duration. Every
+/// field is a number, an id, or a fixed enum — no reply text, no model
+/// output, no URLs (SME-137's rule) — so the incident can be read off a
+/// trace without having sat in the conversation.
+#[allow(clippy::too_many_arguments)]
+fn trace_window_decision(
+    conversation_id: i64,
+    model: &str,
+    source: crate::providers::WindowSource,
+    decision: &str,
+    value: u32,
+    usage: Option<&anthropic::TokenUsage>,
+    reported: Option<i64>,
+    reported_per_request: Option<i64>,
+) {
+    let (measured_input, measured_output, cache_creation, cache_read) = match usage {
+        Some(u) => (
+            Some(u.input_tokens),
+            Some(u.output_tokens),
+            Some(u.cache_creation_input_tokens),
+            Some(u.cache_read_input_tokens),
+        ),
+        None => (None, None, None, None),
+    };
+    tracing::info_span!(
+        "window_learn",
+        conversation_id,
+        smelt.model = model,
+        smelt.window.source = source.as_str(),
+        smelt.window.decision = decision,
+        smelt.window.value = i64::from(value),
+        smelt.window.measured_input = measured_input,
+        smelt.window.measured_output = measured_output,
+        smelt.window.cache_creation = cache_creation,
+        smelt.window.cache_read = cache_read,
+        smelt.window.reported = reported,
+        smelt.window.reported_per_request = reported_per_request,
+    )
+    .in_scope(|| {});
+}
+
+/// The repeat evidence for an ambiguous, implausible window stop
+/// (SME-439): the last candidate measurement per `(provider, model)`, so
+/// a second like-sized stop — two independent fills at one size — can
+/// learn what one never may. Process-local: a restart drops it, which
+/// errs toward never learning (Trade-offs). Never held across an await.
+static WINDOW_STOP_CANDIDATES: LazyLock<Mutex<HashMap<(i64, String), (i64, i64)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// What this model's server reports per request: the stored reported
+/// window and its llama.cpp slot split (two queries — the learner's own
+/// rare path, only consulted when a stop is ambiguous and this turn must
+/// decide what it measured).
+async fn reported_per_request_for(
+    pool: &PgPool,
+    turn_model: &crate::providers::TurnModel,
+) -> (Option<i64>, Option<i64>) {
+    let reported_i32 = db::get_provider_model(pool, turn_model.provider_id, &turn_model.model)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| row.reported_context_window)
+        .filter(|w| *w > 0);
+    let reported = reported_i32.map(i64::from);
+    let total_slots = if turn_model.kind == crate::providers::ProviderKind::LlamaCpp {
+        db::get_inference_provider(pool, turn_model.provider_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|provider| crate::providers::server_caps(&provider))
+            .and_then(|caps| caps.total_slots)
+    } else {
+        None
+    };
+    (reported, reported_per_request(reported_i32, turn_model.kind, total_slots))
+}
+
 /// What a window stop measured is the room the server really had: the
-/// whole call — input, cache and output together — stopped at the window.
-/// When that came in below this turn's believed window by more than
-/// `COMPACTION_SAFETY_BUFFER` the belief was too big: learn the measured
-/// size (the write only ever lowers), and the next request compacts
-/// before it is refused. The reply is kept either way and this retries
-/// nothing itself; a save that doesn't land says nothing more (`learn`).
+/// whole call — input, cache and output together — stopped at the
+/// window. But one ambiguous stop measures the *conversation* too (the
+/// incident: a looping reply stopped at 355 tokens and saved the
+/// conversation's 160,799 as strata's window for 1.7 hours). So
+/// SME-439's gate: save when the stop is unambiguous (the server's own
+/// `model_context_window_exceeded`) or the measurement lands within
+/// [`WINDOW_STOP_MARGIN`] of what the server reports per request, or an
+/// equally-sized stop repeats; never from a degenerate or near-empty
+/// reply, and never below [`MIN_PLAUSIBLE_WINDOW`]. Reported and
+/// disagreeing: save nothing and leave this turn's belief where the
+/// server said it is; reported unknown: evidence for this turn only. The
+/// reply is kept either way and this retries nothing itself; the notice
+/// wording (`window_stop`) is untouched.
 pub(super) async fn learn_window_stop(
     pool: &PgPool,
     conversation_id: i64,
     turn_model: &mut crate::providers::TurnModel,
     usage: &anthropic::TokenUsage,
+    content: &[anthropic::ContentBlock],
+    stop_reason: &str,
 ) {
     let measured = usage
         .input_tokens
         .saturating_add(usage.output_tokens)
         .saturating_add(usage.cache_creation_input_tokens)
         .saturating_add(usage.cache_read_input_tokens);
-    if measured >= MIN_PLAUSIBLE_WINDOW
-        && measured.saturating_add(i64::from(COMPACTION_SAFETY_BUFFER)) < i64::from(turn_model.context_window)
-    {
-        let window = u32::try_from(measured).unwrap_or(u32::MAX);
-        learn(pool, conversation_id, turn_model, Some(window)).await;
+    let window = u32::try_from(measured).unwrap_or(u32::MAX);
+    if usage.output_tokens < MIN_WINDOW_STOP_OUTPUT {
+        trace_window_decision(conversation_id, &turn_model.model, crate::providers::WindowSource::WindowStop, "ignored_short", window, Some(usage), None, None);
+        return;
     }
+    if looks_degenerate(&reply_text(content)) {
+        trace_window_decision(conversation_id, &turn_model.model, crate::providers::WindowSource::WindowStop, "ignored_degenerate", window, Some(usage), None, None);
+        return;
+    }
+    if measured < MIN_PLAUSIBLE_WINDOW {
+        trace_window_decision(conversation_id, &turn_model.model, crate::providers::WindowSource::WindowStop, "not_lower", window, Some(usage), None, None);
+        return;
+    }
+    // The server's own claim the window filled skips the proximity rule.
+    let unambiguous = stop_reason == "model_context_window_exceeded";
+    let (reported, per_request) = reported_per_request_for(pool, turn_model).await;
+    let key = (turn_model.provider_id, turn_model.model.clone());
+    let save = unambiguous || stop_reads_plausible(measured, per_request);
+    let repeats = {
+        let mut candidates = WINDOW_STOP_CANDIDATES.lock().unwrap_or_else(|e| e.into_inner());
+        if save {
+            candidates.remove(&key); // a save ends the argument
+            true
+        } else if candidates.get(&key).is_some_and(|(prev, _)| prev.abs_diff(measured) <= WINDOW_STOP_MARGIN as u64) {
+            candidates.remove(&key); // this stop is the repeat itself
+            true
+        } else {
+            candidates.insert(key, (measured, conversation_id));
+            false
+        }
+    };
+    if repeats {
+        learn_as(pool, conversation_id, turn_model, Some(window), crate::providers::WindowSource::WindowStop, Some(usage), reported, per_request).await;
+        return;
+    }
+    if per_request.is_some() {
+        // The server said what it has; this stop measured the
+        // conversation. The turn's belief — the meter, the next
+        // compaction check — stays put; the candidate keeps the repeat
+        // evidence for a second stop.
+        trace_window_decision(conversation_id, &turn_model.model, crate::providers::WindowSource::WindowStop, "candidate", window, Some(usage), reported, per_request);
+        return;
+    }
+    // Nothing reported: one stop is evidence for this turn only (the
+    // meter and this turn's compaction read it; nobody else ever does).
+    turn_model.context_window = turn_model.context_window.min(window);
+    tracing::info!(conversation_id, model = %turn_model.model, window, "window stop believed for this turn only: the server reports no context window");
+    trace_window_decision(conversation_id, &turn_model.model, crate::providers::WindowSource::WindowStop, "turn_only", window, Some(usage), reported, per_request);
 }
 
 /// The floor on asking Ollama: below this an estimate-vs-measured gap is
@@ -204,6 +417,16 @@ const OLLAMA_CHECK_MIN_ESTIMATE: u64 = 8_192;
 /// gap to mean anything, and the reply below half of it (SME-73).
 pub(super) fn ollama_tell_says_truncated(estimate: u64, measured: u64) -> bool {
     estimate >= OLLAMA_CHECK_MIN_ESTIMATE && measured < estimate / 2
+}
+
+/// Clears the window-stop repeat candidates (SME-439). Every
+/// `#[sqlx::test]` database hands out the same provider ids while the
+/// tests run in one binary, and candidates are keyed by those ids, so a
+/// test that reads or writes them starts by forgetting them;
+/// `lock_turn_tests` keeps the tests off each other's turns.
+#[cfg(test)]
+pub(super) fn forget_window_stop_candidates() {
+    WINDOW_STOP_CANDIDATES.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 /// Ollama answers an oversized request quietly truncated rather than
@@ -243,30 +466,55 @@ pub(super) async fn learn_ollama_window(
         }
     };
     if let Some(window) = loaded.filter(|window| *window < turn_model.context_window) {
-        learn(pool, conversation_id, turn_model, Some(window)).await;
+        learn_as(pool, conversation_id, turn_model, Some(window), crate::providers::WindowSource::OllamaPs, Some(usage), None, None).await;
     }
 }
 
-/// Puts `window` on the turn's copy (every later size reads it) and
-/// saves it for the model. A save that fails — a provider moved mid-
-/// turn — is not the turn's failure: it says nothing more. Returns
-/// whether a window was named at all. Shared with the compaction's own
-/// overflow recovery (`compaction.rs`) and the window-stop measurement
-/// below — the plan's learners 3 and 4.
+/// Puts `window` on the turn's copy (every later size reads it), saves it
+/// for the model as `source`, and traces the decision (SME-439). A save
+/// that fails — a provider moved mid-turn — is not the turn's failure:
+/// it warns and the turn proceeds on its copy, as ever. Returns whether
+/// a window was named at all.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn learn_as(
+    pool: &PgPool,
+    conversation_id: i64,
+    turn_model: &mut crate::providers::TurnModel,
+    window: Option<u32>,
+    source: crate::providers::WindowSource,
+    usage: Option<&anthropic::TokenUsage>,
+    reported: Option<i64>,
+    reported_per_request: Option<i64>,
+) -> Option<u32> {
+    let window = window?;
+    if window < turn_model.context_window {
+        turn_model.context_window = window;
+    }
+    let decision = match crate::providers::learn_context_window(pool, turn_model, window, source, conversation_id).await {
+        Ok(true) => {
+            tracing::info!(conversation_id, model = %turn_model.model, source = source.as_str(), window, "learned a smaller context window");
+            "saved"
+        }
+        Ok(false) => "not_lower",
+        Err(e) => {
+            tracing::warn!(conversation_id, "couldn't save the context window a learner settled on: {e}");
+            "write_failed"
+        }
+    };
+    trace_window_decision(conversation_id, &turn_model.model, source, decision, window, usage, reported, reported_per_request);
+    Some(window)
+}
+
+/// A refusal's learner: [`learn_as`] with the refusal as its source. The
+/// 4-argument shape stays because `compaction.rs` calls it (SME-431
+/// owns that file; this signature is the overlap guard).
 pub(super) async fn learn(
     pool: &PgPool,
     conversation_id: i64,
     turn_model: &mut crate::providers::TurnModel,
     window: Option<u32>,
 ) -> Option<u32> {
-    let window = window?;
-    if window < turn_model.context_window {
-        turn_model.context_window = window;
-    }
-    if let Err(e) = crate::providers::learn_context_window(pool, turn_model, window).await {
-        tracing::warn!(conversation_id, "couldn't save the context window a refusal named: {e}");
-    }
-    Some(window)
+    learn_as(pool, conversation_id, turn_model, window, crate::providers::WindowSource::Refusal, None, None, None).await
 }
 
 /// `request` with its conversation taken out: what's left is the size

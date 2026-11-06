@@ -356,13 +356,14 @@ fn run_turn_steps<'a: 'b, 'b>(
                 Err(CallError::Failed(e)) => return Err(e),
             };
             // A reply the window stopped, rather than one that ran out of
-            // budget, measured the room the server really has: when the
-            // whole call came in far below the window this turn believed,
-            // believe less now (SME-73). Kept as it stands — a cut-off
-            // reply isn't continued — and this runs before the meter is
-            // published below, so it reads the new window too.
+            // budget, measured the room the server really has — but only
+            // against what the server reports, or a repeat of itself,
+            // does that measurement teach anything (SME-439). Kept as it
+            // stands — a cut-off reply isn't continued — and this runs
+            // before the meter is published below, so a save moves the
+            // meter too.
             if super::overflow::window_stop(turn_model.kind, &turn.stop_reason, turn.usage.output_tokens, budget.tokens) {
-                super::overflow::learn_window_stop(pool, conversation_id, turn_model, &turn.usage).await;
+                super::overflow::learn_window_stop(pool, conversation_id, turn_model, &turn.usage, &turn.content, &turn.stop_reason).await;
             }
             save_reply(pool, conversation_id, &turn, &mut persisted).await?;
             #[cfg(test)]
