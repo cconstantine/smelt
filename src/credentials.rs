@@ -271,16 +271,22 @@ pub async fn install_pod_files(
         // Written beside the target and renamed over it, so ssh or git
         // never reads half a file; umask keeps a key private from its
         // first byte.
+        // The byte count is checked before the rename: an exec dropped
+        // mid-stdin (`run_answered` moving past a stall, or the install's
+        // own deadline) closes the command's stdin early, and a short
+        // file must never be renamed over a good one (SME-440, SME-410).
         let mode = format!("{:o}", file.mode);
+        let length = file.content.len().to_string();
         let written = run_answered(
             shell,
             &[
                 "sh",
                 "-c",
-                r#"umask 077 && cat > "$1.new" && chmod "$2" "$1.new" && mv "$1.new" "$1""#,
+                WRITE_FILE_SCRIPT,
                 "sh",
                 &file.path,
                 &mode,
+                &length,
             ],
             Some(file.content.as_bytes()),
         )
@@ -321,6 +327,11 @@ pub async fn install_pod_files(
     }
     Ok(())
 }
+
+/// Writes stdin to `$1` at mode `$2`, only if it is `$3` bytes: beside the
+/// target first, then renamed over it.
+pub(crate) const WRITE_FILE_SCRIPT: &str =
+    r#"umask 077 && cat > "$1.new" && [ "$(wc -c < "$1.new")" -eq "$3" ] && chmod "$2" "$1.new" && mv "$1.new" "$1""#;
 
 /// How long one of an install's execs may go unanswered before it counts as
 /// stalled and is run again (SME-440). On a loaded CI runner one exec of a

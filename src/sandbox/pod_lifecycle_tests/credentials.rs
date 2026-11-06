@@ -147,6 +147,32 @@ async fn test_an_install_whose_exec_stalls_still_lands(pool: PgPool) {
     .await;
 }
 
+/// SME-440: a write whose stdin ends short — an exec dropped mid-write —
+/// renames nothing over the file it would replace.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_short_write_never_replaces_the_file(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let pod = create_pod(&pool, conversation.id, PodLimitOverrides::default()).await.expect("create_pod");
+        let write = |content: &'static str, length: &'static str| {
+            let client = client.clone();
+            async move {
+                let script = crate::credentials::WRITE_FILE_SCRIPT;
+                exec_with(&client, &pod_name(pod), "sandbox", &["sh", "-c", script, "sh", "/tmp/sme440", "600", length], Some(content.as_bytes()))
+                    .await
+                    .expect("exec")
+                    .exit_code
+            }
+        };
+        assert_eq!(write("GOOD-VALUE", "10").await, 0, "a whole write lands");
+        assert_ne!(write("GOOD", "10").await, 0, "a short write fails");
+        assert_eq!(sh_ok(&client, pod, "cat /tmp/sme440").await, "GOOD-VALUE", "and leaves the good file");
+        assert_eq!(sh_ok(&client, pod, "stat -c %a /tmp/sme440").await, "600");
+    })
+    .await;
+}
+
 /// The user's own conversation — no agents row, so no persona and no
 /// Rule S — gets the key as every pod has today, and its secrets
 /// directory stays empty however many are stored.
