@@ -179,7 +179,20 @@ pub async fn call(
     extra: &UsageMeter,
     cli: &mut TurnCli,
 ) -> Result<StreamedTurn, String> {
-    let call = Call { pool, conversation_id, turn_model, request };
+    // The record goes before anything is sent, and comes back only after
+    // a call that went well: a call that doesn't finish (a Stop drops it
+    // mid-reply) leaves no record the next turn would resume past, sending
+    // again what the session already has (PR #285 review 1 M1).
+    let recorded = crate::db::get_claude_cli_session(pool, conversation_id).await.unwrap_or_else(|e| {
+        tracing::warn!(conversation_id, "couldn't read the conversation's Claude Code session: {e}");
+        None
+    });
+    if recorded.is_some()
+        && let Err(e) = crate::db::delete_claude_cli_session(pool, conversation_id).await
+    {
+        tracing::warn!(conversation_id, "couldn't set the conversation's Claude Code session aside: {e}");
+    }
+    let call = Call { conversation_id, turn_model, request, recorded };
     let replied = call_run(&call, on_delta, meter, extra, cli).await;
     // The session the next turn resumes: this run's, synced to this call,
     // after a call that went well; after any other, none, so the next turn
@@ -195,7 +208,7 @@ pub async fn call(
     };
     let kept = match &keep {
         Some(session) => crate::db::set_claude_cli_session(pool, conversation_id, session).await,
-        None => crate::db::delete_claude_cli_session(pool, conversation_id).await,
+        None => Ok(()),
     };
     if let Err(e) = kept {
         tracing::warn!(conversation_id, "couldn't record the conversation's Claude Code session: {e}");
@@ -205,10 +218,11 @@ pub async fn call(
 
 /// One call's fixed inputs.
 struct Call<'a> {
-    pool: &'a sqlx::PgPool,
     conversation_id: i64,
     turn_model: &'a crate::providers::TurnModel,
     request: &'a CreateMessageRequest,
+    /// The conversation's session as recorded when the call began.
+    recorded: Option<crate::db::ClaudeCliSession>,
 }
 
 /// `call` without the session row's upkeep.
@@ -309,10 +323,7 @@ async fn read_from_run(
 /// history, sent what's new; else a new session, sent the history as text.
 async fn start(call: &Call<'_>, resume: bool) -> Result<Run, String> {
     let (conversation_id, turn_model, request) = (call.conversation_id, call.turn_model, call.request);
-    let recorded = if resume { crate::db::get_claude_cli_session(call.pool, conversation_id).await.unwrap_or_else(|e| {
-        tracing::warn!(conversation_id, "couldn't read the conversation's Claude Code session: {e}");
-        None
-    }) } else { None };
+    let recorded = if resume { call.recorded.clone() } else { None };
     let resumable = recorded.filter(|s| s.provider_id == turn_model.provider_id).and_then(|s| {
         let synced = Synced { len: usize::try_from(s.synced_count).ok()?, hash: s.synced_hash };
         tail_after(&synced, &request.messages).map(|tail| (s.session_id, tail.to_vec()))
