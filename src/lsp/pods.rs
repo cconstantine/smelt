@@ -359,15 +359,22 @@ async fn wait_installed(client: &kube::Client, pods: &kube::Api<Pod>, name: &str
         if let Some(error) = watch.read(pods.get_opt(name).await.map_err(|e| e.to_string())) {
             return Err(error);
         }
-        if let Some(rc) = install_rc(client, name).await {
-            if rc == "0" {
-                return Ok(());
+        match install_rc(client, name).await {
+            Ok(Some(rc)) => {
+                if rc == "0" {
+                    return Ok(());
+                }
+                let log = crate::sandbox::exec_with(client, name, "server", &["tail", "-c", "4000", INSTALL_LOG], None)
+                    .await
+                    .map(|r| r.stdout)
+                    .unwrap_or_default();
+                return Err(format!("The install failed (exit {rc}):\n{}", log.trim_end()));
             }
-            let log = crate::sandbox::exec_with(client, name, "server", &["tail", "-c", "4000", INSTALL_LOG], None)
-                .await
-                .map(|r| r.stdout)
-                .unwrap_or_default();
-            return Err(format!("The install failed (exit {rc}):\n{}", log.trim_end()));
+            // Ok(None): the install is still running. Err: this read didn't
+            // get through — say so and ask again next second; the timeout
+            // below is the bound.
+            Ok(None) => {}
+            Err(e) => tracing::info!(pod = name, error = %e, "couldn't read the install's exit code"),
         }
         if started.elapsed() > INSTALL_TIMEOUT {
             return Err(watch.timed_out());
@@ -376,11 +383,15 @@ async fn wait_installed(client: &kube::Client, pods: &kube::Api<Pod>, name: &str
     }
 }
 
-/// The install's exit code, once it has finished.
-async fn install_rc(client: &kube::Client, name: &str) -> Option<String> {
-    let result = crate::sandbox::exec_with(client, name, "server", &["cat", INSTALL_RC], None).await.ok()?;
+/// The install's exit code, once it has finished. `Err` means the check
+/// itself couldn't run (the exec failed): the install's state is then
+/// unknown — *not* "not finished" — and no caller may report liveness from
+/// it the way it once did (SME-426: one dropped exec read a Ready server
+/// as not running).
+async fn install_rc(client: &kube::Client, name: &str) -> Result<Option<String>, String> {
+    let result = crate::sandbox::exec_with(client, name, "server", &["cat", INSTALL_RC], None).await.map_err(|e| e.to_string())?;
     let rc = result.stdout.trim();
-    (result.exit_code == 0 && !rc.is_empty()).then(|| rc.to_string())
+    Ok((result.exit_code == 0 && !rc.is_empty()).then(|| rc.to_string()))
 }
 
 /// The server pods working for `conversation_id`.
@@ -398,10 +409,30 @@ pub async fn list_with(client: &kube::Client, conversation_id: i64, instance: &s
         let label = |key: &str| pod.metadata.labels.as_ref().and_then(|l| l.get(key)).cloned().unwrap_or_default();
         let state = match pod.status.as_ref().and_then(|s| s.phase.as_deref()) {
             Some("Failed" | "Succeeded") => ServerState::Stopped(stop_reason(&pod)),
-            Some("Running") => match install_rc(client, &pod_name).await.as_deref() {
-                Some("0") => ServerState::Ready,
-                _ => ServerState::Installing,
-            },
+            Some("Running") => {
+                let rc = match install_rc(client, &pod_name).await {
+                    Ok(rc) => rc,
+                    Err(e) => {
+                        tracing::info!(pod = %pod_name, error = %e, "couldn't re-read a language server pod's install record");
+                        None
+                    }
+                };
+                // A pod whose install already finished is Ready whatever this
+                // re-read says: smelt/lsp-ready is patched only after the
+                // install exits 0 (`start_with`) and is a property of that
+                // pod object, so one failed exec or missing record must not
+                // read a running, answering server as still installing
+                // (SME-426 — that flake was this, seen as the edit chain's
+                // None via a choose_server with no taker). A pod without the
+                // annotation — a recreated one starts without it — is
+                // mid-install and waits for the rc exactly as before.
+                let annotated = pod.metadata.annotations.as_ref().is_some_and(|a| a.contains_key(READY_ANNOTATION));
+                if rc.as_deref() == Some("0") || annotated {
+                    ServerState::Ready
+                } else {
+                    ServerState::Installing
+                }
+            }
             _ => ServerState::Installing,
         };
         servers.push(ServerPod {

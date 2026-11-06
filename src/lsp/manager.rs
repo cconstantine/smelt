@@ -583,6 +583,9 @@ async fn rename(
             return Err(partial_rename_error(new_name, &written, path, &error, &rest));
         }
         written.push(path.clone());
+        // A failed sync is dropped on purpose: the rename has already been
+        // written to disk, and the next operation's refresh_open_files will
+        // re-sync the file from there.
         let _ = session.sync(path, updated).await;
         report.push(format!("{path} ({count} edit{})", if *count == 1 { "" } else { "s" }));
     }
