@@ -344,3 +344,36 @@ async fn test_a_cli_that_dies_mid_tool_is_replaced_by_a_new_run(pool: PgPool) {
     let saved = saved(&pool, conversation.id).await;
     assert!(matches!(&saved.last().expect("a reply").1[..], [anthropic::ContentBlock::Text { text }] if text == "Carried on."), "{saved:?}");
 }
+
+/// Review 1 L1: a `tools/call` that isn't one of the reply's calls, by id
+/// or (with none) by name and input, is refused at once rather than left
+/// waiting until the run ends; the reply's own call is answered as usual.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_call_that_isnt_the_replys_is_refused_at_once(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let reply = tool_reply(&[("toolu_real", "todoread", json!({}))]);
+    let fake = FakeCli::new("stray", vec![vec![
+        json!({"read": true}),
+        reply[0].clone(),
+        json!({"call": [
+            {"id": "toolu_stray", "name": "mcp__smelt__todoread", "input": {}},
+            {"id": null, "name": "mcp__smelt__todoread", "input": {"unasked": true}},
+            {"id": "toolu_real", "name": "mcp__smelt__todoread", "input": {}},
+        ]}),
+        text_reply("Done."),
+    ]]);
+    fake.pick_for(&pool, conversation.id).await;
+    crate::claude_cli::run::SILENCE_FOR_TESTS.store(3_000, std::sync::atomic::Ordering::SeqCst);
+    let ended = run_turn(&pool, conversation.id, hello()).await;
+    crate::claude_cli::run::SILENCE_FOR_TESTS.store(0, std::sync::atomic::Ordering::SeqCst);
+    ended.expect("the turn runs");
+
+    let results = fake.results(0);
+    let refused: Vec<(bool, &str)> = results.iter().map(|r| (r["is_error"] == true, r["text"].as_str().unwrap_or_default())).collect();
+    assert_eq!(refused.len(), 3, "{results:?}");
+    assert!(refused[0].0 && refused[0].1 == crate::claude_cli::run::NOT_THE_REPLYS, "{results:?}");
+    assert!(refused[1].0 && refused[1].1 == crate::claude_cli::run::NOT_THE_REPLYS, "{results:?}");
+    assert!(!refused[2].0, "the reply's own call gets its result: {results:?}");
+}

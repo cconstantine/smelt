@@ -60,6 +60,9 @@ pub const WIND_DOWN: Duration = Duration::from_secs(5);
 /// for it.
 pub const NOT_RUN: &str = "smelt didn't run this tool call.";
 
+/// What a tool call gets that isn't one of the reply's calls.
+pub const NOT_THE_REPLYS: &str = "smelt refused this tool call: it isn't one of your reply's calls.";
+
 #[cfg(test)]
 pub static SILENCE_FOR_TESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -124,6 +127,11 @@ struct Run {
     /// False once the run can't be trusted with another call.
     healthy: bool,
     interrupts: u64,
+    /// The tool calls the reply streaming now has started.
+    streaming_ids: std::collections::HashSet<String>,
+    /// Whether the last reply's results are in `answers`, until the CLI's
+    /// next API call starts.
+    delivered: bool,
     /// Whether the CLI has said anything since the current call began.
     heard: bool,
     /// Whether its stdout ended or its input broke: the process is gone.
@@ -294,6 +302,8 @@ impl Run {
             interrupts: 0,
             heard: false,
             gone: false,
+            streaming_ids: std::collections::HashSet::new(),
+            delivered: false,
         })
     }
 
@@ -371,6 +381,7 @@ impl Run {
                     last.text.extend(others);
                 }
                 self.answers = replies;
+                self.delivered = true;
                 for parked in std::mem::take(&mut self.anonymous) {
                     self.take_call(parked);
                 }
@@ -396,6 +407,9 @@ impl Run {
                 .find(|e| e.name == parked.name && e.input == parked.arguments && self.answers.contains_key(&e.id))
                 .map(|e| e.id.clone())
         });
+        let refuse = |parked: ParkedCall| {
+            let _ = parked.reply.send(ToolReply { text: vec![NOT_THE_REPLYS.to_string()], is_error: true });
+        };
         match id {
             Some(id) => match self.answers.remove(&id) {
                 Some(reply) => {
@@ -403,11 +417,16 @@ impl Run {
                 }
                 // Not answered yet: the CLI makes a reply's first call
                 // before its `message_stop` (S2), and smelt runs it first.
-                None => {
+                None if self.expected.iter().any(|e| e.id == id) || self.streaming_ids.contains(&id) => {
                     self.arrived.insert(id, parked);
                 }
+                // Not one of the reply's calls: refused at once (review 1 L1).
+                None => refuse(parked),
             },
-            None => self.anonymous.push(parked),
+            // No id, and its input may not have streamed yet: it waits for
+            // the reply's results, and is refused once they're in.
+            None if !self.delivered => self.anonymous.push(parked),
+            None => refuse(parked),
         }
     }
 
@@ -454,11 +473,22 @@ impl Run {
     async fn read_reply(&mut self, on_delta: &mut (dyn FnMut(&str) + Send), meter: &UsageMeter, extra: &UsageMeter) -> Result<StreamedTurn, String> {
         let mut blocks = Blocks::default();
         let mut stop_reason = String::new();
+        self.streaming_ids.clear();
         loop {
             let event = self.next_event().await?;
             match event["type"].as_str() {
                 Some("stream_event") => {
                     let inner = &event["event"];
+                    match inner["type"].as_str() {
+                        // A new API call: the last reply's results are all in.
+                        Some("message_start") => self.delivered = false,
+                        Some("content_block_start") if inner["content_block"]["type"] == "tool_use" => {
+                            if let Some(id) = inner["content_block"]["id"].as_str() {
+                                self.streaming_ids.insert(id.to_string());
+                            }
+                        }
+                        _ => {}
+                    }
                     if inner["type"] == "message_stop" {
                         return self.finish(blocks, stop_reason, meter, extra).await;
                     }
