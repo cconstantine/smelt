@@ -203,3 +203,14 @@ fn test_the_status_line_says_signed_in_how_and_on_what_plan() {
     let missing = ClaudeCliStatus { error: Some("There's no claude on the server's PATH.".to_string()), ..ClaudeCliStatus::default() };
     assert_eq!(missing.summary(), "Couldn't run Claude Code: There's no claude on the server's PATH.");
 }
+
+/// Review 1 L1: a relative path would be checked from smelt's working
+/// directory and run from the CLI's, so only an absolute one is taken.
+#[tokio::test]
+async fn test_a_relative_binary_path_is_refused() {
+    assert!(checked_binary("bin/claude").is_err_and(|e| e.contains("absolute")), "the form refuses it");
+    assert!(checked_binary("./claude").is_err(), "./ too");
+    let dir = scratch("relative");
+    let status = status_with("bin/claude", cli_env(smelt_env(Some(&dir.join("c")))), Duration::from_secs(10)).await;
+    assert!(status.error.as_deref().is_some_and(|e| e.contains("absolute")), "a stored one is refused too: {status:?}");
+}

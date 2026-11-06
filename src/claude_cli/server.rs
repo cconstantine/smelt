@@ -57,12 +57,24 @@ pub fn checked_binary(text: &str) -> Result<String, String> {
     if binary.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err("The binary is one path, with no spaces or arguments.".to_string());
     }
+    relative_path_refused(binary)?;
     Ok(binary.to_string())
 }
 
-/// Where `binary` is: a path (it has a `/`) as given, a name searched for
-/// on `path`. Either must be an executable file.
+/// A path with a `/` must be absolute: a relative one would be checked
+/// from smelt's working directory and run from the CLI's, which is its
+/// config directory (review 1 L1).
+fn relative_path_refused(binary: &str) -> Result<(), String> {
+    if binary.contains('/') && !Path::new(binary).is_absolute() {
+        return Err(format!("{binary} is a relative path: give the binary's absolute path, or a name on the server's PATH."));
+    }
+    Ok(())
+}
+
+/// Where `binary` is: an absolute path as given, a name searched for on
+/// `path`. Either must be an executable file.
 fn resolve_binary(binary: &str, path: Option<&OsStr>) -> Result<PathBuf, String> {
+    relative_path_refused(binary)?;
     if binary.contains('/') {
         let candidate = PathBuf::from(binary);
         return if is_executable(&candidate) {
