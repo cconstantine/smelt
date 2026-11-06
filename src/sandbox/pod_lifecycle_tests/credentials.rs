@@ -195,43 +195,76 @@ async fn column(pool: &PgPool, child: i64) -> Vec<String> {
         .expect("the child's column")
 }
 
+/// Child `id`'s `agents.state`, or `None` when it has no row.
+async fn agent_state(pool: &PgPool, id: i64) -> Option<String> {
+    sqlx::query_scalar("SELECT state FROM agents WHERE conversation_id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .expect("state")
+}
+
 /// Waits for child `id`'s state — and fails the test if it never gets
-/// there, rather than hanging on the scenario's own bound.
+/// there, rather than hanging on the scenario's own bound. Once the row
+/// leaves `starting` without matching, waiting can no longer help: the
+/// start's two writers (`complete_start`, `fail_start`) are
+/// `starting`-guarded, and a stop or delete mid-start that writes
+/// `stopped` is a third way out that never comes back —
+/// `reactivate_agent` requires `started_at`, which a child stopped
+/// during its start never set, so that child stays off the `active`
+/// path. A state other than `starting` is thus final for this wait —
+/// name it at once instead of burning the bound. The give-up message
+/// names what production knows at that moment (last state read, whether
+/// the start task ended, the bound), so the next sighting tells a
+/// slow-but-live start from a failed one from a lost task without
+/// re-running anything (SME-432; SME-161's "a bare 'didn't finish' said
+/// nothing").
 async fn wait_for_state(pool: &PgPool, id: i64, want: &str) {
-    tokio::time::timeout(Duration::from_secs(90), async {
+    let bound = start_chain_wait();
+    let raced = tokio::time::timeout(bound, async {
         loop {
-            let state: Option<String> = sqlx::query_scalar("SELECT state FROM agents WHERE conversation_id = $1")
-                .bind(id)
-                .fetch_optional(pool)
-                .await
-                .expect("state");
-            if state.as_deref() == Some(want) {
-                return;
+            match agent_state(pool, id).await.as_deref() {
+                Some(s) if s == want => return Ok(()),
+                Some("starting") => {}
+                Some(other) => return Err(other.to_string()),
+                None => return Err("no row".to_string()),
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
-    .await
-    .unwrap_or_else(|_| panic!("child {id} never reached {want}"));
+    .await;
+    let give_up = |last: &str| -> ! {
+        panic!(
+            "child {id} never reached {want} in {bound:?}: state was {last}, start task ended {}",
+            test_hooks::starts_ended(id)
+        )
+    };
+    match raced {
+        Ok(Ok(())) => return,
+        Ok(Err(state)) => give_up(&state),
+        Err(_) => give_up(agent_state(pool, id).await.as_deref().unwrap_or("no row")),
+    }
 }
 
 /// Waits for child `id`'s start task to have ended — the exit and its
 /// clearing and reconcile included, which is what the assertions after
 /// this one are about.
 async fn wait_start_ended(child: i64) {
-    tokio::time::timeout(Duration::from_secs(90), async {
+    let bound = start_chain_wait();
+    tokio::time::timeout(bound, async {
         while !test_hooks::starts_ended(child) {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .expect("the start task ended");
+    .unwrap_or_else(|_| panic!("child {child}'s start task never ended in {bound:?}"));
 }
 
 /// The conversation's live pod, appearing when its start's clone makes
 /// it (or its first turn does).
 async fn wait_pod_id(pool: &PgPool, conversation: i64) -> i64 {
-    tokio::time::timeout(Duration::from_secs(90), async {
+    let bound = start_chain_wait();
+    tokio::time::timeout(bound, async {
         loop {
             if let Ok(pod) = live_pod_id(pool, conversation).await {
                 return pod;
@@ -240,7 +273,7 @@ async fn wait_pod_id(pool: &PgPool, conversation: i64) -> i64 {
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("conversation {conversation} never had a live pod"))
+    .unwrap_or_else(|_| panic!("conversation {conversation} never had a live pod in {bound:?}"))
 }
 
 /// Pauses `caller`'s next child's start at its done boundary: awaiting
@@ -249,7 +282,11 @@ async fn wait_pod_id(pool: &PgPool, conversation: i64) -> i64 {
 fn pause_at_done_boundary(caller: i64) -> (tokio::sync::oneshot::Sender<()>, impl Future<Output = ()>) {
     let (reached, release) = test_hooks::pause(test_hooks::BEFORE_START_DONE, caller);
     (release, async move {
-        tokio::time::timeout(Duration::from_secs(90), reached).await.expect("the boundary").expect("the hook");
+        let bound = start_chain_wait();
+        tokio::time::timeout(bound, reached)
+            .await
+            .unwrap_or_else(|_| panic!("the done boundary for {caller}'s next start never arrived in {bound:?}"))
+            .expect("the hook");
     })
 }
 
