@@ -6,6 +6,28 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 failures=0
+
+# This run's fake dx is named after this run (SME-203): the script tests run
+# outside the cluster lock, so another worktree's gate can be running this
+# file at the same moment, and a machine-wide check for one fixed name
+# (sme67-fake-dx, before) saw that run's fake dx as this one's. A process
+# counts as this run's only when its command line starts with the name and a
+# space, so a run whose pid has this one's as a prefix (123 and 1234) isn't
+# this run. The prefix isn't sme67-fake-dx's either, so a copy of this file
+# from before the fix, still checking that, never sees these processes.
+name="sme203-fake-dx-$$"
+ours_running() {
+    pgrep -f "^$name " >/dev/null
+}
+
+# Another run's fake dx, alive for this whole run (about 25 s), so the
+# checks below always meet the overlap that made them flaky, with the
+# nearest name another run can have. It writes to no pipe of this run's and
+# outlives a killed run by two minutes at most.
+(exec -a "${name}0" sleep 120) </dev/null >/dev/null 2>&1 &
+neighbour=$!
+trap 'kill "$neighbour" 2>/dev/null' EXIT
+
 fail() {
     echo "FAIL: $*" >&2
     failures=$((failures + 1))
@@ -33,13 +55,13 @@ run "bash -c 'echo error: build failed; exit 3'"
 # The client completes, then dx hangs: stopped, with a warning and the
 # process list, and the step passes.
 start=$SECONDS
-run "bash -c '$client_done; exec -a sme67-fake-dx sleep 1000'"
+run "bash -c '$client_done; exec -a $name sleep 1000'"
 took=$((SECONDS - start))
 [ "$rc" -eq 0 ] || fail "a hang after the client: exit $rc, want 0 (124 means the watchdog never fired)"
 case "$out" in *"::warning::"*) ;; *) fail "a hang after the client: no ::warning:: line" ;; esac
-case "$out" in *"sme67-fake-dx"*) ;; *) fail "a hang after the client: the process list doesn't show the hung process" ;; esac
+case "$out" in *"$name 1000"*) ;; *) fail "a hang after the client: the process list doesn't show the hung process" ;; esac
 [ "$took" -lt 15 ] || fail "a hang after the client took ${took}s to stop"
-pgrep -f "^sme67-fake-dx" >/dev/null && fail "the hung process is still running after the script exited"
+ours_running && fail "the hung process is still running after the script exited"
 
 # dx keeps logging after the client completes: not stopped while it does.
 run "bash -c '$client_done; for i in 1 2 3 4 5 6; do echo Compiled \$i; sleep 1; done; exit 0'"
@@ -48,7 +70,7 @@ case "$out" in *"::warning::"*) fail "a server build still logging was treated a
 
 # Silence before the client completes isn't this hang: left to the step's
 # own timeout. Run in a process group of its own, stopped by its id.
-setsid env CI_WEB_BUNDLE_DX="bash -c 'exec -a sme67-fake-dx sleep 1000'" CI_WEB_BUNDLE_SILENCE_SECS=2 \
+setsid env CI_WEB_BUNDLE_DX="bash -c 'exec -a $name sleep 1000'" CI_WEB_BUNDLE_SILENCE_SECS=2 \
     scripts/ci-web-bundle >/dev/null 2>&1 &
 group=$!
 sleep 6
@@ -56,7 +78,7 @@ kill -0 "$group" 2>/dev/null || fail "silence before the client completes: the s
 kill -- -"$group" 2>/dev/null
 wait "$group" 2>/dev/null
 sleep 1
-pgrep -f "^sme67-fake-dx" >/dev/null && fail "stopping the script left dx running"
+ours_running && fail "stopping the script left dx running"
 
 if [ "$failures" -eq 0 ]; then
     echo "ci-web-bundle: all checks passed"
