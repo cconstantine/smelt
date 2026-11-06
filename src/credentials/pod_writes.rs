@@ -45,10 +45,9 @@ async fn write_and_prune(
         // Written beside the target and renamed over it, so ssh or git
         // never reads half a file; umask keeps a key private from its
         // first byte.
-        // The byte count is checked before the rename: an exec dropped
-        // mid-stdin (`run_answered` moving past a stall, or the install's
-        // own deadline) closes the command's stdin early, and a short
-        // file must never be renamed over a good one (SME-440, SME-410).
+        // The byte count is checked before the rename: an abandoned
+        // attempt can have its stdin closed early, and a short file must
+        // never be renamed over a good one (SME-440, SME-410).
         let mode = format!("{:o}", file.mode);
         let length = file.content.len().to_string();
         let written = attempts

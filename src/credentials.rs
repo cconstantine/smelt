@@ -306,8 +306,6 @@ where
 /// across its reads and this write, so no install interleaves between
 /// a decision and its files.
 async fn write_pod_files(pool: &PgPool, pod_id: i64, files: &[PodFile]) -> Result<(), String> {
-    // Bounded: every install into this conversation's pod waits on its
-    // lock, so a stalled exec mustn't hold it.
     let shell = sandbox::PodShell::for_pod(pool, pod_id).await.map_err(|e| e.to_string())?;
     let keys_dir = format!("{POD_GIT_DIR}/keys");
     // `install_pod_files` holds itself to `INSTALL_TIMEOUT`, and returns
@@ -411,9 +409,10 @@ pub async fn install_into_live_pods(pool: &PgPool) -> Option<Vec<i64>> {
 /// tier's report. The installs own the task they run in, so neither the
 /// deadline nor a dropped request calls one off: each ends on its own
 /// `INSTALL_TIMEOUT`, and reads its files under its conversation's lock, so
-/// no install in this process can write over a newer change's files. A
-/// command already running in the pod when `INSTALL_TIMEOUT` drops its future
-/// isn't killed, though, so it can still land after that.
+/// no install in this process can write over a newer change's files. An
+/// install also returns only once no exec it started can still change the
+/// pod (SME-440, `pod_writes`' `Attempts`): its abandoned attempts refuse to
+/// act past their deadlines, and it holds the lock until those have passed.
 async fn installs_answered_within<F, Fut>(answer_within: std::time::Duration, pods: Vec<i64>, install: F) -> Vec<i64>
 where
     F: Fn(i64) -> Fut + Send + Sync + 'static,
