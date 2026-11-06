@@ -90,9 +90,16 @@ impl PodShell {
     /// database's: another database's is `NotOurs`, and nothing runs.
     pub async fn run(&self, command: &[&str], stdin: Option<&[u8]>) -> Result<ExecResult, SandboxError> {
         refuse_foreign(&pods_api(&self.client), &self.pod_name, &self.instance).await?;
+        #[cfg(test)]
+        if let Some(stall) = stall_hook::take(&self.pod_name, command) {
+            return stall_hook::stall(&self.client, &self.pod_name, command, stdin, stall).await;
+        }
         exec_with(&self.client, &self.pod_name, "sandbox", command, stdin).await
     }
 }
+
+#[cfg(test)]
+pub(crate) mod stall_hook;
 
 /// kube exec in `pod_name`'s `container`, unchecked: the caller makes
 /// sure the pod is this database's first (`PodShell::run` reads it before
