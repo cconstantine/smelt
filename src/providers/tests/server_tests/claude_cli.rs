@@ -58,3 +58,17 @@ async fn test_a_claude_code_providers_models_are_listed_and_picked(pool: PgPool)
     let choice = default_model(&pool).await.expect("read").expect("set");
     assert_eq!((choice.provider_id, choice.context_window), (created.id, 1_000_000));
 }
+
+/// Review 1 L3: the status runs a provider's stored path only for a
+/// Claude Code provider.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_cli_status_is_only_for_a_claude_code_provider(pool: PgPool) {
+    let ollama = create_provider(&pool, input("Home", "http://ollama:11434", "k")).await.expect("create");
+    let refused = crate::claude_cli::provider_status(&pool, ollama.id).await;
+    assert!(refused.is_err_and(|e| e.contains("isn't a Claude Code provider")), "another kind's address is never run");
+    let missing = crate::claude_cli::provider_status(&pool, ollama.id + 1000).await;
+    assert!(missing.is_err_and(|e| e.contains("no longer exists")));
+    let claude = create_provider(&pool, claude_code("Claude", "/nonexistent/claude")).await.expect("create");
+    let status = crate::claude_cli::provider_status(&pool, claude.id).await.expect("a Claude Code provider's status");
+    assert!(status.error.is_some_and(|e| e.contains("/nonexistent/claude")));
+}

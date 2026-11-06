@@ -113,11 +113,9 @@ pub async fn probe_llama_cpp(base_url: String) -> ServerFnResult<bool> {
 /// seconds. Never a token: whether it's signed in, how, and the plan.
 #[get("/api/providers/{id}/claude-cli-status")]
 pub async fn get_claude_cli_status(id: i64) -> ServerFnResult<ClaudeCliStatus> {
-    let provider = db::get_inference_provider(db::get(), id)
+    crate::claude_cli::provider_status(db::get(), id)
         .await
-        .map_err(ServerFnError::new)?
-        .ok_or_else(|| ServerFnError::new("That provider no longer exists."))?;
-    Ok(crate::claude_cli::status(&provider.base_url).await)
+        .map_err(ServerFnError::new)
 }
 
 #[get("/api/default-model")]

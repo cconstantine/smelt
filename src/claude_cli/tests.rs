@@ -242,3 +242,26 @@ async fn test_auth_status_output_that_isnt_json_is_unknown_even_on_a_failure() {
     assert!(error.contains("didn't say whether it's signed in"), "{error}");
     assert!(!status.summary().contains("not signed in"), "{}", status.summary());
 }
+
+/// Review 1 L3: a page calling the status in a loop can't pile up CLI
+/// processes: at most `MAX_STATUS_CHECKS` checks run at once.
+#[tokio::test]
+async fn test_status_checks_run_a_few_at_a_time() {
+    let dir = scratch("concurrent");
+    let d = dir.display();
+    let claude = fake_claude(
+        &dir,
+        &format!(
+            "mkdir '{d}/run.'$$\nls -d '{d}'/run.* | wc -l >> '{d}/counts'\nsleep 0.3\nrmdir '{d}/run.'$$\ncase \"$1\" in\n  --version) echo '2.1.318 (Claude Code)';;\n  auth) printf '%s' '{{\"loggedIn\":true}}';;\nesac"
+        ),
+    );
+    let binary = claude.to_str().expect("utf-8 path").to_string();
+    let env = cli_env(smelt_env(Some(&dir.join("c"))));
+    let checks = (0..6).map(|_| status_with(&binary, env.clone(), Duration::from_secs(10)));
+    for status in futures_util::future::join_all(checks).await {
+        assert!(status.signed_in, "{status:?}");
+    }
+    let counts = std::fs::read_to_string(dir.join("counts")).expect("the fake counted");
+    let most = counts.lines().filter_map(|n| n.trim().parse::<usize>().ok()).max().expect("counts");
+    assert!(most <= MAX_STATUS_CHECKS, "{most} CLI processes ran at once");
+}

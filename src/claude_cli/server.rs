@@ -95,6 +95,24 @@ fn is_executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
+/// How many status checks run at once (review 1 L3): the status is a GET
+/// any page can call, so a loop can't start more CLI processes than this.
+pub const MAX_STATUS_CHECKS: usize = 2;
+
+/// The status of provider `id`'s CLI, for its page: refused for a
+/// provider of another kind, whose `base_url` is an address, never a
+/// binary to run (review 1 L3).
+pub async fn provider_status(pool: &sqlx::PgPool, id: i64) -> Result<ClaudeCliStatus, String> {
+    let provider = crate::db::get_inference_provider(pool, id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("That provider no longer exists.")?;
+    if crate::providers::ProviderKind::parse(&provider.kind) != Some(crate::providers::ProviderKind::ClaudeCli) {
+        return Err("That provider isn't a Claude Code provider.".to_string());
+    }
+    Ok(status(&provider.base_url).await)
+}
+
 /// What `binary` says about itself, run with smelt's own environment
 /// through `cli_env`.
 pub async fn status(binary: &str) -> ClaudeCliStatus {
@@ -105,7 +123,12 @@ pub async fn status(binary: &str) -> ClaudeCliStatus {
 /// Never echoes what the CLI printed beyond its version line and the two
 /// short words of `auth status` it reads.
 pub async fn status_with(binary: &str, env: Vec<(String, OsString)>, timeout: Duration) -> ClaudeCliStatus {
+    static CHECKS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_STATUS_CHECKS);
     let failed = |error: String| ClaudeCliStatus { error: Some(error), ..ClaudeCliStatus::default() };
+    // Held across both commands; the semaphore is never closed.
+    let Ok(_permit) = CHECKS.acquire().await else {
+        return failed("The status check is shutting down.".to_string());
+    };
     let path = env.iter().find(|(name, _)| name == "PATH").map(|(_, value)| value.as_os_str());
     let resolved = match resolve_binary(binary, path) {
         Ok(resolved) => resolved,
