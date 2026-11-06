@@ -206,10 +206,10 @@ impl HoldGate {
     }
 }
 
-/// For other modules' tests (SME-394): a [`mock_server_for_tests`] server
-/// plus a listed `hold` tool parked on a returned [`HoldGate`]. The server
-/// gets the product's call budget (SME-356), so a held call outlives the
-/// tests' 1 s call timeout comfortably.
+/// For other modules' tests (SME-394): lists `echo`, `second_tool` and a
+/// `hold` tool parked on a returned [`HoldGate`] — not, unlike
+/// [`mock_server_for_tests`], a `hang` route. The server gets the product's
+/// call budget (SME-356), so a held call outlives the tests' 1 s timeout.
 pub(crate) async fn mock_holding_server_for_tests(
     pool: &sqlx::PgPool,
     name: &str,
