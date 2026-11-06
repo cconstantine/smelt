@@ -433,6 +433,12 @@ async fn start(call: &Call<'_>, resume: bool) -> Result<Run, String> {
             if request.messages.iter().any(|m| m.role == "assistant") {
                 tracing::info!(conversation_id, messages = request.messages.len(), "a new Claude Code session starts from smelt's history as text");
             }
+            // A recorded session this one replaces goes now: it holds the
+            // conversation's tool output and the CLI's account email
+            // (PR #285 review 1 L20).
+            if let Some(old) = &call.recorded {
+                super::files::forget_session(conversation_id, &old.session_id);
+            }
             let session_id = super::process::new_session_id();
             let mut run = Run::spawn(conversation_id, turn_model, request, SessionArg::New(&session_id)).await?;
             run.session_id = session_id;

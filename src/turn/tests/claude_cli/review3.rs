@@ -173,3 +173,41 @@ async fn test_a_cli_that_wont_read_blocks_only_its_own_turn(pool: PgPool) {
     let error = stuck.expect("a's turn ends").expect("join").expect_err("a's write times out").to_string();
     assert!(error.contains("didn't take its input"), "{error}");
 }
+
+/// The conversation's session files, as the CLI would keep them.
+fn session_file(conversation_id: i64, session_id: &str) -> std::path::PathBuf {
+    let env = crate::claude_cli::cli_env(|name| std::env::var_os(name));
+    let config = std::path::PathBuf::from(env.into_iter().find(|(n, _)| n == "CLAUDE_CONFIG_DIR").expect("a config dir").1);
+    let work = crate::claude_cli::files::work_dir(&config, conversation_id);
+    crate::claude_cli::files::sessions_dir(&config, &work).join(format!("{session_id}.jsonl"))
+}
+
+/// Review 3 L20: a replaced session's file goes at once, and a deleted
+/// conversation's sessions and working directory go with it.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_conversations_cli_files_go_with_it(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let fake = FakeCli::new("files", vec![vec![json!({"read": true}), text_reply("one")], vec![json!({"read": true}), text_reply("two")]]);
+    fake.pick_for(&pool, conversation.id).await;
+    run_turn(&pool, conversation.id, hello()).await.expect("turn 1");
+    let old = db::get_claude_cli_session(&pool, conversation.id).await.expect("read").expect("a session").session_id;
+    let old_file = session_file(conversation.id, &old);
+    std::fs::create_dir_all(old_file.parent().expect("a dir")).expect("the sessions dir");
+    std::fs::write(&old_file, "{}").expect("a session file");
+    let first = db::list_messages(&pool, conversation.id).await.expect("messages")[0].id;
+    sqlx::query("UPDATE messages SET content = $1 WHERE id = $2").bind(r#"[{"type":"text","text":"edited"}]"#).bind(first).execute(&pool).await.expect("edit");
+
+    run_turn(&pool, conversation.id, hello()).await.expect("turn 2, a new session");
+    assert!(!old_file.exists(), "the replaced session's file is gone");
+    let new = db::get_claude_cli_session(&pool, conversation.id).await.expect("read").expect("a session").session_id;
+    let new_file = session_file(conversation.id, &new);
+    std::fs::write(&new_file, "{}").expect("a session file");
+    let work = new_file.parent().and_then(|p| p.parent()).expect("projects").parent().expect("the config dir").join("work").join(conversation.id.to_string());
+    assert!(work.exists(), "the working dir is there");
+
+    crate::agents::delete_subtree(&pool, conversation.id).await.expect("delete the conversation");
+    assert!(!new_file.exists() && !new_file.parent().expect("dir").exists(), "its sessions go");
+    assert!(!work.exists(), "its working dir goes");
+}
