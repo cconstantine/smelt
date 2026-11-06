@@ -3,6 +3,8 @@
 //! pod, and `PodShell::run` never answers. `LateStart`: the command starts
 //! in the pod only after a delay, on its own, while `run` never answers —
 //! an abandoned exec that acts after its caller has moved on.
+//! `ErrorAfterStart`: the command is running in the pod, acting after a
+//! delay, while `run` answers at once with a broken stream (`Err(Io)`).
 
 use super::{exec_with, ExecResult, SandboxError};
 use std::collections::HashMap;
@@ -13,6 +15,7 @@ use std::time::Duration;
 pub(crate) enum Stall {
     NoReply,
     LateStart(Duration),
+    ErrorAfterStart(Duration),
 }
 
 struct Armed {
@@ -65,21 +68,26 @@ pub(super) async fn stall(
     stdin: Option<&[u8]>,
     stall: Stall,
 ) -> Result<ExecResult, SandboxError> {
-    match stall {
+    let delay = match stall {
         Stall::NoReply => {
             let _ = exec_with(client, pod_name, "sandbox", command, stdin).await;
+            None
         }
-        Stall::LateStart(delay) => {
-            let (client, pod) = (client.clone(), pod_name.to_string());
-            let command: Vec<String> = command.iter().map(|c| c.to_string()).collect();
-            let stdin = stdin.map(<[u8]>::to_vec);
-            let late = tokio::spawn(async move {
-                tokio::time::sleep(delay).await;
-                let command: Vec<&str> = command.iter().map(String::as_str).collect();
-                exec_with(&client, &pod, "sandbox", &command, stdin.as_deref()).await.map_or(-1, |r| r.exit_code)
-            });
-            LATE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry(pod_name.to_string()).or_default().push(late);
-        }
+        Stall::LateStart(delay) | Stall::ErrorAfterStart(delay) => Some(delay),
+    };
+    if let Some(delay) = delay {
+        let (client, pod) = (client.clone(), pod_name.to_string());
+        let command: Vec<String> = command.iter().map(|c| c.to_string()).collect();
+        let stdin = stdin.map(<[u8]>::to_vec);
+        let late = tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let command: Vec<&str> = command.iter().map(String::as_str).collect();
+            exec_with(&client, &pod, "sandbox", &command, stdin.as_deref()).await.map_or(-1, |r| r.exit_code)
+        });
+        LATE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry(pod_name.to_string()).or_default().push(late);
+    }
+    if let Stall::ErrorAfterStart(_) = stall {
+        return Err(SandboxError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "the exec's stream broke (stall_hook)")));
     }
     std::future::pending().await
 }

@@ -204,3 +204,36 @@ async fn test_a_late_prune_cant_remove_a_newer_write(pool: PgPool) {
     })
     .await;
 }
+
+/// SME-440 review R2-M1: a save whose write attempt ends with a broken
+/// stream while its command is still running in the pod, then a delete.
+/// Once the command has acted, the secret file is gone: an attempt that
+/// errored is held to its deadline like one that went unanswered.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_write_whose_stream_broke_cant_undo_a_delete(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        persona_agent(&pool, conversation.id).await;
+        let pod = create_pod(&pool, conversation.id, PodLimitOverrides::default()).await.expect("create_pod");
+        let name = pod_name(pod);
+
+        sqlx::query("INSERT INTO named_secrets (name, value) VALUES ('linear-key', 'SECRET-MARKER')")
+            .execute(&pool)
+            .await
+            .expect("a secret");
+        // Acts well inside the first try's deadline.
+        let acts_after = crate::credentials::EXEC_STALL_AFTER / 2;
+        stall_hook::arm(&name, &["/etc/smelt/secrets/linear-key"], 1, Stall::ErrorAfterStart(acts_after));
+        let saved = crate::credentials::install_into_pod(&pool, pod).await;
+        assert!(saved.is_err(), "the save's write reported a broken stream");
+
+        sqlx::query("DELETE FROM named_secrets WHERE name = 'linear-key'").execute(&pool).await.expect("delete");
+        crate::credentials::install_into_pod(&pool, pod).await.expect("the delete");
+        let late = stall_hook::late_starts_done(&name).await;
+        assert_eq!(late.len(), 1, "the broken-stream attempt ran");
+        let (code, _) = sh(&client, pod, "test -e /etc/smelt/secrets/linear-key").await;
+        assert_eq!(code, 1, "the deleted secret came back: the errored attempt landed after the delete");
+    })
+    .await;
+}

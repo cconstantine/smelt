@@ -195,9 +195,19 @@ impl Attempts {
             let mut bounded = vec!["env", deadline_var.as_str(), "timeout", "-k", "1", seconds.as_str()];
             bounded.extend_from_slice(command);
             match tokio::time::timeout(limit, shell.run(&bounded, stdin)).await {
-                Ok(ran) => return ran,
+                Ok(ran) => {
+                    // Only an exit status says the command is done. A broken
+                    // stream (`Err`) or a status that never came (-1) can
+                    // leave it running in the pod until its deadline, so the
+                    // install is held for it like an unanswered one (SME-440
+                    // review R2-M1).
+                    if !matches!(&ran, Ok(r) if r.exit_code >= 0) {
+                        self.hold_until(deadline);
+                    }
+                    return ran;
+                }
                 Err(_) => {
-                    self.abandoned_until = Some(self.abandoned_until.map_or(deadline, |until| until.max(deadline)));
+                    self.hold_until(deadline);
                     // The arguments name a path, never a value: file
                     // contents go in on stdin, which isn't logged.
                     tracing::warn!(
@@ -209,6 +219,11 @@ impl Attempts {
             }
             tries = tries.saturating_add(1);
         }
+    }
+
+    /// Notes an attempt that may still act in the pod until `deadline`.
+    fn hold_until(&mut self, deadline: SystemTime) {
+        self.abandoned_until = Some(self.abandoned_until.map_or(deadline, |until| until.max(deadline)));
     }
 
     /// Waits until no abandoned attempt can still act in the pod.
