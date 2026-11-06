@@ -118,7 +118,7 @@ For a conversation in a group. "Queued" is an `agent_messages` row; "wake" is `N
 | idle | queued, wakes, runs a turn | queued, wakes | paused; parent told | nothing | stopped, subtree too | turn runs | sweep wakes it if queued | deleted with it | parent told | — |
 | running | taken at the next iteration | taken at the next iteration | turn ends, paused; parent told | nothing | turn ends, stopped | queued behind the turn (turn lock) | turn lost; restart notice and wake | deleted, turn ended | turn ended, rows gone | the call waits; status running |
 | paused (Stop) | queued, no wake | queued, no wake | stays paused | nothing | stopped | pause ends, turn runs and drains | stays paused (stored) | deleted with it | parent told | — |
-| waiting for the user | queued; the turn it wakes saves it and waits on | as left | paused | nothing | stopped | the user's message takes the question | unchanged | deleted with it | parent told | — |
+| waiting for the user | queued, and stays queued; told when the question resolves | as left | paused | nothing | stopped | the user's message takes the question | unchanged | deleted with it | parent told | — |
 | waiting for its parent | the parent's message answers the question and wakes it | as left | paused | nothing | stopped | takes the question (`NOT_ANSWERED`) | unchanged | deleted with it | parent told | — |
 | finished | `active`, wakes | queued, wakes | paused | nothing | stopped | `active`, turn runs | unchanged | deleted with it | parent told | — |
 | stopped | refused at `message_agent` | queued, no wake | stays | nothing | already | `active`, turn runs | unchanged | deleted with it | parent told | — |
@@ -131,7 +131,7 @@ For a conversation in a group. "Queued" is an `agent_messages` row; "wake" is `N
 | idle (active) | **queued, wakes, runs a turn** | **queued, wakes** | — | paused (**stored**); parent told | stopped (**stored pause**) | turn runs | **sweep wakes it if queued** | — |
 | running | **taken at the next iteration** | **taken at the next iteration** | — | turn ends, paused; parent told | turn ends, stopped | queued behind the turn | **turn lost; restart notice and wake** | **refused while a message or answer is queued**; else finished |
 | paused | **queued, no wake** (the paused finished child: **active, queued, no wake**) | **queued, no wake** | **recorded, no wake; the user's next message takes it first** | stays | stopped | pause ends (**stored**), turn drains | **stays paused (stored)** | — |
-| waiting for the user | **queued; the woken turn saves it and waits on** | as left | — | paused | stopped | takes the question | unchanged | — |
+| waiting for the user | **queued, and stays queued; told when the question resolves** | as left | — | paused | stopped | takes the question | unchanged | — |
 | waiting for its parent | **the reply is the answer and wakes it, once the parent has read the question; before that, a plain message** | as left | **answer recorded, wakes, the turn takes it** | paused | stopped; the reply is **refused** | **takes it with `NOT_ANSWERED_BY_PARENT`; a later reply is a plain message** | **unchanged; an answer recorded before is woken by the sweep** | — |
 | finished | **active, queued, wakes** | — | — | paused | stopped | active, turn runs | unchanged | refused |
 | stopped | **refused** | **refused** (`ask_parent` refuses a stopped or failed parent) | refused | stays | already | active (started) or refused (stopped while starting) | unchanged | refused |
