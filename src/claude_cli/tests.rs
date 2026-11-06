@@ -18,11 +18,25 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 /// Writes an executable `claude` into `dir` running `body` under `/bin/sh`.
+///
+/// Written by a child `sh`, never by this process: a file this process
+/// holds open for writing is inherited by every child another test thread
+/// forks meanwhile, until that child execs, and running the fake during
+/// that window fails with ETXTBSY ("Text file busy"), which a stress run of
+/// these tests hit about once in five runs (review 1).
 fn fake_claude(dir: &Path, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Write;
     let path = dir.join("claude");
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write the fake claude");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("make it executable");
+    let mut writer = std::process::Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(&path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("start the fake's writer");
+    let mut stdin = writer.stdin.take().expect("the writer's stdin");
+    stdin.write_all(format!("#!/bin/sh\n{body}\n").as_bytes()).expect("write the fake claude");
+    drop(stdin);
+    assert!(writer.wait().expect("the writer finishes").success(), "the fake was written");
     path
 }
 
@@ -132,7 +146,7 @@ async fn test_the_status_says_signed_out_when_the_cli_does() {
     let dir = scratch("signed-out");
     let claude = answering(&dir, r#"{"loggedIn":false,"authMethod":"none"}"#, 1);
     let status = status_with(claude.to_str().expect("utf-8 path"), cli_env(smelt_env(Some(&dir.join("c")))), Duration::from_secs(10)).await;
-    assert_eq!(status.version.as_deref(), Some("2.1.318 (Claude Code)"));
+    assert_eq!(status.version.as_deref(), Some("2.1.318 (Claude Code)"), "{status:?}");
     assert!(!status.signed_in);
     assert_eq!(status.auth_method.as_deref(), Some("none"));
     assert_eq!(status.error, None, "signed out is an answer, not an error");
