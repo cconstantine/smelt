@@ -197,3 +197,4 @@ fn current() -> Greeting {
 mod requests;
 mod versions;
 mod lifecycle;
+mod stale_terminals;

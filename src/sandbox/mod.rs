@@ -224,6 +224,23 @@ pub enum TerminalError {
     /// `terminate_terminal` refuses while a command is still `running` in
     /// that terminal.
     CommandStillRunning,
+    /// A command was aimed at a terminal the conversation's live pod doesn't
+    /// have: its row is closed, or its pod's row has ended. `run_command`
+    /// and `send_signal` refuse these up front (SME-425) — before this, one
+    /// reached `AgentUnreachable`, whose create_pod advice then hit
+    /// `create_pod`'s "a pod already exists" refusal and pointed on to
+    /// `terminate_pod`: killing a healthy pod.
+    StaleTerminal {
+        terminal_id: i64,
+        /// The terminal's own pod.
+        pod_id: i64,
+        /// The conversation's live pod, if one runs.
+        live_pod: Option<i64>,
+        /// The terminal's row closed while its pod stayed live — the case
+        /// whose message speaks of the terminal. Where the pod has ended,
+        /// that is the story instead, and this is false.
+        terminal_closed: bool,
+    },
     /// A request to the pod's agent failed: it refused (its own words,
     /// which the model needs to see and act on), didn't answer, or the
     /// connection dropped.
@@ -236,7 +253,19 @@ pub enum TerminalError {
     AgentTooOld { needs: ProtocolVersion, found: ProtocolVersion },
     /// Every attempt to reach the pod's agent failed, so its pod was
     /// cleaned up and stopped, as after a crash.
+    ///
+    /// The variant's remaining true meaning (SME-425): the pod dialled was
+    /// the conversation's live one, its crash cleanup just closed it, and no
+    /// pod runs — so create_pod is right. Where a live pod does run,
+    /// `StaleTerminal` (checked up front) or `StalePod` (after a cleanup
+    /// that found the replacement) answers instead.
     AgentUnreachable,
+    /// The pod dialled was cleaned up as gone, as after a crash — but the
+    /// conversation has another live pod (its row ended past the up-front
+    /// staleness check, in the race that ends a pod between that check and
+    /// the dial), so `AgentUnreachable`'s create_pod advice would be wrong
+    /// (SME-425).
+    StalePod { pod_id: i64, live_pod: i64 },
     /// A request to open one of the sandbox agent's own ports (`AGENT_PORT`,
     /// `RELAY_PORT`) from a route into the pod — see `check_reachable_port`.
     AgentPort(u16),
@@ -280,6 +309,26 @@ impl std::fmt::Display for TerminalError {
                     "a command is still running in this terminal; send_signal or wait for it to finish first"
                 )
             }
+            TerminalError::StaleTerminal { terminal_id, pod_id, live_pod, terminal_closed } => {
+                match (live_pod, terminal_closed) {
+                    (Some(live_pod), true) => write!(
+                        f,
+                        "terminal {terminal_id} has been terminated; your pod {live_pod} is running — \
+                         call create_terminal for a new one."
+                    ),
+                    (Some(live_pod), false) => write!(
+                        f,
+                        "terminal {terminal_id} belonged to pod {pod_id}, which has stopped; \
+                         your pod {live_pod} is running — use list_terminals to see your terminals, \
+                         or create_terminal for a new one."
+                    ),
+                    (None, _) => write!(
+                        f,
+                        "terminal {terminal_id} belonged to pod {pod_id}, which has stopped; \
+                         this conversation has no running pod — call create_pod, then create_terminal."
+                    ),
+                }
+            }
             TerminalError::Agent(e) => write!(f, "{e}"),
             TerminalError::AgentOutdated { found, image } => {
                 let found = match found {
@@ -320,6 +369,11 @@ impl std::fmt::Display for TerminalError {
                 f,
                 "the sandbox's agent couldn't be reached, so its pod was stopped (a notice says why, if \
                  the cluster gave a reason). Call create_pod for a new one."
+            ),
+            TerminalError::StalePod { pod_id, live_pod } => write!(
+                f,
+                "pod {pod_id} has stopped; your pod {live_pod} is running — use list_terminals to see \
+                 your terminals, or create_terminal for a new one."
             ),
             TerminalError::AgentPort(port) => write!(
                 f,

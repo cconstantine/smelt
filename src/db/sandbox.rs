@@ -418,6 +418,26 @@ pub async fn terminal_conversation_id(
     .await
 }
 
+/// SME-425: the terminal's pod, whether its terminal row is closed, and
+/// whether that pod's row has ended — one indexed read for the up-front
+/// stale-terminal refusal (`sandbox::refuse_stale_terminal`), which must
+/// decide before anything is dialled or written. `None` for an unknown
+/// terminal id; the join can't miss, as a terminal's pod row is never
+/// deleted.
+pub async fn terminal_pod_state(
+    pool: &PgPool,
+    terminal_id: i64,
+) -> Result<Option<(i64, bool, bool)>, sqlx::Error> {
+    sqlx::query_as::<_, (i64, bool, bool)>(
+        "SELECT t.pod_id, t.terminated_at IS NOT NULL, p.terminated_at IS NOT NULL \
+           FROM sandbox_terminals t JOIN sandbox_pods p ON p.id = t.pod_id \
+          WHERE t.id = $1",
+    )
+    .bind(terminal_id)
+    .fetch_optional(pool)
+    .await
+}
+
 /// Resolves which conversation's `events::publish` bus a pod-scoped call
 /// (`terminate_pod`, `create_terminal`, `terminate_terminal`, crash
 /// cleanup) should target — see

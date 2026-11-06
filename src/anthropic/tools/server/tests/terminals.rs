@@ -353,3 +353,38 @@ async fn test_the_terminal_tools_summarize_a_commands_mcp_calls(pool: PgPool) {
         assert!(quiet.get("mcp_calls").is_none(), "{tool}: {quiet}");
     }
 }
+
+/// SME-425: a `run_terminal_command` aimed at a terminal of an ended pod
+/// is refused before anything is dialled or written: no stray command row,
+/// and the refusal names the live pod instead of sending the model to
+/// `create_pod`. On the unfixed tree this reaches the sandbox machinery
+/// and answers with a dial-failure text instead, leaving a `lost` row.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_run_terminal_command_on_a_stale_terminal_refuses_before_running_anything(pool: PgPool) {
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let old_pod = db::create_sandbox_pod(&pool, conversation.id).await.expect("old pod").id;
+    let terminal = db::create_sandbox_terminal(&pool, old_pod).await.expect("terminal").id;
+    db::terminate_sandbox_terminal(&pool, terminal).await.expect("close terminal");
+    // Ends before the live pod can exist: at most one live pod per conversation.
+    db::terminate_sandbox_pod(&pool, old_pod).await.expect("end old pod");
+    let live_pod = db::create_sandbox_pod(&pool, conversation.id).await.expect("live pod").id;
+
+    let refusal = execute(
+        &pool,
+        conversation.id,
+        "t1",
+        "run_terminal_command",
+        &serde_json::json!({"terminal_id": terminal, "command": "echo hi"}),
+    )
+    .await
+    .expect_err("a stale terminal is refused");
+    assert!(refusal.contains(&format!("belonged to pod {old_pod}, which has stopped")), "{refusal}");
+    assert!(refusal.contains(&format!("pod {live_pod} is running")), "{refusal}");
+    assert!(!refusal.contains("create_pod"), "a live pod runs, so create_pod must not be advised: {refusal}");
+    assert!(!refusal.contains("terminate_pod"), "a live pod runs, so terminate_pod must not be advised: {refusal}");
+    assert_eq!(
+        db::list_terminal_commands(&pool, terminal, 10).await.expect("list").len(),
+        0,
+        "the refused command wrote a row"
+    );
+}
