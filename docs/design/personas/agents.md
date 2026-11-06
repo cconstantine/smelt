@@ -45,7 +45,7 @@ A conversation without a parent isn't offered `ask_parent` or `finish`. Until SM
 
 **Decision: a durable queue, `agent_messages`, drained under the recipient's turn lock like finished commands, and woken with `Notice::Wake`.** Not `Notice::Deliver`.
 
-What happens today (`src/turn/notify.rs`): everything outside a turn reaches the model through `turn::notify`, which spawns a task per call. `Deliver(text)` holds the text in that task's memory until it can take the turn lock; `Wake` holds nothing and drains what the database says is pending (`drain_unnotified_terminal_commands`, `drain_idle_command_notices`, run at the top of every turn-loop iteration in `run_turn_steps`), each saved with its mark in one transaction (SME-91).
+What happens today (`src/turn/notify.rs`): everything outside a turn reaches the model through `turn::notify`, which spawns a task per call. `Deliver(text)` holds the text in that task's memory until it can take the turn lock; `Wake` holds nothing and drains what the database says is pending (`drain_unnotified_terminal_commands`, `drain_idle_command_notices`, run below the `take_answer_or_wait` question check and before each turn-loop iteration's model call in `run_turn_steps` — a question-blocked iteration stops above the drains, consuming nothing (SME-409)), each saved with its mark in one transaction (SME-91).
 
 | | `Notice::Deliver(text)` | Queue + `Notice::Wake` (chosen) |
 | -- | -- | -- |
