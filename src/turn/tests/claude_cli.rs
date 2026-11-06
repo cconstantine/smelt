@@ -278,3 +278,45 @@ async fn test_the_context_view_says_the_subscription_pays(pool: PgPool) {
     let detail = crate::api::chat::context_detail(&pool, other.id).await.expect("the detail");
     assert!(!detail.subscription, "an HTTP provider's");
 }
+
+/// The prompts dir's files for `conversation_id`'s runs.
+fn run_files(conversation_id: i64) -> Vec<std::path::PathBuf> {
+    let env = crate::claude_cli::cli_env(|name| std::env::var_os(name));
+    let Some((_, dir)) = env.iter().find(|(name, _)| name == "CLAUDE_CONFIG_DIR") else {
+        return Vec::new();
+    };
+    let prefix = format!("{conversation_id}-");
+    std::fs::read_dir(std::path::Path::new(dir).join("prompts"))
+        .map(|entries| entries.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(&prefix))).collect())
+        .unwrap_or_default()
+}
+
+/// Review 1 L6: a turn stopped while its first message is still being
+/// written (a CLI that doesn't read, and a message bigger than the pipe)
+/// leaves no prompt or MCP config file behind.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_run_dropped_before_it_starts_leaves_no_files(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let fake = FakeCli::new("unread", vec![vec![json!({"hang": true})]]);
+    fake.pick_for(&pool, conversation.id).await;
+    let big = anthropic::AnthropicMessage { role: "user".to_string(), content: vec![anthropic::ContentBlock::Text { text: "x".repeat(400_000) }] };
+
+    let turn = tokio::spawn({
+        let pool = pool.clone();
+        async move { run_turn(&pool, conversation.id, big).await }
+    });
+    fake.until("the process starts", |f| f.started() == 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!run_files(conversation.id).is_empty(), "the run's files exist while it starts");
+    stop_turn_now(conversation.id);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), turn).await.expect("the turn ends");
+    for _ in 0..50 {
+        if run_files(conversation.id).is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(run_files(conversation.id), Vec::<std::path::PathBuf>::new());
+}
