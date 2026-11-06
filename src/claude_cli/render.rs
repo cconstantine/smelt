@@ -71,7 +71,7 @@ pub fn call_names(messages: &[AnthropicMessage]) -> HashMap<String, String> {
 pub fn tool_result_text(tool_use_id: &str, name: Option<&str>, content: &str, is_error: bool) -> String {
     let what = if is_error { "it failed" } else { "it returned" };
     let ran = name.map_or_else(|| format!("smelt ran call {tool_use_id}"), |name| format!("smelt ran `{name}` (call {tool_use_id})"));
-    format!("({ran}; {what}:)\n{}", neutralised(content))
+    format!("({ran}; {what}:)\n{content}")
 }
 
 /// A tool call as the model reads it in text: past tense, its input as
@@ -87,7 +87,9 @@ fn tool_call_text(id: &str, name: &str, input: &serde_json::Value) -> String {
 }
 
 /// `text` with every line that starts like a transcript heading escaped,
-/// so content can't fake a turn of the transcript (review 1 L9).
+/// so content can't fake a turn of the transcript (review 1 L9). Only the
+/// history in a transcript is escaped: elsewhere there's no transcript to
+/// fake, and a user's markdown heading stays as written (review 2 L14).
 fn neutralised(text: &str) -> String {
     text.lines()
         .map(|line| if line.starts_with("###") { format!("\\{line}") } else { line.to_string() })
@@ -101,8 +103,8 @@ pub fn blocks_text(blocks: &[ContentBlock], names: &HashMap<String, String>) -> 
     let parts: Vec<String> = blocks
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Text { text } | ContentBlock::CompactionPlaceholder { text } => Some(neutralised(text)),
-            ContentBlock::CompactionSummary { summary, .. } => Some(neutralised(summary)),
+            ContentBlock::Text { text } | ContentBlock::CompactionPlaceholder { text } => Some(text.clone()),
+            ContentBlock::CompactionSummary { summary, .. } => Some(summary.clone()),
             ContentBlock::ToolUse { id, name, input } => Some(tool_call_text(id, name, input)),
             ContentBlock::ToolResult { tool_use_id, content, is_error } => {
                 Some(tool_result_text(tool_use_id, names.get(tool_use_id).map(String::as_str), content, is_error.unwrap_or(false)))
@@ -116,7 +118,7 @@ pub fn blocks_text(blocks: &[ContentBlock], names: &HashMap<String, String>) -> 
 
 /// The messages as one text, each under its role.
 fn transcript(messages: &[AnthropicMessage], names: &HashMap<String, String>) -> Vec<String> {
-    messages.iter().map(|m| format!("### {}\n{}", m.role, blocks_text(&m.content, names))).collect()
+    messages.iter().map(|m| format!("### {}\n{}", m.role, neutralised(&blocks_text(&m.content, names)))).collect()
 }
 
 /// What a new run's first message says before the history.
