@@ -174,8 +174,10 @@ jobs:
       # runs with fsync=off so that a busy disk can't slow its checkpoints
       # (.github/ci-compose.yml). The run's checkpoints, and the statements
       # and lock waits Postgres logged as slow, show whether that still
-      # holds. A checkpoint over 5 s is a warning: the PoolTimedOut is 30 s
-      # away.
+      # holds. A statement over 5 s is a warning: it held its connection
+      # that long, and the PoolTimedOut is 30 s away. Not a checkpoint over
+      # 5 s: a timed checkpoint paces its writes on purpose, and only an
+      # immediate one keeps a DROP DATABASE waiting.
       - name: Postgres checkpoints and slow statements
         if: always()
         run: |
@@ -186,12 +188,12 @@ jobs:
             | sed -E 's/.*total=([0-9.]+) s.*/\1 &/' | sort -rn)
           echo "--- the 10 longest checkpoints ---"
           sed -n '1,10s/^[^ ]* //p' <<<"$longest"
-          slowest=$(sed -n '1s/ .*//p' <<<"$longest")
-          if [ -n "$slowest" ] && awk -v s="$slowest" 'BEGIN { exit !(s > 5) }'; then
-            echo "::warning::a Postgres checkpoint took ${slowest} s; sqlx's test setups fail at 30 s (SME-376)"
-          fi
           echo "--- statements over 5 s and lock waits over 1 s (the last 50) ---"
           { grep -E 'duration: [0-9.]+ ms|still waiting for|acquired .* after' "$RUNNER_TEMP/postgres.log" || true; } | tail -50
+          slow=$({ grep -cE 'duration: [0-9.]+ ms' "$RUNNER_TEMP/postgres.log" || true; })
+          if [ "${slow:-0}" -gt 0 ]; then
+            echo "::warning::${slow} Postgres statements took over 5 s; sqlx's test setups fail at 30 s (SME-376)"
+          fi
 
       - name: Dump sandbox pod diagnostics on failure
         if: failure()
