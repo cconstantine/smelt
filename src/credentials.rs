@@ -343,7 +343,11 @@ pub async fn reconcile_pod(pool: &PgPool, child: i64, snapshot: Option<&db::Pers
     .await
 }
 
-/// How long writing the credential files into one pod may take.
+/// How long an install's tries at writing the credential files into one pod
+/// may take. Not the whole bound a caller sees (SME-440 review R2-L2): after
+/// an abandoned or errored attempt the install also waits out that
+/// attempt's deadline plus `pod_writes::CLOCK_SKEW_MARGIN`, so it can return
+/// up to about 65 s after it started, plus the wait for its lock.
 const INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A new pod's files: nothing to write when this conversation gets no
