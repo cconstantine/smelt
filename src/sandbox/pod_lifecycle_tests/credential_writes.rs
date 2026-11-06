@@ -34,8 +34,9 @@ async fn persona_agent(pool: &PgPool, conversation: i64) {
 /// SME-440: an install whose exec stalls still lands. On a loaded CI
 /// runner one exec of a reinstall never answered, and the whole install
 /// failed at `INSTALL_TIMEOUT` with the narrowed key and secret still in
-/// the pod. Here the first exec of the reinstall runs and then never
-/// answers: the install must still finish, with both files pruned.
+/// the pod. Here the reinstall's write of `ssh_config` runs and then never
+/// answers: the install must still finish, with both files pruned and the
+/// retried write whole.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_install_whose_exec_stalls_still_lands(pool: PgPool) {
     let client = own_sandbox(&pool).await;
@@ -54,7 +55,8 @@ async fn test_an_install_whose_exec_stalls_still_lands(pool: PgPool) {
             .execute(&pool)
             .await
             .expect("narrow");
-        stall_hook::arm(&pod_name(pod), &[], 1, Stall::NoReply);
+        // A stdin-fed write, the path the byte count guards (review L1).
+        stall_hook::arm(&pod_name(pod), &[r#"cat > "$t""#, "/etc/smelt/ssh_config"], 1, Stall::NoReply);
         let installed = crate::credentials::install_into_pod(&pool, pod).await;
         let unused = stall_hook::remaining(&pod_name(pod));
         stall_hook::arm(&pod_name(pod), &[], 0, Stall::NoReply);
@@ -64,6 +66,8 @@ async fn test_an_install_whose_exec_stalls_still_lands(pool: PgPool) {
         assert_eq!(code, 1, "the key file was pruned");
         let (code, _) = sh(&client, pod, "test -e /etc/smelt/secrets/linear-key").await;
         assert_eq!(code, 1, "the secret file was pruned");
+        let offered = sh_ok(&client, pod, "grep -c IdentityFile /etc/smelt/ssh_config || true").await;
+        assert_eq!(offered, "0", "the retried write of ssh_config landed whole");
     })
     .await;
 }
