@@ -194,10 +194,15 @@ fn positive(value: Option<i32>) -> Option<u32> {
 }
 
 /// The context window a turn uses and whether anything sized it: the
-/// user's override, else what the provider reported, else a known
-/// `claude-*` model's, else `ASSUMED_CONTEXT_WINDOW`.
+/// user's override, else what smelt last learned (SME-439), else what
+/// the provider reported, else a known `claude-*` model's, else
+/// `ASSUMED_CONTEXT_WINDOW`.
 pub fn context_window(model: &str, row: Option<&db::ProviderModelRow>) -> (u32, bool) {
-    row.and_then(|r| positive(r.context_window).or(positive(r.reported_context_window)))
+    row.and_then(|r| {
+        positive(r.context_window)
+            .or(positive(r.learned_context_window))
+            .or(positive(r.reported_context_window))
+    })
         .or_else(|| crate::anthropic::context_window_for(model))
         .map_or((ASSUMED_CONTEXT_WINDOW, false), |window| (window, true))
 }

@@ -188,8 +188,9 @@ pub async fn delete_inference_provider(pool: &PgPool, id: i64) -> Result<bool, s
     Ok(deleted == 1)
 }
 
-/// A model's row in `provider_models`: the user's overrides and what the
-/// provider last reported. Null means unset or not reported.
+/// A model's row in `provider_models`: the user's overrides, what the
+/// provider last reported, and what smelt last learned (SME-439). Null
+/// means unset, not reported, or nothing learned.
 #[derive(Clone, Debug, Default, PartialEq, sqlx::FromRow)]
 pub struct ProviderModelRow {
     pub provider_id: i64,
@@ -210,6 +211,11 @@ pub struct ProviderModelRow {
     /// Whether the model takes adaptive thinking, as last reported (B9,
     /// SME-122).
     pub reported_adaptive_thinking: Option<bool>,
+    /// The context window smelt itself learned (SME-439): written only by
+    /// the learners, read below the user's `context_window` and above
+    /// `reported_context_window`, so learning never overwrites the user's
+    /// own value. Null means nothing learned (or not since it last mattered).
+    pub learned_context_window: Option<i32>,
     /// Added on the provider's page as a model its listing doesn't show,
     /// so it's shown even when the listing works and lacks it.
     pub added_by_hand: bool,

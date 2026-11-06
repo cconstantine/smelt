@@ -238,10 +238,44 @@ async fn test_model_overrides_and_reported_details_leave_each_other_alone(pool: 
             reported_max_output: Some(4096),
             reasoning_budget: Some(1024),
             reported_adaptive_thinking: None,
+            learned_context_window: None,
             added_by_hand: false,
         }
     );
     assert_eq!(list_provider_models(&pool, provider.id).await.expect("list"), vec![row]);
+}
+
+/// SME-439: the learned window and its when/why/which-round columns are a
+/// round-trip like every other column: `get_provider_model` and
+/// `list_provider_models` read them, a listing report never writes them.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_learned_window_and_its_record_round_trip(pool: PgPool) {
+    let provider = test_provider(&pool, "p").await;
+    set_provider_model_reported(&pool, provider.id, "m", Some(262_144), None, None, None, None).await.expect("reported");
+    sqlx::query(
+        "UPDATE provider_models SET learned_context_window = $2, learned_context_window_at = now(), learned_context_window_reason = 'window_stop', learned_context_window_conversation = 42 WHERE provider_id = $1 AND model = 'm'",
+    )
+    .bind(provider.id)
+    .bind(160_799_i32)
+    .execute(&pool)
+    .await
+    .expect("seed a learned window");
+
+    let row = get_provider_model(&pool, provider.id, "m").await.expect("get").expect("exists");
+    assert_eq!(row.learned_context_window, Some(160_799));
+    assert_eq!(list_provider_models(&pool, provider.id).await.expect("list"), vec![row.clone()]);
+    let record: Option<(Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT learned_context_window_reason, learned_context_window_conversation FROM provider_models WHERE provider_id = $1 AND model = 'm'",
+    )
+    .bind(provider.id)
+    .fetch_optional(&pool)
+    .await
+    .expect("the record");
+    assert_eq!(record, Some((Some("window_stop".to_string()), Some(42))));
+
+    set_provider_model_reported(&pool, provider.id, "m", Some(131_072), None, None, None, None).await.expect("reported again");
+    let row = get_provider_model(&pool, provider.id, "m").await.expect("get").expect("exists");
+    assert_eq!(row.learned_context_window, Some(160_799), "a listing report leaves the learned value alone");
 }
 
 /// SME-162: a provider's max concurrent requests is kept as set: none
