@@ -3,7 +3,7 @@
 //! through a live agent connection is in `agent_connection_tests`.
 
 use super::*;
-use crate::mcp::tests::{forget_mock_server, mock_server_for_tests};
+use crate::mcp::tests::{forget_mock_server, mock_holding_server_for_tests, mock_server_for_tests};
 use std::sync::atomic::Ordering;
 
 /// A conversation with a live pod; with `chain`, an `active` agent whose
@@ -402,18 +402,54 @@ async fn test_zero_calls_a_minute_turns_script_calls_off(pool: PgPool) {
     assert!(db::list_sandbox_mcp_calls(&pool, conversation).await.expect("rows").is_empty());
 }
 
+/// The next summary `command_id` publishes; panics once patience runs out.
+async fn next_summary(events: &mut crate::events::Subscription, command_id: &str) -> (String, i64) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, events.recv()).await {
+        if let crate::events::ConversationEvent::SandboxMcpCalls { command_id: seen, summary } = event {
+            if seen == command_id {
+                return (seen, summary.calls);
+            }
+        }
+    }
+    panic!("no summary of {command_id:?} within 10 s");
+}
+
 /// C7: a command's summary is published as its calls finish, but a burst
 /// of calls makes one event, not one each, and that event counts them all.
+///
+/// SME-394: the burst is a burst *by construction*. Three sequential calls
+/// over a real server are a burst only when load lets them be, and a call
+/// that straddles the 500 ms summary window makes two publishes, each with
+/// the latest count — the contract pinned by
+/// [`test_calls_held_across_a_summary_window_publishes_the_latest_count_twice`].
+/// Here the mock holds all three calls until every one has arrived, and
+/// releasing them together lands their finishes in one window under any load.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_burst_of_calls_publishes_one_summary_with_them_all(pool: PgPool) {
-    let (config, _calls) = mock_server_for_tests(&pool, "mock-c7").await;
+    let (config, arrived, gate) = mock_holding_server_for_tests(&pool, "mock-c7").await;
     let (conversation, pod) = conversation_with_pod(&pool, None).await;
     let terminal = db::create_sandbox_terminal(&pool, pod).await.expect("terminal").id;
     db::create_terminal_command(&pool, conversation, terminal, "cmd-c7", "python3 loop.py", 0).await.expect("command");
     let mut events = crate::events::subscribe(conversation);
     let mine = Caller { conversation_id: conversation, pod_id: pod, command_id: Some("cmd-c7") };
-    for _ in 0..3 {
-        assert_eq!(call_body(&pool, mine, json!({"tool": "mock-c7/second_tool"})).await.status, 200);
+    let calls: Vec<_> = (0..3)
+        .map(|_| {
+            let pool = pool.clone();
+            tokio::spawn(async move { call_body(&pool, mine, json!({"tool": "mock-c7/hold"})).await.status })
+        })
+        .collect();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while arrived.load(Ordering::SeqCst) < 3 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("all three calls reached the server");
+    gate.release();
+    for call in calls {
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), call).await.expect("the call ends").expect("no panic");
+        assert_eq!(status, 200);
     }
     let mut published = Vec::new();
     let deadline = tokio::time::Instant::now() + SUMMARY_EVERY * 3;
@@ -424,6 +460,68 @@ async fn test_a_burst_of_calls_publishes_one_summary_with_them_all(pool: PgPool)
     }
     forget_mock_server(config.id).await;
     assert_eq!(published, vec![("cmd-c7".to_string(), 3)]);
+}
+
+/// The summary beat is a trailing edge (SME-394): `publish_summary_soon`
+/// debounces off the *scheduled* publish and frees its slot before reading,
+/// so a call finishing while a summary is being read sets up the next
+/// publish "rather than going unsaid" — the design comment in `mod.rs`.
+/// Calls spread past one window are therefore under contract, not
+/// corruption: every window publishes the latest count, twice with the same
+/// count if nothing changed between the reads. That double publish is what
+/// CI saw this file's burst test do under full-gate load (once in 2308,
+/// `left: [("cmd-c7", 3), ("cmd-c7", 3)]`): its burst was racing its own
+/// premise that the burst fits one window, not a broken debounce.
+///
+/// The straddle is forced here rather than waited for: the two held calls
+/// finish strictly after the first summary's read — the gate releases only
+/// once that read's event has arrived — so both summaries count all three
+/// rows, every time under any load. Under the burst test's old assertion
+/// this exact interleaving red 3/3 runs with the CI signature; the fix is
+/// the burst test making its burst a burst, not this behavior changing.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_calls_held_across_a_summary_window_publishes_the_latest_count_twice(pool: PgPool) {
+    let (config, arrived, gate) = mock_holding_server_for_tests(&pool, "mock-c7b").await;
+    let (conversation, pod) = conversation_with_pod(&pool, None).await;
+    let terminal = db::create_sandbox_terminal(&pool, pod).await.expect("terminal").id;
+    db::create_terminal_command(&pool, conversation, terminal, "cmd-c7b", "python3 loop.py", 0).await.expect("command");
+    let mut events = crate::events::subscribe(conversation);
+    let mine = Caller { conversation_id: conversation, pod_id: pod, command_id: Some("cmd-c7b") };
+    let held: Vec<_> = (0..2)
+        .map(|_| {
+            let pool = pool.clone();
+            tokio::spawn(async move { call_body(&pool, mine, json!({"tool": "mock-c7b/hold"})).await.status })
+        })
+        .collect();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while arrived.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both held calls reached the server");
+    // The finisher first: its summary window opens now, and its read finds
+    // all three rows — the held calls' included, still running — but not
+    // their finishes.
+    assert_eq!(call_body(&pool, mine, json!({"tool": "mock-c7b/second_tool"})).await.status, 200);
+    let mut published = vec![next_summary(&mut events, "cmd-c7b").await];
+    gate.release();
+    for call in held {
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), call).await.expect("the held call ends").expect("no panic");
+        assert_eq!(status, 200);
+    }
+    // Their finishes, strictly after the first read, set up the second —
+    // the trailing edge, with the latest count again.
+    published.push(next_summary(&mut events, "cmd-c7b").await);
+    // And that is all of them: two summaries for the whole run.
+    let deadline = tokio::time::Instant::now() + SUMMARY_EVERY * 2;
+    while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, events.recv()).await {
+        if let crate::events::ConversationEvent::SandboxMcpCalls { command_id, summary } = event {
+            published.push((command_id, summary.calls));
+        }
+    }
+    forget_mock_server(config.id).await;
+    assert_eq!(published, vec![("cmd-c7b".to_string(), 3), ("cmd-c7b".to_string(), 3)]);
 }
 
 /// Review round 1, M3: a script may call only a tool its server lists,
