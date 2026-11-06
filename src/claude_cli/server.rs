@@ -174,11 +174,13 @@ fn version_line(stdout: &[u8]) -> Option<String> {
 
 /// Reads `auth status`'s JSON (`loggedIn`, `authMethod`,
 /// `subscriptionType`), and only that: whether it's signed in, how, and on
-/// what plan. Output that isn't JSON is signed out when the CLI exited
-/// non-zero (its "not logged in"), else an error that doesn't quote it.
+/// what plan. Output that isn't JSON is an error that doesn't quote it,
+/// whatever the exit code: an older CLI, a crash or a wrapper says nothing
+/// about the sign-in, and "not signed in" would send the user to set a
+/// token that may be set already (review 1 L2).
 fn parse_auth_status(stdout: &[u8], success: bool) -> Result<(bool, Option<String>, Option<String>), String> {
     let Ok(body) = serde_json::from_slice::<serde_json::Value>(stdout) else {
-        return if success { Err("printed something other than JSON.".to_string()) } else { Ok((false, None, None)) };
+        return Err("didn't say whether it's signed in: it printed something other than JSON.".to_string());
     };
     let signed_in = body.get("loggedIn").and_then(serde_json::Value::as_bool).unwrap_or(success);
     let word = |key: &str| short_word(body.get(key)?.as_str()?);

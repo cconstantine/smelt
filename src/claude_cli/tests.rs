@@ -214,3 +214,17 @@ async fn test_a_relative_binary_path_is_refused() {
     let status = status_with("bin/claude", cli_env(smelt_env(Some(&dir.join("c")))), Duration::from_secs(10)).await;
     assert!(status.error.as_deref().is_some_and(|e| e.contains("absolute")), "a stored one is refused too: {status:?}");
 }
+
+/// Review 1 L2: output that isn't JSON says nothing about the sign-in,
+/// whatever the exit code, so it's an error and never "not signed in"
+/// (whose advice, to set a token, is wrong when one is set).
+#[tokio::test]
+async fn test_auth_status_output_that_isnt_json_is_unknown_even_on_a_failure() {
+    let dir = scratch("not-json-failed");
+    let claude = answering(&dir, "Unknown command: auth", 1);
+    let status = status_with(claude.to_str().expect("utf-8 path"), cli_env(smelt_env(Some(&dir.join("c")))), Duration::from_secs(10)).await;
+    assert!(!status.signed_in);
+    let error = status.error.clone().expect("an error, not a sign-in answer");
+    assert!(error.contains("didn't say whether it's signed in"), "{error}");
+    assert!(!status.summary().contains("not signed in"), "{}", status.summary());
+}
