@@ -256,9 +256,7 @@ pub async fn install_pod_files(
 ) -> Result<(), sandbox::SandboxError> {
     use sandbox::SandboxError;
     for dir in prune_dirs {
-        let made = shell
-            .run(&["sh", "-c", r#"mkdir -p -m 700 "$1""#, "sh", dir], None)
-            .await?;
+        let made = run_answered(shell, &["sh", "-c", r#"mkdir -p -m 700 "$1""#, "sh", dir], None).await?;
         if made.exit_code != 0 {
             return Err(SandboxError::GitSetup(format!(
                 "couldn't make {dir}: {}",
@@ -274,19 +272,19 @@ pub async fn install_pod_files(
         // never reads half a file; umask keeps a key private from its
         // first byte.
         let mode = format!("{:o}", file.mode);
-        let written = shell
-            .run(
-                &[
-                    "sh",
-                    "-c",
-                    r#"umask 077 && cat > "$1.new" && chmod "$2" "$1.new" && mv "$1.new" "$1""#,
-                    "sh",
-                    &file.path,
-                    &mode,
-                ],
-                Some(file.content.as_bytes()),
-            )
-            .await?;
+        let written = run_answered(
+            shell,
+            &[
+                "sh",
+                "-c",
+                r#"umask 077 && cat > "$1.new" && chmod "$2" "$1.new" && mv "$1.new" "$1""#,
+                "sh",
+                &file.path,
+                &mode,
+            ],
+            Some(file.content.as_bytes()),
+        )
+        .await?;
         if written.exit_code != 0 {
             return Err(SandboxError::GitSetup(format!(
                 "couldn't write {}: {}",
@@ -313,7 +311,7 @@ pub async fn install_pod_files(
             dir,
         ];
         prune.extend(keep);
-        let pruned = shell.run(&prune, None).await?;
+        let pruned = run_answered(shell, &prune, None).await?;
         if pruned.exit_code != 0 {
             return Err(SandboxError::GitSetup(format!(
                 "couldn't remove deleted files from {dir}: {}",
@@ -322,6 +320,43 @@ pub async fn install_pod_files(
         }
     }
     Ok(())
+}
+
+/// How long one of an install's execs may go unanswered before it counts as
+/// stalled and is run again (SME-440). On a loaded CI runner one exec of a
+/// reinstall ran and never answered; with nothing bounding it but the whole
+/// install's `INSTALL_TIMEOUT`, the install failed and the pod kept a key
+/// and a secret its conversation no longer had — in production, a live pod
+/// keeping what a narrowing or a delete took away, or a new pod failing to
+/// start. Every install exec answers in about a second, 1.3 s under SME-341's
+/// load, so 10 s is well past a slow one, and leaves `INSTALL_TIMEOUT` room
+/// for several tries.
+const EXEC_STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `shell.run`, run again whenever it goes `EXEC_STALL_AFTER` without an
+/// answer. Safe because every install command is idempotent: `mkdir -p`, a
+/// write beside the target renamed over it, a prune to the same names. A
+/// stalled exec may still finish in the pod after this has moved on, which
+/// lands the same bytes (SME-410 is the case where a later install's change
+/// is in between). Bounded by the caller: `write_pod_files` holds the whole
+/// install to `INSTALL_TIMEOUT`.
+async fn run_answered(
+    shell: &sandbox::PodShell,
+    command: &[&str],
+    stdin: Option<&[u8]>,
+) -> Result<sandbox::ExecResult, sandbox::SandboxError> {
+    loop {
+        match tokio::time::timeout(EXEC_STALL_AFTER, shell.run(command, stdin)).await {
+            Ok(ran) => return ran,
+            // The command's arguments name a path, never a value: file
+            // contents go in on stdin, which isn't logged.
+            Err(_) => tracing::warn!(
+                after = ?EXEC_STALL_AFTER,
+                target = command.get(4).copied().unwrap_or(""),
+                "an install's exec stalled; running it again"
+            ),
+        }
+    }
 }
 
 /// Runs `install` (read the keys, then write them into `conversation`'s

@@ -410,3 +410,13 @@ async fn test_pod_files_hand_a_multi_line_secret_byte_equal(pool: PgPool) {
     assert_eq!((tailless.mode, tailless.content.as_str()), (0o600, unended), "ends exactly where it was stored: no byte added, none dropped");
 }
 
+
+/// SME-440: a stalled exec is run again well inside the install's own
+/// bound, with room for more than one retry.
+#[test]
+fn test_an_install_has_room_to_retry_stalled_execs() {
+    assert!(
+        3 * EXEC_STALL_AFTER <= INSTALL_TIMEOUT,
+        "{EXEC_STALL_AFTER:?} leaves {INSTALL_TIMEOUT:?} no room for two retries"
+    );
+}
