@@ -26,7 +26,21 @@ On a deployment made with [`terraform/smelt`](../../terraform/smelt/README.md), 
 
 1. Store it on smelt's **Secrets** page (`/secrets`) as `claude_oauth_token`.
 2. The [deployer](../personas/deployer.md) seat's persona names that secret in its `credentials:`, so its pod holds it at `/etc/smelt/secrets/claude_oauth_token`. Before plan and apply the seat exports it as `TF_VAR_claude_code_oauth_token`, never printing it.
-3. The deployment's root (homelab's `smelt.tf`) declares `variable "claude_code_oauth_token" { type = string, sensitive = true }`, with no default, and passes it to the module as `secret_env = { CLAUDE_CODE_OAUTH_TOKEN = var.claude_code_oauth_token }`.
+3. The deployment's root (homelab's `smelt.tf`) declares the variable with no default and passes it to the module:
+
+   ```hcl
+   variable "claude_code_oauth_token" {
+     type      = string
+     sensitive = true
+   }
+
+   module "smelt" {
+     # ...
+     secret_env = { CLAUDE_CODE_OAUTH_TOKEN = var.claude_code_oauth_token }
+   }
+   ```
+
+   The module refuses an empty value at plan, which is what a missing file's `$(cat …)` export gives.
 4. The module keeps it in the `smelt-secret-env` secret, and the server container reads `CLAUDE_CODE_OAUTH_TOKEN` from it through a `secretKeyRef`. The plan shows it as `(sensitive value)`.
 
 A new token (a year on, or after a revoke) is a new value for `claude_oauth_token` and a deploy: the module's checksum annotation rolls the server pod, and the provider's page signs in with the new one.
