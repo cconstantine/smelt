@@ -124,7 +124,7 @@ async fn test_a_call_the_cli_answered_itself_fails_the_call(pool: PgPool) {
 
 /// A request on `conversation_id`'s Claude Code model, with `messages`
 /// and a reply cap of `max_tokens`, as the turn builds one.
-fn cli_request(messages: Vec<anthropic::AnthropicMessage>, max_tokens: u32) -> anthropic::CreateMessageRequest {
+pub(super) fn cli_request(messages: Vec<anthropic::AnthropicMessage>, max_tokens: u32) -> anthropic::CreateMessageRequest {
     anthropic::CreateMessageRequest {
         model: "claude-opus-5-5".to_string(),
         max_tokens,
@@ -140,12 +140,12 @@ fn cli_request(messages: Vec<anthropic::AnthropicMessage>, max_tokens: u32) -> a
     }
 }
 
-fn said(role: &str, text: &str) -> anthropic::AnthropicMessage {
+pub(super) fn said(role: &str, text: &str) -> anthropic::AnthropicMessage {
     anthropic::AnthropicMessage { role: role.to_string(), content: vec![anthropic::ContentBlock::Text { text: text.to_string() }] }
 }
 
 /// One model call through `cli`.
-async fn one_call(
+pub(super) async fn one_call(
     conversation_id: i64,
     model: &crate::providers::TurnModel,
     cli: &mut crate::claude_cli::run::TurnCli,
@@ -159,8 +159,8 @@ async fn one_call(
 }
 
 /// Review 1 L3, and the history going another way mid-turn: a run is
-/// reused only for the cap it was started with (the CLI takes it at
-/// launch) and a history that carries on from its last call; either
+/// reused only for a cap no larger than it was started with (the CLI
+/// takes it at launch; review 2 M3) and a history that carries on from its last call; either
 /// change starts a new run, given the history as text.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_new_cap_or_another_history_starts_a_new_run(pool: PgPool) {
@@ -178,8 +178,8 @@ async fn test_a_new_cap_or_another_history_starts_a_new_run(pool: PgPool) {
     crate::claude_cli::run::SILENCE_FOR_TESTS.store(3_000, std::sync::atomic::Ordering::SeqCst);
     let first = one_call(conversation.id, &model, &mut cli, vec![said("user", "hi")], 1_000).await;
     let same = one_call(conversation.id, &model, &mut cli, vec![said("user", "hi"), said("assistant", "one"), said("user", "again")], 1_000).await;
-    let new_cap = one_call(conversation.id, &model, &mut cli, vec![said("user", "hi"), said("assistant", "one"), said("user", "again"), said("assistant", "two"), said("user", "more")], 900).await;
-    let other = one_call(conversation.id, &model, &mut cli, vec![said("user", "edited"), said("assistant", "x"), said("user", "and")], 900).await;
+    let new_cap = one_call(conversation.id, &model, &mut cli, vec![said("user", "hi"), said("assistant", "one"), said("user", "again"), said("assistant", "two"), said("user", "more")], 1_100).await;
+    let other = one_call(conversation.id, &model, &mut cli, vec![said("user", "edited"), said("assistant", "x"), said("user", "and")], 1_100).await;
     crate::claude_cli::run::SILENCE_FOR_TESTS.store(0, std::sync::atomic::Ordering::SeqCst);
     let text = |r: Result<Vec<anthropic::ContentBlock>, String>| match r.expect("a reply").as_slice() {
         [anthropic::ContentBlock::Text { text }] => text.clone(),
@@ -231,7 +231,7 @@ async fn test_a_cli_without_smelts_tools_fails_the_call(pool: PgPool) {
 // --- Review 1's missing tests ---
 
 /// Gives this provider's Claude Code model a window of `window`.
-async fn set_cli_window(pool: &PgPool, provider_id: i64, window: i32) {
+pub(super) async fn set_cli_window(pool: &PgPool, provider_id: i64, window: i32) {
     sqlx::query("INSERT INTO provider_models (provider_id, model, context_window) VALUES ($1, 'claude-opus-5-5', $2)")
         .bind(provider_id)
         .bind(window)

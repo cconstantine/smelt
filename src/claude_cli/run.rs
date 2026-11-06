@@ -12,8 +12,9 @@
 //!   the call arrives (the CLI makes them one at a time, S2), the tail's
 //!   other blocks as text on the last → Streaming.
 //! - call, Idle: send the tail as a user message → Streaming.
-//! - call, with another reply cap than the run's launch (the CLI reads it
-//!   once): end the run, then as None (review 1 L3).
+//! - call, with a larger reply cap than the run's launch (the CLI reads
+//!   it once): end the run, then as None (review 1 L3). A smaller one keeps
+//!   the run (review 2 M3).
 //! - call, the history went another way (`render::tail_after`): end the
 //!   run, then as None.
 //! - `message_stop` `tool_use` → Parked, return the reply.
@@ -169,9 +170,12 @@ pub async fn call(
         dead.end_in_background();
     }
     // The CLI takes the reply's cap at launch (CLAUDE_CODE_MAX_OUTPUT_TOKENS):
-    // a call with another one needs a run of its own (review 1 L3).
+    // a call that needs a larger one needs a run of its own (review 1 L3).
+    // A smaller one keeps the run, so a turn near the window, whose cap
+    // shrinks at every call, isn't re-sent uncached each time: smelt's own
+    // room check before the call governs the reply (review 2 M3).
     if let Some(run) = cli.run.as_ref()
-        && run.max_tokens != request.max_tokens
+        && request.max_tokens > run.max_tokens
         && let Some(old) = cli.run.take()
     {
         tracing::info!(conversation_id, from = old.max_tokens, to = request.max_tokens, "the reply's cap changed: starting a new Claude Code run");
