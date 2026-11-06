@@ -17,26 +17,59 @@ locals {
   preview_enabled = var.preview_domain != null
   preview_url     = local.preview_enabled ? "https://{port}-{conversation}.${var.preview_domain}" : null
 
-  # Every non-secret environment value, with the ones left unset dropped — smelt's
-  # own defaults are what should apply unless the caller asked otherwise.
-  server_env = {
-    for key, value in {
-      SMELT_BASE_URL                    = local.base_url
-      SMELT_ALLOWED_HOSTS               = local.allowed_hosts
-      SMELT_PREVIEW_ADDR                = local.preview_enabled ? "0.0.0.0:8181" : "127.0.0.1:8181"
-      SMELT_PREVIEW_URL                 = local.preview_url
-      SANDBOX_IMAGE                     = var.sandbox_image
-      SANDBOX_IMAGE_PULL_POLICY         = var.image_pull_policy
-      SANDBOX_IMAGE_PULL_SECRET         = var.image_pull_secret
-      SANDBOX_MEMORY_LIMIT              = var.sandbox_memory_limit
-      SANDBOX_DOCKER_STORAGE_SIZE       = var.docker_storage_size
-      SANDBOX_WORKSPACE_STORAGE_SIZE    = var.workspace_storage_size
-      SANDBOX_RUNNING_WAIT_TIMEOUT_SECS = var.sandbox_wait_timeout_secs != null ? tostring(var.sandbox_wait_timeout_secs) : null
-    } :
-    key => value if value != null
+  # Every non-secret environment value this module can set, unset ones included.
+  module_env = {
+    SMELT_BASE_URL                    = local.base_url
+    SMELT_ALLOWED_HOSTS               = local.allowed_hosts
+    SMELT_PREVIEW_ADDR                = local.preview_enabled ? "0.0.0.0:8181" : "127.0.0.1:8181"
+    SMELT_PREVIEW_URL                 = local.preview_url
+    SANDBOX_IMAGE                     = var.sandbox_image
+    SANDBOX_IMAGE_PULL_POLICY         = var.image_pull_policy
+    SANDBOX_IMAGE_PULL_SECRET         = var.image_pull_secret
+    SANDBOX_MEMORY_LIMIT              = var.sandbox_memory_limit
+    SANDBOX_DOCKER_STORAGE_SIZE       = var.docker_storage_size
+    SANDBOX_WORKSPACE_STORAGE_SIZE    = var.workspace_storage_size
+    SANDBOX_RUNNING_WAIT_TIMEOUT_SECS = var.sandbox_wait_timeout_secs != null ? tostring(var.sandbox_wait_timeout_secs) : null
   }
 
+  # The ones left unset dropped — smelt's own defaults are what should apply
+  # unless the caller asked otherwise.
+  server_env = { for key, value in local.module_env : key => value if value != null }
+
   env = merge(var.extra_env, local.server_env)
+
+  # `secret_env`'s keys, unmarked: a sensitive value can't drive a `count` or a
+  # dynamic block's `for_each`, and the names are no secret (only the values
+  # are). Its values stay sensitive and go nowhere but the secret below.
+  secret_env_names   = toset(nonsensitive(keys(var.secret_env)))
+  secret_env_enabled = length(local.secret_env_names) > 0
+
+  # A secret_env key the module or extra_env also sets would be two env entries
+  # of one name, the later silently winning. Every name the module can set
+  # counts, set now or not, so turning a setting on later can't make a clash.
+  secret_env_clashes = sort(tolist(setintersection(
+    local.secret_env_names,
+    toset(concat(["DATABASE_URL"], keys(local.module_env), keys(var.extra_env))),
+  )))
+}
+
+# `secret_env`'s values, one key each, for the server's `secretKeyRef`s. Made only
+# when there are some, so a deployment that sets none gets no new object.
+resource "kubernetes_secret_v1" "secret_env" {
+  count = local.secret_env_enabled ? 1 : 0
+
+  metadata {
+    name      = "smelt-secret-env"
+    namespace = kubernetes_namespace_v1.park.metadata[0].name
+
+    labels = {
+      "app.kubernetes.io/name" = "smelt"
+    }
+  }
+
+  data = var.secret_env
+
+  type = "Opaque"
 }
 
 resource "kubernetes_deployment_v1" "smelt" {
@@ -46,6 +79,15 @@ resource "kubernetes_deployment_v1" "smelt" {
 
     labels = {
       "app.kubernetes.io/name" = "smelt"
+    }
+  }
+
+  # A precondition, not a validation on `secret_env`: the names it is checked
+  # against are this module's own, and `extra_env` is another variable.
+  lifecycle {
+    precondition {
+      condition     = length(local.secret_env_clashes) == 0
+      error_message = "secret_env sets ${join(", ", local.secret_env_clashes)}, which this module or extra_env sets too. Give each environment variable one source."
     }
   }
 
@@ -67,6 +109,16 @@ resource "kubernetes_deployment_v1" "smelt" {
         labels = {
           "app.kubernetes.io/name" = "smelt"
         }
+
+        # A changed `secret_env` value changes nothing else in the pod spec,
+        # and env from a secret is read only at a container's start, so this
+        # checksum is what rolls the pod. A SHA-256 of the whole map: it
+        # doesn't give a value away, and it stays sensitive in the plan.
+        # None without `secret_env`, so such a deployment's pod isn't rolled
+        # by this module's upgrade.
+        annotations = local.secret_env_enabled ? {
+          "smelt/secret-env-sha256" = sha256(jsonencode(var.secret_env))
+        } : {}
       }
 
       spec {
@@ -150,6 +202,21 @@ resource "kubernetes_deployment_v1" "smelt" {
             content {
               name  = env.key
               value = env.value
+            }
+          }
+
+          dynamic "env" {
+            for_each = local.secret_env_names
+
+            content {
+              name = env.value
+
+              value_from {
+                secret_key_ref {
+                  name = kubernetes_secret_v1.secret_env[0].metadata[0].name
+                  key  = env.value
+                }
+              }
             }
           }
 

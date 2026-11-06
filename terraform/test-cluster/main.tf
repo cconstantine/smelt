@@ -5,7 +5,9 @@
 #
 #   k3d cluster create smelt-test --image rancher/k3s:v1.34.6-k3s1 \
 #     --port "18080:80@loadbalancer" --wait
-#   terraform init && terraform apply
+#   terraform init && terraform apply && ./check-secret-env.sh
+#
+# The last step checks `secret_env` (see its header).
 #
 # The k3s image matters: sandbox pods use native sidecar containers, which a
 # k3d default image (1.28-era) refuses. Pin the one docs/setup.md pins.
@@ -27,7 +29,7 @@
 # to loopback.
 
 terraform {
-  required_version = ">= 1.5.0"
+  required_version = ">= 1.7.0"
 
   required_providers {
     kubernetes = {
@@ -61,6 +63,13 @@ variable "sandbox_image" {
   default     = "ghcr.io/cconstantine/smelt-sandbox:6d2831da191e"
 }
 
+variable "secret_env_value" {
+  description = "The dummy value `secret_env` carries here, which check-secret-env.sh looks for. Change it to see the server pod roll."
+  type        = string
+  default     = "k3d-test-not-a-secret"
+  sensitive   = true
+}
+
 provider "kubernetes" {
   config_path    = var.kubeconfig_path
   config_context = var.kubeconfig_context
@@ -83,6 +92,10 @@ module "smelt" {
   # k3s's default provisioner, named explicitly so the plan says which storage
   # the Postgres claim lands on.
   storage_class_name = "local-path"
+
+  # A sensitive value that reaches the server through a Secret, never the pod
+  # spec: check-secret-env.sh checks it.
+  secret_env = { SMELT_TEST_SECRET_ENV = var.secret_env_value }
 }
 
 output "url" {

@@ -37,8 +37,26 @@ where smelt's own real-cluster test suite runs.
 - Previews are off unless `preview_domain` is set (wildcard DNS plus a rule
   reaching port 8181 is the prerequisite; without it the preview listener
   binds loopback inside the pod, which is the safe default).
-- OAuth and anything else secret go in through `extra_env`; the module has no
-  opinion about them.
+- Plain settings go in through `extra_env`, verbatim into the pod spec.
+  **Secrets go in through `secret_env`** (a sensitive `map(string)`, default
+  `{}`), e.g. `secret_env = { CLAUDE_CODE_OAUTH_TOKEN = var.claude_code_oauth_token }`
+  with that variable `sensitive = true` and exported as `TF_VAR_…` at plan and
+  apply time, so the value never reaches git:
+  - The module puts the map in a `smelt-secret-env` secret in `namespace`
+    (made only when the map isn't empty), and gives the server one env var per
+    key, of the key's name, from a `secretKeyRef` on it. The Deployment holds
+    the names, never the values, and the plan shows them as sensitive.
+  - The keys are no secret: they show in the plan and the Deployment.
+  - The plan refuses an empty value (a `TF_VAR_x="$(cat <missing file>)"`
+    export sets one, and a variable with no default doesn't catch it), a key
+    that isn't an environment variable name, or one that
+    `extra_env` or this module sets, `DATABASE_URL` included. Every name the
+    module can set counts, set or not, so turning a setting on later can't
+    clash.
+  - **A changed value rolls the server pod.** The pod template carries
+    `smelt/secret-env-sha256`, a SHA-256 of the whole map, which gives no value
+    away. A deployment with no `secret_env` gets no secret and no annotation, so
+    upgrading the module doesn't roll it.
 - **amd64 or arm64 nodes, or a mix.** Images CI publishes from SME-360
   (#248, 6d2831d) on are built for linux/amd64 and linux/arm64, and so are
   `postgres_image`'s default (`postgres:17-alpine`) and smelt's default Docker
@@ -63,6 +81,12 @@ where smelt's own real-cluster test suite runs.
 - The pod gets its cluster access from its own ServiceAccount token — no
   kubeconfig is mounted, and none should be.
 
+## Terraform version
+
+Terraform 1.7 or later (`versions.tf`). `secret_env`'s validations call
+`nonsensitive()`, which 1.5 and 1.6 refuse inside a validation even for the
+empty default, so on those every plan would fail.
+
 ## Kubernetes version
 
 Sandbox pods use native sidecar containers (init containers with
@@ -76,4 +100,9 @@ container.
 
 `terraform/test-cluster/` applies this module to a k3d cluster, and smelt's
 real-cluster pod-lifecycle tests run against the result. See that directory's
-header comment for the exact recipe.
+header comment for the exact recipe. Its `secret_env` carries a dummy value,
+and `terraform/test-cluster/check-secret-env.sh` checks the result: the server
+reads it from a `secretKeyRef`, `kubectl get deploy -o yaml` holds no plain
+copy, the checksum annotation is there, and the running server sees the value.
+Applying another value (`-var secret_env_value=…`) changes the checksum and
+rolls the pod.
