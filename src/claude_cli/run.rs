@@ -136,6 +136,8 @@ struct Run {
     /// Whether the last reply's results are in `answers`, until the CLI's
     /// next API call starts.
     delivered: bool,
+    /// Whether it was given smelt's tools (an `--mcp-config`).
+    has_tools: bool,
     /// The reply cap it was launched with.
     max_tokens: u32,
     /// Whether the CLI has said anything since the current call began.
@@ -318,6 +320,7 @@ impl Run {
             heard: false,
             gone: false,
             max_tokens: request.max_tokens,
+            has_tools: !request.tools.is_empty(),
             streaming_ids: std::collections::HashSet::new(),
             answered: std::collections::HashSet::new(),
             delivered: false,
@@ -522,6 +525,10 @@ impl Run {
                         return Err(e);
                     }
                 }
+                Some("system") if event["subtype"] == "init" && self.has_tools && !bridge_connected(&event) => {
+                    self.healthy = false;
+                    return Err("Claude Code couldn't connect to smelt's tools, so smelt stopped the call rather than let it run without them. Send another message to try again; if this keeps happening, the server's log says why.".to_string());
+                }
                 Some("user") => {
                     if let Some(id) = self.answered_by_the_cli(&event) {
                         self.healthy = false;
@@ -709,6 +716,14 @@ fn apply(blocks: &mut Blocks, stop_reason: &mut String, event: &Value, on_delta:
         }
     }
     Ok(())
+}
+
+/// Whether an `init` event says the CLI connected to smelt's bridge
+/// (review 1 L7).
+fn bridge_connected(init: &Value) -> bool {
+    init["mcp_servers"]
+        .as_array()
+        .is_some_and(|servers| servers.iter().any(|s| s["name"] == super::bridge::SERVER_NAME && s["status"] == "connected"))
 }
 
 /// Keeps the last `errors::MAX_QUOTED` bytes of the CLI's stderr.

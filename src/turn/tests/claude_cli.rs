@@ -45,6 +45,12 @@ fn captured_thinking_reply() -> Value {
 
 use serde_json::Value;
 
+/// A fixture's lines without its `init`: one captured with no tools names
+/// no smelt server, which a turn with tools refuses (review 1 L7).
+fn without_init(lines: Vec<Value>) -> Vec<Value> {
+    lines.into_iter().filter(|l| !(l["type"] == "system" && l["subtype"] == "init")).collect()
+}
+
 /// Part 1, the stream mapping: a reply's thinking (empty text, its
 /// signature kept) and text are saved as one assistant message, its usage
 /// recorded once, and the process ran with the plan's arguments and the
@@ -205,7 +211,9 @@ async fn test_a_cut_off_reply_interrupts_the_clis_own_continuation(pool: PgPool)
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     // The capture's first API call, to its message_stop, then the start
     // of the continuation it made on its own.
-    let lines = fixture_lines("capped");
+    // Captured with no tools, so its init names no smelt server; smelt's
+    // turns always have tools, and an init without the bridge fails (L7).
+    let lines = without_init(fixture_lines("capped"));
     let stop = lines.iter().position(|l| l["event"]["type"] == "message_stop").expect("a message_stop");
     let continuation = lines[stop..].iter().find(|l| l["event"]["type"] == "message_start").cloned().expect("the continuation");
     let fake = FakeCli::new("capped", vec![vec![
@@ -239,7 +247,7 @@ async fn test_a_refused_sign_in_fails_the_turn_saying_how_to_sign_in(pool: PgPoo
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("conversation");
-    let fake = FakeCli::new("auth", vec![vec![json!({"read": true}), json!({"emit": fixture_lines("bad_token")}), json!({"exit": 1})]]);
+    let fake = FakeCli::new("auth", vec![vec![json!({"read": true}), json!({"emit": without_init(fixture_lines("bad_token"))}), json!({"exit": 1})]]);
     fake.pick_for(&pool, conversation.id).await;
 
     let error = run_turn(&pool, conversation.id, hello()).await.expect_err("signed out");
@@ -486,4 +494,19 @@ async fn test_an_exit_before_the_result_quotes_a_scrubbed_line(pool: PgPool) {
     for leak in ["/home/dev", "me@example.com", "sk-ant-"] {
         assert!(!error.contains(leak), "{leak} in {error}");
     }
+}
+
+/// Review 1 L7: a CLI that couldn't connect to smelt's tools fails the
+/// call, rather than running the turn with no tools.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_cli_without_smelts_tools_fails_the_call(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let init = json!({"type": "system", "subtype": "init", "tools": [], "mcp_servers": [{"name": "smelt", "status": "failed", "source": "dynamic"}]});
+    let fake = FakeCli::new("unbridged", vec![vec![json!({"read": true}), json!({"emit": [init]}), text_reply("No tools.")]]);
+    fake.pick_for(&pool, conversation.id).await;
+
+    let error = run_turn(&pool, conversation.id, hello()).await.expect_err("no tools").to_string();
+    assert!(error.contains("couldn't connect to smelt's tools"), "{error}");
 }
