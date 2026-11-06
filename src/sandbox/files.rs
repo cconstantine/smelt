@@ -138,6 +138,31 @@ pub enum RunCommandError {
     Failed(String),
 }
 
+/// SME-425: refuse a command aimed at a terminal the conversation's live
+/// pod doesn't have — its row closed, or its pod's row ended — before
+/// anything is dialled or written: no `lost` row behind it, no panel
+/// flicker, and above all not `AgentUnreachable`'s create_pod advice while
+/// a healthy pod runs (which routed on to `terminate_pod`). An unknown
+/// terminal id still answers `NoTerminal`, unchanged; a live terminal of a
+/// live pod passes. The conversation resolves through the terminal's own
+/// pod row, so `send_signal` needs no new parameter.
+async fn refuse_stale_terminal(pool: &PgPool, terminal_id: i64) -> Result<(), TerminalError> {
+    let Some((pod_id, terminal_closed, pod_ended)) = db::terminal_pod_state(pool, terminal_id).await? else {
+        return Err(TerminalError::NoTerminal);
+    };
+    if !(terminal_closed || pod_ended) {
+        return Ok(());
+    }
+    let conversation_id = db::sandbox_pod_conversation_id(pool, pod_id).await?.ok_or(TerminalError::NoTerminal)?;
+    Err(TerminalError::StaleTerminal {
+        terminal_id,
+        pod_id,
+        live_pod: conversation_pod_id(pool, conversation_id).await.ok(),
+        // Where the pod has ended, that is the story the message tells.
+        terminal_closed: terminal_closed && !pod_ended,
+    })
+}
+
 /// Starts `command` in `terminal_id` as `command_id`: refuses while another
 /// command runs there, records it as running, publishes it to the sandbox
 /// panel as started, and sends it to the pod's agent. A send that fails
@@ -156,6 +181,11 @@ pub async fn run_command(
     command: &str,
     idle_notice_secs: i32,
 ) -> Result<(), RunCommandError> {
+    // Up front, before the busy check and any row (SME-425).
+    if let Err(e) = refuse_stale_terminal(pool, terminal_id).await {
+        return Err(RunCommandError::Failed(e.to_string()));
+    }
+
     if let Some(running) = db::terminal_command_is_running(pool, terminal_id)
         .await
         .map_err(|e| RunCommandError::Failed(e.to_string()))?
@@ -216,6 +246,8 @@ pub async fn send_signal(
     command_id: &str,
     signal: &str,
 ) -> Result<(), TerminalError> {
+    // Up front, before dialling (SME-425).
+    refuse_stale_terminal(pool, terminal_id).await?;
     let pod_id = db::sandbox_terminal_pod_id(pool, terminal_id)
         .await?
         .ok_or(TerminalError::NoTerminal)?;

@@ -224,6 +224,23 @@ pub enum TerminalError {
     /// `terminate_terminal` refuses while a command is still `running` in
     /// that terminal.
     CommandStillRunning,
+    /// A command was aimed at a terminal the conversation's live pod doesn't
+    /// have: its row is closed, or its pod's row has ended. `run_command`
+    /// and `send_signal` refuse these up front (SME-425) — before this, one
+    /// reached `AgentUnreachable`, whose create_pod advice then hit
+    /// `create_pod`'s "a pod already exists" refusal and pointed on to
+    /// `terminate_pod`: killing a healthy pod.
+    StaleTerminal {
+        terminal_id: i64,
+        /// The terminal's own pod.
+        pod_id: i64,
+        /// The conversation's live pod, if one runs.
+        live_pod: Option<i64>,
+        /// The terminal's row closed while its pod stayed live — the case
+        /// whose message speaks of the terminal. Where the pod has ended,
+        /// that is the story instead, and this is false.
+        terminal_closed: bool,
+    },
     /// A request to the pod's agent failed: it refused (its own words,
     /// which the model needs to see and act on), didn't answer, or the
     /// connection dropped.
@@ -279,6 +296,26 @@ impl std::fmt::Display for TerminalError {
                     f,
                     "a command is still running in this terminal; send_signal or wait for it to finish first"
                 )
+            }
+            TerminalError::StaleTerminal { terminal_id, pod_id, live_pod, terminal_closed } => {
+                match (live_pod, terminal_closed) {
+                    (Some(live_pod), true) => write!(
+                        f,
+                        "terminal {terminal_id} has been terminated; your pod {live_pod} is running — \
+                         call create_terminal for a new one."
+                    ),
+                    (Some(live_pod), false) => write!(
+                        f,
+                        "terminal {terminal_id} belonged to pod {pod_id}, which has stopped; \
+                         your pod {live_pod} is running — use list_terminals to see your terminals, \
+                         or create_terminal for a new one."
+                    ),
+                    (None, _) => write!(
+                        f,
+                        "terminal {terminal_id} belonged to pod {pod_id}, which has stopped; \
+                         this conversation has no running pod — call create_pod, then create_terminal."
+                    ),
+                }
             }
             TerminalError::Agent(e) => write!(f, "{e}"),
             TerminalError::AgentOutdated { found, image } => {
