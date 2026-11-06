@@ -190,6 +190,62 @@ pub(crate) async fn forget_mock_server(server_id: i64) {
     REGISTRY.lock().await.remove(&server_id);
 }
 
+/// SME-394: a test-held gate over the mock's `hold` tool, which answers
+/// only once [`HoldGate::release`] has been called: a way to land calls on
+/// chosen sides of a wall-clock window — e.g. to straddle the script
+/// call-summary beat (`script_mcp::SUMMARY_EVERY`) instead of hoping load
+/// opens the gap.
+#[derive(Clone)]
+pub(crate) struct HoldGate(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl HoldGate {
+    /// Lets the `hold` calls answer — those already waiting, and any
+    /// arriving later.
+    pub(crate) fn release(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// For other modules' tests (SME-394): lists `echo`, `second_tool` and a
+/// `hold` tool parked on a returned [`HoldGate`] — not, unlike
+/// [`mock_server_for_tests`], a `hang` route. The server gets the product's
+/// call budget (SME-356), so a held call outlives the tests' 1 s timeout.
+pub(crate) async fn mock_holding_server_for_tests(
+    pool: &sqlx::PgPool,
+    name: &str,
+) -> (McpServerConfig, Arc<AtomicU32>, HoldGate) {
+    let id = next_server_id(pool).await;
+    let config = crate::db::create_mcp_server_config(pool, name, "http://unused.invalid/mcp", &HashMap::new(), "static_headers", None, None)
+        .await
+        .expect("create mcp server config");
+    assert_eq!(config.id, id);
+    crate::mcp::test_support::give_product_budget(config.id);
+    let server = MockMcpServer::new(true);
+    // Before it's served, so no `tools/list_changed` marks the list stale.
+    server.router.write().await.enable_route("second_tool");
+    let hold = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gate = HoldGate(hold.clone());
+    server.router.write().await.add_route(ToolRoute::new_dyn(
+        rmcp::model::Tool::new(
+            "hold",
+            "Answers once the test's gate is released",
+            Arc::new(serde_json::from_value(serde_json::json!({"type": "object"})).unwrap()),
+        ),
+        move |_ctx| {
+            let hold = hold.clone();
+            Box::pin(async move {
+                while !hold.load(Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                Ok(CallToolResult::default().into())
+            })
+        },
+    ));
+    let calls = server.calls.clone();
+    register_mock(config.id, server).await;
+    (config, calls, gate)
+}
+
 async fn register_mock(server_id: i64, server: MockMcpServer) -> MockMcpServer {
     let (server_transport, client_transport) = tokio::io::duplex(4096);
 
