@@ -557,3 +557,102 @@ async fn test_a_wake_drains_a_lost_command(pool: PgPool) {
     );
     assert_eq!(counter.load(Ordering::SeqCst), 1, "the wake called the model");
 }
+
+/// SME-409: the sighting state — a question the conversation waits on, and
+/// a finished command, an idle-due running command and a queued agent
+/// message all owed at once. A wake must stop at the question *before*
+/// consuming any of them: a saved notice is invisible to every re-wake
+/// rule (`wake_has_work` counts only *un*notified ends, due idles,
+/// answered-untaken questions and undelivered rows), so consuming one into
+/// a turn that stops before its model call freezes it until the question
+/// resolves — the ticket's notice saved with no turn telling it. All three
+/// stay queued and marked un-notified; then the answer, recorded with no
+/// turn, is told by the next wake *together with* all three notices, in
+/// one model call.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_wake_while_a_question_waits_leaves_every_notice_queued(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+    waiting_question(&pool, conversation_id).await;
+    // The finished command (`cmd-1`) and the idle-due running one
+    // (`cmd-idle`) on one live pod — the pair this file's fixture builds,
+    // since the two single-purpose ones can't share a conversation.
+    finished_and_idle_commands(&pool, conversation_id).await;
+    // And a queued agent message, owed like the other two.
+    let mut conn = pool.acquire().await.expect("a connection");
+    db::queue_agent_message(
+        &mut conn,
+        conversation_id,
+        None,
+        "agent #9",
+        db::KIND_MESSAGE,
+        "Reply body.",
+    )
+    .await
+    .expect("queue the message");
+
+    let counter = start_mock_upstream(&pool, vec![text_reply_body("Noted.")]).await;
+
+    // The blocked wake: it stops at the question, having consumed nothing.
+    let woke = wake_conversation(&pool, conversation_id)
+        .await
+        .expect("a wake that stops at the question succeeds");
+    let saved = db::list_messages(&pool, conversation_id).await.expect("list messages");
+    assert!(saved.is_empty(), "nothing may be saved into a turn that stops at the question: {saved:?}");
+    assert!(woke.is_empty(), "the blocked wake persisted nothing: {woke:?}");
+    let remaining = db::unnotified_finished_terminal_commands(&pool, conversation_id)
+        .await
+        .expect("query unnotified commands");
+    assert!(
+        remaining.iter().any(|c| c.command_id == "cmd-1"),
+        "cmd-1's finish notice is still owed, not consumed: {remaining:?}"
+    );
+    let idle = db::get_terminal_command(&pool, "cmd-idle").await.expect("query").expect("the command row");
+    assert!(idle.idle_notice_at.is_none(), "cmd-idle's idle notice is still owed: {idle:?}");
+    let queued = db::undelivered_agent_messages(&pool, conversation_id).await.expect("query queued rows");
+    assert_eq!(queued.len(), 1, "the agent message is still queued: {queued:?}");
+    assert_eq!(counter.load(Ordering::SeqCst), 0, "the blocked wake called the model");
+    assert!(
+        db::get_pending_question(&pool, conversation_id).await.expect("read").is_some(),
+        "the question still waits"
+    );
+
+    // The question resolves — the answer recorded with no turn spawned —
+    // and the next wake tells it *and* everything that stayed queued.
+    let answers = vec![crate::questions::QuestionAnswer {
+        selected: vec!["Yes (Recommended)".to_string()],
+        other: None,
+    }];
+    assert!(
+        db::answer_pending_question(&pool, conversation_id, "toolu_ask", &answers).await.expect("answer"),
+        "the answer is recorded, with no turn spawned for it"
+    );
+
+    let woke = wake_conversation(&pool, conversation_id).await.expect("the resolving wake runs");
+    assert_eq!(woke.len(), 5, "the answer, the three notices and the reply: {woke:?}");
+    assert!(
+        matches!(
+            &woke[0].blocks().expect("valid blocks")[0],
+            anthropic::ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "toolu_ask"
+        ),
+        "the answer went first: {:?}",
+        woke[0]
+    );
+    assert!(woke[1].content.contains("Terminal command cmd-1 finished: exit code 0."), "{:?}", woke[1]);
+    assert!(woke[2].content.contains("Terminal command cmd-idle"), "{:?}", woke[2]);
+    assert!(woke[3].content.contains("Message from agent #9:"), "{:?}", woke[3]);
+    assert_eq!(woke[4].role, "assistant", "the one reply: {:?}", woke[4]);
+    assert_eq!(counter.load(Ordering::SeqCst), 1, "one model call told the answer and all three notices");
+    assert!(
+        db::unnotified_finished_terminal_commands(&pool, conversation_id).await.expect("query").is_empty(),
+        "cmd-1's notice is told and marked"
+    );
+    let idle = db::get_terminal_command(&pool, "cmd-idle").await.expect("query").expect("the command row");
+    assert!(idle.idle_notice_at.is_some(), "cmd-idle's idle notice is told and marked");
+    assert!(
+        db::undelivered_agent_messages(&pool, conversation_id).await.expect("query").is_empty(),
+        "the agent message is delivered"
+    );
+    assert!(db::get_pending_question(&pool, conversation_id).await.expect("read").is_none(), "the question is taken");
+}
