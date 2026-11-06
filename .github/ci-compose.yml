@@ -9,7 +9,13 @@
 # reuses its layers and docker:29-dind isn't pulled again; with the
 # docker-data volume, `down -v` threw both away every run. k3s keeps a
 # volume, so each run still starts with an empty cluster.
+#
+# Postgres logs every statement over 5 s and every lock wait over 1 s
+# (deadlock_timeout), which the server job's "Postgres checkpoints and slow
+# statements" step reports with the run's checkpoints (SME-376).
 services:
+  postgres:
+    command: ["postgres", "-c", "log_min_duration_statement=5000", "-c", "log_lock_waits=on"]
   docker:
     volumes:
       - ${CI_DOCKER_DATA:?}:/var/lib/docker

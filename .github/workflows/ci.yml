@@ -166,6 +166,25 @@ jobs:
         if: always()
         run: scripts/ci-test-report "$RUNNER_TEMP/server-tests.log" server 600
 
+      # Every passing #[sqlx::test] ends in sqlx's DROP DATABASE, which
+      # forces an immediate checkpoint and waits for it while holding one
+      # of sqlx's 20 master-pool connections; a slow checkpoint piles them
+      # up until a test's setup fails with PoolTimedOut (SME-376,
+      # docs/testing.md's "Known infrastructure failures"). The run's
+      # checkpoints, and the statements and lock waits Postgres logged as
+      # slow (.github/ci-compose.yml), say whether that's what happened.
+      - name: Postgres checkpoints and slow statements
+        if: always()
+        run: |
+          docker compose exec -T postgres psql -U smelt -d smelt -c \
+            "select num_timed, num_requested, write_time, sync_time, buffers_written from pg_stat_checkpointer" || true
+          docker compose logs --no-log-prefix postgres > "$RUNNER_TEMP/postgres.log" 2>&1 || true
+          echo "--- the 10 longest checkpoints ---"
+          { grep 'checkpoint complete' "$RUNNER_TEMP/postgres.log" || true; } \
+            | sed -E 's/.*total=([0-9.]+) s.*/\1 &/' | sort -rn | head -10 | cut -d' ' -f2-
+          echo "--- statements over 5 s and lock waits over 1 s (the last 50) ---"
+          { grep -E 'duration: [0-9.]+ ms|still waiting for|acquired .* after' "$RUNNER_TEMP/postgres.log" || true; } | tail -50
+
       - name: Dump sandbox pod diagnostics on failure
         if: failure()
         # kubectl runs *inside* the smelt service (docker compose run),
