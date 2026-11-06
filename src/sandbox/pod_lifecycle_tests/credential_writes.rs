@@ -82,11 +82,14 @@ async fn test_a_short_write_never_replaces_the_file(pool: PgPool) {
                 exec_with(&client, &pod_name(pod), "sandbox", &["sh", "-c", script, "sh", "/tmp/sme440", "600", length], Some(content.as_bytes()))
                     .await
                     .expect("exec")
-                    .exit_code
             }
         };
-        assert_eq!(write("GOOD-VALUE", "10").await, 0, "a whole write lands");
-        assert_ne!(write("GOOD", "10").await, 0, "a short write fails");
+        assert_eq!(write("GOOD-VALUE", "10").await.exit_code, 0, "a whole write lands");
+        let short = write("GOOD", "10").await;
+        assert_ne!(short.exit_code, 0, "a short write fails");
+        // Review L2: it says why, and leaves no partial temp file behind.
+        assert!(short.stderr.contains("short write"), "the reason: {:?}", short.stderr);
+        assert_eq!(sh_ok(&client, pod, "ls -A /tmp | grep -c '^sme440.new' || true").await, "0", "no temp file left");
         assert_eq!(sh_ok(&client, pod, "cat /tmp/sme440").await, "GOOD-VALUE", "and leaves the good file");
         assert_eq!(sh_ok(&client, pod, "stat -c %a /tmp/sme440").await, "600");
     })

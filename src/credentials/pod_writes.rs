@@ -92,9 +92,15 @@ pub async fn install_pod_files(
 /// (`$$`, unique in the pod while it runs): an abandoned attempt and a later
 /// writer sharing one name wrote into one inode, so one's bytes could land
 /// inside the other's renamed file (SME-440 review M1). The prune sweeps a
-/// leftover temp file, since no kept name matches it.
-pub(crate) const WRITE_FILE_SCRIPT: &str =
-    r#"umask 077 && t="$1.new.$$" && cat > "$t" && [ "$(wc -c < "$t")" -eq "$3" ] && chmod "$2" "$t" && mv "$t" "$1""#;
+/// leftover temp file, since no kept name matches it. A short write
+/// removes its own temp file and says why (review L2): the install stops
+/// before its prune, which would otherwise leave a partial key behind.
+pub(crate) const WRITE_FILE_SCRIPT: &str = r#"umask 077
+t="$1.new.$$"
+cat > "$t" || { rm -f "$t"; echo "couldn't write $t" >&2; exit 1; }
+n=$(wc -c < "$t")
+if [ "$n" -ne "$3" ]; then rm -f "$t"; echo "short write to $1: $n of $3 bytes" >&2; exit 1; fi
+chmod "$2" "$t" && mv "$t" "$1" || { rm -f "$t"; exit 1; }"#;
 
 /// How long one of an install's execs may go unanswered before it counts as
 /// stalled and is run again (SME-440). On a loaded CI runner one exec of a
