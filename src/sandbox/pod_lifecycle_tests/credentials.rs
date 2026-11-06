@@ -206,9 +206,13 @@ async fn agent_state(pool: &PgPool, id: i64) -> Option<String> {
 
 /// Waits for child `id`'s state — and fails the test if it never gets
 /// there, rather than hanging on the scenario's own bound. Once the row
-/// leaves `starting` without matching, waiting can no longer help: both
-/// writers (`complete_start`, `fail_start`) are `starting`-guarded, so a
-/// start leaves `starting` exactly once and a different state is final —
+/// leaves `starting` without matching, waiting can no longer help: the
+/// start's two writers (`complete_start`, `fail_start`) are
+/// `starting`-guarded, and a stop or delete mid-start that writes
+/// `stopped` is a third way out that never comes back —
+/// `reactivate_agent` requires `started_at`, which a child stopped
+/// during its start never set, so that child stays off the `active`
+/// path. A state other than `starting` is thus final for this wait —
 /// name it at once instead of burning the bound. The give-up message
 /// names what production knows at that moment (last state read, whether
 /// the start task ended, the bound), so the next sighting tells a
