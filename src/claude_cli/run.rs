@@ -127,6 +127,8 @@ struct Run {
     /// False once the run can't be trusted with another call.
     healthy: bool,
     interrupts: u64,
+    /// The calls smelt has answered.
+    answered: std::collections::HashSet<String>,
     /// The tool calls the reply streaming now has started.
     streaming_ids: std::collections::HashSet<String>,
     /// Whether the last reply's results are in `answers`, until the CLI's
@@ -303,6 +305,7 @@ impl Run {
             heard: false,
             gone: false,
             streaming_ids: std::collections::HashSet::new(),
+            answered: std::collections::HashSet::new(),
             delivered: false,
         })
     }
@@ -414,6 +417,7 @@ impl Run {
             Some(id) => match self.answers.remove(&id) {
                 Some(reply) => {
                     let _ = parked.reply.send(reply);
+                    self.answered.insert(id);
                 }
                 // Not answered yet: the CLI makes a reply's first call
                 // before its `message_stop` (S2), and smelt runs it first.
@@ -497,6 +501,12 @@ impl Run {
                         return Err(e);
                     }
                 }
+                Some("user") => {
+                    if let Some(id) = self.answered_by_the_cli(&event) {
+                        self.healthy = false;
+                        return Err(format!("Claude Code answered tool call {id} itself, so its context and smelt's no longer agree; smelt stopped the call. Send another message to carry on from smelt's record."));
+                    }
+                }
                 Some("result") => {
                     self.state = State::Idle;
                     self.healthy = false;
@@ -506,6 +516,16 @@ impl Run {
                 _ => self.note(&event),
             }
         }
+    }
+
+    /// The id of a call of the parked reply that the CLI's echoed
+    /// `tool_result` answers though smelt never did (review 1 L2).
+    fn answered_by_the_cli(&self, event: &Value) -> Option<String> {
+        event["message"]["content"].as_array()?.iter().find_map(|block| {
+            let id = block["tool_use_id"].as_str()?;
+            let ours = self.expected.iter().any(|e| e.id == id);
+            (block["type"] == "tool_result" && ours && !self.answered.contains(id)).then(|| id.to_string())
+        })
     }
 
     /// What smelt notes of a line that isn't the reply's.

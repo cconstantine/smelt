@@ -377,3 +377,23 @@ async fn test_a_call_that_isnt_the_replys_is_refused_at_once(pool: PgPool) {
     assert!(refused[1].0 && refused[1].1 == crate::claude_cli::run::NOT_THE_REPLYS, "{results:?}");
     assert!(!refused[2].0, "the reply's own call gets its result: {results:?}");
 }
+
+/// Review 1 L2: the CLI answering one of the reply's calls itself (a
+/// local refusal smelt never heard of) means its context and smelt's went
+/// different ways: the call fails, saying so, rather than reading the
+/// CLI's next reply as the answer to smelt's results.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_call_the_cli_answered_itself_fails_the_call(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let reply = tool_reply(&[("toolu_self", "todoread", json!({}))]);
+    let own = json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_self", "is_error": true, "content": "refused locally"}]}});
+    let fake = FakeCli::new("itself", vec![vec![json!({"read": true}), reply[0].clone(), json!({"emit": [own]}), text_reply("Unrelated.")]]);
+    fake.pick_for(&pool, conversation.id).await;
+
+    let error = run_turn(&pool, conversation.id, hello()).await.expect_err("diverged");
+    assert!(error.to_string().contains("answered tool call toolu_self itself"), "{error}");
+    let saved = saved(&pool, conversation.id).await;
+    assert!(!saved.iter().any(|(_, blocks)| blocks.iter().any(|b| matches!(b, anthropic::ContentBlock::Text { text } if text == "Unrelated."))), "{saved:?}");
+}
