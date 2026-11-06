@@ -237,13 +237,13 @@ fn run_turn_steps<'a: 'b, 'b>(
                     .await
                     .map_err(ServerFnError::new)?,
             };
-            // The turn's own copy, mutable: an overflow refusal's window
-            // lands on it so every later size of the turn reads it (SME-73).
             // Before any slot, compaction or call: a Claude Code turn has
             // no transport yet (SME-429; SME-430 adds it).
             if model.kind == crate::providers::ProviderKind::ClaudeCli {
                 return Err(ServerFnError::new(crate::claude_cli::NOT_YET));
             }
+            // The turn's own copy, mutable: an overflow refusal's window
+            // lands on it so every later size of the turn reads it (SME-73).
             let turn_model = resolved_model.insert(model);
             // Take the provider's request slot before this turn's first
             // model call, and re-check the pool every iteration after
