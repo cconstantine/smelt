@@ -323,9 +323,10 @@ pub async fn watch_idle_commands(pool: PgPool) {
 /// due commands in one conversation wakes it once; the wake's drain re-reads
 /// the due rule under the conversation lock, so a command that finished, or
 /// was touched, or whose notice another drain already saved in between costs
-/// nothing. A conversation the user has stopped is left out rather than
-/// woken — see the skip below. Returns the conversation ids it woke, oldest
-/// first, so the pass is testable without running a turn.
+/// nothing. Conversations the user has stopped, or that wait on an
+/// unanswered question (SME-409), are left out rather than woken — see the
+/// skips below. Returns the conversation ids it woke, oldest first, so the
+/// pass is testable without running a turn.
 pub(crate) async fn notice_idle_commands_once(pool: &PgPool) -> Vec<i64> {
     let due = match db::idle_commands_to_notice(pool).await {
         Ok(due) => due,
@@ -347,6 +348,25 @@ pub(crate) async fn notice_idle_commands_once(pool: &PgPool) -> Vec<i64> {
         // still owed, and the user's next message drains it as ever.
         if crate::turn::is_paused(conversation_id) {
             continue;
+        }
+        // The conversation waits on an unanswered question, of either
+        // `asked_of` kind. Its wake runs a turn that stops at the question
+        // *above* the drains (SME-409), so as with a stopped conversation
+        // it saves and marks nothing: the row stays due, and every pass
+        // would wake it again for as long as the question waits — a counted
+        // turn, an "…waking its conversation" line and a tab flap for zero
+        // work done, the churn review 1 found (SME-409 review 1, mirroring
+        // the skip above). The notice is still owed, not lost: the turn
+        // that resolves the question drains it with that moment's numbers.
+        // A failed read wakes as today.
+        match db::question_waits(pool, conversation_id).await {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                conversation_id,
+                error = %e,
+                "couldn't check a conversation's waiting question for its idle notices"
+            ),
         }
         // Ids only, never the command line: that's model-authored text
         // (SME-137), and the tool span already records ids and no input.

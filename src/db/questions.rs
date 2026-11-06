@@ -96,6 +96,20 @@ pub async fn get_pending_question(
     Ok(row.map(stored_question))
 }
 
+/// Whether `conversation_id` waits on an unanswered question — either
+/// `asked_of` kind: the state that stops a turn's iteration *above* its
+/// drains (`take_answer_or_wait`, SME-409), so a wake into it consumes
+/// nothing. The idle watch skips such conversations for that reason
+/// (`sandbox::watch::notice_idle_commands_once`, SME-409 review 1).
+pub async fn question_waits(pool: &PgPool, conversation_id: i64) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM pending_questions WHERE conversation_id = $1 AND answer IS NULL)",
+    )
+    .bind(conversation_id)
+    .fetch_one(pool)
+    .await
+}
+
 /// Records the user's `answer` for the waiting question `tool_use_id`.
 /// False when there's no such question, it was already answered (another
 /// tab got there first) or it's asked of the child's parent (SME-238):

@@ -185,12 +185,26 @@ fn run_turn_steps<'a: 'b, 'b>(
 
         let mut streak = TextCallStreak::default();
         for _ in 0..max_turns {
-            // Checked at the top of every loop iteration, not just once per
-            // `run_turn_bounded` call — this is what gives same-turn visibility: if
-            // a command finishes partway through a turn's tool-calling
-            // loop, the very next iteration already sees the notification,
-            // without waiting for a fresh user message. See SME-9's
-            // "What" and "How" (the completion-notification design).
+            // The model's `ask_user` (SME-34): an answer recorded since
+            // this turn saved its own message is taken now, so the model
+            // never sees the call unanswered. A question still waiting
+            // stops this iteration *before* it consumes anything: a notice
+            // saved and marked here could never be re-woken
+            // (`wake_has_work` sees consumed as done), so it stays queued
+            // and the turn that resolves the question — a card answer, the
+            // parent's reply, or the user's dismissive message — tells it
+            // (SME-409). No row left means none can be answered until this
+            // turn asks again (code review 1).
+            if take_answer_or_wait(pool, conversation_id, &mut pending_new_content, &mut persisted).await? {
+                return Ok(persisted);
+            }
+            // Checked at the top of every loop iteration past the question
+            // above, not just once per `run_turn_bounded` call — this is
+            // what gives same-turn visibility: if a command finishes
+            // partway through a turn's tool-calling loop, the very next
+            // iteration already sees the notification, without waiting for
+            // a fresh user message. See SME-9's "What" and "How" (the
+            // completion-notification design).
             drain_unnotified_terminal_commands(
                 pool,
                 conversation_id,
@@ -205,16 +219,6 @@ fn run_turn_steps<'a: 'b, 'b>(
                 .await?;
             // Reports and notices from agents (SME-236), likewise.
             drain_agent_messages(pool, conversation_id, &mut pending_new_content, &mut persisted).await?;
-
-            // The model's `ask_user` (SME-34): an answer recorded since
-            // this turn saved its own message is taken now, so the model
-            // never sees the call unanswered; a question still waiting
-            // means this turn's notice is saved and the model hears it with
-            // the answer. No row left means none can be answered until this
-            // turn asks again (code review 1).
-            if take_answer_or_wait(pool, conversation_id, &mut pending_new_content, &mut persisted).await? {
-                return Ok(persisted);
-            }
 
             // Nothing to do: `new_message` was `None` (a pure "check for a
             // backlog" wake-up, see `wake_conversation`) and the drain
