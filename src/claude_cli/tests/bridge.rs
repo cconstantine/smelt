@@ -106,3 +106,20 @@ async fn test_the_bridge_refuses_a_wrong_token_and_an_unknown_tool() {
     assert!(is_error);
     assert!(text.contains("no tool named rm_rf"), "{text}");
 }
+
+/// Review 1 L10: a long smelt name (an MCP tool's can be 128 characters)
+/// becomes a CLI name within the limit, still unique, and maps back.
+#[tokio::test]
+async fn test_a_long_tool_name_is_shortened_uniquely_and_maps_back() {
+    use crate::claude_cli::bridge::MAX_CLI_TOOL_NAME;
+    let long_a = format!("github.{}_a", "x".repeat(110));
+    let long_b = format!("github.{}_b", "x".repeat(110));
+    let (a, b) = (cli_tool_name(&long_a), cli_tool_name(&long_b));
+    assert!(a.len() <= MAX_CLI_TOOL_NAME && b.len() <= MAX_CLI_TOOL_NAME, "{a} {b}");
+    assert_ne!(a, b, "two names sharing a long prefix stay apart");
+    assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'), "{a}");
+    assert_eq!(cli_tool_name("todoread"), "mcp__smelt__todoread", "a short name is as it was");
+    let run = bridge().await.expect("the bridge starts").register(&[tool(&long_a), tool(&long_b)]);
+    assert_eq!(run.smelt_name(&a), Some(long_a.as_str()));
+    assert_eq!(run.smelt_name(&b), Some(long_b.as_str()));
+}

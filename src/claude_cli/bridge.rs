@@ -34,12 +34,27 @@ pub const SERVER_NAME: &str = "smelt";
 /// `tools/call` (the planner's probe P2).
 pub const TOOL_USE_ID_META: &str = "claudecode/toolUseId";
 
+/// The longest tool name the CLI is given: Claude Code refuses an MCP
+/// tool whose full name passes 64 characters (review 1 L10), and smelt's
+/// own can be 128 (an MCP server's tools).
+pub const MAX_CLI_TOOL_NAME: usize = 64;
+
 /// What a tool's name is to the CLI: `mcp__smelt__` and smelt's name, with
 /// every character outside `[A-Za-z0-9_-]` made `_` (an MCP tool's own
 /// name can hold a `.`; Claude Code's names can't).
+/// A name that would pass `MAX_CLI_TOOL_NAME` is cut, and ends with 8
+/// hex characters of a hash of smelt's whole name, so two cut alike stay
+/// apart (review 1 L10).
 pub fn cli_tool_name(name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let prefix = format!("mcp__{SERVER_NAME}__");
     let plain: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
-    format!("mcp__{SERVER_NAME}__{plain}")
+    if prefix.len() + plain.len() <= MAX_CLI_TOOL_NAME {
+        return format!("{prefix}{plain}");
+    }
+    let hash: String = Sha256::digest(name.as_bytes()).iter().take(4).map(|b| format!("{b:02x}")).collect();
+    let keep = MAX_CLI_TOOL_NAME - prefix.len() - hash.len() - 1;
+    format!("{prefix}{}_{hash}", &plain[..keep])
 }
 
 /// One tool call the CLI made, waiting for smelt's result.
