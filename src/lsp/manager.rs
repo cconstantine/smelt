@@ -610,21 +610,42 @@ fn note_indexing(answer: String, indexing: bool, server: &str) -> String {
 /// after a server starts, or after smelt restarts, connects in the
 /// background and says so), and never fails the edit.
 pub async fn diagnostics_after_edit(pool: &PgPool, conversation_id: i64, path: &str) -> Option<String> {
-    let all = configs(pool).await.ok()?;
-    let config_list: Vec<LanguageServerConfig> = all.into_iter().map(|(c, _)| c).collect();
-    // Nothing takes this kind of file: no need to ask the cluster.
-    let extension = std::path::Path::new(path).extension()?.to_str()?;
-    if !config_list.iter().any(|c| c.enabled && c.file_types.contains_key(extension)) {
-        return None;
+    match edit_attempt(pool, conversation_id, path).await {
+        Ok(answer) => answer,
+        Err(why) => {
+            // The reason reaches the log only — an edit's reply stays silent
+            // about LSP plumbing failures (SME-426 Q2) — but it names the
+            // step, so a red `expect` or a missing `diagnostics` key can be
+            // attributed from the server log without a re-run.
+            tracing::warn!(path, error = %why, "no diagnostics after an edit");
+            None
+        }
     }
-    let client = crate::sandbox::kube_client().ok()?;
-    let sandbox = sandbox_ref(pool, &client, conversation_id).await.ok()?;
-    edit_diagnostics(&config_list, &client, &sandbox, path).await
 }
 
-async fn edit_diagnostics(config_list: &[LanguageServerConfig], client: &kube::Client, sandbox: &SandboxRef, path: &str) -> Option<String> {
-    let running = ready_servers(client, sandbox).await.ok()?;
-    let config = ops::choose_server(path, config_list, &running).ok()?.clone();
+/// `edit_diagnostics` up front, keeping the reason it didn't answer instead
+/// of dropping it: every step's error is prefixed with the step's name.
+async fn edit_attempt(pool: &PgPool, conversation_id: i64, path: &str) -> Result<Option<String>, String> {
+    let all = configs(pool).await.map_err(|e| format!("configs: {e}"))?;
+    let config_list: Vec<LanguageServerConfig> = all.into_iter().map(|(c, _)| c).collect();
+    // Nothing takes this kind of file: no need to ask the cluster. (No
+    // extension is as ordinary as an unclaimed one: `Ok(None)`, not an error.)
+    let Some(extension) = std::path::Path::new(path).extension().and_then(|e| e.to_str()) else {
+        return Ok(None);
+    };
+    if !config_list.iter().any(|c| c.enabled && c.file_types.contains_key(extension)) {
+        return Ok(None);
+    }
+    let client = crate::sandbox::kube_client().map_err(|e| format!("kube_client: {e}"))?;
+    let sandbox = sandbox_ref(pool, &client, conversation_id).await.map_err(|e| format!("sandbox_ref: {e}"))?;
+    edit_diagnostics(&config_list, &client, &sandbox, path).await.map(Some)
+}
+
+async fn edit_diagnostics(config_list: &[LanguageServerConfig], client: &kube::Client, sandbox: &SandboxRef, path: &str) -> Result<String, String> {
+    let running = ready_servers(client, sandbox).await.map_err(|e| format!("ready_servers: {e}"))?;
+    let config = ops::choose_server(path, config_list, &running)
+        .map_err(|e| format!("choose_server: {e}"))?
+        .clone();
     let pod_name = pods::server_pod_name(sandbox.pod_id, &config.name);
     let root = root_in_pod(client, &pod_name, path, &config.root_markers).await;
     // Only a session that's already open: opening one waits for the
@@ -633,15 +654,15 @@ async fn edit_diagnostics(config_list: &[LanguageServerConfig], client: &kube::C
     if !open {
         let failed = CONNECT_FAILED.lock().unwrap_or_else(|e| e.into_inner()).get(&pod_name).cloned();
         connect_in_background(client, &pod_name, &config, &root);
-        return Some(match failed {
+        return Ok(match failed {
             Some(error) => format!("{} couldn't connect, so there are no diagnostics ({error}).", config.name),
             None => format!("{} is connecting; edits after this one will include its diagnostics.", config.name),
         });
     }
-    let session = session_for(client, &pod_name, &config, &root).await.ok()?;
-    refresh_open_files(client, &pod_name, &session).await.ok()?;
-    let text = read_in_pod(client, &pod_name, path).await.ok()?;
-    let version = session.sync(path, &text).await.ok()?;
+    let session = session_for(client, &pod_name, &config, &root).await.map_err(|e| format!("session_for: {e}"))?;
+    refresh_open_files(client, &pod_name, &session).await.map_err(|e| format!("refresh_open_files: {e}"))?;
+    let text = read_in_pod(client, &pod_name, path).await.map_err(|e| format!("read_in_pod: {e}"))?;
+    let version = session.sync(path, &text).await.map_err(|e| format!("session.sync: {e}"))?;
     // When the server was told this text, by the refresh (which syncs the
     // edited file too when the server has it open) or by the sync:
     // diagnostics published without a version before then are for older
@@ -658,7 +679,7 @@ async fn edit_diagnostics(config_list: &[LanguageServerConfig], client: &kube::C
     if !found.complete {
         out.push_str("\n(It's still working, indexing or checking; the list may be incomplete. The lsp tool's diagnostics operation shows the latest.)");
     }
-    Some(out)
+    Ok(out)
 }
 
 #[cfg(test)]
