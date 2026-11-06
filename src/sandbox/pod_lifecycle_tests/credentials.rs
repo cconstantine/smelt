@@ -198,7 +198,7 @@ async fn column(pool: &PgPool, child: i64) -> Vec<String> {
 /// Waits for child `id`'s state — and fails the test if it never gets
 /// there, rather than hanging on the scenario's own bound.
 async fn wait_for_state(pool: &PgPool, id: i64, want: &str) {
-    tokio::time::timeout(Duration::from_secs(90), async {
+    tokio::time::timeout(start_chain_wait(), async {
         loop {
             let state: Option<String> = sqlx::query_scalar("SELECT state FROM agents WHERE conversation_id = $1")
                 .bind(id)
@@ -219,7 +219,7 @@ async fn wait_for_state(pool: &PgPool, id: i64, want: &str) {
 /// clearing and reconcile included, which is what the assertions after
 /// this one are about.
 async fn wait_start_ended(child: i64) {
-    tokio::time::timeout(Duration::from_secs(90), async {
+    tokio::time::timeout(start_chain_wait(), async {
         while !test_hooks::starts_ended(child) {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -231,7 +231,7 @@ async fn wait_start_ended(child: i64) {
 /// The conversation's live pod, appearing when its start's clone makes
 /// it (or its first turn does).
 async fn wait_pod_id(pool: &PgPool, conversation: i64) -> i64 {
-    tokio::time::timeout(Duration::from_secs(90), async {
+    tokio::time::timeout(start_chain_wait(), async {
         loop {
             if let Ok(pod) = live_pod_id(pool, conversation).await {
                 return pod;
@@ -249,7 +249,7 @@ async fn wait_pod_id(pool: &PgPool, conversation: i64) -> i64 {
 fn pause_at_done_boundary(caller: i64) -> (tokio::sync::oneshot::Sender<()>, impl Future<Output = ()>) {
     let (reached, release) = test_hooks::pause(test_hooks::BEFORE_START_DONE, caller);
     (release, async move {
-        tokio::time::timeout(Duration::from_secs(90), reached).await.expect("the boundary").expect("the hook");
+        tokio::time::timeout(start_chain_wait(), reached).await.expect("the boundary").expect("the hook");
     })
 }
 
@@ -385,7 +385,16 @@ async fn test_a_stored_secret_reaches_a_grandchild_no_ancestor_held(pool: PgPool
         // field narrows the chain's key away (D3) and names no secret,
         // so it holds neither — in particular not `deep-key`, which is
         // stored while its pod lives.
+        //
+        // SME-432 forcing (red-first, red by construction until the fix):
+        // hold the child's start at its done boundary and never release
+        // it, so the wait for `active` races a start that stays
+        // `starting` for its whole life — shape C — which is what the
+        // full gate's load did by accident when the chain outran the
+        // 90 s literal. The fix derives the bound and lifts this hold.
+        let (_release, wait_paused) = pause_at_done_boundary(root);
         let child = start_child(&pool, root, Some("plain")).await;
+        wait_paused.await;
         wait_for_state(&pool, child, "active").await;
         wait_start_ended(child).await;
         let child_pod = wait_pod_id(&pool, child).await;

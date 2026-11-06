@@ -194,6 +194,34 @@ fn test_teardown_waits_longer_than_a_pod_start_can_take() {
     );
 }
 
+/// The most a child's start chain can take before it ends `active` or
+/// `failed`: the pod start's own bound (up to two running waits plus git
+/// setup, as teardown's `pod_start_wait`), plus the start's post-pod
+/// tail — the clone exec, the persona reads, the credentials reconcile,
+/// `complete_start`. SME-432: the waits in `credentials.rs` race that
+/// chain with this bound. It still carries the four 90 s literals moved
+/// out of those waits — the companion test below is red until the bound
+/// is derived from the env-configurable timeout, as
+/// docs/testing/sandbox.md demands.
+fn start_chain_wait() -> Duration {
+    Duration::from_secs(90)
+}
+
+/// SME-432: the start-chain waits outlast a start chain. The chain's pod
+/// start alone can wait out a stopping pod and then its own pod each for
+/// the running wait (120 s in CI) — a fixed 90 s loses to a start
+/// production has not given up on (the full-gate flake this guards).
+/// The permanent guard against re-literalising the bound.
+#[test]
+fn test_start_waits_outlast_the_start_chain() {
+    assert!(
+        start_chain_wait() > 2 * running_wait_timeout(),
+        "{:?} is shorter than two running waits of {:?}",
+        start_chain_wait(),
+        running_wait_timeout()
+    );
+}
+
 /// Deletes every conversation's pods and claims, every volume's claim, and
 /// anything else labelled with the test database's instance. Best-effort:
 /// a failure here mustn't hide the scenario's own.
