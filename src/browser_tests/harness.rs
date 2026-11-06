@@ -4,6 +4,9 @@ pub(super) struct BrowserTestHarness {
     pub(super) browser: Browser,
     server_task: tokio::task::JoinHandle<()>,
     preview_task: tokio::task::JoinHandle<()>,
+    /// Where every host outside this machine leads the tier's Chromes
+    /// (`OutsideWorld`).
+    outside: OutsideWorld,
     pub(super) base_url: String,
 }
 
@@ -24,6 +27,7 @@ impl BrowserTestHarness {
                 public_path.display()
             );
         }
+        let public_path = served_bundle(&public_path);
         // SAFETY: this test binary is single-threaded at this point (no
         // other threads have been spawned yet that could race a concurrent
         // std::env read) — see the harness's own doc comment on why this is
@@ -97,12 +101,14 @@ impl BrowserTestHarness {
                 .expect("test server error");
         });
 
-        let browser = launch_browser().await;
+        let outside = OutsideWorld::start().await;
+        let browser = launch_browser(outside.port).await;
 
         Self {
             browser,
             server_task,
             preview_task,
+            outside,
             base_url: format!("http://127.0.0.1:{port}/"),
         }
     }
@@ -111,7 +117,7 @@ impl BrowserTestHarness {
     /// pass): tabs in different lanes never share a renderer, so one lane's
     /// busy page can't throttle another's timers or frames.
     pub(super) async fn another_browser(&self) -> Browser {
-        launch_browser().await
+        launch_browser(self.outside.port).await
     }
 
     /// Called explicitly at the end of the test rather than via `Drop`
@@ -122,15 +128,89 @@ impl BrowserTestHarness {
 
         self.server_task.abort();
         self.preview_task.abort();
+        self.outside.task.abort();
     }
+}
+
+/// SME-397: the outside world as the tier's Chromes see it, a port on this
+/// machine that takes every connection and never answers, so a page that
+/// waits on any host outside this machine waits for good, in every run,
+/// rather than only on the run where the real network is slow. A page's
+/// `load` used to wait on fonts.googleapis.com (see `served_bundle`), and a
+/// slow answer failed the first page load of a run after chromiumoxide's
+/// 30 s ("agent_tree: open the parent: Timeout").
+struct OutsideWorld {
+    port: u16,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl OutsideWorld {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind the outside world's port");
+        let port = listener.local_addr().expect("the outside world's address").port();
+        let task = tokio::spawn(async move {
+            // Held, never read or written: the browser's side waits.
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        Self { port, task }
+    }
+}
+
+/// SME-397: the bundle `built` as the tier serves it, in a directory beside
+/// it: the same files, linked, but an `index.html` with no stylesheet
+/// imported from another host. A debug bundle's `index.html` carries dx's
+/// dev toast, whose `<style>` imports a font stylesheet from
+/// fonts.googleapis.com, and a pending `@import` holds the page's `load`
+/// event (and its first paint), so every page load waited on Google. A
+/// release bundle, what smelt's image serves, has no toast and no import.
+fn served_bundle(built: &std::path::Path) -> PathBuf {
+    let served = built.with_file_name("public-browser-tier");
+    // Rebuilt from the bundle every run: a `dx build` since the last one
+    // changed its files.
+    if served.exists() {
+        std::fs::remove_dir_all(&served).expect("remove the last run's served bundle");
+    }
+    std::fs::create_dir_all(&served).expect("make the served bundle's directory");
+    for entry in std::fs::read_dir(built).expect("list the built bundle") {
+        let entry = entry.expect("a built bundle entry");
+        if entry.file_name() != "index.html" {
+            std::os::unix::fs::symlink(entry.path(), served.join(entry.file_name())).expect("link a bundle file");
+        }
+    }
+    let index = std::fs::read_to_string(built.join("index.html")).expect("read the bundle's index.html");
+    std::fs::write(served.join("index.html"), without_outside_imports(&index)).expect("write the served index.html");
+    served
+}
+
+/// `index` without its lines that `@import` a stylesheet by absolute URL.
+fn without_outside_imports(index: &str) -> String {
+    index
+        .lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            !["@import url('http", "@import url(\"http", "@import url(http", "@import 'http", "@import \"http"]
+                .iter()
+                .any(|import| line.starts_with(import))
+        })
+        .map(|line| format!("{line}\n"))
+        .collect()
 }
 
 /// Same launcher as the app's shared browser, so this Chrome can't outlive
 /// the test process either. `smelt-http.test` reaches the tier's server over
 /// plain HTTP from an origin that isn't a secure context, as a LAN address
 /// does (SME-105's copy fallback).
-async fn launch_browser() -> Browser {
-    crate::headless_chrome::launch(&[format!("--host-resolver-rules=MAP {INSECURE_HOST} 127.0.0.1")])
+/// Every other name, IP literals included, leads to `outside` (see
+/// `OutsideWorld`), except this machine's own: the tier's server on
+/// 127.0.0.1 and its previews on `*.localhost`.
+async fn launch_browser(outside: u16) -> Browser {
+    crate::headless_chrome::launch(&[format!(
+        "--host-resolver-rules=MAP {INSECURE_HOST} 127.0.0.1, MAP * 127.0.0.1:{outside}, \
+         EXCLUDE 127.0.0.1, EXCLUDE localhost, EXCLUDE *.localhost"
+    )])
         .await
         .expect("chrome-headless-shell should launch")
 }
