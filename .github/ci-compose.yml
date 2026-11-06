@@ -9,7 +9,25 @@
 # reuses its layers and docker:29-dind isn't pulled again; with the
 # docker-data volume, `down -v` threw both away every run. k3s keeps a
 # volume, so each run still starts with an empty cluster.
+#
+# Postgres runs with fsync=off (SME-376). Every passing #[sqlx::test] ends
+# in sqlx's DROP DATABASE, which forces an immediate checkpoint and waits
+# for it while holding one of sqlx's 20 master-pool connections (sqlx 0.8.6
+# hard-codes both the 20 and the 30 s wait for one, with nothing to set
+# them). On this runner the checkpoints' fsyncs took up to 10 s each while
+# the cluster tests used the same disk, a dozen drops waited on one together,
+# and a slower stretch pushed a setup past the 30 s: `failed to connect to
+# setup test database: PoolTimedOut`. This database lives for one job
+# (`down -v`), so it has nothing to make durable; without fsync a checkpoint
+# is writes to the page cache, which a busy disk can't stretch to 30 s.
+# The dev stack keeps fsync on: its database is real.
+#
+# Postgres also logs every statement over 5 s and every lock wait over 1 s
+# (deadlock_timeout), which the server job's "Postgres checkpoints and slow
+# statements" step reports with the run's checkpoints.
 services:
+  postgres:
+    command: ["postgres", "-c", "fsync=off", "-c", "log_min_duration_statement=5000", "-c", "log_lock_waits=on"]
   docker:
     volumes:
       - ${CI_DOCKER_DATA:?}:/var/lib/docker
