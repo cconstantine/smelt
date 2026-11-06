@@ -228,10 +228,14 @@ fn apply(blocks: &mut Blocks, stop_reason: &mut String, event: &Value, on_delta:
     Ok(())
 }
 
-/// Whether an `init` event says the CLI connected to smelt's bridge
-/// (review 1 L7).
+/// Whether an `init` event says the CLI has smelt's tools: the bridge
+/// `connected`, or any of its tools listed. The CLI waits about 30 s for
+/// a server before it starts, then starts with it `pending` and none of its
+/// tools (the capture `pending`, review 2 L15), so `pending` alone isn't
+/// enough, and its tools are (review 1 L7).
 fn bridge_connected(init: &Value) -> bool {
-    init["mcp_servers"]
-        .as_array()
-        .is_some_and(|servers| servers.iter().any(|s| s["name"] == crate::claude_cli::bridge::SERVER_NAME && s["status"] == "connected"))
+    let name = crate::claude_cli::bridge::SERVER_NAME;
+    let connected = init["mcp_servers"].as_array().is_some_and(|servers| servers.iter().any(|s| s["name"] == name && s["status"] == "connected"));
+    let prefix = format!("mcp__{name}__");
+    connected || init["tools"].as_array().is_some_and(|tools| tools.iter().any(|t| t.as_str().is_some_and(|t| t.starts_with(&prefix))))
 }

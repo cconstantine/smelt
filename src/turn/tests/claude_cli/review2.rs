@@ -2,6 +2,7 @@
 //! (SME-430) added.
 
 use super::review1::{one_call, said};
+use crate::claude_cli::tests::fake::fixture_lines;
 use super::*;
 
 /// Review 2 M3: near the window each call's cap shrinks with the room
@@ -81,4 +82,28 @@ async fn test_a_tight_conversation_fails_plainly_when_its_request_is_built(pool:
     let error = run_turn(&pool, conversation.id, hello()).await.expect_err("it doesn't fit").to_string();
     assert!(error.contains(crate::claude_cli::CANT_COMPACT_YET), "{error}");
     assert_eq!(fake.started(), 0, "no CLI ran");
+}
+
+/// Review 2 L15, against the real CLI (capture `pending`): with smelt's
+/// MCP server not answering, the CLI waits about 30 s, then starts with
+/// the server `pending` and none of its tools, and would run the turn
+/// without them. That fails the call. An init that says `pending` but
+/// lists smelt's tools (the server came up as it started) runs.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_pending_bridge_fails_only_without_its_tools(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let captured = fixture_lines("pending").into_iter().find(|l| l["subtype"] == "init").expect("the capture's init");
+    assert_eq!(captured["mcp_servers"][0]["status"], "pending", "the real CLI reports pending");
+    let with_tools = json!({"type": "system", "subtype": "init", "tools": ["mcp__smelt__todoread"], "mcp_servers": [{"name": "smelt", "status": "pending"}]});
+    let fake = FakeCli::new("pending", vec![
+        vec![json!({"read": true}), json!({"emit": [captured]}), text_reply("No tools.")],
+        vec![json!({"read": true}), json!({"emit": [with_tools]}), text_reply("With tools.")],
+    ]);
+    fake.pick_for(&pool, conversation.id).await;
+
+    let error = run_turn(&pool, conversation.id, hello()).await.expect_err("no tools").to_string();
+    assert!(error.contains("couldn't connect to smelt's tools"), "{error}");
+    run_turn(&pool, conversation.id, hello()).await.expect("smelt's tools are listed");
 }
