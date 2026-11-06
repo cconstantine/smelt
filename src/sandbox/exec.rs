@@ -90,48 +90,16 @@ impl PodShell {
     /// database's: another database's is `NotOurs`, and nothing runs.
     pub async fn run(&self, command: &[&str], stdin: Option<&[u8]>) -> Result<ExecResult, SandboxError> {
         refuse_foreign(&pods_api(&self.client), &self.pod_name, &self.instance).await?;
-        let ran = exec_with(&self.client, &self.pod_name, "sandbox", command, stdin).await;
         #[cfg(test)]
-        if stall_hook::take(&self.pod_name) {
-            // The command ran; its answer never comes.
-            std::future::pending::<()>().await;
+        if let Some(stall) = stall_hook::take(&self.pod_name, command) {
+            return stall_hook::stall(&self.client, &self.pod_name, command, stdin, stall).await;
         }
-        ran
+        exec_with(&self.client, &self.pod_name, "sandbox", command, stdin).await
     }
 }
 
-/// SME-440: makes a pod's next execs stall the way one did on a loaded CI
-/// runner — the command runs in the pod, and `run` never answers — so a
-/// test can stall one on demand.
 #[cfg(test)]
-pub(crate) mod stall_hook {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-
-    static STALLS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
-
-    /// The next `count` execs through `PodShell::run` into `pod_name` run,
-    /// then never answer.
-    pub(crate) fn stall_next(pod_name: &str, count: usize) {
-        STALLS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(pod_name.to_string(), count);
-    }
-
-    /// How many of the armed stalls for `pod_name` are still to come.
-    pub(crate) fn remaining(pod_name: &str) -> usize {
-        STALLS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(pod_name).copied()).unwrap_or(0)
-    }
-
-    pub(super) fn take(pod_name: &str) -> bool {
-        let mut stalls = STALLS.lock().unwrap_or_else(|e| e.into_inner());
-        match stalls.as_mut().and_then(|m| m.get_mut(pod_name)) {
-            Some(left) if *left > 0 => {
-                *left -= 1;
-                true
-            }
-            _ => false,
-        }
-    }
-}
+pub(crate) mod stall_hook;
 
 /// kube exec in `pod_name`'s `container`, unchecked: the caller makes
 /// sure the pod is this database's first (`PodShell::run` reads it before

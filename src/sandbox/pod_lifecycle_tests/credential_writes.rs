@@ -2,6 +2,7 @@
 //! that never answers is run again; a write lands whole or not at all.
 
 use super::*;
+use crate::sandbox::stall_hook::{self, Stall};
 
 /// Runs `script` in pod `pod`'s sandbox container: exit code and stdout.
 async fn sh(client: &kube::Client, pod: i64, script: &str) -> (i32, String) {
@@ -53,10 +54,10 @@ async fn test_an_install_whose_exec_stalls_still_lands(pool: PgPool) {
             .execute(&pool)
             .await
             .expect("narrow");
-        crate::sandbox::stall_hook::stall_next(&pod_name(pod), 1);
+        stall_hook::arm(&pod_name(pod), &[], 1, Stall::NoReply);
         let installed = crate::credentials::install_into_pod(&pool, pod).await;
-        let unused = crate::sandbox::stall_hook::remaining(&pod_name(pod));
-        crate::sandbox::stall_hook::stall_next(&pod_name(pod), 0);
+        let unused = stall_hook::remaining(&pod_name(pod));
+        stall_hook::arm(&pod_name(pod), &[], 0, Stall::NoReply);
         assert_eq!(unused, 0, "the stall was armed but no exec took it");
         installed.expect("an install with one stalled exec");
         let (code, _) = sh(&client, pod, "test -e /etc/smelt/keys/id_ed25519").await;
@@ -65,6 +66,12 @@ async fn test_an_install_whose_exec_stalls_still_lands(pool: PgPool) {
         assert_eq!(code, 1, "the secret file was pruned");
     })
     .await;
+}
+
+/// The deadline the install scripts check before each effect, a minute out.
+fn in_a_minute() -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    format!("SMELT_INSTALL_DEADLINE={}", now + 60)
 }
 
 /// SME-440: a write whose stdin ends short — an exec dropped mid-write —
@@ -79,7 +86,9 @@ async fn test_a_short_write_never_replaces_the_file(pool: PgPool) {
             let client = client.clone();
             async move {
                 let script = crate::credentials::WRITE_FILE_SCRIPT;
-                exec_with(&client, &pod_name(pod), "sandbox", &["sh", "-c", script, "sh", "/tmp/sme440", "600", length], Some(content.as_bytes()))
+                let deadline = in_a_minute();
+                let command = ["env", deadline.as_str(), "sh", "-c", script, "sh", "/tmp/sme440", "600", length];
+                exec_with(&client, &pod_name(pod), "sandbox", &command, Some(content.as_bytes()))
                     .await
                     .expect("exec")
             }
@@ -107,6 +116,7 @@ async fn test_two_writes_of_one_file_never_mix(pool: PgPool) {
         let conversation = db::create_conversation(&pool).await.expect("create conversation");
         let pod = create_pod(&pool, conversation.id, PodLimitOverrides::default()).await.expect("create_pod");
         let harness = r#"S="$1"
+export SMELT_INSTALL_DEADLINE=$(( $(date +%s) + 60 ))
 (sleep 2; printf AAAAA) | sh -c "$S" sh /tmp/sme440m1 600 5 &
 sleep 1
 printf BBBBBBBBBB | sh -c "$S" sh /tmp/sme440m1 600 10
@@ -117,6 +127,76 @@ cat /tmp/sme440m1"#;
             .expect("exec");
         let landed = ran.stdout.trim();
         assert!(landed == "AAAAA" || landed == "BBBBBBBBBB", "a mixed file landed: {landed:?}");
+    })
+    .await;
+}
+
+/// How late an abandoned exec starts in the H1 tests: past the first try's
+/// limit and the install's settling after it, so the late attempt acts
+/// after the install has answered and the next one has run.
+fn late_start() -> Duration {
+    crate::credentials::EXEC_STALL_AFTER + crate::credentials::CLOCK_SKEW_MARGIN + Duration::from_secs(5)
+}
+
+/// SME-440 review H1: a save whose write of a secret started late and was
+/// retried, then a delete. Once everything has run, the late attempt
+/// included, the secret file is gone: an exec an install abandoned can't
+/// act after that install has answered.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_late_write_from_a_retried_save_cant_undo_a_delete(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        persona_agent(&pool, conversation.id).await;
+        let pod = create_pod(&pool, conversation.id, PodLimitOverrides::default()).await.expect("create_pod");
+        let name = pod_name(pod);
+
+        sqlx::query("INSERT INTO named_secrets (name, value) VALUES ('linear-key', 'SECRET-MARKER')")
+            .execute(&pool)
+            .await
+            .expect("a secret");
+        stall_hook::arm(&name, &["/etc/smelt/secrets/linear-key"], 1, Stall::LateStart(late_start()));
+        crate::credentials::install_into_pod(&pool, pod).await.expect("the save");
+        assert_eq!(stall_hook::remaining(&name), 0, "the secret's write never stalled");
+        sh_ok(&client, pod, "test -e /etc/smelt/secrets/linear-key").await;
+
+        sqlx::query("DELETE FROM named_secrets WHERE name = 'linear-key'").execute(&pool).await.expect("delete");
+        crate::credentials::install_into_pod(&pool, pod).await.expect("the delete");
+        let late = stall_hook::late_starts_done(&name).await;
+        assert_eq!(late.len(), 1, "one late attempt ran");
+        assert_ne!(late[0], 0, "the late attempt acted past its deadline");
+        let (code, _) = sh(&client, pod, "test -e /etc/smelt/secrets/linear-key").await;
+        assert_eq!(code, 1, "the deleted secret came back: the late write landed");
+    })
+    .await;
+}
+
+/// SME-440 review H1: an install whose prune started late and was retried,
+/// then a save of a new secret. Once the late prune has run, the new
+/// secret's file is still there.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_late_prune_cant_remove_a_newer_write(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        persona_agent(&pool, conversation.id).await;
+        let pod = create_pod(&pool, conversation.id, PodLimitOverrides::default()).await.expect("create_pod");
+        let name = pod_name(pod);
+
+        stall_hook::arm(&name, &["for f in", "/etc/smelt/secrets"], 1, Stall::LateStart(late_start()));
+        crate::credentials::install_into_pod(&pool, pod).await.expect("an install with nothing to keep");
+        assert_eq!(stall_hook::remaining(&name), 0, "the prune never stalled");
+
+        sqlx::query("INSERT INTO named_secrets (name, value) VALUES ('linear-key', 'SECRET-MARKER')")
+            .execute(&pool)
+            .await
+            .expect("a secret");
+        crate::credentials::install_into_pod(&pool, pod).await.expect("the save");
+        let late = stall_hook::late_starts_done(&name).await;
+        assert_eq!(late.len(), 1, "one late attempt ran");
+        assert_ne!(late[0], 0, "the late attempt acted past its deadline");
+        let (code, _) = sh(&client, pod, "test -e /etc/smelt/secrets/linear-key").await;
+        assert_eq!(code, 0, "the late prune removed the newer secret");
     })
     .await;
 }

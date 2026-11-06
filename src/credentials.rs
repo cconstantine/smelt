@@ -17,7 +17,7 @@ pub use self::pod_writes::install_pod_files;
 #[cfg(test)]
 pub(crate) use self::pod_writes::WRITE_FILE_SCRIPT;
 #[cfg(test)]
-use self::pod_writes::EXEC_STALL_AFTER;
+pub(crate) use self::pod_writes::{CLOCK_SKEW_MARGIN, EXEC_STALL_AFTER};
 
 /// The built-in credential every persona may list in
 /// `smelt.credentials`: the user's git SSH key (SME-242). No stored
@@ -310,10 +310,10 @@ async fn write_pod_files(pool: &PgPool, pod_id: i64, files: &[PodFile]) -> Resul
     // lock, so a stalled exec mustn't hold it.
     let shell = sandbox::PodShell::for_pod(pool, pod_id).await.map_err(|e| e.to_string())?;
     let keys_dir = format!("{POD_GIT_DIR}/keys");
-    tokio::time::timeout(INSTALL_TIMEOUT, install_pod_files(&shell, files, &[keys_dir.as_str(), POD_SECRETS_DIR]))
-        .await
-        .map_err(|_| format!("writing credential files into the pod took over {}s", INSTALL_TIMEOUT.as_secs()))?
-        .map_err(|e| e.to_string())
+    // `install_pod_files` holds itself to `INSTALL_TIMEOUT`, and returns
+    // only once nothing it started can still act in the pod: a timeout
+    // around it would drop that wait and release the lock too soon.
+    install_pod_files(&shell, files, &[keys_dir.as_str(), POD_SECRETS_DIR]).await.map_err(|e| e.to_string())
 }
 
 /// Writes a starting child's decision into its live pod before its
