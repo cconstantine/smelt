@@ -157,10 +157,24 @@ async fn refuse_stale_terminal(pool: &PgPool, terminal_id: i64) -> Result<(), Te
     Err(TerminalError::StaleTerminal {
         terminal_id,
         pod_id,
-        live_pod: conversation_pod_id(pool, conversation_id).await.ok(),
+        live_pod: live_pod_or_propagate(conversation_pod_id(pool, conversation_id).await)?,
         // Where the pod has ended, that is the story the message tells.
         terminal_closed: terminal_closed && !pod_ended,
     })
+}
+
+/// The live pod a stale-terminal refusal may name: `Some` for a live pod,
+/// and `None` only where a healthy read says there is none (`NoPod`) —
+/// a failed read is not "no live pod" (SME-425 review 1, F1). It
+/// propagates like the two reads above: the `None` wording advises
+/// `create_pod`, and a pool timeout can't tell us whether a pod runs, so
+/// a degraded read must fail the call rather than word that advice.
+fn live_pod_or_propagate(read: Result<i64, TerminalError>) -> Result<Option<i64>, TerminalError> {
+    match read {
+        Ok(pod_id) => Ok(Some(pod_id)),
+        Err(TerminalError::NoPod) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Starts `command` in `terminal_id` as `command_id`: refuses while another
@@ -418,4 +432,33 @@ pub async fn grep(
         Reply::GrepMatched(result) => Some(result),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A failed live-pod read must propagate, not answer as "no live pod":
+    /// the no-live-pod wording advises `create_pod` while a pod may well be
+    /// running — the advice class the stale-terminal refusal exists to
+    /// remove (SME-425 review 1, F1). The DB failure itself can't be
+    /// provoked through a live pool from a test; the mapping it must not
+    /// make is pinned here.
+    #[test]
+    fn a_failed_live_pod_read_is_not_no_live_pod() {
+        let failed = live_pod_or_propagate(Err(TerminalError::Sandbox(SandboxError::Db(sqlx::Error::RowNotFound))));
+        assert!(failed.is_err(), "a failed read answered {failed:?}, not an error");
+    }
+
+    /// A healthy read that finds no pod is the one honest `None` — the
+    /// wording that (rightly) names `create_pod` stays available for it.
+    #[test]
+    fn a_healthy_no_pod_read_is_no_live_pod() {
+        assert!(matches!(live_pod_or_propagate(Err(TerminalError::NoPod)), Ok(None)));
+    }
+
+    #[test]
+    fn a_live_pod_read_names_it() {
+        assert!(matches!(live_pod_or_propagate(Ok(7)), Ok(Some(7))));
+    }
 }

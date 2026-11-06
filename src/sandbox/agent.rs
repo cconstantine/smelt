@@ -478,13 +478,30 @@ pub(super) async fn clean_up_and_terminate_pod(pool: &PgPool, pod_id: i64, reaso
 /// on this error path decides; cleanup has already ended `pod_id`'s row,
 /// so a live pod found here is always another.
 async fn stale_pod_or_unreachable(pool: &PgPool, pod_id: i64) -> TerminalError {
-    if let Some(conversation_id) = db::sandbox_pod_conversation_id(pool, pod_id).await.unwrap_or(None)
-        && let Ok(live_pod) = conversation_pod_id(pool, conversation_id).await
-        && live_pod != pod_id
-    {
-        return TerminalError::StalePod { pod_id, live_pod };
+    // F1 (review 1): a failed read still answers AgentUnreachable — the
+    // safer fallback while the database itself is failing — but it says
+    // so. Swallowed, it reads as "no live pod" to whoever later wonders
+    // why the crash-path advice fired, when it may be a replacement the
+    // failed query never showed.
+    let conversation_id = match db::sandbox_pod_conversation_id(pool, pod_id).await {
+        Ok(conversation_id) => conversation_id,
+        Err(e) => {
+            tracing::warn!(pod_id, error = %e, "couldn't read the dialled pod's conversation after cleanup");
+            None
+        }
+    };
+    let mut live_pod = None;
+    if let Some(conversation_id) = conversation_id {
+        match conversation_pod_id(pool, conversation_id).await {
+            Ok(pod) => live_pod = Some(pod),
+            Err(TerminalError::NoPod) => {} // the one honest "no live pod"
+            Err(e) => tracing::warn!(pod_id, error = %e, "couldn't read the conversation's live pod after cleanup"),
+        }
     }
-    TerminalError::AgentUnreachable
+    match live_pod {
+        Some(live_pod) if live_pod != pod_id => TerminalError::StalePod { pod_id, live_pod },
+        _ => TerminalError::AgentUnreachable,
+    }
 }
 
 /// Connects to every live pod's agent at startup (SME-359, Q4), each in a
