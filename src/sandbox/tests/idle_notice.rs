@@ -187,3 +187,48 @@ async fn test_a_stopped_conversation_is_left_out_of_the_idle_pass(pool: sqlx::Pg
 
     crate::turn::forget_conversation_lock(stopped);
 }
+
+/// SME-409 review 1 (F-A): a conversation waiting on an unanswered question
+/// is left out of the pass too, the stopped skip above mirrored. Its wake
+/// runs a turn that stops at the question *above* the drains (SME-409 F1),
+/// so like a stopped conversation it saves and marks nothing — the row
+/// stayed due, and every pass woke it again for as long as the question
+/// waited: a counted turn, an info line claiming a wake and a tab flap, for
+/// zero work done. The notice is held, not lost — the turn that resolves
+/// the question drains it with that moment's numbers, the guarantee
+/// `turn::tests::wake::test_a_wake_while_a_question_waits_leaves_every_notice_queued`
+/// pins. Both `asked_of` kinds are skipped: a child waiting on its parent
+/// is as blocked as one waiting on the user.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_question_waiting_conversation_is_left_out_of_the_idle_pass(pool: sqlx::PgPool) {
+    let _guard = crate::providers::test_support::lock_turn_tests();
+    // One conversation here does get woken and runs a turn, so an id no
+    // other run's conversation shares (SME-135).
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let asked_user = idle_conversation(&pool, &["idle-q-user-1"]).await;
+    let asked_parent = idle_conversation(&pool, &["idle-q-parent-1"]).await;
+    let unblocked = idle_conversation(&pool, &["idle-q-free-1"]).await;
+    for (conversation_id, asked_of) in [(asked_user, "user"), (asked_parent, "parent")] {
+        sqlx::query(
+            "INSERT INTO pending_questions (conversation_id, tool_use_id, questions, asked_of) VALUES ($1, 'toolu_q', '[]', $2)",
+        )
+        .bind(conversation_id)
+        .bind(asked_of)
+        .execute(&pool)
+        .await
+        .expect("waiting question");
+    }
+
+    assert_eq!(
+        notice_idle_commands_once(&pool).await,
+        vec![unblocked],
+        "the two question-blocked conversations are skipped; the other is woken as usual"
+    );
+    for command_id in ["idle-q-user-1", "idle-q-parent-1"] {
+        let command = db::get_terminal_command(&pool, command_id)
+            .await
+            .expect("query")
+            .expect("the command row");
+        assert!(command.idle_notice_at.is_none(), "{command_id}'s notice is still owed, not spent on a wake that didn't happen");
+    }
+}
