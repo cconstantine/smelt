@@ -102,14 +102,14 @@ impl Run {
                 None if self.expected.iter().any(|e| e.id == id) || self.streaming_ids.contains(&id) => {
                     self.arrived.insert(id, parked);
                 }
-                // While a new reply streams (the last one's results all
-                // delivered and a new API call begun, or none yet), its own
-                // first call can reach the bridge before smelt has read its
-                // block from stdout: held until the reply's `message_stop`
-                // (review 2 L12). Between the delivery and the next API call
-                // the CLI makes only the last reply's calls, so an unknown id
-                // then is a stray, refused at once (L1).
-                None if self.state == State::Streaming && !self.delivered => self.held.push(parked),
+                // While a reply streams, its own first call can reach the
+                // bridge before smelt has read its block, or even its start,
+                // from stdout: held until the reply's `message_stop` (review
+                // 2 L12), on a loop's later replies too (PR #285 review 1
+                // L16). Only while some of the last reply's results wait to
+                // be taken is the CLI still making that reply's calls, so an
+                // unknown id then is a stray, refused at once (L1).
+                None if self.state == State::Streaming && self.answers.is_empty() => self.held.push(parked),
                 // Not one of the reply's calls: refused at once (review 1 L1).
                 None => refuse(parked),
             },

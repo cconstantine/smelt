@@ -87,3 +87,33 @@ async fn test_a_limit_before_the_reply_keeps_the_session(pool: PgPool) {
     let resumed = args.iter().position(|a| a == "--resume").and_then(|i| args.get(i + 1));
     assert_eq!(resumed, Some(&session), "turn 3 resumes the session: {args:?}");
 }
+
+/// Review 3 L16: L12's case on a loop's second reply. Once the first
+/// reply's results are all in, the second reply's first call can reach
+/// the bridge before smelt reads that reply's start; it's held, not
+/// refused.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_second_replys_early_call_is_held(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let first = tool_reply(&[("toolu_a", "todoread", json!({}))]);
+    let second = tool_reply(&[("toolu_b", "todoread", json!({}))]);
+    let fake = FakeCli::new("early-second", vec![vec![
+        json!({"read": true}),
+        first[0].clone(),
+        first[1].clone(),
+        json!({"call_early": {"id": "toolu_b", "name": "mcp__smelt__todoread", "input": {}}}),
+        json!({"sleep_ms": 300}),
+        second[0].clone(),
+        json!({"join": true}),
+        text_reply("Done."),
+    ]]);
+    fake.pick_for(&pool, conversation.id).await;
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the turn runs");
+
+    let results = fake.results(0);
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(results.iter().all(|r| r["is_error"] == false), "both calls got their results: {results:?}");
+}
