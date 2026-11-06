@@ -117,3 +117,27 @@ async fn test_a_second_replys_early_call_is_held(pool: PgPool) {
     assert_eq!(results.len(), 2, "{results:?}");
     assert!(results.iter().all(|r| r["is_error"] == false), "both calls got their results: {results:?}");
 }
+
+/// Review 3 L17: a run that resumes a session waits for that
+/// conversation's last process to end, so two are never in one session:
+/// here L3's restart for a larger cap, whose old run takes 1.5 s to go.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_resume_waits_for_the_last_process_to_end(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let fake = FakeCli::new("one-at-once", vec![
+        vec![json!({"read": true}), text_reply("one"), json!({"sleep_ms": 1_500})],
+        vec![json!({"read": true}), text_reply("two")],
+    ]);
+    fake.pick_for(&pool, conversation.id).await;
+    let model = crate::providers::resolve_turn_model(&pool, conversation.id).await.expect("the model");
+    let mut cli = crate::claude_cli::run::TurnCli::default();
+    super::review1::one_call(&pool, conversation.id, &model, &mut cli, vec![super::review1::said("user", "hi")], 1_000).await.expect("call 1");
+    let next = vec![super::review1::said("user", "hi"), super::review1::said("assistant", "one"), super::review1::said("user", "more")];
+    super::review1::one_call(&pool, conversation.id, &model, &mut cli, next, 1_200).await.expect("call 2");
+
+    assert!(fake.args(1).iter().any(|a| a == "--resume"), "{:?}", fake.args(1));
+    fake.until("the first process ends", |f| f.dir.join("exited.0").exists()).await;
+    assert!(fake.time_of("started.1") >= fake.time_of("exited.0"), "the resume started after the last process ended");
+}

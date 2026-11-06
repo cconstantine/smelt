@@ -174,6 +174,8 @@ struct Run {
     held: Vec<ParkedCall>,
     /// Whether it was given smelt's tools (an `--mcp-config`).
     has_tools: bool,
+    /// The conversation it's a turn of.
+    conversation_id: i64,
     /// How this call failed, if it did.
     failure: Failure,
     /// The reply cap it was launched with.
@@ -358,6 +360,10 @@ async fn start(call: &Call<'_>, resume: bool) -> Result<Run, String> {
         Some((session_id, tail)) => {
             let names = call_names(&request.messages);
             let text = tail.iter().map(|m| blocks_text(&m.content, &names)).collect::<Vec<_>>().join("\n\n");
+            // Never two processes in one session: the conversation's last one
+            // (L3's restart, or the last turn's) may still be ending
+            // (PR #285 review 1 L17).
+            ended(conversation_id).await;
             let mut run = Run::spawn(conversation_id, turn_model, request, SessionArg::Resume(&session_id)).await?;
             run.resumed = true;
             run.session_id = session_id;
@@ -487,6 +493,7 @@ impl Run {
             gone: false,
             max_tokens: request.max_tokens,
             failure: Failure::Diverged,
+            conversation_id,
             has_tools: !request.tools.is_empty(),
             held: Vec::new(),
             session_id: String::new(),
@@ -547,7 +554,8 @@ impl Run {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        runtime.spawn(async move {
+        let conversation_id = self.conversation_id;
+        let ending = runtime.spawn(async move {
             if self.state != State::Idle && self.interrupt().await.is_ok() {
                 let _ = tokio::time::timeout(WIND_DOWN, async {
                     while let Ok(event) = self.next_event().await {
@@ -570,6 +578,32 @@ impl Run {
                 let _ = self.child.wait().await;
             }
         });
+        let mut endings = endings();
+        let mine = endings.entry(conversation_id).or_default();
+        mine.retain(|task| !task.is_finished());
+        mine.push(ending);
+    }
+}
+
+/// The tasks ending each conversation's runs (`end_in_background`).
+fn endings() -> std::sync::MutexGuard<'static, HashMap<i64, Vec<tokio::task::JoinHandle<()>>>> {
+    static ENDINGS: std::sync::LazyLock<Mutex<HashMap<i64, Vec<tokio::task::JoinHandle<()>>>>> = std::sync::LazyLock::new(Mutex::default);
+    // Every change is one insert or take: nothing is left half-done.
+    ENDINGS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The longest a resume waits for the conversation's last runs to end:
+/// an ending interrupts within `WIND_DOWN`, waits as long again, then kills.
+pub const ENDED_WAIT: Duration = Duration::from_secs(12);
+
+/// Waits, within `ENDED_WAIT`, for every run of `conversation_id` that's
+/// ending to be gone (PR #285 review 1 L17).
+async fn ended(conversation_id: i64) {
+    let ending = endings().remove(&conversation_id).unwrap_or_default();
+    for task in ending {
+        if tokio::time::timeout(ENDED_WAIT, task).await.is_err() {
+            tracing::warn!(conversation_id, "a Claude Code process of this conversation is still ending; resuming its session anyway");
+        }
     }
 }
 

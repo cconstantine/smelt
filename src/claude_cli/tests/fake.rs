@@ -148,7 +148,10 @@ fn fake_claude_entry() {
         return;
     };
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a runtime");
-    let code = runtime.block_on(play(&dir));
+    let n = take_number(&dir);
+    let code = runtime.block_on(play(&dir, n));
+    // When it ended, for a test of what waits on that (PR #285 review 1 L17).
+    let _ = std::fs::write(dir.join(format!("exited.{n}")), "");
     std::process::exit(code);
 }
 
@@ -247,8 +250,7 @@ impl Fake {
     }
 }
 
-async fn play(dir: &Path) -> i32 {
-    let n = take_number(dir);
+async fn play(dir: &Path, n: usize) -> i32 {
     let args_file = std::env::var_os("SMELT_FAKE_CLAUDE_ARGS").map(PathBuf::from).expect("the args file");
     let _ = std::fs::rename(&args_file, dir.join(format!("args.of.{n}")));
     let args = std::fs::read_to_string(dir.join(format!("args.of.{n}"))).unwrap_or_default();
