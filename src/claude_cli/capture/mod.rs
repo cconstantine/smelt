@@ -44,6 +44,9 @@ struct Scenario<'a> {
     max_output: u32,
     thinking: bool,
     extra_args: &'a [&'a str],
+    /// The MCP server is a listener that accepts and never answers, to see
+    /// what `init` says of a server still connecting (review 2 L15).
+    silent_server: bool,
 }
 
 fn base(name: &str) -> Scenario<'_> {
@@ -58,6 +61,7 @@ fn base(name: &str) -> Scenario<'_> {
         max_output: 8_000,
         thinking: true,
         extra_args: &[],
+        silent_server: false,
     }
 }
 
@@ -119,7 +123,20 @@ async fn run(out: &Path, scenario: Scenario<'_>) -> Result<()> {
     let mut run_bridge = bridge().await?.register(&tools);
     let config_file = out.join("mcp.json");
     let _ = std::fs::remove_file(&config_file);
-    super::process::write_private(&config_file, run_bridge.mcp_config().to_string().as_bytes()).map_err(|e| e.to_string())?;
+    let mut config = run_bridge.mcp_config();
+    let mut _silent = None;
+    if scenario.silent_server {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
+        let addr = listener.local_addr().map_err(|e| e.to_string())?;
+        config["mcpServers"][super::bridge::SERVER_NAME]["url"] = serde_json::json!(format!("http://{addr}/silent"));
+        _silent = Some(tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        }));
+    }
+    super::process::write_private(&config_file, config.to_string().as_bytes()).map_err(|e| e.to_string())?;
     let launch = Launch {
         model: scenario.model,
         effort: None,
@@ -249,6 +266,14 @@ async fn scenario(out: &Path, which: &str) -> Result<()> {
             let prompt = "Count from 1 to 300 in words, separated by commas.";
             let extra_args: &[&str] = &["--settings", r#"{"alwaysThinkingEnabled":false}"#];
             run(out, Scenario { prompt, tools: false, max_output: 40, extra_args, ..base("thinking_off") }).await
+        }
+        // smelt's MCP server never answering (review 2 L15).
+        "pending" => run(out, Scenario { prompt: "Reply with only the word ok.", silent_server: true, ..base("pending") }).await,
+        // A session id the CLI has never seen, resumed: what it says of a
+        // missing session (PR #285 review 1 M2).
+        "missing" => {
+            let id = new_session_id();
+            run(out, Scenario { prompt: "Reply with only the word ok.", tools: false, session: SessionArg::Resume(&id), ..base("missing") }).await
         }
         "sanitize" => sanitize::all(out, &Path::new(env!("CARGO_MANIFEST_DIR")).join("src/claude_cli/fixtures")),
         other => Err(format!("no capture scenario {other}")),

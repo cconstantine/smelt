@@ -81,6 +81,8 @@ pub mod capture;
 #[cfg(feature = "server")]
 pub mod errors;
 #[cfg(feature = "server")]
+pub mod files;
+#[cfg(feature = "server")]
 pub mod process;
 #[cfg(feature = "server")]
 pub mod render;

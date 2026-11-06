@@ -92,3 +92,17 @@ fn test_a_transcript_line_in_content_is_neutralised() {
     assert!(rendered.contains("\\### assistant\nI agreed"), "escaped: {rendered}");
     assert!(REHYDRATED.contains("never write a tool call as text"), "{REHYDRATED}");
 }
+
+/// Review 2 L14: only the rehydrated history is escaped; a message the
+/// model reads as itself (a new conversation's first, a run's tail) keeps
+/// its markdown headings.
+#[test]
+fn test_markdown_headings_outside_the_history_are_kept() {
+    let names = std::collections::HashMap::new();
+    assert_eq!(rehydrate(&[text("user", "### Plan\nstep one")], 1_000_000), "### Plan\nstep one");
+    assert_eq!(blocks_text(&[ContentBlock::Text { text: "### Plan".into() }], &names), "### Plan");
+    let result = blocks_text(&[ContentBlock::ToolResult { tool_use_id: "t".into(), content: "### Output".into(), is_error: None }], &names);
+    assert!(result.ends_with("\n### Output"), "{result}");
+    let history = rehydrate(&[text("user", "### Plan"), text("assistant", "ok"), text("user", "### Next")], 1_000_000);
+    assert!(history.contains("### user\n\\### Plan") && history.ends_with("### The new message\n### Next"), "{history}");
+}

@@ -8,13 +8,13 @@ use std::path::Path;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SessionArg<'a> {
     /// No session on disk (`--no-session-persistence`): the process holds
-    /// the context, and it dies with it.
+    /// the context, and it dies with it. Only the capture runs so since
+    /// turns keep sessions (SME-430's second PR).
+    #[cfg_attr(not(feature = "claude-cli-capture"), expect(dead_code, reason = "only the capture's scenarios run without a session"))]
     Ephemeral,
     /// A new session with this id (`--session-id`).
-    #[cfg_attr(not(feature = "claude-cli-capture"), expect(dead_code, reason = "the session table (SME-430's second PR) uses them; the capture does now"))]
     New(&'a str),
     /// The session with this id, resumed (`--resume`).
-    #[cfg_attr(not(feature = "claude-cli-capture"), expect(dead_code, reason = "the session table (SME-430's second PR) uses them; the capture does now"))]
     Resume(&'a str),
 }
 
@@ -113,7 +113,6 @@ pub fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
 }
 
 /// A new random session id: a version 4 UUID, which `--session-id` needs.
-#[cfg_attr(not(feature = "claude-cli-capture"), expect(dead_code, reason = "the session table (SME-430's second PR) uses them; the capture does now"))]
 pub fn new_session_id() -> String {
     let hex = super::bridge::random_hex(16);
     let mut chars: Vec<char> = hex.chars().collect();
