@@ -415,7 +415,8 @@ fn cli_request(messages: Vec<anthropic::AnthropicMessage>, max_tokens: u32) -> a
         system: Some("You are smelt.".to_string()),
         messages,
         stream: true,
-        tools: Vec::new(),
+        // One of smelt's tools, so the run has the bridge.
+        tools: vec![anthropic::ToolDefinition { name: "todoread".to_string(), description: "Reads the todo list.".to_string(), input_schema: json!({"type": "object"}) }],
         thinking: None,
         output_config: None,
         chat_template_kwargs: None,
@@ -509,4 +510,132 @@ async fn test_a_cli_without_smelts_tools_fails_the_call(pool: PgPool) {
 
     let error = run_turn(&pool, conversation.id, hello()).await.expect_err("no tools").to_string();
     assert!(error.contains("couldn't connect to smelt's tools"), "{error}");
+}
+
+// --- Review 1's missing tests ---
+
+/// Gives this provider's Claude Code model a window of `window`.
+async fn set_cli_window(pool: &PgPool, provider_id: i64, window: i32) {
+    sqlx::query("INSERT INTO provider_models (provider_id, model, context_window) VALUES ($1, 'claude-opus-5-5', $2)")
+        .bind(provider_id)
+        .bind(window)
+        .execute(pool)
+        .await
+        .expect("seed the window");
+}
+
+/// A conversation too full for its window ends its turn plainly on this
+/// kind, by the proactive check, and calls nothing.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_full_conversation_fails_plainly_by_the_proactive_check(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let fake = FakeCli::new("full", vec![vec![json!({"read": true}), text_reply("unreached")]]);
+    let provider = fake.pick_for(&pool, conversation.id).await;
+    set_cli_window(&pool, provider, 32_768).await;
+    let usage = anthropic::TokenUsage { input_tokens: 31_000, ..Default::default() };
+    db::upsert_conversation_usage(&pool, conversation.id, &usage).await.expect("the last usage");
+
+    let error = run_turn(&pool, conversation.id, hello()).await.expect_err("it doesn't fit").to_string();
+    assert!(error.contains(crate::claude_cli::CANT_COMPACT_YET), "{error}");
+    assert_eq!(fake.started(), 0, "no CLI ran");
+}
+
+/// Stop while smelt runs the reply's tool (the run Parked): the run is
+/// interrupted, so the CLI records the call as stopped, and the call is
+/// never answered with a result.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_stop_mid_tool_interrupts_the_parked_run(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let mut steps = vec![json!({"read": true})];
+    steps.extend(tool_reply(&[("toolu_mid", "todoread", json!({}))]));
+    let fake = FakeCli::new("stop-parked", vec![steps]);
+    fake.pick_for(&pool, conversation.id).await;
+    let (reached, release) = crate::turn::test_hooks::pause_after_reply_saved(conversation.id);
+
+    let turn = tokio::spawn({
+        let pool = pool.clone();
+        async move { run_turn(&pool, conversation.id, hello()).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), reached).await.expect("the reply is saved").expect("the hook");
+    stop_turn_now(conversation.id);
+    drop(release);
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(5), turn).await.expect("the turn ends").expect("join");
+    assert!(ended.expect_err("stopped").to_string().contains(TURN_STOPPED));
+    fake.until("the parked run is interrupted", |f| f.stdin(0).iter().any(is_interrupt)).await;
+    assert_eq!(fake.results(0), Vec::<Value>::new(), "the call got no result");
+}
+
+/// A call of the reply that the next request has no result for is
+/// answered NOT_RUN, the request's other blocks riding on it.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_call_with_no_result_is_answered_not_run(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let mut steps = vec![json!({"read": true})];
+    steps.extend(tool_reply(&[("toolu_none", "todoread", json!({}))]));
+    steps.push(text_reply("ok"));
+    let fake = FakeCli::new("not-run", vec![steps]);
+    fake.pick_for(&pool, conversation.id).await;
+    let model = crate::providers::resolve_turn_model(&pool, conversation.id).await.expect("the model");
+    let mut cli = crate::claude_cli::run::TurnCli::default();
+    let first = vec![said("user", "hi")];
+    let reply = one_call(conversation.id, &model, &mut cli, first.clone(), 1_000).await.expect("the call");
+    let mut next = first;
+    next.push(anthropic::AnthropicMessage { role: "assistant".to_string(), content: reply });
+    next.push(said("user", "a notice"));
+    one_call(conversation.id, &model, &mut cli, next, 1_000).await.expect("the next call");
+
+    let results = fake.results(0);
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(results[0]["is_error"], true);
+    let text = results[0]["text"].as_str().unwrap_or_default();
+    assert!(text.starts_with(crate::claude_cli::run::NOT_RUN) && text.ends_with("a notice"), "{text}");
+}
+
+/// SME-343: a Claude Code turn holds its provider's one request slot for
+/// the whole turn, its tool pass included.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_claude_code_turn_holds_its_slot_across_its_tools(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let mut steps = vec![json!({"read": true})];
+    steps.extend(tool_reply(&[("toolu_slot", "todoread", json!({}))]));
+    steps.push(text_reply("Done."));
+    let fake = FakeCli::new("slot", vec![steps]);
+    let provider = fake.pick_for(&pool, conversation.id).await;
+    sqlx::query("UPDATE inference_providers SET max_concurrent_requests = 1 WHERE id = $1").bind(provider).execute(&pool).await.expect("one slot");
+    let (reached, release) = crate::turn::test_hooks::pause_after_reply_saved(conversation.id);
+
+    let turn = tokio::spawn({
+        let pool = pool.clone();
+        async move { run_turn(&pool, conversation.id, hello()).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), reached).await.expect("the reply is saved").expect("the hook");
+    let pool_now = crate::providers::limiter::current(provider).expect("the provider's pool");
+    assert_eq!(pool_now.available_permits(), 0, "the turn holds the one slot between its calls");
+    let _ = release.send(());
+    tokio::time::timeout(std::time::Duration::from_secs(10), turn).await.expect("the turn ends").expect("join").expect("the turn runs");
+    assert_eq!(crate::providers::limiter::current(provider).expect("the pool").available_permits(), 1, "and gives it up at its end");
+}
+
+/// The subscription's limit reaches the turn's error, saying which limit
+/// and when it resets. Synthesized: no capture of a real limit exists.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_reached_limit_fails_the_turn_saying_when_it_resets(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let limit = json!({"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", "rateLimitType": "seven_day", "resetsAt": 1_767_225_600}});
+    let refused = json!({"type": "result", "subtype": "success", "is_error": true, "api_error_status": 429, "result": "API Error: 429 rate limited"});
+    let fake = FakeCli::new("limit", vec![vec![json!({"read": true}), json!({"emit": [limit, refused]}), json!({"exit": 1})]]);
+    fake.pick_for(&pool, conversation.id).await;
+
+    let error = run_turn(&pool, conversation.id, hello()).await.expect_err("limited").to_string();
+    assert!(error.contains("usage limit (seven-day) is reached. It resets at 2026-01-01 00:00 UTC."), "{error}");
 }
