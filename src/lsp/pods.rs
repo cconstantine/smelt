@@ -410,27 +410,30 @@ pub async fn list_with(client: &kube::Client, conversation_id: i64, instance: &s
         let state = match pod.status.as_ref().and_then(|s| s.phase.as_deref()) {
             Some("Failed" | "Succeeded") => ServerState::Stopped(stop_reason(&pod)),
             Some("Running") => {
-                let rc = match install_rc(client, &pod_name).await {
-                    Ok(rc) => rc,
-                    Err(e) => {
-                        tracing::info!(pod = %pod_name, error = %e, "couldn't re-read a language server pod's install record");
-                        None
-                    }
-                };
-                // A pod whose install already finished is Ready whatever this
-                // re-read says: smelt/lsp-ready is patched only after the
-                // install exits 0 (`start_with`) and is a property of that
-                // pod object, so one failed exec or missing record must not
-                // read a running, answering server as still installing
-                // (SME-426 — that flake was this, seen as the edit chain's
-                // None via a choose_server with no taker). A pod without the
-                // annotation — a recreated one starts without it — is
-                // mid-install and waits for the rc exactly as before.
-                let annotated = pod.metadata.annotations.as_ref().is_some_and(|a| a.contains_key(READY_ANNOTATION));
-                if rc.as_deref() == Some("0") || annotated {
+                // The annotation answers first: smelt/lsp-ready is patched
+                // only after the install exits 0 (`start_with`) and is a
+                // property of that pod object — a recreated pod starts
+                // without it — so an annotated pod is Ready without the
+                // rc re-read at all. Skipping the exec removes the very
+                // round-trip whose one failure was the flake (SME-426,
+                // seen as the edit chain's None via a choose_server with
+                // no taker), its per-call load, and its noise; no failed
+                // exec or missing record can read a running, answering
+                // server as installing. A pod without the annotation is
+                // mid-install and waits for the rc exactly as before:
+                // 0 is Ready, anything else — including a failed check,
+                // whose state is unknown — keeps Installing and polls on.
+                if pod.metadata.annotations.as_ref().is_some_and(|a| a.contains_key(READY_ANNOTATION)) {
                     ServerState::Ready
                 } else {
-                    ServerState::Installing
+                    match install_rc(client, &pod_name).await {
+                        Ok(Some(rc)) if rc == "0" => ServerState::Ready,
+                        Ok(_) => ServerState::Installing,
+                        Err(e) => {
+                            tracing::info!(pod = %pod_name, error = %e, "couldn't re-read a language server pod's install record");
+                            ServerState::Installing
+                        }
+                    }
                 }
             }
             _ => ServerState::Installing,
