@@ -75,3 +75,4 @@ mod learning;
 mod llama;
 mod listing;
 mod limiter;
+mod claude_cli;

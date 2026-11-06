@@ -70,9 +70,26 @@ fn test_a_llama_cpp_provider_starts_with_bearer_auth_and_no_caching() {
     assert!(!ProviderKind::LlamaCpp.default_prompt_caching());
     assert_eq!(
         ProviderKind::ALL,
-        [ProviderKind::Anthropic, ProviderKind::Ollama, ProviderKind::LlamaCpp, ProviderKind::Other],
-        "listed between Ollama and Other"
+        [ProviderKind::Anthropic, ProviderKind::Ollama, ProviderKind::LlamaCpp, ProviderKind::Other, ProviderKind::ClaudeCli],
+        "listed between Ollama and Other, with Claude Code last (SME-429)"
     );
+}
+
+/// SME-429: Claude Code is its own kind, with no address or key, priced
+/// as Anthropic's API would price its calls.
+#[test]
+fn test_a_claude_code_provider_is_a_binary_priced_as_anthropic() {
+    assert_eq!(ProviderKind::parse("claude_cli"), Some(ProviderKind::ClaudeCli));
+    assert!(!ProviderKind::ClaudeCli.is_http());
+    assert!(ProviderKind::ALL.iter().filter(|k| **k != ProviderKind::ClaudeCli).all(|k| k.is_http()));
+    assert!(!ProviderKind::ClaudeCli.default_prompt_caching(), "the CLI marks its own cache breakpoints");
+    assert_eq!(ProviderKind::ClaudeCli.base_url_placeholder(), "claude");
+    let sources = [
+        PriceSource { id: "anthropic".to_string(), name: "Anthropic".to_string(), api: None },
+        PriceSource { id: "other".to_string(), name: "Other".to_string(), api: Some("https://claude".to_string()) },
+    ];
+    assert_eq!(suggest_price_source(&sources, ProviderKind::ClaudeCli, "claude").as_deref(), Some("anthropic"));
+    assert_eq!(suggest_price_source(&sources[1..], ProviderKind::ClaudeCli, "claude"), None, "not in the catalog");
 }
 
 /// SME-162: the form sends a provider's max concurrent requests, and its

@@ -6,6 +6,7 @@ mod agents;
 mod anthropic;
 mod api;
 mod browsing;
+mod claude_cli;
 #[cfg(feature = "server")]
 mod credentials;
 #[cfg(feature = "server")]

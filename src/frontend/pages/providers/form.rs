@@ -151,6 +151,10 @@ fn ProviderFields(
                 onchange: move |e| {
                     if let Some(kind) = ProviderKind::parse(&e.value()) {
                         let mut f = form.write();
+                        // An address isn't a binary, nor the other way round.
+                        if f.kind.is_http() != kind.is_http() {
+                            f.base_url.clear();
+                        }
                         f.kind = kind;
                         if is_new {
                             f.auth_kind = kind.default_auth_kind();
@@ -169,6 +173,7 @@ fn ProviderFields(
                     ProviderKind::Ollama => "An Ollama server. smelt asks it which models it has, what each can do, and each model's context window where it can tell.",
                     ProviderKind::LlamaCpp => "A llama.cpp server (llama-server). smelt reads its /v1/models and /props for the model, its context window and what its chat template supports.",
                     ProviderKind::Other => "Any other server with an Anthropic-compatible /v1/messages, such as a gateway or llama.cpp. smelt tries its /v1/models for the list.",
+                    ProviderKind::ClaudeCli => "The official Claude Code CLI on this server, signed in to your Claude subscription, which then pays for the turns.",
                 }
             }
 
@@ -176,61 +181,65 @@ fn ProviderFields(
             input { id: "provider-name", r#type: "text", required: true, placeholder: "Anthropic",
                 value: "{form().name}", oninput: move |e| form.write().name = e.value() }
 
-            label { r#for: "provider-url", "Base URL" }
-            input { id: "provider-url", r#type: "url", required: true, placeholder: "{form().kind.base_url_placeholder()}",
-                value: "{form().base_url}", oninput: move |e| {
-                    let mut f = form.write();
-                    f.base_url = e.value();
-                    f.follow_suggestion(&source_list());
-                },
-                onchange: move |e| probe(e.value().trim().to_string()) }
-            p { class: "muted", "Turns go to this address's /v1/messages." }
-            if suggest_llama_cpp() {
-                p { class: "provider-kind-suggestion", role: "status",
-                    "This looks like a llama.cpp server. "
-                    button { r#type: "button", class: "model-picker-button",
-                        onclick: move |_| {
-                            let mut f = form.write();
-                            f.kind = ProviderKind::LlamaCpp;
-                            if is_new {
-                                f.auth_kind = ProviderKind::LlamaCpp.default_auth_kind();
-                                f.prompt_caching = ProviderKind::LlamaCpp.default_prompt_caching();
-                            }
-                            f.follow_suggestion(&source_list());
-                        },
-                        "Use the llama.cpp kind"
+            if form().kind.is_http() {
+                label { r#for: "provider-url", "Base URL" }
+                input { id: "provider-url", r#type: "url", required: true, placeholder: "{form().kind.base_url_placeholder()}",
+                    value: "{form().base_url}", oninput: move |e| {
+                        let mut f = form.write();
+                        f.base_url = e.value();
+                        f.follow_suggestion(&source_list());
+                    },
+                    onchange: move |e| probe(e.value().trim().to_string()) }
+                p { class: "muted", "Turns go to this address's /v1/messages." }
+                if suggest_llama_cpp() {
+                    p { class: "provider-kind-suggestion", role: "status",
+                        "This looks like a llama.cpp server. "
+                        button { r#type: "button", class: "model-picker-button",
+                            onclick: move |_| {
+                                let mut f = form.write();
+                                f.kind = ProviderKind::LlamaCpp;
+                                if is_new {
+                                    f.auth_kind = ProviderKind::LlamaCpp.default_auth_kind();
+                                    f.prompt_caching = ProviderKind::LlamaCpp.default_prompt_caching();
+                                }
+                                f.follow_suggestion(&source_list());
+                            },
+                            "Use the llama.cpp kind"
+                        }
                     }
                 }
-            }
 
-            label { r#for: "provider-auth", "Sent as" }
-            select {
-                id: "provider-auth",
-                onchange: move |e| {
-                    if let Some(auth) = AuthKind::parse(&e.value()) {
-                        form.write().auth_kind = auth;
+                label { r#for: "provider-auth", "Sent as" }
+                select {
+                    id: "provider-auth",
+                    onchange: move |e| {
+                        if let Some(auth) = AuthKind::parse(&e.value()) {
+                            form.write().auth_kind = auth;
+                        }
+                    },
+                    for auth in AuthKind::ALL {
+                        option { key: "{auth.as_str()}", value: "{auth.as_str()}", selected: form().auth_kind == auth, "{auth.label()}" }
                     }
-                },
-                for auth in AuthKind::ALL {
-                    option { key: "{auth.as_str()}", value: "{auth.as_str()}", selected: form().auth_kind == auth, "{auth.label()}" }
                 }
-            }
 
-            label { r#for: "provider-secret", "API key or token" }
-            input { id: "provider-secret", r#type: "password", required: is_new, autocomplete: "off",
-                placeholder: "{secret_placeholder}",
-                value: "{form().secret}", oninput: move |e| form.write().secret = e.value() }
-            p { class: "muted",
-                "Stays on the server: pages only ever show its last four characters. A local Ollama needs one but ignores it, so any value does."
-            }
+                label { r#for: "provider-secret", "API key or token" }
+                input { id: "provider-secret", r#type: "password", required: is_new, autocomplete: "off",
+                    placeholder: "{secret_placeholder}",
+                    value: "{form().secret}", oninput: move |e| form.write().secret = e.value() }
+                p { class: "muted",
+                    "Stays on the server: pages only ever show its last four characters. A local Ollama needs one but ignores it, so any value does."
+                }
 
-            label { class: "provider-checkbox",
-                input { id: "provider-caching", r#type: "checkbox", checked: form().prompt_caching,
-                    onchange: move |e| form.write().prompt_caching = e.checked() }
-                "Prompt caching"
-            }
-            p { class: "muted",
-                "Marks each turn's request so the server can reuse the conversation so far instead of reading it again; on Anthropic a cached read costs a tenth of the input price. Turn it off if this server refuses requests with a cache_control error."
+                label { class: "provider-checkbox",
+                    input { id: "provider-caching", r#type: "checkbox", checked: form().prompt_caching,
+                        onchange: move |e| form.write().prompt_caching = e.checked() }
+                    "Prompt caching"
+                }
+                p { class: "muted",
+                    "Marks each turn's request so the server can reuse the conversation so far instead of reading it again; on Anthropic a cached read costs a tenth of the input price. Turn it off if this server refuses requests with a cache_control error."
+                }
+            } else {
+                ClaudeCliFields { form }
             }
 
             if form().kind == ProviderKind::LlamaCpp {
@@ -284,6 +293,25 @@ fn ProviderFields(
 
             super::super::ErrorText { message: field_error().or(error) }
             button { r#type: "submit", "{save_label}" }
+        }
+    }
+}
+
+/// A Claude Code provider's own field, the binary it runs, and Anthropic's
+/// terms for running it, quoted: this kind breaks if they change (SME-429).
+#[component]
+fn ClaudeCliFields(form: Signal<ProviderForm>) -> Element {
+    let mut form = form;
+    rsx! {
+        label { r#for: "provider-binary", "Claude Code binary" }
+        input { id: "provider-binary", r#type: "text", placeholder: "{crate::claude_cli::DEFAULT_BINARY}",
+            value: "{form().base_url}", oninput: move |e| form.write().base_url = e.value() }
+        p { class: "muted",
+            "Leave blank for claude on the server's PATH (the server image's is /opt/claude/bin/claude). It runs with a cleared environment: its sign-in is CLAUDE_CODE_OAUTH_TOKEN in the server's environment, from claude setup-token, and no ANTHROPIC_* variable reaches it. This page shows whether it's signed in once the provider is saved."
+        }
+        blockquote { class: "provider-policy",
+            p { "{crate::claude_cli::POLICY_QUOTE}" }
+            p { class: "muted", "\u{2014} {crate::claude_cli::POLICY_SOURCE}. Anthropic has changed these terms before; if they change again, this provider is the one that stops working." }
         }
     }
 }

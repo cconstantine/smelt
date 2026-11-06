@@ -34,11 +34,15 @@ pub enum ProviderKind {
     /// A llama.cpp server (`llama-server`), SME-111.
     LlamaCpp,
     Other,
+    /// The official Claude Code CLI on the server host, signed in to the
+    /// user's Claude subscription (SME-399). Its `base_url` holds the
+    /// binary's path, and it has no key: `claude_cli` runs it.
+    ClaudeCli,
 }
 
 impl ProviderKind {
     /// In the order the new-provider form lists them.
-    pub const ALL: [ProviderKind; 4] = [Self::Anthropic, Self::Ollama, Self::LlamaCpp, Self::Other];
+    pub const ALL: [ProviderKind; 5] = [Self::Anthropic, Self::Ollama, Self::LlamaCpp, Self::Other, Self::ClaudeCli];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -46,6 +50,7 @@ impl ProviderKind {
             Self::Ollama => "ollama",
             Self::LlamaCpp => "llama_cpp",
             Self::Other => "other",
+            Self::ClaudeCli => "claude_cli",
         }
     }
 
@@ -59,24 +64,33 @@ impl ProviderKind {
             Self::Ollama => "Ollama",
             Self::LlamaCpp => "llama.cpp",
             Self::Other => "Other Anthropic-compatible server",
+            Self::ClaudeCli => "Claude Code (your Claude subscription)",
         }
     }
 
-    /// The new-provider form's base URL placeholder.
+    /// The new-provider form's base URL placeholder; for Claude Code,
+    /// the binary it runs.
     pub fn base_url_placeholder(self) -> &'static str {
         match self {
             Self::Anthropic => "https://api.anthropic.com",
             Self::Ollama => "http://localhost:11434",
             Self::LlamaCpp => "http://localhost:8080",
             Self::Other => "https://gateway.example.com",
+            Self::ClaudeCli => crate::claude_cli::DEFAULT_BINARY,
         }
+    }
+
+    /// Whether turns go to an HTTP address with a key: every kind but
+    /// Claude Code, whose form asks for a binary instead (SME-399).
+    pub fn is_http(self) -> bool {
+        self != Self::ClaudeCli
     }
 
     /// The auth the new-provider form starts with. Local Ollama wants an
     /// `x-api-key` it ignores; its cloud endpoint wants `bearer`.
     pub fn default_auth_kind(self) -> AuthKind {
         match self {
-            Self::Anthropic | Self::Ollama => AuthKind::ApiKey,
+            Self::Anthropic | Self::Ollama | Self::ClaudeCli => AuthKind::ApiKey,
             Self::LlamaCpp | Self::Other => AuthKind::Bearer,
         }
     }
@@ -214,6 +228,11 @@ pub struct PriceSource {
 /// and a plan on it share an address, and only the user knows which key
 /// they have).
 pub fn suggest_price_source(sources: &[PriceSource], kind: ProviderKind, base_url: &str) -> Option<String> {
+    // Claude Code's calls cost what Anthropic's API would charge for them,
+    // though the subscription pays (SME-399).
+    if kind == ProviderKind::ClaudeCli {
+        return sources.iter().any(|s| s.id == "anthropic").then(|| "anthropic".to_string());
+    }
     let (host, path) = host_and_path(base_url)?;
     // The catalog gives Anthropic no address of its own.
     if kind == ProviderKind::Anthropic && host == "api.anthropic.com" {

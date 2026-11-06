@@ -6,6 +6,7 @@ use dioxus::prelude::*;
 
 #[cfg(feature = "server")]
 use crate::db;
+use crate::claude_cli::ClaudeCliStatus;
 use crate::providers::{ModelChoice, ModelInfo, ModelSettings, PriceSource, ProviderInput, ProviderModels, ProviderSummary};
 
 #[get("/api/providers")]
@@ -105,6 +106,16 @@ pub async fn set_model_settings(id: i64, model: String, settings: ModelSettings)
 #[post("/api/providers/probe-llama-cpp")]
 pub async fn probe_llama_cpp(base_url: String) -> ServerFnResult<bool> {
     Ok(crate::anthropic::models::probe_llama_cpp(&base_url).await)
+}
+
+/// What a Claude Code provider's CLI says about itself, for its page
+/// (SME-429): `claude --version` and `claude auth status`, each up to 10
+/// seconds. Never a token: whether it's signed in, how, and the plan.
+#[get("/api/providers/{id}/claude-cli-status")]
+pub async fn get_claude_cli_status(id: i64) -> ServerFnResult<ClaudeCliStatus> {
+    crate::claude_cli::provider_status(db::get(), id)
+        .await
+        .map_err(ServerFnError::new)
 }
 
 #[get("/api/default-model")]
