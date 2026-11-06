@@ -92,6 +92,12 @@ fn build_router() -> axum::Router {
 #[cfg(feature = "server")]
 #[tokio::main]
 async fn main() {
+    // Before `.env` is read: the capture's CLI gets none of smelt's
+    // environment either way, and it never serves (SME-430).
+    #[cfg(feature = "claude-cli-capture")]
+    if std::env::args().nth(1).as_deref() == Some("claude-cli-capture") {
+        std::process::exit(claude_cli::capture::main(std::env::args().skip(2).collect()).await);
+    }
     // Optional: absent in prod, where real env vars are set directly.
     // Reported once logging is set up, below.
     let dotenv_problem = dotenv_problem(dotenvy::dotenv());

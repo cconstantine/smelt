@@ -78,7 +78,7 @@ fn relative_path_refused(binary: &str) -> Result<(), String> {
 
 /// Where `binary` is: an absolute path as given, a name searched for on
 /// `path`. Either must be an executable file.
-fn resolve_binary(binary: &str, path: Option<&OsStr>) -> Result<PathBuf, String> {
+pub(super) fn resolve_binary(binary: &str, path: Option<&OsStr>) -> Result<PathBuf, String> {
     relative_path_refused(binary)?;
     if binary.contains('/') {
         let candidate = PathBuf::from(binary);
@@ -169,7 +169,7 @@ pub async fn status_with(binary: &str, env: Vec<(String, OsString)>, timeout: Du
 /// Makes `dir`, and any missing parent, mode 0700, and makes an existing
 /// `dir` 0700 too: only its owner can, so a directory someone else made
 /// is refused rather than used (review 1 L5).
-fn private_dir(dir: &Path) -> std::io::Result<()> {
+pub(super) fn private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))

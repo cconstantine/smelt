@@ -162,8 +162,12 @@ pub(super) async fn call_model(
     turn_model: &crate::providers::TurnModel,
     request: &mut anthropic::CreateMessageRequest,
     slot: anthropic::stream::SlotPolicy<'_>,
+    cli: &mut crate::claude_cli::run::TurnCli,
 ) -> Result<(anthropic::stream::StreamedTurn, CallRecorder), CallError> {
     let mut relay = |delta: &str| relay_reply_delta(conversation_id, delta);
+    if turn_model.kind == crate::providers::ProviderKind::ClaudeCli {
+        return call_claude_cli(pool, conversation_id, turn_model, request, &mut relay, cli).await;
+    }
     let mut last_err = String::new();
     for attempt in 0..=TOOL_CALL_PARSE_RETRIES {
         // A fresh bubble per model call, and per retry: a retry's
@@ -200,6 +204,29 @@ pub(super) async fn call_model(
         }
     }
     Err(CallError::Failed(ServerFnError::new(last_err)))
+}
+
+/// `call_model` on a Claude Code provider (SME-430): one API call of the
+/// turn's CLI run, with no parse retries (the CLI talks to Anthropic
+/// itself). An API call the CLI made on its own after a cut-off reply
+/// (S6) is recorded as a call of its own, from `extra`'s drop. A request
+/// that didn't fit fails plainly until smelt compacts these (SME-431).
+#[cfg(feature = "server")]
+async fn call_claude_cli(
+    pool: &PgPool,
+    conversation_id: i64,
+    turn_model: &crate::providers::TurnModel,
+    request: &anthropic::CreateMessageRequest,
+    relay: &mut (dyn FnMut(&str) + Send),
+    cli: &mut crate::claude_cli::run::TurnCli,
+) -> Result<(anthropic::stream::StreamedTurn, CallRecorder), CallError> {
+    clear_reply_in_progress(conversation_id);
+    crate::events::publish(conversation_id, crate::events::ConversationEvent::ReplyReset {});
+    let recorder = CallRecorder::new(pool, conversation_id, turn_model, db::ModelCallKind::Turn, request);
+    let extra = CallRecorder::new(pool, conversation_id, turn_model, db::ModelCallKind::Turn, request);
+    let called = crate::claude_cli::run::call(conversation_id, turn_model, request, relay, recorder.meter(), extra.meter(), cli).await;
+    drop(extra);
+    called.map(|turn| (turn, recorder)).map_err(|e| CallError::Failed(ServerFnError::new(e)))
 }
 
 /// Records one model call attempt's usage and cost (SME-106), however the

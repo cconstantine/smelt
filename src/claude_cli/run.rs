@@ -1,0 +1,572 @@
+//! One turn's CLI run (SME-430): a `claude -p` process held for the whole
+//! turn, each of the turn's model calls one of its API calls.
+//!
+//! States (SME-399's state model): **None** (no run), **Streaming** (an
+//! API call in flight), **Parked** (the reply ended in `tool_use`; its
+//! calls wait in the bridge for smelt's results), **Idle** (`result`
+//! seen, stdin open). A call that fails ends the run, and the next call
+//! starts a new one, given smelt's history as text.
+//!
+//! - call, None: spawn, send the history (`render::rehydrate`) → Streaming.
+//! - call, Parked: answer each of the reply's calls with its result, as
+//!   the call arrives (the CLI makes them one at a time, S2), the tail's
+//!   other blocks as text on the last → Streaming.
+//! - call, Idle: send the tail as a user message → Streaming.
+//! - call, the history went another way (`render::tail_after`): end the
+//!   run, then as None.
+//! - `message_stop` `tool_use` → Parked, return the reply.
+//! - `message_stop` cut off (`max_tokens`): interrupt at once, since the
+//!   CLI would carry on by itself (S6); its continuation's usage goes to
+//!   the extra meter; await `result` → Idle, return the reply.
+//! - `message_stop` otherwise: await `result` → Idle, return the reply.
+//! - `result` with `is_error` before `message_stop`, the process ending,
+//!   or a silence over `SILENCE`: the call fails, and the run ends.
+//! - `TurnCli` dropped (the turn finished, failed, stopped or asked the
+//!   user): Streaming or Parked → interrupt (the CLI then records each
+//!   parked call as stopped, the planner's P3), then close stdin, wait,
+//!   kill; Idle → close stdin, wait, kill. In a spawned task, so a Stop
+//!   never waits for it.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::{Child, ChildStdin, ChildStdout};
+
+use super::bridge::{ParkedCall, RunBridge, ToolReply, bridge};
+use super::errors::{RateLimit, result_error};
+use super::process::{Launch, SessionArg, cli_args, turn_env};
+use super::render::{Synced, blocks_text, rehydrate, synced, tail_after, tool_result_text};
+use crate::anthropic::stream::interpret::{StreamOutcome, block_index, interpret_stream_event};
+use crate::anthropic::stream::{Blocks, PartialBlock, StreamedTurn, UsageMeter};
+use crate::anthropic::{AnthropicMessage, ContentBlock, CreateMessageRequest};
+
+/// The longest the CLI may say nothing while smelt waits on it, before the
+/// call fails: long enough for a large prompt's first token.
+pub const SILENCE: Duration = Duration::from_secs(180);
+
+/// How long a run that's ending, or that was interrupted, gets to say its
+/// `result` and exit before it's killed.
+pub const WIND_DOWN: Duration = Duration::from_secs(5);
+
+/// What a reply's call gets when the turn's next request has no result
+/// for it.
+pub const NOT_RUN: &str = "smelt didn't run this tool call.";
+
+#[cfg(test)]
+pub static SILENCE_FOR_TESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn silence() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = SILENCE_FOR_TESTS.load(std::sync::atomic::Ordering::SeqCst);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    SILENCE
+}
+
+/// A turn's run, if it has one: held by the turn for as long as it runs.
+#[derive(Default)]
+pub struct TurnCli {
+    run: Option<Run>,
+}
+
+impl Drop for TurnCli {
+    fn drop(&mut self) {
+        if let Some(run) = self.run.take() {
+            run.end_in_background();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum State {
+    Streaming,
+    Parked,
+    Idle,
+}
+
+/// One of the reply's tool calls the CLI will make.
+struct Expected {
+    id: String,
+    name: String,
+    input: Value,
+}
+
+struct Run {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    lines: Lines<BufReader<ChildStdout>>,
+    stderr: Arc<Mutex<String>>,
+    bridge: RunBridge,
+    state: State,
+    /// The calls of the reply last returned, while Parked.
+    expected: Vec<Expected>,
+    /// Calls that arrived before smelt had their result, by tool-use id.
+    arrived: HashMap<String, ParkedCall>,
+    /// Calls that arrived with no tool-use id.
+    anonymous: Vec<ParkedCall>,
+    /// Results for calls that haven't arrived yet, by tool-use id.
+    answers: HashMap<String, ToolReply>,
+    synced: Synced,
+    rate: Option<RateLimit>,
+    prompt_file: PathBuf,
+    /// False once the run can't be trusted with another call.
+    healthy: bool,
+    interrupts: u64,
+}
+
+/// One model call through the turn's run: starts one if the turn has
+/// none (or its history went another way), sends what's new, and reads
+/// the reply. The reply's usage goes to `meter`, and that of any API call
+/// the CLI made on its own after a cut-off to `extra` (S6).
+pub async fn call(
+    conversation_id: i64,
+    turn_model: &crate::providers::TurnModel,
+    request: &CreateMessageRequest,
+    on_delta: &mut (dyn FnMut(&str) + Send),
+    meter: &UsageMeter,
+    extra: &UsageMeter,
+    cli: &mut TurnCli,
+) -> Result<StreamedTurn, String> {
+    let tail = cli.run.as_ref().and_then(|run| tail_after(&run.synced, &request.messages)).map(<[_]>::to_vec);
+    if tail.is_none()
+        && let Some(old) = cli.run.take()
+    {
+        tracing::info!(conversation_id, "the conversation went on without its Claude Code run: starting a new one from smelt's history");
+        old.end_in_background();
+    }
+    if let (Some(run), Some(tail)) = (cli.run.as_mut(), &tail)
+        && let Err(e) = run.send_tail(tail).await
+    {
+        if let Some(run) = cli.run.take() {
+            run.end_in_background();
+        }
+        return Err(e);
+    }
+    if cli.run.is_none() {
+        let mut run = Run::spawn(conversation_id, turn_model, request).await?;
+        if request.messages.iter().any(|m| m.role == "assistant") {
+            tracing::info!(conversation_id, messages = request.messages.len(), "a new Claude Code run starts from smelt's history as text");
+        }
+        if let Err(e) = run.write_user(&rehydrate(&request.messages, turn_model.context_window)).await {
+            run.end_in_background();
+            return Err(e);
+        }
+        cli.run = Some(run);
+    }
+    let Some(run) = cli.run.as_mut() else {
+        return Err("Claude Code's run is gone.".to_string());
+    };
+    run.synced = synced(&request.messages);
+    let replied = run.read_reply(on_delta, meter, extra).await;
+    if replied.is_err() || !run.healthy {
+        if let Some(run) = cli.run.take() {
+            run.end_in_background();
+        }
+    }
+    replied
+}
+
+impl Run {
+    async fn spawn(conversation_id: i64, turn_model: &crate::providers::TurnModel, request: &CreateMessageRequest) -> Result<Self, String> {
+        let env = super::cli_env(|name| std::env::var_os(name));
+        let value = |name: &str| env.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone());
+        let config_dir = value("CLAUDE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("Claude Code has no config directory: set {}, or HOME, in the server's environment.", super::CONFIG_DIR_VAR))?;
+        let work = config_dir.join("work").join(conversation_id.to_string());
+        let prompts = config_dir.join("prompts");
+        for dir in [&config_dir, &work, &prompts] {
+            super::private_dir(dir).map_err(|e| format!("Couldn't make Claude Code's directory {} private: {e}", dir.display()))?;
+        }
+        let binary = super::resolve_binary(&turn_model.endpoint.base_url, value("PATH").as_deref())?;
+        let prompt_file = prompts.join(format!("{conversation_id}-{}.md", super::bridge::random_hex(8)));
+        std::fs::write(&prompt_file, request.system.as_deref().unwrap_or_default())
+            .map_err(|e| format!("Couldn't write the system prompt for Claude Code: {e}"))?;
+        let run_bridge = bridge().await?.register(&request.tools);
+        let launch = Launch {
+            model: &turn_model.model,
+            effort: turn_model.effort,
+            system_prompt_file: &prompt_file,
+            mcp_config: (!request.tools.is_empty()).then(|| run_bridge.mcp_config().to_string()),
+            session: SessionArg::Ephemeral,
+        };
+        let env = turn_env(env, request.max_tokens);
+        let spawned = tokio::process::Command::new(&binary)
+            .args(cli_args(&launch))
+            .env_clear()
+            .envs(env.iter().map(|(name, value)| (name, value)))
+            .current_dir(&work)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn();
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(e) => {
+                let _ = std::fs::remove_file(&prompt_file);
+                return Err(format!("Couldn't run Claude Code ({}): {e}", binary.display()));
+            }
+        };
+        let (Some(stdin), Some(stdout), Some(stderr_pipe)) = (child.stdin.take(), child.stdout.take(), child.stderr.take()) else {
+            let _ = std::fs::remove_file(&prompt_file);
+            return Err("Claude Code's pipes weren't made.".to_string());
+        };
+        let stderr = Arc::new(Mutex::new(String::new()));
+        tokio::spawn(keep_tail(stderr_pipe, stderr.clone()));
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            lines: BufReader::new(stdout).lines(),
+            stderr,
+            bridge: run_bridge,
+            state: State::Streaming,
+            expected: Vec::new(),
+            arrived: HashMap::new(),
+            anonymous: Vec::new(),
+            answers: HashMap::new(),
+            synced: synced(&[]),
+            rate: None,
+            prompt_file,
+            healthy: true,
+            interrupts: 0,
+        })
+    }
+
+    async fn write_line(&mut self, line: &Value) -> Result<(), String> {
+        let stdin = self.stdin.as_mut().ok_or("Claude Code's input is closed.")?;
+        let mut bytes = line.to_string().into_bytes();
+        bytes.push(b'\n');
+        stdin.write_all(&bytes).await.map_err(|e| format!("Couldn't write to Claude Code: {e}"))?;
+        stdin.flush().await.map_err(|e| format!("Couldn't write to Claude Code: {e}"))
+    }
+
+    async fn write_user(&mut self, text: &str) -> Result<(), String> {
+        self.write_line(&serde_json::json!({"type": "user", "message": {"role": "user", "content": text}})).await?;
+        self.state = State::Streaming;
+        Ok(())
+    }
+
+    async fn interrupt(&mut self) -> Result<(), String> {
+        self.interrupts += 1;
+        let id = format!("smelt-interrupt-{}", self.interrupts);
+        self.write_line(&serde_json::json!({"type": "control_request", "request_id": id, "request": {"subtype": "interrupt"}})).await
+    }
+
+    /// Sends what the turn added since the last call: the reply's results
+    /// to its parked calls, or a user message.
+    async fn send_tail(&mut self, tail: &[AnthropicMessage]) -> Result<(), String> {
+        match self.state {
+            State::Streaming => Err("Claude Code was still replying when smelt called it again.".to_string()),
+            State::Idle => {
+                let text = tail.iter().map(|m| blocks_text(&m.content)).collect::<Vec<_>>().join("\n\n");
+                self.write_user(&text).await
+            }
+            State::Parked => {
+                let mut replies: HashMap<String, ToolReply> = HashMap::new();
+                let mut others = Vec::new();
+                for block in tail.iter().flat_map(|m| &m.content) {
+                    match block {
+                        ContentBlock::ToolResult { tool_use_id, content, is_error }
+                            if self.expected.iter().any(|e| &e.id == tool_use_id) =>
+                        {
+                            let reply = ToolReply { text: vec![content.clone()], is_error: is_error.unwrap_or(false) };
+                            replies.insert(tool_use_id.clone(), reply);
+                        }
+                        ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                            others.push(tool_result_text(tool_use_id, content, is_error.unwrap_or(false)));
+                        }
+                        other => others.push(blocks_text(std::slice::from_ref(other))),
+                    }
+                }
+                others.retain(|text| !text.trim().is_empty());
+                for expected in &self.expected {
+                    replies
+                        .entry(expected.id.clone())
+                        .or_insert_with(|| ToolReply { text: vec![NOT_RUN.to_string()], is_error: true });
+                }
+                if let Some(last) = self.expected.last().and_then(|e| replies.get_mut(&e.id)) {
+                    last.text.extend(others);
+                }
+                self.answers = replies;
+                for parked in std::mem::take(&mut self.anonymous) {
+                    self.take_call(parked);
+                }
+                let arrived: Vec<String> = self.arrived.keys().cloned().collect();
+                for id in arrived {
+                    if let Some(parked) = self.arrived.remove(&id) {
+                        self.take_call(parked);
+                    }
+                }
+                self.state = State::Streaming;
+                Ok(())
+            }
+        }
+    }
+
+    /// A call from the CLI: answered now if smelt has its result, else
+    /// kept until it does. One without a tool-use id is matched to a call
+    /// of the reply by name and input, first come first served.
+    fn take_call(&mut self, parked: ParkedCall) {
+        let id = parked.tool_use_id.clone().or_else(|| {
+            self.expected
+                .iter()
+                .find(|e| e.name == parked.name && e.input == parked.arguments && self.answers.contains_key(&e.id))
+                .map(|e| e.id.clone())
+        });
+        match id {
+            Some(id) => match self.answers.remove(&id) {
+                Some(reply) => {
+                    let _ = parked.reply.send(reply);
+                }
+                // Not answered yet: the CLI makes a reply's first call
+                // before its `message_stop` (S2), and smelt runs it first.
+                None => {
+                    self.arrived.insert(id, parked);
+                }
+            },
+            None => self.anonymous.push(parked),
+        }
+    }
+
+    fn stderr_tail(&self) -> String {
+        self.stderr.lock().map(|tail| tail.trim().to_string()).unwrap_or_default()
+    }
+
+    /// The next line from the CLI, the bridge's calls taken as they come.
+    async fn next_event(&mut self) -> Result<Value, String> {
+        loop {
+            tokio::select! {
+                Some(parked) = self.bridge.calls.recv() => self.take_call(parked),
+                line = tokio::time::timeout(silence(), self.lines.next_line()) => {
+                    let line = match line {
+                        Err(_) => {
+                            self.healthy = false;
+                            return Err(format!("Claude Code said nothing for {} seconds, so smelt stopped it.", silence().as_secs()));
+                        }
+                        Ok(Ok(Some(line))) => line,
+                        Ok(Ok(None)) | Ok(Err(_)) => {
+                            self.healthy = false;
+                            let status = tokio::time::timeout(WIND_DOWN, self.child.wait()).await;
+                            let code = match status {
+                                Ok(Ok(status)) => status.to_string(),
+                                _ => "an unknown status".to_string(),
+                            };
+                            let tail = self.stderr_tail();
+                            let said = if tail.is_empty() { String::new() } else { format!(" It said: {tail}") };
+                            return Err(format!("Claude Code exited ({code}) before it finished.{said}"));
+                        }
+                    };
+                    // A line that isn't a JSON object isn't the CLI's protocol.
+                    if let Ok(value @ Value::Object(_)) = serde_json::from_str::<Value>(&line) {
+                        return Ok(value);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reads one API call's reply.
+    async fn read_reply(&mut self, on_delta: &mut (dyn FnMut(&str) + Send), meter: &UsageMeter, extra: &UsageMeter) -> Result<StreamedTurn, String> {
+        let mut blocks = Blocks::default();
+        let mut stop_reason = String::new();
+        loop {
+            let event = self.next_event().await?;
+            match event["type"].as_str() {
+                Some("stream_event") => {
+                    let inner = &event["event"];
+                    if inner["type"] == "message_stop" {
+                        return self.finish(blocks, stop_reason, meter, extra).await;
+                    }
+                    if let Err(e) = apply(&mut blocks, &mut stop_reason, inner, on_delta, meter) {
+                        self.healthy = false;
+                        return Err(e);
+                    }
+                }
+                Some("result") => {
+                    self.state = State::Idle;
+                    self.healthy = false;
+                    return Err(result_error(&event, self.rate.as_ref())
+                        .unwrap_or_else(|| "Claude Code ended the reply before it finished.".to_string()));
+                }
+                _ => self.note(&event),
+            }
+        }
+    }
+
+    /// What smelt notes of a line that isn't the reply's.
+    fn note(&mut self, event: &Value) {
+        match (event["type"].as_str(), event["subtype"].as_str()) {
+            (Some("rate_limit_event"), _) => self.rate = Some(RateLimit::from_event(event)),
+            (Some("system"), Some("api_retry")) => {
+                tracing::info!(attempt = event["attempt"].as_i64(), error = event["error"].as_str(), "Claude Code is retrying an API call");
+            }
+            (Some("system"), Some("compact_boundary")) => {
+                // DISABLE_COMPACT is set, so this shouldn't come; smelt's
+                // history stays the record, and the next call starts over.
+                tracing::warn!("Claude Code compacted its context though smelt turned that off: the next call starts a new run");
+                self.healthy = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// The reply at its `message_stop`.
+    async fn finish(&mut self, blocks: Blocks, stop_reason: String, meter: &UsageMeter, extra: &UsageMeter) -> Result<StreamedTurn, String> {
+        let (mut content, cut_off_call) = blocks.finish(&stop_reason)?;
+        for block in &mut content {
+            if let ContentBlock::ToolUse { name, .. } = block
+                && let Some(smelt) = self.bridge.smelt_name(name)
+            {
+                *name = smelt.to_string();
+            }
+        }
+        let turn = StreamedTurn { content, stop_reason, usage: meter.usage(), cut_off_call };
+        if turn.stop_reason == "tool_use" {
+            self.expected = turn
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::ToolUse { id, name, input } => Some(Expected { id: id.clone(), name: name.clone(), input: input.clone() }),
+                    _ => None,
+                })
+                .collect();
+            self.state = State::Parked;
+            return Ok(turn);
+        }
+        if crate::anthropic::stream::is_cut_off(&turn.stop_reason) {
+            // The CLI would call again on its own (S6): stop it now.
+            if self.interrupt().await.is_err() {
+                self.healthy = false;
+            }
+        }
+        self.await_result(extra).await;
+        Ok(turn)
+    }
+
+    /// Reads to the run's `result`, within `WIND_DOWN`: an API call the
+    /// CLI made on its own meanwhile is metered on `extra` and otherwise
+    /// dropped. A run that doesn't get there isn't used again.
+    async fn await_result(&mut self, extra: &UsageMeter) {
+        let waited = tokio::time::timeout(WIND_DOWN, async {
+            loop {
+                let event = self.next_event().await?;
+                match event["type"].as_str() {
+                    Some("result") => return Ok::<_, String>(()),
+                    Some("stream_event") => {
+                        let inner = &event["event"];
+                        match interpret_stream_event(inner) {
+                            StreamOutcome::InitialUsage(usage) => extra.start(&usage),
+                            StreamOutcome::Delta { usage, .. } => extra.delta(&usage),
+                            StreamOutcome::TextDelta(text) | StreamOutcome::ThinkingDelta(text) => extra.streamed(text.len()),
+                            _ => {}
+                        }
+                    }
+                    _ => self.note(&event),
+                }
+            }
+        })
+        .await;
+        if !matches!(waited, Ok(Ok(()))) {
+            self.healthy = false;
+        }
+        self.state = State::Idle;
+        self.expected.clear();
+    }
+
+    /// Ends the run in a spawned task: interrupt if it's mid-reply, then
+    /// close its input, wait, and kill what's left of its process group.
+    fn end_in_background(mut self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            let _ = std::fs::remove_file(&self.prompt_file);
+            return;
+        };
+        runtime.spawn(async move {
+            if self.state != State::Idle && self.interrupt().await.is_ok() {
+                let _ = tokio::time::timeout(WIND_DOWN, async {
+                    while let Ok(event) = self.next_event().await {
+                        if event["type"] == "result" {
+                            break;
+                        }
+                    }
+                })
+                .await;
+            }
+            // Answered with an error only now, after the interrupt: the CLI
+            // then records each as stopped rather than calling again.
+            self.arrived.clear();
+            self.anonymous.clear();
+            self.stdin = None;
+            if tokio::time::timeout(WIND_DOWN, self.child.wait()).await.is_err() {
+                if let Some(group) = self.child.id().and_then(|id| i32::try_from(id).ok()) {
+                    let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(group), nix::sys::signal::Signal::SIGKILL);
+                }
+                let _ = self.child.wait().await;
+            }
+            let _ = std::fs::remove_file(&self.prompt_file);
+        });
+    }
+}
+
+/// One `stream_event`'s API event, applied to the reply as
+/// `anthropic::stream` applies an SSE event.
+fn apply(blocks: &mut Blocks, stop_reason: &mut String, event: &Value, on_delta: &mut (dyn FnMut(&str) + Send), meter: &UsageMeter) -> Result<(), String> {
+    let index = block_index(event);
+    match interpret_stream_event(event) {
+        StreamOutcome::TextDelta(text) => {
+            meter.streamed(text.len());
+            on_delta(&text);
+            blocks.text(index, text);
+        }
+        StreamOutcome::ThinkingDelta(thinking) => {
+            meter.streamed(thinking.len());
+            blocks.thinking(index, thinking);
+        }
+        StreamOutcome::ThinkingSignatureDelta(signature) => blocks.signature(index, &signature),
+        StreamOutcome::ToolUseStart { id, name } => blocks.start(index, PartialBlock::ToolUse { id, name, partial_json: String::new() }),
+        StreamOutcome::ToolUseInputDelta(partial_json) => {
+            meter.streamed(partial_json.len());
+            blocks.tool_input(index, &partial_json);
+        }
+        StreamOutcome::BlockStop => blocks.stop(index),
+        StreamOutcome::Delta { stop_reason: reason, usage } => {
+            if let Some(reason) = reason {
+                *stop_reason = reason;
+            }
+            meter.delta(&usage);
+        }
+        StreamOutcome::InitialUsage(initial) => meter.start(&initial),
+        StreamOutcome::Error(message) => return Err(format!("Claude Code's API call failed: {message}")),
+        StreamOutcome::Ignored => {
+            // A thinking block opens with an empty start event, which the
+            // HTTP stream also ignores: its first delta opens it.
+        }
+    }
+    Ok(())
+}
+
+/// Keeps the last `errors::MAX_QUOTED` bytes of the CLI's stderr.
+async fn keep_tail(mut stderr: tokio::process::ChildStderr, tail: Arc<Mutex<String>>) {
+    let mut buffer = [0u8; 4096];
+    while let Ok(n) = stderr.read(&mut buffer).await {
+        if n == 0 {
+            break;
+        }
+        let Ok(mut kept) = tail.lock() else { break };
+        kept.push_str(&String::from_utf8_lossy(&buffer[..n]));
+        let excess = kept.len().saturating_sub(super::errors::MAX_QUOTED);
+        if excess > 0 {
+            let cut = (excess..=kept.len()).find(|&i| kept.is_char_boundary(i)).unwrap_or(kept.len());
+            kept.drain(..cut);
+        }
+    }
+}

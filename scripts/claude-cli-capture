@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Captures the real Claude Code CLI's output for SME-430: the S-checks and
+# the fixtures in src/claude_cli/fixtures/. Each scenario but `sanitize`
+# is one real `claude -p` call on this host's Claude Code sign-in, so run
+# them by hand, sparingly; the gate never runs this, and the code is built
+# only with the `claude-cli-capture` feature.
+#
+#   scripts/claude-cli-capture <out dir> <scenario>...
+#
+# Scenarios: loop, kill, resume (after kill), bad_token, bad_model,
+# capped, thinking_off, and sanitize (writes the fixtures from <out dir>'s
+# raw output). The raw output, and the CLI's config dir with its
+# sessions, stay in <out dir>, which must be outside the repo: delete its
+# config/ afterwards.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+out=$1
+shift
+mkdir -p "$out"
+out=$(cd "$out" && pwd)
+case "$out/" in "$(pwd)/"*) echo "the out dir must be outside the repo" >&2; exit 2 ;; esac
+exec cargo run --quiet --features claude-cli-capture --bin smelt -- claude-cli-capture "$out" "$@"

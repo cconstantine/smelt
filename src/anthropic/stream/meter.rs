@@ -35,7 +35,7 @@ impl UsageMeter {
 
     /// `message_start`'s input and cache counts (last one wins). Its
     /// `output_tokens` is a placeholder, and ignored.
-    pub(super) fn start(&self, initial: &TokenUsage) {
+    pub(crate) fn start(&self, initial: &TokenUsage) {
         let mut metered = self.lock();
         metered.usage.input_tokens = initial.input_tokens;
         metered.usage.cache_creation_input_tokens = initial.cache_creation_input_tokens;
@@ -43,7 +43,7 @@ impl UsageMeter {
     }
 
     /// A `message_delta`'s usage, by `DeltaUsage::apply_to`'s rule.
-    pub(super) fn delta(&self, delta: &DeltaUsage) {
+    pub(crate) fn delta(&self, delta: &DeltaUsage) {
         let mut metered = self.lock();
         delta.apply_to(&mut metered.usage);
         if delta.output_tokens.is_some() {
@@ -53,12 +53,12 @@ impl UsageMeter {
 
     /// `bytes` more of text, thinking or tool input streamed. A thinking
     /// signature isn't output the model wrote, and isn't counted.
-    pub(super) fn streamed(&self, bytes: usize) {
+    pub(crate) fn streamed(&self, bytes: usize) {
         self.lock().streamed_bytes += bytes as u64;
     }
 
     /// The usage the stream reported, for a call that finished.
-    pub(super) fn usage(&self) -> TokenUsage {
+    pub(crate) fn usage(&self) -> TokenUsage {
         self.lock().usage
     }
 

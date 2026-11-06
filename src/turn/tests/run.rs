@@ -33,29 +33,6 @@ async fn test_run_turn_without_a_model_still_saves_the_message(pool: PgPool) {
     assert_eq!(saved[0].role, "user");
 }
 
-/// SME-429: until the transport lands (SME-430), a turn on a Claude Code
-/// provider ends at once with an error saying so, and calls nothing; the
-/// user's message is still kept.
-#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_a_turn_on_a_claude_code_provider_says_it_cant_run_yet(pool: PgPool) {
-    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
-    let _guard = lock_turn_tests();
-    let conversation = db::create_conversation(&pool).await.expect("create conversation");
-    let provider = db::create_inference_provider(&pool, "Claude", "claude_cli", "claude", "api_key", "", false, None, true, None)
-        .await
-        .expect("create the provider");
-    db::set_conversation_model(&pool, conversation.id, provider.id, "claude-opus-5-5")
-        .await
-        .expect("pick its model");
-    let error = run_turn(&pool, conversation.id, hello())
-        .await
-        .expect_err("the kind can't run turns yet");
-    assert_eq!(error.message(), crate::claude_cli::NOT_YET);
-    let saved = db::list_messages(&pool, conversation.id).await.expect("list messages");
-    assert_eq!(saved.len(), 1, "the user's message is kept, and nothing else is written");
-    assert_eq!(saved[0].role, "user");
-}
-
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_run_turn_persists_user_and_assistant_messages_for_text_only_reply(pool: PgPool) {
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
