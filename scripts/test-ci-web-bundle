@@ -20,11 +20,13 @@ ours_running() {
     pgrep -f "^$name " >/dev/null
 }
 
-# Another run's fake dx, alive for this whole run (about 25 s), so the
-# checks below always meet the overlap that made them flaky, with the
-# nearest name another run can have. It writes to no pipe of this run's and
-# outlives a killed run by two minutes at most.
-(exec -a "${name}0" sleep 120) </dev/null >/dev/null 2>&1 &
+# A neighbour that shares this run's name up to its last character, alive
+# for this whole run (about 25 s), so the checks below always meet an
+# overlap: a check that drops the trailing space would match it. Its suffix
+# is a letter, so no other run's pid-bearing name can be it, or match it.
+# It writes to no pipe of this run's and outlives a killed run by two
+# minutes at most.
+(exec -a "${name}x" sleep 120) </dev/null >/dev/null 2>&1 &
 neighbour=$!
 trap 'kill "$neighbour" 2>/dev/null' EXIT
 
