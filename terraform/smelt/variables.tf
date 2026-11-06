@@ -208,6 +208,30 @@ variable "extra_env" {
   default     = {}
 }
 
+variable "secret_env" {
+  description = <<-EOT
+    Secret environment values for the server, e.g.
+    `{ CLAUDE_CODE_OAUTH_TOKEN = var.claude_code_oauth_token }`. Each key becomes
+    one env var of the same name, read through a `secretKeyRef` from the
+    `smelt-secret-env` secret this module makes (only when the map isn't empty),
+    so the value never appears in the pod spec. The keys are not secret: they
+    show in the plan and the Deployment, the values never do. A key must be an
+    environment variable name, and must not be one this module sets itself or
+    one `extra_env` sets. A changed value rolls the server pod, through a
+    SHA-256 of the whole map on its template.
+  EOT
+  type        = map(string)
+  default     = {}
+  sensitive   = true
+  nullable    = false
+
+  # Only the keys are read, unmarked: they name variables, not secrets.
+  validation {
+    condition     = alltrue([for key in nonsensitive(keys(var.secret_env)) : can(regex("^[A-Za-z_][A-Za-z0-9_]*$", key))])
+    error_message = "Every secret_env key must be an environment variable name: letters, digits and underscores, not starting with a digit."
+  }
+}
+
 variable "node_selector" {
   description = "Node labels the server and database pods must match. Empty by default: images published from SME-360 (#248) on, and postgres:17-alpine, are multi-arch (amd64 and arm64). Set one to pin a single-arch image, such as a tag from before #248, on a mixed cluster. It reaches only the server and database pods, not sandbox pods, for example { \"kubernetes.io/arch\" = \"amd64\" }."
   type        = map(string)
