@@ -469,7 +469,7 @@ async fn test_a_burst_of_calls_publishes_one_summary_with_them_all(pool: PgPool)
 /// Calls spread past one window are therefore under contract, not
 /// corruption: every window publishes the latest count, twice with the same
 /// count if nothing changed between the reads. That double publish is what
-/// CI saw this file's burst test do under full-gate load (once in 2308,
+/// CI saw this file's burst test do under full-gate load (once in 2334,
 /// `left: [("cmd-c7", 3), ("cmd-c7", 3)]`): its burst was racing its own
 /// premise that the burst fits one window, not a broken debounce.
 ///
