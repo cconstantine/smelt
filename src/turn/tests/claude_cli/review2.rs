@@ -51,3 +51,34 @@ async fn test_a_call_before_its_block_is_read_is_the_replys(pool: PgPool) {
     assert_eq!(results.len(), 1, "{results:?}");
     assert_eq!(results[0]["is_error"], false, "the reply's own call got its result: {results:?}");
 }
+
+/// Review 2 L13: the request-built refusal is reachable. A conversation
+/// whose compactions left it tight (on an API provider, at the same
+/// window) and that then moves to Claude Code passes the proactive check
+/// with nothing measured since, and is caught only once its request is
+/// built: it fails plainly there too, starting no CLI.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_tight_conversation_fails_plainly_when_its_request_is_built(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let fake = FakeCli::new("tight", vec![vec![json!({"read": true}), text_reply("unreached")]]);
+    let provider = fake.pick_for(&pool, conversation.id).await;
+    let window = 40_000;
+    super::review1::set_cli_window(&pool, provider, window).await;
+    // Two compactions, each measured near the window: tight.
+    let near = anthropic::TokenUsage { input_tokens: 25_000, ..Default::default() };
+    crate::turn::state::with_compaction_progress(conversation.id, |p| {
+        for _ in 0..2 {
+            p.compacted(window as u32);
+            p.measured(&near, window as u32);
+        }
+        assert!(p.room_only_at(window as u32), "the progress is tight");
+    });
+    let block = [anthropic::ContentBlock::Text { text: "word ".repeat(30_000) }];
+    db::create_message(&pool, conversation.id, "user", &block).await.expect("history");
+
+    let error = run_turn(&pool, conversation.id, hello()).await.expect_err("it doesn't fit").to_string();
+    assert!(error.contains(crate::claude_cli::CANT_COMPACT_YET), "{error}");
+    assert_eq!(fake.started(), 0, "no CLI ran");
+}
