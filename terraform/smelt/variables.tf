@@ -230,6 +230,15 @@ variable "secret_env" {
     condition     = alltrue([for key in nonsensitive(keys(var.secret_env)) : can(regex("^[A-Za-z_][A-Za-z0-9_]*$", key))])
     error_message = "Every secret_env key must be an environment variable name: letters, digits and underscores, not starting with a digit."
   }
+
+  # An empty value would plan, apply and blank the variable in the server: a
+  # `TF_VAR_x="$(cat <missing file>)"` export sets "" rather than failing, and
+  # a variable with no default catches only an unset one. The result is
+  # unmarked: whether some value is empty, never which or what.
+  validation {
+    condition     = nonsensitive(alltrue([for value in values(var.secret_env) : value != ""]))
+    error_message = "Every secret_env value must be non-empty. An empty one usually means the file or variable it was read from is missing."
+  }
 }
 
 variable "node_selector" {

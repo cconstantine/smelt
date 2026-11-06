@@ -47,7 +47,9 @@ where smelt's own real-cluster test suite runs.
     key, of the key's name, from a `secretKeyRef` on it. The Deployment holds
     the names, never the values, and the plan shows them as sensitive.
   - The keys are no secret: they show in the plan and the Deployment.
-  - The plan refuses a key that isn't an environment variable name, or that
+  - The plan refuses an empty value (a `TF_VAR_x="$(cat <missing file>)"`
+    export sets one, and a variable with no default doesn't catch it), a key
+    that isn't an environment variable name, or one that
     `extra_env` or this module sets, `DATABASE_URL` included. Every name the
     module can set counts, set or not, so turning a setting on later can't
     clash.
