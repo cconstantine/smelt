@@ -425,7 +425,7 @@ pub(super) fn connect_with_retry(
                     if mode != ConnectMode::First {
                         if let Some(reason) = dialer.death_reason(pod_id).await {
                             clean_up_and_terminate_pod(&pool, pod_id, reason).await;
-                            return Err(TerminalError::AgentUnreachable);
+                            return Err(stale_pod_or_unreachable(&pool, pod_id).await);
                         }
                     }
                     last_err = Some(e);
@@ -448,7 +448,7 @@ pub(super) fn connect_with_retry(
                 // unreachable, say). Its terminals are unusable either way,
                 // so clean up and stop it the same as a confirmed crash.
                 clean_up_and_terminate_pod(&pool, pod_id, None).await;
-                Err(TerminalError::AgentUnreachable)
+                Err(stale_pod_or_unreachable(&pool, pod_id).await)
             }
         }
     })
@@ -466,6 +466,44 @@ pub(super) async fn clean_up_and_terminate_pod(pool: &PgPool, pod_id: i64, reaso
     handle_crash_cleanup(pool, pod_id, reason).await;
     if let Err(e) = force_terminate_pod(pool, pod_id).await {
         tracing::warn!(pod_id, error = %e, "best-effort pod termination failed after a crash");
+    }
+}
+
+/// SME-425: what to answer once `connect_with_retry` has cleaned up a pod
+/// it couldn't reach. `AgentUnreachable`'s create_pod advice is true only
+/// when no live pod is left — but a caller that dialled an ended pod's
+/// terminal (the pod ending between the up-front staleness check and the
+/// dial, say) meets a conversation that has one, and that advice routes
+/// there on to `terminate_pod` — killing a healthy pod. One indexed read
+/// on this error path decides. Cleanup normally ends `pod_id`'s row
+/// before this reads, so a live pod found here is another;
+/// `force_terminate_pod` is best-effort, and the `!=` guard covers the
+/// termination that didn't — `pod_id` answering live itself keeps
+/// `AgentUnreachable`, its advice still true while it runs.
+async fn stale_pod_or_unreachable(pool: &PgPool, pod_id: i64) -> TerminalError {
+    // F1 (review 1): a failed read still answers AgentUnreachable — the
+    // safer fallback while the database itself is failing — but it says
+    // so. Swallowed, it reads as "no live pod" to whoever later wonders
+    // why the crash-path advice fired, when it may be a replacement the
+    // failed query never showed.
+    let conversation_id = match db::sandbox_pod_conversation_id(pool, pod_id).await {
+        Ok(conversation_id) => conversation_id,
+        Err(e) => {
+            tracing::warn!(pod_id, error = %e, "couldn't read the dialled pod's conversation after cleanup");
+            None
+        }
+    };
+    let mut live_pod = None;
+    if let Some(conversation_id) = conversation_id {
+        match conversation_pod_id(pool, conversation_id).await {
+            Ok(pod) => live_pod = Some(pod),
+            Err(TerminalError::NoPod) => {} // the one honest "no live pod"
+            Err(e) => tracing::warn!(pod_id, error = %e, "couldn't read the conversation's live pod after cleanup"),
+        }
+    }
+    match live_pod {
+        Some(live_pod) if live_pod != pod_id => TerminalError::StalePod { pod_id, live_pod },
+        _ => TerminalError::AgentUnreachable,
     }
 }
 
