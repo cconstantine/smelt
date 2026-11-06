@@ -320,3 +320,27 @@ async fn test_a_run_dropped_before_it_starts_leaves_no_files(pool: PgPool) {
     }
     assert_eq!(run_files(conversation.id), Vec::<std::path::PathBuf>::new());
 }
+
+/// Review 1 M1: a CLI that dies while smelt runs the reply's tool doesn't
+/// fail the turn: the next call starts a new run, whose history carries
+/// the tool's result as text.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_cli_that_dies_mid_tool_is_replaced_by_a_new_run(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let calls = tool_reply(&[("toolu_gone", "todoread", json!({}))]);
+    let fake = FakeCli::new("dies", vec![
+        vec![json!({"read": true}), calls[0].clone(), json!({"exit": 137})],
+        vec![json!({"read": true}), text_reply("Carried on.")],
+    ]);
+    fake.pick_for(&pool, conversation.id).await;
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the turn carries on");
+
+    assert_eq!(fake.started(), 2, "a second process");
+    let sent = &user_texts(&fake, 1)[0];
+    assert!(sent.contains("toolu_gone"), "the result goes to the new run as text: {sent}");
+    let saved = saved(&pool, conversation.id).await;
+    assert!(matches!(&saved.last().expect("a reply").1[..], [anthropic::ContentBlock::Text { text }] if text == "Carried on."), "{saved:?}");
+}

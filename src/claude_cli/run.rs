@@ -19,6 +19,9 @@
 //!   CLI would carry on by itself (S6); its continuation's usage goes to
 //!   the extra meter; await `result` → Idle, return the reply.
 //! - `message_stop` otherwise: await `result` → Idle, return the reply.
+//! - call, the process gone (it exited while smelt ran a tool, or before
+//!   it said anything to this call): end the run, then as None, the
+//!   reply's results going to the new run as text (review 1 M1).
 //! - `result` with `is_error` before `message_stop`, the process ending,
 //!   or a silence over `SILENCE`: the call fails, and the run ends.
 //! - `TurnCli` dropped (the turn finished, failed, stopped or asked the
@@ -121,6 +124,10 @@ struct Run {
     /// False once the run can't be trusted with another call.
     healthy: bool,
     interrupts: u64,
+    /// Whether the CLI has said anything since the current call began.
+    heard: bool,
+    /// Whether its stdout ended or its input broke: the process is gone.
+    gone: bool,
 }
 
 /// One model call through the turn's run: starts one if the turn has
@@ -136,6 +143,15 @@ pub async fn call(
     extra: &UsageMeter,
     cli: &mut TurnCli,
 ) -> Result<StreamedTurn, String> {
+    // A process that died since the last call (an OOM kill while smelt ran
+    // a tool) is replaced, as the state table's Dead row says (review 1 M1).
+    if let Some(run) = cli.run.as_mut()
+        && !run.alive()
+        && let Some(dead) = cli.run.take()
+    {
+        tracing::warn!(conversation_id, "the turn's Claude Code process had exited: starting a new one from smelt's history");
+        dead.end_in_background();
+    }
     let tail = cli.run.as_ref().and_then(|run| tail_after(&run.synced, &request.messages)).map(<[_]>::to_vec);
     if tail.is_none()
         && let Some(old) = cli.run.take()
@@ -146,11 +162,41 @@ pub async fn call(
     if let (Some(run), Some(tail)) = (cli.run.as_mut(), &tail)
         && let Err(e) = run.send_tail(tail).await
     {
-        if let Some(run) = cli.run.take() {
-            run.end_in_background();
+        let Some(mut run) = cli.run.take() else {
+            return Err(e);
+        };
+        // Its input closed under it: it died as smelt wrote (M1).
+        let died = run.exited();
+        run.end_in_background();
+        if !died {
+            return Err(e);
         }
-        return Err(e);
     }
+    let replied = read_from_run(conversation_id, turn_model, request, on_delta, meter, extra, cli).await;
+    match replied {
+        // It died before it said anything to this call (M1, the race the
+        // check above can lose): once more, on a new run.
+        Err(_) if cli.run.as_mut().is_some_and(|run| run.exited() && !run.heard) => {
+            if let Some(dead) = cli.run.take() {
+                tracing::warn!(conversation_id, "the turn's Claude Code process exited before it answered: starting a new one from smelt's history");
+                dead.end_in_background();
+            }
+            read_from_run(conversation_id, turn_model, request, on_delta, meter, extra, cli).await
+        }
+        replied => replied,
+    }
+}
+
+/// `call`'s spawn (when the turn has no run) and its read of the reply.
+async fn read_from_run(
+    conversation_id: i64,
+    turn_model: &crate::providers::TurnModel,
+    request: &CreateMessageRequest,
+    on_delta: &mut (dyn FnMut(&str) + Send),
+    meter: &UsageMeter,
+    extra: &UsageMeter,
+    cli: &mut TurnCli,
+) -> Result<StreamedTurn, String> {
     if cli.run.is_none() {
         let mut run = Run::spawn(conversation_id, turn_model, request).await?;
         if request.messages.iter().any(|m| m.role == "assistant") {
@@ -166,8 +212,10 @@ pub async fn call(
         return Err("Claude Code's run is gone.".to_string());
     };
     run.synced = synced(&request.messages);
+    run.heard = false;
     let replied = run.read_reply(on_delta, meter, extra).await;
-    if replied.is_err() || !run.healthy {
+    // A run that died before it said anything is kept for `call` to see.
+    if (replied.is_err() || !run.healthy) && !(run.exited() && !run.heard) {
         if let Some(run) = cli.run.take() {
             run.end_in_background();
         }
@@ -244,6 +292,8 @@ impl Run {
             _files: files,
             healthy: true,
             interrupts: 0,
+            heard: false,
+            gone: false,
         })
     }
 
@@ -251,8 +301,26 @@ impl Run {
         let stdin = self.stdin.as_mut().ok_or("Claude Code's input is closed.")?;
         let mut bytes = line.to_string().into_bytes();
         bytes.push(b'\n');
-        stdin.write_all(&bytes).await.map_err(|e| format!("Couldn't write to Claude Code: {e}"))?;
-        stdin.flush().await.map_err(|e| format!("Couldn't write to Claude Code: {e}"))
+        let written = match stdin.write_all(&bytes).await {
+            Ok(()) => stdin.flush().await,
+            Err(e) => Err(e),
+        };
+        written.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                self.gone = true;
+            }
+            format!("Couldn't write to Claude Code: {e}")
+        })
+    }
+
+    /// Whether the process is still running.
+    fn alive(&mut self) -> bool {
+        !self.gone && matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Whether the process is known to be gone.
+    fn exited(&mut self) -> bool {
+        self.gone || matches!(self.child.try_wait(), Ok(Some(_)))
     }
 
     async fn write_user(&mut self, text: &str) -> Result<(), String> {
@@ -361,6 +429,7 @@ impl Run {
                         Ok(Ok(Some(line))) => line,
                         Ok(Ok(None)) | Ok(Err(_)) => {
                             self.healthy = false;
+                            self.gone = true;
                             let status = tokio::time::timeout(WIND_DOWN, self.child.wait()).await;
                             let code = match status {
                                 Ok(Ok(status)) => status.to_string(),
@@ -373,6 +442,7 @@ impl Run {
                     };
                     // A line that isn't a JSON object isn't the CLI's protocol.
                     if let Ok(value @ Value::Object(_)) = serde_json::from_str::<Value>(&line) {
+                        self.heard = true;
                         return Ok(value);
                     }
                 }
