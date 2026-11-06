@@ -323,9 +323,10 @@ pub async fn watch_idle_commands(pool: PgPool) {
 /// due commands in one conversation wakes it once; the wake's drain re-reads
 /// the due rule under the conversation lock, so a command that finished, or
 /// was touched, or whose notice another drain already saved in between costs
-/// nothing. A conversation the user has stopped is left out rather than
-/// woken — see the skip below. Returns the conversation ids it woke, oldest
-/// first, so the pass is testable without running a turn.
+/// nothing. Conversations the user has stopped, or that wait on an
+/// unanswered question (SME-409), are left out rather than woken — see the
+/// skips below. Returns the conversation ids it woke, oldest first, so the
+/// pass is testable without running a turn.
 pub(crate) async fn notice_idle_commands_once(pool: &PgPool) -> Vec<i64> {
     let due = match db::idle_commands_to_notice(pool).await {
         Ok(due) => due,
