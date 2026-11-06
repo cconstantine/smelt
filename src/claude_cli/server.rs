@@ -162,7 +162,9 @@ pub async fn status_with(binary: &str, env: Vec<(String, OsString)>, timeout: Du
 
 /// Runs `binary args` from a cleared environment plus `env`, bounded by
 /// `timeout`: whether it exited 0, and its stdout. Its stderr is dropped
-/// unread, so nothing it says there can reach a page or a log.
+/// unread, so nothing it says there can reach a page or a log. It runs in
+/// a process group of its own, which a timeout kills whole, so nothing it
+/// started outlives it (review 1 L4).
 async fn run(
     binary: &Path,
     args: &[&str],
@@ -178,15 +180,27 @@ async fn run(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .process_group(0)
         .kill_on_drop(true);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let output = tokio::time::timeout(timeout, command.output())
-        .await
-        .map_err(|_| format!("didn't answer within {} seconds.", timeout.as_secs_f32()))?
-        .map_err(|e| format!("couldn't be run: {e}."))?;
-    Ok((output.status.success(), output.stdout))
+    let child = command.spawn().map_err(|e| format!("couldn't be run: {e}."))?;
+    let group = child.id();
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(output) => {
+            let output = output.map_err(|e| format!("couldn't be read: {e}."))?;
+            Ok((output.status.success(), output.stdout))
+        }
+        Err(_) => {
+            // The group's id stays taken while any member lives, so this
+            // can't reach another process even after the leader is reaped.
+            if let Some(group) = group.and_then(|id| i32::try_from(id).ok()) {
+                let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(group), nix::sys::signal::Signal::SIGKILL);
+            }
+            Err(format!("didn't answer within {} seconds.", timeout.as_secs_f32()))
+        }
+    }
 }
 
 /// `--version`'s first line, if it's a short line of plain text.

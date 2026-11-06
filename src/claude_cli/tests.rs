@@ -265,3 +265,34 @@ async fn test_status_checks_run_a_few_at_a_time() {
     let most = counts.lines().filter_map(|n| n.trim().parse::<usize>().ok()).max().expect("counts");
     assert!(most <= MAX_STATUS_CHECKS, "{most} CLI processes ran at once");
 }
+
+/// Whether process `pid` is gone: no `/proc` entry, or a zombie waiting
+/// to be reaped by whoever inherited it.
+fn process_gone(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat.rsplit_once(')').is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+    }
+}
+
+/// Review 1 L4: a CLI that times out goes with everything it started,
+/// not only the process smelt started.
+#[tokio::test]
+async fn test_a_hung_cli_is_killed_with_what_it_started() {
+    let dir = scratch("hung-group");
+    let pid_file = dir.join("grandchild.pid");
+    let claude = fake_claude(&dir, &format!("sleep 30 &\necho $! > '{}'\nwait", pid_file.display()));
+    let status = status_with(claude.to_str().expect("utf-8 path"), cli_env(smelt_env(Some(&dir.join("c")))), Duration::from_millis(500)).await;
+    assert!(status.error.as_deref().is_some_and(|e| e.contains("didn't answer")), "{status:?}");
+    let pid: u32 = std::fs::read_to_string(&pid_file).expect("the fake started its sleep").trim().parse().expect("a pid");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !process_gone(pid) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let gone = process_gone(pid);
+    if !gone {
+        // Don't leave it running past a failed run.
+        let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+    }
+    assert!(gone, "the CLI's own child outlived the timeout");
+}
