@@ -131,6 +131,18 @@ async fn test_rust_analyzer_from_the_catalog_answers_across_files(pool: PgPool) 
         assert!(problems.contains("let wrong"), "the problem's line is shown: {problems}");
         let after_edit = edit_diagnostics(&[config.clone()], &client, &sandbox, MAIN).await.expect("a running server answers");
         assert!(after_edit.starts_with("rust-analyzer"), "{after_edit}");
+        // A future red self-attributes (SME-426): every way the edit chain
+        // answered None names its step. Session open, server Ready, warm —
+        // a file that isn't there says so at the read…
+        let why = edit_diagnostics(&[config.clone()], &client, &sandbox, "/workspace/demo/src/gone.rs")
+            .await
+            .expect_err("a file that isn't there cannot answer");
+        assert!(why.contains("read_in_pod") && why.contains("Couldn't read"), "{why}");
+        // …and a config whose server isn't running says so at the choice.
+        let mut idle = config.clone();
+        idle.name = "idle".to_string();
+        let why = edit_diagnostics(&[idle], &client, &sandbox, MAIN).await.expect_err("nothing runs a server named idle");
+        assert!(why.contains("choose_server") && why.contains(".rs files is running"), "{why}");
         write_files(&client, &sandbox, &[(MAIN, MAIN_RS)]).await;
 
         // A rename edits both files.
@@ -214,6 +226,53 @@ async fn test_an_edit_says_when_a_server_cannot_connect() {
         tokio::time::sleep(Duration::from_secs(5)).await;
         let second = edit_diagnostics(&[config], &client, &sandbox, path).await.expect("a note");
         assert!(second.contains("gone couldn't connect"), "{second}");
+    })
+    .await;
+}
+
+/// The readiness report must not re-derive what an install proved (SME-426).
+/// A server pod that finished its install carries `smelt/lsp-ready`; today
+/// every `list_with` call asks `/tmp/install.rc` again over a fresh exec, and
+/// one failed exec — or a missing record, forced here — readied that pod as
+/// "not running": the flake was exactly that, a Ready server whose edit
+/// chain answered None via `choose_server`. Forcing the missing record makes
+/// the mechanism happen every time, no loaded runner needed.
+#[tokio::test]
+async fn test_a_running_server_stays_running_when_its_install_record_is_gone() {
+    with_sandbox(|client, sandbox| async move {
+        let config = LanguageServerConfig {
+            name: "record".to_string(),
+            image: "debian:trixie-slim".to_string(),
+            command: "cat".to_string(),
+            file_types: [("txt".to_string(), "plaintext".to_string())].into(),
+            memory_limit: "128Mi".to_string(),
+            cpu_limit: "1".to_string(),
+            enabled: true,
+            ..Default::default()
+        };
+        // An empty install exits 0, so start_with patches smelt/lsp-ready.
+        pods::start_with(&client, &sandbox, &config, "v1").await.expect("start");
+        let listed = ready_servers(&client, &sandbox).await.expect("list");
+        assert!(listed.contains(&"record".to_string()), "the started server is Ready: {listed:?}");
+        // The state the flake reached transiently on a loaded runner,
+        // made deterministic: the Ready pod's install record is gone.
+        let pod_name = pods::server_pod_name(sandbox.pod_id, "record");
+        let removed = crate::sandbox::exec_with(&client, &pod_name, "server", &["rm", pods::INSTALL_RC], None)
+            .await
+            .expect("rm");
+        assert_eq!(removed.exit_code, 0, "{}", removed.stderr);
+        // Ready is a fact the annotation records, not a question to re-ask:
+        // the readiness report must still list the pod…
+        let listed = ready_servers(&client, &sandbox).await.expect("list");
+        assert!(listed.contains(&"record".to_string()), "a Ready server whose install record is gone must stay Ready: {listed:?}");
+        // …and the edit chain must reach the server. `cat` never opens a
+        // session, so the answer is the "is connecting" note — never the
+        // choose_server "No language server for .txt files is running"
+        // that the sighting's None carried.
+        let path = "/workspace/notes/a.txt";
+        write_files(&client, &sandbox, &[(path, "hello\n")]).await;
+        let note = edit_diagnostics(&[config], &client, &sandbox, path).await.expect("a Ready server answers the edit");
+        assert!(note.contains("record is connecting"), "{note}");
     })
     .await;
 }

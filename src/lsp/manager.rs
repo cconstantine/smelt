@@ -26,6 +26,9 @@ const MAX_FILE_BYTES: usize = 1024 * 1024;
 const RECONNECTS: usize = 3;
 const RECONNECT_WINDOW: Duration = Duration::from_secs(300);
 
+mod pod_files;
+use pod_files::*;
+
 /// The `lsp` tool's input.
 #[derive(Clone, Debug, Default)]
 pub struct OperationInput {
@@ -238,149 +241,6 @@ fn connect_in_background(client: &kube::Client, pod_name: &str, config: &Languag
             CONNECT_FAILED.lock().unwrap_or_else(|e| e.into_inner()).insert(pod_name, e);
         }
     });
-}
-
-/// `text`, read from `path` with one byte past `MAX_FILE_BYTES` asked
-/// for, if it fits: a larger file isn't sent cut short.
-fn within_limit(path: &str, text: String) -> Result<String, String> {
-    if text.len() > MAX_FILE_BYTES {
-        return Err(format!("{path} is over 1 MiB; language servers aren't sent files that large."));
-    }
-    Ok(text)
-}
-
-/// `path`'s contents, read in the server's pod.
-async fn read_in_pod(client: &kube::Client, pod_name: &str, path: &str) -> Result<String, String> {
-    let limit = (MAX_FILE_BYTES + 1).to_string();
-    let result = crate::sandbox::exec_with(client, pod_name, "server", &["head", "-c", &limit, "--", path], None)
-        .await
-        .map_err(|e| e.to_string())?;
-    if result.exit_code != 0 {
-        return Err(format!("Couldn't read {path}: {}", result.stderr.trim()));
-    }
-    within_limit(path, result.stdout)
-}
-
-/// Replaces `path` with `content` in the server's pod, if it still has the
-/// SHA-256 `expected`: a file changed since it was read isn't overwritten.
-async fn write_in_pod(client: &kube::Client, pod_name: &str, path: &str, content: &str, expected: &str) -> Result<(), String> {
-    let script = r#"[ "$(sha256sum -- "$1" | cut -d' ' -f1)" = "$2" ] || { echo "$1 changed while it was being renamed" >&2; exit 3; }; cat > "$1""#;
-    let result = crate::sandbox::exec_with(client, pod_name, "server", &["sh", "-c", script, "_", path, expected], Some(content.as_bytes()))
-        .await
-        .map_err(|e| e.to_string())?;
-    if result.exit_code != 0 {
-        return Err(result.stderr.trim().to_string());
-    }
-    Ok(())
-}
-
-fn sha256(text: &str) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(text.as_bytes()))
-}
-
-/// What to do with each open file, given the SHA-256 of each on disk now
-/// (`-` for one that's gone), in the same order: the files to sync again,
-/// and the files to close. `None` when the hashes don't line up with the
-/// files (the exec printed something else).
-fn stale_files(open: &[(String, String)], hashes: &[String]) -> Option<(Vec<String>, Vec<String>)> {
-    if open.len() != hashes.len() {
-        return None;
-    }
-    let (mut resync, mut close) = (Vec::new(), Vec::new());
-    for ((path, synced), hash) in open.iter().zip(hashes) {
-        if hash == "-" {
-            close.push(path.clone());
-        } else if *hash != sha256(synced) {
-            resync.push(path.clone());
-        }
-    }
-    Some((resync, close))
-}
-
-/// The files a rename touches whose text on disk (`current`) isn't what
-/// the server was told (`synced`, `None` if never): the rename's positions
-/// would be for other text.
-fn rename_check(touched: &[(String, String, Option<String>)]) -> Vec<String> {
-    touched
-        .iter()
-        .filter(|(_, current, synced)| synced.as_deref() != Some(current.as_str()))
-        .map(|(path, ..)| path.clone())
-        .collect()
-}
-
-/// Brings the server's open files up to date with the disk (SME-172): once
-/// a file is open, the server stops reading it from disk, so one changed
-/// by anything but smelt (a terminal) would stay stale. One exec hashes
-/// them all; a changed file is synced again, and a deleted one (or one
-/// that can no longer be read for the server) is closed, so the server
-/// goes back to the disk. An exec that fails skips this, as before; a
-/// notification that fails means the session is broken.
-async fn refresh_open_files(client: &kube::Client, pod_name: &str, session: &Session) -> Result<(), LspError> {
-    let open = session.open_documents();
-    if open.is_empty() {
-        return Ok(());
-    }
-    // One line per file, in order, so no path is parsed out of the output.
-    let script = r#"for f; do if [ -f "$f" ] && h=$(sha256sum < "$f"); then echo "${h%% *}"; else echo -; fi; done"#;
-    let mut argv = vec!["sh", "-c", script, "_"];
-    argv.extend(open.iter().map(|(path, _)| path.as_str()));
-    let hashes = match crate::sandbox::exec_with(client, pod_name, "server", &argv, None).await {
-        Ok(result) if result.exit_code == 0 => result.stdout.lines().map(str::to_string).collect::<Vec<_>>(),
-        Ok(result) => {
-            tracing::info!(pod_name, stderr = %result.stderr.trim(), "couldn't check a language server's open files");
-            return Ok(());
-        }
-        Err(e) => {
-            tracing::info!(pod_name, error = %e, "couldn't check a language server's open files");
-            return Ok(());
-        }
-    };
-    let Some((resync, mut close)) = stale_files(&open, &hashes) else {
-        tracing::info!(pod_name, files = open.len(), lines = hashes.len(), "a language server's open files didn't hash one line each");
-        return Ok(());
-    };
-    for path in resync {
-        match read_in_pod(client, pod_name, &path).await {
-            Ok(text) => {
-                session.sync(&path, &text).await?;
-            }
-            Err(_) => close.push(path),
-        }
-    }
-    for path in close {
-        session.close(&path).await?;
-    }
-    Ok(())
-}
-
-/// Where each of `markers` would be, in every directory from `path`'s up
-/// to `/workspace`.
-fn marker_candidates(path: &str, markers: &[String]) -> Vec<String> {
-    let mut candidates = Vec::new();
-    for dir in std::path::Path::new(path).ancestors().skip(1) {
-        let dir = dir.to_string_lossy();
-        if dir != session::WORKSPACE && !session::in_workspace(&dir) {
-            break;
-        }
-        candidates.extend(markers.iter().map(|marker| format!("{dir}/{marker}")));
-    }
-    candidates
-}
-
-/// The project root for `path` among `markers`, checked in the pod.
-async fn root_in_pod(client: &kube::Client, pod_name: &str, path: &str, markers: &[String]) -> String {
-    if markers.is_empty() {
-        return session::WORKSPACE.to_string();
-    }
-    let candidates = marker_candidates(path, markers);
-    let mut argv = vec!["sh", "-c", r#"for f; do [ -e "$f" ] && echo "$f"; done; true"#, "_"];
-    argv.extend(candidates.iter().map(String::as_str));
-    let found: Vec<String> = match crate::sandbox::exec_with(client, pod_name, "server", &argv, None).await {
-        Ok(result) => result.stdout.lines().map(str::to_string).collect(),
-        Err(_) => Vec::new(),
-    };
-    session::project_root(path, markers, |dir| markers.iter().any(|m| found.contains(&format!("{dir}/{m}"))))
 }
 
 /// Every file path a result names (`uri`, `targetUri`), for reading their
@@ -723,6 +583,9 @@ async fn rename(
             return Err(partial_rename_error(new_name, &written, path, &error, &rest));
         }
         written.push(path.clone());
+        // A failed sync is dropped on purpose: the rename has already been
+        // written to disk, and the next operation's refresh_open_files will
+        // re-sync the file from there.
         let _ = session.sync(path, updated).await;
         report.push(format!("{path} ({count} edit{})", if *count == 1 { "" } else { "s" }));
     }
@@ -750,21 +613,42 @@ fn note_indexing(answer: String, indexing: bool, server: &str) -> String {
 /// after a server starts, or after smelt restarts, connects in the
 /// background and says so), and never fails the edit.
 pub async fn diagnostics_after_edit(pool: &PgPool, conversation_id: i64, path: &str) -> Option<String> {
-    let all = configs(pool).await.ok()?;
-    let config_list: Vec<LanguageServerConfig> = all.into_iter().map(|(c, _)| c).collect();
-    // Nothing takes this kind of file: no need to ask the cluster.
-    let extension = std::path::Path::new(path).extension()?.to_str()?;
-    if !config_list.iter().any(|c| c.enabled && c.file_types.contains_key(extension)) {
-        return None;
+    match edit_attempt(pool, conversation_id, path).await {
+        Ok(answer) => answer,
+        Err(why) => {
+            // The reason reaches the log only — an edit's reply stays silent
+            // about LSP plumbing failures (SME-426 Q2) — but it names the
+            // step, so a red `expect` or a missing `diagnostics` key can be
+            // attributed from the server log without a re-run.
+            tracing::warn!(path, error = %why, "no diagnostics after an edit");
+            None
+        }
     }
-    let client = crate::sandbox::kube_client().ok()?;
-    let sandbox = sandbox_ref(pool, &client, conversation_id).await.ok()?;
-    edit_diagnostics(&config_list, &client, &sandbox, path).await
 }
 
-async fn edit_diagnostics(config_list: &[LanguageServerConfig], client: &kube::Client, sandbox: &SandboxRef, path: &str) -> Option<String> {
-    let running = ready_servers(client, sandbox).await.ok()?;
-    let config = ops::choose_server(path, config_list, &running).ok()?.clone();
+/// `edit_diagnostics` up front, keeping the reason it didn't answer instead
+/// of dropping it: every step's error is prefixed with the step's name.
+async fn edit_attempt(pool: &PgPool, conversation_id: i64, path: &str) -> Result<Option<String>, String> {
+    let all = configs(pool).await.map_err(|e| format!("configs: {e}"))?;
+    let config_list: Vec<LanguageServerConfig> = all.into_iter().map(|(c, _)| c).collect();
+    // Nothing takes this kind of file: no need to ask the cluster. (No
+    // extension is as ordinary as an unclaimed one: `Ok(None)`, not an error.)
+    let Some(extension) = std::path::Path::new(path).extension().and_then(|e| e.to_str()) else {
+        return Ok(None);
+    };
+    if !config_list.iter().any(|c| c.enabled && c.file_types.contains_key(extension)) {
+        return Ok(None);
+    }
+    let client = crate::sandbox::kube_client().map_err(|e| format!("kube_client: {e}"))?;
+    let sandbox = sandbox_ref(pool, &client, conversation_id).await.map_err(|e| format!("sandbox_ref: {e}"))?;
+    edit_diagnostics(&config_list, &client, &sandbox, path).await.map(Some)
+}
+
+async fn edit_diagnostics(config_list: &[LanguageServerConfig], client: &kube::Client, sandbox: &SandboxRef, path: &str) -> Result<String, String> {
+    let running = ready_servers(client, sandbox).await.map_err(|e| format!("ready_servers: {e}"))?;
+    let config = ops::choose_server(path, config_list, &running)
+        .map_err(|e| format!("choose_server: {e}"))?
+        .clone();
     let pod_name = pods::server_pod_name(sandbox.pod_id, &config.name);
     let root = root_in_pod(client, &pod_name, path, &config.root_markers).await;
     // Only a session that's already open: opening one waits for the
@@ -773,15 +657,15 @@ async fn edit_diagnostics(config_list: &[LanguageServerConfig], client: &kube::C
     if !open {
         let failed = CONNECT_FAILED.lock().unwrap_or_else(|e| e.into_inner()).get(&pod_name).cloned();
         connect_in_background(client, &pod_name, &config, &root);
-        return Some(match failed {
+        return Ok(match failed {
             Some(error) => format!("{} couldn't connect, so there are no diagnostics ({error}).", config.name),
             None => format!("{} is connecting; edits after this one will include its diagnostics.", config.name),
         });
     }
-    let session = session_for(client, &pod_name, &config, &root).await.ok()?;
-    refresh_open_files(client, &pod_name, &session).await.ok()?;
-    let text = read_in_pod(client, &pod_name, path).await.ok()?;
-    let version = session.sync(path, &text).await.ok()?;
+    let session = session_for(client, &pod_name, &config, &root).await.map_err(|e| format!("session_for: {e}"))?;
+    refresh_open_files(client, &pod_name, &session).await.map_err(|e| format!("refresh_open_files: {e}"))?;
+    let text = read_in_pod(client, &pod_name, path).await.map_err(|e| format!("read_in_pod: {e}"))?;
+    let version = session.sync(path, &text).await.map_err(|e| format!("session.sync: {e}"))?;
     // When the server was told this text, by the refresh (which syncs the
     // edited file too when the server has it open) or by the sync:
     // diagnostics published without a version before then are for older
@@ -798,7 +682,7 @@ async fn edit_diagnostics(config_list: &[LanguageServerConfig], client: &kube::C
     if !found.complete {
         out.push_str("\n(It's still working, indexing or checking; the list may be incomplete. The lsp tool's diagnostics operation shows the latest.)");
     }
-    Some(out)
+    Ok(out)
 }
 
 #[cfg(test)]
