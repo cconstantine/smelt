@@ -196,15 +196,17 @@ fn test_teardown_waits_longer_than_a_pod_start_can_take() {
 
 /// The most a child's start chain can take before it ends `active` or
 /// `failed`: the pod start's own bound (up to two running waits plus git
-/// setup, as teardown's `pod_start_wait`), plus the start's post-pod
-/// tail — the clone exec, the persona reads, the credentials reconcile,
-/// `complete_start`. SME-432: the waits in `credentials.rs` race that
-/// chain with this bound. It still carries the four 90 s literals moved
-/// out of those waits — the companion test below is red until the bound
-/// is derived from the env-configurable timeout, as
-/// docs/testing/sandbox.md demands.
+/// setup, as teardown's `pod_start_wait`), plus that allowance again for
+/// the start's post-pod tail — the clone exec, the persona reads, the
+/// credentials reconcile, `complete_start`. Derived from the
+/// env-configurable timeout, per docs/testing/sandbox.md: 300 s at the
+/// default 90, 360 s at CI's 120 — always above what production itself
+/// is still waiting for, so the waits in `credentials.rs` can no longer
+/// beat a start smelt has not given up on (SME-432's full-gate flake).
+/// The 60 s tail is a named-stage allowance, styled after
+/// `pod_start_wait()`'s own 60 s git-setup one.
 fn start_chain_wait() -> Duration {
-    Duration::from_secs(90)
+    pod_start_wait() + Duration::from_secs(60)
 }
 
 /// SME-432: the start-chain waits outlast a start chain. The chain's pod
