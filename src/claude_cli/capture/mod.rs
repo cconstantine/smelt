@@ -269,6 +269,12 @@ async fn scenario(out: &Path, which: &str) -> Result<()> {
         }
         // smelt's MCP server never answering (review 2 L15).
         "pending" => run(out, Scenario { prompt: "Reply with only the word ok.", silent_server: true, ..base("pending") }).await,
+        // A session id the CLI has never seen, resumed: what it says of a
+        // missing session (PR #285 review 1 M2).
+        "missing" => {
+            let id = new_session_id();
+            run(out, Scenario { prompt: "Reply with only the word ok.", tools: false, session: SessionArg::Resume(&id), ..base("missing") }).await
+        }
         "sanitize" => sanitize::all(out, &Path::new(env!("CARGO_MANIFEST_DIR")).join("src/claude_cli/fixtures")),
         other => Err(format!("no capture scenario {other}")),
     }

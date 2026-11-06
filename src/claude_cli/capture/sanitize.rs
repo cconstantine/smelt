@@ -9,7 +9,7 @@ use std::path::Path;
 use serde_json::Value;
 
 /// The scenarios whose output becomes a fixture.
-const CAPTURED: [&str; 8] = ["loop", "kill", "resume", "bad_token", "bad_model", "capped", "thinking_off", "pending"];
+const CAPTURED: [&str; 9] = ["loop", "kill", "resume", "bad_token", "bad_model", "capped", "thinking_off", "pending", "missing"];
 
 #[derive(Default)]
 struct Ids(HashMap<String, String>);

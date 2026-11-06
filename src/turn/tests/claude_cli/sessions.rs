@@ -65,10 +65,11 @@ async fn test_a_session_that_wont_resume_is_replaced(pool: PgPool) {
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("conversation");
-    let gone = json!({"type": "result", "subtype": "error_during_execution", "is_error": true, "errors": ["No conversation found with session ID: x"]});
+    // The real CLI's answer to a session it doesn't have (capture `missing`).
+    let gone = crate::claude_cli::tests::fake::fixture_lines("missing");
     let fake = FakeCli::new("gone", vec![
         vec![json!({"read": true}), text_reply("one")],
-        vec![json!({"read": true}), json!({"emit": [gone]}), json!({"exit": 1})],
+        vec![json!({"read": true}), json!({"emit": gone}), json!({"exit": 1})],
         vec![json!({"read": true}), text_reply("fresh")],
     ]);
     fake.pick_for(&pool, conversation.id).await;

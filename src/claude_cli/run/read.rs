@@ -20,6 +20,9 @@ impl Run {
                     let line = match line {
                         Err(_) => {
                             self.healthy = false;
+                            if !self.reply_started {
+                                self.failure = Failure::Unchanged;
+                            }
                             return Err(format!("Claude Code said nothing for {} seconds, so smelt stopped it.", silence().as_secs()));
                         }
                         Ok(Ok(Some(line))) => line,
@@ -99,6 +102,9 @@ impl Run {
                 Some("result") => {
                     self.state = State::Idle;
                     self.healthy = false;
+                    if !self.reply_started {
+                        self.failure = if session_missing(&event) { Failure::SessionMissing } else { Failure::Unchanged };
+                    }
                     return Err(result_error(&event, self.rate.as_ref())
                         .unwrap_or_else(|| "Claude Code ended the reply before it finished.".to_string()));
                 }
@@ -235,6 +241,13 @@ fn apply(blocks: &mut Blocks, stop_reason: &mut String, event: &Value, on_delta:
         }
     }
     Ok(())
+}
+
+/// Whether a `result` says the session to resume doesn't exist, as the
+/// real CLI says it (the capture `missing`).
+fn session_missing(result: &Value) -> bool {
+    let said = |text: &str| text.contains("No conversation found with session ID");
+    result["errors"].as_array().is_some_and(|errors| errors.iter().filter_map(Value::as_str).any(said)) || result["result"].as_str().is_some_and(said)
 }
 
 /// Whether an `init` event says the CLI has smelt's tools: the bridge

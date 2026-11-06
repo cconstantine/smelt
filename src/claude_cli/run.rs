@@ -92,6 +92,23 @@ fn silence() -> Duration {
 #[derive(Default)]
 pub struct TurnCli {
     run: Option<Run>,
+    /// How the last call that failed left its session.
+    last_failure: Option<Failure>,
+}
+
+/// How a failed call left the CLI's session (PR #285 review 1 M2).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Failure {
+    /// As it was: the API refused before the reply began (the limit, a
+    /// 429, 529 or 5xx, a silence), so the record still holds.
+    Unchanged,
+    /// The CLI has no such session to resume ("No conversation found with
+    /// session ID", the capture `missing`): a new one replaces it.
+    SessionMissing,
+    /// Possibly not as smelt's history has it (the CLI answered a call
+    /// itself, compacted, or failed mid-reply), or unknown: forgotten.
+    #[default]
+    Diverged,
 }
 
 impl Drop for TurnCli {
@@ -157,6 +174,8 @@ struct Run {
     held: Vec<ParkedCall>,
     /// Whether it was given smelt's tools (an `--mcp-config`).
     has_tools: bool,
+    /// How this call failed, if it did.
+    failure: Failure,
     /// The reply cap it was launched with.
     max_tokens: u32,
     /// Whether the CLI has said anything since the current call began.
@@ -193,6 +212,7 @@ pub async fn call(
         tracing::warn!(conversation_id, "couldn't set the conversation's Claude Code session aside: {e}");
     }
     let call = Call { conversation_id, turn_model, request, recorded };
+    cli.last_failure = None;
     let replied = call_run(&call, on_delta, meter, extra, cli).await;
     // The session the next turn resumes: this run's, synced to this call,
     // after a call that went well; after any other, none, so the next turn
@@ -204,6 +224,9 @@ pub async fn call(
             synced_count: i32::try_from(run.synced.len).unwrap_or(i32::MAX),
             synced_hash: run.synced.hash.clone(),
         }),
+        // A failure that left the session as it was keeps its record: the
+        // next turn resumes it and is sent what's new since (review 1 M2).
+        (Err(_), _) if cli.last_failure == Some(Failure::Unchanged) => call.recorded.clone(),
         _ => None,
     };
     let kept = match &keep {
@@ -290,6 +313,11 @@ async fn call_run(
     }
 }
 
+/// Records how the call failed.
+fn cli_failure(last: &mut Option<Failure>, failure: Failure) {
+    *last = Some(failure);
+}
+
 /// `call`'s start of a run, when the turn has none, and its read of the
 /// reply. A resumed session that fails before its reply begins (gone with
 /// a restart's config dir, say) is replaced once by a new one.
@@ -305,9 +333,7 @@ async fn read_from_run(
     }
     let replied = read_once(call, on_delta, meter, extra, cli).await;
     if replied.is_err()
-        && let Some(run) = cli.run.as_ref()
-        && run.resumed
-        && !run.reply_started
+        && cli.last_failure == Some(Failure::SessionMissing)
         && let Some(run) = cli.run.take()
     {
         tracing::warn!(conversation_id = call.conversation_id, "the conversation's Claude Code session didn't resume: starting a new one from smelt's history");
@@ -367,10 +393,15 @@ async fn read_once(
     };
     run.synced = synced(&call.request.messages);
     run.heard = false;
+    run.reply_started = false;
+    run.failure = Failure::Diverged;
     let replied = run.read_reply(on_delta, meter, extra).await;
+    if replied.is_err() {
+        cli_failure(&mut cli.last_failure, run.failure);
+    }
     // A run that died before it said anything is kept for `call` to see,
-    // and so is a resumed one that failed before its reply began.
-    let kept = (run.exited() && !run.heard) || (run.resumed && !run.reply_started);
+    // and so is one whose session is missing.
+    let kept = (run.exited() && !run.heard) || run.failure == Failure::SessionMissing;
     if (replied.is_err() || !run.healthy) && !kept {
         if let Some(run) = cli.run.take() {
             run.end_in_background();
@@ -455,6 +486,7 @@ impl Run {
             heard: false,
             gone: false,
             max_tokens: request.max_tokens,
+            failure: Failure::Diverged,
             has_tools: !request.tools.is_empty(),
             held: Vec::new(),
             session_id: String::new(),

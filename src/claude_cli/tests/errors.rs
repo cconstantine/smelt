@@ -56,7 +56,7 @@ fn test_a_successful_result_is_no_error_and_long_words_are_cut() {
 #[test]
 fn test_the_fixtures_hold_nothing_of_the_capture_host() {
     let email = regex::Regex::new(r"[\w.+-]+@[\w-]+\.[\w.]+").expect("a pattern");
-    for name in ["loop", "kill", "resume", "bad_token", "bad_model", "capped", "thinking_off", "pending"] {
+    for name in ["loop", "kill", "resume", "bad_token", "bad_model", "capped", "thinking_off", "pending", "missing"] {
         let text = crate::claude_cli::tests::fake::fixture_lines(name).iter().map(|l| l.to_string()).collect::<String>();
         assert!(!text.is_empty(), "{name} is a fixture");
         for leak in ["/tmp/claude-", "scratchpad", "-tmp-", "/home/dev", "sk-ant-oat01-a", "sk-ant-ort"] {

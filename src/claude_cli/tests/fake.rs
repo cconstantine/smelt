@@ -36,6 +36,7 @@ fn fixture(name: &str) -> &'static str {
         "capped" => include_str!("../fixtures/capped.jsonl"),
         "thinking_off" => include_str!("../fixtures/thinking_off.jsonl"),
         "pending" => include_str!("../fixtures/pending.jsonl"),
+        "missing" => include_str!("../fixtures/missing.jsonl"),
         _ => "",
     }
 }

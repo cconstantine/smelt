@@ -59,3 +59,31 @@ async fn test_a_stop_in_a_turns_first_reply_leaves_no_session_behind(pool: PgPoo
 
     assert!(user_texts(&fake, 2)[0].starts_with(crate::claude_cli::render::REHYDRATED), "{:?}", user_texts(&fake, 2));
 }
+
+/// Review 3 M2: an API error before the reply begins (here the
+/// subscription limit) leaves the session as it was: the call fails
+/// without starting another process, and the next turn resumes it.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_limit_before_the_reply_keeps_the_session(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let limit = json!({"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", "rateLimitType": "five_hour", "resetsAt": 1_767_225_600}});
+    let refused = json!({"type": "result", "subtype": "success", "is_error": true, "api_error_status": 429, "result": "API Error: 429 rate limited"});
+    let fake = FakeCli::new("limit-kept", vec![
+        vec![json!({"read": true}), text_reply("one")],
+        vec![json!({"read": true}), json!({"emit": [limit, refused]}), json!({"exit": 1})],
+        vec![json!({"read": true}), text_reply("three")],
+    ]);
+    fake.pick_for(&pool, conversation.id).await;
+    run_turn(&pool, conversation.id, hello()).await.expect("turn 1");
+    let session = db::get_claude_cli_session(&pool, conversation.id).await.expect("read").expect("a session").session_id;
+
+    run_turn(&pool, conversation.id, hello()).await.expect_err("limited");
+    assert_eq!(fake.started(), 2, "no second process for the limited call");
+    run_turn(&pool, conversation.id, hello()).await.expect("turn 3");
+
+    let args = fake.args(2);
+    let resumed = args.iter().position(|a| a == "--resume").and_then(|i| args.get(i + 1));
+    assert_eq!(resumed, Some(&session), "turn 3 resumes the session: {args:?}");
+}
