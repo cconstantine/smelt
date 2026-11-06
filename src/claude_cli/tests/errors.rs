@@ -50,3 +50,19 @@ fn test_a_successful_result_is_no_error_and_long_words_are_cut() {
     let error = result_error(&long, None).expect("an error");
     assert!(error.chars().count() < MAX_QUOTED + 40, "{}", error.len());
 }
+
+/// Review 1 L5: no fixture holds the capture host's paths, a pid-named
+/// socket, an email or a token.
+#[test]
+fn test_the_fixtures_hold_nothing_of_the_capture_host() {
+    let email = regex::Regex::new(r"[\w.+-]+@[\w-]+\.[\w.]+").expect("a pattern");
+    for name in ["loop", "kill", "resume", "bad_token", "bad_model", "capped", "thinking_off"] {
+        let text = crate::claude_cli::tests::fake::fixture_lines(name).iter().map(|l| l.to_string()).collect::<String>();
+        assert!(!text.is_empty(), "{name} is a fixture");
+        for leak in ["/tmp/claude-", "scratchpad", "-tmp-", "/home/dev", "sk-ant-oat01-a", "sk-ant-ort"] {
+            assert!(!text.contains(leak), "{name} holds {leak}");
+        }
+        assert!(!email.is_match(&text), "{name} holds an email");
+        assert!(!regex::Regex::new(r"cc-socks/[0-9]{2,}").expect("a pattern").is_match(&text), "{name} names a pid's socket");
+    }
+}

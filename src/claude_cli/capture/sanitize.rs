@@ -32,6 +32,9 @@ struct Scrub {
     regexes: Vec<(regex::Regex, &'static str)>,
     uuid: regex::Regex,
     out_dir: String,
+    /// `out_dir` as the CLI names a project directory after it: every
+    /// character but a letter or digit made `-` (review 1 L5).
+    out_slug: String,
     home: String,
 }
 
@@ -51,6 +54,7 @@ impl Scrub {
             regexes,
             uuid,
             out_dir: out_dir.display().to_string(),
+            out_slug: out_dir.display().to_string().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect(),
             home: std::env::var("HOME").unwrap_or_default(),
         })
     }
@@ -58,6 +62,10 @@ impl Scrub {
     fn string(&mut self, key: &str, text: &str) -> Value {
         if (key == "signature" || key == "signature_delta") && !text.is_empty() {
             return Value::String("fixture-signature".to_string());
+        }
+        // A socket named after the CLI's pid (review 1 L5).
+        if key == "messaging_socket_path" {
+            return Value::String("/tmp/cc-socks/1.sock".to_string());
         }
         if self.uuid.is_match(text) {
             return Value::String(self.ids.stand_in("uuid", text));
@@ -67,7 +75,7 @@ impl Scrub {
                 return Value::String(self.ids.stand_in(prefix, text));
             }
         }
-        let mut text = text.replace(&self.out_dir, "/capture");
+        let mut text = text.replace(&self.out_dir, "/capture").replace(&self.out_slug, "-capture");
         if !self.home.is_empty() {
             text = text.replace(&self.home, "/home/user");
         }
