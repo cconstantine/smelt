@@ -99,3 +99,27 @@ async fn test_a_failed_call_forgets_the_session(pool: PgPool) {
 
     assert_eq!(db::get_claude_cli_session(&pool, conversation.id).await.expect("read"), None, "the next turn starts over");
 }
+
+/// SME-399's L11: CLI processes share one config dir, and each writes its
+/// `.claude.json` as it starts, which concurrent starts can clobber. A
+/// process starts only once the last one to start has said its first line.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_cli_processes_start_one_at_a_time(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let (a, b) = (db::create_conversation(&pool).await.expect("a"), db::create_conversation(&pool).await.expect("b"));
+    let slow = FakeCli::new("start-a", vec![vec![json!({"read": true}), json!({"sleep_ms": 800}), json!({"stamp": "first_line"}), text_reply("A")]]);
+    let next = FakeCli::new("start-b", vec![vec![json!({"read": true}), text_reply("B")]]);
+    slow.pick_for(&pool, a.id).await;
+    next.pick_for(&pool, b.id).await;
+
+    let first = tokio::spawn({
+        let pool = pool.clone();
+        async move { run_turn(&pool, a.id, hello()).await }
+    });
+    slow.until("the first process starts", |f| f.started() == 1).await;
+    run_turn(&pool, b.id, hello()).await.expect("turn b");
+    first.await.expect("join").expect("turn a");
+
+    assert!(next.time_of("started.0") >= slow.time_of("first_line.stamp"), "b started after a's first line");
+}

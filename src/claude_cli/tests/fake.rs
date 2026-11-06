@@ -70,7 +70,8 @@ impl FakeCli {
     /// A Claude Code provider running this fake, picked for `conversation_id`.
     pub(crate) async fn pick_for(&self, pool: &sqlx::PgPool, conversation_id: i64) -> i64 {
         let binary = self.binary.display().to_string();
-        let provider = crate::db::create_inference_provider(pool, "Claude", "claude_cli", &binary, "api_key", "", false, Some("anthropic"), true, None)
+        let name = format!("Claude {}", self.dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+        let provider = crate::db::create_inference_provider(pool, &name, "claude_cli", &binary, "api_key", "", false, Some("anthropic"), true, None)
             .await
             .expect("create the provider");
         crate::db::set_conversation_model(pool, conversation_id, provider.id, "claude-opus-5-5").await.expect("pick its model");
@@ -110,6 +111,11 @@ impl FakeCli {
     pub(crate) fn env_names(&self, n: usize) -> Vec<String> {
         let text = std::fs::read_to_string(self.dir.join(format!("env.{n}"))).unwrap_or_default();
         text.lines().map(str::to_string).collect()
+    }
+
+    /// When the fake wrote stamp `name`, or started process `n` (`started.n`).
+    pub(crate) fn time_of(&self, file: &str) -> std::time::SystemTime {
+        std::fs::metadata(self.dir.join(file)).and_then(|m| m.modified()).expect("the file's time")
     }
 
     /// Waits up to 10 s for `check` to hold.
@@ -321,6 +327,9 @@ async fn play(dir: &Path) -> i32 {
                 fake.log("results", &json!({"id": id, "text": text, "is_error": is_error}));
                 fake.emit(&json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": [{"type": "text", "text": text}]}]}})).await;
             }
+            false
+        } else if let Some(name) = step["stamp"].as_str() {
+            std::fs::write(fake.dir.join(format!("{name}.stamp")), "").expect("a stamp");
             false
         } else if let Some(ms) = step["sleep_ms"].as_u64() {
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;

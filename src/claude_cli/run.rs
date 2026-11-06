@@ -59,6 +59,14 @@ pub const SILENCE: Duration = Duration::from_secs(180);
 /// `result` and exit before it's killed.
 pub const WIND_DOWN: Duration = Duration::from_secs(5);
 
+/// Taken by each process as it starts and held until it has started
+/// (its first line), so no two write the shared config dir's `.claude.json`
+/// at once (SME-399's L11).
+static LAUNCH: std::sync::LazyLock<Arc<tokio::sync::Mutex<()>>> = std::sync::LazyLock::new(Arc::default);
+
+/// The longest a start holds `LAUNCH`, for a CLI that says nothing.
+pub const LAUNCH_HOLD: Duration = Duration::from_secs(10);
+
 /// What a reply's call gets when the turn's next request has no result
 /// for it.
 pub const NOT_RUN: &str = "smelt didn't run this tool call.";
@@ -137,6 +145,8 @@ struct Run {
     /// Whether the last reply's results are in `answers`, until the CLI's
     /// next API call starts.
     delivered: bool,
+    /// The start lock, until its first line or the deadline (L11).
+    launching: Option<(tokio::sync::OwnedMutexGuard<()>, tokio::time::Instant)>,
     /// The CLI session it's in.
     session_id: String,
     /// Whether it resumed a session from an earlier turn.
@@ -391,6 +401,10 @@ impl Run {
             session,
         };
         let env = turn_env(env, request.max_tokens);
+        // One start at a time: every process shares the config dir, and
+        // each writes its .claude.json as it starts (SME-399's L11). Held
+        // until this one says its first line, or LAUNCH_HOLD passes.
+        let launching = LAUNCH.clone().lock_owned().await;
         let spawned = tokio::process::Command::new(&binary)
             .args(cli_args(&launch))
             .env_clear()
@@ -435,6 +449,7 @@ impl Run {
             session_id: String::new(),
             resumed: false,
             reply_started: false,
+            launching: Some((launching, tokio::time::Instant::now() + LAUNCH_HOLD)),
             streaming_ids: std::collections::HashSet::new(),
             answered: std::collections::HashSet::new(),
             delivered: false,
