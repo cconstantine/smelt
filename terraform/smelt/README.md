@@ -81,6 +81,12 @@ where smelt's own real-cluster test suite runs.
 - The pod gets its cluster access from its own ServiceAccount token — no
   kubeconfig is mounted, and none should be.
 
+## Terraform version
+
+Terraform 1.7 or later (`versions.tf`). `secret_env`'s validations call
+`nonsensitive()`, which 1.5 and 1.6 refuse inside a validation even for the
+empty default, so on those every plan would fail.
+
 ## Kubernetes version
 
 Sandbox pods use native sidecar containers (init containers with
