@@ -11,7 +11,7 @@
 //! fake exits 0), `{"emit": [line, …]}`, `{"fixture": name, "from": a,
 //! "to": b}` (its lines `a..b`), `{"call": [{"id", "name", "input"}, …]}`
 //! (each through the bridge, one at a time, then its `tool_result` line),
-//! `{"await_interrupt": true}`, `{"hang": true}`, `{"exit": code}`. An
+//! `{"await_interrupt": true}`, `{"stderr": text}`, `{"hang": true}`, `{"exit": code}`. An
 //! interrupt during `read` or `call` ends the call with the CLI's
 //! stopped result and an `error_during_execution` `result`, and skips to
 //! the next `read`. After the last step, stdin is read to EOF.
@@ -308,6 +308,9 @@ async fn play(dir: &Path) -> i32 {
                 }
             }
             fake.stopped(None).await;
+            false
+        } else if let Some(text) = step["stderr"].as_str() {
+            eprintln!("{text}");
             false
         } else if step.get("hang").is_some() {
             std::future::pending::<()>().await;

@@ -472,8 +472,15 @@ impl Run {
                                 Ok(Ok(status)) => status.to_string(),
                                 _ => "an unknown status".to_string(),
                             };
+                            // The whole tail goes to the server's log only; the
+                            // turn's error, which the conversation keeps, gets
+                            // one short scrubbed line of it (review 1 L4).
                             let tail = self.stderr_tail();
-                            let said = if tail.is_empty() { String::new() } else { format!(" It said: {tail}") };
+                            if !tail.is_empty() {
+                                tracing::warn!(stderr = %tail, "Claude Code exited before it finished");
+                            }
+                            let line = super::errors::scrubbed_line(&tail);
+                            let said = if line.is_empty() { String::new() } else { format!(" It said: {line}") };
                             return Err(format!("Claude Code exited ({code}) before it finished.{said}"));
                         }
                     };

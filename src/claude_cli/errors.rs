@@ -37,7 +37,39 @@ impl RateLimit {
 
 /// `text` cut to `MAX_QUOTED` characters.
 fn quoted(text: &str) -> String {
-    let mut cut: String = text.chars().take(MAX_QUOTED).collect();
+    quoted_to(text, MAX_QUOTED)
+}
+
+/// The most of the CLI's stderr a turn's error quotes.
+pub const MAX_STDERR_LINE: usize = 200;
+
+/// The last line of the CLI's stderr, for a turn's error: at most
+/// `MAX_STDERR_LINE` characters, with every path, email and token-shaped
+/// word taken out (review 1 L4). The conversation keeps this text.
+pub fn scrubbed_line(stderr: &str) -> String {
+    static SCRUB: std::sync::LazyLock<Vec<(regex::Regex, &'static str)>> = std::sync::LazyLock::new(|| {
+        [
+            (r"[\w.+-]+@[\w-]+(\.[\w-]+)+", "<email>"),
+            (r"sk-ant-[\w-]+", "<token>"),
+            (r"\b[A-Za-z0-9_-]{32,}\b", "<token>"),
+            (r"(~|\.{1,2})?/[^\s'\x22,;:)]+", "<path>"),
+        ]
+        .into_iter()
+        .filter_map(|(pattern, with)| regex::Regex::new(pattern).ok().map(|re| (re, with)))
+        .collect()
+    });
+    let Some(line) = stderr.lines().map(str::trim).filter(|line| !line.is_empty()).last() else {
+        return String::new();
+    };
+    let mut line = line.to_string();
+    for (pattern, with) in SCRUB.iter() {
+        line = pattern.replace_all(&line, *with).into_owned();
+    }
+    quoted_to(&line, MAX_STDERR_LINE)
+}
+
+fn quoted_to(text: &str, most: usize) -> String {
+    let mut cut: String = text.chars().take(most).collect();
     if cut.len() < text.len() {
         cut.push('\u{2026}');
     }

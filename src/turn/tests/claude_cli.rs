@@ -466,3 +466,24 @@ async fn test_a_new_cap_or_another_history_starts_a_new_run(pool: PgPool) {
     assert!(user_texts(&fake, 1)[0].ends_with("### The new message\nmore"), "{:?}", user_texts(&fake, 1));
     assert!(user_texts(&fake, 2)[0].contains("edited"), "{:?}", user_texts(&fake, 2));
 }
+
+/// Review 1 L4: a CLI that exits before it finishes fails the turn, and
+/// the error, which the conversation keeps, quotes its stderr only as a
+/// short line with paths, emails and tokens taken out.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_exit_before_the_result_quotes_a_scrubbed_line(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let said = "Error: couldn't open /home/dev/.claude/secret.json for me@example.com with sk-ant-oat01-ABCDEFGHIJ";
+    let partial = api_call(10, vec![text_block("Starting")], "end_turn", 1);
+    let fake = FakeCli::new("stderr", vec![vec![json!({"read": true}), json!({"emit": partial[..3]}), json!({"stderr": said}), json!({"exit": 3})]]);
+    fake.pick_for(&pool, conversation.id).await;
+
+    let error = run_turn(&pool, conversation.id, hello()).await.expect_err("it exited").to_string();
+    assert!(error.contains("Claude Code exited (exit status: 3) before it finished"), "{error}");
+    assert!(error.contains("couldn't open"), "the line is quoted: {error}");
+    for leak in ["/home/dev", "me@example.com", "sk-ant-"] {
+        assert!(!error.contains(leak), "{leak} in {error}");
+    }
+}
