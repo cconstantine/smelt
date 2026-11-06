@@ -12,6 +12,7 @@
 //!   capabilities (SME-111).
 //! - `other`: `GET /v1/models`, reading `max_input_tokens`, or llama.cpp's
 //!   `meta.n_ctx`, when present.
+//! - `claude_cli`: a static list (`CLAUDE_CLI_MODELS`), asking nothing.
 //!
 //! Every request is bounded by `REQUEST_TIMEOUT`; nothing here retries or
 //! caches.
@@ -275,10 +276,39 @@ async fn list_v1_models(endpoint: &Endpoint) -> Result<Vec<ListedModel>, String>
     Ok(models)
 }
 
+/// The models a Claude Code provider lists (SME-429): the CLI has no
+/// `/v1/models`, so this is the current generation, from Anthropic's model
+/// table of 2026-10-06; another is added on the provider's page by id.
+/// Each has a 1M-token window and a 128K reply cap, and calls tools.
+const CLAUDE_CLI_MODELS: [(&str, &str); 4] = [
+    ("claude-opus-5-5", "Claude Opus 5.5"),
+    ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+    ("claude-haiku-5-5", "Claude Haiku 5.5"),
+    ("claude-fable-5-1", "Claude Fable 5.1"),
+];
+
+fn claude_cli_models() -> Vec<ListedModel> {
+    CLAUDE_CLI_MODELS
+        .iter()
+        .map(|(id, name)| ListedModel {
+            id: id.to_string(),
+            display_name: Some(name.to_string()),
+            details: ModelDetails {
+                context_window: Some(1_000_000),
+                thinking: Some(true),
+                tools: Some(true),
+                max_output: Some(128_000),
+                adaptive_thinking: Some(true),
+            },
+        })
+        .collect()
+}
+
 /// Lists `endpoint`'s models the way its `kind` does.
 pub async fn list_models(kind: ProviderKind, endpoint: &Endpoint) -> Result<Vec<ListedModel>, String> {
     match kind {
         ProviderKind::Anthropic | ProviderKind::LlamaCpp | ProviderKind::Other => list_v1_models(endpoint).await,
+        ProviderKind::ClaudeCli => Ok(claude_cli_models()),
         ProviderKind::Ollama => {
             let request = endpoint.client()?.get(endpoint.url("/api/tags"));
             parse_ollama_tags(&fetch_json(endpoint, request).await?)
@@ -391,6 +421,7 @@ pub async fn model_details(
             let body = fetch_json(endpoint, request).await?;
             Ok(parse_v1_model(&body).map(|m| m.details).unwrap_or_default())
         }
+        ProviderKind::ClaudeCli => Ok(claude_cli_models().into_iter().find(|m| m.id == model).map(|m| m.details).unwrap_or_default()),
         ProviderKind::LlamaCpp | ProviderKind::Other => Ok(list_v1_models(endpoint)
             .await?
             .into_iter()

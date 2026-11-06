@@ -25,6 +25,9 @@ pub(super) fn ProviderModelsSection(id: i64, refresh: Signal<u64>) -> Element {
                     if listing.kind == ProviderKind::LlamaCpp {
                         LlamaServerLine { caps: listing.server_caps.clone(), error: listing.server_error.clone() }
                     }
+                    if listing.kind == ProviderKind::ClaudeCli {
+                        ClaudeCliStatusLine { id, refresh }
+                    }
                     if let Some(err) = listing.listing_error {
                         p { class: "error", "Couldn't list this provider's models: {err}" }
                     }
@@ -317,6 +320,24 @@ fn ProviderModelRow(id: i64, model: ModelInfo, kind: ProviderKind, efforts: Vec<
             if let Some(err) = error() {
                 span { class: "error", "{err}" }
             }
+        }
+    }
+}
+
+/// A Claude Code provider's CLI: its version and whether it's signed in
+/// (SME-429), asked again with the listing.
+#[component]
+fn ClaudeCliStatusLine(id: i64, refresh: Signal<u64>) -> Element {
+    let status = use_resource(move || async move {
+        refresh();
+        get_claude_cli_status(id).await
+    });
+    match status() {
+        None => rsx! { p { class: "muted", "Asking Claude Code\u{2026}" } },
+        Some(Err(e)) => rsx! { super::super::ErrorText { message: Some(server_error_message(&e)) } },
+        Some(Ok(status)) => {
+            let class = if status.signed_in && status.error.is_none() { "muted claude-cli-status" } else { "error claude-cli-status" };
+            rsx! { p { class, role: "status", "{status.summary()}" } }
         }
     }
 }

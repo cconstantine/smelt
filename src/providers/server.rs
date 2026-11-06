@@ -96,7 +96,7 @@ impl TurnModel {
                 }
                 _ => return None,
             },
-            ProviderKind::Anthropic | ProviderKind::Ollama | ProviderKind::Other => {
+            ProviderKind::Anthropic | ProviderKind::Ollama | ProviderKind::Other | ProviderKind::ClaudeCli => {
                 crate::anthropic::ThinkingConfig::Adaptive
             }
         })
@@ -424,15 +424,20 @@ fn checked(input: ProviderInput) -> Result<ProviderInput, String> {
         return Err("Give the provider a name.".to_string());
     }
     let base_url = input.base_url.trim().to_string();
-    match reqwest::Url::parse(&base_url) {
-        Ok(url) if matches!(url.scheme(), "http" | "https") && url.host().is_some() => {}
-        _ => {
-            return Err(format!(
-                "The base URL must be an http:// or https:// address, like {}.",
-                input.kind.base_url_placeholder()
-            ));
+    // Claude Code's is the binary it runs (SME-429).
+    let base_url = if input.kind.is_http() {
+        match reqwest::Url::parse(&base_url) {
+            Ok(url) if matches!(url.scheme(), "http" | "https") && url.host().is_some() => base_url,
+            _ => {
+                return Err(format!(
+                    "The base URL must be an http:// or https:// address, like {}.",
+                    input.kind.base_url_placeholder()
+                ));
+            }
         }
-    }
+    } else {
+        crate::claude_cli::checked_binary(&base_url)?
+    };
     let price_catalog_provider = input
         .price_catalog_provider
         .as_deref()
@@ -447,10 +452,13 @@ fn checked(input: ProviderInput) -> Result<ProviderInput, String> {
     if input.max_concurrent_requests == Some(0) && input.kind != ProviderKind::LlamaCpp {
         return Err("Max concurrent requests 0 (the server's own count) needs a llama.cpp server, which reports it; type a number instead.".to_string());
     }
+    // A kind with no address has no key to send, nor a request to mark.
+    let http = input.kind.is_http();
     Ok(ProviderInput {
         name,
         base_url,
-        secret: input.secret.trim().to_string(),
+        secret: if http { input.secret.trim().to_string() } else { String::new() },
+        prompt_caching: input.prompt_caching && http,
         price_catalog_provider,
         ..input
     })
@@ -468,7 +476,7 @@ fn save_error(name: &str, error: sqlx::Error) -> String {
 
 pub async fn create_provider(pool: &PgPool, input: ProviderInput) -> Result<ProviderSummary, String> {
     let input = checked(input)?;
-    if input.secret.is_empty() {
+    if input.secret.is_empty() && input.kind.is_http() {
         return Err("Enter the API key or token (any value, for a local Ollama).".to_string());
     }
     let provider = db::create_inference_provider(
@@ -526,7 +534,7 @@ pub async fn update_provider(
     input: ProviderInput,
 ) -> Result<ProviderSummary, String> {
     let input = checked(input)?;
-    if input.secret.is_empty() {
+    if input.secret.is_empty() && input.kind.is_http() {
         let stored = db::get_inference_provider(pool, id)
             .await
             .map_err(|e| e.to_string())?
@@ -537,7 +545,8 @@ pub async fn update_provider(
             return Err("Enter the key again to use it at a new address.".to_string());
         }
     }
-    let secret = (!input.secret.is_empty()).then_some(input.secret.as_str());
+    // Claude Code clears a key kept from another kind (SME-429).
+    let secret = (!input.secret.is_empty() || !input.kind.is_http()).then_some(input.secret.as_str());
     let provider = db::update_inference_provider(
         pool,
         id,

@@ -1,0 +1,205 @@
+//! The CLI's environment, binary and status (SME-429), against a fake
+//! `claude`: a shell script each test writes into a directory of its own.
+//! No test runs the real CLI or reaches Anthropic.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use super::*;
+
+/// A directory of the test's own under the system temp dir, emptied first.
+fn scratch(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("smelt-claude-cli-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("make the scratch dir");
+    dir
+}
+
+/// Writes an executable `claude` into `dir` running `body` under `/bin/sh`.
+fn fake_claude(dir: &Path, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("claude");
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write the fake claude");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("make it executable");
+    path
+}
+
+/// A fake that answers `--version` and `auth status` with `auth` (its
+/// stdout) and `auth_exit`.
+fn answering(dir: &Path, auth: &str, auth_exit: i32) -> PathBuf {
+    fake_claude(
+        dir,
+        &format!(
+            "case \"$1\" in\n  --version) echo '2.1.318 (Claude Code)'; echo 'second line';;\n  auth) printf '%s' '{auth}'; exit {auth_exit};;\n  *) exit 2;;\nesac"
+        ),
+    )
+}
+
+/// What smelt's own environment looks like on a dev host: the two
+/// `ANTHROPIC_*` the dev `.env` sets, a key, the database, and the ones
+/// the CLI is allowed.
+fn smelt_env(config_dir: Option<&Path>) -> impl Fn(&str) -> Option<OsString> {
+    let mut vars: BTreeMap<&'static str, OsString> = BTreeMap::new();
+    vars.insert("ANTHROPIC_BASE_URL", "http://proxy.invalid".into());
+    vars.insert("ANTHROPIC_AUTH_TOKEN", "fake-auth-token".into());
+    vars.insert("ANTHROPIC_API_KEY", "fake-api-key".into());
+    vars.insert("DATABASE_URL", "postgres://fake@db.invalid/smelt".into());
+    vars.insert("CLAUDE_CODE_OAUTH_TOKEN", "fake-oauth-token".into());
+    vars.insert("HOME", "/home/smelt".into());
+    vars.insert("PATH", std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()));
+    if let Some(dir) = config_dir {
+        vars.insert(CONFIG_DIR_VAR, dir.as_os_str().to_owned());
+    }
+    move |name| vars.get(name).cloned()
+}
+
+fn names(env: &[(String, OsString)]) -> BTreeSet<String> {
+    env.iter().map(|(name, _)| name.clone()).collect()
+}
+
+#[test]
+fn test_the_cli_env_passes_only_the_allowlist() {
+    let env = cli_env(smelt_env(Some(Path::new("/var/smelt-claude"))));
+    let expected: BTreeSet<String> = ["PATH", "HOME", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR", "DISABLE_AUTOUPDATER"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    // Names only: the values are never printed.
+    assert_eq!(names(&env), expected);
+    let value = |name: &str| env.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone());
+    assert_eq!(value("CLAUDE_CONFIG_DIR"), Some(OsString::from("/var/smelt-claude")), "SMELT_CLAUDE_CONFIG_DIR names it");
+    assert_eq!(value("DISABLE_AUTOUPDATER"), Some(OsString::from("1")));
+}
+
+#[test]
+fn test_the_cli_config_dir_defaults_and_unset_vars_stay_unset() {
+    let env = cli_env(|name| (name == "PATH").then(|| OsString::from("/usr/bin")));
+    let set = names(&env);
+    assert!(!set.contains("CLAUDE_CODE_OAUTH_TOKEN"), "unset in smelt, unset for the CLI");
+    assert!(!set.contains("HOME"));
+    let config = env.iter().find(|(n, _)| n == "CLAUDE_CONFIG_DIR").map(|(_, v)| v.clone());
+    assert_eq!(config, Some(OsString::from(DEFAULT_CONFIG_DIR)));
+}
+
+#[tokio::test]
+async fn test_the_fake_cli_sees_none_of_smelts_environment() {
+    let dir = scratch("env");
+    let seen = dir.join("seen-env");
+    let claude = fake_claude(&dir, &format!("env > '{}'\necho '2.1.318 (Claude Code)'", seen.display()));
+    let config = dir.join("config");
+    status_with(claude.to_str().expect("utf-8 path"), cli_env(smelt_env(Some(&config))), Duration::from_secs(10)).await;
+    let dumped = std::fs::read_to_string(&seen).expect("the fake wrote its environment");
+    let seen_names: BTreeSet<&str> = dumped.lines().filter_map(|line| line.split_once('=').map(|(n, _)| n)).collect();
+    let leaked: Vec<&&str> = seen_names
+        .iter()
+        .filter(|name| name.starts_with("ANTHROPIC_") || **name == "DATABASE_URL")
+        .collect();
+    assert!(leaked.is_empty(), "these reached the CLI: {leaked:?}");
+    // What sh adds itself (PWD, SHLVL, _) aside, it saw the allowlist only.
+    let extra: Vec<&&str> = seen_names
+        .iter()
+        .filter(|name| !["PWD", "OLDPWD", "SHLVL", "_"].contains(name))
+        .filter(|name| !["PATH", "HOME", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR", "DISABLE_AUTOUPDATER"].contains(name))
+        .collect();
+    assert!(extra.is_empty(), "not on the allowlist: {extra:?}");
+    assert!(config.is_dir(), "the config dir is made for the CLI");
+}
+
+#[tokio::test]
+async fn test_the_status_says_version_sign_in_and_plan_and_nothing_else() {
+    let dir = scratch("signed-in");
+    let auth = r#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"someone@example.com","orgName":"Org","subscriptionType":"max","token":"sk-ant-oat01-NEVERSHOWN"}"#;
+    let claude = answering(&dir, auth, 0);
+    let status = status_with(claude.to_str().expect("utf-8 path"), cli_env(smelt_env(Some(&dir.join("c")))), Duration::from_secs(10)).await;
+    assert_eq!(
+        status,
+        ClaudeCliStatus {
+            version: Some("2.1.318 (Claude Code)".to_string()),
+            signed_in: true,
+            auth_method: Some("claude.ai".to_string()),
+            plan: Some("max".to_string()),
+            error: None,
+        }
+    );
+    let shown = format!("{status:?}");
+    assert!(!shown.contains("sk-ant") && !shown.contains("example.com"), "only the version and two words cross");
+}
+
+#[tokio::test]
+async fn test_the_status_says_signed_out_when_the_cli_does() {
+    let dir = scratch("signed-out");
+    let claude = answering(&dir, r#"{"loggedIn":false,"authMethod":"none"}"#, 1);
+    let status = status_with(claude.to_str().expect("utf-8 path"), cli_env(smelt_env(Some(&dir.join("c")))), Duration::from_secs(10)).await;
+    assert_eq!(status.version.as_deref(), Some("2.1.318 (Claude Code)"));
+    assert!(!status.signed_in);
+    assert_eq!(status.auth_method.as_deref(), Some("none"));
+    assert_eq!(status.error, None, "signed out is an answer, not an error");
+}
+
+#[tokio::test]
+async fn test_an_unreadable_auth_status_is_an_error_that_echoes_nothing() {
+    let dir = scratch("garbage");
+    let claude = answering(&dir, "token: sk-ant-oat01-LEAKED", 0);
+    let status = status_with(claude.to_str().expect("utf-8 path"), cli_env(smelt_env(Some(&dir.join("c")))), Duration::from_secs(10)).await;
+    assert!(!status.signed_in);
+    let error = status.error.expect("an error");
+    assert!(error.contains("auth status"), "{error}");
+    assert!(!error.contains("LEAKED") && !error.contains("sk-ant"), "the CLI's output is never echoed");
+}
+
+#[tokio::test]
+async fn test_a_missing_binary_says_where_it_looked() {
+    let dir = scratch("missing");
+    let env = cli_env(smelt_env(Some(&dir.join("c"))));
+    let by_path = status_with("/nonexistent/claude", env.clone(), Duration::from_secs(10)).await;
+    assert_eq!(by_path.version, None);
+    assert!(by_path.error.as_deref().is_some_and(|e| e.contains("/nonexistent/claude")), "{by_path:?}");
+    let by_name = status_with("no-such-claude-binary", env, Duration::from_secs(10)).await;
+    assert!(by_name.error.as_deref().is_some_and(|e| e.contains("PATH")), "{by_name:?}");
+}
+
+#[tokio::test]
+async fn test_a_hung_cli_times_out() {
+    let dir = scratch("hung");
+    let claude = fake_claude(&dir, "sleep 30");
+    let started = std::time::Instant::now();
+    let status = status_with(claude.to_str().expect("utf-8 path"), cli_env(smelt_env(Some(&dir.join("c")))), Duration::from_millis(300)).await;
+    assert!(started.elapsed() < Duration::from_secs(10), "it gave up rather than waiting");
+    assert!(status.error.as_deref().is_some_and(|e| e.contains("didn't answer")), "{status:?}");
+}
+
+#[test]
+fn test_a_binary_path_is_checked() {
+    assert_eq!(checked_binary("  "), Ok(DEFAULT_BINARY.to_string()), "blank is the default");
+    assert_eq!(checked_binary(" /opt/claude/bin/claude "), Ok("/opt/claude/bin/claude".to_string()));
+    assert!(checked_binary("https://api.anthropic.com").is_err(), "an address isn't a binary");
+    assert!(checked_binary("claude --dangerously").is_err(), "no arguments");
+}
+
+#[test]
+fn test_the_status_line_says_signed_in_how_and_on_what_plan() {
+    let status = |signed_in, auth_method: Option<&str>, plan: Option<&str>| ClaudeCliStatus {
+        version: Some("2.1.318 (Claude Code)".to_string()),
+        signed_in,
+        auth_method: auth_method.map(str::to_string),
+        plan: plan.map(str::to_string),
+        error: None,
+    };
+    assert_eq!(
+        status(true, Some("oauth_token"), Some("max")).summary(),
+        "Claude Code 2.1.318 (Claude Code): signed in with CLAUDE_CODE_OAUTH_TOKEN, on the max plan."
+    );
+    assert_eq!(
+        status(true, Some("claude.ai"), None).summary(),
+        "Claude Code 2.1.318 (Claude Code): signed in with a claude.ai login; it didn't say which plan."
+    );
+    let signed_out = status(false, Some("none"), None).summary();
+    assert!(signed_out.starts_with("Claude Code 2.1.318 (Claude Code): not signed in."), "{signed_out}");
+    assert!(signed_out.contains("claude setup-token") && signed_out.contains("CLAUDE_CODE_OAUTH_TOKEN"), "says how: {signed_out}");
+    let unread = ClaudeCliStatus { error: Some("claude auth status didn't answer within 10 seconds.".to_string()), ..status(false, None, None) };
+    assert_eq!(unread.summary(), "Claude Code 2.1.318 (Claude Code): couldn't read its sign-in: claude auth status didn't answer within 10 seconds.");
+    let missing = ClaudeCliStatus { error: Some("There's no claude on the server's PATH.".to_string()), ..ClaudeCliStatus::default() };
+    assert_eq!(missing.summary(), "Couldn't run Claude Code: There's no claude on the server's PATH.");
+}

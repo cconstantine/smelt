@@ -5,7 +5,7 @@ use dioxus::prelude::*;
 
 use crate::api::chat::{get_conversation_model, set_conversation_model};
 use crate::api::providers::{
-    add_provider_model, create_provider, delete_provider, get_default_model, get_provider, get_recent_spend, list_price_sources,
+    add_provider_model, create_provider, delete_provider, get_claude_cli_status, get_default_model, get_provider, get_recent_spend, list_price_sources,
     list_provider_models, list_providers, probe_llama_cpp, refresh_model_details, set_default_model, set_model_settings,
     update_provider,
 };
