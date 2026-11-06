@@ -61,7 +61,10 @@ impl Run {
                     let inner = &event["event"];
                     match inner["type"].as_str() {
                         // A new API call: the last reply's results are all in.
-                        Some("message_start") => self.delivered = false,
+                        Some("message_start") => {
+                            self.delivered = false;
+                            self.reply_started = true;
+                        }
                         Some("content_block_start") if inner["content_block"]["type"] == "tool_use" => {
                             if let Some(id) = inner["content_block"]["id"].as_str() {
                                 self.streaming_ids.insert(id.to_string());

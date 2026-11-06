@@ -18,9 +18,9 @@ async fn test_a_shrinking_cap_keeps_the_run(pool: PgPool) {
     let model = crate::providers::resolve_turn_model(&pool, conversation.id).await.expect("the model");
     let mut cli = crate::claude_cli::run::TurnCli::default();
     crate::claude_cli::run::SILENCE_FOR_TESTS.store(3_000, std::sync::atomic::Ordering::SeqCst);
-    let first = one_call(conversation.id, &model, &mut cli, vec![said("user", &"long ".repeat(1_000))], 1_000).await;
+    let first = one_call(&pool, conversation.id, &model, &mut cli, vec![said("user", &"long ".repeat(1_000))], 1_000).await;
     let grown = vec![said("user", &"long ".repeat(1_000)), said("assistant", "one"), said("user", &"longer ".repeat(1_000))];
-    let second = one_call(conversation.id, &model, &mut cli, grown, 800).await;
+    let second = one_call(&pool, conversation.id, &model, &mut cli, grown, 800).await;
     crate::claude_cli::run::SILENCE_FOR_TESTS.store(0, std::sync::atomic::Ordering::SeqCst);
     first.expect("the first call");
     second.expect("the second call");

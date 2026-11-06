@@ -76,6 +76,7 @@ mod providers;
 mod secrets;
 mod storage_grace;
 mod script_mcp;
+mod claude_cli;
 
 pub use agents::*;
 pub use conversations::*;
@@ -91,6 +92,7 @@ pub use providers::*;
 pub use secrets::*;
 pub use storage_grace::*;
 pub use script_mcp::*;
+pub use claude_cli::*;
 
 #[cfg(test)]
 mod tests;

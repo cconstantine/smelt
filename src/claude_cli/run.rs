@@ -137,6 +137,12 @@ struct Run {
     /// Whether the last reply's results are in `answers`, until the CLI's
     /// next API call starts.
     delivered: bool,
+    /// The CLI session it's in.
+    session_id: String,
+    /// Whether it resumed a session from an earlier turn.
+    resumed: bool,
+    /// Whether this call's reply has begun (a `message_start`).
+    reply_started: bool,
     /// Calls with an id the streaming reply hasn't shown yet (L12).
     held: Vec<ParkedCall>,
     /// Whether it was given smelt's tools (an `--mcp-config`).
@@ -154,6 +160,7 @@ struct Run {
 /// the reply. The reply's usage goes to `meter`, and that of any API call
 /// the CLI made on its own after a cut-off to `extra` (S6).
 pub async fn call(
+    pool: &sqlx::PgPool,
     conversation_id: i64,
     turn_model: &crate::providers::TurnModel,
     request: &CreateMessageRequest,
@@ -162,6 +169,47 @@ pub async fn call(
     extra: &UsageMeter,
     cli: &mut TurnCli,
 ) -> Result<StreamedTurn, String> {
+    let call = Call { pool, conversation_id, turn_model, request };
+    let replied = call_run(&call, on_delta, meter, extra, cli).await;
+    // The session the next turn resumes: this run's, synced to this call,
+    // after a call that went well; after any other, none, so the next turn
+    // starts over from smelt's record.
+    let keep = match (&replied, cli.run.as_ref()) {
+        (Ok(_), Some(run)) if run.healthy => Some(crate::db::ClaudeCliSession {
+            provider_id: turn_model.provider_id,
+            session_id: run.session_id.clone(),
+            synced_count: i32::try_from(run.synced.len).unwrap_or(i32::MAX),
+            synced_hash: run.synced.hash.clone(),
+        }),
+        _ => None,
+    };
+    let kept = match &keep {
+        Some(session) => crate::db::set_claude_cli_session(pool, conversation_id, session).await,
+        None => crate::db::delete_claude_cli_session(pool, conversation_id).await,
+    };
+    if let Err(e) = kept {
+        tracing::warn!(conversation_id, "couldn't record the conversation's Claude Code session: {e}");
+    }
+    replied
+}
+
+/// One call's fixed inputs.
+struct Call<'a> {
+    pool: &'a sqlx::PgPool,
+    conversation_id: i64,
+    turn_model: &'a crate::providers::TurnModel,
+    request: &'a CreateMessageRequest,
+}
+
+/// `call` without the session row's upkeep.
+async fn call_run(
+    call: &Call<'_>,
+    on_delta: &mut (dyn FnMut(&str) + Send),
+    meter: &UsageMeter,
+    extra: &UsageMeter,
+    cli: &mut TurnCli,
+) -> Result<StreamedTurn, String> {
+    let (conversation_id, request) = (call.conversation_id, call.request);
     // A process that died since the last call (an OOM kill while smelt ran
     // a tool) is replaced, as the state table's Dead row says (review 1 M1).
     if let Some(run) = cli.run.as_mut()
@@ -203,7 +251,7 @@ pub async fn call(
             return Err(e);
         }
     }
-    let replied = read_from_run(conversation_id, turn_model, request, on_delta, meter, extra, cli).await;
+    let replied = read_from_run(call, on_delta, meter, extra, cli).await;
     match replied {
         // It died before it said anything to this call (M1, the race the
         // check above can lose): once more, on a new run.
@@ -212,41 +260,97 @@ pub async fn call(
                 tracing::warn!(conversation_id, "the turn's Claude Code process exited before it answered: starting a new one from smelt's history");
                 dead.end_in_background();
             }
-            read_from_run(conversation_id, turn_model, request, on_delta, meter, extra, cli).await
+            read_from_run(call, on_delta, meter, extra, cli).await
         }
         replied => replied,
     }
 }
 
-/// `call`'s spawn (when the turn has no run) and its read of the reply.
+/// `call`'s start of a run, when the turn has none, and its read of the
+/// reply. A resumed session that fails before its reply begins (gone with
+/// a restart's config dir, say) is replaced once by a new one.
 async fn read_from_run(
-    conversation_id: i64,
-    turn_model: &crate::providers::TurnModel,
-    request: &CreateMessageRequest,
+    call: &Call<'_>,
     on_delta: &mut (dyn FnMut(&str) + Send),
     meter: &UsageMeter,
     extra: &UsageMeter,
     cli: &mut TurnCli,
 ) -> Result<StreamedTurn, String> {
     if cli.run.is_none() {
-        let mut run = Run::spawn(conversation_id, turn_model, request).await?;
-        if request.messages.iter().any(|m| m.role == "assistant") {
-            tracing::info!(conversation_id, messages = request.messages.len(), "a new Claude Code run starts from smelt's history as text");
-        }
-        if let Err(e) = run.write_user(&rehydrate(&request.messages, turn_model.context_window)).await {
-            run.end_in_background();
-            return Err(e);
-        }
-        cli.run = Some(run);
+        cli.run = Some(start(call, true).await?);
     }
+    let replied = read_once(call, on_delta, meter, extra, cli).await;
+    if replied.is_err()
+        && let Some(run) = cli.run.as_ref()
+        && run.resumed
+        && !run.reply_started
+        && let Some(run) = cli.run.take()
+    {
+        tracing::warn!(conversation_id = call.conversation_id, "the conversation's Claude Code session didn't resume: starting a new one from smelt's history");
+        run.end_in_background();
+        cli.run = Some(start(call, false).await?);
+        return read_once(call, on_delta, meter, extra, cli).await;
+    }
+    replied
+}
+
+/// A new run for the turn: resuming the conversation's session when
+/// `resume` and its record (`claude_cli_sessions`) still matches smelt's
+/// history, sent what's new; else a new session, sent the history as text.
+async fn start(call: &Call<'_>, resume: bool) -> Result<Run, String> {
+    let (conversation_id, turn_model, request) = (call.conversation_id, call.turn_model, call.request);
+    let recorded = if resume { crate::db::get_claude_cli_session(call.pool, conversation_id).await.unwrap_or_else(|e| {
+        tracing::warn!(conversation_id, "couldn't read the conversation's Claude Code session: {e}");
+        None
+    }) } else { None };
+    let resumable = recorded.filter(|s| s.provider_id == turn_model.provider_id).and_then(|s| {
+        let synced = Synced { len: usize::try_from(s.synced_count).ok()?, hash: s.synced_hash };
+        tail_after(&synced, &request.messages).map(|tail| (s.session_id, tail.to_vec()))
+    });
+    let (mut run, first) = match resumable {
+        Some((session_id, tail)) => {
+            let names = call_names(&request.messages);
+            let text = tail.iter().map(|m| blocks_text(&m.content, &names)).collect::<Vec<_>>().join("\n\n");
+            let mut run = Run::spawn(conversation_id, turn_model, request, SessionArg::Resume(&session_id)).await?;
+            run.resumed = true;
+            run.session_id = session_id;
+            (run, text)
+        }
+        None => {
+            if request.messages.iter().any(|m| m.role == "assistant") {
+                tracing::info!(conversation_id, messages = request.messages.len(), "a new Claude Code session starts from smelt's history as text");
+            }
+            let session_id = super::process::new_session_id();
+            let mut run = Run::spawn(conversation_id, turn_model, request, SessionArg::New(&session_id)).await?;
+            run.session_id = session_id;
+            (run, rehydrate(&request.messages, turn_model.context_window))
+        }
+    };
+    if let Err(e) = run.write_user(&first).await {
+        run.end_in_background();
+        return Err(e);
+    }
+    Ok(run)
+}
+
+/// Reads the turn's run's reply to this call.
+async fn read_once(
+    call: &Call<'_>,
+    on_delta: &mut (dyn FnMut(&str) + Send),
+    meter: &UsageMeter,
+    extra: &UsageMeter,
+    cli: &mut TurnCli,
+) -> Result<StreamedTurn, String> {
     let Some(run) = cli.run.as_mut() else {
         return Err("Claude Code's run is gone.".to_string());
     };
-    run.synced = synced(&request.messages);
+    run.synced = synced(&call.request.messages);
     run.heard = false;
     let replied = run.read_reply(on_delta, meter, extra).await;
-    // A run that died before it said anything is kept for `call` to see.
-    if (replied.is_err() || !run.healthy) && !(run.exited() && !run.heard) {
+    // A run that died before it said anything is kept for `call` to see,
+    // and so is a resumed one that failed before its reply began.
+    let kept = (run.exited() && !run.heard) || (run.resumed && !run.reply_started);
+    if (replied.is_err() || !run.healthy) && !kept {
         if let Some(run) = cli.run.take() {
             run.end_in_background();
         }
@@ -255,7 +359,7 @@ async fn read_from_run(
 }
 
 impl Run {
-    async fn spawn(conversation_id: i64, turn_model: &crate::providers::TurnModel, request: &CreateMessageRequest) -> Result<Self, String> {
+    async fn spawn(conversation_id: i64, turn_model: &crate::providers::TurnModel, request: &CreateMessageRequest, session: SessionArg<'_>) -> Result<Self, String> {
         let env = super::cli_env(|name| std::env::var_os(name));
         let value = |name: &str| env.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone());
         let config_dir = value("CLAUDE_CONFIG_DIR")
@@ -284,7 +388,7 @@ impl Run {
             effort: turn_model.effort,
             system_prompt_file: &prompt_file,
             mcp_config_file: config_file.as_deref(),
-            session: SessionArg::Ephemeral,
+            session,
         };
         let env = turn_env(env, request.max_tokens);
         let spawned = tokio::process::Command::new(&binary)
@@ -328,6 +432,9 @@ impl Run {
             max_tokens: request.max_tokens,
             has_tools: !request.tools.is_empty(),
             held: Vec::new(),
+            session_id: String::new(),
+            resumed: false,
+            reply_started: false,
             streaming_ids: std::collections::HashSet::new(),
             answered: std::collections::HashSet::new(),
             delivered: false,

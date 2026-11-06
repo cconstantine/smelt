@@ -82,7 +82,7 @@ async fn test_a_claude_code_turn_saves_thinking_and_text_and_its_usage(pool: PgP
     assert_eq!(usage_rows(&pool, conversation.id).await, vec![(4, 900, 160, 48)]);
     assert_eq!(user_texts(&fake, 0), vec!["hello".to_string()], "a new conversation's message goes as it is");
     let args = fake.args(0);
-    for expected in ["-p", "--no-session-persistence", "--disable-slash-commands", "--strict-mcp-config", "--system-prompt-file"] {
+    for expected in ["-p", "--session-id", "--disable-slash-commands", "--strict-mcp-config", "--system-prompt-file"] {
         assert!(args.iter().any(|a| a == expected), "{expected} in {args:?}");
     }
     let model = args.iter().position(|a| a == "--model").and_then(|i| args.get(i + 1));
@@ -135,10 +135,11 @@ async fn test_a_tool_call_runs_in_smelt_and_its_result_answers_the_parked_call(p
     assert_eq!(usage_rows(&pool, conversation.id).await.len(), 2, "one row per API call");
 }
 
-/// Part 1, a new run per turn: the next turn's process gets smelt's
-/// history as text before the new message.
+/// A turn with no session to resume (none recorded: a failed call, or
+/// none yet) starts a new one, given smelt's history as text before the
+/// new message.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_each_turn_starts_a_run_from_smelts_history(pool: PgPool) {
+async fn test_a_turn_with_no_session_starts_from_smelts_history(pool: PgPool) {
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("conversation");
@@ -146,6 +147,7 @@ async fn test_each_turn_starts_a_run_from_smelts_history(pool: PgPool) {
     fake.pick_for(&pool, conversation.id).await;
 
     run_turn(&pool, conversation.id, hello()).await.expect("turn 1");
+    db::delete_claude_cli_session(&pool, conversation.id).await.expect("forget the session");
     run_turn(&pool, conversation.id, hello()).await.expect("turn 2");
 
     assert_eq!(fake.started(), 2);
@@ -289,3 +291,4 @@ async fn test_the_context_view_says_the_subscription_pays(pool: PgPool) {
 
 mod review1;
 mod review2;
+mod sessions;

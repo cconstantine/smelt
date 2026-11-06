@@ -146,6 +146,7 @@ pub(super) fn said(role: &str, text: &str) -> anthropic::AnthropicMessage {
 
 /// One model call through `cli`.
 pub(super) async fn one_call(
+    pool: &PgPool,
     conversation_id: i64,
     model: &crate::providers::TurnModel,
     cli: &mut crate::claude_cli::run::TurnCli,
@@ -155,7 +156,7 @@ pub(super) async fn one_call(
     let request = cli_request(messages, cap);
     let (meter, extra) = (anthropic::stream::UsageMeter::default(), anthropic::stream::UsageMeter::default());
     let mut relay = |_: &str| {};
-    crate::claude_cli::run::call(conversation_id, model, &request, &mut relay, &meter, &extra, cli).await.map(|turn| turn.content)
+    crate::claude_cli::run::call(pool, conversation_id, model, &request, &mut relay, &meter, &extra, cli).await.map(|turn| turn.content)
 }
 
 /// Review 1 L3, and the history going another way mid-turn: a run is
@@ -176,10 +177,10 @@ async fn test_a_new_cap_or_another_history_starts_a_new_run(pool: PgPool) {
     let model = crate::providers::resolve_turn_model(&pool, conversation.id).await.expect("the model");
     let mut cli = crate::claude_cli::run::TurnCli::default();
     crate::claude_cli::run::SILENCE_FOR_TESTS.store(3_000, std::sync::atomic::Ordering::SeqCst);
-    let first = one_call(conversation.id, &model, &mut cli, vec![said("user", "hi")], 1_000).await;
-    let same = one_call(conversation.id, &model, &mut cli, vec![said("user", "hi"), said("assistant", "one"), said("user", "again")], 1_000).await;
-    let new_cap = one_call(conversation.id, &model, &mut cli, vec![said("user", "hi"), said("assistant", "one"), said("user", "again"), said("assistant", "two"), said("user", "more")], 1_100).await;
-    let other = one_call(conversation.id, &model, &mut cli, vec![said("user", "edited"), said("assistant", "x"), said("user", "and")], 1_100).await;
+    let first = one_call(&pool, conversation.id, &model, &mut cli, vec![said("user", "hi")], 1_000).await;
+    let same = one_call(&pool, conversation.id, &model, &mut cli, vec![said("user", "hi"), said("assistant", "one"), said("user", "again")], 1_000).await;
+    let new_cap = one_call(&pool, conversation.id, &model, &mut cli, vec![said("user", "hi"), said("assistant", "one"), said("user", "again"), said("assistant", "two"), said("user", "more")], 1_100).await;
+    let other = one_call(&pool, conversation.id, &model, &mut cli, vec![said("user", "edited"), said("assistant", "x"), said("user", "and")], 1_100).await;
     crate::claude_cli::run::SILENCE_FOR_TESTS.store(0, std::sync::atomic::Ordering::SeqCst);
     let text = |r: Result<Vec<anthropic::ContentBlock>, String>| match r.expect("a reply").as_slice() {
         [anthropic::ContentBlock::Text { text }] => text.clone(),
@@ -188,7 +189,10 @@ async fn test_a_new_cap_or_another_history_starts_a_new_run(pool: PgPool) {
     assert_eq!([text(first), text(same), text(new_cap), text(other)], ["one", "two", "three", "four"]);
     assert_eq!(fake.started(), 3, "the same run, then a new cap's, then another history's");
     assert_eq!(user_texts(&fake, 0), ["hi", "again"], "the same run is sent only what's new");
-    assert!(user_texts(&fake, 1)[0].ends_with("### The new message\nmore"), "{:?}", user_texts(&fake, 1));
+    // The new cap's run resumes the session the last call left (SME-430's
+    // sessions), so it too is sent only what's new.
+    assert_eq!(user_texts(&fake, 1), ["more"], "{:?}", fake.args(1));
+    assert!(fake.args(1).iter().any(|a| a == "--resume"), "{:?}", fake.args(1));
     assert!(user_texts(&fake, 2)[0].contains("edited"), "{:?}", user_texts(&fake, 2));
 }
 
@@ -300,11 +304,11 @@ async fn test_a_call_with_no_result_is_answered_not_run(pool: PgPool) {
     let model = crate::providers::resolve_turn_model(&pool, conversation.id).await.expect("the model");
     let mut cli = crate::claude_cli::run::TurnCli::default();
     let first = vec![said("user", "hi")];
-    let reply = one_call(conversation.id, &model, &mut cli, first.clone(), 1_000).await.expect("the call");
+    let reply = one_call(&pool, conversation.id, &model, &mut cli, first.clone(), 1_000).await.expect("the call");
     let mut next = first;
     next.push(anthropic::AnthropicMessage { role: "assistant".to_string(), content: reply });
     next.push(said("user", "a notice"));
-    one_call(conversation.id, &model, &mut cli, next, 1_000).await.expect("the next call");
+    one_call(&pool, conversation.id, &model, &mut cli, next, 1_000).await.expect("the next call");
 
     let results = fake.results(0);
     assert_eq!(results.len(), 1, "{results:?}");

@@ -224,7 +224,7 @@ async fn call_claude_cli(
     crate::events::publish(conversation_id, crate::events::ConversationEvent::ReplyReset {});
     let recorder = CallRecorder::new(pool, conversation_id, turn_model, db::ModelCallKind::Turn, request);
     let extra = CallRecorder::new(pool, conversation_id, turn_model, db::ModelCallKind::Turn, request);
-    let called = crate::claude_cli::run::call(conversation_id, turn_model, request, relay, recorder.meter(), extra.meter(), cli).await;
+    let called = crate::claude_cli::run::call(pool, conversation_id, turn_model, request, relay, recorder.meter(), extra.meter(), cli).await;
     drop(extra);
     called.map(|turn| (turn, recorder)).map_err(|e| CallError::Failed(ServerFnError::new(e)))
 }
