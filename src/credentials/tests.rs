@@ -411,12 +411,17 @@ async fn test_pod_files_hand_a_multi_line_secret_byte_equal(pool: PgPool) {
 }
 
 
-/// SME-440: a stalled exec is run again well inside the install's own
-/// bound, with room for more than one retry.
+/// SME-440 review M2: each try of an exec gets longer, 10 s, then 20 s,
+/// then what is left of the install's own bound, so an exec slower than
+/// the first try's limit still finishes rather than being re-issued until
+/// the install fails; and the first two leave the third room.
 #[test]
-fn test_an_install_has_room_to_retry_stalled_execs() {
-    assert!(
-        3 * EXEC_STALL_AFTER <= INSTALL_TIMEOUT,
-        "{EXEC_STALL_AFTER:?} leaves {INSTALL_TIMEOUT:?} no room for two retries"
-    );
+fn test_an_execs_tries_grow_and_end_at_the_installs_bound() {
+    let s = std::time::Duration::from_secs;
+    assert_eq!(try_limit(0, INSTALL_TIMEOUT), s(10));
+    assert_eq!(try_limit(1, INSTALL_TIMEOUT - s(10)), s(20));
+    assert_eq!(try_limit(2, INSTALL_TIMEOUT - s(30)), INSTALL_TIMEOUT - s(30), "the third try takes what's left");
+    assert_eq!(try_limit(5, s(7)), s(7));
+    assert_eq!(try_limit(0, s(4)), s(4), "never past the install's bound");
+    assert!(s(10) + s(20) < INSTALL_TIMEOUT, "the first two tries leave the third room");
 }

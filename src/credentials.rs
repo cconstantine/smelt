@@ -17,7 +17,7 @@ pub use self::pod_writes::install_pod_files;
 #[cfg(test)]
 pub(crate) use self::pod_writes::WRITE_FILE_SCRIPT;
 #[cfg(test)]
-pub(crate) use self::pod_writes::{CLOCK_SKEW_MARGIN, EXEC_STALL_AFTER};
+pub(crate) use self::pod_writes::{try_limit, CLOCK_SKEW_MARGIN, EXEC_STALL_AFTER};
 
 /// The built-in credential every persona may list in
 /// `smelt.credentials`: the user's git SSH key (SME-242). No stored

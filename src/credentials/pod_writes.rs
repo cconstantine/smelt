@@ -114,15 +114,15 @@ chmod "$2" "$t" || { rm -f "$t"; exit 1; }
 [ "$(date +%s)" -lt "${SMELT_INSTALL_DEADLINE:-0}" ] || { rm -f "$t"; echo "past the install's deadline" >&2; exit 1; }
 mv "$t" "$1" || { rm -f "$t"; exit 1; }"#;
 
-/// How long one of an install's execs may go unanswered before it counts as
-/// stalled and is run again (SME-440). On a loaded CI runner one exec of a
-/// reinstall ran and never answered; with nothing bounding it but the whole
-/// install's `INSTALL_TIMEOUT`, the install failed and the pod kept a key
-/// and a secret its conversation no longer had — in production, a live pod
-/// keeping what a narrowing or a delete took away, or a new pod failing to
-/// start. Every install exec answers in about a second, 1.3 s under SME-341's
-/// load, so 10 s is well past a slow one, and leaves `INSTALL_TIMEOUT` room
-/// for several tries.
+/// How long an install's exec may go unanswered on its first try before it
+/// counts as stalled and is run again (SME-440). On a loaded CI runner one
+/// exec of a reinstall never answered; with nothing bounding it but the
+/// whole install's `INSTALL_TIMEOUT`, the install failed and the pod kept
+/// a key and a secret its conversation no longer had. An install exec
+/// answers in about a second (a whole pod's install took 1.3 s under
+/// SME-341's load), so 10 s is far past a slow one; each later try waits
+/// longer (`try_limit`), since one exec slower than this is likelier than
+/// many lost ones.
 pub(crate) const EXEC_STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How far a node's clock may be behind the server's, for the deadlines
@@ -134,6 +134,19 @@ pub(crate) const EXEC_STALL_AFTER: std::time::Duration = std::time::Duration::fr
 /// between its deadline check and its `mv` or `rm`. It's paid only after
 /// an attempt was abandoned.
 pub(crate) const CLOCK_SKEW_MARGIN: Duration = Duration::from_secs(5);
+
+/// Try `n`'s limit (from 0), given what remains of the install's bound:
+/// 10 s, then 20 s, then all that's left (SME-440 review M2). A fixed 10 s
+/// turned an exec that takes 12 s on a loaded node into six re-issued
+/// execs, each more load, and an install that failed at 60 s.
+pub(crate) fn try_limit(n: u32, remaining: Duration) -> Duration {
+    match n {
+        0 => EXEC_STALL_AFTER,
+        1 => 2 * EXEC_STALL_AFTER,
+        _ => remaining,
+    }
+    .min(remaining)
+}
 
 /// One install's execs (SME-440 review H1). Dropping an exec's stream
 /// doesn't stop its command in the pod, which can even start after the
@@ -165,8 +178,9 @@ impl Attempts {
         command: &[&str],
         stdin: Option<&[u8]>,
     ) -> Result<sandbox::ExecResult, sandbox::SandboxError> {
+        let mut tries = 0;
         loop {
-            let limit = EXEC_STALL_AFTER.min(self.ends_at.saturating_duration_since(tokio::time::Instant::now()));
+            let limit = try_limit(tries, self.ends_at.saturating_duration_since(tokio::time::Instant::now()));
             if limit < Duration::from_secs(1) {
                 return Err(sandbox::SandboxError::GitSetup(format!(
                     "writing credential files into the pod took over {}s",
@@ -194,6 +208,7 @@ impl Attempts {
                     );
                 }
             }
+            tries = tries.saturating_add(1);
         }
     }
 
