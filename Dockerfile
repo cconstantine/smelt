@@ -174,6 +174,44 @@ ENV BROWSER_CHECK_CACHE=/opt/browser-check-cache
 RUN bash /build/smelt/scripts/browser-check/setup.sh \
     && rm -rf "$BROWSER_CHECK_CACHE/debs" "$BROWSER_CHECK_CACHE/apt"
 
+# Claude Code, for the Claude Code provider kind (SME-429): the official
+# native binary at a pinned version, at /opt/claude/bin/claude. Fetched from
+# Anthropic's release bucket and verified the way Claude Code's setup docs
+# ("Binary integrity and code signing") describe: the release manifest's
+# detached signature against Anthropic's release-signing key, pinned here by
+# its fingerprint, then the binary against the manifest's SHA-256. Not the
+# docs' `install.sh | bash -s <version>` route: that runs the latest release
+# to install the pinned one under a home directory, behind a launcher meant
+# to update itself. Bump CLAUDE_CODE_VERSION to upgrade; the runtime stage
+# turns the autoupdater off and runs `claude --version`.
+FROM debian:trixie-slim AS claude
+ARG CLAUDE_CODE_VERSION=2.1.318
+ARG CLAUDE_CODE_KEY_FINGERPRINT=31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl gnupg jq \
+    && rm -rf /var/lib/apt/lists/*
+RUN set -eu; \
+    case "$(uname -m)" in \
+        x86_64) platform=linux-x64 ;; \
+        aarch64) platform=linux-arm64 ;; \
+        *) echo "error: no Claude Code build for $(uname -m)"; exit 1 ;; \
+    esac; \
+    repo=https://downloads.claude.ai/claude-code-releases; \
+    work="$(mktemp -d)"; cd "$work"; \
+    export GNUPGHOME="$work/gnupg"; mkdir -m 700 "$GNUPGHOME"; \
+    curl -fsSL https://downloads.claude.ai/keys/claude-code.asc | gpg --batch --import; \
+    gpg --batch --with-colons --fingerprint | grep -qx "fpr:::::::::${CLAUDE_CODE_KEY_FINGERPRINT}:" \
+        || { echo "error: Claude Code's release key isn't $CLAUDE_CODE_KEY_FINGERPRINT"; exit 1; }; \
+    curl -fsSLO "$repo/$CLAUDE_CODE_VERSION/manifest.json"; \
+    curl -fsSLO "$repo/$CLAUDE_CODE_VERSION/manifest.json.sig"; \
+    gpg --batch --verify manifest.json.sig manifest.json; \
+    test "$(jq -r .version manifest.json)" = "$CLAUDE_CODE_VERSION"; \
+    checksum="$(jq -r --arg p "$platform" '.platforms[$p].checksum' manifest.json)"; \
+    curl -fsSL -o claude "$repo/$CLAUDE_CODE_VERSION/$platform/claude"; \
+    echo "$checksum  claude" | sha256sum -c -; \
+    install -D -m 0755 claude /opt/claude/bin/claude; \
+    cd /; rm -rf "$work"
+
 # The server image. `ca-certificates` because every model provider, MCP server
 # and price-catalog fetch is HTTPS; `fonts-liberation` (with fontconfig, as a
 # dependency) because a browsing session shows the user the page it rendered,
@@ -188,12 +226,17 @@ RUN apt-get update \
 RUN groupadd -g 1000 smelt && useradd -m -u 1000 -g 1000 -s /bin/bash smelt
 COPY --from=server-build --chown=smelt:smelt /app/image/smelt/ /opt/smelt/
 COPY --from=chrome --chown=smelt:smelt /opt/browser-check-cache /opt/browser-check-cache
+COPY --from=claude /opt/claude /opt/claude
 # Where the server finds its web bundle. The default is a `public` directory
 # beside the executable; named here so it doesn't depend on how the binary
 # was launched.
+# Claude Code on PATH, as a Claude Code provider's default `claude` finds
+# it, and never updating itself: the image pins its version (SME-429).
 ENV DIOXUS_PUBLIC_PATH=/opt/smelt/public \
     BROWSER_CHECK_CACHE=/opt/browser-check-cache \
-    PORT=8080
+    PORT=8080 \
+    PATH=/opt/claude/bin:$PATH \
+    DISABLE_AUTOUPDATER=1
 USER smelt
 WORKDIR /opt/smelt
 # 8080 is the app; 8181 is the sandbox preview listener, a separate one of its
@@ -210,4 +253,7 @@ EXPOSE 8080 8181
 RUN test -x /opt/smelt/smelt && test -d /opt/smelt/public \
     && lib="/opt/browser-check-cache/libs/usr/lib/$(uname -m)-linux-gnu" \
     && LD_LIBRARY_PATH="$lib:$lib/dri" /opt/browser-check-cache/libs/usr/lib/chromium/chromium-headless-shell --version
+# The same for Claude Code: it runs here, as the server's user, or the build
+# fails rather than a provider's status line.
+RUN claude --version
 ENTRYPOINT ["/opt/smelt/smelt"]
