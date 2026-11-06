@@ -348,6 +348,25 @@ pub(crate) async fn notice_idle_commands_once(pool: &PgPool) -> Vec<i64> {
         if crate::turn::is_paused(conversation_id) {
             continue;
         }
+        // The conversation waits on an unanswered question, of either
+        // `asked_of` kind. Its wake runs a turn that stops at the question
+        // *above* the drains (SME-409), so as with a stopped conversation
+        // it saves and marks nothing: the row stays due, and every pass
+        // would wake it again for as long as the question waits — a counted
+        // turn, an "…waking its conversation" line and a tab flap for zero
+        // work done, the churn review 1 found (SME-409 review 1, mirroring
+        // the skip above). The notice is still owed, not lost: the turn
+        // that resolves the question drains it with that moment's numbers.
+        // A failed read wakes as today.
+        match db::question_waits(pool, conversation_id).await {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                conversation_id,
+                error = %e,
+                "couldn't check a conversation's waiting question for its idle notices"
+            ),
+        }
         // Ids only, never the command line: that's model-authored text
         // (SME-137), and the tool span already records ids and no input.
         tracing::info!(
