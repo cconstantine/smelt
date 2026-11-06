@@ -92,3 +92,28 @@ async fn test_a_short_write_never_replaces_the_file(pool: PgPool) {
     })
     .await;
 }
+
+/// SME-440 review M1: two writes of one file at once — an abandoned try
+/// and a later writer — each land whole or not at all. Here the first's
+/// stdin arrives late, while the second writes a longer value: sharing one
+/// temp name, the first's bytes went into the second's renamed file.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_two_writes_of_one_file_never_mix(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let pod = create_pod(&pool, conversation.id, PodLimitOverrides::default()).await.expect("create_pod");
+        let harness = r#"S="$1"
+(sleep 2; printf AAAAA) | sh -c "$S" sh /tmp/sme440m1 600 5 &
+sleep 1
+printf BBBBBBBBBB | sh -c "$S" sh /tmp/sme440m1 600 10
+wait
+cat /tmp/sme440m1"#;
+        let ran = exec_with(&client, &pod_name(pod), "sandbox", &["sh", "-c", harness, "sh", crate::credentials::WRITE_FILE_SCRIPT], None)
+            .await
+            .expect("exec");
+        let landed = ran.stdout.trim();
+        assert!(landed == "AAAAA" || landed == "BBBBBBBBBB", "a mixed file landed: {landed:?}");
+    })
+    .await;
+}

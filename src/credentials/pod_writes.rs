@@ -88,9 +88,13 @@ pub async fn install_pod_files(
 }
 
 /// Writes stdin to `$1` at mode `$2`, only if it is `$3` bytes: beside the
-/// target first, then renamed over it.
+/// target first, then renamed over it. The temp name is this attempt's own
+/// (`$$`, unique in the pod while it runs): an abandoned attempt and a later
+/// writer sharing one name wrote into one inode, so one's bytes could land
+/// inside the other's renamed file (SME-440 review M1). The prune sweeps a
+/// leftover temp file, since no kept name matches it.
 pub(crate) const WRITE_FILE_SCRIPT: &str =
-    r#"umask 077 && cat > "$1.new" && [ "$(wc -c < "$1.new")" -eq "$3" ] && chmod "$2" "$1.new" && mv "$1.new" "$1""#;
+    r#"umask 077 && t="$1.new.$$" && cat > "$t" && [ "$(wc -c < "$t")" -eq "$3" ] && chmod "$2" "$t" && mv "$t" "$1""#;
 
 /// How long one of an install's execs may go unanswered before it counts as
 /// stalled and is run again (SME-440). On a loaded CI runner one exec of a
