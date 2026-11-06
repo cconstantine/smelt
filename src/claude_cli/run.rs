@@ -45,7 +45,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use super::bridge::{ParkedCall, RunBridge, ToolReply, bridge};
 use super::errors::{RateLimit, result_error};
 use super::process::{Launch, SessionArg, cli_args, turn_env};
-use super::render::{Synced, blocks_text, rehydrate, synced, tail_after, tool_result_text};
+use super::render::{Synced, blocks_text, call_names, rehydrate, synced, tail_after, tool_result_text};
 use crate::anthropic::stream::interpret::{StreamOutcome, block_index, interpret_stream_event};
 use crate::anthropic::stream::{Blocks, PartialBlock, StreamedTurn, UsageMeter};
 use crate::anthropic::{AnthropicMessage, ContentBlock, CreateMessageRequest};
@@ -371,7 +371,8 @@ impl Run {
         match self.state {
             State::Streaming => Err("Claude Code was still replying when smelt called it again.".to_string()),
             State::Idle => {
-                let text = tail.iter().map(|m| blocks_text(&m.content)).collect::<Vec<_>>().join("\n\n");
+                let names = call_names(tail);
+                let text = tail.iter().map(|m| blocks_text(&m.content, &names)).collect::<Vec<_>>().join("\n\n");
                 self.write_user(&text).await
             }
             State::Parked => {
@@ -386,9 +387,9 @@ impl Run {
                             replies.insert(tool_use_id.clone(), reply);
                         }
                         ContentBlock::ToolResult { tool_use_id, content, is_error } => {
-                            others.push(tool_result_text(tool_use_id, content, is_error.unwrap_or(false)));
+                            others.push(tool_result_text(tool_use_id, None, content, is_error.unwrap_or(false)));
                         }
-                        other => others.push(blocks_text(std::slice::from_ref(other))),
+                        other => others.push(blocks_text(std::slice::from_ref(other), &HashMap::new())),
                     }
                 }
                 others.retain(|text| !text.trim().is_empty());
