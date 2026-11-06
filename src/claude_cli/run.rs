@@ -12,6 +12,8 @@
 //!   the call arrives (the CLI makes them one at a time, S2), the tail's
 //!   other blocks as text on the last → Streaming.
 //! - call, Idle: send the tail as a user message → Streaming.
+//! - call, with another reply cap than the run's launch (the CLI reads it
+//!   once): end the run, then as None (review 1 L3).
 //! - call, the history went another way (`render::tail_after`): end the
 //!   run, then as None.
 //! - `message_stop` `tool_use` → Parked, return the reply.
@@ -134,6 +136,8 @@ struct Run {
     /// Whether the last reply's results are in `answers`, until the CLI's
     /// next API call starts.
     delivered: bool,
+    /// The reply cap it was launched with.
+    max_tokens: u32,
     /// Whether the CLI has said anything since the current call began.
     heard: bool,
     /// Whether its stdout ended or its input broke: the process is gone.
@@ -161,6 +165,15 @@ pub async fn call(
     {
         tracing::warn!(conversation_id, "the turn's Claude Code process had exited: starting a new one from smelt's history");
         dead.end_in_background();
+    }
+    // The CLI takes the reply's cap at launch (CLAUDE_CODE_MAX_OUTPUT_TOKENS):
+    // a call with another one needs a run of its own (review 1 L3).
+    if let Some(run) = cli.run.as_ref()
+        && run.max_tokens != request.max_tokens
+        && let Some(old) = cli.run.take()
+    {
+        tracing::info!(conversation_id, from = old.max_tokens, to = request.max_tokens, "the reply's cap changed: starting a new Claude Code run");
+        old.end_in_background();
     }
     let tail = cli.run.as_ref().and_then(|run| tail_after(&run.synced, &request.messages)).map(<[_]>::to_vec);
     if tail.is_none()
@@ -304,6 +317,7 @@ impl Run {
             interrupts: 0,
             heard: false,
             gone: false,
+            max_tokens: request.max_tokens,
             streaming_ids: std::collections::HashSet::new(),
             answered: std::collections::HashSet::new(),
             delivered: false,

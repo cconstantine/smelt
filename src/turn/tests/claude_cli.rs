@@ -397,3 +397,72 @@ async fn test_a_call_the_cli_answered_itself_fails_the_call(pool: PgPool) {
     let saved = saved(&pool, conversation.id).await;
     assert!(!saved.iter().any(|(_, blocks)| blocks.iter().any(|b| matches!(b, anthropic::ContentBlock::Text { text } if text == "Unrelated."))), "{saved:?}");
 }
+
+/// A request on `conversation_id`'s Claude Code model, with `messages`
+/// and a reply cap of `max_tokens`, as the turn builds one.
+fn cli_request(messages: Vec<anthropic::AnthropicMessage>, max_tokens: u32) -> anthropic::CreateMessageRequest {
+    anthropic::CreateMessageRequest {
+        model: "claude-opus-5-5".to_string(),
+        max_tokens,
+        system: Some("You are smelt.".to_string()),
+        messages,
+        stream: true,
+        tools: Vec::new(),
+        thinking: None,
+        output_config: None,
+        chat_template_kwargs: None,
+        prompt_caching: false,
+    }
+}
+
+fn said(role: &str, text: &str) -> anthropic::AnthropicMessage {
+    anthropic::AnthropicMessage { role: role.to_string(), content: vec![anthropic::ContentBlock::Text { text: text.to_string() }] }
+}
+
+/// One model call through `cli`.
+async fn one_call(
+    conversation_id: i64,
+    model: &crate::providers::TurnModel,
+    cli: &mut crate::claude_cli::run::TurnCli,
+    messages: Vec<anthropic::AnthropicMessage>,
+    cap: u32,
+) -> Result<Vec<anthropic::ContentBlock>, String> {
+    let request = cli_request(messages, cap);
+    let (meter, extra) = (anthropic::stream::UsageMeter::default(), anthropic::stream::UsageMeter::default());
+    let mut relay = |_: &str| {};
+    crate::claude_cli::run::call(conversation_id, model, &request, &mut relay, &meter, &extra, cli).await.map(|turn| turn.content)
+}
+
+/// Review 1 L3, and the history going another way mid-turn: a run is
+/// reused only for the cap it was started with (the CLI takes it at
+/// launch) and a history that carries on from its last call; either
+/// change starts a new run, given the history as text.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_new_cap_or_another_history_starts_a_new_run(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let fake = FakeCli::new("relaunch", vec![
+        vec![json!({"read": true}), text_reply("one"), json!({"read": true}), text_reply("two")],
+        vec![json!({"read": true}), text_reply("three")],
+        vec![json!({"read": true}), text_reply("four")],
+    ]);
+    fake.pick_for(&pool, conversation.id).await;
+    let model = crate::providers::resolve_turn_model(&pool, conversation.id).await.expect("the model");
+    let mut cli = crate::claude_cli::run::TurnCli::default();
+    crate::claude_cli::run::SILENCE_FOR_TESTS.store(3_000, std::sync::atomic::Ordering::SeqCst);
+    let first = one_call(conversation.id, &model, &mut cli, vec![said("user", "hi")], 1_000).await;
+    let same = one_call(conversation.id, &model, &mut cli, vec![said("user", "hi"), said("assistant", "one"), said("user", "again")], 1_000).await;
+    let new_cap = one_call(conversation.id, &model, &mut cli, vec![said("user", "hi"), said("assistant", "one"), said("user", "again"), said("assistant", "two"), said("user", "more")], 900).await;
+    let other = one_call(conversation.id, &model, &mut cli, vec![said("user", "edited"), said("assistant", "x"), said("user", "and")], 900).await;
+    crate::claude_cli::run::SILENCE_FOR_TESTS.store(0, std::sync::atomic::Ordering::SeqCst);
+    let text = |r: Result<Vec<anthropic::ContentBlock>, String>| match r.expect("a reply").as_slice() {
+        [anthropic::ContentBlock::Text { text }] => text.clone(),
+        other => format!("{other:?}"),
+    };
+    assert_eq!([text(first), text(same), text(new_cap), text(other)], ["one", "two", "three", "four"]);
+    assert_eq!(fake.started(), 3, "the same run, then a new cap's, then another history's");
+    assert_eq!(user_texts(&fake, 0), ["hi", "again"], "the same run is sent only what's new");
+    assert!(user_texts(&fake, 1)[0].ends_with("### The new message\nmore"), "{:?}", user_texts(&fake, 1));
+    assert!(user_texts(&fake, 2)[0].contains("edited"), "{:?}", user_texts(&fake, 2));
+}
