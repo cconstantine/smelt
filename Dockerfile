@@ -179,7 +179,10 @@ RUN bash /build/smelt/scripts/browser-check/setup.sh \
 # Anthropic's release bucket and verified the way Claude Code's setup docs
 # ("Binary integrity and code signing") describe: the release manifest's
 # detached signature against Anthropic's release-signing key, pinned here by
-# its fingerprint, then the binary against the manifest's SHA-256. Not the
+# its fingerprint, then the binary against the manifest's SHA-256. The
+# signature is checked by gpgv against a keyring of the pinned key alone:
+# `gpg --verify` takes a good signature from any key the .asc carried, so a
+# second key in it could sign a manifest of its own (review 1 M1). Not the
 # docs' `install.sh | bash -s <version>` route: that runs the latest release
 # to install the pinned one under a home directory, behind a launcher meant
 # to update itself. Bump CLAUDE_CODE_VERSION to upgrade; the runtime stage
@@ -188,7 +191,7 @@ FROM debian:trixie-slim AS claude
 ARG CLAUDE_CODE_VERSION=2.1.318
 ARG CLAUDE_CODE_KEY_FINGERPRINT=31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl gnupg jq \
+    && apt-get install -y --no-install-recommends ca-certificates curl gnupg gpgv jq \
     && rm -rf /var/lib/apt/lists/*
 RUN set -eu; \
     case "$(uname -m)" in \
@@ -202,9 +205,11 @@ RUN set -eu; \
     curl -fsSL https://downloads.claude.ai/keys/claude-code.asc | gpg --batch --import; \
     gpg --batch --with-colons --fingerprint | grep -qx "fpr:::::::::${CLAUDE_CODE_KEY_FINGERPRINT}:" \
         || { echo "error: Claude Code's release key isn't $CLAUDE_CODE_KEY_FINGERPRINT"; exit 1; }; \
+    gpg --batch --export "$CLAUDE_CODE_KEY_FINGERPRINT" > pinned.gpg; \
     curl -fsSLO "$repo/$CLAUDE_CODE_VERSION/manifest.json"; \
     curl -fsSLO "$repo/$CLAUDE_CODE_VERSION/manifest.json.sig"; \
-    gpg --batch --verify manifest.json.sig manifest.json; \
+    gpgv --keyring "$work/pinned.gpg" manifest.json.sig manifest.json \
+        || { echo "error: the manifest isn't signed by $CLAUDE_CODE_KEY_FINGERPRINT"; exit 1; }; \
     test "$(jq -r .version manifest.json)" = "$CLAUDE_CODE_VERSION"; \
     checksum="$(jq -r --arg p "$platform" '.platforms[$p].checksum' manifest.json)"; \
     curl -fsSL -o claude "$repo/$CLAUDE_CODE_VERSION/$platform/claude"; \
