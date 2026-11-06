@@ -249,7 +249,7 @@ async fn play(dir: &Path) -> i32 {
         .collect();
     std::fs::write(dir.join(format!("env.{n}")), names.join("\n")).expect("log the env");
     let mcp = args.iter().position(|a| *a == "--mcp-config").and_then(|i| args.get(i + 1)).map(|config| {
-        let config: Value = serde_json::from_str(config).expect("the MCP config");
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(config).expect("the MCP config file")).expect("the MCP config");
         let server = &config["mcpServers"]["smelt"];
         let token = server["headers"]["Authorization"].as_str().unwrap_or_default().trim_start_matches("Bearer ").to_string();
         (server["url"].as_str().unwrap_or_default().to_string(), token)

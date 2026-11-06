@@ -117,6 +117,8 @@ struct Run {
     synced: Synced,
     rate: Option<RateLimit>,
     prompt_file: PathBuf,
+    /// The `--mcp-config` file, holding the bridge's token (review 1 M2).
+    config_file: Option<PathBuf>,
     /// False once the run can't be trusted with another call.
     healthy: bool,
     interrupts: u64,
@@ -190,12 +192,31 @@ impl Run {
         let prompt_file = prompts.join(format!("{conversation_id}-{}.md", super::bridge::random_hex(8)));
         std::fs::write(&prompt_file, request.system.as_deref().unwrap_or_default())
             .map_err(|e| format!("Couldn't write the system prompt for Claude Code: {e}"))?;
-        let run_bridge = bridge().await?.register(&request.tools);
+        let run_bridge = match bridge().await {
+            Ok(bridge) => bridge.register(&request.tools),
+            Err(e) => {
+                let _ = std::fs::remove_file(&prompt_file);
+                return Err(e);
+            }
+        };
+        let config_file = (!request.tools.is_empty()).then(|| prompt_file.with_extension("mcp.json"));
+        if let Some(config_file) = &config_file
+            && let Err(e) = super::process::write_private(config_file, run_bridge.mcp_config().to_string().as_bytes())
+        {
+            let _ = std::fs::remove_file(&prompt_file);
+            return Err(format!("Couldn't write Claude Code's MCP config: {e}"));
+        }
+        let remove_files = || {
+            let _ = std::fs::remove_file(&prompt_file);
+            if let Some(config_file) = &config_file {
+                let _ = std::fs::remove_file(config_file);
+            }
+        };
         let launch = Launch {
             model: &turn_model.model,
             effort: turn_model.effort,
             system_prompt_file: &prompt_file,
-            mcp_config: (!request.tools.is_empty()).then(|| run_bridge.mcp_config().to_string()),
+            mcp_config_file: config_file.as_deref(),
             session: SessionArg::Ephemeral,
         };
         let env = turn_env(env, request.max_tokens);
@@ -213,12 +234,12 @@ impl Run {
         let mut child = match spawned {
             Ok(child) => child,
             Err(e) => {
-                let _ = std::fs::remove_file(&prompt_file);
+                remove_files();
                 return Err(format!("Couldn't run Claude Code ({}): {e}", binary.display()));
             }
         };
         let (Some(stdin), Some(stdout), Some(stderr_pipe)) = (child.stdin.take(), child.stdout.take(), child.stderr.take()) else {
-            let _ = std::fs::remove_file(&prompt_file);
+            remove_files();
             return Err("Claude Code's pipes weren't made.".to_string());
         };
         let stderr = Arc::new(Mutex::new(String::new()));
@@ -237,6 +258,7 @@ impl Run {
             synced: synced(&[]),
             rate: None,
             prompt_file,
+            config_file,
             healthy: true,
             interrupts: 0,
         })
@@ -487,7 +509,7 @@ impl Run {
     /// close its input, wait, and kill what's left of its process group.
     fn end_in_background(mut self) {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            let _ = std::fs::remove_file(&self.prompt_file);
+            self.remove_files();
             return;
         };
         runtime.spawn(async move {
@@ -512,8 +534,15 @@ impl Run {
                 }
                 let _ = self.child.wait().await;
             }
-            let _ = std::fs::remove_file(&self.prompt_file);
+            self.remove_files();
         });
+    }
+
+    fn remove_files(&self) {
+        let _ = std::fs::remove_file(&self.prompt_file);
+        if let Some(config_file) = &self.config_file {
+            let _ = std::fs::remove_file(config_file);
+        }
     }
 }
 

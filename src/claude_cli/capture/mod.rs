@@ -117,11 +117,14 @@ async fn run(out: &Path, scenario: Scenario<'_>) -> Result<()> {
 
     let tools = if scenario.tools { vec![lookup_tool()] } else { Vec::new() };
     let mut run_bridge = bridge().await?.register(&tools);
+    let config_file = out.join("mcp.json");
+    let _ = std::fs::remove_file(&config_file);
+    super::process::write_private(&config_file, run_bridge.mcp_config().to_string().as_bytes()).map_err(|e| e.to_string())?;
     let launch = Launch {
         model: scenario.model,
         effort: None,
         system_prompt_file: &prompt_file,
-        mcp_config: scenario.tools.then(|| run_bridge.mcp_config().to_string()),
+        mcp_config_file: scenario.tools.then_some(config_file.as_path()),
         session: scenario.session,
     };
     let mut child = tokio::process::Command::new("claude")

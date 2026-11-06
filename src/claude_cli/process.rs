@@ -24,9 +24,11 @@ pub struct Launch<'a> {
     pub model: &'a str,
     pub effort: Option<crate::anthropic::Effort>,
     pub system_prompt_file: &'a Path,
-    /// The `--mcp-config` JSON (`bridge::RunBridge::mcp_config`), if the
-    /// run has tools.
-    pub mcp_config: Option<String>,
+    /// The file holding the `--mcp-config` JSON
+    /// (`bridge::RunBridge::mcp_config`), if the run has tools: a file,
+    /// never the JSON itself, since it holds the bridge's bearer token and
+    /// a command line is readable by every user on the host (review 1 M2).
+    pub mcp_config_file: Option<&'a Path>,
     pub session: SessionArg<'a>,
 }
 
@@ -58,8 +60,8 @@ pub fn cli_args(launch: &Launch<'_>) -> Vec<OsString> {
     .into_iter()
     .map(OsString::from)
     .collect();
-    if let Some(config) = &launch.mcp_config {
-        args.extend(["--mcp-config".into(), config.into()]);
+    if let Some(config) = launch.mcp_config_file {
+        args.extend(["--mcp-config".into(), config.as_os_str().to_owned()]);
         let allowed = format!("mcp__{}__*", super::bridge::SERVER_NAME);
         args.extend(["--allowedTools".into(), allowed.into()]);
     }
@@ -99,6 +101,15 @@ pub fn turn_env(mut base: Vec<(String, OsString)>, max_output_tokens: u32) -> Ve
     set("MAX_MCP_OUTPUT_TOKENS", MAX_MCP_OUTPUT_TOKENS.to_string());
     set("MCP_TOOL_TIMEOUT", MCP_TOOL_TIMEOUT_MS.to_string());
     base
+}
+
+/// Writes `body` to a new file at `path` that only smelt's user can read
+/// (mode 0600), refusing one that's already there.
+pub fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
+    file.write_all(body)
 }
 
 /// A new random session id: a version 4 UUID, which `--session-id` needs.

@@ -119,6 +119,12 @@ async fn test_a_tool_call_runs_in_smelt_and_its_result_answers_the_parked_call(p
     assert_eq!(answered, results, "each parked call got smelt's result, one at a time");
     assert!(matches!(&saved[3].1[..], [anthropic::ContentBlock::Text { text }] if text == "Nothing to do."));
     assert_eq!(fake.started(), 1, "one process for the turn");
+    // Review 1 M2: argv is readable by every user on the host; the
+    // bridge's token goes in a file only the server's user can read.
+    let args = fake.args(0);
+    assert!(!args.iter().any(|a| a.contains("Bearer") || a.contains("Authorization")), "no token on the command line: {args:?}");
+    let config = args.iter().position(|a| a == "--mcp-config").and_then(|i| args.get(i + 1)).expect("an --mcp-config");
+    assert!(config.ends_with(".json") && !config.contains('{'), "a file's path: {config}");
     assert_eq!(user_texts(&fake, 0).len(), 1, "the results went through the bridge, not stdin");
     assert_eq!(usage_rows(&pool, conversation.id).await.len(), 2, "one row per API call");
 }
