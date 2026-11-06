@@ -17,8 +17,19 @@ The server image carries a pinned Claude Code at `/opt/claude/bin/claude`, on `P
 ## Signing in on a server with no browser
 
 1. On your own machine, with Claude Code installed and your subscription, run `claude setup-token`. It opens the browser sign-in and prints a token that lasts about a year. It saves nothing.
-2. Set that token as `CLAUDE_CODE_OAUTH_TOKEN` in the smelt server's environment (a deployment's Secret, or the dev `.env`), and restart the server.
+2. Set that token as `CLAUDE_CODE_OAUTH_TOKEN` in the smelt server's environment (the dev `.env`, or a deployment's Secret: see Hosted, below), and restart the server.
 3. Open the provider's page under **Model providers**. The line under **Models** says the CLI's version and "signed in with CLAUDE_CODE_OAUTH_TOKEN", with the plan when the CLI reports one. It reads `claude --version` and `claude auth status` each time the page loads, and never shows the token.
+
+### Hosted (the Terraform module)
+
+On a deployment made with [`terraform/smelt`](../../terraform/smelt/README.md), the token never goes in git or in the pod spec in plain text:
+
+1. Store it on smelt's **Secrets** page (`/secrets`) as `claude_oauth_token`.
+2. The [deployer](../personas/deployer.md) seat's persona names that secret in its `credentials:`, so its pod holds it at `/etc/smelt/secrets/claude_oauth_token`. Before plan and apply the seat exports it as `TF_VAR_claude_code_oauth_token`, never printing it.
+3. The deployment's root (homelab's `smelt.tf`) declares `variable "claude_code_oauth_token" { type = string, sensitive = true }`, with no default, and passes it to the module as `secret_env = { CLAUDE_CODE_OAUTH_TOKEN = var.claude_code_oauth_token }`.
+4. The module keeps it in the `smelt-secret-env` secret, and the server container reads `CLAUDE_CODE_OAUTH_TOKEN` from it through a `secretKeyRef`. The plan shows it as `(sensitive value)`.
+
+A new token (a year on, or after a revoke) is a new value for `claude_oauth_token` and a deploy: the module's checksum annotation rolls the server pod, and the provider's page signs in with the new one.
 
 ## How a turn runs
 
