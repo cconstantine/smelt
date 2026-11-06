@@ -145,7 +145,13 @@ pub enum RunCommandError {
 /// a healthy pod runs (which routed on to `terminate_pod`). An unknown
 /// terminal id still answers `NoTerminal`, unchanged; a live terminal of a
 /// live pod passes. The conversation resolves through the terminal's own
-/// pod row, so `send_signal` needs no new parameter.
+/// pod row, so `send_signal` needs no new parameter — and this carries no
+/// conversation check of its own (Q3): callers must have checked the
+/// terminal is the calling conversation's, as both do — `owned_terminal`
+/// (`src/anthropic/tools/pods.rs:454`) before `run_command`, and
+/// `send_signal`'s caller routes by the owned command's own terminal.
+/// A future caller skipping that would print a foreign conversation's
+/// live-pod id into this refusal.
 async fn refuse_stale_terminal(pool: &PgPool, terminal_id: i64) -> Result<(), TerminalError> {
     let Some((pod_id, terminal_closed, pod_ended)) = db::terminal_pod_state(pool, terminal_id).await? else {
         return Err(TerminalError::NoTerminal);

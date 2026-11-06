@@ -475,8 +475,11 @@ pub(super) async fn clean_up_and_terminate_pod(pool: &PgPool, pod_id: i64, reaso
 /// terminal (the pod ending between the up-front staleness check and the
 /// dial, say) meets a conversation that has one, and that advice routes
 /// there on to `terminate_pod` — killing a healthy pod. One indexed read
-/// on this error path decides; cleanup has already ended `pod_id`'s row,
-/// so a live pod found here is always another.
+/// on this error path decides. Cleanup normally ends `pod_id`'s row
+/// before this reads, so a live pod found here is another;
+/// `force_terminate_pod` is best-effort, and the `!=` guard covers the
+/// termination that didn't — `pod_id` answering live itself keeps
+/// `AgentUnreachable`, its advice still true while it runs.
 async fn stale_pod_or_unreachable(pool: &PgPool, pod_id: i64) -> TerminalError {
     // F1 (review 1): a failed read still answers AgentUnreachable — the
     // safer fallback while the database itself is failing — but it says
