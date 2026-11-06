@@ -129,9 +129,10 @@ pub(crate) const EXEC_STALL_AFTER: std::time::Duration = std::time::Duration::fr
 /// its own clock and the pod checks it by its node's. One cluster, its
 /// nodes NTP-synced (and in the dev stack and CI, containers on one host's
 /// clock), so they agree to well under a second; 5 s also covers a node
-/// whose sync has drifted, and a command descheduled for a few seconds
-/// between its deadline check and its `mv` or `rm`. It's paid only after
-/// an attempt was abandoned.
+/// whose sync has drifted; the pod's `timeout`, set to the deadline, kills
+/// a command within 1 s of it, which the margin covers too. It's paid only
+/// after an attempt was abandoned. A node clock more than this behind the
+/// server's is a known limit (SME-440 review R2-L1), left to NTP.
 pub(crate) const CLOCK_SKEW_MARGIN: Duration = Duration::from_secs(5);
 
 /// Try `n`'s limit (from 0), given what remains of the install's bound:
@@ -147,12 +148,34 @@ pub(crate) fn try_limit(n: u32, remaining: Duration) -> Duration {
     .min(remaining)
 }
 
+/// `command` with its attempt's deadline in `SMELT_INSTALL_DEADLINE` (Unix
+/// seconds), under the pod's `timeout` set to the time left until that
+/// deadline by the pod's clock (SME-440 review R2-M2). A limit relative to
+/// the command's start let an attempt that started late but before the
+/// deadline run, and act, up to a whole try's limit past it; now it is
+/// killed by the deadline plus `timeout`'s 1 s kill grace, wherever it
+/// started, and one past its deadline never starts. GNU `timeout` signals
+/// the whole process group, so a running `mv` or `rm` goes too. The checks
+/// right before each `mv` and `rm` stay as a second guard.
+pub(crate) fn bounded_command(deadline_epoch: u64, command: &[&str]) -> Vec<String> {
+    let mut bounded = vec![
+        "env".to_string(),
+        format!("SMELT_INSTALL_DEADLINE={deadline_epoch}"),
+        "sh".to_string(),
+        "-c".to_string(),
+        r#"r=$((SMELT_INSTALL_DEADLINE - $(date +%s))); [ "$r" -gt 0 ] || { echo "past the install's deadline" >&2; exit 75; }; exec timeout -k 1 "$r" "$@""#.to_string(),
+        "sh".to_string(),
+    ];
+    bounded.extend(command.iter().map(|c| c.to_string()));
+    bounded
+}
+
 /// One install's execs (SME-440 review H1). Dropping an exec's stream
 /// doesn't stop its command in the pod, which can even start after the
 /// install has moved on. So every attempt carries an absolute deadline,
 /// `SMELT_INSTALL_DEADLINE` (Unix seconds), which the write and prune
 /// scripts check right before each effect, and runs under the pod's own
-/// `timeout`. An attempt unanswered at its deadline is abandoned and run
+/// `timeout` set to that deadline (`bounded_command`). An attempt unanswered at its deadline is abandoned and run
 /// again, and `settle` holds the install until every abandoned attempt's
 /// deadline, plus `CLOCK_SKEW_MARGIN`, has passed. The invariant: once an
 /// install returns, and its lock is released, nothing it started can
@@ -190,10 +213,8 @@ impl Attempts {
             // Rounded down, so the pod stops acting no later than this
             // attempt is abandoned.
             let epoch = deadline.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-            let deadline_var = format!("SMELT_INSTALL_DEADLINE={epoch}");
-            let seconds = limit.as_secs().to_string();
-            let mut bounded = vec!["env", deadline_var.as_str(), "timeout", "-k", "1", seconds.as_str()];
-            bounded.extend_from_slice(command);
+            let bounded = bounded_command(epoch, command);
+            let bounded: Vec<&str> = bounded.iter().map(String::as_str).collect();
             match tokio::time::timeout(limit, shell.run(&bounded, stdin)).await {
                 Ok(ran) => {
                     // Only an exit status says the command is done. A broken

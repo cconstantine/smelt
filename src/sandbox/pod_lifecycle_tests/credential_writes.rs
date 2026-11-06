@@ -237,3 +237,25 @@ async fn test_a_write_whose_stream_broke_cant_undo_a_delete(pool: PgPool) {
     })
     .await;
 }
+
+/// SME-440 review R2-M2: an attempt that starts before its deadline but
+/// whose effect would land after it is killed, and the effect never
+/// lands. Here the attempt starts 3 s before its deadline, as a late start
+/// does (a relative limit gave it a whole try's 10 s); its command's effect
+/// comes at 5 s.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_attempt_cant_act_past_its_deadline_however_late_it_started(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let pod = create_pod(&pool, conversation.id, PodLimitOverrides::default()).await.expect("create_pod");
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let command = crate::credentials::bounded_command(now + 3, &["sh", "-c", "sleep 5; touch /tmp/sme440-r2m2"]);
+        let command: Vec<&str> = command.iter().map(String::as_str).collect();
+        let ran = exec_with(&client, &pod_name(pod), "sandbox", &command, None).await.expect("exec");
+        assert_ne!(ran.exit_code, 0, "the command was stopped at its deadline");
+        let (code, _) = sh(&client, pod, "test -e /tmp/sme440-r2m2").await;
+        assert_eq!(code, 1, "the effect landed after the attempt's deadline");
+    })
+    .await;
+}
