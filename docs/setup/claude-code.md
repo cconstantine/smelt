@@ -27,7 +27,7 @@ smelt starts the CLI with a cleared environment and passes only these: `PATH`, `
 | Variable | Default | Notes |
 |---|---|---|
 | `CLAUDE_CODE_OAUTH_TOKEN` | unset | The subscription token from `claude setup-token`. Passed to the CLI only. Unset, the provider's page says "not signed in". |
-| `SMELT_CLAUDE_CONFIG_DIR` | `/tmp/smelt-claude` | The CLI's `CLAUDE_CONFIG_DIR`: its settings and, once turns run, its sessions. Ephemeral by default. Mount a volume here to keep them across restarts. |
+| `SMELT_CLAUDE_CONFIG_DIR` | `$HOME/.local/state/smelt-claude` | The CLI's `CLAUDE_CONFIG_DIR`: its settings and, once turns run, its sessions. smelt makes it mode 0700 and refuses one someone else owns, since the CLI runs settings it finds there. It is never under a shared `/tmp`, where another user could make it first. In the server image it is lost on restart. Mount a volume here to keep it. |
 
 ## Models
 

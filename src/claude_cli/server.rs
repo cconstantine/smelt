@@ -9,12 +9,14 @@ use std::time::Duration;
 use super::*;
 
 /// The server's variable naming the CLI's config directory
-/// (`CLAUDE_CONFIG_DIR`): its sessions and settings. Ephemeral by default;
-/// a deployment can mount a volume there (docs/setup/claude-code.md).
+/// (`CLAUDE_CONFIG_DIR`): its sessions and settings. A deployment can
+/// mount a volume there (docs/setup/claude-code.md).
 pub const CONFIG_DIR_VAR: &str = "SMELT_CLAUDE_CONFIG_DIR";
 
-/// `CONFIG_DIR_VAR`'s default.
-pub const DEFAULT_CONFIG_DIR: &str = "/tmp/smelt-claude";
+/// `CONFIG_DIR_VAR`'s default, under smelt's `$HOME`: never a shared
+/// `/tmp`, where another user could make the directory first and plant
+/// settings the CLI would run as smelt's user (review 1 L5).
+pub const DEFAULT_CONFIG_SUBDIR: &str = ".local/state/smelt-claude";
 
 /// The bound on each status command: the same as a provider's model
 /// listing, the other "is this there" question the provider page asks.
@@ -29,17 +31,20 @@ const PASSED_THROUGH: [&str; 3] = ["PATH", "HOME", "CLAUDE_CODE_OAUTH_TOKEN"];
 
 /// The environment the CLI runs with, read through `lookup` (smelt's own
 /// is `std::env::var_os`): `PASSED_THROUGH` where set, `CLAUDE_CONFIG_DIR`
-/// from `CONFIG_DIR_VAR`, and the autoupdater off, since the image pins
-/// the version. A process started with it starts from `env_clear()`.
+/// from `CONFIG_DIR_VAR`, else `DEFAULT_CONFIG_SUBDIR` under `HOME` (with
+/// neither, none: `status_with` then says so), and the autoupdater off,
+/// since the image pins the version. A process started with it starts
+/// from `env_clear()`.
 pub fn cli_env(lookup: impl Fn(&str) -> Option<OsString>) -> Vec<(String, OsString)> {
     let mut env: Vec<(String, OsString)> = PASSED_THROUGH
         .iter()
         .filter_map(|name| Some((name.to_string(), lookup(name)?)))
         .collect();
-    let config_dir = lookup(CONFIG_DIR_VAR)
-        .filter(|dir| !dir.is_empty())
-        .unwrap_or_else(|| DEFAULT_CONFIG_DIR.into());
-    env.push(("CLAUDE_CONFIG_DIR".to_string(), config_dir));
+    let set = |name: &str| lookup(name).filter(|value| !value.is_empty());
+    let config_dir = set(CONFIG_DIR_VAR).or_else(|| set("HOME").map(|home| PathBuf::from(home).join(DEFAULT_CONFIG_SUBDIR).into_os_string()));
+    if let Some(config_dir) = config_dir {
+        env.push(("CLAUDE_CONFIG_DIR".to_string(), config_dir));
+    }
     env.push(("DISABLE_AUTOUPDATER".to_string(), "1".into()));
     env
 }
@@ -134,12 +139,13 @@ pub async fn status_with(binary: &str, env: Vec<(String, OsString)>, timeout: Du
         Ok(resolved) => resolved,
         Err(e) => return failed(e),
     };
-    let config_dir = env.iter().find(|(name, _)| name == "CLAUDE_CONFIG_DIR").map(|(_, value)| PathBuf::from(value));
-    if let Some(dir) = &config_dir
-        && let Err(e) = std::fs::create_dir_all(dir)
-    {
-        return failed(format!("Couldn't make the CLI's config directory {}: {e}", dir.display()));
+    let Some(config_dir) = env.iter().find(|(name, _)| name == "CLAUDE_CONFIG_DIR").map(|(_, value)| PathBuf::from(value)) else {
+        return failed(format!("The CLI has no config directory: set {CONFIG_DIR_VAR}, or HOME, in the server's environment."));
+    };
+    if let Err(e) = private_dir(&config_dir) {
+        return failed(format!("Couldn't make the CLI's config directory {} private: {e}", config_dir.display()));
     }
+    let config_dir = Some(config_dir);
     let version = match run(&resolved, &["--version"], &env, config_dir.as_deref(), timeout).await {
         Ok((true, stdout)) => version_line(&stdout),
         Ok((false, _)) => return failed(format!("{binary} --version failed.")),
@@ -158,6 +164,15 @@ pub async fn status_with(binary: &str, env: Vec<(String, OsString)>, timeout: Du
         Err(e) => status.error = Some(format!("{binary} auth status {e}")),
     }
     status
+}
+
+/// Makes `dir`, and any missing parent, mode 0700, and makes an existing
+/// `dir` 0700 too: only its owner can, so a directory someone else made
+/// is refused rather than used (review 1 L5).
+fn private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
 /// Runs `binary args` from a cleared environment plus `env`, bounded by

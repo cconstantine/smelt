@@ -89,12 +89,41 @@ fn test_the_cli_env_passes_only_the_allowlist() {
 
 #[test]
 fn test_the_cli_config_dir_defaults_and_unset_vars_stay_unset() {
-    let env = cli_env(|name| (name == "PATH").then(|| OsString::from("/usr/bin")));
+    // Review 1 L5: under smelt's own home, never a shared /tmp.
+    let env = cli_env(|name| match name {
+        "PATH" => Some(OsString::from("/usr/bin")),
+        "HOME" => Some(OsString::from("/home/smelt")),
+        _ => None,
+    });
     let set = names(&env);
     assert!(!set.contains("CLAUDE_CODE_OAUTH_TOKEN"), "unset in smelt, unset for the CLI");
-    assert!(!set.contains("HOME"));
     let config = env.iter().find(|(n, _)| n == "CLAUDE_CONFIG_DIR").map(|(_, v)| v.clone());
-    assert_eq!(config, Some(OsString::from(DEFAULT_CONFIG_DIR)));
+    assert_eq!(config, Some(OsString::from("/home/smelt/.local/state/smelt-claude")));
+    // With no home and no SMELT_CLAUDE_CONFIG_DIR there's no default.
+    let homeless = cli_env(|name| (name == "PATH").then(|| OsString::from("/usr/bin")));
+    assert!(!names(&homeless).contains("HOME") && !names(&homeless).contains("CLAUDE_CONFIG_DIR"));
+}
+
+/// Review 1 L5: the config directory is smelt's alone: made mode 0700, and
+/// an existing one is made 0700 too (which only its owner can do).
+#[tokio::test]
+async fn test_the_cli_config_dir_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("private");
+    let claude = answering(&dir, r#"{"loggedIn":true}"#, 0);
+    let binary = claude.to_str().expect("utf-8 path");
+    let fresh = dir.join("state/smelt-claude");
+    status_with(binary, cli_env(smelt_env(Some(&fresh))), Duration::from_secs(10)).await;
+    let mode = |path: &Path| std::fs::metadata(path).expect("the dir").permissions().mode() & 0o777;
+    assert_eq!(mode(&fresh), 0o700, "made private");
+    let open = dir.join("open");
+    std::fs::create_dir(&open).expect("make it");
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).expect("open it up");
+    let status = status_with(binary, cli_env(smelt_env(Some(&open))), Duration::from_secs(10)).await;
+    assert_eq!(mode(&open), 0o700, "made private: {status:?}");
+    let homeless = cli_env(|name| (name == "PATH").then(|| std::env::var_os("PATH")).flatten());
+    let status = status_with(binary, homeless, Duration::from_secs(10)).await;
+    assert!(status.error.as_deref().is_some_and(|e| e.contains("SMELT_CLAUDE_CONFIG_DIR")), "{status:?}");
 }
 
 #[tokio::test]
