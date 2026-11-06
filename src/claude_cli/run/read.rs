@@ -10,12 +10,8 @@ impl Run {
     /// The next line from the CLI, the bridge's calls taken as they come.
     pub(super) async fn next_event(&mut self) -> Result<Value, String> {
         loop {
-            let launch_deadline = self.launching.as_ref().map(|(_, at)| *at);
             tokio::select! {
                 Some(parked) = self.bridge.calls.recv() => self.take_call(parked),
-                () = tokio::time::sleep_until(launch_deadline.unwrap_or_else(tokio::time::Instant::now)), if launch_deadline.is_some() => {
-                    self.launching = None;
-                }
                 line = tokio::time::timeout(silence(), self.lines.next_line()) => {
                     let line = match line {
                         Err(_) => {
@@ -50,7 +46,7 @@ impl Run {
                     if let Ok(value @ Value::Object(_)) = serde_json::from_str::<Value>(&line) {
                         self.heard = true;
                         // Started: done with the start lock (L11).
-                        self.launching = None;
+                        self.launching.release();
                         return Ok(value);
                     }
                 }

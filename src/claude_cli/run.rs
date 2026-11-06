@@ -67,6 +67,66 @@ static LAUNCH: std::sync::LazyLock<Arc<tokio::sync::Mutex<()>>> = std::sync::Laz
 /// The longest a start holds `LAUNCH`, for a CLI that says nothing.
 pub const LAUNCH_HOLD: Duration = Duration::from_secs(10);
 
+/// The longest a write to the CLI's input may take.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn launch_hold() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = LAUNCH_HOLD_FOR_TESTS.load(std::sync::atomic::Ordering::SeqCst);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    LAUNCH_HOLD
+}
+
+fn write_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = WRITE_TIMEOUT_FOR_TESTS.load(std::sync::atomic::Ordering::SeqCst);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    WRITE_TIMEOUT
+}
+
+/// A start's hold on `LAUNCH`, let go at its first line (`release`) or,
+/// from a timer of its own, at `launch_hold()`, whatever the run is doing
+/// meanwhile (PR #285 review 1 L18).
+struct Launching(Arc<Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>>);
+
+impl Launching {
+    fn hold(guard: tokio::sync::OwnedMutexGuard<()>) -> Self {
+        let held = Arc::new(Mutex::new(Some(guard)));
+        let timer = Arc::downgrade(&held);
+        tokio::spawn(async move {
+            tokio::time::sleep(launch_hold()).await;
+            if let Some(held) = timer.upgrade() {
+                release(&held);
+            }
+        });
+        Self(held)
+    }
+
+    fn release(&self) {
+        release(&self.0);
+    }
+}
+
+fn release(held: &Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>) {
+    // A guard taken out whole: nothing is left half-done.
+    if let Ok(mut held) = held.lock() {
+        held.take();
+    }
+}
+
+#[cfg(test)]
+pub static LAUNCH_HOLD_FOR_TESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+pub static WRITE_TIMEOUT_FOR_TESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// What a reply's call gets when the turn's next request has no result
 /// for it.
 pub const NOT_RUN: &str = "smelt didn't run this tool call.";
@@ -163,7 +223,7 @@ struct Run {
     /// next API call starts.
     delivered: bool,
     /// The start lock, until its first line or the deadline (L11).
-    launching: Option<(tokio::sync::OwnedMutexGuard<()>, tokio::time::Instant)>,
+    launching: Launching,
     /// The CLI session it's in.
     session_id: String,
     /// Whether it resumed a session from an earlier turn.
@@ -499,7 +559,7 @@ impl Run {
             session_id: String::new(),
             resumed: false,
             reply_started: false,
-            launching: Some((launching, tokio::time::Instant::now() + LAUNCH_HOLD)),
+            launching: Launching::hold(launching),
             streaming_ids: std::collections::HashSet::new(),
             answered: std::collections::HashSet::new(),
             delivered: false,
@@ -510,9 +570,15 @@ impl Run {
         let stdin = self.stdin.as_mut().ok_or("Claude Code's input is closed.")?;
         let mut bytes = line.to_string().into_bytes();
         bytes.push(b'\n');
-        let written = match stdin.write_all(&bytes).await {
-            Ok(()) => stdin.flush().await,
-            Err(e) => Err(e),
+        // Bounded: a CLI that never reads its input fails only its own call
+        // (PR #285 review 1 L18).
+        let writing = async {
+            stdin.write_all(&bytes).await?;
+            stdin.flush().await
+        };
+        let Ok(written) = tokio::time::timeout(write_timeout(), writing).await else {
+            self.healthy = false;
+            return Err(format!("Claude Code didn't take its input within {} seconds, so smelt stopped it.", write_timeout().as_secs()));
         };
         written.map_err(|e| {
             if e.kind() == std::io::ErrorKind::BrokenPipe {

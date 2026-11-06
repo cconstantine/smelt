@@ -141,3 +141,35 @@ async fn test_a_resume_waits_for_the_last_process_to_end(pool: PgPool) {
     fake.until("the first process ends", |f| f.dir.join("exited.0").exists()).await;
     assert!(fake.time_of("started.1") >= fake.time_of("exited.0"), "the resume started after the last process ended");
 }
+
+/// Review 3 L18: a CLI that never reads its input holds no one else's
+/// start: the start lock goes at its deadline from a timer, and the write
+/// of its first message times out, failing only its own turn.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_cli_that_wont_read_blocks_only_its_own_turn(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let (a, b) = (db::create_conversation(&pool).await.expect("a"), db::create_conversation(&pool).await.expect("b"));
+    let deaf = FakeCli::new("deaf", vec![vec![json!({"hang": true})]]);
+    let next = FakeCli::new("after-deaf", vec![vec![json!({"read": true}), text_reply("B")]]);
+    deaf.pick_for(&pool, a.id).await;
+    next.pick_for(&pool, b.id).await;
+    use std::sync::atomic::Ordering::SeqCst;
+    crate::claude_cli::run::LAUNCH_HOLD_FOR_TESTS.store(500, SeqCst);
+    crate::claude_cli::run::WRITE_TIMEOUT_FOR_TESTS.store(3_000, SeqCst);
+    let big = anthropic::AnthropicMessage { role: "user".to_string(), content: vec![anthropic::ContentBlock::Text { text: "x".repeat(400_000) }] };
+
+    let stuck = tokio::spawn({
+        let pool = pool.clone();
+        async move { run_turn(&pool, a.id, big).await }
+    });
+    deaf.until("the deaf process starts", |f| f.started() == 1).await;
+    let other = tokio::time::timeout(std::time::Duration::from_secs(2), run_turn(&pool, b.id, hello())).await;
+    let stuck = tokio::time::timeout(std::time::Duration::from_secs(10), stuck).await;
+    crate::claude_cli::run::LAUNCH_HOLD_FOR_TESTS.store(0, SeqCst);
+    crate::claude_cli::run::WRITE_TIMEOUT_FOR_TESTS.store(0, SeqCst);
+
+    other.expect("b's turn isn't held behind a's start").expect("b's turn runs");
+    let error = stuck.expect("a's turn ends").expect("join").expect_err("a's write times out").to_string();
+    assert!(error.contains("didn't take its input"), "{error}");
+}
