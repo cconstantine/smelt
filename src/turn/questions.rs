@@ -1,10 +1,11 @@
 //! The turn's side of the model's `ask_user` (SME-34). The model's call
 //! records a `pending_questions` row and ends the turn; while it waits,
-//! turns save their notices and don't call the model; the card's answer is
-//! written onto the row, and the next turn to hold the conversation's turn
-//! lock takes it and sends it as the call's result, at the front of that
-//! turn's message. A message the user writes instead takes the question
-//! too, with `questions::NOT_ANSWERED` as the result.
+//! turns consume nothing — their notices and answers stay queued and the
+//! turn that resolves the question tells them (SME-409); the card's answer
+//! is written onto the row, and the next turn to hold the conversation's
+//! turn lock takes it and sends it as the call's result, at the front of
+//! that turn's message. A message the user writes instead takes the
+//! question too, with `questions::NOT_ANSWERED` as the result.
 
 use super::*;
 use crate::questions::{PendingQuestion, Question, QuestionAnswer};
@@ -63,12 +64,14 @@ fn question_result(question: &db::StoredQuestion) -> anthropic::ContentBlock {
     }
 }
 
-/// Run by a turn right before it calls the model, holding the turn lock:
-/// takes an answered question (saving the call's result as a message of
-/// its own, which `move_late_results` puts after the call), and says
-/// whether a question still waits, in which case the turn stops there.
-/// Repeats until no row is left or one is waiting, since an answer can be
-/// recorded between the take and the check.
+/// Run by a turn before it drains or calls the model, holding the turn
+/// lock: takes an answered question (saving the call's result as a message
+/// of its own, which `move_late_results` puts after the call), and says
+/// whether a question still waits, in which case the turn stops there
+/// having consumed nothing — the queues stay visible to every re-wake rule
+/// and the resolving turn tells them (SME-409). Repeats until no row is
+/// left or one is waiting, since an answer can be recorded between the
+/// take and the check.
 pub(super) async fn take_answer_or_wait(
     pool: &PgPool,
     conversation_id: i64,

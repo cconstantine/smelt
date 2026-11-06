@@ -9,8 +9,15 @@ use crate::git::GitIdentity;
 use crate::{db, sandbox};
 use sqlx::PgPool;
 
+mod pod_writes;
 #[cfg(test)]
 mod tests;
+
+pub use self::pod_writes::install_pod_files;
+#[cfg(test)]
+pub(crate) use self::pod_writes::WRITE_FILE_SCRIPT;
+#[cfg(test)]
+pub(crate) use self::pod_writes::{bounded_command, try_limit, CLOCK_SKEW_MARGIN, EXEC_STALL_AFTER};
 
 /// The built-in credential every persona may list in
 /// `smelt.credentials`: the user's git SSH key (SME-242). No stored
@@ -246,84 +253,6 @@ async fn files_for_granted(pool: &PgPool, granted: &PodCredentials) -> Result<Ve
     Ok(files)
 }
 
-/// Writes `files` into the pod's sandbox container, then prunes each of
-/// `prune_dirs` to the names kept in `files`, so a file deleted since the
-/// last install goes too.
-pub async fn install_pod_files(
-    shell: &sandbox::PodShell,
-    files: &[PodFile],
-    prune_dirs: &[&str],
-) -> Result<(), sandbox::SandboxError> {
-    use sandbox::SandboxError;
-    for dir in prune_dirs {
-        let made = shell
-            .run(&["sh", "-c", r#"mkdir -p -m 700 "$1""#, "sh", dir], None)
-            .await?;
-        if made.exit_code != 0 {
-            return Err(SandboxError::GitSetup(format!(
-                "couldn't make {dir}: {}",
-                made.stderr.trim()
-            )));
-        }
-    }
-    // Never emptied: a clone or push running during a reinstall must
-    // still find its key. Files are written over in place, and only the
-    // ones no longer in `files` removed afterwards.
-    for file in files {
-        // Written beside the target and renamed over it, so ssh or git
-        // never reads half a file; umask keeps a key private from its
-        // first byte.
-        let mode = format!("{:o}", file.mode);
-        let written = shell
-            .run(
-                &[
-                    "sh",
-                    "-c",
-                    r#"umask 077 && cat > "$1.new" && chmod "$2" "$1.new" && mv "$1.new" "$1""#,
-                    "sh",
-                    &file.path,
-                    &mode,
-                ],
-                Some(file.content.as_bytes()),
-            )
-            .await?;
-        if written.exit_code != 0 {
-            return Err(SandboxError::GitSetup(format!(
-                "couldn't write {}: {}",
-                file.path,
-                written.stderr.trim()
-            )));
-        }
-    }
-    for dir in prune_dirs {
-        let kept_prefix = format!("{dir}/");
-        let keep: Vec<&str> = files
-            .iter()
-            .filter_map(|f| f.path.strip_prefix(&kept_prefix))
-            .collect();
-        let mut prune = vec![
-            "sh",
-            "-c",
-            r#"cd "$1" && shift && for f in * .[!.]*; do
-               [ -e "$f" ] || continue
-               keep=; for k in "$@"; do [ "$f" = "$k" ] && keep=1; done
-               [ -n "$keep" ] || rm -f -- "$f"
-           done"#,
-            "sh",
-            dir,
-        ];
-        prune.extend(keep);
-        let pruned = shell.run(&prune, None).await?;
-        if pruned.exit_code != 0 {
-            return Err(SandboxError::GitSetup(format!(
-                "couldn't remove deleted files from {dir}: {}",
-                pruned.stderr.trim()
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// Runs `install` (read the keys, then write them into `conversation`'s
 /// pod) with no other install into that conversation's pod in between, so
 /// an install that read the keys before a change can't write them over one
@@ -377,14 +306,12 @@ where
 /// across its reads and this write, so no install interleaves between
 /// a decision and its files.
 async fn write_pod_files(pool: &PgPool, pod_id: i64, files: &[PodFile]) -> Result<(), String> {
-    // Bounded: every install into this conversation's pod waits on its
-    // lock, so a stalled exec mustn't hold it.
     let shell = sandbox::PodShell::for_pod(pool, pod_id).await.map_err(|e| e.to_string())?;
     let keys_dir = format!("{POD_GIT_DIR}/keys");
-    tokio::time::timeout(INSTALL_TIMEOUT, install_pod_files(&shell, files, &[keys_dir.as_str(), POD_SECRETS_DIR]))
-        .await
-        .map_err(|_| format!("writing credential files into the pod took over {}s", INSTALL_TIMEOUT.as_secs()))?
-        .map_err(|e| e.to_string())
+    // `install_pod_files` holds itself to `INSTALL_TIMEOUT`, and returns
+    // only once nothing it started can still act in the pod: a timeout
+    // around it would drop that wait and release the lock too soon.
+    install_pod_files(&shell, files, &[keys_dir.as_str(), POD_SECRETS_DIR]).await.map_err(|e| e.to_string())
 }
 
 /// Writes a starting child's decision into its live pod before its
@@ -416,7 +343,11 @@ pub async fn reconcile_pod(pool: &PgPool, child: i64, snapshot: Option<&db::Pers
     .await
 }
 
-/// How long writing the credential files into one pod may take.
+/// How long an install's tries at writing the credential files into one pod
+/// may take. Not the whole bound a caller sees (SME-440 review R2-L2): after
+/// an abandoned or errored attempt the install also waits out that
+/// attempt's deadline plus `pod_writes::CLOCK_SKEW_MARGIN`, so it can return
+/// up to about 65 s after it started, plus the wait for its lock.
 const INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A new pod's files: nothing to write when this conversation gets no
@@ -482,9 +413,10 @@ pub async fn install_into_live_pods(pool: &PgPool) -> Option<Vec<i64>> {
 /// tier's report. The installs own the task they run in, so neither the
 /// deadline nor a dropped request calls one off: each ends on its own
 /// `INSTALL_TIMEOUT`, and reads its files under its conversation's lock, so
-/// no install in this process can write over a newer change's files. A
-/// command already running in the pod when `INSTALL_TIMEOUT` drops its future
-/// isn't killed, though, so it can still land after that.
+/// no install in this process can write over a newer change's files. An
+/// install also returns only once no exec it started can still change the
+/// pod (SME-440, `pod_writes`' `Attempts`): its abandoned attempts refuse to
+/// act past their deadlines, and it holds the lock until those have passed.
 async fn installs_answered_within<F, Fut>(answer_within: std::time::Duration, pods: Vec<i64>, install: F) -> Vec<i64>
 where
     F: Fn(i64) -> Fut + Send + Sync + 'static,

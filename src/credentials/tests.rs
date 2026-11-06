@@ -410,3 +410,18 @@ async fn test_pod_files_hand_a_multi_line_secret_byte_equal(pool: PgPool) {
     assert_eq!((tailless.mode, tailless.content.as_str()), (0o600, unended), "ends exactly where it was stored: no byte added, none dropped");
 }
 
+
+/// SME-440 review M2: each try of an exec gets longer, 10 s, then 20 s,
+/// then what is left of the install's own bound, so an exec slower than
+/// the first try's limit still finishes rather than being re-issued until
+/// the install fails; and the first two leave the third room.
+#[test]
+fn test_an_execs_tries_grow_and_end_at_the_installs_bound() {
+    let s = std::time::Duration::from_secs;
+    assert_eq!(try_limit(0, INSTALL_TIMEOUT), s(10));
+    assert_eq!(try_limit(1, INSTALL_TIMEOUT - s(10)), s(20));
+    assert_eq!(try_limit(2, INSTALL_TIMEOUT - s(30)), INSTALL_TIMEOUT - s(30), "the third try takes what's left");
+    assert_eq!(try_limit(5, s(7)), s(7));
+    assert_eq!(try_limit(0, s(4)), s(4), "never past the install's bound");
+    assert!(s(10) + s(20) < INSTALL_TIMEOUT, "the first two tries leave the third room");
+}
