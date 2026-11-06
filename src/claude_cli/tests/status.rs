@@ -10,7 +10,7 @@ use std::time::Duration;
 use super::*;
 
 /// A directory of the test's own under the system temp dir, emptied first.
-fn scratch(name: &str) -> PathBuf {
+pub(super) fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("smelt-claude-cli-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("make the scratch dir");
@@ -24,7 +24,7 @@ fn scratch(name: &str) -> PathBuf {
 /// forks meanwhile, until that child execs, and running the fake during
 /// that window fails with ETXTBSY ("Text file busy"), which a stress run of
 /// these tests hit about once in five runs (review 1).
-fn fake_claude(dir: &Path, body: &str) -> PathBuf {
+pub(super) fn fake_claude(dir: &Path, body: &str) -> PathBuf {
     use std::io::Write;
     let path = dir.join("claude");
     let mut writer = std::process::Command::new("/bin/sh")

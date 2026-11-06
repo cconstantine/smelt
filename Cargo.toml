@@ -106,8 +106,8 @@ chromiumoxide = { version = "0.7", optional = true }
 # "-no-provider" variant keeps reqwest 0.13 from bringing aws-lc-rs as a
 # second crypto backend (SME-60): it uses the process-wide ring provider,
 # which `mcp::install_crypto_provider` makes sure is installed.
-# rmcp's server side (the #[cfg(test)] mock MCP server) is a
-# dev-dependency, below.
+# rmcp's server side is in the main dependency too since SME-430 (the
+# Claude Code bridge); the dev-dependency below predates it.
 # For src/mcp/'s header-map construction (HeaderName/HeaderValue) — same
 # version axum/rmcp already pull in transitively, needed here directly
 # since Rust doesn't expose a transitive dependency's API without an
@@ -142,7 +142,10 @@ url = { version = "2", optional = true }
 # serde_norway is its maintained fork.
 serde_norway = { version = "0.9", optional = true }
 toml = { version = "1", optional = true }
-rmcp = { version = "3.1.2", default-features = false, features = ["client", "reqwest-tls-no-provider", "transport-streamable-http-client-reqwest", "auth"], optional = true }
+# "server" and "transport-streamable-http-server" are src/claude_cli/bridge.rs's
+# loopback MCP server, which shows smelt's tools to the Claude Code CLI
+# (SME-430).
+rmcp = { version = "3.1.2", default-features = false, features = ["client", "reqwest-tls-no-provider", "transport-streamable-http-client-reqwest", "auth", "server", "transport-streamable-http-server"], optional = true }
 # The reqwest 0.13 rmcp itself uses, by another name: an OAuth server's
 # transport is rmcp's `AuthClient<reqwest::Client>` (SME-113), which needs
 # a 0.13 `Client` to wrap, and smelt's own `reqwest` is 0.12. No features
@@ -213,6 +216,10 @@ server = [
 # SME-10 and
 # SME-21.
 browser-test = ["server"]
+# `smelt claude-cli-capture`, run only by scripts/claude-cli-capture: real
+# Claude Code calls that record src/claude_cli/fixtures/ (SME-430). Off in
+# every build the gate or the image makes.
+claude-cli-capture = ["server"]
 
 # sandbox_agent runs standalone inside the sandbox pod (injected and
 # launched by src/sandbox.rs, not served by main.rs) — it needs the same

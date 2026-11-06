@@ -96,6 +96,9 @@ pub(super) async fn build_request_with_room(
             // Only once: `compacted` is set now, and the next pass is settled
             // by the floor. Compacting can learn a smaller window, which the
             // next pass reads again.
+            BeforeSending::Compact if turn_model.kind == crate::providers::ProviderKind::ClaudeCli => {
+                return Err(ServerFnError::new(crate::claude_cli::CANT_COMPACT_YET));
+            }
             BeforeSending::Compact => {
                 compact_conversation(pool, conversation_id, turn_model, slot, refused.map(str::to_string)).await?;
                 // One answering a refusal counts as one (round 2 M4).

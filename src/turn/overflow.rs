@@ -114,7 +114,10 @@ pub(super) async fn recover(
         undercount,
     )
     .await?;
-    match call_model(pool, conversation_id, turn_model, &mut request, slot).await {
+    // A Claude Code call never reports an overflow (SME-430), so this
+    // retry is always an HTTP one, and has no CLI run to use.
+    let mut no_cli = crate::claude_cli::run::TurnCli::default();
+    match call_model(pool, conversation_id, turn_model, &mut request, slot, &mut no_cli).await {
         Ok((turn, recorder)) => {
             // The server took it (final review L-2). Not a step taken for the
             // refusal count, which a server refusing every step needs (review L2).

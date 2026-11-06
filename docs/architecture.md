@@ -6,7 +6,7 @@ Dioxus **fullstack** (SSR + hydration + typed server functions) on Axum, Postgre
 
 Unlike a hand-rolled Axum-API app, there is no separate REST layer and no hand-written browser fetch client: functions in `src/api/` decorated `#[get]`/`#[post]`/`#[delete]` are isomorphic — the same function is a real Axum route on the server build and a transparent HTTP call on the web/WASM build. See [api.md](api.md).
 
-The exceptions, all server-side: `build_router()` in `src/main.rs` adds one plain Axum route, `/oauth/mcp-callback/{id}` (the MCP OAuth redirect target, `mcp_oauth::callback_handler` — see [mcp.md](mcp.md)), and wraps the whole router in two layers, `request_guard::guard` (refuses cross-site writes and unknown `Host` names) and `tower_http`'s `TraceLayer` (each request's span: method and path only, see [Tracing](#tracing-opentelemetry)). Sandbox previews are served by `src/preview.rs`, a hyper reverse proxy on a listener of its own (`SMELT_PREVIEW_ADDR`), not by the Dioxus router.
+The exceptions, all server-side: `build_router()` in `src/main.rs` adds one plain Axum route, `/oauth/mcp-callback/{id}` (the MCP OAuth redirect target, `mcp_oauth::callback_handler` — see [mcp.md](mcp.md)), and wraps the whole router in two layers, `request_guard::guard` (refuses cross-site writes and unknown `Host` names) and `tower_http`'s `TraceLayer` (each request's span: method and path only, see [Tracing](#tracing-opentelemetry)). Sandbox previews are served by `src/preview.rs`, a hyper reverse proxy on a listener of its own (`SMELT_PREVIEW_ADDR`), not by the Dioxus router. A Claude Code turn's tools reach the CLI through `src/claude_cli/bridge.rs`, an rmcp streamable-HTTP MCP server on a loopback listener (`127.0.0.1:0`) and runtime of its own, outside `request_guard`: each CLI run gets a random path and bearer token (SME-430).
 
 ## Module map
 
@@ -25,6 +25,8 @@ Each SSE/broadcast-shaped stream answers a different question:
 2. **smelt server → browser, scoped to a conversation** (`api::chat::subscribe_conversation_events`'s `ServerEvents<ConversationEvent>`): "stream me whatever happens to this conversation, unprompted." A chat tab opens it once per viewed conversation and it forwards `events::subscribe(id)` for as long as that tab has the conversation selected, plus the app-wide `PodsChanged` and `TurnsChanged` relayed as `ConversationEvent`s. It carries every turn's messages and streaming reply text too, whoever started the turn: a tab's send, a finished command, another tab.
 3. **smelt server → browser, app-wide** (`api::pods::subscribe_app_events`'s `ServerEvents<AppEvent>`): the `/pods` page, and a chat tab with no conversation selected — which has no conversation stream of its own, so its sidebar listens here instead and stops the moment one is selected (SME-269).
 4. **Browsing frames** (`api::browsing::subscribe_browser_frames`): the live screencast of the conversation's browsing session, open only while one is.
+
+On a **Claude Code** provider (SME-430), stream 1 is the `claude -p` process's stdout instead: stream-json lines whose `stream_event`s carry the same Messages API events, read by `claude_cli::run` with the same block assembler and usage meter. The model's tool calls arrive as MCP `tools/call`s on the bridge (above), parked until the turn's loop has run them as on every other kind; the turn's next model call answers them.
 
 So a chat tab holds one always-open connection, plus the frames stream while the model is browsing.
 

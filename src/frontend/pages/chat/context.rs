@@ -243,6 +243,9 @@ pub(super) fn render_context_detail_body(detail: Option<&Result<ContextDetailSna
             }
             h4 { class: "context-detail-heading", "Spent so far" }
             p { "{spend_cost_text(&detail.spend)}" }
+            if detail.subscription {
+                p { class: "muted", "API-equivalent: Claude Code's calls are paid by your Claude subscription." }
+            }
             // Its own calls and tokens under its own cost, before the group
             // line (SME-354 B21: printed after it, they read as the group's).
             if detail.spend.calls > 0 {

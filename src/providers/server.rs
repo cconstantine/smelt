@@ -17,7 +17,8 @@ pub struct TurnModel {
     pub prompt_caching: bool,
     /// The catalog provider its calls are priced as (SME-106).
     pub price_catalog_provider: Option<String>,
-    /// The model's effort, for an Anthropic provider only (SME-106).
+    /// The model's effort, for an Anthropic or Claude Code provider only
+    /// (SME-106, SME-430).
     pub effort: Option<crate::anthropic::Effort>,
     /// The provider's kind: which controls a request carries.
     pub kind: ProviderKind,
@@ -395,7 +396,8 @@ async fn resolve_once(pool: &PgPool, conversation_id: i64) -> Result<Option<Turn
         prompt_caching: provider.prompt_caching,
         price_catalog_provider: provider.price_catalog_provider.clone(),
         // Sent to Anthropic only: another server may refuse the field.
-        effort: (kind == ProviderKind::Anthropic)
+        // Claude Code takes it as `--effort` (SME-430).
+        effort: matches!(kind, ProviderKind::Anthropic | ProviderKind::ClaudeCli)
             .then(|| settings.as_ref().and_then(|r| r.effort.as_deref()).and_then(crate::anthropic::Effort::parse))
             .flatten(),
         template: (kind == ProviderKind::LlamaCpp).then(|| template_settings(&provider, settings.as_ref())),

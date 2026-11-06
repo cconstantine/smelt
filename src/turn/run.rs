@@ -172,6 +172,9 @@ fn run_turn_steps<'a: 'b, 'b>(
         // The request slot this turn holds on its model's provider once
         // that model is resolved, and holds to the end (SME-343).
         let mut turn_slot: Option<crate::turn::call::TurnSlot> = None;
+        // A Claude Code turn's CLI run, held, like the slot, to the end
+        // (SME-430): dropping it ends the run.
+        let mut turn_cli = crate::claude_cli::run::TurnCli::default();
 
         // A repo the user just attached may still be cloning; its AGENTS.md
         // belongs in this turn's system prompt (SME-32). Bounded: past it,
@@ -237,11 +240,6 @@ fn run_turn_steps<'a: 'b, 'b>(
                     .await
                     .map_err(ServerFnError::new)?,
             };
-            // Before any slot, compaction or call: a Claude Code turn has
-            // no transport yet (SME-429; SME-430 adds it).
-            if model.kind == crate::providers::ProviderKind::ClaudeCli {
-                return Err(ServerFnError::new(crate::claude_cli::NOT_YET));
-            }
             // The turn's own copy, mutable: an overflow refusal's window
             // lands on it so every later size of the turn reads it (SME-73).
             let turn_model = resolved_model.insert(model);
@@ -278,6 +276,11 @@ fn run_turn_steps<'a: 'b, 'b>(
                 // Compacting again would only repeat what the last ones
                 // showed: the turn ends, saying why (SME-386 F10).
                 CompactionStep::Stuck(why) => return Err(ServerFnError::new(why)),
+                // smelt doesn't compact a Claude Code conversation yet
+                // (SME-431): one that no longer fits fails plainly.
+                CompactionStep::Compact if turn_model.kind == crate::providers::ProviderKind::ClaudeCli => {
+                    return Err(ServerFnError::new(crate::claude_cli::CANT_COMPACT_YET));
+                }
                 CompactionStep::Compact => {
                     // A proactive compaction: no refusal to name on the
                     // divider (SME-73).
@@ -309,7 +312,7 @@ fn run_turn_steps<'a: 'b, 'b>(
             // A refusal meaning "this didn't fit" answers itself once:
             // learn the window, shrink, send again (SME-73). Every
             // other failure ends the turn as it always did.
-            let called = call_model(pool, conversation_id, turn_model, &mut request, slot.held()).await;
+            let called = call_model(pool, conversation_id, turn_model, &mut request, slot.held(), &mut turn_cli).await;
             let (turn, recorder, budget) = match called {
                 Ok((turn, recorder)) => {
                     // Ollama truncates an oversized request quietly rather

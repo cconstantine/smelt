@@ -97,7 +97,7 @@ impl DeltaUsage {
 
 /// Parse one decoded JSON payload from an Anthropic SSE `data:` line.
 /// Pure and synchronous — unit-testable without any network access.
-pub(super) fn interpret_stream_event(value: &Value) -> StreamOutcome {
+pub(crate) fn interpret_stream_event(value: &Value) -> StreamOutcome {
     match value.get("type").and_then(Value::as_str) {
         Some("message_start") => {
             let usage = value.get("message").and_then(|m| m.get("usage"));
@@ -195,7 +195,7 @@ pub(super) fn interpret_stream_event(value: &Value) -> StreamOutcome {
 }
 
 /// The `index` a `content_block_*` event names, the block it belongs to.
-pub(super) fn block_index(value: &Value) -> Option<usize> {
+pub(crate) fn block_index(value: &Value) -> Option<usize> {
     value
         .get("index")
         .and_then(Value::as_u64)

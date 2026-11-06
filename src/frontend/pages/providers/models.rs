@@ -27,6 +27,7 @@ pub(super) fn ProviderModelsSection(id: i64, refresh: Signal<u64>) -> Element {
                     }
                     if listing.kind == ProviderKind::ClaudeCli {
                         ClaudeCliStatusLine { id, refresh }
+                        p { class: "muted", "Thinking is always on for Claude Code, and its text is hidden: the CLI has no way to turn it off, so a model's thinking setting has no effect here." }
                     }
                     if let Some(err) = listing.listing_error {
                         p { class: "error", "Couldn't list this provider's models: {err}" }

@@ -98,6 +98,7 @@ mod detail_shown_tests {
             prices_as_of: None,
             group_spend: Default::default(),
             group_root_title: None,
+            subscription: false,
         }
     }
 
@@ -337,11 +338,22 @@ mod group_spend_tests {
             prices_as_of: None,
             group_spend,
             group_root_title: group_root_title.map(|t| t.to_string()),
+            subscription: false,
         }
     }
 
     fn render(detail: ContextDetailSnapshot) -> String {
         dioxus::ssr::render_element(render_context_detail_body(Some(&Ok(detail))))
+    }
+
+    /// SME-430: a Claude Code conversation's cost says the subscription pays.
+    #[test]
+    fn test_a_claude_code_conversations_cost_says_the_subscription_pays() {
+        let mut snapshot = detail(spend(1, Some(0.5), 0), spend(1, Some(0.5), 0), None);
+        assert!(!render(snapshot.clone()).contains("paid by your Claude subscription"));
+        snapshot.subscription = true;
+        let rendered = render(snapshot);
+        assert!(rendered.contains("API-equivalent") && rendered.contains("paid by your Claude subscription"), "{rendered}");
     }
 
     /// SME-354 B21: on an unpriced model the group line said only "No
@@ -413,6 +425,7 @@ mod summary_first_tests {
             prices_as_of: None,
             group_spend: Default::default(),
             group_root_title: None,
+            subscription: false,
         };
         let html = dioxus::ssr::render_element(render_context_detail_body(Some(&Ok(detail))));
         assert!(html.contains("262,144"), "{html}");
@@ -422,4 +435,5 @@ mod summary_first_tests {
         assert!(window < prompt, "the summary comes first: {html}");
         assert!(html.contains("<details class=\"context-detail-system\""), "the prompt is folded: {html}");
     }
+
 }

@@ -8,7 +8,7 @@ use serde_json::Value;
 use super::types::{ContentBlock, CreateMessageRequest, TokenUsage};
 
 mod endpoint;
-mod interpret;
+pub(crate) mod interpret;
 mod lines;
 mod meter;
 
@@ -82,7 +82,7 @@ pub struct StreamedTurn {
 /// each tool call without closing any, and stops them all at the end of
 /// the reply (SME-112). See `Blocks`.
 #[derive(Debug)]
-enum PartialBlock {
+pub(crate) enum PartialBlock {
     Text(String),
     ToolUse {
         id: String,
@@ -173,7 +173,7 @@ pub fn stopped_early(stop_reason: &str) -> bool {
 /// index (no real provider sends one) belongs to the block opened last,
 /// or opens one after every block seen so far.
 #[derive(Default)]
-struct Blocks {
+pub(crate) struct Blocks {
     open: std::collections::BTreeMap<usize, PartialBlock>,
     /// Finished blocks by (index, order finished): a block reopened at an
     /// index already finished lands right after the first.
@@ -188,7 +188,7 @@ impl Blocks {
 
     /// Opens `block` at `index` (or after every block seen, without one).
     /// A block still open there is finished first.
-    fn start(&mut self, index: Option<usize>, block: PartialBlock) {
+    pub(crate) fn start(&mut self, index: Option<usize>, block: PartialBlock) {
         let index = index.unwrap_or_else(|| {
             let seen = self.open.keys().chain(self.done.keys().map(|(i, _)| i));
             seen.max().map_or(0, |i| i.saturating_add(1))
@@ -213,7 +213,7 @@ impl Blocks {
 
     /// Finishes the block at `index` (or the one opened last). A stop
     /// for a block that isn't open is ignored.
-    fn stop(&mut self, index: Option<usize>) {
+    pub(crate) fn stop(&mut self, index: Option<usize>) {
         let Some(index) = index.or(self.last) else {
             return;
         };
@@ -223,7 +223,7 @@ impl Blocks {
         }
     }
 
-    fn text(&mut self, index: Option<usize>, text: String) {
+    pub(crate) fn text(&mut self, index: Option<usize>, text: String) {
         if let Some(PartialBlock::Text(existing)) = self.open_at(index) {
             existing.push_str(&text);
             return;
@@ -231,7 +231,7 @@ impl Blocks {
         self.start(index, PartialBlock::Text(text));
     }
 
-    fn thinking(&mut self, index: Option<usize>, thinking: String) {
+    pub(crate) fn thinking(&mut self, index: Option<usize>, thinking: String) {
         if let Some(PartialBlock::Thinking { thinking: existing, .. }) = self.open_at(index) {
             existing.push_str(&thinking);
             return;
@@ -246,14 +246,14 @@ impl Blocks {
     }
 
     /// Dropped unless its index holds an open thinking block.
-    fn signature(&mut self, index: Option<usize>, signature: &str) {
+    pub(crate) fn signature(&mut self, index: Option<usize>, signature: &str) {
         if let Some(PartialBlock::Thinking { signature: existing, .. }) = self.open_at(index) {
             existing.push_str(signature);
         }
     }
 
     /// Dropped unless its index holds an open tool call.
-    fn tool_input(&mut self, index: Option<usize>, partial_json: &str) {
+    pub(crate) fn tool_input(&mut self, index: Option<usize>, partial_json: &str) {
         if let Some(PartialBlock::ToolUse { partial_json: existing, .. }) = self.open_at(index) {
             existing.push_str(partial_json);
         }
@@ -264,7 +264,7 @@ impl Blocks {
     /// is a tool call, that call is dropped, whether or not its input
     /// parsed, and its name returned (SME-126). A call left whose input
     /// doesn't parse fails the reply.
-    fn finish(mut self, stop_reason: &str) -> Result<(Vec<ContentBlock>, Option<String>), String> {
+    pub(crate) fn finish(mut self, stop_reason: &str) -> Result<(Vec<ContentBlock>, Option<String>), String> {
         while let Some(&index) = self.open.keys().next() {
             self.stop(Some(index));
         }

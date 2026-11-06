@@ -5,8 +5,9 @@
 //! This part (SME-429) is the binary, its status and its environment: the
 //! provider page shows what `claude --version` and `claude auth status`
 //! say, and every process smelt starts gets a cleared environment with an
-//! allowlist (`cli_env`). A turn on the kind is refused (`NOT_YET`) until
-//! the transport lands (SME-430).
+//! allowlist (`cli_env`). SME-430's transport runs the turns: `bridge`
+//! shows smelt's tools to the CLI, `run` holds a turn's `claude -p`
+//! process, and `render` says what of smelt's history it's sent.
 //!
 //! The wire types here cross to the browser; the rest is server-only.
 
@@ -16,10 +17,10 @@ use serde::{Deserialize, Serialize};
 /// `PATH` (the server image puts it at `/opt/claude/bin/claude`).
 pub const DEFAULT_BINARY: &str = "claude";
 
-/// The error a turn on a Claude Code provider ends with until SME-430's
-/// transport lands.
+/// The error a Claude Code turn ends with when its conversation no longer
+/// fits the model's window: smelt compacts these from SME-431 on.
 #[cfg(feature = "server")]
-pub const NOT_YET: &str = "Claude Code providers can't run turns yet: smelt can show this provider's sign-in, but sending through the claude CLI comes in a later update. Choose another model for now.";
+pub const CANT_COMPACT_YET: &str = "This conversation no longer fits its Claude Code model's context window, and smelt can't compact a Claude Code conversation yet. Start a new conversation, or switch this one to another provider's model.";
 
 /// Anthropic's terms for this route, quoted on the provider form: the
 /// kind is the one that breaks if they change (SME-399's risk).
@@ -74,10 +75,22 @@ impl ClaudeCliStatus {
 }
 
 #[cfg(feature = "server")]
+pub mod bridge;
+#[cfg(feature = "claude-cli-capture")]
+pub mod capture;
+#[cfg(feature = "server")]
+pub mod errors;
+#[cfg(feature = "server")]
+pub mod process;
+#[cfg(feature = "server")]
+pub mod render;
+#[cfg(feature = "server")]
+pub mod run;
+#[cfg(feature = "server")]
 mod server;
 
 #[cfg(feature = "server")]
 pub use server::*;
 
 #[cfg(all(test, feature = "server"))]
-mod tests;
+pub(crate) mod tests;

@@ -401,6 +401,10 @@ pub struct ContextDetailSnapshot {
     /// when it is a group's root itself — a conversation with no `agents`
     /// row (SME-244).
     pub group_root_title: Option<String>,
+    /// The conversation's model is a Claude Code provider's (SME-430): its
+    /// cost is what the API would charge, and the subscription pays.
+    #[serde(default)]
+    pub subscription: bool,
 }
 
 #[get("/api/conversations/{id}/context-detail")]
@@ -419,14 +423,18 @@ pub(crate) async fn context_detail(pool: &PgPool, id: i64) -> ServerFnResult<Con
     let usage = db::get_conversation_usage(pool, id)
         .await
         .map_err(ServerFnError::new)?;
-    let (model, context_window) = crate::providers::conversation_model(pool, id)
-        .await
-        .map_err(ServerFnError::new)?
-        .as_ref()
-        .and_then(crate::providers::ConversationModel::choice)
-        .map_or((String::new(), crate::providers::ASSUMED_CONTEXT_WINDOW), |choice| {
-            (choice.model.clone(), choice.context_window)
-        });
+    let choice = crate::providers::conversation_model(pool, id).await.map_err(ServerFnError::new)?;
+    let choice = choice.as_ref().and_then(crate::providers::ConversationModel::choice);
+    let (model, context_window) = choice.map_or((String::new(), crate::providers::ASSUMED_CONTEXT_WINDOW), |choice| {
+        (choice.model.clone(), choice.context_window)
+    });
+    let subscription = match choice {
+        Some(choice) => db::get_inference_provider(pool, choice.provider_id)
+            .await
+            .map_err(ServerFnError::new)?
+            .is_some_and(|p| crate::providers::ProviderKind::parse(&p.kind) == Some(crate::providers::ProviderKind::ClaudeCli)),
+        None => false,
+    };
     // The cost group this conversation belongs to (SME-244): its own id
     // when it has no `agents` row, and the agent tree's root otherwise.
     // One more round trip per dialog open — an index scan, and the dialog
@@ -452,6 +460,7 @@ pub(crate) async fn context_detail(pool: &PgPool, id: i64) -> ServerFnResult<Con
             .await
             .map_err(ServerFnError::new)?,
         group_root_title,
+        subscription,
     })
 }
 
