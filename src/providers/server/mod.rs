@@ -614,7 +614,29 @@ pub(super) async fn store_details(
         details.adaptive_thinking,
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    // SME-439 PR 2 (Expected 3a): a report bigger than what smelt learned
+    // says the learned window is too small — forget it. A llama.cpp report
+    // is the server's whole context split across its slots, so what must
+    // outgrow is one slot's share, the learner's own division. The picker
+    // lists with the last `/props` unrefreshed, so its llama.cpp report can
+    // over-clear — a lost re-learn, never a wrong keep (the plan's noted
+    // trade-off).
+    if details.context_window.filter(|w| *w > 0).is_some()
+        && let Some(provider) = db::get_inference_provider(pool, provider_id).await.map_err(|e| e.to_string())?
+    {
+        let kind = ProviderKind::parse(&provider.kind).unwrap_or(ProviderKind::Other);
+        let total_slots = server_caps(&provider).and_then(|caps| caps.total_slots);
+        if let Some(per_request) = crate::turn::reported_per_request(to_column(details.context_window), kind, total_slots) {
+            let forgotten = db::clear_learned_context_window_below(pool, provider_id, &provider.base_url, model, per_request)
+                .await
+                .map_err(|e| e.to_string())?;
+            if forgotten {
+                providers_changed();
+            }
+        }
+    }
+    Ok(())
 }
 
 fn has_any(details: &crate::anthropic::models::ModelDetails) -> bool {

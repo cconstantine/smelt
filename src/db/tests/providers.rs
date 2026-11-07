@@ -280,6 +280,35 @@ async fn test_forgetting_a_learned_window_leaves_the_users_value_alone(pool: PgP
     assert!(!again, "with nothing learned there is nothing to forget");
 }
 
+/// SME-439 PR 2 (Expected 3): the clear-by-a-bigger-number — used for a
+/// report that outgrows the learned window and (via `turn::run`) for a
+/// whole reply that does. Strictly bigger clears; equal and smaller
+/// keep; a different server clears nothing; only the learned four go.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_bigger_number_below_clears_what_a_smaller_one_keeps(pool: PgPool) {
+    let provider = test_provider(&pool, "p").await;
+    set_provider_model_reported(&pool, provider.id, "m", Some(32_768), None, None, None, None).await.expect("reported");
+    save_learned_context_window(&pool, provider.id, "https://api.anthropic.com", "m", 16_384, "window_stop", 42, UNSIZED).await.expect("learned");
+
+    assert!(!clear_learned_context_window_below(&pool, provider.id, "https://api.anthropic.com", "m", 16_384).await.expect("equal"), "equal exceeds nothing");
+    assert!(!clear_learned_context_window_below(&pool, provider.id, "https://api.anthropic.com", "m", 4_096).await.expect("smaller"), "smaller exceeds nothing");
+    assert!(!clear_learned_context_window_below(&pool, provider.id, "https://elsewhere.example", "m", 1_000_000).await.expect("guard"), "only the server that taught it has a say");
+    assert!(clear_learned_context_window_below(&pool, provider.id, "https://api.anthropic.com", "m", 16_385).await.expect("clears"), "one token past the learned window outgrew it");
+
+    let row = get_provider_model(&pool, provider.id, "m").await.expect("get").expect("exists");
+    assert_eq!(
+        (
+            row.learned_context_window,
+            row.learned_context_window_at,
+            row.learned_context_window_reason.as_deref(),
+            row.learned_context_window_conversation
+        ),
+        (None, None, None, None),
+        "the four telling columns go together"
+    );
+    assert_eq!(row.reported_context_window, Some(32_768), "the report is not this clear's to touch");
+}
+
 /// SME-439: the learned window and its when/why/which-round columns are a
 /// round-trip like every other column: `get_provider_model` and
 /// `list_provider_models` read them, a listing report never writes them.

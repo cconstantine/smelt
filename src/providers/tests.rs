@@ -27,7 +27,7 @@ fn test_kinds_and_auth_kinds_round_trip_their_names() {
 #[cfg(feature = "server")]
 #[test]
 fn test_model_info_carries_the_learned_window_and_its_telling() {
-    let at = chrono::NaiveDateTime::parse_from_str("2026-11-06 16:14:07", "%Y-%m-%d %H:%M:%S").unwrap();
+    let at = chrono::NaiveDateTime::parse_from_str("2026-11-06 16:14:07", "%Y-%m-%d %H:%M:%S").unwrap().and_utc();
     let row = crate::db::ProviderModelRow {
         context_window: Some(262_144),
         learned_context_window: Some(160_799),
@@ -49,6 +49,71 @@ fn test_model_info_carries_the_learned_window_and_its_telling() {
         (None, None, None, None),
         "nothing learned, nothing to show"
     );
+}
+
+#[cfg(feature = "server")]
+use sqlx::PgPool;
+
+/// A `ModelDetails` for the tests below it: only the reported window.
+#[cfg(feature = "server")]
+fn details_with_window(window: u32) -> crate::anthropic::models::ModelDetails {
+    crate::anthropic::models::ModelDetails { context_window: Some(window), ..Default::default() }
+}
+
+/// A stored provider of `kind` at `base_url`, for the report tests below.
+#[cfg(feature = "server")]
+async fn report_provider(pool: &PgPool, kind: &str, base_url: &str) -> crate::db::InferenceProvider {
+    crate::db::create_inference_provider(pool, "p", kind, base_url, "api_key", "k", false, None, true, None)
+        .await
+        .expect("provider")
+}
+
+/// SME-439 PR 2 (Expected 3a): a listing report bigger than the learned
+/// window says the learned one is too small — forget it. Everyone else's
+/// report is per model, so 40,000 against a learned 32,768 clears; one
+/// that doesn't outgrow it keeps, and the clear never reaches the user's
+/// own field.
+#[cfg(feature = "server")]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_bigger_report_forgets_a_smaller_learned_window(pool: PgPool) {
+    let provider = report_provider(&pool, "anthropic", "http://one").await;
+    crate::db::save_learned_context_window(&pool, provider.id, "http://one", "m", 32_768, "window_stop", 42, 200_000).await.expect("learn");
+    crate::db::set_provider_model_overrides(&pool, provider.id, "m", None, Some(400_000), None, None, None).await.expect("user window");
+
+    server::store_details(&pool, provider.id, "m", &details_with_window(16_384)).await.expect("smaller report");
+    let row = crate::db::get_provider_model(&pool, provider.id, "m").await.expect("get").expect("row");
+    assert_eq!(row.learned_context_window, Some(32_768), "16,384 does not outgrow 32,768");
+
+    server::store_details(&pool, provider.id, "m", &details_with_window(40_000)).await.expect("bigger report");
+    let row = crate::db::get_provider_model(&pool, provider.id, "m").await.expect("get").expect("row");
+    assert_eq!(row.learned_context_window, None, "40,000 outgrew the learned 32,768: forgotten");
+    assert_eq!(row.context_window, Some(400_000), "the user's own field is nobody of this clear's");
+}
+
+/// SME-439 PR 2 (Expected 3a) at llama.cpp's per-request reading: the
+/// report is the server's total, and a llama.cpp slot gets its share —
+/// 65,536 across four slots is 16,384, which does not outgrow a learned
+/// 32,768; 163,840 total (40,960 a request) does. The clear is
+/// `reported / total_slots`, the learner's own division.
+#[cfg(feature = "server")]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_llama_cpp_report_divides_by_its_slots_before_it_forgets(pool: PgPool) {
+    let provider = report_provider(&pool, "llama_cpp", "http://llama").await;
+    sqlx::query("UPDATE inference_providers SET server_caps = $2 WHERE id = $1")
+        .bind(provider.id)
+        .bind(serde_json::json!({ "n_ctx": 65_536, "total_slots": 4, "template_caps": {} }))
+        .execute(&pool)
+        .await
+        .expect("caps");
+    crate::db::save_learned_context_window(&pool, provider.id, "http://llama", "m", 32_768, "window_stop", 42, 200_000).await.expect("learn");
+
+    server::store_details(&pool, provider.id, "m", &details_with_window(65_536)).await.expect("four-slot report");
+    let row = crate::db::get_provider_model(&pool, provider.id, "m").await.expect("get").expect("row");
+    assert_eq!(row.learned_context_window, Some(32_768), "65,536 is four slots' total — 16,384 a request, not a bigger window");
+
+    server::store_details(&pool, provider.id, "m", &details_with_window(163_840)).await.expect("bigger four-slot report");
+    let row = crate::db::get_provider_model(&pool, provider.id, "m").await.expect("get").expect("row");
+    assert_eq!(row.learned_context_window, None, "40,960 a request outgrew 32,768: forgotten");
 }
 
 /// Wire types go to the browser as JSON; each shape round-trips.

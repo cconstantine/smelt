@@ -201,8 +201,10 @@ const DEGENERATE_REPEATS: usize = 24;
 /// llama.cpp's own server code); every other kind reports per model, so
 /// its window passes whole. An uneven split (`--slot-context`, upstream
 /// proposal) breaks the even division — the margin and the repeat rule
-/// are the guard. `None` reported stays `None`.
-pub(super) fn reported_per_request(
+/// are the guard. `None` reported stays `None`. (SME-439 PR 2:
+/// `providers::store_details` divides the same way before a report may
+/// forget a learned window.)
+pub(crate) fn reported_per_request(
     reported: Option<i32>,
     kind: crate::providers::ProviderKind,
     total_slots: Option<u32>,
