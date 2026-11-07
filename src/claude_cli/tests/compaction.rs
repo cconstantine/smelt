@@ -49,3 +49,29 @@ async fn test_a_reset_deletes_the_session_and_marks_the_run(pool: sqlx::PgPool) 
     assert_eq!(take_retired(conversation.id), vec![session.session_id]);
     crate::claude_cli::session::forget(conversation.id);
 }
+
+/// SME-444's delivered mark: noted, taken once, and cleared by a reset
+/// and by the conversation's delete; never another conversation's.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_delivered_mark_is_taken_once_and_cleared_by_reset_and_forget(pool: sqlx::PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation = crate::db::create_conversation(&pool).await.expect("conversation");
+    let other = crate::db::create_conversation(&pool).await.expect("another conversation");
+    use crate::claude_cli::session::{forget, note_delivered, reset, take_delivered};
+    let ids = |list: &[&str]| list.iter().map(|id| id.to_string()).collect::<std::collections::HashSet<_>>();
+
+    note_delivered(conversation.id, ["toolu_a".to_string()]);
+    note_delivered(conversation.id, ["toolu_b".to_string()]);
+    assert!(take_delivered(other.id).is_empty(), "another conversation's");
+    assert_eq!(take_delivered(conversation.id), ids(&["toolu_a", "toolu_b"]));
+    assert!(take_delivered(conversation.id).is_empty(), "taken once");
+
+    note_delivered(conversation.id, ["toolu_c".to_string()]);
+    reset(&pool, conversation.id, crate::providers::ProviderKind::ClaudeCli).await;
+    assert!(take_delivered(conversation.id).is_empty(), "a reset clears it");
+
+    note_delivered(conversation.id, ["toolu_d".to_string()]);
+    forget(conversation.id);
+    assert!(take_delivered(conversation.id).is_empty(), "a delete clears it");
+    forget(other.id);
+}

@@ -13,6 +13,10 @@
 //!   the wind-down without an interrupt;
 //! - `CLOSE_WAIT` passing first: a warning naming the calls not echoed,
 //!   then the interrupt, as a run that wasn't closed gets.
+//!
+//! Whichever way it ends, the calls the CLI echoed, questions aside, are
+//! noted as delivered (`session::note_delivered`): the next turn's resume
+//! doesn't send their results again as text.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -116,6 +120,17 @@ impl Run {
         })
         .await
         .unwrap_or(Settled::TimedOut);
+        // The session has what it echoed, so the next turn doesn't repeat
+        // it (Q2); a question's answer is still to come, and isn't marked.
+        let delivered: Vec<String> = self
+            .expected
+            .iter()
+            .filter(|e| echoed.contains(&e.id) && e.name != crate::questions::ASK_USER && e.name != crate::agents::ASK_PARENT)
+            .map(|e| e.id.clone())
+            .collect();
+        if !delivered.is_empty() {
+            crate::claude_cli::session::note_delivered(self.conversation_id, delivered);
+        }
         match waited {
             Settled::Taken => true,
             Settled::Ended => {

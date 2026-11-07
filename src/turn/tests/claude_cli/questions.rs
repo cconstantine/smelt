@@ -157,6 +157,37 @@ async fn test_a_reply_with_a_tool_and_ask_user_answers_both_in_order(pool: PgPoo
     fake.until("the answer's run is sent its message", |f| !user_texts(f, 1).is_empty()).await;
     let sent = &user_texts(&fake, 1)[0];
     assert!(sent.contains("(This answers your earlier `ask_user` (call toolu_ask)"), "the tie is kept: {sent}");
+    assert!(!sent.contains("(smelt ran `todoread`"), "todoread's result, delivered by the close, isn't sent again: {sent}");
+}
+
+/// notify_user: its real result, a success, answers the call as the turn
+/// ends, and the next turn doesn't send it again (the delivered mark).
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_notify_user_gets_its_real_result_and_isnt_repeated(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let mut first = vec![json!({"read": true})];
+    first.extend(tool_reply(&[("toolu_note", crate::anthropic::tools::NOTIFY_USER, json!({"message": "Built and tested"}))]));
+    first.push(json!({"next_call": true}));
+    let fake = FakeCli::new("notify-close", vec![first, vec![json!({"read": true}), text_reply("Hi again.")]]);
+    fake.pick_for(&pool, conversation.id).await;
+
+    run_turn(&pool, conversation.id, hello()).await.expect("notifies");
+    fake.until("the run has ended", |f| f.dir.join("exited.0").exists()).await;
+    assert_eq!(
+        answered(&fake, 0),
+        vec![("toolu_note".to_string(), "The user will be notified when this conversation goes idle.".to_string(), false)],
+        "its real result, a success"
+    );
+    assert_no_refusal(&fake.transcript(0));
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the next turn");
+    assert!(fake.args(1).iter().any(|a| a == "--resume"), "resumed: {:?}", fake.args(1));
+    let sent = user_texts(&fake, 1);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(!sent[0].contains("(smelt ran `notify_user`"), "not repeated: {}", sent[0]);
+    assert!(sent[0].contains("hello"), "the user's message: {}", sent[0]);
 }
 
 /// A CLI that takes the answer and never echoes it: the close gives up

@@ -52,7 +52,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use super::bridge::{ParkedCall, RunBridge, ToolReply, bridge};
 use super::errors::{RateLimit, result_error};
 use super::process::{Launch, SessionArg, cli_args, turn_env};
-use super::render::{Synced, blocks_text, call_names, rehydrate, synced, tail_after, tool_result_text};
+use super::render::{Synced, blocks_text, call_names, rehydrate, synced, tail_after, tool_result_text, without_delivered};
 use crate::anthropic::stream::interpret::{StreamOutcome, block_index, interpret_stream_event};
 use crate::anthropic::stream::{Blocks, PartialBlock, StreamedTurn, UsageMeter};
 use crate::anthropic::{AnthropicMessage, ContentBlock, CreateMessageRequest};
@@ -431,7 +431,7 @@ async fn call_run(
         old.end_in_background();
     }
     if let (Some(run), Some(tail)) = (cli.run.as_mut(), &tail)
-        && let Err(e) = run.send_tail(tail).await
+        && let Err(e) = run.send_tail(tail, &request.messages).await
     {
         let Some(mut run) = cli.run.take() else {
             return Err(e);
@@ -501,12 +501,14 @@ async fn start(call: &Call<'_>, resume: bool) -> Result<Run, String> {
     });
     let (mut run, first) = match resumable {
         Some((session_id, tail)) => {
-            let names = call_names(&request.messages);
-            let text = tail.iter().map(|m| blocks_text(&m.content, &names)).collect::<Vec<_>>().join("\n\n");
             // Never two processes in one session: the conversation's last one
             // (L3's restart, or the last turn's) may still be ending
-            // (PR #285 review 1 L17).
+            // (PR #285 review 1 L17). A closing one writes what it delivered
+            // as it ends, so that's taken after (SME-444).
             ended(conversation_id).await;
+            let tail = without_delivered(&tail, &super::session::take_delivered(conversation_id));
+            let names = call_names(&request.messages);
+            let text = tail.iter().map(|m| blocks_text(&m.content, &names)).collect::<Vec<_>>().join("\n\n");
             let mut run = Run::spawn(conversation_id, turn_model, request, SessionArg::Resume(&session_id)).await?;
             run.resumed = true;
             run.session_id = session_id;
@@ -529,6 +531,9 @@ async fn start(call: &Call<'_>, resume: bool) -> Result<Run, String> {
             for old in &replaced {
                 super::files::forget_session(conversation_id, old);
             }
+            // A new session has nothing delivered: it's sent the whole
+            // history (SME-444).
+            drop(super::session::take_delivered(conversation_id));
             let session_id = super::process::new_session_id();
             let mut run = Run::spawn(conversation_id, turn_model, request, SessionArg::New(&session_id)).await?;
             run.session_id = session_id;
