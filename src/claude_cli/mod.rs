@@ -91,6 +91,8 @@ pub mod run;
 mod server;
 #[cfg(feature = "server")]
 pub mod session;
+#[cfg(feature = "server")]
+pub mod summary;
 
 #[cfg(feature = "server")]
 pub use server::*;

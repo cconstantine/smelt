@@ -751,11 +751,7 @@ async fn summarize(
             _ => None,
         })
         .unwrap_or_default();
-    // Never saved over the history: a summary that's empty (its thinking
-    // spent the cap) or cut off fails the compaction (PR #291 review 1 M1).
-    let why = if summary.trim().is_empty() { Some("came back empty") } else { anthropic::stream::is_cut_off(&turn.stop_reason).then_some("was cut off") };
-    if let Some(why) = why {
-        return Err(anthropic::stream::ModelError::Other(format!("Couldn't compact the conversation: its summary {why}, so the history was kept as it is. Send another message to try again.")));
-    }
-    Ok(summary)
+    // On Claude Code, an empty or cut-off summary fails the compaction
+    // rather than replace the history (PR #291 review 1 M1).
+    crate::claude_cli::summary::checked(turn_model.kind, summary, &turn.stop_reason)
 }

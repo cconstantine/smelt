@@ -206,3 +206,25 @@ async fn test_the_clis_reported_window_is_learned(pool: PgPool) {
         .expect("the model row");
     assert_eq!((window, cap), (Some(200_000), Some(64_000)));
 }
+
+/// The summary check is the Claude Code kind's only (the user's Q1, PR
+/// #291): on an HTTP kind a summary cut off at `SUMMARY_MAX_TOKENS` is
+/// saved as it always was, since hosted models' summaries do reach that
+/// cap and failing them would fail every send of a long conversation.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_http_kinds_cut_off_summary_is_saved(pool: PgPool) {
+    use super::super::overflow::{compaction_summaries, start_refusal_mock, too_long};
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let cut = super::super::text_reply_body("Summary: it was").replace(r#""stop_reason":"end_turn""#, r#""stop_reason":"max_tokens""#);
+    assert!(cut.contains("max_tokens"), "the summary is cut off: {cut}");
+    let upstream = start_refusal_mock(&pool, vec![too_long(120_000, 131_072), Ok(cut), Ok(super::super::text_reply_body("Done now."))]).await;
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    db::create_message(&pool, conversation.id, "user", &[anthropic::ContentBlock::Text { text: "earlier".to_string() }]).await.expect("seed");
+    db::create_message(&pool, conversation.id, "assistant", &[anthropic::ContentBlock::Text { text: "reply".to_string() }]).await.expect("seed");
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the cut-off summary is saved and the turn carries on");
+
+    assert_eq!(upstream.count(), 3, "refusal, summary, retry");
+    assert_eq!(compaction_summaries(&pool, conversation.id).await, ["Summary: it was"]);
+}
