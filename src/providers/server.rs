@@ -259,6 +259,20 @@ pub async fn learn_context_window(
     Ok(lowered)
 }
 
+/// Forgets what smelt learned about a model's window (SME-439 PR 2): the
+/// Forget button's server side. The learned four go; the user's own
+/// Context window, the provider's report, and this turn's belief stay
+/// exactly where they were.
+pub async fn clear_learned_context_window(pool: &PgPool, provider_id: i64, model: &str) -> Result<(), String> {
+    let forgotten = db::clear_learned_context_window(pool, provider_id, model)
+        .await
+        .map_err(|e| e.to_string())?;
+    if forgotten {
+        providers_changed();
+    }
+    Ok(())
+}
+
 /// The cap on a reply to a model on a `kind` provider (SME-111): the
 /// user's, else what the provider reported, else `UNKNOWN_OUTPUT_CAP`
 /// on an Anthropic or Other provider. `None`: only the window caps it.

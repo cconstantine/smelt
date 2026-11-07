@@ -393,6 +393,28 @@ pub async fn save_learned_context_window(
     Ok(written.rows_affected() > 0)
 }
 
+/// Forgets what smelt learned about a model's window (SME-439 PR 2): the
+/// Forget button's doing, so all four learned columns go together and
+/// nothing else moves — the user's own `context_window` and the provider's
+/// report are not this statement's to touch. No base_url guard: the user
+/// is renaming nothing; they are looking at the row. `true` if there was
+/// a learned window to forget.
+pub async fn clear_learned_context_window(pool: &PgPool, provider_id: i64, model: &str) -> Result<bool, sqlx::Error> {
+    let written = sqlx::query(
+        "UPDATE provider_models
+            SET learned_context_window = NULL,
+                learned_context_window_at = NULL,
+                learned_context_window_reason = NULL,
+                learned_context_window_conversation = NULL
+          WHERE provider_id = $1 AND model = $2 AND learned_context_window IS NOT NULL",
+    )
+    .bind(provider_id)
+    .bind(model)
+    .execute(pool)
+    .await?;
+    Ok(written.rows_affected() > 0)
+}
+
 /// The default provider and model, if one is set.
 pub async fn get_default_model(pool: &PgPool) -> Result<Option<(i64, String)>, sqlx::Error> {
     let row: Option<(Option<i64>, Option<String>)> =

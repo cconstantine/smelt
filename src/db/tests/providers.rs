@@ -248,6 +248,38 @@ async fn test_model_overrides_and_reported_details_leave_each_other_alone(pool: 
     assert_eq!(list_provider_models(&pool, provider.id).await.expect("list"), vec![row]);
 }
 
+/// SME-439 PR 2 (Done-when: "the user's setting is untouched"): Forget
+/// clears the learned four and nothing else — with the user's own Context
+/// window set beside a learned one, exactly what it forgets is what it
+/// learned.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_forgetting_a_learned_window_leaves_the_users_value_alone(pool: PgPool) {
+    let provider = test_provider(&pool, "p").await;
+    set_provider_model_reported(&pool, provider.id, "m", Some(262_144), Some(true), Some(true), None, None).await.expect("reported");
+    save_learned_context_window(&pool, provider.id, "https://api.anthropic.com", "m", 160_799, "window_stop", 42, UNSIZED).await.expect("learned");
+    set_provider_model_overrides(&pool, provider.id, "m", None, Some(262_144), None, None, None).await.expect("user window");
+
+    let forgotten = clear_learned_context_window(&pool, provider.id, "m").await.expect("forget");
+    assert!(forgotten, "there was a learned window to forget");
+
+    let row = get_provider_model(&pool, provider.id, "m").await.expect("get").expect("exists");
+    assert_eq!(
+        (
+            row.learned_context_window,
+            row.learned_context_window_at,
+            row.learned_context_window_reason.as_deref(),
+            row.learned_context_window_conversation
+        ),
+        (None, None, None, None),
+        "all four telling columns go together"
+    );
+    assert_eq!(row.context_window, Some(262_144), "the user's Context window is not Forget's to clear");
+    assert_eq!(row.reported_context_window, Some(262_144), "nor is the provider's report");
+
+    let again = clear_learned_context_window(&pool, provider.id, "m").await.expect("forget again");
+    assert!(!again, "with nothing learned there is nothing to forget");
+}
+
 /// SME-439: the learned window and its when/why/which-round columns are a
 /// round-trip like every other column: `get_provider_model` and
 /// `list_provider_models` read them, a listing report never writes them.
