@@ -22,6 +22,13 @@ use super::run::{Launching, RunFiles, WIND_DOWN, apply, keep_tail, silence};
 use crate::anthropic::stream::{Blocks, ModelError, StreamedTurn, UsageMeter};
 use crate::anthropic::{ContentBlock, CreateMessageRequest};
 
+/// What a one-shot call's cap adds to its request's `max_tokens`: the CLI
+/// can't turn thinking off (S6), and its thinking shares the cap with the
+/// reply (PR #291 review 1 M1). With the summary's 2,048 that's 6,144,
+/// inside the 8,192 tokens `compaction_transcript_budget` keeps clear of
+/// the transcript for the instructions, the live state and the output.
+pub const THINKING_ROOM: u32 = 4_096;
+
 /// The request's one message, as the text the CLI is sent.
 fn message_text(request: &CreateMessageRequest) -> String {
     request
@@ -71,14 +78,16 @@ pub async fn once(
     let _files = RunFiles(vec![prompt_file.clone()]);
     super::process::write_private(&prompt_file, request.system.as_deref().unwrap_or_default().as_bytes())
         .map_err(|e| fail(format!("Couldn't write the system prompt for Claude Code: {e}")))?;
-    let launch = Launch { model: &turn_model.model, effort: None, system_prompt_file: &prompt_file, mcp_config_file: None, session: SessionArg::Ephemeral };
+    // Thinking at its least (M1): a summary needs little.
+    let effort = Some(crate::anthropic::Effort::Low);
+    let launch = Launch { model: &turn_model.model, effort, system_prompt_file: &prompt_file, mcp_config_file: None, session: SessionArg::Ephemeral };
     let mut args = cli_args(&launch);
     args.extend(["--max-turns".into(), "1".into()]);
     let launching = Launching::take().await;
     let mut child = tokio::process::Command::new(&binary)
         .args(args)
         .env_clear()
-        .envs(turn_env(env, request.max_tokens))
+        .envs(turn_env(env, request.max_tokens.saturating_add(THINKING_ROOM)))
         .current_dir(&work)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

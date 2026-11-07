@@ -743,12 +743,19 @@ async fn summarize(
     // not the summary is saved below (SME-106). One stopped or failed
     // before then is recorded by the recorder's drop (SME-178).
     recorder.finish(&turn, None).await.map_err(|e| anthropic::stream::ModelError::Other(e.to_string()))?;
-    Ok(turn
+    let summary = turn
         .content
         .into_iter()
         .find_map(|block| match block {
             anthropic::ContentBlock::Text { text } => Some(text),
             _ => None,
         })
-        .unwrap_or_default())
+        .unwrap_or_default();
+    // Never saved over the history: a summary that's empty (its thinking
+    // spent the cap) or cut off fails the compaction (PR #291 review 1 M1).
+    let why = if summary.trim().is_empty() { Some("came back empty") } else { anthropic::stream::is_cut_off(&turn.stop_reason).then_some("was cut off") };
+    if let Some(why) = why {
+        return Err(anthropic::stream::ModelError::Other(format!("Couldn't compact the conversation: its summary {why}, so the history was kept as it is. Send another message to try again.")));
+    }
+    Ok(summary)
 }

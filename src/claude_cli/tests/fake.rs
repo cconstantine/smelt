@@ -111,6 +111,11 @@ impl FakeCli {
         text.split('\0').filter(|a| !a.is_empty()).map(str::to_string).collect()
     }
 
+    /// Process `n`'s `CLAUDE_CODE_MAX_OUTPUT_TOKENS`.
+    pub(crate) fn cap(&self, n: usize) -> String {
+        std::fs::read_to_string(self.dir.join(format!("cap.{n}"))).unwrap_or_default()
+    }
+
     /// The names in process `n`'s environment, the fake's own two left out.
     pub(crate) fn env_names(&self, n: usize) -> Vec<String> {
         let text = std::fs::read_to_string(self.dir.join(format!("env.{n}"))).unwrap_or_default();

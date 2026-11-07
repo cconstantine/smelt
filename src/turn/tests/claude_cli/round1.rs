@@ -50,6 +50,72 @@ async fn test_a_deleted_conversations_files_dont_come_back(pool: PgPool) {
     assert!(!file.exists(), "the session file the ending run wrote is gone too");
 }
 
+/// A thinking block as the CLI streams one: no text, a signature.
+fn thinking_block() -> Vec<Value> {
+    vec![
+        json!({"type": "content_block_start", "content_block": {"type": "thinking", "thinking": ""}}),
+        json!({"type": "content_block_delta", "delta": {"type": "signature_delta", "signature": "c2ln"}}),
+    ]
+}
+
+/// A tool loop whose reply filled the window (65,536) past its ceiling,
+/// then `summary`'s steps as the summary's one-shot process.
+fn full_loop_then(summary: Vec<Value>) -> Vec<Vec<Value>> {
+    let tool = crate::claude_cli::tests::fake::tool_block("toolu_r1", "todoread", &json!({}));
+    vec![
+        vec![json!({"read": true}), json!({"emit": api_call(50_000, vec![tool], "tool_use", 5)}), json!({"call": [{"id": "toolu_r1", "name": "mcp__smelt__todoread", "input": {}}]})],
+        summary,
+        vec![json!({"read": true}), text_reply("unreached")],
+    ]
+}
+
+/// M1: a summary that comes back with nothing in it, its thinking having
+/// spent the cap, isn't saved over the history: the compaction fails, the
+/// history stays, and the summary call had room for thinking (`--effort
+/// low`, a cap of `SUMMARY_MAX_TOKENS` plus `once::THINKING_ROOM`).
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_empty_summary_fails_the_compaction_and_keeps_the_history(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let mut empty = api_call(30_000, vec![thinking_block()], "max_tokens", 6_144);
+    empty.push(crate::claude_cli::tests::fake::result_ok());
+    let fake = FakeCli::new("r1-m1", full_loop_then(vec![json!({"read": true}), json!({"emit": empty})]));
+    let provider = fake.pick_for(&pool, conversation.id).await;
+    super::review1::set_cli_window(&pool, provider, 65_536).await;
+
+    let error = run_turn(&pool, conversation.id, hello()).await.expect_err("the compaction fails").to_string();
+
+    assert!(error.contains("summary"), "{error}");
+    assert_eq!(fake.started(), 2, "the run and the summary, no new session");
+    let saved = saved(&pool, conversation.id).await;
+    assert!(!saved.iter().flat_map(|(_, b)| b).any(|b| matches!(b, anthropic::ContentBlock::CompactionSummary { .. })), "nothing replaced the history: {saved:?}");
+    let args = fake.args(1);
+    let effort = args.iter().position(|a| a == "--effort").and_then(|i| args.get(i + 1)).map(String::as_str);
+    assert_eq!(effort, Some("low"), "{args:?}");
+    assert_eq!(fake.cap(1), "6144", "the summary's cap, with room to think");
+}
+
+/// M1, the other half: a summary cut off at its cap, half written, isn't
+/// saved either.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_cut_off_summary_fails_the_compaction(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let mut cut = api_call(30_000, vec![thinking_block(), text_block("The user asked for")], "max_tokens", 6_144);
+    cut.push(crate::claude_cli::tests::fake::result_ok());
+    let fake = FakeCli::new("r1-m1-cut", full_loop_then(vec![json!({"read": true}), json!({"emit": cut})]));
+    let provider = fake.pick_for(&pool, conversation.id).await;
+    super::review1::set_cli_window(&pool, provider, 65_536).await;
+
+    let error = run_turn(&pool, conversation.id, hello()).await.expect_err("the compaction fails").to_string();
+
+    assert!(error.contains("summary"), "{error}");
+    let saved = saved(&pool, conversation.id).await;
+    assert!(!saved.iter().flat_map(|(_, b)| b).any(|b| matches!(b, anthropic::ContentBlock::CompactionSummary { .. })), "{saved:?}");
+}
+
 /// L1: a one-shot call cut off at its cap is stopped at once: the CLI's
 /// own continuation (here, a call that would stamp after 2 s) never runs,
 /// and the call returns without waiting out `WIND_DOWN`.
