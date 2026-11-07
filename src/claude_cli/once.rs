@@ -8,7 +8,8 @@
 //! allowlist as a turn's run, given the request's system prompt as its
 //! file and its one message as a stream-json user line, its input then
 //! closed. It replies once (`--max-turns 1`), says its `result`, and
-//! exits; one that hasn't within `WIND_DOWN` of its `result` is killed.
+//! exits; one that hasn't within `WIND_DOWN` of its `result` is killed,
+//! and one whose reply is cut off at its cap is killed at once.
 
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -106,11 +107,20 @@ pub async fn once(
     drop(stdin);
     let mut lines = BufReader::new(stdout).lines();
     let replied = read(&mut lines, &launching, on_delta, meter).await;
-    // Done with it however the reply went: it's given `WIND_DOWN` to exit.
-    if tokio::time::timeout(WIND_DOWN, child.wait()).await.is_err() {
+    let kill = |child: &tokio::process::Child| {
         if let Some(group) = child.id().and_then(|id| i32::try_from(id).ok()) {
             let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(group), nix::sys::signal::Signal::SIGKILL);
         }
+    };
+    // A reply cut off at its cap is killed at once: the CLI would carry on
+    // by itself (S6), unmetered, and its input is already closed, so no
+    // interrupt can reach it (PR #291 review 1 L1).
+    if replied.as_ref().is_ok_and(|turn| crate::anthropic::stream::is_cut_off(&turn.stop_reason)) {
+        kill(&child);
+    }
+    // Done with it however the reply went: it's given `WIND_DOWN` to exit.
+    if tokio::time::timeout(WIND_DOWN, child.wait()).await.is_err() {
+        kill(&child);
         let _ = child.wait().await;
     }
     replied.map_err(|e| match e {
@@ -166,6 +176,10 @@ async fn read(
         }
     }
     let (content, cut_off_call) = blocks.finish(&stop_reason).map_err(ModelError::Other)?;
+    // Cut off: no `result` to wait for, since `once` kills it now (L1).
+    if crate::anthropic::stream::is_cut_off(&stop_reason) {
+        return Ok(StreamedTurn { content, stop_reason, usage: meter.usage(), cut_off_call });
+    }
     // Its `result`, so the process is done; a reply already in hand stands.
     let _ = tokio::time::timeout(WIND_DOWN, async {
         while let Ok(event) = next().await {
