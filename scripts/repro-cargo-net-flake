@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# Gives scripts/check.sh the crates.io network flake a seat's gate met
+# (SME-442), on demand, and says what came of it:
+#
+#   docker compose run --rm --no-deps smelt scripts/repro-cargo-net-flake <case>
+#
+# check.sh runs with a fresh, empty CARGO_HOME (a seat's gate state: every
+# `docker compose run --rm smelt` starts with an empty registry) and the
+# repo's target/, with cargo's traffic through scripts/lib/flaky-connect-proxy.py,
+# which refuses chosen CONNECTs with a 503. It is stopped at its
+# `== cluster (` line, after every compile step (web build, server build,
+# lints, the server tests' build), so no cluster or database is needed.
+#
+# Cases (the proxy's refusals):
+#   server-once     refuse 1 CONNECT, armed when the server build starts
+#   server-exhaust  refuse every CONNECT from the server build on
+#   web-once        refuse the first CONNECT
+#   fetch-exhaust   refuse the first 4 CONNECTs (cargo's try and 3 retries)
+#   fetch-down      refuse every CONNECT
+#   warm            a `cargo fetch` through a proxy that refuses nothing,
+#                   then check.sh with every CONNECT refused
+#
+# The server build is armed by a `cargo` shim first on PATH that writes the
+# arm file when its arguments are exactly `build --features server`, before
+# it execs the real cargo, so the refusal lands on that build's first
+# connection whatever came before it.
+#
+# One verdict, and the exit status says it:
+#   0 PASSED          check.sh reached `== cluster (`
+#   1 REPRODUCED      check.sh failed with a network-flake line (`spurious
+#                     network error`, `failed to get`/`failed to download`)
+#                     and the proxy refused something
+#   2 INCONCLUSIVE    the harness didn't bite: the case's refusal never
+#                     happened (no REFUSED, or the server build never armed)
+#   3 OTHER FAILURE   anything else
+#   4 OUTAGE REPORTED check.sh stopped before any build with its
+#                     `crates.io unreachable` line
+# The run's output, the proxy's log and a summary are kept, overwritten by
+# the next run of the case, under target/repro-net/<case>/.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+case=${1:-}
+proxy_args=()
+bite=refused
+case $case in
+server-once) proxy_args=(--armed-refuse 1); bite=armed ;;
+server-exhaust) proxy_args=(--armed-refuse all); bite=armed ;;
+web-once) proxy_args=(--refuse-first 1) ;;
+fetch-exhaust) proxy_args=(--refuse-first 4) ;;
+fetch-down) proxy_args=(--refuse-all) ;;
+warm) proxy_args=(--refuse-all); bite=none ;;
+*)
+    echo "usage: scripts/repro-cargo-net-flake server-once|server-exhaust|web-once|fetch-exhaust|fetch-down|warm" >&2
+    exit 64
+    ;;
+esac
+
+out=target/repro-net/$case
+mkdir -p "$out"
+work=$(mktemp -d)
+arm_file=$work/armed
+real_cargo=$(command -v cargo) || { echo "no cargo on PATH" >&2; exit 3; }
+mkdir -p "$work/bin" "$work/cargo-home"
+cat >"$work/bin/cargo" <<'EOF'
+#!/usr/bin/env bash
+[ "$*" = "build --features server" ] && : >"$REPRO_ARM_FILE"
+exec "$REPRO_REAL_CARGO" "$@"
+EOF
+chmod +x "$work/bin/cargo"
+
+proxy_pid=""
+stop_proxy() {
+    [ -n "$proxy_pid" ] && kill "$proxy_pid" 2>/dev/null
+    [ -n "$proxy_pid" ] && wait "$proxy_pid" 2>/dev/null
+    proxy_pid=""
+}
+trap stop_proxy EXIT
+# start_proxy LOG ARGS...: a proxy logging to LOG; sets $proxy_port.
+start_proxy() {
+    local log=$1
+    shift
+    : >"$log"
+    python3 -I scripts/lib/flaky-connect-proxy.py --log "$log" --ready "$work/port" "$@" &
+    proxy_pid=$!
+    for _ in $(seq 1 100); do
+        [ -s "$work/port" ] && break
+        sleep 0.1
+    done
+    if ! [ -s "$work/port" ] || ! kill -0 "$proxy_pid" 2>/dev/null; then
+        echo "the proxy didn't start" >&2
+        exit 3
+    fi
+    proxy_port=$(cat "$work/port")
+    : >"$work/port"
+}
+# cargo's environment: the empty CARGO_HOME, the proxy, the shim; nothing
+# of the caller's own proxy or offline settings.
+run_env=(env -u CARGO_NET_OFFLINE -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY
+    PATH="$work/bin:$PATH" CARGO_HOME="$work/cargo-home" REPRO_ARM_FILE="$arm_file" REPRO_REAL_CARGO="$real_cargo"
+    SMELT_SKIP_SCRIPT_TESTS=1)
+
+if [ "$case" = warm ]; then
+    start_proxy "$out/proxy-prefetch.log"
+    echo "== warm: cargo fetch into the empty CARGO_HOME, nothing refused"
+    if ! "${run_env[@]}" CARGO_HTTP_PROXY="http://127.0.0.1:$proxy_port" cargo fetch >"$out/prefetch.log" 2>&1; then
+        tail -20 "$out/prefetch.log"
+        echo "VERDICT: OTHER FAILURE (the warm case's first fetch failed: $out/prefetch.log)"
+        exit 3
+    fi
+    stop_proxy
+fi
+
+start_proxy "$out/proxy.log" --arm-file "$arm_file" "${proxy_args[@]}"
+echo "== $case: scripts/check.sh, CARGO_HOME $work/cargo-home, proxy 127.0.0.1:$proxy_port ${proxy_args[*]}"
+: >"$out/output.log"
+"${run_env[@]}" CARGO_HTTP_PROXY="http://127.0.0.1:$proxy_port" setsid scripts/check.sh >"$out/output.log" 2>&1 &
+check_pid=$!
+reached=no
+deadline=$((SECONDS + ${REPRO_TIMEOUT:-3600}))
+while kill -0 "$check_pid" 2>/dev/null; do
+    if grep -q '^== cluster (' "$out/output.log"; then
+        reached=yes
+        kill -TERM -- "-$check_pid" 2>/dev/null
+        break
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+        echo "check.sh still running after ${REPRO_TIMEOUT:-3600} s; stopping it"
+        kill -TERM -- "-$check_pid" 2>/dev/null
+        break
+    fi
+    sleep 1
+done
+wait "$check_pid"
+rc=$?
+grep -q '^== cluster (' "$out/output.log" && reached=yes
+stop_proxy
+
+total=$(grep -c '^#' "$out/proxy.log")
+refused=$(grep -c ' REFUSED' "$out/proxy.log")
+after_arming=$(grep -c ' armed$' "$out/proxy.log")
+armed=no
+[ -e "$arm_file" ] && armed=yes
+out_log=$out/output.log
+bit=yes
+case $bite in
+armed) [ "$armed" = yes ] || bit=no ;;
+refused) [ "$refused" -gt 0 ] || bit=no ;;
+esac
+
+if [ "$reached" = yes ]; then
+    if [ "$bit" = yes ]; then verdict="PASSED"; code=0; else verdict="INCONCLUSIVE"; code=2; fi
+elif grep -q '^crates.io unreachable' "$out_log" && ! grep -qE '^== (web build|server build)' "$out_log"; then
+    verdict="OUTAGE REPORTED"; code=4
+elif [ "$bit" = no ] || { [ "$bite" != none ] && [ "$refused" -eq 0 ]; }; then
+    verdict="INCONCLUSIVE"; code=2
+elif [ "$refused" -gt 0 ] && grep -qE 'spurious network error|failed to (get|download)' "$out_log"; then
+    verdict="REPRODUCED"; code=1
+else
+    verdict="OTHER FAILURE"; code=3
+fi
+
+{
+    echo "== $case"
+    echo "-- check.sh's warning/error lines:"
+    grep -E '^(warning|error)|^Caused by:|^ +\[[0-9]+\]|spurious network error|^crates.io unreachable|^cargo-fetch:' "$out_log" | head -40
+    echo "-- check.sh's steps and last line:"
+    grep -E '^== ' "$out_log"
+    tail -1 "$out_log"
+    echo "-- check.sh exit status: $rc (reached '== cluster (': $reached; stopped there when it did)"
+    echo "-- proxy: $total CONNECTs, $refused REFUSED, server build armed: $armed, $after_arming CONNECTs after arming"
+    grep -E 'REFUSED|armed' "$out/proxy.log" | head -20
+    echo "   (full log: $out/proxy.log; run output: $out_log)"
+    echo "VERDICT: $verdict"
+} | tee "$out/summary.txt"
+exit "$code"
