@@ -320,3 +320,41 @@ async fn test_a_refused_questions_delivered_result_isnt_repeated(pool: PgPool) {
     assert!(!sent.contains("toolu_again"), "the refusal the CLI has isn't sent again: {sent}");
 }
 
+/// PR #295 review 1 L3: an echo the CLI wrote itself, for a call smelt
+/// never answered, isn't counted as delivered: the next turn still sends
+/// smelt's own result for it, and skips only the one smelt answered.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_echo_smelt_never_answered_isnt_marked_delivered(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let mut first = vec![json!({"read": true})];
+    let mut reply = tool_reply(&[("toolu_a", "todoread", json!({})), ("toolu_b", "todoread", json!({}))]);
+    reply.pop();
+    first.extend(reply);
+    // toolu_a through the bridge; toolu_b answered by the CLI itself.
+    first.push(json!({"call": [{"id": "toolu_a", "name": "mcp__smelt__todoread", "input": {}}]}));
+    let own = json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_b", "content": [{"type": "text", "text": "the CLI's own"}]}]}});
+    first.push(json!({"emit": [own]}));
+    first.push(json!({"next_call": true}));
+    let fake = FakeCli::new("own-echo", vec![first, vec![json!({"read": true}), text_reply("Hi again.")]]);
+    fake.pick_for(&pool, conversation.id).await;
+    crate::claude_cli::run::close::CLOSE_WAIT_FOR_TESTS.store(300, std::sync::atomic::Ordering::SeqCst);
+
+    let bounded = run_turn_bounded(&pool, TurnInFlight::start(conversation.id), Some(hello()), 1, None, false).await;
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !fake.dir.join("exited.0").exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    crate::claude_cli::run::close::CLOSE_WAIT_FOR_TESTS.store(0, std::sync::atomic::Ordering::SeqCst);
+    bounded.expect_err("one model call is the bound");
+    ended.expect("the run ends");
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the next turn");
+    assert!(fake.args(1).iter().any(|a| a == "--resume"), "resumed: {:?}", fake.args(1));
+    let sent = &user_texts(&fake, 1)[0];
+    assert!(sent.contains("(smelt ran `todoread` (call toolu_b); it returned:)"), "smelt's own result for the call it never answered: {sent}");
+    assert!(!sent.contains("(call toolu_a)"), "the call the close answered isn't repeated: {sent}");
+}

@@ -126,7 +126,14 @@ impl Run {
                             if block["type"] == "tool_result"
                                 && let Some(id) = block["tool_use_id"].as_str()
                             {
-                                echoed.insert(id.to_string());
+                                // Only an echo of smelt's own answer is
+                                // delivered: one the CLI wrote itself isn't
+                                // (PR #295 review 1 L3).
+                                if self.answered.contains(id) {
+                                    echoed.insert(id.to_string());
+                                } else {
+                                    tracing::warn!(conversation_id = self.conversation_id, tool_use_id = id, "Claude Code echoed a result for a call smelt didn't answer while closing its run");
+                                }
                             }
                         }
                     }
