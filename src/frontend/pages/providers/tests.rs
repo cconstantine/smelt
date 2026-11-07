@@ -100,9 +100,11 @@ fn test_digits_are_grouped_by_thousands() {
     assert_eq!(group_digits(1_048_576), "1,048,576");
 }
 
-#[test]
-fn test_models_without_tools_are_suggested_last() {
-    let model = |id: &str, tools: Option<bool>| ModelInfo {
+/// A `ModelInfo` for these tests: nothing overridden, nothing learned,
+/// and only the tools tell — the learned window is what the tests below
+/// it vary.
+fn model_row(id: &str, tools: Option<bool>) -> ModelInfo {
+    ModelInfo {
         id: id.to_string(),
         display_name: None,
         thinking_override: None,
@@ -121,10 +123,76 @@ fn test_models_without_tools_are_suggested_last() {
         learned_window_reason: None,
         learned_window_conversation: None,
         details_error: None,
-    };
+    }
+}
+
+#[test]
+fn test_models_without_tools_are_suggested_last() {
+    let model = |id: &str, tools: Option<bool>| model_row(id, tools);
     let ordered = suggestion_order(vec![model("a", Some(false)), model("b", None), model("c", Some(true))]);
     let ids: Vec<&str> = ordered.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, vec!["b", "c", "a"]);
+}
+
+/// SME-439 PR 2: when smelt learned a model's window, the page says the
+/// whole story — value, telling, when, conversation — and always shows it
+/// when one exists, the user's own value notwithstanding.
+#[test]
+fn test_the_learned_line_tells_its_whole_story() {
+    let learned = ModelInfo {
+        learned_context_window: Some(160_799),
+        learned_window_at: Some("2026-11-06T16:14:07".to_string()),
+        learned_window_reason: Some("window_stop".to_string()),
+        learned_window_conversation: Some(2_294_639_607),
+        ..model_row("strata", None)
+    };
+    assert_eq!(
+        learned_window_line(&learned).as_deref(),
+        Some("smelt learned 160,799 after a window stop on Nov 6 16:14 (conversation #2294639607)")
+    );
+    let refused = ModelInfo { learned_window_reason: Some("refusal".to_string()), ..learned.clone() };
+    assert_eq!(
+        learned_window_line(&refused).as_deref(),
+        Some("smelt learned 160,799 after a named refusal on Nov 6 16:14 (conversation #2294639607)")
+    );
+    let ps = ModelInfo { learned_window_reason: Some("ollama_ps".to_string()), ..learned.clone() };
+    assert!(
+        learned_window_line(&ps).as_deref().is_some_and(|l| l.starts_with("smelt learned 160,799 after Ollama's answer")),
+        "{:?}",
+        learned_window_line(&ps)
+    );
+    let untold = ModelInfo { learned_window_reason: None, learned_window_at: None, learned_window_conversation: None, ..learned.clone() };
+    assert_eq!(learned_window_line(&untold).as_deref(), Some("smelt learned 160,799 from a window measurement"), "a telling that cannot be read leaves plain words, not a crash");
+}
+
+/// Nothing learned, nothing said.
+#[test]
+fn test_the_learned_line_is_absent_with_nothing_learned() {
+    assert_eq!(learned_window_line(&model_row("m", None)), None);
+}
+
+/// The incident made visible: with the user's own Context window also
+/// set, the learned line still appears and admits what the reader does
+/// not use. A field value the reader would ignore (zero) gets no such
+/// tag (Decided (Driver): the tag follows the read path's positivity).
+#[test]
+fn test_the_learned_line_admits_when_the_users_value_wins() {
+    let masked = ModelInfo {
+        learned_context_window: Some(160_799),
+        learned_window_reason: Some("window_stop".to_string()),
+        context_window_override: Some(262_144),
+        ..model_row("strata", None)
+    };
+    assert_eq!(
+        learned_window_line(&masked).as_deref(),
+        Some("smelt learned 160,799 after a window stop (not in use — your Context window value wins)")
+    );
+    let nonsense = ModelInfo { context_window_override: Some(0), ..masked.clone() };
+    assert_eq!(
+        learned_window_line(&nonsense).as_deref(),
+        Some("smelt learned 160,799 after a window stop"),
+        "a value the reader ignores cannot win the read"
+    );
 }
 
 /// SME-162: "Max concurrent requests" as sent: blank is no limit, and
