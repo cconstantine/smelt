@@ -6,7 +6,12 @@
 #
 # check.sh runs with a fresh, empty CARGO_HOME (a seat's gate state: every
 # `docker compose run --rm smelt` starts with an empty registry) and the
-# repo's target/, with cargo's traffic through scripts/lib/flaky-connect-proxy.py,
+# repo's target/. The CARGO_HOME is at one fixed path in the container's
+# own /tmp, /tmp/repro-net-cargo-home, which a new `run --rm` container
+# starts without; the harness refuses to run when it isn't empty. A fixed
+# path, not a new one per run, because cargo's fingerprints name the
+# registry's source path: a new path recompiled every crate on each run.
+# With cargo's traffic through scripts/lib/flaky-connect-proxy.py,
 # which refuses chosen CONNECTs with a 503. It is stopped at its
 # `== cluster (` line, after every compile step (web build, server build,
 # lints, the server tests' build), so no cluster or database is needed.
@@ -61,7 +66,12 @@ mkdir -p "$out"
 work=$(mktemp -d)
 arm_file=$work/armed
 real_cargo=$(command -v cargo) || { echo "no cargo on PATH" >&2; exit 3; }
-mkdir -p "$work/bin" "$work/cargo-home"
+cargo_home=/tmp/repro-net-cargo-home
+mkdir -p "$work/bin" "$cargo_home"
+if [ -n "$(ls -A "$cargo_home")" ]; then
+    echo "$cargo_home isn't empty: run each case in a new container (docker compose run --rm)" >&2
+    exit 3
+fi
 cat >"$work/bin/cargo" <<'EOF'
 #!/usr/bin/env bash
 [ "$*" = "build --features server" ] && : >"$REPRO_ARM_FILE"
@@ -97,7 +107,7 @@ start_proxy() {
 # cargo's environment: the empty CARGO_HOME, the proxy, the shim; nothing
 # of the caller's own proxy or offline settings.
 run_env=(env -u CARGO_NET_OFFLINE -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY
-    PATH="$work/bin:$PATH" CARGO_HOME="$work/cargo-home" REPRO_ARM_FILE="$arm_file" REPRO_REAL_CARGO="$real_cargo"
+    PATH="$work/bin:$PATH" CARGO_HOME="$cargo_home" REPRO_ARM_FILE="$arm_file" REPRO_REAL_CARGO="$real_cargo"
     SMELT_SKIP_SCRIPT_TESTS=1)
 
 if [ "$case" = warm ]; then
@@ -112,7 +122,7 @@ if [ "$case" = warm ]; then
 fi
 
 start_proxy "$out/proxy.log" --arm-file "$arm_file" "${proxy_args[@]}"
-echo "== $case: scripts/check.sh, CARGO_HOME $work/cargo-home, proxy 127.0.0.1:$proxy_port ${proxy_args[*]}"
+echo "== $case: scripts/check.sh, CARGO_HOME $cargo_home, proxy 127.0.0.1:$proxy_port ${proxy_args[*]}"
 : >"$out/output.log"
 "${run_env[@]}" CARGO_HTTP_PROXY="http://127.0.0.1:$proxy_port" setsid scripts/check.sh >"$out/output.log" 2>&1 &
 check_pid=$!
