@@ -184,6 +184,12 @@ fn run_turn_steps<'a: 'b, 'b>(
         }
 
         let mut streak = TextCallStreak::default();
+        // The number this turn's window stops carry as evidence (SME-439
+        // round 1 M1): every model call below shares it — a `carries_on`
+        // continuation included — so the candidate map can refuse a
+        // like-sized restop inside one turn the repeat it would wrongly
+        // learn from.
+        let window_stop_turn = super::overflow::next_window_stop_turn();
         for _ in 0..max_turns {
             // The model's `ask_user` (SME-34): an answer recorded since
             // this turn saved its own message is taken now, so the model
@@ -363,7 +369,7 @@ fn run_turn_steps<'a: 'b, 'b>(
             // before the meter is published below, so a save moves the
             // meter too.
             if super::overflow::window_stop(turn_model.kind, &turn.stop_reason, turn.usage.output_tokens, budget.tokens) {
-                super::overflow::learn_window_stop(pool, conversation_id, turn_model, &turn.usage, &turn.content, &turn.stop_reason).await;
+                super::overflow::learn_window_stop(pool, conversation_id, window_stop_turn, turn_model, &turn.usage, &turn.content, &turn.stop_reason).await;
             }
             save_reply(pool, conversation_id, &turn, &mut persisted).await?;
             #[cfg(test)]

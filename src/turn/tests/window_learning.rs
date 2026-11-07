@@ -297,6 +297,39 @@ async fn test_a_second_stop_of_a_different_size_replaces_the_candidate(pool: PgP
     assert_eq!(saved_learned_context_window(&pool).await, None, "nothing is saved from two different sizes");
 }
 
+/// Round 1 M1: a repeat that saves must come from a later turn, not from
+/// the same turn calling the model again. `carries_on` (and a looping
+/// reply that keeps restopping — this incident's own shape) can stop a
+/// user turn's second model call at the same size, and that second stop
+/// measured the same conversation filling, not a second, independent
+/// fill. The cross-turn case — a second turn's like-sized stop being the
+/// evidence — stays T9, pinned at the learner's own level below.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_like_sized_stop_inside_one_turn_is_no_repeat(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    crate::turn::overflow::forget_window_stop_candidates();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    // The llama.cpp shape, nothing reported: only a repeat could ever
+    // save. The learner is driven once per model call of one turn; the
+    // mock is there to own the provider row, not to answer.
+    let _requests = start_recording_mock_upstream_of_kind(&pool, vec![text_reply_body("Never served.")], "llama_cpp").await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let mut turn_model = crate::providers::resolve_turn_model(&pool, conversation.id).await.expect("the mock model");
+    let usage = anthropic::TokenUsage { input_tokens: 41_900, output_tokens: 100, ..Default::default() };
+    let content = [anthropic::ContentBlock::Text { text: "Filled what there was.".into() }];
+
+    // Two model calls inside one turn (carries_on, say), both stopped at
+    // 42,000: one turn id for both.
+    crate::turn::overflow::learn_window_stop(&pool, conversation.id, 1, &mut turn_model, &usage, &content, "max_tokens").await;
+    crate::turn::overflow::learn_window_stop(&pool, conversation.id, 1, &mut turn_model, &usage, &content, "max_tokens").await;
+    assert_eq!(saved_learned_context_window(&pool).await, None, "one turn, two like-sized stops: one conversation filled, not two fills");
+
+    // The same stop in a later turn is the evidence (T9's pair, pinned at
+    // the learner's own level).
+    crate::turn::overflow::learn_window_stop(&pool, conversation.id, 2, &mut turn_model, &usage, &content, "max_tokens").await;
+    assert_eq!(saved_learned_context_window(&pool).await, Some(42_000), "twice 42,000, two turns apart, is 42,000");
+}
+
 /// T11: a llama.cpp server's `n_ctx` is the total across its slots — the
 /// gate divides before it compares. A measurement at one slot's window
 /// (262,144 ÷ 2 = 131,072) is plausible at 130,000, and the incident's

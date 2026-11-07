@@ -7,6 +7,7 @@
 //! its budget is kept as it stands and leaves its measured size behind.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use super::*;
@@ -296,12 +297,29 @@ fn trace_window_decision(
 }
 
 /// The repeat evidence for an ambiguous, implausible window stop
-/// (SME-439): the last candidate measurement per `(provider, model)`, so
-/// a second like-sized stop — two independent fills at one size — can
-/// learn what one never may. Process-local: a restart drops it, which
-/// errs toward never learning (Trade-offs). Never held across an await.
-static WINDOW_STOP_CANDIDATES: LazyLock<Mutex<HashMap<(i64, String), (i64, i64)>>> =
+/// (SME-439): the last candidate measurement per `(provider, model)` —
+/// its size and the turn that measured it — so a second like-sized stop,
+/// two independent fills at one size, can learn what one never may. A
+/// repeat only counts from a *later* turn (round 1 M1): one turn can
+/// stop twice (its `carries_on` continuation calls the model again),
+/// and a looping reply restopping within its own turn — this incident's
+/// own shape — measures the same conversation filling, not a second
+/// fill. Process-local: a restart drops it, which errs toward never
+/// learning (Trade-offs). Never held across an await.
+static WINDOW_STOP_CANDIDATES: LazyLock<Mutex<HashMap<(i64, String), (i64, u64)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Numbers telling one turn's model calls from every other turn's
+/// (SME-439 round 1 M1): `run_turn_steps` takes the next one before its
+/// loop, so every model call of that turn — a `carries_on` continuation
+/// included — shares it and no other turn has it.
+static WINDOW_STOP_TURNS: AtomicU64 = AtomicU64::new(0);
+
+/// The number this turn's window-stop evidence carries; take it once per
+/// turn, before its loop.
+pub(super) fn next_window_stop_turn() -> u64 {
+    WINDOW_STOP_TURNS.fetch_add(1, Ordering::Relaxed)
+}
 
 /// What this model's server reports per request: the stored reported
 /// window and its llama.cpp slot split (two queries — the learner's own
@@ -338,16 +356,18 @@ async fn reported_per_request_for(
 /// conversation's 160,799 as strata's window for 1.7 hours). So
 /// SME-439's gate: save when the stop is unambiguous (the server's own
 /// `model_context_window_exceeded`) or the measurement lands within
-/// [`WINDOW_STOP_MARGIN`] of what the server reports per request, or an
-/// equally-sized stop repeats; never from a degenerate or near-empty
-/// reply, and never below [`MIN_PLAUSIBLE_WINDOW`]. Reported and
-/// disagreeing: save nothing and leave this turn's belief where the
+/// [`WINDOW_STOP_MARGIN`] of what the server reports per request, or a
+/// like-sized stop comes in a later turn (a second stop in this same
+/// turn is the same fill counted twice); never from a degenerate or
+/// near-empty reply, and never below [`MIN_PLAUSIBLE_WINDOW`]. Reported
+/// and disagreeing: save nothing and leave this turn's belief where the
 /// server said it is; reported unknown: evidence for this turn only. The
 /// reply is kept either way and this retries nothing itself; the notice
 /// wording (`window_stop`) is untouched.
 pub(super) async fn learn_window_stop(
     pool: &PgPool,
     conversation_id: i64,
+    stop_turn: u64,
     turn_model: &mut crate::providers::TurnModel,
     usage: &anthropic::TokenUsage,
     content: &[anthropic::ContentBlock],
@@ -381,11 +401,13 @@ pub(super) async fn learn_window_stop(
         if save {
             candidates.remove(&key); // a save ends the argument
             true
-        } else if candidates.get(&key).is_some_and(|(prev, _)| prev.abs_diff(measured) <= WINDOW_STOP_MARGIN as u64) {
-            candidates.remove(&key); // this stop is the repeat itself
+        } else if candidates.get(&key).is_some_and(|(prev, prev_turn)| *prev_turn != stop_turn && prev.abs_diff(measured) <= WINDOW_STOP_MARGIN as u64) {
+            candidates.remove(&key); // a later turn's stop is the repeat itself
             true
         } else {
-            candidates.insert(key, (measured, conversation_id));
+            // First candidate, or this turn's own stop again: keep (or
+            // update) it, still only a repeat for a later turn.
+            candidates.insert(key, (measured, stop_turn));
             false
         }
     };
