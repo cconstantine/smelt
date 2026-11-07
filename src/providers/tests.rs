@@ -150,6 +150,27 @@ async fn test_a_llama_cpp_report_divides_by_its_slots_before_it_forgets(pool: Pg
     assert_eq!(row.learned_context_window, None, "40,960 a request outgrew 32,768: forgotten");
 }
 
+/// L4 (round 1), Expected 3a's third leg: a listing write carrying no
+/// reported window is no evidence about the window at all — what it
+/// reports about thinking or tools notwithstanding, the learned four
+/// stay set and the clear stays silent. The guard was right-by-read and
+/// unpinned; this pins the promise, not the mechanism.
+#[cfg(feature = "server")]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_report_with_no_window_says_nothing_against_a_learned_one(pool: PgPool) {
+    let provider = report_provider(&pool, "anthropic", "http://one").await;
+    crate::db::save_learned_context_window(&pool, provider.id, "http://one", "m", 32_768, "window_stop", 42, 200_000).await.expect("learn");
+    let details = crate::anthropic::models::ModelDetails { thinking: Some(true), tools: Some(true), ..Default::default() };
+
+    let (result, spans) = crate::telemetry::capture_spans(server::store_details(&pool, provider.id, "m", &details)).await;
+    result.expect("a listing with no window still stores its thinking and tools");
+
+    let row = crate::db::get_provider_model(&pool, provider.id, "m").await.expect("get").expect("row");
+    assert_eq!(row.learned_context_window, Some(32_768), "nothing reported outgrew nothing: the learned window stays");
+    assert_eq!((row.reported_thinking, row.reported_tools), (Some(true), Some(true)), "what it did report is stored");
+    assert!(window_learn_spans(&spans).is_empty(), "nothing cleared, nothing said: {:?}", window_learn_spans(&spans));
+}
+
 /// Wire types go to the browser as JSON; each shape round-trips.
 #[test]
 fn test_conversation_models_round_trip_through_json() {
