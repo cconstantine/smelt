@@ -7,7 +7,9 @@
 //! say, and every process smelt starts gets a cleared environment with an
 //! allowlist (`cli_env`). SME-430's transport runs the turns: `bridge`
 //! shows smelt's tools to the CLI, `run` holds a turn's `claude -p`
-//! process, and `render` says what of smelt's history it's sent.
+//! process, and `render` says what of smelt's history it's sent. SME-431's
+//! compaction: `once` runs the summary as a one-shot call, and `session`
+//! resets the conversation's session after it.
 //!
 //! The wire types here cross to the browser; the rest is server-only.
 
@@ -16,11 +18,6 @@ use serde::{Deserialize, Serialize};
 /// The binary a new Claude Code provider runs: `claude` on the server's
 /// `PATH` (the server image puts it at `/opt/claude/bin/claude`).
 pub const DEFAULT_BINARY: &str = "claude";
-
-/// The error a Claude Code turn ends with when its conversation no longer
-/// fits the model's window: smelt compacts these from SME-431 on.
-#[cfg(feature = "server")]
-pub const CANT_COMPACT_YET: &str = "This conversation no longer fits its Claude Code model's context window, and smelt can't compact a Claude Code conversation yet. Start a new conversation, or switch this one to another provider's model.";
 
 /// Anthropic's terms for this route, quoted on the provider form: the
 /// kind is the one that breaks if they change (SME-399's risk).
@@ -83,6 +80,8 @@ pub mod errors;
 #[cfg(feature = "server")]
 pub mod files;
 #[cfg(feature = "server")]
+pub mod once;
+#[cfg(feature = "server")]
 pub mod process;
 #[cfg(feature = "server")]
 pub mod render;
@@ -90,6 +89,10 @@ pub mod render;
 pub mod run;
 #[cfg(feature = "server")]
 mod server;
+#[cfg(feature = "server")]
+pub mod session;
+#[cfg(feature = "server")]
+pub mod summary;
 
 #[cfg(feature = "server")]
 pub use server::*;

@@ -286,11 +286,8 @@ fn run_turn_steps<'a: 'b, 'b>(
                 // Compacting again would only repeat what the last ones
                 // showed: the turn ends, saying why (SME-386 F10).
                 CompactionStep::Stuck(why) => return Err(ServerFnError::new(why)),
-                // smelt doesn't compact a Claude Code conversation yet
-                // (SME-431): one that no longer fits fails plainly.
-                CompactionStep::Compact if turn_model.kind == crate::providers::ProviderKind::ClaudeCli => {
-                    return Err(ServerFnError::new(crate::claude_cli::CANT_COMPACT_YET));
-                }
+                // A Claude Code conversation too (SME-431): its summary is
+                // a one-shot CLI call, and its session restarts from it.
                 CompactionStep::Compact => {
                     // A proactive compaction: no refusal to name on the
                     // divider (SME-73).

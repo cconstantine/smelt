@@ -631,7 +631,7 @@ async fn compact(
 
     let transcript = compaction_transcript(
         &messages,
-        compaction_transcript_budget(turn_model.context_window),
+        compaction_transcript_budget(turn_model.context_window, turn_model.kind),
     );
 
     // A summary request refused as an overflow (SME-73) is that same
@@ -644,7 +644,7 @@ async fn compact(
         Ok(summary) => summary,
         Err(anthropic::stream::ModelError::Overflow(overflow)) => {
             let named = super::overflow::learn(pool, conversation_id, turn_model, overflow.window).await;
-            let budget = named.map_or(transcript.chars().count() / 2, compaction_transcript_budget);
+            let budget = named.map_or(transcript.chars().count() / 2, |w| compaction_transcript_budget(w, turn_model.kind));
             let transcript = compaction_transcript(&messages, budget);
             match summarize(pool, conversation_id, turn_model, slot, &transcript).await {
                 Ok(summary) => {
@@ -689,6 +689,7 @@ async fn compact(
     db::clear_conversation_usage(pool, conversation_id)
         .await
         .map_err(ServerFnError::new)?;
+    crate::claude_cli::session::reset(pool, conversation_id, turn_model.kind).await;
     Ok(())
 }
 
@@ -730,8 +731,8 @@ async fn summarize(
     let mut discard_deltas = |_: &str| {};
     let recorder =
         CallRecorder::new(pool, conversation_id, turn_model, db::ModelCallKind::Compaction, &summarization_request);
-    let turn = anthropic::stream::stream_anthropic_message_metered(
-        &turn_model.endpoint,
+    let turn = super::call::stream_for_kind(
+        conversation_id, turn_model,
         &summarization_request,
         &mut discard_deltas,
         recorder.meter(),
@@ -742,12 +743,15 @@ async fn summarize(
     // not the summary is saved below (SME-106). One stopped or failed
     // before then is recorded by the recorder's drop (SME-178).
     recorder.finish(&turn, None).await.map_err(|e| anthropic::stream::ModelError::Other(e.to_string()))?;
-    Ok(turn
+    let summary = turn
         .content
         .into_iter()
         .find_map(|block| match block {
             anthropic::ContentBlock::Text { text } => Some(text),
             _ => None,
         })
-        .unwrap_or_default())
+        .unwrap_or_default();
+    // On Claude Code, an empty or cut-off summary fails the compaction
+    // rather than replace the history (PR #291 review 1 M1).
+    crate::claude_cli::summary::checked(turn_model.kind, summary, &turn.stop_reason)
 }

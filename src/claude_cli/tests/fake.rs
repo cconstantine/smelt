@@ -11,7 +11,8 @@
 //! fake exits 0), `{"emit": [line, …]}`, `{"fixture": name, "from": a,
 //! "to": b}` (its lines `a..b`), `{"call": [{"id", "name", "input"}, …]}`
 //! (each through the bridge, one at a time, then its `tool_result` line),
-//! `{"await_interrupt": true}`, `{"stderr": text}`, `{"hang": true}`, `{"exit": code}`. An
+//! `{"await_interrupt": true}`, `{"stderr": text}`, `{"hang": true}`, `{"exit": code}`,
+//! `{"write_session": true}` (its session's file, where the CLI keeps it). An
 //! interrupt during `read` or `call` ends the call with the CLI's
 //! stopped result and an `error_during_execution` `result`, and skips to
 //! the next `read`. After the last step, stdin is read to EOF.
@@ -37,6 +38,9 @@ fn fixture(name: &str) -> &'static str {
         "thinking_off" => include_str!("../fixtures/thinking_off.jsonl"),
         "pending" => include_str!("../fixtures/pending.jsonl"),
         "missing" => include_str!("../fixtures/missing.jsonl"),
+        // Synthesised, not captured (SME-431): its first line says so.
+        "overflow" => include_str!("../fixtures/overflow.jsonl"),
+        "window_stop" => include_str!("../fixtures/window_stop.jsonl"),
         _ => "",
     }
 }
@@ -108,6 +112,11 @@ impl FakeCli {
         text.split('\0').filter(|a| !a.is_empty()).map(str::to_string).collect()
     }
 
+    /// Process `n`'s `CLAUDE_CODE_MAX_OUTPUT_TOKENS`.
+    pub(crate) fn cap(&self, n: usize) -> String {
+        std::fs::read_to_string(self.dir.join(format!("cap.{n}"))).unwrap_or_default()
+    }
+
     /// The names in process `n`'s environment, the fake's own two left out.
     pub(crate) fn env_names(&self, n: usize) -> Vec<String> {
         let text = std::fs::read_to_string(self.dir.join(format!("env.{n}"))).unwrap_or_default();
@@ -117,6 +126,17 @@ impl FakeCli {
     /// When the fake wrote stamp `name`, or started process `n` (`started.n`).
     pub(crate) fn time_of(&self, file: &str) -> std::time::SystemTime {
         std::fs::metadata(self.dir.join(file)).and_then(|m| m.modified()).expect("the file's time")
+    }
+
+    /// The earlier processes still running as process `n` started.
+    pub(crate) fn alive_at_start(&self, n: usize) -> Vec<String> {
+        let text = std::fs::read_to_string(self.dir.join(format!("alive_at_start.{n}"))).expect("process n started");
+        text.lines().map(str::to_string).collect()
+    }
+
+    /// The system prompt process `n` was given (`--system-prompt-file`).
+    pub(crate) fn prompt(&self, n: usize) -> String {
+        std::fs::read_to_string(self.dir.join(format!("prompt.{n}"))).unwrap_or_default()
     }
 
     /// Waits up to 10 s for `check` to hold.
@@ -149,10 +169,25 @@ fn fake_claude_entry() {
     };
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a runtime");
     let n = take_number(&dir);
+    // Its pid, and which earlier processes still ran as it started, for a
+    // test of two processes in one session (SME-431 L21).
+    let _ = std::fs::write(dir.join(format!("pid.{n}")), std::process::id().to_string());
+    let alive: Vec<String> = (0..n)
+        .filter(|i| std::fs::read_to_string(dir.join(format!("pid.{i}"))).ok().is_some_and(|pid| running(pid.trim())))
+        .map(|i| i.to_string())
+        .collect();
+    let _ = std::fs::write(dir.join(format!("alive_at_start.{n}")), alive.join("\n"));
     let code = runtime.block_on(play(&dir, n));
     // When it ended, for a test of what waits on that (PR #285 review 1 L17).
     let _ = std::fs::write(dir.join(format!("exited.{n}")), "");
     std::process::exit(code);
+}
+
+/// Whether process `pid` runs: there, and not a zombie.
+fn running(pid: &str) -> bool {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    // The state follows the command's closing parenthesis.
+    stat.rsplit_once(") ").and_then(|(_, rest)| rest.chars().next()).is_some_and(|state| !matches!(state, 'Z' | 'X'))
 }
 
 /// Takes the next process number.
@@ -260,14 +295,22 @@ async fn play(dir: &Path, n: usize) -> i32 {
         .filter(|name| !name.starts_with("SMELT_FAKE_CLAUDE"))
         .collect();
     std::fs::write(dir.join(format!("env.{n}")), names.join("\n")).expect("log the env");
+    // The reply cap it was launched with (SME-431 review 1 M1).
+    let cap = std::env::var("CLAUDE_CODE_MAX_OUTPUT_TOKENS").unwrap_or_default();
+    std::fs::write(dir.join(format!("cap.{n}")), cap).expect("log the cap");
     let mcp = args.iter().position(|a| *a == "--mcp-config").and_then(|i| args.get(i + 1)).map(|config| {
         let config: Value = serde_json::from_str(&std::fs::read_to_string(config).expect("the MCP config file")).expect("the MCP config");
         let server = &config["mcpServers"]["smelt"];
         let token = server["headers"]["Authorization"].as_str().unwrap_or_default().trim_start_matches("Bearer ").to_string();
         (server["url"].as_str().unwrap_or_default().to_string(), token)
     });
+    // Its system prompt, which smelt removes once the run goes.
+    if let Some(file) = args.iter().position(|a| *a == "--system-prompt-file").and_then(|i| args.get(i + 1)) {
+        let _ = std::fs::copy(file, dir.join(format!("prompt.{n}")));
+    }
     let scenario: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("scenario.json")).expect("the scenario")).expect("JSON");
     let steps = scenario[n].as_array().cloned().unwrap_or_default();
+    let started_in = std::env::current_dir().ok();
     let mut fake = Fake {
         n,
         dir: dir.to_path_buf(),
@@ -333,6 +376,19 @@ async fn play(dir: &Path, n: usize) -> i32 {
             false
         } else if let Some(name) = step["stamp"].as_str() {
             std::fs::write(fake.dir.join(format!("{name}.stamp")), "").expect("a stamp");
+            false
+        } else if step.get("write_session").is_some() {
+            // Its session's file, as the CLI writes it as it goes (SME-431
+            // L22), where smelt's `files` looks for it.
+            let id = args.iter().position(|a| *a == "--session-id" || *a == "--resume").and_then(|i| args.get(i + 1)).copied().unwrap_or_default();
+            let config = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).expect("a config dir");
+            // Its cwd as it started: the CLI knows its paths from then on,
+            // so a deleted cwd doesn't stop it writing (PR #291 review 1 L3).
+            let cwd = started_in.clone().expect("the cwd");
+            let conversation_id: i64 = cwd.file_name().and_then(|n| n.to_str()).and_then(|n| n.parse().ok()).expect("a conversation's work dir");
+            let sessions = crate::claude_cli::files::sessions_dir(&config, &crate::claude_cli::files::work_dir(&config, conversation_id));
+            std::fs::create_dir_all(&sessions).expect("the sessions dir");
+            std::fs::write(sessions.join(format!("{id}.jsonl")), "{}\n").expect("the session file");
             false
         } else if let Some(ms) = step["sleep_ms"].as_u64() {
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;

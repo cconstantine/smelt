@@ -244,23 +244,9 @@ pub(super) async fn set_cli_window(pool: &PgPool, provider_id: i64, window: i32)
         .expect("seed the window");
 }
 
-/// A conversation too full for its window ends its turn plainly on this
-/// kind, by the proactive check, and calls nothing.
-#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_a_full_conversation_fails_plainly_by_the_proactive_check(pool: PgPool) {
-    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
-    let _guard = lock_turn_tests();
-    let conversation = db::create_conversation(&pool).await.expect("conversation");
-    let fake = FakeCli::new("full", vec![vec![json!({"read": true}), text_reply("unreached")]]);
-    let provider = fake.pick_for(&pool, conversation.id).await;
-    set_cli_window(&pool, provider, 32_768).await;
-    let usage = anthropic::TokenUsage { input_tokens: 31_000, ..Default::default() };
-    db::upsert_conversation_usage(&pool, conversation.id, &usage).await.expect("the last usage");
-
-    let error = run_turn(&pool, conversation.id, hello()).await.expect_err("it doesn't fit").to_string();
-    assert!(error.contains(crate::claude_cli::CANT_COMPACT_YET), "{error}");
-    assert_eq!(fake.started(), 0, "no CLI ran");
-}
+// A conversation too full for its window compacted by the proactive check
+// is `compaction::test_a_full_conversation_compacts_at_its_next_turn`
+// since SME-431 (it failed plainly here before).
 
 /// Stop while smelt runs the reply's tool (the run Parked): the run is
 /// interrupted, so the CLI records the call as stopped, and the call is

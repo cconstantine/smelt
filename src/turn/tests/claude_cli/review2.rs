@@ -57,13 +57,14 @@ async fn test_a_call_before_its_block_is_read_is_the_replys(pool: PgPool) {
 /// whose compactions left it tight (on an API provider, at the same
 /// window) and that then moves to Claude Code passes the proactive check
 /// with nothing measured since, and is caught only once its request is
-/// built: it fails plainly there too, starting no CLI.
+/// built. Since SME-431 it compacts there: its first CLI process is the
+/// summary's one-shot call.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_a_tight_conversation_fails_plainly_when_its_request_is_built(pool: PgPool) {
+async fn test_a_tight_conversation_compacts_when_its_request_is_built(pool: PgPool) {
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("conversation");
-    let fake = FakeCli::new("tight", vec![vec![json!({"read": true}), text_reply("unreached")]]);
+    let fake = FakeCli::new("tight", vec![vec![json!({"read": true}), text_reply("SUMMARY-TIGHT")], vec![json!({"read": true}), text_reply("after")]]);
     let provider = fake.pick_for(&pool, conversation.id).await;
     let window = 40_000;
     super::review1::set_cli_window(&pool, provider, window).await;
@@ -79,9 +80,13 @@ async fn test_a_tight_conversation_fails_plainly_when_its_request_is_built(pool:
     let block = [anthropic::ContentBlock::Text { text: "word ".repeat(30_000) }];
     db::create_message(&pool, conversation.id, "user", &block).await.expect("history");
 
-    let error = run_turn(&pool, conversation.id, hello()).await.expect_err("it doesn't fit").to_string();
-    assert!(error.contains(crate::claude_cli::CANT_COMPACT_YET), "{error}");
-    assert_eq!(fake.started(), 0, "no CLI ran");
+    // Whether the turn then fits is the floor's business; the compaction
+    // is what this checks.
+    let _ = run_turn(&pool, conversation.id, hello()).await;
+    assert!(fake.args(0).iter().any(|a| a == "--no-session-persistence"), "the summary ran first: {:?}", fake.args(0));
+    let messages = db::list_messages(&pool, conversation.id).await.expect("messages");
+    let divider = messages.iter().flat_map(|m| m.blocks().expect("blocks")).any(|b| matches!(b, anthropic::ContentBlock::CompactionSummary { .. }));
+    assert!(divider, "it compacted");
 }
 
 /// Review 2 L15, against the real CLI (capture `pending`): with smelt's

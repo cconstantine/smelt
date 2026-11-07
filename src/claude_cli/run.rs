@@ -81,7 +81,7 @@ fn launch_hold() -> Duration {
     LAUNCH_HOLD
 }
 
-fn write_timeout() -> Duration {
+pub(super) fn write_timeout() -> Duration {
     #[cfg(test)]
     {
         let ms = WRITE_TIMEOUT_FOR_TESTS.load(std::sync::atomic::Ordering::SeqCst);
@@ -95,9 +95,14 @@ fn write_timeout() -> Duration {
 /// A start's hold on `LAUNCH`, let go at its first line (`release`) or,
 /// from a timer of its own, at `launch_hold()`, whatever the run is doing
 /// meanwhile (PR #285 review 1 L18).
-struct Launching(Arc<Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>>);
+pub(super) struct Launching(Arc<Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>>);
 
 impl Launching {
+    /// Takes the start lock: a one-shot call's start, too (SME-431).
+    pub(super) async fn take() -> Self {
+        Self::hold(LAUNCH.clone().lock_owned().await)
+    }
+
     fn hold(guard: tokio::sync::OwnedMutexGuard<()>) -> Self {
         let held = Arc::new(Mutex::new(Some(guard)));
         let timer = Arc::downgrade(&held);
@@ -110,7 +115,7 @@ impl Launching {
         Self(held)
     }
 
-    fn release(&self) {
+    pub(super) fn release(&self) {
         release(&self.0);
     }
 }
@@ -137,7 +142,7 @@ pub const NOT_THE_REPLYS: &str = "smelt refused this tool call: it isn't one of 
 #[cfg(test)]
 pub static SILENCE_FOR_TESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn silence() -> Duration {
+pub(super) fn silence() -> Duration {
     #[cfg(test)]
     {
         let ms = SILENCE_FOR_TESTS.load(std::sync::atomic::Ordering::SeqCst);
@@ -154,6 +159,16 @@ pub struct TurnCli {
     run: Option<Run>,
     /// How the last call that failed left its session.
     last_failure: Option<Failure>,
+    /// The last call's failure, when it was an overflow (SME-431).
+    overflow: Option<crate::anthropic::overflow::Overflow>,
+}
+
+impl TurnCli {
+    /// The overflow the last call failed with, if it did: SME-73's
+    /// recovery compacts on it.
+    pub fn take_overflow(&mut self) -> Option<crate::anthropic::overflow::Overflow> {
+        self.overflow.take()
+    }
 }
 
 /// How a failed call left the CLI's session (PR #285 review 1 M2).
@@ -244,6 +259,15 @@ struct Run {
     heard: bool,
     /// Whether its stdout ended or its input broke: the process is gone.
     gone: bool,
+    /// The model it runs.
+    model: String,
+    /// The window and reply cap its last `result` reported for the model,
+    /// until `call` saves them (SME-431).
+    reported: Option<(i32, Option<i32>)>,
+    /// Whether it has saved them.
+    learned: bool,
+    /// The overflow its last `result` said, if it said one.
+    overflow: Option<crate::anthropic::overflow::Overflow>,
 }
 
 /// One model call through the turn's run: starts one if the turn has
@@ -275,6 +299,7 @@ pub async fn call(
     }
     let call = Call { conversation_id, turn_model, request, recorded };
     cli.last_failure = None;
+    cli.overflow = None;
     let replied = call_run(&call, on_delta, meter, extra, cli).await;
     // The session the next turn resumes: this run's, synced to this call,
     // after a call that went well; after any other, none, so the next turn
@@ -298,6 +323,15 @@ pub async fn call(
     if let Err(e) = kept {
         tracing::warn!(conversation_id, "couldn't record the conversation's Claude Code session: {e}");
     }
+    // The window the CLI reported, the model row's from now on: the
+    // compaction trigger's (SME-431). Once a run.
+    if let Some(run) = cli.run.as_mut()
+        && let Some((window, max_output)) = run.reported.take()
+        && !std::mem::replace(&mut run.learned, true)
+        && let Err(e) = crate::providers::learn_claude_cli_window(pool, turn_model.provider_id, &turn_model.model, window, max_output).await
+    {
+        tracing::warn!(conversation_id, "couldn't save the window Claude Code reported: {e}");
+    }
     replied
 }
 
@@ -319,6 +353,15 @@ async fn call_run(
     cli: &mut TurnCli,
 ) -> Result<StreamedTurn, String> {
     let (conversation_id, request) = (call.conversation_id, call.request);
+    // A compaction replaced the history this run's session holds
+    // (SME-431): the run ends, and the call starts a new session from the
+    // summary (the state table's B2 row).
+    if super::session::take_reset(conversation_id)
+        && let Some(old) = cli.run.take()
+    {
+        tracing::info!(conversation_id, "compacted: ending the turn's Claude Code run");
+        old.end_in_background();
+    }
     // A process that died since the last call (an OOM kill while smelt ran
     // a tool) is replaced, as the state table's Dead row says (review 1 M1).
     if let Some(run) = cli.run.as_mut()
@@ -435,9 +478,16 @@ async fn start(call: &Call<'_>, resume: bool) -> Result<Run, String> {
             }
             // A recorded session this one replaces goes now: it holds the
             // conversation's tool output and the CLI's account email
-            // (PR #285 review 1 L20).
-            if let Some(old) = &call.recorded {
-                super::files::forget_session(conversation_id, &old.session_id);
+            // (PR #285 review 1 L20). Once its last process has ended, so
+            // that one doesn't write it back (SME-431 L22). So do those a
+            // compaction replaced (SME-431's reset).
+            let mut replaced = super::session::take_retired(conversation_id);
+            replaced.extend(call.recorded.iter().map(|old| old.session_id.clone()));
+            if !replaced.is_empty() {
+                ended(conversation_id).await;
+            }
+            for old in &replaced {
+                super::files::forget_session(conversation_id, old);
             }
             let session_id = super::process::new_session_id();
             let mut run = Run::spawn(conversation_id, turn_model, request, SessionArg::New(&session_id)).await?;
@@ -470,6 +520,7 @@ async fn read_once(
     let replied = run.read_reply(on_delta, meter, extra).await;
     if replied.is_err() {
         cli_failure(&mut cli.last_failure, run.failure);
+        cli.overflow = run.overflow.take();
     }
     // A run that died before it said anything is kept for `call` to see,
     // and so is one whose session is missing.
@@ -569,6 +620,10 @@ impl Run {
             streaming_ids: std::collections::HashSet::new(),
             answered: std::collections::HashSet::new(),
             delivered: false,
+            model: turn_model.model.clone(),
+            reported: None,
+            learned: false,
+            overflow: None,
         })
     }
 
@@ -627,6 +682,7 @@ impl Run {
             return;
         };
         let conversation_id = self.conversation_id;
+        let group = self.child.id().and_then(|id| i32::try_from(id).ok());
         let ending = runtime.spawn(async move {
             if self.state != State::Idle && self.interrupt().await.is_ok() {
                 let _ = tokio::time::timeout(WIND_DOWN, async {
@@ -652,14 +708,21 @@ impl Run {
         });
         let mut endings = endings();
         let mine = endings.entry(conversation_id).or_default();
-        mine.retain(|task| !task.is_finished());
-        mine.push(ending);
+        mine.retain(|ending| !ending.task.is_finished());
+        mine.push(Ending { task: ending, group });
     }
 }
 
+/// A run being ended: its task, and its process group (the child's pid,
+/// `process_group(0)`), for a wait that runs out to kill (SME-431 L21).
+struct Ending {
+    task: tokio::task::JoinHandle<()>,
+    group: Option<i32>,
+}
+
 /// The tasks ending each conversation's runs (`end_in_background`).
-fn endings() -> std::sync::MutexGuard<'static, HashMap<i64, Vec<tokio::task::JoinHandle<()>>>> {
-    static ENDINGS: std::sync::LazyLock<Mutex<HashMap<i64, Vec<tokio::task::JoinHandle<()>>>>> = std::sync::LazyLock::new(Mutex::default);
+fn endings() -> std::sync::MutexGuard<'static, HashMap<i64, Vec<Ending>>> {
+    static ENDINGS: std::sync::LazyLock<Mutex<HashMap<i64, Vec<Ending>>>> = std::sync::LazyLock::new(Mutex::default);
     // Every change is one insert or take: nothing is left half-done.
     ENDINGS.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -668,24 +731,55 @@ fn endings() -> std::sync::MutexGuard<'static, HashMap<i64, Vec<tokio::task::Joi
 /// an ending interrupts within `WIND_DOWN`, waits as long again, then kills.
 pub const ENDED_WAIT: Duration = Duration::from_secs(12);
 
+#[cfg(test)]
+pub static ENDED_WAIT_FOR_TESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn ended_wait() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = ENDED_WAIT_FOR_TESTS.load(std::sync::atomic::Ordering::SeqCst);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    ENDED_WAIT
+}
+
+/// Whether the table holds an entry for `conversation_id`.
+#[cfg(test)]
+pub fn has_endings(conversation_id: i64) -> bool {
+    endings().contains_key(&conversation_id)
+}
+
 /// Waits, within `ENDED_WAIT`, for every run of `conversation_id` that's
-/// ending to be gone (PR #285 review 1 L17).
-async fn ended(conversation_id: i64) {
+/// ending to be gone (PR #285 review 1 L17). One still going at the end
+/// of the wait is killed, its task and its process group, so a session is
+/// never in two processes (SME-431 L21): its interrupt alone can take
+/// `WRITE_TIMEOUT` to fail on a CLI that doesn't read.
+pub async fn ended(conversation_id: i64) {
     let ending = endings().remove(&conversation_id).unwrap_or_default();
-    for task in ending {
-        if tokio::time::timeout(ENDED_WAIT, task).await.is_err() {
-            tracing::warn!(conversation_id, "a Claude Code process of this conversation is still ending; resuming its session anyway");
+    for Ending { mut task, group } in ending {
+        if tokio::time::timeout(ended_wait(), &mut task).await.is_err() {
+            tracing::warn!(conversation_id, "a Claude Code process of this conversation is still ending: killing it before its session goes on");
+            // The task's drop of the run kills the child (`kill_on_drop`);
+            // the group goes too, whatever it started.
+            task.abort();
+            if let Some(group) = group {
+                let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(group), nix::sys::signal::Signal::SIGKILL);
+            }
+            let _ = task.await;
         }
     }
 }
 
 mod deliver;
 mod read;
+pub(super) use read::apply;
 
 /// A run's files: its system prompt and its `--mcp-config` (which holds
 /// the bridge's token), removed when the run is dropped, however it ends
 /// (review 1 L6). The CLI reads both only as it starts.
-struct RunFiles(Vec<PathBuf>);
+pub(super) struct RunFiles(pub(super) Vec<PathBuf>);
 
 impl Drop for RunFiles {
     fn drop(&mut self) {
@@ -696,7 +790,7 @@ impl Drop for RunFiles {
 }
 
 /// Keeps the last `errors::MAX_QUOTED` bytes of the CLI's stderr.
-async fn keep_tail(mut stderr: tokio::process::ChildStderr, tail: Arc<Mutex<String>>) {
+pub(super) async fn keep_tail(mut stderr: tokio::process::ChildStderr, tail: Arc<Mutex<String>>) {
     let mut buffer = [0u8; 4096];
     while let Ok(n) = stderr.read(&mut buffer).await {
         if n == 0 {

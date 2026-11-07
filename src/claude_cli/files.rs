@@ -34,14 +34,22 @@ fn remove(path: &Path, conversation_id: i64) {
     }
 }
 
-/// Removes everything the CLI kept for `conversation_id`.
-pub fn forget_conversation(conversation_id: i64) {
+/// Removes everything the CLI kept for `conversation_id`, on a blocking
+/// thread: a directory tree's removal is blocking file work, and this
+/// runs on the delete's async path (SME-430's review note, SME-431).
+pub async fn forget_conversation(conversation_id: i64) {
     let Some(config_dir) = config_dir() else {
         return;
     };
-    let work = work_dir(&config_dir, conversation_id);
-    remove(&sessions_dir(&config_dir, &work), conversation_id);
-    remove(&work, conversation_id);
+    let removed = tokio::task::spawn_blocking(move || {
+        let work = work_dir(&config_dir, conversation_id);
+        remove(&sessions_dir(&config_dir, &work), conversation_id);
+        remove(&work, conversation_id);
+    })
+    .await;
+    if let Err(e) = removed {
+        tracing::warn!(conversation_id, "couldn't remove the conversation's Claude Code files: {e}");
+    }
 }
 
 /// Removes session `session_id` of `conversation_id`, once replaced.

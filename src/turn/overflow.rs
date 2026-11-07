@@ -118,8 +118,9 @@ pub(super) async fn recover(
         undercount,
     )
     .await?;
-    // A Claude Code call never reports an overflow (SME-430), so this
-    // retry is always an HTTP one, and has no CLI run to use.
+    // On a Claude Code provider (SME-431) the compaction above reset the
+    // conversation's session, so this retry starts a new one, from the
+    // summary, in a run of its own; the turn's run ends at its next call.
     let mut no_cli = crate::claude_cli::run::TurnCli::default();
     match call_model(pool, conversation_id, turn_model, &mut request, slot, &mut no_cli).await {
         Ok((turn, recorder)) => {

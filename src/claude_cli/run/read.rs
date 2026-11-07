@@ -96,10 +96,15 @@ impl Run {
                     }
                 }
                 Some("result") => {
+                    self.learn_window(&event);
                     self.state = State::Idle;
                     self.healthy = false;
                     if !self.reply_started {
                         self.failure = if session_missing(&event) { Failure::SessionMissing } else { Failure::Unchanged };
+                    }
+                    // "Prompt is too long": the turn's recovery compacts (SME-431).
+                    if let Some(crate::anthropic::stream::ModelError::Overflow(overflow)) = crate::claude_cli::once::result_failure(&event, self.rate.as_ref()) {
+                        self.overflow = Some(overflow);
                     }
                     return Err(result_error(&event, self.rate.as_ref())
                         .unwrap_or_else(|| "Claude Code ended the reply before it finished.".to_string()));
@@ -117,6 +122,20 @@ impl Run {
             let ours = self.expected.iter().any(|e| e.id == id);
             (block["type"] == "tool_result" && ours && !self.answered.contains(id)).then(|| id.to_string())
         })
+    }
+
+    /// The window and reply cap a `result` reports for the run's model
+    /// (`modelUsage[model].contextWindow`, `maxOutputTokens`), kept for
+    /// `call` to save (SME-431). A result with an unknown or implausible
+    /// window keeps what was there.
+    pub(super) fn learn_window(&mut self, result: &Value) {
+        let Some(models) = result["modelUsage"].as_object() else { return };
+        let usage = models.get(&self.model).or_else(|| models.values().find(|u| u["canonicalModel"] == self.model.as_str()));
+        let Some(usage) = usage else { return };
+        let read = |key: &str| usage[key].as_i64().and_then(|n| i32::try_from(n).ok()).filter(|n| *n > 0);
+        if let Some(window) = read("contextWindow").filter(|w| *w >= 1_024) {
+            self.reported = Some((window, read("maxOutputTokens")));
+        }
     }
 
     /// What smelt notes of a line that isn't the reply's.
@@ -179,7 +198,10 @@ impl Run {
             loop {
                 let event = self.next_event().await?;
                 match event["type"].as_str() {
-                    Some("result") => return Ok::<_, String>(()),
+                    Some("result") => {
+                        self.learn_window(&event);
+                        return Ok::<_, String>(());
+                    }
                     Some("stream_event") => {
                         let inner = &event["event"];
                         match interpret_stream_event(inner) {
@@ -204,7 +226,7 @@ impl Run {
 
 /// One `stream_event`'s API event, applied to the reply as
 /// `anthropic::stream` applies an SSE event.
-fn apply(blocks: &mut Blocks, stop_reason: &mut String, event: &Value, on_delta: &mut (dyn FnMut(&str) + Send), meter: &UsageMeter) -> Result<(), String> {
+pub(in crate::claude_cli) fn apply(blocks: &mut Blocks, stop_reason: &mut String, event: &Value, on_delta: &mut (dyn FnMut(&str) + Send), meter: &UsageMeter) -> Result<(), String> {
     let index = block_index(event);
     match interpret_stream_event(event) {
         StreamOutcome::TextDelta(text) => {
