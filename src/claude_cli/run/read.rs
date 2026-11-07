@@ -96,6 +96,7 @@ impl Run {
                     }
                 }
                 Some("result") => {
+                    self.learn_window(&event);
                     self.state = State::Idle;
                     self.healthy = false;
                     if !self.reply_started {
@@ -117,6 +118,20 @@ impl Run {
             let ours = self.expected.iter().any(|e| e.id == id);
             (block["type"] == "tool_result" && ours && !self.answered.contains(id)).then(|| id.to_string())
         })
+    }
+
+    /// The window and reply cap a `result` reports for the run's model
+    /// (`modelUsage[model].contextWindow`, `maxOutputTokens`), kept for
+    /// `call` to save (SME-431). A result with an unknown or implausible
+    /// window keeps what was there.
+    pub(super) fn learn_window(&mut self, result: &Value) {
+        let Some(models) = result["modelUsage"].as_object() else { return };
+        let usage = models.get(&self.model).or_else(|| models.values().find(|u| u["canonicalModel"] == self.model.as_str()));
+        let Some(usage) = usage else { return };
+        let read = |key: &str| usage[key].as_i64().and_then(|n| i32::try_from(n).ok()).filter(|n| *n > 0);
+        if let Some(window) = read("contextWindow").filter(|w| *w >= 1_024) {
+            self.reported = Some((window, read("maxOutputTokens")));
+        }
     }
 
     /// What smelt notes of a line that isn't the reply's.
@@ -179,7 +194,10 @@ impl Run {
             loop {
                 let event = self.next_event().await?;
                 match event["type"].as_str() {
-                    Some("result") => return Ok::<_, String>(()),
+                    Some("result") => {
+                        self.learn_window(&event);
+                        return Ok::<_, String>(());
+                    }
                     Some("stream_event") => {
                         let inner = &event["event"];
                         match interpret_stream_event(inner) {

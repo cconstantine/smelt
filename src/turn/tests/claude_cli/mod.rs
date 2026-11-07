@@ -294,3 +294,4 @@ mod review2;
 mod sessions;
 mod review3;
 mod carried;
+mod compaction;

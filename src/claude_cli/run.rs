@@ -244,6 +244,13 @@ struct Run {
     heard: bool,
     /// Whether its stdout ended or its input broke: the process is gone.
     gone: bool,
+    /// The model it runs.
+    model: String,
+    /// The window and reply cap its last `result` reported for the model,
+    /// until `call` saves them (SME-431).
+    reported: Option<(i32, Option<i32>)>,
+    /// Whether it has saved them.
+    learned: bool,
 }
 
 /// One model call through the turn's run: starts one if the turn has
@@ -297,6 +304,15 @@ pub async fn call(
     };
     if let Err(e) = kept {
         tracing::warn!(conversation_id, "couldn't record the conversation's Claude Code session: {e}");
+    }
+    // The window the CLI reported, the model row's from now on: the
+    // compaction trigger's (SME-431). Once a run.
+    if let Some(run) = cli.run.as_mut()
+        && let Some((window, max_output)) = run.reported.take()
+        && !std::mem::replace(&mut run.learned, true)
+        && let Err(e) = crate::db::set_claude_cli_reported_window(pool, turn_model.provider_id, &turn_model.model, window, max_output).await
+    {
+        tracing::warn!(conversation_id, "couldn't save the window Claude Code reported: {e}");
     }
     replied
 }
@@ -571,6 +587,9 @@ impl Run {
             streaming_ids: std::collections::HashSet::new(),
             answered: std::collections::HashSet::new(),
             delivered: false,
+            model: turn_model.model.clone(),
+            reported: None,
+            learned: false,
         })
     }
 
