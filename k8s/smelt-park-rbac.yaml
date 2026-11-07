@@ -85,13 +85,17 @@ roleRef:
 # SME-12's "Per-pod limit overrides") — the
 # API server rejects any pod creation over this automatically, model
 # override or not, so nothing in application code needs to parse or
-# compare Kubernetes quantity strings itself. Only `max` is set. The API
-# server fills in `default` and `defaultRequest` from it, which matters
-# only for what a container leaves unset: `build_pod_spec` always sets a
-# memory limit and a zero memory request. No `cpu` here at all (SME-77):
-# sandbox pods have no CPU limit or request, and a `cpu` max would hand
-# each container a defaulted 16-CPU limit and request, which can't be
-# scheduled.
+# compare Kubernetes quantity strings itself. All three fields are set
+# explicitly (SME-335): the API server fills an unset `default` or
+# `defaultRequest` from `max` on every write, so omitting them left the
+# Terraform module's plan never closing and handed the whole ceiling as a
+# memory request — unschedulable — to every container naming none of its
+# own. `default` mirrors the max (an un-capped container keeps the limit
+# it always effectively had, and lowering the ceiling moves both
+# together); `defaultRequest: "0"` reserves nothing. No `cpu` here at
+# all (SME-77): sandbox pods have no CPU limit or request, and a `cpu`
+# max would hand each container a defaulted CPU limit and request,
+# which can't be scheduled.
 apiVersion: v1
 kind: LimitRange
 metadata:
@@ -102,6 +106,10 @@ spec:
     - type: Container
       max:
         memory: 64Gi
+      default:
+        memory: 64Gi
+      defaultRequest:
+        memory: "0"
 ---
 # `smelt-park-test` mirrors every namespaced object above, for real-cluster
 # test runs — see the file-level comment for why this exists as a second
@@ -177,3 +185,7 @@ spec:
     - type: Container
       max:
         memory: 64Gi
+      default:
+        memory: 64Gi
+      defaultRequest:
+        memory: "0"
