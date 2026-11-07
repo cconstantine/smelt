@@ -27,11 +27,17 @@
 //!   reply's results going to the new run as text (review 1 M1).
 //! - `result` with `is_error` before `message_stop`, the process ending,
 //!   or a silence over `SILENCE`: the call fails, and the run ends.
-//! - `TurnCli` dropped (the turn finished, failed, stopped or asked the
-//!   user): Streaming or Parked → interrupt (the CLI then records each
-//!   parked call as stopped, the planner's P3), then close stdin, wait,
-//!   kill; Idle → close stdin, wait, kill. In a spawned task, so a Stop
-//!   never waits for it.
+//! - the turn returned (`TurnCli::close`: it finished, failed, or asked)
+//!   while Parked, with a reply for each of the reply's calls (its held
+//!   result, or a question's placeholder, `close::replies`) → **Closing**:
+//!   answer each call, await the CLI's echo of each (or its next API
+//!   call starting), then interrupt, close stdin, wait, kill; within
+//!   `CLOSE_WAIT`, past which it interrupts anyway (SME-444).
+//! - `TurnCli` dropped otherwise (a Stop, or a call missing its result):
+//!   Streaming or Parked → interrupt (the CLI then records each parked
+//!   call as stopped, the planner's P3), then close stdin, wait, kill;
+//!   Idle → close stdin, wait, kill. In a spawned task, so a Stop never
+//!   waits for it, and so does Closing.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -139,6 +145,13 @@ pub const NOT_RUN: &str = "smelt didn't run this tool call.";
 /// What a tool call gets that isn't one of the reply's calls.
 pub const NOT_THE_REPLYS: &str = "smelt refused this tool call: it isn't one of your reply's calls.";
 
+/// What an `ask_user` call is answered with as its turn ends (SME-444): a
+/// success, so the model doesn't read the run's close as a refusal.
+pub const ASKED_USER: &str = "smelt is showing your questions to the user. Their answer arrives as your next message: end your turn now, without another tool call.";
+
+/// What an `ask_parent` call is answered with as its turn ends (SME-444).
+pub const ASKED_PARENT: &str = "smelt has sent your question to your parent. Its answer arrives as your next message: end your turn now, without another tool call.";
+
 #[cfg(test)]
 pub static SILENCE_FOR_TESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -161,6 +174,10 @@ pub struct TurnCli {
     last_failure: Option<Failure>,
     /// The last call's failure, when it was an overflow (SME-431).
     overflow: Option<crate::anthropic::overflow::Overflow>,
+    /// The turn's last tool results, saved but not yet sent: the next
+    /// call sends them, or the close answers the parked calls with them
+    /// (SME-444).
+    results: Vec<ContentBlock>,
 }
 
 impl TurnCli {
@@ -168,6 +185,26 @@ impl TurnCli {
     /// recovery compacts on it.
     pub fn take_overflow(&mut self) -> Option<crate::anthropic::overflow::Overflow> {
         self.overflow.take()
+    }
+
+    /// Holds the results the turn just saved for its reply's calls,
+    /// replacing any held before: the close answers with them if the turn
+    /// returns before its next call (SME-444).
+    pub fn hold_results(&mut self, results: &[ContentBlock]) {
+        self.results = results.to_vec();
+    }
+
+    /// The turn returned, Ok or Err: a run Parked on calls smelt has a
+    /// reply for each of is closed (answered, echoed, then interrupted),
+    /// and any other ends as a drop ends it. Only a return reaches this:
+    /// a Stop drops the turn, so its calls still read as stopped.
+    pub fn close(&mut self) {
+        let Some(run) = self.run.take() else { return };
+        let replies = if run.state == State::Parked { close::replies(&run.expected, &self.results) } else { None };
+        match replies {
+            Some(replies) => run.ending(Some(replies)),
+            None => run.end_in_background(),
+        }
     }
 }
 
@@ -202,10 +239,11 @@ enum State {
 }
 
 /// One of the reply's tool calls the CLI will make.
-struct Expected {
-    id: String,
-    name: String,
-    input: Value,
+pub(in crate::claude_cli) struct Expected {
+    pub(in crate::claude_cli) id: String,
+    /// smelt's name for its tool (`read::finish` maps the CLI's).
+    pub(in crate::claude_cli) name: String,
+    pub(in crate::claude_cli) input: Value,
 }
 
 struct Run {
@@ -300,6 +338,8 @@ pub async fn call(
     let call = Call { conversation_id, turn_model, request, recorded };
     cli.last_failure = None;
     cli.overflow = None;
+    // This call sends the held results the normal way (SME-444).
+    cli.results.clear();
     let replied = call_run(&call, on_delta, meter, extra, cli).await;
     // The session the next turn resumes: this run's, synced to this call,
     // after a call that went well; after any other, none, so the next turn
@@ -677,14 +717,25 @@ impl Run {
 
     /// Ends the run in a spawned task: interrupt if it's mid-reply, then
     /// close its input, wait, and kill what's left of its process group.
-    fn end_in_background(mut self) {
+    fn end_in_background(self) {
+        self.ending(None);
+    }
+
+    /// Ends the run in a spawned task, closing it first with `replies`
+    /// when given (SME-444's Closing, `close::settle`): answered, echoed,
+    /// then the same interrupt and wind-down as any run.
+    fn ending(mut self, replies: Option<HashMap<String, ToolReply>>) {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let conversation_id = self.conversation_id;
         let group = self.child.id().and_then(|id| i32::try_from(id).ok());
         let ending = runtime.spawn(async move {
-            if self.state != State::Idle && self.interrupt().await.is_ok() {
+            let interrupt = match replies {
+                Some(replies) => self.settle(replies).await,
+                None => self.state != State::Idle,
+            };
+            if interrupt && self.interrupt().await.is_ok() {
                 let _ = tokio::time::timeout(WIND_DOWN, async {
                     while let Ok(event) = self.next_event().await {
                         if event["type"] == "result" {
@@ -728,8 +779,9 @@ fn endings() -> std::sync::MutexGuard<'static, HashMap<i64, Vec<Ending>>> {
 }
 
 /// The longest a resume waits for the conversation's last runs to end:
-/// an ending interrupts within `WIND_DOWN`, waits as long again, then kills.
-pub const ENDED_WAIT: Duration = Duration::from_secs(12);
+/// a close waits up to `CLOSE_WAIT` for its echoes (SME-444), an ending
+/// interrupts within `WIND_DOWN`, waits as long again, then kills.
+pub const ENDED_WAIT: Duration = Duration::from_secs(17);
 
 #[cfg(test)]
 pub static ENDED_WAIT_FOR_TESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -772,6 +824,7 @@ pub async fn ended(conversation_id: i64) {
     }
 }
 
+pub mod close;
 mod deliver;
 mod read;
 pub(super) use read::apply;
