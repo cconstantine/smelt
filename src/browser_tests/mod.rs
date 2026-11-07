@@ -236,6 +236,7 @@ fn scenarios() -> Vec<Entry> {
         entry("cut_off_notice", 30, Runs::Alone, |t| Box::pin(scenario_cut_off_notice(t))),
         entry("cut_off_in_a_call", 30, Runs::Alone, |t| Box::pin(scenario_cut_off_in_a_call(t))),
         entry("llama_cpp_provider", 60, Runs::Alone, |t| Box::pin(scenario_llama_cpp_provider(t))),
+        entry("learned_window_line", 30, Runs::Beside, |t| Box::pin(scenario_learned_window_line(t))),
         entry("chat_errors_are_alerts", 30, Runs::Beside, |t| Box::pin(scenario_chat_errors_are_alerts(t))),
         entry("message_box_label", 30, Runs::Beside, |t| Box::pin(scenario_message_box_label(t))),
         entry("conversation_rows_by_keyboard", 60, Runs::Alone, |t| Box::pin(scenario_conversation_rows_by_keyboard(t))),

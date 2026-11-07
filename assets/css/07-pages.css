@@ -1001,6 +1001,25 @@
     align-items: center;
     gap: 4px;
 }
+/* SME-439 PR 2: what smelt learned, under the Context window field.
+ * A flex item that shares the field's row while there is room and wraps
+ * whole beneath it at phone widths; nothing overlaps. */
+.provider-model-learned {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+}
+/* The compact Forget button. Scoped one level deeper than the row's
+ * own button rule below: at equal specificity that later rule would
+ * out-order this one and the compact padding would never render
+ * (SME-439 round 1 L3). */
+.provider-model-row .provider-model-learned button {
+    padding: 2px 8px;
+    font-size: 12px;
+}
 .provider-model-row button,
 .provider-model-add button {
     padding: 4px 12px;

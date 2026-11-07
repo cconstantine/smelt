@@ -193,71 +193,9 @@ fn positive(value: Option<i32>) -> Option<u32> {
     value.and_then(|v| u32::try_from(v).ok()).filter(|v| *v > 0)
 }
 
-/// The context window a turn uses and whether anything sized it: the
-/// user's override, else what smelt last learned (SME-439), else what
-/// the provider reported, else a known `claude-*` model's, else
-/// `ASSUMED_CONTEXT_WINDOW`.
-pub fn context_window(model: &str, row: Option<&db::ProviderModelRow>) -> (u32, bool) {
-    row.and_then(|r| {
-        positive(r.context_window)
-            .or(positive(r.learned_context_window))
-            .or(positive(r.reported_context_window))
-    })
-        .or_else(|| crate::anthropic::context_window_for(model))
-        .map_or((ASSUMED_CONTEXT_WINDOW, false), |window| (window, true))
-}
+mod window;
+pub use window::*;
 
-/// Which learner saved a window (SME-439): recorded beside the learned
-/// window, so it can always be said where a number came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WindowSource {
-    /// An overflow refusal that named a window.
-    Refusal,
-    /// A reply the window stopped, measured through the gate in
-    /// `turn::overflow::learn_window_stop`.
-    WindowStop,
-    /// Ollama's `/api/ps` answer for what's loaded.
-    OllamaPs,
-}
-
-impl WindowSource {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Refusal => "refusal",
-            Self::WindowStop => "window_stop",
-            Self::OllamaPs => "ollama_ps",
-        }
-    }
-}
-
-/// Saves a window a learner settled on (SME-73, SME-439) for the model
-/// this turn ran on — into the learned column, never the user's own — and
-/// tells the app, so the providers page and pickers refresh. The meter
-/// takes the new window from the turn's own copy, which its caller
-/// updates too.
-pub async fn learn_context_window(
-    pool: &PgPool,
-    model: &TurnModel,
-    window: u32,
-    reason: WindowSource,
-    conversation_id: i64,
-) -> Result<bool, sqlx::Error> {
-    let lowered = db::save_learned_context_window(
-        pool,
-        model.provider_id,
-        &model.endpoint.base_url,
-        &model.model,
-        window,
-        reason.as_str(),
-        conversation_id,
-        context_window(&model.model, None).0,
-    )
-    .await?;
-    if lowered {
-        providers_changed();
-    }
-    Ok(lowered)
-}
 
 /// Saves the window and reply cap Claude Code reports for a model (its
 /// `result.modelUsage`, SME-431) as the row's reported ones, and tells
@@ -321,6 +259,12 @@ pub fn model_info(
         max_output: output_cap(kind, &id, row),
         context_window,
         context_window_known,
+        learned_context_window: row.and_then(|r| positive(r.learned_context_window)),
+        learned_window_at: row
+            .and_then(|r| r.learned_context_window_at)
+            .map(|at| at.format("%Y-%m-%dT%H:%M:%S").to_string()),
+        learned_window_reason: row.and_then(|r| r.learned_context_window_reason.clone()),
+        learned_window_conversation: row.and_then(|r| r.learned_context_window_conversation),
         details_error,
         id,
     }
@@ -682,7 +626,36 @@ pub(super) async fn store_details(
         details.adaptive_thinking,
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    // SME-439 PR 2 (Expected 3a): a report bigger than what smelt learned
+    // says the learned window is too small — forget it. A llama.cpp report
+    // is the server's whole context split across its slots, so what must
+    // outgrow is one slot's share, the learner's own division. The picker
+    // lists with the last `/props` unrefreshed, so its llama.cpp report can
+    // over-clear — a lost re-learn, never a wrong keep (the plan's noted
+    // trade-off).
+    if details.context_window.filter(|w| *w > 0).is_some()
+        && let Some(provider) = db::get_inference_provider(pool, provider_id).await.map_err(|e| e.to_string())?
+    {
+        let kind = ProviderKind::parse(&provider.kind).unwrap_or(ProviderKind::Other);
+        let total_slots = server_caps(&provider).and_then(|caps| caps.total_slots);
+        if let Some(per_request) = crate::turn::reported_per_request(to_column(details.context_window), kind, total_slots) {
+            let forgotten = db::clear_learned_context_window_below(pool, provider_id, &provider.base_url, model, per_request)
+                .await
+                .map_err(|e| e.to_string())?;
+            if forgotten {
+                providers_changed();
+                // Round 1 H1: a clear that cleared speaks on window_learn
+                // — decision `bigger_report`, the report and its
+                // per-request share, and no conversation id: a listing
+                // has none. Fired on the UPDATE's answer, not the attempt.
+                let reported = to_column(details.context_window).map(i64::from);
+                tracing::info!(model = %model, reported = reported.unwrap_or_default(), reported_per_request = per_request, decision = "bigger_report", "learned context window forgotten: a report outgrew it");
+                trace_window_learn(None, model, "listing", "bigger_report", per_request, None, reported, Some(per_request));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn has_any(details: &crate::anthropic::models::ModelDetails) -> bool {
