@@ -94,7 +94,7 @@ roleRef:
 # it always effectively had, and lowering the ceiling moves both
 # together); `defaultRequest: "0"` reserves nothing. No `cpu` here at
 # all (SME-77): sandbox pods have no CPU limit or request, and a `cpu`
-# max would hand each container a defaulted 16-CPU limit and request,
+# max would hand each container a defaulted CPU limit and request,
 # which can't be scheduled.
 apiVersion: v1
 kind: LimitRange
