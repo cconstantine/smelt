@@ -5,6 +5,7 @@
 use super::*;
 
 pub(crate) mod bridge;
+mod close;
 mod compaction;
 mod errors;
 pub(crate) mod fake;

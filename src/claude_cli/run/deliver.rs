@@ -9,12 +9,15 @@ use super::*;
 
 impl Run {
     /// Sends what the turn added since the last call: the reply's results
-    /// to its parked calls, or a user message.
-    pub(super) async fn send_tail(&mut self, tail: &[AnthropicMessage]) -> Result<(), String> {
+    /// to its parked calls, or a user message. `messages` is the whole
+    /// request, whose calls name the tail's results.
+    pub(super) async fn send_tail(&mut self, tail: &[AnthropicMessage], messages: &[AnthropicMessage]) -> Result<(), String> {
         match self.state {
             State::Streaming => Err("Claude Code was still replying when smelt called it again.".to_string()),
             State::Idle => {
-                let names = call_names(tail);
+                // What a closed run delivered isn't sent again (SME-444).
+                let tail = without_delivered(tail, &crate::claude_cli::session::take_delivered(self.conversation_id));
+                let names = call_names(messages);
                 let text = tail.iter().map(|m| blocks_text(&m.content, &names)).collect::<Vec<_>>().join("\n\n");
                 self.write_user(&text).await
             }

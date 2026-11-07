@@ -8,7 +8,9 @@
 //! conversation: its run is ended at its next call (`take_reset`), and
 //! the replaced session's files go once its last process has ended
 //! (`take_retired`, from `run::start`). A conversation that's deleted
-//! drops its marks (`forget`).
+//! drops its marks (`forget`). The same marks hold the tool results a
+//! closed run delivered (SME-444, `note_delivered`/`take_delivered`),
+//! which a reset clears too.
 //!
 //! **A guard, not the only lock** (PR #291 review 1 L4). Today no turn
 //! depends on the reset alone: the post-compaction request starts with
@@ -24,12 +26,14 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// Per conversation: whether a reset waits for its run, and the replaced
-/// sessions whose files go at the next new session.
+/// Per conversation: whether a reset waits for its run, the replaced
+/// sessions whose files go at the next new session, and the tool results
+/// a closed run delivered (SME-444).
 #[derive(Default)]
 struct Marks {
     reset: bool,
     retired: Vec<String>,
+    delivered: std::collections::HashSet<String>,
 }
 
 fn marks() -> std::sync::MutexGuard<'static, HashMap<i64, Marks>> {
@@ -57,6 +61,9 @@ pub async fn reset(pool: &sqlx::PgPool, conversation_id: i64, kind: crate::provi
     let mut marks = marks();
     let mine = marks.entry(conversation_id).or_default();
     mine.reset = true;
+    // Delivered to the session the compaction retires: the new one has
+    // nothing delivered.
+    mine.delivered.clear();
     if let Some(session) = recorded {
         mine.retired.push(session.session_id);
     }
@@ -70,6 +77,19 @@ pub fn take_reset(conversation_id: i64) -> bool {
 /// The sessions a reset replaced, whose files can go, taken.
 pub fn take_retired(conversation_id: i64) -> Vec<String> {
     marks().get_mut(&conversation_id).map(|m| std::mem::take(&mut m.retired)).unwrap_or_default()
+}
+
+/// Notes the tool results a closing run's CLI echoed (SME-444): its
+/// session has them, so the next call that resumes it doesn't send them
+/// again as text. Written by the close's ending task, which a resume
+/// waits for (`run::ended`) before it takes them.
+pub fn note_delivered(conversation_id: i64, ids: impl IntoIterator<Item = String>) {
+    marks().entry(conversation_id).or_default().delivered.extend(ids);
+}
+
+/// The results a closed run delivered, taken.
+pub fn take_delivered(conversation_id: i64) -> std::collections::HashSet<String> {
+    marks().get_mut(&conversation_id).map(|m| std::mem::take(&mut m.delivered)).unwrap_or_default()
 }
 
 /// Drops `conversation_id`'s marks: it's being deleted.

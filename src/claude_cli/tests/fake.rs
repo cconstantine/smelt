@@ -16,6 +16,14 @@
 //! interrupt during `read` or `call` ends the call with the CLI's
 //! stopped result and an `error_during_execution` `result`, and skips to
 //! the next `read`. After the last step, stdin is read to EOF.
+//!
+//! SME-444's steps: `{"next_call": true}` (the CLI after it echoed the
+//! reply's results: `status: requesting`, then, on an interrupt, the
+//! expected post-echo lines of `post_echo_interrupt`), and `{"call_mute":
+//! [...]}` (as `call`, the answer taken but never echoed). Each process
+//! also keeps `transcript.{n}.jsonl`: what the model would read in its
+//! session, in order — each user message taken, each `tool_result` echoed
+//! (with `is_error`), and each interrupt marker.
 
 use std::path::{Path, PathBuf};
 
@@ -41,6 +49,8 @@ fn fixture(name: &str) -> &'static str {
         // Synthesised, not captured (SME-431): its first line says so.
         "overflow" => include_str!("../fixtures/overflow.jsonl"),
         "window_stop" => include_str!("../fixtures/window_stop.jsonl"),
+        // Synthesised, not captured (SME-444): its first line says so.
+        "post_echo_interrupt" => include_str!("../fixtures/post_echo_interrupt.jsonl"),
         _ => "",
     }
 }
@@ -104,6 +114,11 @@ impl FakeCli {
     /// What each of process `n`'s tool calls got from the bridge.
     pub(crate) fn results(&self, n: usize) -> Vec<Value> {
         self.json_lines(&format!("results.{n}.jsonl"))
+    }
+
+    /// What process `n`'s model would read in its session (SME-444).
+    pub(crate) fn transcript(&self, n: usize) -> Vec<Value> {
+        self.json_lines(&format!("transcript.{n}.jsonl"))
     }
 
     /// Process `n`'s arguments.
@@ -236,6 +251,7 @@ impl Fake {
             let value: Value = serde_json::from_str(&line).unwrap_or(json!({"unparsed": line}));
             self.log("stdin", &value);
             if is_user(&value) {
+                self.log("transcript", &json!({"user": value["message"]["content"]}));
                 return Read::User;
             }
             if is_interrupt(&value) {
@@ -244,11 +260,49 @@ impl Fake {
         }
     }
 
+    /// A tool result the CLI took, echoed on stdout and kept in the
+    /// session's transcript.
+    async fn echo(&mut self, id: &Value, text: &str, is_error: bool) {
+        self.log("transcript", &json!({"tool_result": id, "text": text, "is_error": is_error}));
+        let mut block = json!({"type": "tool_result", "tool_use_id": id, "content": [{"type": "text", "text": text}]});
+        if is_error {
+            block["is_error"] = json!(true);
+        }
+        self.emit(&json!({"type": "user", "message": {"role": "user", "content": [block]}})).await;
+    }
+
     async fn stopped(&mut self, tool_use_id: Option<&str>) {
         if let Some(id) = tool_use_id {
-            self.emit(&json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "is_error": true, "content": "The user doesn't want to proceed with this tool use."}]}})).await;
+            let text = "The user doesn't want to proceed with this tool use.";
+            self.log("transcript", &json!({"tool_result": id, "text": text, "is_error": true}));
+            self.log("transcript", &json!({"marker": "[Request interrupted by user for tool use]"}));
+            self.emit(&json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "is_error": true, "content": text}]}})).await;
+        } else {
+            self.log("transcript", &json!({"marker": "[Request interrupted by user]"}));
         }
         self.emit(&json!({"type": "result", "subtype": "error_during_execution", "is_error": true, "terminal_reason": "aborted_tools"})).await;
+    }
+
+    /// The CLI after the reply's results are echoed: its next API call
+    /// starting, until an interrupt ends it with the expected lines of
+    /// `post_echo_interrupt` (SME-444). Whether it was interrupted.
+    async fn next_call(&mut self) -> bool {
+        let lines = fixture_lines("post_echo_interrupt");
+        let requesting = lines.iter().find(|l| l["subtype"] == "status").cloned().expect("the status line");
+        self.emit(&requesting).await;
+        loop {
+            match self.read().await {
+                Read::Interrupt => break,
+                Read::Eof => return false,
+                Read::User => {}
+            }
+        }
+        self.log("transcript", &json!({"marker": "[Request interrupted by user]"}));
+        let after: Vec<Value> = lines.iter().skip_while(|l| l["subtype"] != "status").skip(1).cloned().collect();
+        for line in &after {
+            self.emit(line).await;
+        }
+        true
     }
 
     async fn peer(&mut self) -> rmcp::service::Peer<rmcp::RoleClient> {
@@ -259,8 +313,9 @@ impl Fake {
         self.client.as_ref().expect("connected").peer().clone()
     }
 
-    /// Calls `call` through the bridge, unless an interrupt comes first.
-    async fn call(&mut self, call: &Value) -> bool {
+    /// Calls `call` through the bridge, unless an interrupt comes first;
+    /// `mute`, the answer is taken but never echoed (SME-444).
+    async fn call(&mut self, call: &Value, mute: bool) -> bool {
         let (id, name, input) = (call["id"].as_str().map(str::to_string), call["name"].as_str().unwrap_or_default().to_string(), call["input"].clone());
         let short = name.trim_start_matches("mcp__smelt__").to_string();
         let peer = self.peer().await;
@@ -280,7 +335,9 @@ impl Fake {
             return false;
         };
         self.log("results", &json!({"id": id, "name": name, "text": text, "is_error": is_error}));
-        self.emit(&json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": [{"type": "text", "text": text}]}]}})).await;
+        if !mute {
+            self.echo(&json!(id), &text, is_error).await;
+        }
         true
     }
 }
@@ -346,15 +403,20 @@ async fn play(dir: &Path, n: usize) -> i32 {
                 fake.emit(line).await;
             }
             false
-        } else if let Some(calls) = step["call"].as_array() {
+        } else if let Some((calls, mute)) = step["call"].as_array().map(|c| (c, false)).or_else(|| step["call_mute"].as_array().map(|c| (c, true))) {
             let mut stopped = false;
             for call in calls {
-                if !fake.call(call).await {
+                if !fake.call(call, mute).await {
                     stopped = true;
                     break;
                 }
             }
             stopped
+        } else if step.get("next_call").is_some() {
+            if !fake.next_call().await {
+                return 0;
+            }
+            false
         } else if let Some(call) = step.get("call_early") {
             // A call made before the reply's lines are written, as the
             // CLI makes a reply's first call before stdout shows its block
@@ -371,7 +433,7 @@ async fn play(dir: &Path, n: usize) -> i32 {
             for early in std::mem::take(&mut fake.early) {
                 let (id, text, is_error) = early.await.expect("the early call");
                 fake.log("results", &json!({"id": id, "text": text, "is_error": is_error}));
-                fake.emit(&json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": [{"type": "text", "text": text}]}]}})).await;
+                fake.echo(&id, &text, is_error).await;
             }
             false
         } else if let Some(name) = step["stamp"].as_str() {

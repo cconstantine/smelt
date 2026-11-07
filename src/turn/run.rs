@@ -140,11 +140,37 @@ fn run_turn_steps<'a: 'b, 'b>(
     pool: &'a PgPool,
     conversation_id: i64,
     held: &'b Arc<tokio::sync::Mutex<()>>,
-    mut persisted: Vec<Message>,
+    persisted: Vec<Message>,
     new_content: Option<Vec<anthropic::ContentBlock>>,
     max_turns: usize,
     generation: &'b mut Option<u64>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'b>>
+{
+    Box::pin(async move {
+        // A Claude Code turn's CLI run, held, like the slot, to the end
+        // (SME-430): dropping it ends the run.
+        let mut turn_cli = crate::claude_cli::run::TurnCli::default();
+        let result = run_turn_loop(pool, conversation_id, held, persisted, new_content, max_turns, generation, &mut turn_cli).await;
+        // A turn that returned, Ok or Err, answers the calls its run still
+        // waits on before ending it (SME-444). A Stop drops this future
+        // before here, so its calls still read as stopped.
+        turn_cli.close();
+        result
+    })
+}
+
+/// `run_turn_steps`' loop, on the turn's CLI run `turn_cli`.
+#[cfg(feature = "server")]
+fn run_turn_loop<'c>(
+    pool: &'c PgPool,
+    conversation_id: i64,
+    held: &'c Arc<tokio::sync::Mutex<()>>,
+    mut persisted: Vec<Message>,
+    new_content: Option<Vec<anthropic::ContentBlock>>,
+    max_turns: usize,
+    generation: &'c mut Option<u64>,
+    turn_cli: &'c mut crate::claude_cli::run::TurnCli,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'c>>
 {
     Box::pin(async move {
         // The turn's own span, `run_turn_bounded`'s: its model and the
@@ -172,9 +198,6 @@ fn run_turn_steps<'a: 'b, 'b>(
         // The request slot this turn holds on its model's provider once
         // that model is resolved, and holds to the end (SME-343).
         let mut turn_slot: Option<crate::turn::call::TurnSlot> = None;
-        // A Claude Code turn's CLI run, held, like the slot, to the end
-        // (SME-430): dropping it ends the run.
-        let mut turn_cli = crate::claude_cli::run::TurnCli::default();
 
         // A repo the user just attached may still be cloning; its AGENTS.md
         // belongs in this turn's system prompt (SME-32). Bounded: past it,
@@ -319,7 +342,7 @@ fn run_turn_steps<'a: 'b, 'b>(
             // A refusal meaning "this didn't fit" answers itself once:
             // learn the window, shrink, send again (SME-73). Every
             // other failure ends the turn as it always did.
-            let called = call_model(pool, conversation_id, turn_model, &mut request, slot.held(), &mut turn_cli).await;
+            let called = call_model(pool, conversation_id, turn_model, &mut request, slot.held(), turn_cli).await;
             let (turn, recorder, budget) = match called {
                 Ok((turn, recorder)) => {
                     // Ollama truncates an oversized request quietly rather
@@ -437,6 +460,9 @@ fn run_turn_steps<'a: 'b, 'b>(
                     .map_err(ServerFnError::new)?;
                 record_saved(conversation_id, &mut persisted, saved);
             }
+            // Saved: the run's waiting calls are answered with them if the
+            // turn returns before its next call (SME-444).
+            turn_cli.hold_results(&result_blocks, ran.asked.as_deref());
             pending_new_content = result_blocks;
             // A call the reply wrote as text, told after the real calls'
             // results, even when the turn ends here (SME-286).
