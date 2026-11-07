@@ -317,6 +317,25 @@ pub async fn conversations_with_live_pods(pool: &PgPool) -> Result<Vec<i64>, sql
     .await
 }
 
+/// The conversations with at least one running terminal command on a
+/// live pod, with the count — the sidebar's markers (SME-441). Same
+/// predicate as `list_live_pods`' `running_commands` and `POD_BUSY`.
+pub async fn running_command_conversation_counts(
+    pool: &PgPool,
+) -> Result<Vec<(i64, i64)>, sqlx::Error> {
+    sqlx::query_as::<_, (i64, i64)>(
+        "SELECT p.conversation_id, COUNT(*)::BIGINT
+           FROM sandbox_pods p
+           JOIN sandbox_terminals t ON t.pod_id = p.id
+           JOIN terminal_commands tc ON tc.terminal_id = t.id
+          WHERE p.terminated_at IS NULL AND tc.status = 'running'
+          GROUP BY p.conversation_id
+          ORDER BY p.conversation_id ASC",
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// Live pods only (`terminated_at IS NULL`) — a terminated pod's row
 /// sticks around (see SME-9's "How") but shouldn't be listed as if it
 /// still existed.

@@ -86,3 +86,15 @@ fn test_the_lost_title_names_only_what_can_cause_it() {
     assert!(title.contains("couldn't be sent") && title.contains("no exit status"), "{title}");
     assert!(!title.contains("restart"), "{title}");
 }
+
+/// SME-441: the sidebar's command marker — the count alone says what
+/// shows, it says nothing while a turn runs (the busy spinner wins), and
+/// a conversation with no running commands keeps no marker at all.
+#[test]
+fn test_the_command_marker_counts_commands_and_loses_to_a_running_turn() {
+    assert_eq!(command_marker(0, false), None);
+    assert_eq!(command_marker(0, true), None);
+    assert_eq!(command_marker(2, true), None, "the running turn wins");
+    assert_eq!(command_marker(1, false).as_deref(), Some("1 command running"));
+    assert_eq!(command_marker(3, false).as_deref(), Some("3 commands running"));
+}

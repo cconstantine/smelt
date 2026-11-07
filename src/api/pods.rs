@@ -525,6 +525,29 @@ pub async fn get_live_pod_conversations() -> ServerFnResult<Vec<i64>> {
         .map_err(ServerFnError::new)
 }
 
+/// A conversation's running terminal commands, for the sidebar's markers.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RunningCommands {
+    pub conversation_id: i64,
+    pub running_commands: i64,
+}
+
+/// Which conversations have running terminal commands on a live pod,
+/// and how many — the sidebar's command markers (SME-441). Its own
+/// endpoint, not a widened `get_live_pod_conversations`: this refetches
+/// on every command start and finish (a ~100× livelier event than
+/// `PodsChanged`), and the dot's query shouldn't ride that.
+#[get("/api/pods/commands")]
+pub async fn get_running_command_conversations() -> ServerFnResult<Vec<RunningCommands>> {
+    let counts = db::running_command_conversation_counts(db::get())
+        .await
+        .map_err(ServerFnError::new)?;
+    Ok(counts
+        .into_iter()
+        .map(|(conversation_id, running_commands)| RunningCommands { conversation_id, running_commands })
+        .collect())
+}
+
 /// The Sandboxes page's stored-volumes rows (SME-253): which
 /// conversations hold sandbox disk — the /workspace and Docker-data
 /// claims — whether or not a pod runs, plus what the panel shows as its
