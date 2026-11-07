@@ -59,6 +59,12 @@ if [ -z "${BROWSER_CHECK_CACHE:-}" ] && [ ! -x ".browser-check-cache/$chromium" 
     fi
 fi
 
+# The crates first, with retries, so the tier's cargo tests below run
+# offline and no network retry's `warning:` line reaches their build's
+# warning check (SME-442). Not dx build: it may fetch its own tools.
+echo "== crates (cargo fetch)"
+scripts/cargo-fetch || exit 1
+
 # The tier's pods run this working tree's own agent (SME-102), and a missing
 # image is one clear message rather than a failed scenario.
 SANDBOX_IMAGE=${SANDBOX_IMAGE:-$(scripts/sandbox-image-ref)}
@@ -80,7 +86,7 @@ fi
 # Compiled before the lock, so the locked run below only runs it (SME-100).
 echo "== browser tier (build)"
 build_log=target/browser-tier/test-build.log
-if ! cargo test --features "server browser-test" --no-run >"$build_log" 2>&1; then
+if ! CARGO_NET_OFFLINE=true cargo test --features "server browser-test" --no-run >"$build_log" 2>&1; then
     grep -E '^error' -A8 "$build_log" | head -40
     echo "the browser tier doesn't build (full log: $build_log)" >&2
     exit 1
@@ -103,4 +109,4 @@ echo "== browser tier"
 # A passing test's prints shown, as CI shows them: the live-pod install
 # deadline's line and a page's errors are said only there, so a soak with them
 # hidden would look clean without having checked anything (SME-371).
-RUST_TEST_NOCAPTURE=1 DATABASE_URL="$scratch" scripts/with-cluster-lock cargo test --features "server browser-test" -- --ignored --test-threads=1
+CARGO_NET_OFFLINE=true RUST_TEST_NOCAPTURE=1 DATABASE_URL="$scratch" scripts/with-cluster-lock cargo test --features "server browser-test" -- --ignored --test-threads=1

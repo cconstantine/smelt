@@ -8,7 +8,7 @@
 . "$(dirname "$0")/lib/test-check-scripts.sh"
 
 # None of the scripts the gate or a hands-on check runs removes a file.
-for script in scripts/check-server scripts/browser-tier scripts/check.sh scripts/lint-expects scripts/build-sandbox-image.sh \
+for script in scripts/check-server scripts/browser-tier scripts/check.sh scripts/cargo-fetch scripts/lint-expects scripts/build-sandbox-image.sh \
     scripts/with-cluster-lock scripts/cluster-test scripts/clean-test-namespace.sh; do
     if found=$(grep -nE '(^|[^[:alnum:]_-])(rm|rmdir|unlink|shred)([[:space:]]|$)|-delete([[:space:]]|$)' "$script" | grep -vE '^[0-9]+:[[:space:]]*#'); then
         fail "$script removes files: $found"
@@ -20,8 +20,13 @@ done
 # step: this suite does run check.sh, and the nested run would run this
 # suite again, under stubs, recursing and polluting the calls recorded below.
 export CALLS=$dir/calls
-gate_env=(env -u SANDBOX_IMAGE -u CARGO_FAIL -u CARGO_WARN PATH="$dir/bin:$PATH" SANDBOX_IMAGE_IMPORT="$dir/bin/import"
+# No pauses between scripts/cargo-fetch's attempts, and none of the
+# caller's offline setting (SME-442).
+gate_env=(env -u SANDBOX_IMAGE -u CARGO_FAIL -u CARGO_WARN -u CARGO_FAIL_TIMES -u CARGO_FAIL_COUNT -u CALLS_ENV
+    -u CARGO_NET_OFFLINE PATH="$dir/bin:$PATH" SANDBOX_IMAGE_IMPORT="$dir/bin/import" CARGO_FETCH_PAUSES="0 0"
     DATABASE_URL=postgres://u@localhost/smelt_dev BROWSER_CHECK_CACHE="$dir" SMELT_SKIP_SCRIPT_TESTS=1)
+calls_env=$dir/calls-env
+fail_count=$dir/cargo-fail-count
 # Never the real cargo or dx: that would build, and run the real tests.
 for tool in cargo dx sqlx; do
     [ "$("${gate_env[@]}" bash -c "command -v $tool")" = "$dir/bin/$tool" ] || {
@@ -35,10 +40,13 @@ lints="-- -D warnings -A clippy::all -D clippy::expect_used -D clippy::unwrap_us
 # 7. check.sh builds, lints, compiles the tests and checks the cluster
 # unlocked, and takes the lock for the test run only.
 : >"$CALLS"
-if ! out=$(timeout 60 "${gate_env[@]}" scripts/check.sh 2>&1); then
+: >"$calls_env"
+if ! out=$(timeout 60 "${gate_env[@]}" CALLS_ENV="$calls_env" scripts/check.sh 2>&1); then
     fail "check.sh with stubs failed: $out"
 fi
-expected="$wasm_check unlocked
+# The crates are fetched first (SME-442).
+expected="cargo fetch unlocked
+$wasm_check unlocked
 cargo build --features server unlocked
 cargo clippy --version unlocked
 cargo clippy --features server $lints unlocked
@@ -50,6 +58,34 @@ cargo test --features server locked"
 # Two `import`s since SME-391: the doctor checks the sandbox image and then
 # the pre-pull list, both through the same read-only tool.
 [ "$(cat "$CALLS")" = "$expected" ] || fail "check.sh's calls: $(cat "$CALLS")"
+# The fetch itself is online, and every cargo call after it offline, so no
+# build's output can carry a network retry's warning (SME-442).
+[ "$(head -1 "$calls_env")" = "CARGO_NET_OFFLINE=<unset> cargo fetch" ] ||
+    fail "check.sh's fetch didn't run online first: $(cat "$calls_env")"
+online=$(tail -n +2 "$calls_env" | grep -v '^CARGO_NET_OFFLINE=true ')
+[ "$(wc -l <"$calls_env")" -gt 1 ] && [ -z "$online" ] ||
+    fail "check.sh ran cargo after the fetch without CARGO_NET_OFFLINE=true: $(cat "$calls_env")"
+# A fetch that fails twice and then succeeds lets the gate go on, saying so.
+: >"$CALLS"
+echo 0 >"$fail_count"
+if ! out=$(timeout 60 "${gate_env[@]}" CARGO_FAIL='^fetch' CARGO_FAIL_TIMES=2 CARGO_FAIL_COUNT="$fail_count" scripts/check.sh 2>&1); then
+    fail "check.sh failed on a fetch that succeeded at its third attempt: $out"
+fi
+grep -q "attempt 1 of 3 failed" <<<"$out" && grep -q "attempt 2 of 3 failed" <<<"$out" ||
+    fail "check.sh didn't say the fetch's first two attempts failed: $out"
+[ "$(grep -c '^cargo fetch ' "$CALLS")" = 3 ] || fail "check.sh didn't fetch three times: $(cat "$CALLS")"
+# Three failed fetches stop the gate before any build, saying crates.io is
+# unreachable rather than showing a build failure.
+: >"$CALLS"
+echo 0 >"$fail_count"
+if out=$(timeout 60 "${gate_env[@]}" CARGO_FAIL='^fetch' CARGO_FAIL_TIMES=3 CARGO_FAIL_COUNT="$fail_count" scripts/check.sh 2>&1); then
+    fail "check.sh passed with every fetch failing: $out"
+fi
+grep -q "^crates.io unreachable: cargo fetch failed 3 times" <<<"$out" ||
+    fail "check.sh didn't say crates.io was unreachable: $out"
+[ "$(cat "$CALLS")" = "cargo fetch unlocked
+cargo fetch unlocked
+cargo fetch unlocked" ] || fail "check.sh did more than fetch after three failed fetches: $(cat "$CALLS")"
 # A test build that fails stops check.sh before the lock.
 : >"$CALLS"
 if out=$(timeout 60 "${gate_env[@]}" CARGO_FAIL="--no-run" scripts/check.sh 2>&1); then
@@ -92,11 +128,13 @@ grep -q "unused variable" <<<"$out" || fail "browser-tier didn't show its build'
 # 8. browser-tier likewise: the bundle, the test build and the scratch
 # database unlocked, the tier's run locked.
 : >"$CALLS"
-if ! out=$(timeout 60 "${gate_env[@]}" scripts/browser-tier 2>&1); then
+: >"$calls_env"
+if ! out=$(timeout 60 "${gate_env[@]}" CALLS_ENV="$calls_env" scripts/browser-tier 2>&1); then
     fail "browser-tier with stubs failed: $out"
 fi
 tier_db=postgres://u@localhost/smelt_browser_tier_$(basename "$PWD" | tr -c 'a-zA-Z0-9\n' '_')
-expected="import unlocked
+expected="cargo fetch unlocked
+import unlocked
 import unlocked
 dx build --platform web unlocked
 cargo test --features server browser-test --no-run unlocked
@@ -105,6 +143,11 @@ sqlx database create --database-url $tier_db unlocked
 cargo test --features server browser-test -- --ignored --test-threads=1 locked
 sqlx database drop -y --database-url $tier_db unlocked"
 [ "$(cat "$CALLS")" = "$expected" ] || fail "browser-tier's calls: $(cat "$CALLS")"
+# Its fetch online, its two cargo tests offline (SME-442).
+expected="CARGO_NET_OFFLINE=<unset> cargo fetch
+CARGO_NET_OFFLINE=true cargo test --features server browser-test --no-run
+CARGO_NET_OFFLINE=true cargo test --features server browser-test -- --ignored --test-threads=1"
+[ "$(cat "$calls_env")" = "$expected" ] || fail "browser-tier's cargo calls' CARGO_NET_OFFLINE: $(cat "$calls_env")"
 : >"$CALLS"
 if out=$(timeout 60 "${gate_env[@]}" CARGO_FAIL="--no-run" scripts/browser-tier 2>&1); then
     fail "browser-tier passed with a failing test build: $out"

@@ -126,6 +126,13 @@ jobs:
       - name: Start the compose stack
         uses: ./.github/actions/start-stack
 
+      # Every crate before any cargo step, with retries, so a crates.io flake
+      # cargo recovers from can't put a `warning: spurious network error`
+      # line into a build that ci-no-warnings reads (SME-442). On the
+      # runner's warm cache it makes no connection.
+      - name: cargo fetch (with retries)
+        run: docker compose run --rm --no-deps smelt scripts/cargo-fetch
+
       # The sandbox tests create real pods against the compose-provided k3s
       # cluster. Two of them (test_dropping_without_delete_still_cleans_up_via_drain_task,
       # the sandbox lifecycle test, since split up) reliably timed out here in CI —
@@ -256,6 +263,10 @@ jobs:
 
       - name: Start the compose stack
         uses: ./.github/actions/start-stack
+
+      # As in the server job (SME-442).
+      - name: cargo fetch (with retries)
+        run: docker compose run --rm --no-deps smelt scripts/cargo-fetch
 
       - name: Browser test setup (chromium-headless-shell)
         run: |
