@@ -9,6 +9,17 @@
 //! the replaced session's files go once its last process has ended
 //! (`take_retired`, from `run::start`). A conversation that's deleted
 //! drops its marks (`forget`).
+//!
+//! **A guard, not the only lock** (PR #291 review 1 L4). Today no turn
+//! depends on the reset alone: the post-compaction request starts with
+//! the summary, so its hash no longer matches the session's record, and
+//! `render::tail_after` would already end the run, refuse the old row and
+//! forget its file. The reset says so outright instead of by a hash
+//! mismatch, and `claude_cli::tests::compaction` pins what it does. A
+//! change that keeps the history's first messages through a compaction
+//! (keeping the opening turn, say) would make it the only thing between a
+//! compacted conversation and a resumed session of its old history: keep
+//! it, and give that change a turn test of its own.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
