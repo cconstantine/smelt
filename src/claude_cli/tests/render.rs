@@ -77,6 +77,16 @@ fn test_a_questions_result_says_it_answers_the_earlier_call() {
     assert!(named.starts_with("(This answers your earlier `ask_user` (call toolu_ask)"), "{named}");
 }
 
+/// PR #295 review 1 L1: a question's error result (refused, or never
+/// asked) isn't worded as an answer the user gave; it keeps today's.
+#[test]
+fn test_a_questions_error_result_keeps_todays_wording() {
+    let refused = tool_result_text("toolu_ask", Some(crate::questions::ASK_USER), "ask one set of questions at a time", true);
+    assert_eq!(refused, "(smelt ran `ask_user` (call toolu_ask); it failed:)\nask one set of questions at a time");
+    let parent = tool_result_text("toolu_up", Some(crate::agents::ASK_PARENT), "ask_parent is only for an agent", true);
+    assert_eq!(parent, "(smelt ran `ask_parent` (call toolu_up); it failed:)\nask_parent is only for an agent");
+}
+
 #[test]
 fn test_a_new_conversation_sends_its_message_as_it_is() {
     assert_eq!(rehydrate(&[text("user", "hello"), text("user", "a notice")], 1_000_000), "hello\n\na notice");
