@@ -627,6 +627,7 @@ impl Run {
             return;
         };
         let conversation_id = self.conversation_id;
+        let group = self.child.id().and_then(|id| i32::try_from(id).ok());
         let ending = runtime.spawn(async move {
             if self.state != State::Idle && self.interrupt().await.is_ok() {
                 let _ = tokio::time::timeout(WIND_DOWN, async {
@@ -652,14 +653,21 @@ impl Run {
         });
         let mut endings = endings();
         let mine = endings.entry(conversation_id).or_default();
-        mine.retain(|task| !task.is_finished());
-        mine.push(ending);
+        mine.retain(|ending| !ending.task.is_finished());
+        mine.push(Ending { task: ending, group });
     }
 }
 
+/// A run being ended: its task, and its process group (the child's pid,
+/// `process_group(0)`), for a wait that runs out to kill (SME-431 L21).
+struct Ending {
+    task: tokio::task::JoinHandle<()>,
+    group: Option<i32>,
+}
+
 /// The tasks ending each conversation's runs (`end_in_background`).
-fn endings() -> std::sync::MutexGuard<'static, HashMap<i64, Vec<tokio::task::JoinHandle<()>>>> {
-    static ENDINGS: std::sync::LazyLock<Mutex<HashMap<i64, Vec<tokio::task::JoinHandle<()>>>>> = std::sync::LazyLock::new(Mutex::default);
+fn endings() -> std::sync::MutexGuard<'static, HashMap<i64, Vec<Ending>>> {
+    static ENDINGS: std::sync::LazyLock<Mutex<HashMap<i64, Vec<Ending>>>> = std::sync::LazyLock::new(Mutex::default);
     // Every change is one insert or take: nothing is left half-done.
     ENDINGS.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -668,13 +676,37 @@ fn endings() -> std::sync::MutexGuard<'static, HashMap<i64, Vec<tokio::task::Joi
 /// an ending interrupts within `WIND_DOWN`, waits as long again, then kills.
 pub const ENDED_WAIT: Duration = Duration::from_secs(12);
 
+#[cfg(test)]
+pub static ENDED_WAIT_FOR_TESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn ended_wait() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = ENDED_WAIT_FOR_TESTS.load(std::sync::atomic::Ordering::SeqCst);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    ENDED_WAIT
+}
+
 /// Waits, within `ENDED_WAIT`, for every run of `conversation_id` that's
-/// ending to be gone (PR #285 review 1 L17).
+/// ending to be gone (PR #285 review 1 L17). One still going at the end
+/// of the wait is killed, its task and its process group, so a session is
+/// never in two processes (SME-431 L21): its interrupt alone can take
+/// `WRITE_TIMEOUT` to fail on a CLI that doesn't read.
 async fn ended(conversation_id: i64) {
     let ending = endings().remove(&conversation_id).unwrap_or_default();
-    for task in ending {
-        if tokio::time::timeout(ENDED_WAIT, task).await.is_err() {
-            tracing::warn!(conversation_id, "a Claude Code process of this conversation is still ending; resuming its session anyway");
+    for Ending { mut task, group } in ending {
+        if tokio::time::timeout(ended_wait(), &mut task).await.is_err() {
+            tracing::warn!(conversation_id, "a Claude Code process of this conversation is still ending: killing it before its session goes on");
+            // The task's drop of the run kills the child (`kill_on_drop`);
+            // the group goes too, whatever it started.
+            task.abort();
+            if let Some(group) = group {
+                let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(group), nix::sys::signal::Signal::SIGKILL);
+            }
+            let _ = task.await;
         }
     }
 }

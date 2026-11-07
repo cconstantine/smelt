@@ -11,7 +11,8 @@
 //! fake exits 0), `{"emit": [line, …]}`, `{"fixture": name, "from": a,
 //! "to": b}` (its lines `a..b`), `{"call": [{"id", "name", "input"}, …]}`
 //! (each through the bridge, one at a time, then its `tool_result` line),
-//! `{"await_interrupt": true}`, `{"stderr": text}`, `{"hang": true}`, `{"exit": code}`. An
+//! `{"await_interrupt": true}`, `{"stderr": text}`, `{"hang": true}`, `{"exit": code}`,
+//! `{"write_session": true}` (its session's file, where the CLI keeps it). An
 //! interrupt during `read` or `call` ends the call with the CLI's
 //! stopped result and an `error_during_execution` `result`, and skips to
 //! the next `read`. After the last step, stdin is read to EOF.
@@ -119,6 +120,12 @@ impl FakeCli {
         std::fs::metadata(self.dir.join(file)).and_then(|m| m.modified()).expect("the file's time")
     }
 
+    /// The earlier processes still running as process `n` started.
+    pub(crate) fn alive_at_start(&self, n: usize) -> Vec<String> {
+        let text = std::fs::read_to_string(self.dir.join(format!("alive_at_start.{n}"))).expect("process n started");
+        text.lines().map(str::to_string).collect()
+    }
+
     /// Waits up to 10 s for `check` to hold.
     pub(crate) async fn until(&self, what: &str, check: impl Fn(&Self) -> bool) {
         for _ in 0..200 {
@@ -149,10 +156,25 @@ fn fake_claude_entry() {
     };
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a runtime");
     let n = take_number(&dir);
+    // Its pid, and which earlier processes still ran as it started, for a
+    // test of two processes in one session (SME-431 L21).
+    let _ = std::fs::write(dir.join(format!("pid.{n}")), std::process::id().to_string());
+    let alive: Vec<String> = (0..n)
+        .filter(|i| std::fs::read_to_string(dir.join(format!("pid.{i}"))).ok().is_some_and(|pid| running(pid.trim())))
+        .map(|i| i.to_string())
+        .collect();
+    let _ = std::fs::write(dir.join(format!("alive_at_start.{n}")), alive.join("\n"));
     let code = runtime.block_on(play(&dir, n));
     // When it ended, for a test of what waits on that (PR #285 review 1 L17).
     let _ = std::fs::write(dir.join(format!("exited.{n}")), "");
     std::process::exit(code);
+}
+
+/// Whether process `pid` runs: there, and not a zombie.
+fn running(pid: &str) -> bool {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    // The state follows the command's closing parenthesis.
+    stat.rsplit_once(") ").and_then(|(_, rest)| rest.chars().next()).is_some_and(|state| !matches!(state, 'Z' | 'X'))
 }
 
 /// Takes the next process number.
@@ -333,6 +355,17 @@ async fn play(dir: &Path, n: usize) -> i32 {
             false
         } else if let Some(name) = step["stamp"].as_str() {
             std::fs::write(fake.dir.join(format!("{name}.stamp")), "").expect("a stamp");
+            false
+        } else if step.get("write_session").is_some() {
+            // Its session's file, as the CLI writes it as it goes (SME-431
+            // L22), where smelt's `files` looks for it.
+            let id = args.iter().position(|a| *a == "--session-id" || *a == "--resume").and_then(|i| args.get(i + 1)).copied().unwrap_or_default();
+            let config = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).expect("a config dir");
+            let cwd = std::env::current_dir().expect("the cwd");
+            let conversation_id: i64 = cwd.file_name().and_then(|n| n.to_str()).and_then(|n| n.parse().ok()).expect("a conversation's work dir");
+            let sessions = crate::claude_cli::files::sessions_dir(&config, &crate::claude_cli::files::work_dir(&config, conversation_id));
+            std::fs::create_dir_all(&sessions).expect("the sessions dir");
+            std::fs::write(sessions.join(format!("{id}.jsonl")), "{}\n").expect("the session file");
             false
         } else if let Some(ms) = step["sleep_ms"].as_u64() {
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;

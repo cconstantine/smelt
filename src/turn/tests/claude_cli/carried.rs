@@ -46,3 +46,30 @@ async fn test_a_kept_runs_cut_off_names_the_cap_it_ran_with(pool: PgPool) {
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert_eq!(notices[0].0, 32_768, "the notice names the cap the CLI ran with: {notices:?}");
 }
+
+/// L21: a resume whose wait for the last process times out (here 300 ms,
+/// the old run taking 4 s to go) doesn't start a second process in the
+/// session: the one still ending is killed first.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_timed_out_wait_kills_the_last_process_before_resuming(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let fake = FakeCli::new("l21", vec![
+        vec![json!({"read": true}), text_reply("one"), json!({"sleep_ms": 4_000})],
+        vec![json!({"read": true}), text_reply("two")],
+    ]);
+    fake.pick_for(&pool, conversation.id).await;
+    let model = crate::providers::resolve_turn_model(&pool, conversation.id).await.expect("the model");
+    let mut cli = crate::claude_cli::run::TurnCli::default();
+    use super::review1::{one_call, said};
+    one_call(&pool, conversation.id, &model, &mut cli, vec![said("user", "hi")], 1_000).await.expect("call 1");
+    let next = vec![said("user", "hi"), said("assistant", "one"), said("user", "more")];
+    crate::claude_cli::run::ENDED_WAIT_FOR_TESTS.store(300, std::sync::atomic::Ordering::SeqCst);
+    let called = one_call(&pool, conversation.id, &model, &mut cli, next, 1_200).await;
+    crate::claude_cli::run::ENDED_WAIT_FOR_TESTS.store(0, std::sync::atomic::Ordering::SeqCst);
+    called.expect("call 2");
+
+    assert!(fake.args(1).iter().any(|a| a == "--resume"), "{:?}", fake.args(1));
+    assert_eq!(fake.alive_at_start(1), Vec::<String>::new(), "no earlier process ran as the resume started");
+}
