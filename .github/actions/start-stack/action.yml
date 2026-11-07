@@ -105,6 +105,12 @@ runs:
       shell: bash
       run: echo "SANDBOX_IMAGE=$(scripts/sandbox-image-ref)" >> "$GITHUB_ENV"
 
+    # The job's first cargo step. build-sandbox-image.sh starts with
+    # scripts/cargo-fetch (every crate, all targets, with retries), so a
+    # crates.io flake can't fail its builds, and no later test step's build
+    # downloads anything that could print a `warning: spurious network
+    # error` line into the log ci-no-warnings reads (SME-442). On the
+    # runner's warm cache the fetch makes no connection.
     - name: Build and deliver the sandbox image
       if: inputs.full == 'true'
       shell: bash

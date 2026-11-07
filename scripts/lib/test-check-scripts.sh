@@ -89,14 +89,36 @@ flock -n "$SMELT_LOCK_DIR/smelt-cluster.lock" true && echo unlocked || echo lock
 EOF
 # cargo: records each call. A test run (not --no-run) prints a result line.
 # CARGO_FAIL: a pattern; a call whose arguments match it fails.
+# CARGO_FAIL_TIMES=N with CARGO_FAIL_COUNT=FILE: only the first N matching
+# calls fail, counted in FILE (SME-442: a fetch that fails, then succeeds).
 # CARGO_WARN: a pattern; a call whose arguments match it succeeds with a
 # compiler warning, as rustc prints one (SME-361).
+# CALLS_ENV: a file; each call also appends its CARGO_NET_OFFLINE there
+# (SME-442: the builds after the fetch run offline).
+# CARGO_SPURIOUS: a pattern; a call whose arguments match it first prints
+# one network retry's warning, as cargo does, whether it then fails or not
+# (SME-442 review 1, L2).
 cat >"$dir/bin/cargo" <<'EOF'
 #!/usr/bin/env bash
 echo "cargo $* $(lock-state)" >>"$CALLS"
+[ -n "${CALLS_ENV:-}" ] && echo "CARGO_NET_OFFLINE=${CARGO_NET_OFFLINE-<unset>} cargo $*" >>"$CALLS_ENV"
+if [ -n "${CARGO_SPURIOUS:-}" ] && [[ "$*" =~ $CARGO_SPURIOUS ]]; then
+    echo "warning: spurious network error (3 tries remaining): [56] stub"
+fi
 if [ -n "${CARGO_FAIL:-}" ] && [[ "$*" =~ $CARGO_FAIL ]]; then
-    echo "error: stub cargo told to fail"
-    exit 101
+    fail_now=yes
+    if [ -n "${CARGO_FAIL_TIMES:-}" ]; then
+        failed=$(cat "$CARGO_FAIL_COUNT" 2>/dev/null || echo 0)
+        if [ "${failed:-0}" -lt "$CARGO_FAIL_TIMES" ]; then
+            echo $((${failed:-0} + 1)) >"$CARGO_FAIL_COUNT"
+        else
+            fail_now=no
+        fi
+    fi
+    if [ "$fail_now" = yes ]; then
+        echo "error: stub cargo told to fail"
+        exit 101
+    fi
 fi
 if [ -n "${CARGO_WARN:-}" ] && [[ "$*" =~ $CARGO_WARN ]]; then
     echo "warning: unused variable: \`pod\`"

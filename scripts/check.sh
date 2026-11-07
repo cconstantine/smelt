@@ -24,8 +24,17 @@
 # The browser tier (`cargo test --features "server browser-test" --
 # --ignored --test-threads=1`) isn't run here: it needs a built web
 # bundle and a real browser, and belongs before calling a change done.
+#
+# The crates are fetched first (scripts/cargo-fetch, SME-442), with retries
+# and its output kept out of the builds', and every cargo step after it runs
+# offline: a crates.io flake cargo recovered from used to fail a build's
+# `^warning` check through its `warning: spurious network error` line.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+echo "== crates (cargo fetch)"
+scripts/cargo-fetch || exit 1
+export CARGO_NET_OFFLINE=true
 
 echo "== web build (wasm32)"
 web_output=$(cargo check --no-default-features --features web --target wasm32-unknown-unknown 2>&1) || {

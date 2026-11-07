@@ -110,7 +110,7 @@ less, since it reaches neither the database nor a cluster. A daemon that
 refuses privileged containers can't bring up the `k3s` and `docker` sidecars,
 and then the cluster-backed tests fall to CI. What this seat is, in practice — one clone, the sequential gate, what is and isn't installed, how the run ends — is the "Working from a conversation sandbox" section of [the persona rules](personas/rules.md). This deployment's daemon allows privileged containers, so the real gate runs in a conversation sandbox and not only in CI.
 
-Three things trip a conversation sandbox's stack (SME-257's retrospective, proposal 2):
+Four things trip a conversation sandbox's stack (SME-257's retrospective, proposal 2; the fourth, SME-442):
 
 - **The pod's Docker sidecar has to hold the whole gate stack.** The cargo
   builds, the nested `docker` dind service, `k3s` and `postgres` all run under
@@ -144,6 +144,26 @@ Three things trip a conversation sandbox's stack (SME-257's retrospective, propo
   ```
 
   The cluster then starts empty, so build the sandbox image again too.
+- **Every `docker compose run --rm smelt` starts with an empty cargo
+  registry** (`CARGO_HOME` is the image's `/usr/local/cargo`, in the
+  container's own layer; no volume keeps it), so each seat gate downloads
+  every crate in `Cargo.lock`. A crates.io flake cargo recovered from used to
+  fail the gate anyway: cargo prints each retry as `warning: spurious network
+  error (N tries remaining): …`, and `check.sh` fails a build on any
+  `^warning` line. Since SME-442 `check.sh`, `scripts/browser-tier` and
+  `scripts/build-sandbox-image.sh` start with `scripts/cargo-fetch`: up to
+  three `cargo fetch` attempts (15 s and 45 s apart), their output in
+  `target/check/cargo-fetch.log` rather than in a build's. In `check.sh` and
+  `browser-tier` every cargo step after it runs with `CARGO_NET_OFFLINE=true`;
+  `build-sandbox-image.sh` checks no build output for warnings, so the fetch
+  alone is enough there.
+  A gate that stops with `crates.io unreachable: cargo fetch failed 3 times`
+  met an outage, not a build failure: wait and run it again. To see the
+  flake on demand, `docker compose run --rm --no-deps smelt
+  scripts/repro-cargo-net-flake <case>` runs `check.sh` up to its
+  `== cluster (` line with a fresh registry and a proxy that refuses chosen
+  connections (its header lists the cases and verdicts; results in
+  `target/repro-net/<case>/`).
 
 Helper scripts: `scripts/check.sh` (the checks every commit must pass: both
 builds and the test build with no warnings, plus the server tests), `scripts/check-server`
@@ -179,7 +199,10 @@ since both suites want a test cluster to themselves. Each runner keeps a
 cache volume (`CI_CACHE_DIR`) that outlives the job: cargo's downloads,
 `target/` and the compose `docker` service's storage are mounted from it by
 [.github/ci-compose.yml](<../.github/ci-compose.yml>), so a run builds on the
-last one's output. A pull request from a fork runs on GitHub's
+last one's output. Each test job's first cargo step is `scripts/cargo-fetch`,
+which `scripts/build-sandbox-image.sh` (start-stack's sandbox image step)
+runs before its builds (SME-442; see the seat's traps above); on that warm
+cache it makes no connection. A pull request from a fork runs on GitHub's
 `ubuntu-latest` instead, which has no such volume, so it builds everything
 from scratch.
 

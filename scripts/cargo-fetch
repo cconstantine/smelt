@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Downloads every crate Cargo.lock names, before any build (SME-442), so the
+# builds after it never touch the network and can run with
+# CARGO_NET_OFFLINE=true:
+#
+#   scripts/cargo-fetch
+#
+# A seat's `docker compose run --rm smelt` starts with an empty registry, so
+# its gate downloads every crate. A crates.io flake there that cargo
+# recovered from still failed the gate, since cargo says each retry as a
+# `warning: spurious network error` line, and check.sh fails a build on any
+# `^warning` line. Here cargo's own retries absorb a short flake: the fetch's
+# output goes to a log, never into a build's output. A longer one gets up to
+# three attempts, paused CARGO_FETCH_PAUSES seconds apart ("15 45" by
+# default; the tests set "0 0"). After the third failed attempt it stops
+# with one line, `crates.io unreachable: …`, so an outage reads as an
+# outage rather than as a build failure.
+#
+# On a warm registry (the user's dev container, CI's cache) it makes no
+# connection. Kept, and overwritten by the next run: target/check/cargo-fetch.log.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+attempts=3
+read -r -a pauses <<<"${CARGO_FETCH_PAUSES-15 45}"
+mkdir -p target/check
+log=target/check/cargo-fetch.log
+: >"$log"
+for ((i = 1; i <= attempts; i++)); do
+    echo "-- cargo fetch, attempt $i of $attempts" >>"$log"
+    # Never offline itself, whatever the caller exported.
+    if env -u CARGO_NET_OFFLINE cargo fetch >>"$log" 2>&1; then
+        # This attempt's retries only, from its own marker on (review 1, L2).
+        retries=$(sed -n "/^-- cargo fetch, attempt $i of /,\$p" "$log" | grep -c 'spurious network error')
+        echo "cargo-fetch: crates fetched on attempt $i of $attempts ($retries network retries absorbed; log: $log)"
+        exit 0
+    fi
+    echo "cargo-fetch: attempt $i of $attempts failed (log: $log)"
+    if [ "$i" -lt "$attempts" ]; then
+        sleep "${pauses[i - 1]:-0}"
+    fi
+done
+# The last attempt's errors, indented so no caller's ^error grep reads them
+# as a build's.
+sed -n "/^-- cargo fetch, attempt $attempts /,\$p" "$log" | grep -E '^(error|warning)|^Caused by|^ +' | tail -12 | sed 's/^/    /'
+echo "crates.io unreachable: cargo fetch failed $attempts times (log: $log)"
+exit 1
