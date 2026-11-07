@@ -328,7 +328,7 @@ pub async fn call(
     if let Some(run) = cli.run.as_mut()
         && let Some((window, max_output)) = run.reported.take()
         && !std::mem::replace(&mut run.learned, true)
-        && let Err(e) = crate::db::set_claude_cli_reported_window(pool, turn_model.provider_id, &turn_model.model, window, max_output).await
+        && let Err(e) = crate::providers::learn_claude_cli_window(pool, turn_model.provider_id, &turn_model.model, window, max_output).await
     {
         tracing::warn!(conversation_id, "couldn't save the window Claude Code reported: {e}");
     }

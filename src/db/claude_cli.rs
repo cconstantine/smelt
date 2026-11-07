@@ -45,14 +45,19 @@ pub async fn set_claude_cli_session(pool: &PgPool, conversation_id: i64, session
 
 /// Saves the window and reply cap Claude Code reports for `model` on
 /// `provider_id` (its `result.modelUsage`, SME-431) as the model row's
-/// reported ones, touching nothing else of the row.
-pub async fn set_claude_cli_reported_window(pool: &PgPool, provider_id: i64, model: &str, window: i32, max_output: Option<i32>) -> Result<(), sqlx::Error> {
+/// reported ones, touching nothing else of the row. Writes only when
+/// either differs from what's there, and says whether it wrote (PR #291
+/// review 1 L5).
+pub async fn set_claude_cli_reported_window(pool: &PgPool, provider_id: i64, model: &str, window: i32, max_output: Option<i32>) -> Result<bool, sqlx::Error> {
     sqlx::query(
         "INSERT INTO provider_models (provider_id, model, reported_context_window, reported_max_output)
          VALUES ($1, $2, $3, $4)
          ON CONFLICT (provider_id, model) DO UPDATE SET
              reported_context_window = EXCLUDED.reported_context_window,
-             reported_max_output = COALESCE(EXCLUDED.reported_max_output, provider_models.reported_max_output)",
+             reported_max_output = COALESCE(EXCLUDED.reported_max_output, provider_models.reported_max_output)
+         WHERE provider_models.reported_context_window IS DISTINCT FROM EXCLUDED.reported_context_window
+            OR (EXCLUDED.reported_max_output IS NOT NULL
+                AND provider_models.reported_max_output IS DISTINCT FROM EXCLUDED.reported_max_output)",
     )
     .bind(provider_id)
     .bind(model)
@@ -60,7 +65,7 @@ pub async fn set_claude_cli_reported_window(pool: &PgPool, provider_id: i64, mod
     .bind(max_output)
     .execute(pool)
     .await
-    .map(|_| ())
+    .map(|done| done.rows_affected() > 0)
 }
 
 /// Forgets `conversation_id`'s session: its next turn starts a new one.

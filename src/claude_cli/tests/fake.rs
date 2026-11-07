@@ -289,6 +289,9 @@ async fn play(dir: &Path, n: usize) -> i32 {
         .filter(|name| !name.starts_with("SMELT_FAKE_CLAUDE"))
         .collect();
     std::fs::write(dir.join(format!("env.{n}")), names.join("\n")).expect("log the env");
+    // The reply cap it was launched with (SME-431 review 1 M1).
+    let cap = std::env::var("CLAUDE_CODE_MAX_OUTPUT_TOKENS").unwrap_or_default();
+    std::fs::write(dir.join(format!("cap.{n}")), cap).expect("log the cap");
     let mcp = args.iter().position(|a| *a == "--mcp-config").and_then(|i| args.get(i + 1)).map(|config| {
         let config: Value = serde_json::from_str(&std::fs::read_to_string(config).expect("the MCP config file")).expect("the MCP config");
         let server = &config["mcpServers"]["smelt"];
@@ -301,6 +304,7 @@ async fn play(dir: &Path, n: usize) -> i32 {
     }
     let scenario: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("scenario.json")).expect("the scenario")).expect("JSON");
     let steps = scenario[n].as_array().cloned().unwrap_or_default();
+    let started_in = std::env::current_dir().ok();
     let mut fake = Fake {
         n,
         dir: dir.to_path_buf(),
@@ -372,7 +376,9 @@ async fn play(dir: &Path, n: usize) -> i32 {
             // L22), where smelt's `files` looks for it.
             let id = args.iter().position(|a| *a == "--session-id" || *a == "--resume").and_then(|i| args.get(i + 1)).copied().unwrap_or_default();
             let config = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).expect("a config dir");
-            let cwd = std::env::current_dir().expect("the cwd");
+            // Its cwd as it started: the CLI knows its paths from then on,
+            // so a deleted cwd doesn't stop it writing (PR #291 review 1 L3).
+            let cwd = started_in.clone().expect("the cwd");
             let conversation_id: i64 = cwd.file_name().and_then(|n| n.to_str()).and_then(|n| n.parse().ok()).expect("a conversation's work dir");
             let sessions = crate::claude_cli::files::sessions_dir(&config, &crate::claude_cli::files::work_dir(&config, conversation_id));
             std::fs::create_dir_all(&sessions).expect("the sessions dir");
