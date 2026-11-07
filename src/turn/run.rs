@@ -375,6 +375,12 @@ fn run_turn_steps<'a: 'b, 'b>(
             #[cfg(test)]
             test_hooks::after_reply_saved(conversation_id).await;
             recorder.finish(&turn, Some(turn_model.context_window)).await?;
+            // A whole reply that filled more than the learned window just
+            // fit through it: that number is too small, and this is where
+            // the proof has landed (SME-439 PR 2, Expected 3b). Nothing
+            // else about this reply changes, and a failed forget stops
+            // nothing — the function swallows its own error.
+            crate::providers::learned_window_beaten(pool, turn_model, &turn.usage).await;
             // The new baseline the *next* compaction check starts from:
             // everything up through this response is now accounted for, so
             // `pending_new_content` resets — only what's persisted after

@@ -89,3 +89,23 @@ pub async fn clear_learned_context_window(pool: &PgPool, provider_id: i64, model
     }
     Ok(())
 }
+
+/// A whole reply that filled more than the learned window disproves it
+/// (SME-439 PR 2, Expected 3b): what just fit is bigger than what smelt
+/// learned, so the learned number goes — one statement, strictly bigger
+/// only, the learner's base_url guard and four columns like every other
+/// clear. The measured size is the window-stop learner's own sum of the
+/// whole call. Called fire-and-forget from the turn loop after the reply
+/// is finished: a failed forget proves nothing and stops nothing, so the
+/// error is swallowed here rather than reaching `run_turn`'s.
+pub async fn learned_window_beaten(pool: &PgPool, model: &TurnModel, usage: &crate::anthropic::TokenUsage) {
+    let measured = usage
+        .input_tokens
+        .saturating_add(usage.output_tokens)
+        .saturating_add(usage.cache_creation_input_tokens)
+        .saturating_add(usage.cache_read_input_tokens);
+    let cleared = db::clear_learned_context_window_below(pool, model.provider_id, &model.endpoint.base_url, &model.model, measured).await;
+    if matches!(cleared, Ok(true)) {
+        providers_changed();
+    }
+}

@@ -12,7 +12,7 @@
 
 use super::*;
 use super::overflow::{start_refusal_mock, too_long};
-use super::window_stop::set_reported_context_window;
+use super::window_stop::{set_learned_context_window, set_reported_context_window};
 
 /// `body` reporting all four usage counts, as a real reply's
 /// `message_start` and `message_delta` do. `with_usage` leaves cache
@@ -397,6 +397,45 @@ async fn test_the_named_window_stop_still_learns_ungated(pool: PgPool) {
 
     assert_eq!(saved_learned_context_window(&pool).await, Some(35_000), "far from the report, and still: the server said the window filled");
     assert!(published_windows(drain_events(&mut rx).await).contains(&35_000), "the meter reads it too");
+}
+
+/// PR 2, Expected 3b: a whole reply that filled more than the learned
+/// window just fit through it — the learned number is too small and goes.
+/// Reported 262,144 keeps the turn's belief out of the way; the reply ends
+/// clean, so no stop learner is involved at all.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_reply_past_the_learned_window_forgives_it(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    crate::turn::overflow::forget_window_stop_candidates();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let body = with_usage(&text_reply_body("Over the learned line."), 39_900, 0, 100);
+    start_recording_mock_upstream_of_kind(&pool, vec![body], "llama_cpp").await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    set_reported_context_window(&pool, 262_144).await;
+    set_learned_context_window(&pool, 32_768).await;
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the turn succeeds");
+
+    assert_eq!(saved_learned_context_window(&pool).await, None, "40,000 measured fit: 32,768 was too small a claim");
+    assert_eq!(saved_context_window(&pool).await, None, "a clear's no one to move the user's column");
+}
+
+/// Expected 3b's other half: a reply that stayed inside the learned window
+/// says nothing against it — 30,000 inside 32,768 keeps the telling.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_reply_within_the_learned_window_keeps_it(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    crate::turn::overflow::forget_window_stop_candidates();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let body = with_usage(&text_reply_body("Well inside."), 29_900, 0, 100);
+    start_recording_mock_upstream_of_kind(&pool, vec![body], "llama_cpp").await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    set_reported_context_window(&pool, 262_144).await;
+    set_learned_context_window(&pool, 32_768).await;
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the turn succeeds");
+
+    assert_eq!(saved_learned_context_window(&pool).await, Some(32_768), "fitting inside the claim is no proof against it");
 }
 
 /// The per-request division: llama.cpp splits its total across slots,
