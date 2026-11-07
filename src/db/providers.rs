@@ -216,6 +216,12 @@ pub struct ProviderModelRow {
     /// `reported_context_window`, so learning never overwrites the user's
     /// own value. Null means nothing learned (or not since it last mattered).
     pub learned_context_window: Option<i32>,
+    /// When smelt learned it, which learner wrote it, and from which
+    /// conversation (SME-439): the provider page quotes all three, and
+    /// the Forget button answers exactly this telling.
+    pub learned_context_window_at: Option<NaiveDateTime>,
+    pub learned_context_window_reason: Option<String>,
+    pub learned_context_window_conversation: Option<i64>,
     /// Added on the provider's page as a model its listing doesn't show,
     /// so it's shown even when the listing works and lacks it.
     pub added_by_hand: bool,

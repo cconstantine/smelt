@@ -21,6 +21,36 @@ fn test_kinds_and_auth_kinds_round_trip_their_names() {
     assert_eq!(ProviderKind::parse("openai"), None);
 }
 
+/// SME-439 PR 2: the page reads the learned window and its whole telling
+/// — value, when, which learner, which conversation — off `ModelInfo`,
+/// whether or not a user value also exists and wins the read.
+#[cfg(feature = "server")]
+#[test]
+fn test_model_info_carries_the_learned_window_and_its_telling() {
+    let at = chrono::NaiveDateTime::parse_from_str("2026-11-06 16:14:07", "%Y-%m-%d %H:%M:%S").unwrap();
+    let row = crate::db::ProviderModelRow {
+        context_window: Some(262_144),
+        learned_context_window: Some(160_799),
+        learned_context_window_at: Some(at),
+        learned_context_window_reason: Some("window_stop".to_string()),
+        learned_context_window_conversation: Some(2_294_639_607),
+        ..Default::default()
+    };
+    let info = model_info(ProviderKind::LlamaCpp, "strata".to_string(), None, Some(&row), None);
+    assert_eq!(info.context_window_override, Some(262_144), "the user's value still wins the read");
+    assert_eq!(info.learned_context_window, Some(160_799));
+    assert_eq!(info.learned_window_reason.as_deref(), Some("window_stop"));
+    assert_eq!(info.learned_window_conversation, Some(2_294_639_607));
+    assert_eq!(info.learned_window_at.as_deref(), Some("2026-11-06T16:14:07"), "ISO, the page formats it");
+
+    let bare = model_info(ProviderKind::LlamaCpp, "strata".to_string(), None, None, None);
+    assert_eq!(
+        (bare.learned_context_window, bare.learned_window_at, bare.learned_window_reason, bare.learned_window_conversation),
+        (None, None, None, None),
+        "nothing learned, nothing to show"
+    );
+}
+
 /// Wire types go to the browser as JSON; each shape round-trips.
 #[test]
 fn test_conversation_models_round_trip_through_json() {

@@ -315,6 +315,13 @@ pub struct ModelInfo {
     /// False when `context_window` is `ASSUMED_CONTEXT_WINDOW` because
     /// nothing sized the model.
     pub context_window_known: bool,
+    /// What smelt learned (SME-439): shown on the page even when the
+    /// user's own value wins the read — that pairing is the incident
+    /// made visible. `learned_window_at` is ISO 8601 UTC.
+    pub learned_context_window: Option<u32>,
+    pub learned_window_at: Option<String>,
+    pub learned_window_reason: Option<String>,
+    pub learned_window_conversation: Option<i64>,
     /// Why this model's details couldn't be fetched, if they couldn't.
     pub details_error: Option<String>,
 }

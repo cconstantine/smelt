@@ -116,6 +116,10 @@ fn test_models_without_tools_are_suggested_last() {
         thinking: true,
         context_window: 1,
         context_window_known: true,
+        learned_context_window: None,
+        learned_window_at: None,
+        learned_window_reason: None,
+        learned_window_conversation: None,
         details_error: None,
     };
     let ordered = suggestion_order(vec![model("a", Some(false)), model("b", None), model("c", Some(true))]);

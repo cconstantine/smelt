@@ -239,6 +239,9 @@ async fn test_model_overrides_and_reported_details_leave_each_other_alone(pool: 
             reasoning_budget: Some(1024),
             reported_adaptive_thinking: None,
             learned_context_window: None,
+            learned_context_window_at: None,
+            learned_context_window_reason: None,
+            learned_context_window_conversation: None,
             added_by_hand: false,
         }
     );

@@ -309,6 +309,12 @@ pub fn model_info(
         max_output: output_cap(kind, &id, row),
         context_window,
         context_window_known,
+        learned_context_window: row.and_then(|r| positive(r.learned_context_window)),
+        learned_window_at: row
+            .and_then(|r| r.learned_context_window_at)
+            .map(|at| at.format("%Y-%m-%dT%H:%M:%S").to_string()),
+        learned_window_reason: row.and_then(|r| r.learned_context_window_reason.clone()),
+        learned_window_conversation: row.and_then(|r| r.learned_context_window_conversation),
         details_error,
         id,
     }
