@@ -1012,7 +1012,11 @@
     max-width: 100%;
     overflow-wrap: anywhere;
 }
-.provider-model-learned button {
+/* The compact Forget button. Scoped one level deeper than the row's
+ * own button rule below: at equal specificity that later rule would
+ * out-order this one and the compact padding would never render
+ * (SME-439 round 1 L3). */
+.provider-model-row .provider-model-learned button {
     padding: 2px 8px;
     font-size: 12px;
 }
