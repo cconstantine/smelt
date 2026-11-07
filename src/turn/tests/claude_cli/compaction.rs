@@ -274,3 +274,24 @@ fn test_a_claude_code_summarys_transcript_leaves_room_for_its_thinking() {
     assert!(room(ProviderKind::ClaudeCli) >= output + 4_096, "{} tokens of room", room(ProviderKind::ClaudeCli));
     assert_eq!(room(ProviderKind::Anthropic), 8_192);
 }
+
+/// An empty summary that ended normally (`end_turn`, all thinking and no
+/// text) fails the compaction on the Claude Code kind too: the check is
+/// for the empty text, not only the cut-off stop (PR #291 review 2's note).
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_empty_summary_that_ended_its_turn_fails_the_compaction(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let mut empty = api_call(30_000, vec![super::round1::thinking_block()], "end_turn", 300);
+    empty.push(crate::claude_cli::tests::fake::result_ok());
+    let fake = FakeCli::new("r2-empty-end-turn", super::round1::full_loop_then(vec![json!({"read": true}), json!({"emit": empty})]));
+    let provider = fake.pick_for(&pool, conversation.id).await;
+    super::review1::set_cli_window(&pool, provider, 65_536).await;
+
+    let error = run_turn(&pool, conversation.id, hello()).await.expect_err("the compaction fails").to_string();
+
+    assert!(error.contains("its summary came back empty"), "{error}");
+    assert_eq!(fake.started(), 2, "the run and the summary, no new session");
+    assert_eq!(dividers(&pool, conversation.id).await, 0, "nothing replaced the history");
+}
