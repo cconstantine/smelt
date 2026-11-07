@@ -194,21 +194,65 @@ fn positive(value: Option<i32>) -> Option<u32> {
 }
 
 /// The context window a turn uses and whether anything sized it: the
-/// user's override, else what the provider reported, else a known
-/// `claude-*` model's, else `ASSUMED_CONTEXT_WINDOW`.
+/// user's override, else what smelt last learned (SME-439), else what
+/// the provider reported, else a known `claude-*` model's, else
+/// `ASSUMED_CONTEXT_WINDOW`.
 pub fn context_window(model: &str, row: Option<&db::ProviderModelRow>) -> (u32, bool) {
-    row.and_then(|r| positive(r.context_window).or(positive(r.reported_context_window)))
+    row.and_then(|r| {
+        positive(r.context_window)
+            .or(positive(r.learned_context_window))
+            .or(positive(r.reported_context_window))
+    })
         .or_else(|| crate::anthropic::context_window_for(model))
         .map_or((ASSUMED_CONTEXT_WINDOW, false), |window| (window, true))
 }
 
-/// Saves the context window an overflow refusal named (SME-73) for the
-/// model this turn ran on — it only ever lowers the model's effective
-/// window (see `db::lower_model_context_window`) — and tells the app, so the
-/// providers page and pickers refresh. The meter takes the new window
-/// from the turn's own copy, which its caller updates too.
-pub async fn learn_context_window(pool: &PgPool, model: &TurnModel, window: u32) -> Result<bool, sqlx::Error> {
-    let lowered = db::lower_model_context_window(pool, model.provider_id, &model.endpoint.base_url, &model.model, window, context_window(&model.model, None).0).await?;
+/// Which learner saved a window (SME-439): recorded beside the learned
+/// window, so it can always be said where a number came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowSource {
+    /// An overflow refusal that named a window.
+    Refusal,
+    /// A reply the window stopped, measured through the gate in
+    /// `turn::overflow::learn_window_stop`.
+    WindowStop,
+    /// Ollama's `/api/ps` answer for what's loaded.
+    OllamaPs,
+}
+
+impl WindowSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Refusal => "refusal",
+            Self::WindowStop => "window_stop",
+            Self::OllamaPs => "ollama_ps",
+        }
+    }
+}
+
+/// Saves a window a learner settled on (SME-73, SME-439) for the model
+/// this turn ran on — into the learned column, never the user's own — and
+/// tells the app, so the providers page and pickers refresh. The meter
+/// takes the new window from the turn's own copy, which its caller
+/// updates too.
+pub async fn learn_context_window(
+    pool: &PgPool,
+    model: &TurnModel,
+    window: u32,
+    reason: WindowSource,
+    conversation_id: i64,
+) -> Result<bool, sqlx::Error> {
+    let lowered = db::save_learned_context_window(
+        pool,
+        model.provider_id,
+        &model.endpoint.base_url,
+        &model.model,
+        window,
+        reason.as_str(),
+        conversation_id,
+        context_window(&model.model, None).0,
+    )
+    .await?;
     if lowered {
         providers_changed();
     }

@@ -184,6 +184,12 @@ fn run_turn_steps<'a: 'b, 'b>(
         }
 
         let mut streak = TextCallStreak::default();
+        // The number this turn's window stops carry as evidence (SME-439
+        // round 1 M1): every model call below shares it — a `carries_on`
+        // continuation included — so the candidate map can refuse a
+        // like-sized restop inside one turn the repeat it would wrongly
+        // learn from.
+        let window_stop_turn = super::overflow::next_window_stop_turn();
         for _ in 0..max_turns {
             // The model's `ask_user` (SME-34): an answer recorded since
             // this turn saved its own message is taken now, so the model
@@ -353,13 +359,14 @@ fn run_turn_steps<'a: 'b, 'b>(
                 Err(CallError::Failed(e)) => return Err(e),
             };
             // A reply the window stopped, rather than one that ran out of
-            // budget, measured the room the server really has: when the
-            // whole call came in far below the window this turn believed,
-            // believe less now (SME-73). Kept as it stands — a cut-off
-            // reply isn't continued — and this runs before the meter is
-            // published below, so it reads the new window too.
+            // budget, measured the room the server really has — but only
+            // against what the server reports, or a repeat of itself,
+            // does that measurement teach anything (SME-439). Kept as it
+            // stands — a cut-off reply isn't continued — and this runs
+            // before the meter is published below, so a save moves the
+            // meter too.
             if super::overflow::window_stop(turn_model.kind, &turn.stop_reason, turn.usage.output_tokens, budget.tokens) {
-                super::overflow::learn_window_stop(pool, conversation_id, turn_model, &turn.usage).await;
+                super::overflow::learn_window_stop(pool, conversation_id, window_stop_turn, turn_model, &turn.usage, &turn.content, &turn.stop_reason).await;
             }
             save_reply(pool, conversation_id, &turn, &mut persisted).await?;
             #[cfg(test)]
