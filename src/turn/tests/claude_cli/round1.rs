@@ -51,7 +51,7 @@ async fn test_a_deleted_conversations_files_dont_come_back(pool: PgPool) {
 }
 
 /// A thinking block as the CLI streams one: no text, a signature.
-fn thinking_block() -> Vec<Value> {
+pub(super) fn thinking_block() -> Vec<Value> {
     vec![
         json!({"type": "content_block_start", "content_block": {"type": "thinking", "thinking": ""}}),
         json!({"type": "content_block_delta", "delta": {"type": "signature_delta", "signature": "c2ln"}}),
@@ -60,7 +60,7 @@ fn thinking_block() -> Vec<Value> {
 
 /// A tool loop whose reply filled the window (65,536) past its ceiling,
 /// then `summary`'s steps as the summary's one-shot process.
-fn full_loop_then(summary: Vec<Value>) -> Vec<Vec<Value>> {
+pub(super) fn full_loop_then(summary: Vec<Value>) -> Vec<Vec<Value>> {
     let tool = crate::claude_cli::tests::fake::tool_block("toolu_r1", "todoread", &json!({}));
     vec![
         vec![json!({"read": true}), json!({"emit": api_call(50_000, vec![tool], "tool_use", 5)}), json!({"call": [{"id": "toolu_r1", "name": "mcp__smelt__todoread", "input": {}}]})],

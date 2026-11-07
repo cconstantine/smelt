@@ -228,3 +228,49 @@ async fn test_an_http_kinds_cut_off_summary_is_saved(pool: PgPool) {
     assert_eq!(upstream.count(), 3, "refusal, summary, retry");
     assert_eq!(compaction_summaries(&pool, conversation.id).await, ["Summary: it was"]);
 }
+
+/// A summary stopped by the window (`model_context_window_exceeded`, the
+/// synthesised fixture `window_stop`) is an overflow, not a cut-off: the
+/// compaction asks once more with half the transcript and saves that
+/// summary, rather than failing the same way on every send (PR #291
+/// review 2 L1).
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_summary_stopped_by_the_window_retries_on_half_the_transcript(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let stopped = without_init(fixture_lines("window_stop"));
+    let mut runs = super::round1::full_loop_then(vec![json!({"read": true}), json!({"emit": stopped})]);
+    runs[2] = vec![json!({"read": true}), text_reply("SUMMARY-RETRY")];
+    runs.push(vec![json!({"read": true}), text_reply("carried on")]);
+    let fake = FakeCli::new("r2-window-stop", runs);
+    let provider = fake.pick_for(&pool, conversation.id).await;
+    super::review1::set_cli_window(&pool, provider, 65_536).await;
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the retried summary is saved and the turn carries on");
+
+    assert_eq!(fake.started(), 4, "the run, two summaries, the new session");
+    let (first, retry) = (user_texts(&fake, 1)[0].len(), user_texts(&fake, 2)[0].len());
+    assert!(retry < first, "the retry's transcript is smaller: {retry} vs {first}");
+    let saved = saved(&pool, conversation.id).await;
+    let summaries: Vec<&str> = saved.iter().flat_map(|(_, b)| b).filter_map(|b| match b {
+        anthropic::ContentBlock::CompactionSummary { summary, .. } => Some(summary.as_str()),
+        _ => None,
+    }).collect();
+    assert_eq!(summaries, ["SUMMARY-RETRY"], "{saved:?}");
+}
+
+/// The Claude Code kind's summary call is capped at the summary plus
+/// `THINKING_ROOM`, so its transcript leaves room for both and a margin;
+/// the other kinds keep 8,192 (PR #291 review 2 L1).
+#[test]
+fn test_a_claude_code_summarys_transcript_leaves_room_for_its_thinking() {
+    use crate::providers::ProviderKind;
+    use crate::turn::compaction::SUMMARY_MAX_TOKENS;
+    use crate::turn::compaction_transcript::compaction_transcript_budget;
+    let window = 200_000_u32;
+    let room = |kind| window as usize - compaction_transcript_budget(window, kind) / 3;
+    let output = (SUMMARY_MAX_TOKENS + crate::claude_cli::once::THINKING_ROOM) as usize;
+    assert!(room(ProviderKind::ClaudeCli) >= output + 4_096, "{} tokens of room", room(ProviderKind::ClaudeCli));
+    assert_eq!(room(ProviderKind::Anthropic), 8_192);
+}

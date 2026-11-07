@@ -25,8 +25,8 @@ use crate::anthropic::{ContentBlock, CreateMessageRequest};
 /// What a one-shot call's cap adds to its request's `max_tokens`: the CLI
 /// can't turn thinking off (S6), and its thinking shares the cap with the
 /// reply (PR #291 review 1 M1). With the summary's 2,048 that's 6,144,
-/// inside the 8,192 tokens `compaction_transcript_budget` keeps clear of
-/// the transcript for the instructions, the live state and the output.
+/// and on this kind `compaction_transcript_budget` keeps that plus 4,096
+/// clear of the transcript for the instructions and the live state.
 pub const THINKING_ROOM: u32 = 4_096;
 
 /// The request's one message, as the text the CLI is sent.

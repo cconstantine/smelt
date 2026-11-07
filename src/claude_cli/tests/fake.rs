@@ -40,6 +40,7 @@ fn fixture(name: &str) -> &'static str {
         "missing" => include_str!("../fixtures/missing.jsonl"),
         // Synthesised, not captured (SME-431): its first line says so.
         "overflow" => include_str!("../fixtures/overflow.jsonl"),
+        "window_stop" => include_str!("../fixtures/window_stop.jsonl"),
         _ => "",
     }
 }

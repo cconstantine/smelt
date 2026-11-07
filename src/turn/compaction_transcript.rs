@@ -129,7 +129,16 @@ fn users_words(messages: &[Message], budget: usize) -> String {
 
 /// How much transcript the summarization call can take: the context window
 /// less room for its instructions, the live-state listing and its own
-/// output, at a conservative 3 characters per token.
-pub(super) fn compaction_transcript_budget(context_window: u32) -> usize {
-    (context_window as usize).saturating_sub(8_192) * 3
+/// output, at a conservative 3 characters per token. On Claude Code the
+/// output is the summary plus the thinking the CLI can't turn off
+/// (`once::THINKING_ROOM`), so the room grows by that and keeps a 4,096
+/// margin (PR #291 review 2 L1).
+pub(super) fn compaction_transcript_budget(context_window: u32, kind: crate::providers::ProviderKind) -> usize {
+    let room = match kind {
+        crate::providers::ProviderKind::ClaudeCli => {
+            (super::compaction::SUMMARY_MAX_TOKENS + crate::claude_cli::once::THINKING_ROOM) as usize + 4_096
+        }
+        _ => 8_192,
+    };
+    (context_window as usize).saturating_sub(room) * 3
 }

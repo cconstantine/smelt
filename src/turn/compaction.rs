@@ -631,7 +631,7 @@ async fn compact(
 
     let transcript = compaction_transcript(
         &messages,
-        compaction_transcript_budget(turn_model.context_window),
+        compaction_transcript_budget(turn_model.context_window, turn_model.kind),
     );
 
     // A summary request refused as an overflow (SME-73) is that same
@@ -644,7 +644,7 @@ async fn compact(
         Ok(summary) => summary,
         Err(anthropic::stream::ModelError::Overflow(overflow)) => {
             let named = super::overflow::learn(pool, conversation_id, turn_model, overflow.window).await;
-            let budget = named.map_or(transcript.chars().count() / 2, compaction_transcript_budget);
+            let budget = named.map_or(transcript.chars().count() / 2, |w| compaction_transcript_budget(w, turn_model.kind));
             let transcript = compaction_transcript(&messages, budget);
             match summarize(pool, conversation_id, turn_model, slot, &transcript).await {
                 Ok(summary) => {
