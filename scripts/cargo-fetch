@@ -30,7 +30,8 @@ for ((i = 1; i <= attempts; i++)); do
     echo "-- cargo fetch, attempt $i of $attempts" >>"$log"
     # Never offline itself, whatever the caller exported.
     if env -u CARGO_NET_OFFLINE cargo fetch >>"$log" 2>&1; then
-        retries=$(grep -c 'spurious network error' "$log")
+        # This attempt's retries only, from its own marker on (review 1, L2).
+        retries=$(sed -n "/^-- cargo fetch, attempt $i of /,\$p" "$log" | grep -c 'spurious network error')
         echo "cargo-fetch: crates fetched on attempt $i of $attempts ($retries network retries absorbed; log: $log)"
         exit 0
     fi

@@ -95,10 +95,16 @@ EOF
 # compiler warning, as rustc prints one (SME-361).
 # CALLS_ENV: a file; each call also appends its CARGO_NET_OFFLINE there
 # (SME-442: the builds after the fetch run offline).
+# CARGO_SPURIOUS: a pattern; a call whose arguments match it first prints
+# one network retry's warning, as cargo does, whether it then fails or not
+# (SME-442 review 1, L2).
 cat >"$dir/bin/cargo" <<'EOF'
 #!/usr/bin/env bash
 echo "cargo $* $(lock-state)" >>"$CALLS"
 [ -n "${CALLS_ENV:-}" ] && echo "CARGO_NET_OFFLINE=${CARGO_NET_OFFLINE-<unset>} cargo $*" >>"$CALLS_ENV"
+if [ -n "${CARGO_SPURIOUS:-}" ] && [[ "$*" =~ $CARGO_SPURIOUS ]]; then
+    echo "warning: spurious network error (3 tries remaining): [56] stub"
+fi
 if [ -n "${CARGO_FAIL:-}" ] && [[ "$*" =~ $CARGO_FAIL ]]; then
     fail_now=yes
     if [ -n "${CARGO_FAIL_TIMES:-}" ]; then

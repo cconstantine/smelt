@@ -23,7 +23,7 @@ export CALLS=$dir/calls
 # No pauses between scripts/cargo-fetch's attempts, and none of the
 # caller's offline setting (SME-442).
 gate_env=(env -u SANDBOX_IMAGE -u CARGO_FAIL -u CARGO_WARN -u CARGO_FAIL_TIMES -u CARGO_FAIL_COUNT -u CALLS_ENV
-    -u CARGO_NET_OFFLINE PATH="$dir/bin:$PATH" SANDBOX_IMAGE_IMPORT="$dir/bin/import" CARGO_FETCH_PAUSES="0 0"
+    -u CARGO_SPURIOUS -u CARGO_NET_OFFLINE PATH="$dir/bin:$PATH" SANDBOX_IMAGE_IMPORT="$dir/bin/import" CARGO_FETCH_PAUSES="0 0"
     DATABASE_URL=postgres://u@localhost/smelt_dev BROWSER_CHECK_CACHE="$dir" SMELT_SKIP_SCRIPT_TESTS=1)
 calls_env=$dir/calls-env
 fail_count=$dir/cargo-fail-count
@@ -74,6 +74,13 @@ fi
 grep -q "attempt 1 of 3 failed" <<<"$out" && grep -q "attempt 2 of 3 failed" <<<"$out" ||
     fail "check.sh didn't say the fetch's first two attempts failed: $out"
 [ "$(grep -c '^cargo fetch ' "$CALLS")" = 3 ] || fail "check.sh didn't fetch three times: $(cat "$CALLS")"
+# The retries it says it absorbed are the successful attempt's only, not a
+# failed attempt's too (review 1, L2): each attempt here prints one.
+echo 0 >"$fail_count"
+out=$(timeout 60 "${gate_env[@]}" CARGO_FAIL='^fetch' CARGO_FAIL_TIMES=1 CARGO_FAIL_COUNT="$fail_count" \
+    CARGO_SPURIOUS='^fetch' scripts/cargo-fetch 2>&1) || fail "cargo-fetch failed on a second attempt that succeeded: $out"
+grep -q "crates fetched on attempt 2 of 3 (1 network retries absorbed" <<<"$out" ||
+    fail "cargo-fetch didn't count only the successful attempt's one retry: $out"
 # Three failed fetches stop the gate before any build, saying crates.io is
 # unreachable rather than showing a build failure.
 : >"$CALLS"
