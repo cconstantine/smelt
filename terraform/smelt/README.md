@@ -15,7 +15,8 @@ consumer (e.g. the homelab repo) pulls it as a git source.
 In `namespace` (default `smelt-park`):
 
 - the namespace itself, a `park` ServiceAccount, a Role/RoleBinding mirroring
-  `k8s/smelt-park-rbac.yaml`, and a LimitRange capping sandbox pod memory;
+  `k8s/smelt-park-rbac.yaml`, and a LimitRange capping sandbox pod memory and
+  declaring `default`/`defaultRequest` explicitly (SME-335);
 - one `smelt` server Deployment (Recreate, not RollingUpdate — a new server
   applies its migrations at startup, and two writers on one schema is how
   that goes wrong), Service, and Ingress;
@@ -105,4 +106,7 @@ and `terraform/test-cluster/check-secret-env.sh` checks the result: the server
 reads it from a `secretKeyRef`, `kubectl get deploy -o yaml` holds no plain
 copy, the checksum annotation is there, and the running server sees the value.
 Applying another value (`-var secret_env_value=…`) changes the checksum and
-rolls the pod.
+rolls the pod. `terraform/test-cluster/check-limitrange.sh` checks the
+LimitRange likewise: the plan converges, `defaultRequest` reads back the
+declared `0`, a pod naming no resources runs at request 0, a sandbox-like one
+is untouched, and a hand-applied `k8s/smelt-park-rbac.yaml` stays idempotent.

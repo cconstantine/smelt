@@ -139,9 +139,25 @@ resource "kubernetes_role_binding_v1" "park" {
   }
 }
 
-# The ceiling on `create_pod`'s per-pod memory_limit override. Only `max` is
-# set: a `cpu` entry here would hand every container a defaulted CPU limit and
+# The ceiling on `create_pod`'s per-pod memory_limit override. No `cpu` entry
+# is ever set here: it would hand every container a defaulted CPU limit and
 # request it can't be scheduled with (SME-77).
+#
+# `default` and `defaultRequest` are declared, not omitted (SME-335): the API
+# server fills a LimitRange item's unset defaults from `max` on every write,
+# so a config that leaves them out can never converge — homelab's master sat
+# permanently plan-dirty on `default -> null`. And the filled request was
+# worse than drift: every container naming no memory of its own — the
+# server's own `database-is-ready` init container among them — reserved the
+# whole ceiling, which no node under it could schedule.
+#
+# `default` mirrors the max exactly: an un-capped container's limit stays
+# what it has always effectively been, and lowering `sandbox_pod_memory_max`
+# moves both together, so lowering the ceiling keeps applying.
+# `defaultRequest` is zero: naming nothing reserves nothing — the SME-77
+# intent, extended to containers that name nothing. Containers that DO name
+# their memory — every container smelt builds, `requests.memory: 0` included
+# — are untouched by either field.
 resource "kubernetes_limit_range_v1" "sandbox_pod_max" {
   for_each = local.sandbox_namespaces
 
@@ -154,6 +170,9 @@ resource "kubernetes_limit_range_v1" "sandbox_pod_max" {
     limit {
       type = "Container"
       max  = { memory = var.sandbox_pod_memory_max }
+
+      default         = { memory = var.sandbox_pod_memory_max }
+      default_request = { memory = "0" }
     }
   }
 }
