@@ -692,6 +692,18 @@ fn ended_wait() -> Duration {
     ENDED_WAIT
 }
 
+/// Drops `conversation_id`'s entry in the table of runs ending: it's being
+/// deleted (SME-431 L23). Its tasks carry on and end their runs.
+pub fn forget_endings(conversation_id: i64) {
+    endings().remove(&conversation_id);
+}
+
+/// Whether the table holds an entry for `conversation_id`.
+#[cfg(test)]
+pub fn has_endings(conversation_id: i64) -> bool {
+    endings().contains_key(&conversation_id)
+}
+
 /// Waits, within `ENDED_WAIT`, for every run of `conversation_id` that's
 /// ending to be gone (PR #285 review 1 L17). One still going at the end
 /// of the wait is killed, its task and its process group, so a session is

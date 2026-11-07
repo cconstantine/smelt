@@ -102,3 +102,19 @@ async fn test_a_replaced_sessions_file_doesnt_come_back(pool: PgPool) {
     assert!(fake.args(1).iter().any(|a| a == "--session-id"), "{:?}", fake.args(1));
     assert!(!super::review3::session_file(conversation.id, &old).exists(), "the replaced session's file stays gone");
 }
+
+/// L23: a deleted conversation leaves no entry in the table of runs
+/// still ending.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_deleted_conversation_leaves_no_ending_entry(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let fake = FakeCli::new("l23", vec![vec![json!({"read": true}), text_reply("one")]]);
+    fake.pick_for(&pool, conversation.id).await;
+    run_turn(&pool, conversation.id, hello()).await.expect("a turn");
+    assert!(crate::claude_cli::run::has_endings(conversation.id), "the turn's run is ending");
+
+    crate::agents::delete_subtree(&pool, conversation.id).await.expect("delete the conversation");
+    assert!(!crate::claude_cli::run::has_endings(conversation.id), "its entry went with it");
+}
