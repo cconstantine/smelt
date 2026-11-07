@@ -256,11 +256,9 @@ fn reply_text(content: &[anthropic::ContentBlock]) -> String {
         .join(" ")
 }
 
-/// One `window_learn` span per learning *decision* (SME-439's Expected
-/// 6): a records-carrier, ended on the spot, never a duration. Every
-/// field is a number, an id, or a fixed enum — no reply text, no model
-/// output, no URLs (SME-137's rule) — so the incident can be read off a
-/// trace without having sat in the conversation.
+/// Learners write through the one `window_learn` span definition
+/// (`providers::trace_window_learn`), which PR 2's self-clears share
+/// since round 1 H1: one field list, one no-reply-text rule (SME-137's).
 #[allow(clippy::too_many_arguments)]
 fn trace_window_decision(
     conversation_id: i64,
@@ -272,30 +270,16 @@ fn trace_window_decision(
     reported: Option<i64>,
     reported_per_request: Option<i64>,
 ) {
-    let (measured_input, measured_output, cache_creation, cache_read) = match usage {
-        Some(u) => (
-            Some(u.input_tokens),
-            Some(u.output_tokens),
-            Some(u.cache_creation_input_tokens),
-            Some(u.cache_read_input_tokens),
-        ),
-        None => (None, None, None, None),
-    };
-    tracing::info_span!(
-        "window_learn",
-        conversation_id,
-        smelt.model = model,
-        smelt.window.source = source.as_str(),
-        smelt.window.decision = decision,
-        smelt.window.value = i64::from(value),
-        smelt.window.measured_input = measured_input,
-        smelt.window.measured_output = measured_output,
-        smelt.window.cache_creation = cache_creation,
-        smelt.window.cache_read = cache_read,
-        smelt.window.reported = reported,
-        smelt.window.reported_per_request = reported_per_request,
-    )
-    .in_scope(|| {});
+    crate::providers::trace_window_learn(
+        Some(conversation_id),
+        model,
+        source.as_str(),
+        decision,
+        i64::from(value),
+        usage,
+        reported,
+        reported_per_request,
+    );
 }
 
 /// The repeat evidence for an ambiguous, implausible window stop

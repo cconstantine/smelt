@@ -68,11 +68,28 @@ async fn report_provider(pool: &PgPool, kind: &str, base_url: &str) -> crate::db
         .expect("provider")
 }
 
+/// `window_learn` spans only, and their one telling attribute — the
+/// pattern from `turn::tests::window_learning`, copied for the clear's
+/// own side of the seam (round 1 H1: the self-clears must speak).
+#[cfg(feature = "server")]
+fn window_learn_spans(spans: &[opentelemetry_sdk::trace::SpanData]) -> Vec<&opentelemetry_sdk::trace::SpanData> {
+    spans.iter().filter(|span| span.name == "window_learn").collect()
+}
+
+#[cfg(feature = "server")]
+fn span_attribute<'a>(span: &'a opentelemetry_sdk::trace::SpanData, key: &str) -> Option<&'a opentelemetry::Value> {
+    let values: Vec<_> = span.attributes.iter().filter(|kv| kv.key.as_str() == key).map(|kv| &kv.value).collect();
+    assert!(values.len() <= 1, "{key} recorded more than once: {values:?}");
+    values.first().copied()
+}
+
 /// SME-439 PR 2 (Expected 3a): a listing report bigger than the learned
 /// window says the learned one is too small — forget it. Everyone else's
 /// report is per model, so 40,000 against a learned 32,768 clears; one
 /// that doesn't outgrow it keeps, and the clear never reaches the user's
-/// own field.
+/// own field. Round 1 H1: the clear says so on `window_learn` — decision
+/// `bigger_report`, the report and its per-request share, no conversation
+/// id (a listing has none) — and says nothing when nothing clears.
 #[cfg(feature = "server")]
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_bigger_report_forgets_a_smaller_learned_window(pool: PgPool) {
@@ -80,11 +97,28 @@ async fn test_a_bigger_report_forgets_a_smaller_learned_window(pool: PgPool) {
     crate::db::save_learned_context_window(&pool, provider.id, "http://one", "m", 32_768, "window_stop", 42, 200_000).await.expect("learn");
     crate::db::set_provider_model_overrides(&pool, provider.id, "m", None, Some(400_000), None, None, None).await.expect("user window");
 
-    server::store_details(&pool, provider.id, "m", &details_with_window(16_384)).await.expect("smaller report");
+    let (result, spans) = crate::telemetry::capture_spans(server::store_details(&pool, provider.id, "m", &details_with_window(16_384))).await;
+    result.expect("smaller report");
+    assert!(window_learn_spans(&spans).is_empty(), "a report that keeps says nothing: {:?}", window_learn_spans(&spans));
     let row = crate::db::get_provider_model(&pool, provider.id, "m").await.expect("get").expect("row");
     assert_eq!(row.learned_context_window, Some(32_768), "16,384 does not outgrow 32,768");
 
-    server::store_details(&pool, provider.id, "m", &details_with_window(40_000)).await.expect("bigger report");
+    let (result, spans) = crate::telemetry::capture_spans(server::store_details(&pool, provider.id, "m", &details_with_window(32_768))).await;
+    result.expect("equal report");
+    assert!(window_learn_spans(&spans).is_empty(), "equal exceeds nothing, and traces nothing: {:?}", window_learn_spans(&spans));
+    let row = crate::db::get_provider_model(&pool, provider.id, "m").await.expect("get").expect("row");
+    assert_eq!(row.learned_context_window, Some(32_768), "32,768 is not bigger than 32,768");
+
+    let (result, spans) = crate::telemetry::capture_spans(server::store_details(&pool, provider.id, "m", &details_with_window(40_000))).await;
+    result.expect("bigger report");
+    let found = window_learn_spans(&spans);
+    let [span] = found.as_slice() else { panic!("one window_learn span for the clear: {found:?}") };
+    assert_eq!(span_attribute(span, "smelt.window.source"), Some(&"listing".into()));
+    assert_eq!(span_attribute(span, "smelt.window.decision"), Some(&"bigger_report".into()));
+    assert_eq!(span_attribute(span, "smelt.window.value"), Some(&40_000_i64.into()));
+    assert_eq!(span_attribute(span, "smelt.window.reported"), Some(&40_000_i64.into()));
+    assert_eq!(span_attribute(span, "smelt.window.reported_per_request"), Some(&40_000_i64.into()));
+    assert_eq!(span_attribute(span, "conversation_id"), None, "a listing has no conversation to name");
     let row = crate::db::get_provider_model(&pool, provider.id, "m").await.expect("get").expect("row");
     assert_eq!(row.learned_context_window, None, "40,000 outgrew the learned 32,768: forgotten");
     assert_eq!(row.context_window, Some(400_000), "the user's own field is nobody of this clear's");

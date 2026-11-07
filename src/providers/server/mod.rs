@@ -633,6 +633,13 @@ pub(super) async fn store_details(
                 .map_err(|e| e.to_string())?;
             if forgotten {
                 providers_changed();
+                // Round 1 H1: a clear that cleared speaks on window_learn
+                // — decision `bigger_report`, the report and its
+                // per-request share, and no conversation id: a listing
+                // has none. Fired on the UPDATE's answer, not the attempt.
+                let reported = to_column(details.context_window).map(i64::from);
+                tracing::info!(model = %model, reported = reported.unwrap_or_default(), reported_per_request = per_request, decision = "bigger_report", "learned context window forgotten: a report outgrew it");
+                trace_window_learn(None, model, "listing", "bigger_report", per_request, None, reported, Some(per_request));
             }
         }
     }

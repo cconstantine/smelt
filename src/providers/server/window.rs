@@ -47,6 +47,54 @@ impl WindowSource {
     }
 }
 
+/// One `window_learn` span per decision about a model's window
+/// (SME-439's Expected 6, and PR 2's two self-clears): a records-carrier,
+/// ended on the spot, never a duration. Every field is a number, an id,
+/// or a fixed enum — no reply text, no model output, no URLs (SME-137's
+/// rule) — so the incident can be read off a trace without having sat in
+/// the conversation. Lives beside the columns it reports on so the
+/// self-clears — `window_beaten` and `bigger_report`, round 1 H1: "why
+/// did mine vanish?" gets answered here or nowhere — speak on the same
+/// span as the learners; `turn::overflow` writes through it. `value` is
+/// what was, would be, or disproved the claim; the clears carry no
+/// `conversation_id` — neither has one in hand, and neither reaches.
+#[allow(clippy::too_many_arguments)]
+pub fn trace_window_learn(
+    conversation_id: Option<i64>,
+    model: &str,
+    source: &str,
+    decision: &str,
+    value: i64,
+    usage: Option<&crate::anthropic::TokenUsage>,
+    reported: Option<i64>,
+    reported_per_request: Option<i64>,
+) {
+    let (measured_input, measured_output, cache_creation, cache_read) = match usage {
+        Some(u) => (
+            Some(u.input_tokens),
+            Some(u.output_tokens),
+            Some(u.cache_creation_input_tokens),
+            Some(u.cache_read_input_tokens),
+        ),
+        None => (None, None, None, None),
+    };
+    tracing::info_span!(
+        "window_learn",
+        conversation_id,
+        smelt.model = model,
+        smelt.window.source = source,
+        smelt.window.decision = decision,
+        smelt.window.value = value,
+        smelt.window.measured_input = measured_input,
+        smelt.window.measured_output = measured_output,
+        smelt.window.cache_creation = cache_creation,
+        smelt.window.cache_read = cache_read,
+        smelt.window.reported = reported,
+        smelt.window.reported_per_request = reported_per_request,
+    )
+    .in_scope(|| {});
+}
+
 /// Saves a window a learner settled on (SME-73, SME-439) for the model
 /// this turn ran on — into the learned column, never the user's own — and
 /// tells the app, so the providers page and pickers refresh. The meter
@@ -97,7 +145,10 @@ pub async fn clear_learned_context_window(pool: &PgPool, provider_id: i64, model
 /// clear. The measured size is the window-stop learner's own sum of the
 /// whole call. Called fire-and-forget from the turn loop after the reply
 /// is finished: a failed forget proves nothing and stops nothing, so the
-/// error is swallowed here rather than reaching `run_turn`'s.
+/// error is swallowed here rather than reaching `run_turn`'s. When the
+/// UPDATE really clears (round 1 H1) the clear says so on `window_learn`
+/// with an info line — fired on the answer, never on the attempt, since
+/// a no-op proves nothing.
 pub async fn learned_window_beaten(pool: &PgPool, model: &TurnModel, usage: &crate::anthropic::TokenUsage) {
     let measured = usage
         .input_tokens
@@ -107,5 +158,7 @@ pub async fn learned_window_beaten(pool: &PgPool, model: &TurnModel, usage: &cra
     let cleared = db::clear_learned_context_window_below(pool, model.provider_id, &model.endpoint.base_url, &model.model, measured).await;
     if matches!(cleared, Ok(true)) {
         providers_changed();
+        tracing::info!(model = %model.model, measured, decision = "window_beaten", "learned context window forgotten: a whole reply measured past it");
+        trace_window_learn(None, &model.model, "reply", "window_beaten", measured, Some(usage), None, None);
     }
 }
