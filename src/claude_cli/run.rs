@@ -745,12 +745,6 @@ fn ended_wait() -> Duration {
     ENDED_WAIT
 }
 
-/// Drops `conversation_id`'s entry in the table of runs ending: it's being
-/// deleted (SME-431 L23). Its tasks carry on and end their runs.
-pub fn forget_endings(conversation_id: i64) {
-    endings().remove(&conversation_id);
-}
-
 /// Whether the table holds an entry for `conversation_id`.
 #[cfg(test)]
 pub fn has_endings(conversation_id: i64) -> bool {
@@ -762,7 +756,7 @@ pub fn has_endings(conversation_id: i64) -> bool {
 /// of the wait is killed, its task and its process group, so a session is
 /// never in two processes (SME-431 L21): its interrupt alone can take
 /// `WRITE_TIMEOUT` to fail on a CLI that doesn't read.
-async fn ended(conversation_id: i64) {
+pub async fn ended(conversation_id: i64) {
     let ending = endings().remove(&conversation_id).unwrap_or_default();
     for Ending { mut task, group } in ending {
         if tokio::time::timeout(ended_wait(), &mut task).await.is_err() {

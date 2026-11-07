@@ -30,6 +30,26 @@ fn providers_changed(rx: &mut tokio::sync::broadcast::Receiver<crate::events::Ap
     seen
 }
 
+/// L3: a deleted conversation's CLI files stay gone though its last run
+/// was still ending: that process writes its session 1.5 s after its turn,
+/// and the delete waits for it to end before removing the files.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_deleted_conversations_files_dont_come_back(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let fake = FakeCli::new("r1-l3", vec![vec![json!({"read": true}), text_reply("one"), json!({"sleep_ms": 1_500}), json!({"write_session": true})]]);
+    fake.pick_for(&pool, conversation.id).await;
+    run_turn(&pool, conversation.id, hello()).await.expect("a turn");
+    let session = db::get_claude_cli_session(&pool, conversation.id).await.expect("read").expect("a session").session_id;
+    let file = super::review3::session_file(conversation.id, &session);
+
+    crate::agents::delete_subtree(&pool, conversation.id).await.expect("delete the conversation");
+    fake.until("the run's process ends", |f| f.dir.join("exited.0").exists()).await;
+
+    assert!(!file.exists(), "the session file the ending run wrote is gone too");
+}
+
 /// L5: a window the CLI reports tells the app (the providers page and
 /// pickers refresh), and the same window again writes nothing.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]

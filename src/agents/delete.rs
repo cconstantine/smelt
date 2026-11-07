@@ -62,9 +62,12 @@ pub(crate) async fn delete_subtree(pool: &PgPool, id: i64) -> Result<(), String>
         #[cfg(test)]
         test_hooks::torn_down(conversation_id, &pod_ids);
         crate::sandbox::teardown_conversation(pool, conversation_id, &pod_ids).await;
-        // Its Claude Code sessions and working dir (SME-430), best effort.
+        // Its Claude Code sessions and working dir (SME-430), best effort,
+        // once its runs still ending have ended, so none writes its
+        // session back (PR #291 review 1 L3; this also takes its entry in
+        // the table of runs ending, SME-431 L23).
+        crate::claude_cli::run::ended(conversation_id).await;
         crate::claude_cli::files::forget_conversation(conversation_id).await;
-        crate::claude_cli::run::forget_endings(conversation_id);
         crate::claude_cli::session::forget(conversation_id);
         crate::events::forget(conversation_id);
         crate::turn::forget_conversation_lock(conversation_id);
