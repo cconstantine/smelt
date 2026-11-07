@@ -5,8 +5,10 @@
 #   docker compose run --rm --no-deps smelt scripts/repro-cargo-net-flake <case>
 #
 # check.sh runs with a fresh, empty CARGO_HOME (a seat's gate state: every
-# `docker compose run --rm smelt` starts with an empty registry) and the
-# repo's target/. The CARGO_HOME is at one fixed path in the container's
+# `docker compose run --rm smelt` starts with an empty registry) and a
+# target dir of its own, target/repro-net/target, warm after its first run,
+# so it and the real gate don't recompile each other's dependencies. The
+# CARGO_HOME is at one fixed path in the container's
 # own /tmp, /tmp/repro-net-cargo-home, which a new `run --rm` container
 # starts without; the harness refuses to run when it isn't empty. A fixed
 # path, not a new one per run, because cargo's fingerprints name the
@@ -104,11 +106,15 @@ start_proxy() {
     proxy_port=$(cat "$work/port")
     : >"$work/port"
 }
-# cargo's environment: the empty CARGO_HOME, the proxy, the shim; nothing
-# of the caller's own proxy or offline settings.
+# cargo's environment: the empty CARGO_HOME, the proxy, the shim, a target
+# dir of the harness's own; nothing of the caller's own proxy or offline
+# settings. Its own CARGO_TARGET_DIR (SME-442 review 1, L3) because the
+# fingerprints name the registry's path: building the repo's target/ from
+# this CARGO_HOME made the next real gate recompile every dependency (473
+# crates after one run), and the gate made the next harness run do the same.
 run_env=(env -u CARGO_NET_OFFLINE -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY
-    PATH="$work/bin:$PATH" CARGO_HOME="$cargo_home" REPRO_ARM_FILE="$arm_file" REPRO_REAL_CARGO="$real_cargo"
-    SMELT_SKIP_SCRIPT_TESTS=1)
+    PATH="$work/bin:$PATH" CARGO_HOME="$cargo_home" CARGO_TARGET_DIR="$PWD/target/repro-net/target"
+    REPRO_ARM_FILE="$arm_file" REPRO_REAL_CARGO="$real_cargo" SMELT_SKIP_SCRIPT_TESTS=1)
 
 if [ "$case" = warm ]; then
     start_proxy "$out/proxy-prefetch.log"
