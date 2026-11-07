@@ -18,24 +18,41 @@ pub(super) async fn set_context_window(pool: &PgPool, window: i32, max_output: O
         .expect("seed the window");
 }
 
+/// Seeds `mock-model`'s **reported** Context window, as a listing storing
+/// what the server reports would (SME-439: the gate compares a stop's
+/// measurement against this).
+pub(super) async fn set_reported_context_window(pool: &PgPool, window: i32) {
+    sqlx::query(
+        "INSERT INTO provider_models (provider_id, model, reported_context_window) SELECT id, $1, $2 FROM inference_providers
+         ON CONFLICT (provider_id, model) DO UPDATE SET reported_context_window = EXCLUDED.reported_context_window",
+    )
+    .bind(crate::providers::test_support::MOCK_MODEL)
+    .bind(window)
+    .execute(pool)
+    .await
+    .expect("seed the reported window");
+}
+
 /// W1: a llama.cpp slot that fills stops at `max_tokens` written far short
 /// of the budget — the notice reads the room left with what it wrote, the
-/// call's whole measured size (below the believed window by more than the
-/// safety buffer) is learned for the next request to compact on, and
-/// nothing is retried. A llama.cpp kind provider: that reading is its
-/// stop's tell, W5 pins the Anthropic-kind same shape staying a budget stop.
+/// call's whole measured size (which is what the server reports per
+/// request) is learned for the next request to compact on, in the learned
+/// column, the user's own field untouched (SME-439), and nothing is
+/// retried. A llama.cpp kind provider: that reading is its stop's tell,
+/// W5 pins the Anthropic-kind same shape staying a budget stop.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_max_tokens_stop_short_of_its_budget_reads_as_the_window(pool: PgPool) {
     use crate::api::chat::{ReplyLimit, parse_cut_off_notice};
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
-    // 12,000 written against a 16,384 budget; 42,000 measured against the
-    // 64,000 the turn believed.
+    // 12,000 written against a 16,384 budget; 42,000 measured — exactly
+    // what the server reports — under the user's 64,000.
     let body = with_usage(&text_reply_body("Right up to the room."), 30_000, 0, 12_000)
         .replace(r#""stop_reason":"end_turn""#, r#""stop_reason":"max_tokens""#);
     let requests = start_recording_mock_upstream_of_kind(&pool, vec![body], "llama_cpp").await;
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     set_context_window(&pool, 64_000, None).await;
+    set_reported_context_window(&pool, 42_000).await;
     let mut rx = events::subscribe(conversation.id);
 
     run_turn(&pool, conversation.id, hello()).await.expect("a window-stopped reply still succeeds");
@@ -52,7 +69,8 @@ async fn test_a_max_tokens_stop_short_of_its_budget_reads_as_the_window(pool: Pg
         Some((12_000, ReplyLimit::RoomLeft, None)),
         "the room and what it wrote, not the budget it never reached: {notice}"
     );
-    assert_eq!(saved_context_window(&pool).await, Some(42_000), "the call's whole measured size is the window");
+    assert_eq!(saved_learned_context_window(&pool).await, Some(42_000), "the call's whole measured size is learned for the model");
+    assert_eq!(saved_context_window(&pool).await, Some(64_000), "a learner never writes the user's Context window (SME-439)");
     assert!(published_windows(drain_events(&mut rx).await).contains(&42_000), "the meter reads the new window too");
 }
 
@@ -137,7 +155,9 @@ async fn test_a_stop_within_its_slack_of_the_budget_keeps_the_budget_wording(poo
 
 /// W4: Claude 4.5+'s own stop reason measures the room too — its notice
 /// wording SME-111 already pinned, and now the size behind it is learned
-/// when the call ended far under the window smelt believed.
+/// when the call ended far under the window smelt believed: the server
+/// said the window filled, so no proximity gate (SME-439). The learned
+/// column takes it; the user's field stays.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_reply_stopped_by_the_window_learns_its_measured_size(pool: PgPool) {
     use crate::api::chat::{ReplyLimit, parse_cut_off_notice};
@@ -157,7 +177,8 @@ async fn test_a_reply_stopped_by_the_window_learns_its_measured_size(pool: PgPoo
         other => panic!("one text block: {other:?}"),
     };
     assert_eq!(parse_cut_off_notice(&notice), Some((5_000, ReplyLimit::RoomLeft, None)), "{notice}");
-    assert_eq!(saved_context_window(&pool).await, Some(35_000), "measured, not believed");
+    assert_eq!(saved_learned_context_window(&pool).await, Some(35_000), "measured, not believed");
+    assert_eq!(saved_context_window(&pool).await, Some(64_000), "the user's field keeps their value");
 }
 
 /// An Ollama-kind provider: `/v1/messages` answers `reply`, `/api/ps`
@@ -249,7 +270,8 @@ async fn test_a_quietly_truncated_ollama_reply_learns_the_loaded_window(pool: Pg
         "the written reply is kept: {saved:?}"
     );
     assert_eq!(mock.ps_hits.load(std::sync::atomic::Ordering::SeqCst), 1, "asked once what's loaded");
-    assert_eq!(saved_context_window(&pool).await, Some(32_768), "the loaded window, not the believed one");
+    assert_eq!(saved_learned_context_window(&pool).await, Some(32_768), "the loaded window, not the believed one");
+    assert_eq!(saved_context_window(&pool).await, Some(64_000), "the learner never writes the user's field (SME-439)");
 
     let updates: Vec<(i64, u32)> = drain_events(&mut rx)
         .await
@@ -278,6 +300,7 @@ async fn test_a_whole_ollama_reply_never_asks_the_server(pool: PgPool) {
 
     assert_eq!(mock.ps_hits.load(std::sync::atomic::Ordering::SeqCst), 0, "a whole request never knocks");
     assert_eq!(saved_context_window(&pool).await, Some(64_000), "the field keeps the user's value");
+    assert_eq!(saved_learned_context_window(&pool).await, None, "and nothing was learned");
 }
 
 /// O3: a loaded window that isn't smaller than the believed one teaches
@@ -296,6 +319,7 @@ async fn test_an_ollama_window_that_isnt_smaller_teaches_nothing(pool: PgPool) {
 
     assert_eq!(mock.ps_hits.load(std::sync::atomic::Ordering::SeqCst), 1, "asked, and answered");
     assert_eq!(saved_context_window(&pool).await, Some(64_000), "learners only ever lower");
+    assert_eq!(saved_learned_context_window(&pool).await, None, "a bigger loaded window teaches nothing");
 }
 
 /// The tell reads only requests big enough for its gap to mean anything,

@@ -13,6 +13,29 @@ fn test_the_context_window_prefers_the_override_then_the_report_then_a_known_mod
     );
 }
 
+/// SME-439: the window a learner wrote sits below the user's own value —
+/// which it can never overwrite — and above what the server reported.
+#[test]
+fn test_a_learned_window_reads_below_the_users_and_above_the_reported() {
+    let with = |user, learned, reported| db::ProviderModelRow {
+        context_window: user,
+        learned_context_window: learned,
+        ..row(None, None, reported, None)
+    };
+    assert_eq!(
+        context_window("m", Some(&with(Some(262_144), Some(160_799), Some(131_072)))),
+        (262_144, true),
+        "the user's own value wins the read; a learner keeps its own column"
+    );
+    assert_eq!(
+        context_window("m", Some(&with(None, Some(160_799), Some(262_144)))),
+        (160_799, true),
+        "what was learned beats the report, as the old learned value did"
+    );
+    assert_eq!(context_window("m", Some(&with(None, Some(0), Some(262_144)))), (262_144, true), "a zero isn't a size");
+    assert_eq!(context_window("m", Some(&with(None, None, Some(262_144)))), (262_144, true), "nothing learned: the report decides");
+}
+
 /// SME-111: a reply's cap is the user's, else the provider's, else
 /// 16,384 where a Claude model may sit behind the provider.
 #[test]

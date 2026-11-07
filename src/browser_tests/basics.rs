@@ -311,20 +311,32 @@ pub(super) async fn scenario_overflow_compacts(t: &Scenario<'_>) {
     }
 
     // Take the window back (SME-73's learner wrote it to this lane's
-    // model row).
+    // model row — since SME-439, in the learned four, which the override
+    // restore does not touch: null them here so a learned 131,072 can't
+    // leak to the lane's next scenario).
     match before {
-        Some(row) => db::set_provider_model_overrides(
-            pool,
-            provider,
-            &model,
-            row.thinking,
-            row.context_window,
-            row.effort.as_deref(),
-            row.max_output,
-            row.reasoning_budget,
-        )
-        .await
-        .expect("restore the lane model's settings"),
+        Some(row) => {
+            db::set_provider_model_overrides(
+                pool,
+                provider,
+                &model,
+                row.thinking,
+                row.context_window,
+                row.effort.as_deref(),
+                row.max_output,
+                row.reasoning_budget,
+            )
+            .await
+            .expect("restore the lane model's settings");
+            sqlx::query(
+                "UPDATE provider_models SET learned_context_window = NULL, learned_context_window_at = NULL, learned_context_window_reason = NULL, learned_context_window_conversation = NULL WHERE provider_id = $1 AND model = $2",
+            )
+            .bind(provider)
+            .bind(&model)
+            .execute(pool)
+            .await
+            .expect("unlearn the window this scenario learned");
+        }
         None => {
             sqlx::query("DELETE FROM provider_models WHERE provider_id = $1 AND model = $2")
                 .bind(provider)

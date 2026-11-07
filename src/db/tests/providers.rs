@@ -238,10 +238,44 @@ async fn test_model_overrides_and_reported_details_leave_each_other_alone(pool: 
             reported_max_output: Some(4096),
             reasoning_budget: Some(1024),
             reported_adaptive_thinking: None,
+            learned_context_window: None,
             added_by_hand: false,
         }
     );
     assert_eq!(list_provider_models(&pool, provider.id).await.expect("list"), vec![row]);
+}
+
+/// SME-439: the learned window and its when/why/which-round columns are a
+/// round-trip like every other column: `get_provider_model` and
+/// `list_provider_models` read them, a listing report never writes them.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_learned_window_and_its_record_round_trip(pool: PgPool) {
+    let provider = test_provider(&pool, "p").await;
+    set_provider_model_reported(&pool, provider.id, "m", Some(262_144), None, None, None, None).await.expect("reported");
+    sqlx::query(
+        "UPDATE provider_models SET learned_context_window = $2, learned_context_window_at = now(), learned_context_window_reason = 'window_stop', learned_context_window_conversation = 42 WHERE provider_id = $1 AND model = 'm'",
+    )
+    .bind(provider.id)
+    .bind(160_799_i32)
+    .execute(&pool)
+    .await
+    .expect("seed a learned window");
+
+    let row = get_provider_model(&pool, provider.id, "m").await.expect("get").expect("exists");
+    assert_eq!(row.learned_context_window, Some(160_799));
+    assert_eq!(list_provider_models(&pool, provider.id).await.expect("list"), vec![row.clone()]);
+    let record: Option<(Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT learned_context_window_reason, learned_context_window_conversation FROM provider_models WHERE provider_id = $1 AND model = 'm'",
+    )
+    .bind(provider.id)
+    .fetch_optional(&pool)
+    .await
+    .expect("the record");
+    assert_eq!(record, Some((Some("window_stop".to_string()), Some(42))));
+
+    set_provider_model_reported(&pool, provider.id, "m", Some(131_072), None, None, None, None).await.expect("reported again");
+    let row = get_provider_model(&pool, provider.id, "m").await.expect("get").expect("exists");
+    assert_eq!(row.learned_context_window, Some(160_799), "a listing report leaves the learned value alone");
 }
 
 /// SME-162: a provider's max concurrent requests is kept as set: none
@@ -271,43 +305,62 @@ async fn test_a_providers_max_concurrent_requests_is_kept_as_set(pool: PgPool) {
     );
 }
 
-// --- SME-73: a context window learned from a refusal -------------------
+// --- SME-73/SME-439: saving a learned context window -------------------
 
 /// The window a model nothing sized has, as the tests below pass it.
 const UNSIZED: u32 = 200_000;
 
 /// SME-386 T5: a learned window only ever lowers the *effective* window:
 /// with none saved, a model's reported window (else the unsized one) is
-/// what it must come in under, or nothing is written.
+/// what it must come in under, or nothing is written — and it all lands
+/// in `learned_context_window`, never the user's `context_window`
+/// (SME-439).
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_learned_window_never_raises_the_reported_one(pool: PgPool) {
     let p = test_provider(&pool, "p").await;
     set_provider_model_reported(&pool, p.id, "small", Some(32_768), None, None, None, None).await.expect("reported");
-    let learn = |model: &'static str, window: u32| lower_model_context_window(&pool, p.id, "https://api.anthropic.com", model, window, UNSIZED);
+    let learn = |model: &'static str, window: u32| save_learned_context_window(&pool, p.id, "https://api.anthropic.com", model, window, "refusal", 7, UNSIZED);
 
     assert!(!learn("small", 100_000).await.expect("learn"), "above the reported window: nothing written");
     let row = get_provider_model(&pool, p.id, "small").await.expect("get").expect("exists");
-    assert_eq!(row.context_window, None, "the reported 32,768 still decides");
+    assert_eq!((row.context_window, row.learned_context_window), (None, None), "the reported 32,768 still decides");
     assert!(learn("small", 16_384).await.expect("learn"), "below it, it lowers");
+    let row = get_provider_model(&pool, p.id, "small").await.expect("get").expect("exists");
+    assert_eq!((row.context_window, row.learned_context_window), (None, Some(16_384)), "the user's column is a learner's to leave alone");
+    // The reason/conversation columns aren't on the row yet (PR 2 adds
+    // them); read them raw to pin what the write records.
+    let (reason, conversation): (Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT learned_context_window_reason, learned_context_window_conversation FROM provider_models WHERE provider_id = $1 AND model = 'small'",
+    )
+    .bind(p.id)
+    .fetch_one(&pool)
+    .await
+    .expect("the learn record");
+    assert_eq!(
+        (reason.as_deref(), conversation),
+        (Some("refusal"), Some(7)),
+        "why the number says it is, and which conversation learned it"
+    );
     assert!(!learn("unsized", 300_000).await.expect("learn"), "above the unsized window: nothing written");
     assert_eq!(get_provider_model(&pool, p.id, "unsized").await.expect("get"), None, "not even a row");
 }
 
 /// SME-386 review 1, M1: a model whose effective window is above the
-/// unsized one still learns a window between the two: the reported
-/// 262,144 lowers to 230,000, and a saved 1,000,000 to 200,000.
+/// unsized one still learns a window between the two — and SME-439: what
+/// it learns lands in the learned column, with the user's own value and
+/// the listing's report both left exactly where they were.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_window_above_the_unsized_one_still_lowers_a_larger_effective_one(pool: PgPool) {
     let p = test_provider(&pool, "p").await;
     set_provider_model_reported(&pool, p.id, "big", Some(262_144), None, None, None, None).await.expect("reported");
-    let learn = |model: &'static str, window: u32| lower_model_context_window(&pool, p.id, "https://api.anthropic.com", model, window, UNSIZED);
+    let learn = |model: &'static str, window: u32| save_learned_context_window(&pool, p.id, "https://api.anthropic.com", model, window, "window_stop", 7, UNSIZED);
     assert!(learn("big", 230_000).await.expect("learn"), "below the reported window, it lowers");
     let row = get_provider_model(&pool, p.id, "big").await.expect("get").expect("exists");
-    assert_eq!(row.context_window, Some(230_000));
+    assert_eq!((row.context_window, row.learned_context_window), (None, Some(230_000)));
     set_provider_model_overrides(&pool, p.id, "huge", None, Some(1_000_000), None, None, None).await.expect("save");
     assert!(learn("huge", 200_000).await.expect("learn"), "below the saved window, it lowers");
     let row = get_provider_model(&pool, p.id, "huge").await.expect("get").expect("exists");
-    assert_eq!(row.context_window, Some(200_000));
+    assert_eq!((row.context_window, row.learned_context_window), (Some(1_000_000), Some(200_000)), "a value the user set caps what counts as lower, and is never overwritten");
 }
 
 /// The learned window lands wherever there's room for it and lowers
@@ -316,20 +369,20 @@ async fn test_a_window_above_the_unsized_one_still_lowers_a_larger_effective_one
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_learned_window_inserts_or_lowers_and_never_raises(pool: PgPool) {
     let p = test_provider(&pool, "p").await;
-    let learn = |window: u32| lower_model_context_window(&pool, p.id, "https://api.anthropic.com", "m", window, UNSIZED);
+    let learn = |window: u32| save_learned_context_window(&pool, p.id, "https://api.anthropic.com", "m", window, "refusal", 7, UNSIZED);
 
     assert!(learn(32_768).await.expect("insert"), "no row: one is added");
     let row = get_provider_model(&pool, p.id, "m").await.expect("get").expect("exists");
-    assert_eq!(row.context_window, Some(32_768));
+    assert_eq!((row.context_window, row.learned_context_window), (None, Some(32_768)));
     assert!(!row.added_by_hand, "a learned window doesn't claim the user added the model");
 
     set_provider_model_reported(&pool, p.id, "reported-only", None, None, None, None, None).await.expect("reported");
-    assert!(lower_model_context_window(&pool, p.id, "https://api.anthropic.com", "reported-only", 8_192, UNSIZED).await.expect("set"), "a null window is set");
+    assert!(save_learned_context_window(&pool, p.id, "https://api.anthropic.com", "reported-only", 8_192, "refusal", 7, UNSIZED).await.expect("set"), "a null window is set");
 
     assert!(learn(16_384).await.expect("lower"), "a smaller window lowers it");
     assert!(!learn(65_536).await.expect("raise refused"), "it only ever lowers");
     let row = get_provider_model(&pool, p.id, "m").await.expect("get").expect("exists");
-    assert_eq!(row.context_window, Some(16_384));
+    assert_eq!((row.context_window, row.learned_context_window), (None, Some(16_384)));
 }
 
 /// Two turns, two refusals: the smaller window is what stays, whoever
@@ -337,13 +390,13 @@ async fn test_a_learned_window_inserts_or_lowers_and_never_raises(pool: PgPool) 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_two_learners_settle_on_the_smaller_window(pool: PgPool) {
     let p = test_provider(&pool, "p").await;
-    let learn = |window: u32| lower_model_context_window(&pool, p.id, "https://api.anthropic.com", "m", window, UNSIZED);
+    let learn = |window: u32| save_learned_context_window(&pool, p.id, "https://api.anthropic.com", "m", window, "refusal", 7, UNSIZED);
 
     assert!(learn(65_536).await.expect("first learner"));
     assert!(learn(32_768).await.expect("second learner, smaller"));
     assert!(!learn(131_072).await.expect("third, larger"), "nothing left to lower");
     let row = get_provider_model(&pool, p.id, "m").await.expect("get").expect("exists");
-    assert_eq!(row.context_window, Some(32_768), "the two settle on the smaller");
+    assert_eq!(row.learned_context_window, Some(32_768), "the two settle on the smaller");
 }
 
 /// A provider moved to another server mid-turn isn't given the old
@@ -359,20 +412,21 @@ async fn test_a_window_learned_for_a_server_the_provider_left_is_dropped(pool: P
         .expect("move")
         .expect("exists");
 
-    assert!(!lower_model_context_window(&pool, p.id, "http://one", "m", 32_768, UNSIZED).await.expect("stale learn"), "the old server's window isn't the new one's");
+    assert!(!save_learned_context_window(&pool, p.id, "http://one", "m", 32_768, "refusal", 7, UNSIZED).await.expect("stale learn"), "the old server's window isn't the new one's");
     assert_eq!(get_provider_model(&pool, p.id, "m").await.expect("get"), None, "not even a row was added");
-    assert!(lower_model_context_window(&pool, p.id, "http://two", "m", 32_768, UNSIZED).await.expect("current learn"), "the current server still learns");
+    assert!(save_learned_context_window(&pool, p.id, "http://two", "m", 32_768, "refusal", 7, UNSIZED).await.expect("current learn"), "the current server still learns");
 }
 
-/// The user's form is the last word: a save after a learned write sets
-/// what they typed, up as well as down.
+/// The user's form is the last word on the column it owns: a save after
+/// a learned write sets what they typed, up as well as down, and leaves
+/// the learning beside it (its Forget button is PR 2's).
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_users_save_replaces_a_learned_window(pool: PgPool) {
     let p = test_provider(&pool, "p").await;
-    lower_model_context_window(&pool, p.id, "https://api.anthropic.com", "m", 16_384, UNSIZED).await.expect("learn");
+    save_learned_context_window(&pool, p.id, "https://api.anthropic.com", "m", 16_384, "refusal", 7, UNSIZED).await.expect("learn");
     set_provider_model_overrides(&pool, p.id, "m", None, Some(131_072), None, None, None).await.expect("save");
     let row = get_provider_model(&pool, p.id, "m").await.expect("get").expect("exists");
-    assert_eq!(row.context_window, Some(131_072), "the lower-only rule is the learner's, not the user's");
+    assert_eq!((row.context_window, row.learned_context_window), (Some(131_072), Some(16_384)), "the lower-only rule is the learner's, not the user's");
 }
 
 /// A listing refresh reports beside the learned window: it keeps the
@@ -380,8 +434,12 @@ async fn test_the_users_save_replaces_a_learned_window(pool: PgPool) {
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_listing_refresh_leaves_the_learned_window_alone(pool: PgPool) {
     let p = test_provider(&pool, "p").await;
-    lower_model_context_window(&pool, p.id, "https://api.anthropic.com", "m", 16_384, UNSIZED).await.expect("learn");
+    save_learned_context_window(&pool, p.id, "https://api.anthropic.com", "m", 16_384, "refusal", 7, UNSIZED).await.expect("learn");
     set_provider_model_reported(&pool, p.id, "m", Some(8_192), Some(true), Some(true), None, None).await.expect("reported");
     let row = get_provider_model(&pool, p.id, "m").await.expect("get").expect("exists");
-    assert_eq!((row.context_window, row.reported_context_window), (Some(16_384), Some(8_192)), "the listing never touches the learned value");
+    assert_eq!(
+        (row.context_window, row.learned_context_window, row.reported_context_window),
+        (None, Some(16_384), Some(8_192)),
+        "the listing never touches the learned value"
+    );
 }

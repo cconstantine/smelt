@@ -37,6 +37,7 @@ fn row(
         reported_max_output: None,
         reasoning_budget: None,
         reported_adaptive_thinking: None,
+        learned_context_window: None,
         added_by_hand: false,
     }
 }
