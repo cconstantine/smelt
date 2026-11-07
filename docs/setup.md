@@ -150,10 +150,13 @@ Four things trip a conversation sandbox's stack (SME-257's retrospective, propos
   every crate in `Cargo.lock`. A crates.io flake cargo recovered from used to
   fail the gate anyway: cargo prints each retry as `warning: spurious network
   error (N tries remaining): …`, and `check.sh` fails a build on any
-  `^warning` line. Since SME-442 `check.sh` and `scripts/browser-tier` start
-  with `scripts/cargo-fetch`: up to three `cargo fetch` attempts (15 s and
-  45 s apart), their output in `target/check/cargo-fetch.log` rather than in
-  a build's, and every cargo step after it runs with `CARGO_NET_OFFLINE=true`.
+  `^warning` line. Since SME-442 `check.sh`, `scripts/browser-tier` and
+  `scripts/build-sandbox-image.sh` start with `scripts/cargo-fetch`: up to
+  three `cargo fetch` attempts (15 s and 45 s apart), their output in
+  `target/check/cargo-fetch.log` rather than in a build's. In `check.sh` and
+  `browser-tier` every cargo step after it runs with `CARGO_NET_OFFLINE=true`;
+  `build-sandbox-image.sh` checks no build output for warnings, so the fetch
+  alone is enough there.
   A gate that stops with `crates.io unreachable: cargo fetch failed 3 times`
   met an outage, not a build failure: wait and run it again. To see the
   flake on demand, `docker compose run --rm --no-deps smelt
@@ -196,9 +199,10 @@ since both suites want a test cluster to themselves. Each runner keeps a
 cache volume (`CI_CACHE_DIR`) that outlives the job: cargo's downloads,
 `target/` and the compose `docker` service's storage are mounted from it by
 [.github/ci-compose.yml](<../.github/ci-compose.yml>), so a run builds on the
-last one's output. Each job's first cargo step is `scripts/cargo-fetch`
-(SME-442; see the seat's traps above), which on that warm cache makes no
-connection. A pull request from a fork runs on GitHub's
+last one's output. Each test job's first cargo step is `scripts/cargo-fetch`,
+which `scripts/build-sandbox-image.sh` (start-stack's sandbox image step)
+runs before its builds (SME-442; see the seat's traps above); on that warm
+cache it makes no connection. A pull request from a fork runs on GitHub's
 `ubuntu-latest` instead, which has no such volume, so it builds everything
 from scratch.
 

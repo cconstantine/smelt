@@ -93,6 +93,29 @@ grep -q "^crates.io unreachable: cargo fetch failed 3 times" <<<"$out" ||
 [ "$(cat "$CALLS")" = "cargo fetch unlocked
 cargo fetch unlocked
 cargo fetch unlocked" ] || fail "check.sh did more than fetch after three failed fetches: $(cat "$CALLS")"
+# build-sandbox-image.sh fetches before its first cargo build too: it is the
+# first cargo step of a seat's stack and of CI's start-stack (review 1, L1).
+# A failing build stops it there, before any docker call; a docker stub that
+# fails keeps a regression from building and importing for real.
+mkdir -p "$dir/bin-no-docker"
+printf '#!/usr/bin/env bash\necho "stub docker: not for these cases" >&2\nexit 1\n' >"$dir/bin-no-docker/docker"
+chmod +x "$dir/bin-no-docker/docker"
+image_env=("${gate_env[@]}" PATH="$dir/bin-no-docker:$dir/bin:$PATH")
+: >"$CALLS"
+timeout 60 "${image_env[@]}" CARGO_FAIL='^build' scripts/build-sandbox-image.sh >/dev/null 2>&1
+[ "$(cat "$CALLS")" = "cargo fetch unlocked
+cargo build --bin sandbox_agent --features server unlocked" ] ||
+    fail "build-sandbox-image.sh didn't fetch before its build: $(cat "$CALLS")"
+: >"$CALLS"
+echo 0 >"$fail_count"
+if out=$(timeout 60 "${image_env[@]}" CARGO_FAIL='^fetch' CARGO_FAIL_TIMES=3 CARGO_FAIL_COUNT="$fail_count" \
+    scripts/build-sandbox-image.sh 2>&1); then
+    fail "build-sandbox-image.sh passed with every fetch failing: $out"
+fi
+grep -q "^crates.io unreachable: cargo fetch failed 3 times" <<<"$out" ||
+    fail "build-sandbox-image.sh didn't say crates.io was unreachable: $out"
+[ "$(grep -vc '^cargo fetch ' "$CALLS")" = 0 ] ||
+    fail "build-sandbox-image.sh built after three failed fetches: $(cat "$CALLS")"
 # A test build that fails stops check.sh before the lock.
 : >"$CALLS"
 if out=$(timeout 60 "${gate_env[@]}" CARGO_FAIL="--no-run" scripts/check.sh 2>&1); then

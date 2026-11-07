@@ -46,6 +46,13 @@ done
 REF=$(scripts/sandbox-image-ref)
 TAG=${REF#docker.io/library/}
 
+# Every crate first, with retries (SME-442 review 1, L1): this is the first
+# cargo step of a seat's stack and of CI's start-stack, on a registry that
+# may be cold. Its builds' output below isn't checked for warnings, so they
+# needn't run offline: the fetch alone keeps a crates.io flake cargo would
+# recover from, or one that outlasts its retries, from failing them.
+scripts/cargo-fetch
+
 scripts/build-sandbox-agent.sh "$@"
 
 docker build -f docker/sandbox/Dockerfile -t "$TAG" target/sandbox-agent/
