@@ -462,7 +462,7 @@ fn run_turn_loop<'c>(
             }
             // Saved: the run's waiting calls are answered with them if the
             // turn returns before its next call (SME-444).
-            turn_cli.hold_results(&result_blocks);
+            turn_cli.hold_results(&result_blocks, ran.asked.as_deref());
             pending_new_content = result_blocks;
             // A call the reply wrote as text, told after the real calls'
             // results, even when the turn ends here (SME-286).

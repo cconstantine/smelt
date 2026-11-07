@@ -178,6 +178,9 @@ pub struct TurnCli {
     /// call sends them, or the close answers the parked calls with them
     /// (SME-444).
     results: Vec<ContentBlock>,
+    /// The question those results' turn asked, once recorded: the only
+    /// call the close answers with a placeholder (PR #295 review 1 M1).
+    asked: Option<String>,
 }
 
 impl TurnCli {
@@ -187,11 +190,13 @@ impl TurnCli {
         self.overflow.take()
     }
 
-    /// Holds the results the turn just saved for its reply's calls,
-    /// replacing any held before: the close answers with them if the turn
-    /// returns before its next call (SME-444).
-    pub fn hold_results(&mut self, results: &[ContentBlock]) {
+    /// Holds the results the turn just saved for its reply's calls, and
+    /// the id of the question it asked, replacing any held before: the
+    /// close answers with them if the turn returns before its next call
+    /// (SME-444).
+    pub fn hold_results(&mut self, results: &[ContentBlock], asked: Option<&str>) {
         self.results = results.to_vec();
+        self.asked = asked.map(str::to_string);
     }
 
     /// The turn returned, Ok or Err: a run Parked on calls smelt has a
@@ -200,9 +205,9 @@ impl TurnCli {
     /// a Stop drops the turn, so its calls still read as stopped.
     pub fn close(&mut self) {
         let Some(run) = self.run.take() else { return };
-        let replies = if run.state == State::Parked { close::replies(&run.expected, &self.results) } else { None };
-        match replies {
-            Some(replies) => run.ending(Some(replies)),
+        let closing = if run.state == State::Parked { close::replies(&run.expected, &self.results, self.asked.as_deref()) } else { None };
+        match closing {
+            Some(closing) => run.ending(Some(closing)),
             None => run.end_in_background(),
         }
     }
@@ -340,6 +345,7 @@ pub async fn call(
     cli.overflow = None;
     // This call sends the held results the normal way (SME-444).
     cli.results.clear();
+    cli.asked = None;
     let replied = call_run(&call, on_delta, meter, extra, cli).await;
     // The session the next turn resumes: this run's, synced to this call,
     // after a call that went well; after any other, none, so the next turn
@@ -729,7 +735,7 @@ impl Run {
     /// Ends the run in a spawned task, closing it first with `replies`
     /// when given (SME-444's Closing, `close::settle`): answered, echoed,
     /// then the same interrupt and wind-down as any run.
-    fn ending(mut self, replies: Option<HashMap<String, ToolReply>>) {
+    fn ending(mut self, replies: Option<close::Close>) {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };

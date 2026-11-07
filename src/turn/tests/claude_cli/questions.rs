@@ -255,3 +255,68 @@ async fn test_a_turn_that_fails_after_its_tools_still_closes(pool: PgPool) {
     assert_eq!((answered[0].0.as_str(), answered[0].2), ("toolu_t", false), "its real result, a success");
     assert_no_refusal(&fake.transcript(0));
 }
+
+/// PR #295 review 1 M1: a question the turn never got to ask (here,
+/// recording it fails, after the reply is saved) isn't answered as shown
+/// to the user: the run is interrupted as before, and the call reads
+/// stopped.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_question_the_turn_never_asked_reads_stopped(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    // This test's own database: recording any question fails.
+    sqlx::query("CREATE FUNCTION refuse_question() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'refused for the test'; END $$")
+        .execute(&pool)
+        .await
+        .expect("the refusing function");
+    sqlx::query("CREATE TRIGGER refuse_question BEFORE INSERT ON pending_questions FOR EACH ROW EXECUTE FUNCTION refuse_question()")
+        .execute(&pool)
+        .await
+        .expect("the trigger");
+    let mut first = vec![json!({"read": true})];
+    first.extend(tool_reply(&[("toolu_ask", crate::questions::ASK_USER, delete_question())]));
+    first.push(json!({"next_call": true}));
+    let fake = FakeCli::new("never-asked", vec![first]);
+    fake.pick_for(&pool, conversation.id).await;
+
+    let error = run_turn(&pool, conversation.id, hello()).await.expect_err("recording the question fails");
+    assert!(error.to_string().contains("refused for the test"), "{error}");
+    fake.until("the run has ended", |f| f.dir.join("exited.0").exists()).await;
+
+    assert_eq!(answered(&fake, 0), Vec::new(), "no placeholder for a question nobody was shown");
+    let transcript = fake.transcript(0);
+    assert!(transcript.iter().any(|e| e["tool_result"] == "toolu_ask" && e["is_error"] == true), "the call reads stopped: {transcript:?}");
+}
+
+/// PR #295 review 1 L2: a refused question's error result, which the
+/// close delivered and the CLI echoed, isn't sent again next turn; only
+/// the question answered with a placeholder is still to come.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_refused_questions_delivered_result_isnt_repeated(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let mut first = vec![json!({"read": true})];
+    first.extend(tool_reply(&[("toolu_ask", crate::questions::ASK_USER, delete_question()), ("toolu_again", crate::questions::ASK_USER, delete_question())]));
+    first.push(json!({"next_call": true}));
+    let fake = FakeCli::new("refused-again", vec![first, vec![json!({"read": true}), text_reply("Deleting.")]]);
+    fake.pick_for(&pool, conversation.id).await;
+
+    run_turn(&pool, conversation.id, hello()).await.expect("asks");
+    fake.until("the run has ended", |f| f.dir.join("exited.0").exists()).await;
+    let refused = "ask one set of questions at a time: put them all in one ask_user call";
+    assert_eq!(
+        answered(&fake, 0),
+        vec![("toolu_ask".to_string(), ASKED_USER.to_string(), false), ("toolu_again".to_string(), refused.to_string(), true)]
+    );
+
+    let answers = vec![crate::questions::QuestionAnswer { selected: vec!["Yes".to_string()], other: None }];
+    answer_question(pool.clone(), conversation.id, "toolu_ask".to_string(), answers).await.expect("answered");
+    fake.until("the answer's run is sent its message", |f| !user_texts(f, 1).is_empty()).await;
+    assert!(fake.args(1).iter().any(|a| a == "--resume"), "resumed: {:?}", fake.args(1));
+    let sent = &user_texts(&fake, 1)[0];
+    assert!(sent.contains("(This answers your earlier `ask_user` (call toolu_ask)"), "{sent}");
+    assert!(!sent.contains("toolu_again"), "the refusal the CLI has isn't sent again: {sent}");
+}
+

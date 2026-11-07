@@ -40,12 +40,25 @@ fn close_wait() -> Duration {
     CLOSE_WAIT
 }
 
+/// What a close answers a run's waiting calls with.
+pub(in crate::claude_cli) struct Close {
+    /// Each call's reply, by tool-use id.
+    pub(in crate::claude_cli) replies: HashMap<String, ToolReply>,
+    /// The question answered with a placeholder, if one was: its real
+    /// answer is still to come, so it's never marked delivered (PR #295
+    /// review 1 L2).
+    pub(in crate::claude_cli) placeholder: Option<String>,
+}
+
 /// The reply each of `expected`'s calls gets when its turn returns: its
-/// result in `held`, or, for a question with none, the placeholder that
-/// says where its answer comes from. `None` when another call has no
-/// result: that run isn't closed, and its calls read as stopped.
-pub(in crate::claude_cli) fn replies(expected: &[Expected], held: &[ContentBlock]) -> Option<HashMap<String, ToolReply>> {
+/// result in `held`, or, for the question the turn asked (`asked`, once
+/// recorded) with none, the placeholder that says where its answer comes
+/// from. `None` when another call has no result, a question never asked
+/// included (review 1 M1): that run isn't closed, and its calls read as
+/// stopped.
+pub(in crate::claude_cli) fn replies(expected: &[Expected], held: &[ContentBlock], asked: Option<&str>) -> Option<Close> {
     let mut replies = HashMap::new();
+    let mut placeholder_for = None;
     for call in expected {
         let result = held.iter().find_map(|block| match block {
             ContentBlock::ToolResult { tool_use_id, content, is_error } if *tool_use_id == call.id => {
@@ -54,15 +67,20 @@ pub(in crate::claude_cli) fn replies(expected: &[Expected], held: &[ContentBlock
             _ => None,
         });
         let placeholder = |text: &str| ToolReply { text: vec![text.to_string()], is_error: false };
+        let asked_this = asked == Some(call.id.as_str());
+        let placeheld = asked_this && result.is_none();
         let reply = match result {
             Some(reply) => reply,
-            None if call.name == crate::questions::ASK_USER => placeholder(ASKED_USER),
-            None if call.name == crate::agents::ASK_PARENT => placeholder(ASKED_PARENT),
+            None if asked_this && call.name == crate::questions::ASK_USER => placeholder(ASKED_USER),
+            None if asked_this && call.name == crate::agents::ASK_PARENT => placeholder(ASKED_PARENT),
             None => return None,
         };
+        if placeheld {
+            placeholder_for = Some(call.id.clone());
+        }
         replies.insert(call.id.clone(), reply);
     }
-    Some(replies)
+    Some(Close { replies, placeholder: placeholder_for })
 }
 
 /// How a close's wait ended.
@@ -78,7 +96,8 @@ enum Settled {
 impl Run {
     /// Answers every call with `replies` and waits, within `CLOSE_WAIT`,
     /// for the CLI to take them. Whether the run still needs an interrupt.
-    pub(super) async fn settle(&mut self, replies: HashMap<String, ToolReply>) -> bool {
+    pub(super) async fn settle(&mut self, close: Close) -> bool {
+        let Close { replies, placeholder } = close;
         self.answers = replies;
         self.delivered = true;
         for parked in std::mem::take(&mut self.anonymous) {
@@ -121,11 +140,13 @@ impl Run {
         .await
         .unwrap_or(Settled::TimedOut);
         // The session has what it echoed, so the next turn doesn't repeat
-        // it (Q2); a question's answer is still to come, and isn't marked.
+        // it (Q2). Only the placeholder's question is still to be answered,
+        // so only it isn't marked: a refused question's error result is
+        // delivered like any other (PR #295 review 1 L2).
         let delivered: Vec<String> = self
             .expected
             .iter()
-            .filter(|e| echoed.contains(&e.id) && e.name != crate::questions::ASK_USER && e.name != crate::agents::ASK_PARENT)
+            .filter(|e| echoed.contains(&e.id) && placeholder.as_deref() != Some(e.id.as_str()))
             .map(|e| e.id.clone())
             .collect();
         if !delivered.is_empty() {
