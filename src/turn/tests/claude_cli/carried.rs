@@ -45,6 +45,15 @@ async fn test_a_kept_runs_cut_off_names_the_cap_it_ran_with(pool: PgPool) {
     let notices = cut_off_notices(&pool, conversation.id).await;
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert_eq!(notices[0].0, 32_768, "the notice names the cap the CLI ran with: {notices:?}");
+    // And says why that cap, not the room this call's budget left (PR #291
+    // review 1 L2).
+    assert_eq!(notices[0].1.reason(), "the reply cap Claude Code was started with", "{notices:?}");
+    let saved = saved(&pool, conversation.id).await;
+    let text = saved.iter().flat_map(|(_, b)| b).find_map(|b| match b {
+        anthropic::ContentBlock::Text { text } if text.contains(crate::api::chat::CUT_OFF_NOTICE_START) => Some(text.clone()),
+        _ => None,
+    });
+    assert!(text.as_deref().is_some_and(|t| t.contains("32768 tokens (the reply cap Claude Code was started with)")), "{text:?}");
 }
 
 /// L21: a resume whose wait for the last process times out (here 300 ms,

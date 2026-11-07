@@ -166,10 +166,15 @@ pub enum ReplyLimit {
     HalfWindow,
     /// What the conversation had left.
     RoomLeft,
+    /// The cap a Claude Code run was started with, for a reply that wrote
+    /// past this call's smaller budget: the CLI takes its cap at launch,
+    /// and a run is kept for a smaller one (SME-430 review 2 M3; PR #291
+    /// review 1 L2).
+    LaunchCap,
 }
 
 impl ReplyLimit {
-    pub const ALL: [ReplyLimit; 4] = [Self::OutputCap, Self::ModelMaximum, Self::HalfWindow, Self::RoomLeft];
+    pub const ALL: [ReplyLimit; 5] = [Self::OutputCap, Self::ModelMaximum, Self::HalfWindow, Self::RoomLeft, Self::LaunchCap];
 
     /// How a notice says it, for the model and for the transcript.
     pub fn reason(self) -> &'static str {
@@ -178,6 +183,7 @@ impl ReplyLimit {
             Self::ModelMaximum => "the most this model can write in one reply",
             Self::HalfWindow => "half the context window",
             Self::RoomLeft => "the room left in the conversation",
+            Self::LaunchCap => "the reply cap Claude Code was started with",
         }
     }
 
@@ -188,6 +194,7 @@ impl ReplyLimit {
             Self::ModelMaximum => "That's the model's own limit: lower its effort on its provider's page, or ask for less at once.",
             Self::HalfWindow => "A reply can be at most half the context window: lower the model's effort or reasoning budget on its provider's page, or ask for less at once.",
             Self::RoomLeft => "The conversation is nearly full, and compacts before the next reply.",
+            Self::LaunchCap => "Claude Code keeps the reply cap it started with for its whole run; the conversation is nearly full, and compacts before the next reply.",
         }
     }
 }

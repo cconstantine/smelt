@@ -206,8 +206,12 @@ pub(super) async fn save_stop_notice(
         // A reply that wrote past its budget ran under a larger cap: a
         // Claude Code run kept from a call whose budget was larger (SME-430
         // review 2 M3) takes its cap at launch. It names the cap it reached
-        // (SME-431 L19).
-        _ => Some((budget.tokens.max(u32::try_from(turn.usage.output_tokens).unwrap_or(0)), match budget.limit {
+        // (SME-431 L19), and says that cap is why (PR #291 review 1 L2).
+        _ if u32::try_from(turn.usage.output_tokens).is_ok_and(|written| written > budget.tokens) => Some((
+            u32::try_from(turn.usage.output_tokens).unwrap_or(budget.tokens),
+            crate::api::chat::ReplyLimit::LaunchCap,
+        )),
+        _ => Some((budget.tokens, match budget.limit {
             crate::api::chat::ReplyLimit::OutputCap if turn_model.output_cap_is_models_own => {
                 crate::api::chat::ReplyLimit::ModelMaximum
             }
