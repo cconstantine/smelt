@@ -102,6 +102,10 @@ impl Run {
                     if !self.reply_started {
                         self.failure = if session_missing(&event) { Failure::SessionMissing } else { Failure::Unchanged };
                     }
+                    // "Prompt is too long": the turn's recovery compacts (SME-431).
+                    if let Some(crate::anthropic::stream::ModelError::Overflow(overflow)) = crate::claude_cli::once::result_failure(&event, self.rate.as_ref()) {
+                        self.overflow = Some(overflow);
+                    }
                     return Err(result_error(&event, self.rate.as_ref())
                         .unwrap_or_else(|| "Claude Code ended the reply before it finished.".to_string()));
                 }

@@ -231,7 +231,8 @@ pub(super) async fn stream_for_kind(
 /// turn's CLI run, with no parse retries (the CLI talks to Anthropic
 /// itself). An API call the CLI made on its own after a cut-off reply
 /// (S6) is recorded as a call of its own, from `extra`'s drop. A request
-/// that didn't fit fails plainly until smelt compacts these (SME-431).
+/// that didn't fit is an overflow, which the turn's recovery compacts
+/// (SME-73, SME-431).
 #[cfg(feature = "server")]
 async fn call_claude_cli(
     pool: &PgPool,
@@ -247,7 +248,10 @@ async fn call_claude_cli(
     let extra = CallRecorder::new(pool, conversation_id, turn_model, db::ModelCallKind::Turn, request);
     let called = crate::claude_cli::run::call(pool, conversation_id, turn_model, request, relay, recorder.meter(), extra.meter(), cli).await;
     drop(extra);
-    called.map(|turn| (turn, recorder)).map_err(|e| CallError::Failed(ServerFnError::new(e)))
+    called.map(|turn| (turn, recorder)).map_err(|e| match cli.take_overflow() {
+        Some(overflow) => CallError::Overflow(overflow),
+        None => CallError::Failed(ServerFnError::new(e)),
+    })
 }
 
 /// Records one model call attempt's usage and cost (SME-106), however the

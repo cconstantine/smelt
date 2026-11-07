@@ -155,6 +155,34 @@ async fn test_a_full_conversation_compacts_at_its_next_turn(pool: PgPool) {
     assert_eq!(dividers(&pool, conversation.id).await, 1);
 }
 
+/// An overflow `result` (the synthesised fixture `overflow`, "Prompt is
+/// too long") is SME-73's overflow: the turn compacts once, and its retry
+/// (`overflow_recovery`, unchanged: a run of its own) starts a new session
+/// from the summary, and the turn carries on.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_overflow_compacts_once_and_carries_on(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let overflow = without_init(fixture_lines("overflow"));
+    let fake = FakeCli::new("b2-overflow", vec![
+        vec![json!({"read": true}), json!({"emit": overflow})],
+        vec![json!({"read": true}), text_reply("SUMMARY-OVERFLOW")],
+        vec![json!({"read": true}), text_reply("carried on")],
+    ]);
+    fake.pick_for(&pool, conversation.id).await;
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the turn compacts and carries on");
+
+    assert_eq!(fake.started(), 3, "the refused run, the summary, the retry");
+    assert_eq!(dividers(&pool, conversation.id).await, 1, "one compaction");
+    assert!(fake.args(2).iter().any(|a| a == "--session-id"), "the retry is a new session: {:?}", fake.args(2));
+    assert!(user_texts(&fake, 2)[0].contains("SUMMARY-OVERFLOW"));
+    let saved = saved(&pool, conversation.id).await;
+    let last = saved.last().expect("a reply");
+    assert!(matches!(&last.1[..], [anthropic::ContentBlock::Text { text }] if text == "carried on"), "{saved:?}");
+}
+
 /// The window the CLI reports (`result.modelUsage[model].contextWindow`)
 /// is learned onto the model row, with its output cap.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]

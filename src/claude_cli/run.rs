@@ -159,6 +159,16 @@ pub struct TurnCli {
     run: Option<Run>,
     /// How the last call that failed left its session.
     last_failure: Option<Failure>,
+    /// The last call's failure, when it was an overflow (SME-431).
+    overflow: Option<crate::anthropic::overflow::Overflow>,
+}
+
+impl TurnCli {
+    /// The overflow the last call failed with, if it did: SME-73's
+    /// recovery compacts on it.
+    pub fn take_overflow(&mut self) -> Option<crate::anthropic::overflow::Overflow> {
+        self.overflow.take()
+    }
 }
 
 /// How a failed call left the CLI's session (PR #285 review 1 M2).
@@ -256,6 +266,8 @@ struct Run {
     reported: Option<(i32, Option<i32>)>,
     /// Whether it has saved them.
     learned: bool,
+    /// The overflow its last `result` said, if it said one.
+    overflow: Option<crate::anthropic::overflow::Overflow>,
 }
 
 /// One model call through the turn's run: starts one if the turn has
@@ -287,6 +299,7 @@ pub async fn call(
     }
     let call = Call { conversation_id, turn_model, request, recorded };
     cli.last_failure = None;
+    cli.overflow = None;
     let replied = call_run(&call, on_delta, meter, extra, cli).await;
     // The session the next turn resumes: this run's, synced to this call,
     // after a call that went well; after any other, none, so the next turn
@@ -507,6 +520,7 @@ async fn read_once(
     let replied = run.read_reply(on_delta, meter, extra).await;
     if replied.is_err() {
         cli_failure(&mut cli.last_failure, run.failure);
+        cli.overflow = run.overflow.take();
     }
     // A run that died before it said anything is kept for `call` to see,
     // and so is one whose session is missing.
@@ -609,6 +623,7 @@ impl Run {
             model: turn_model.model.clone(),
             reported: None,
             learned: false,
+            overflow: None,
         })
     }
 
