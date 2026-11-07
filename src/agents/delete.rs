@@ -63,7 +63,7 @@ pub(crate) async fn delete_subtree(pool: &PgPool, id: i64) -> Result<(), String>
         test_hooks::torn_down(conversation_id, &pod_ids);
         crate::sandbox::teardown_conversation(pool, conversation_id, &pod_ids).await;
         // Its Claude Code sessions and working dir (SME-430), best effort.
-        crate::claude_cli::files::forget_conversation(conversation_id);
+        crate::claude_cli::files::forget_conversation(conversation_id).await;
         crate::claude_cli::run::forget_endings(conversation_id);
         crate::events::forget(conversation_id);
         crate::turn::forget_conversation_lock(conversation_id);
