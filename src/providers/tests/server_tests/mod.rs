@@ -38,6 +38,9 @@ fn row(
         reasoning_budget: None,
         reported_adaptive_thinking: None,
         learned_context_window: None,
+        learned_context_window_at: None,
+        learned_context_window_reason: None,
+        learned_context_window_conversation: None,
         added_by_hand: false,
     }
 }

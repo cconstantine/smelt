@@ -196,6 +196,91 @@ pub(super) async fn scenario_llama_cpp_provider(t: &Scenario<'_>) {
     db::delete_inference_provider(t.pool, provider.id).await.expect("delete the llama.cpp provider");
 }
 
+/// SME-439 PR 2: the incident made visible — what smelt learned about a
+/// model shows under its Context window field with its telling and a
+/// Forget button, and forgetting clears the learned four, leaves the
+/// page line-free, and is nobody else's business. Seeded at the widest
+/// values (10-digit window, 19-digit conversation id) and checked at
+/// 360 px too — the plan's screenshot check, kept as a DOM assertion:
+/// the line wraps under the field's input, its button at the end and on
+/// screen, nothing wider than the page, and the click still lands there.
+/// The provider lists nothing (its address is a closed port), which shows
+/// stored rows as they are and keeps the mock out of the scenario.
+pub(super) async fn scenario_learned_window_line(t: &Scenario<'_>) {
+    let provider = db::create_inference_provider(t.pool, &unique_id("learned"), "anthropic", "http://127.0.0.1:9", "api_key", "key", false, None, true, None)
+        .await
+        .expect("create a provider");
+    db::ensure_provider_model(t.pool, provider.id, "forget-me").await.expect("add the model");
+    sqlx::query(
+        "UPDATE provider_models SET learned_context_window = 2147483647, learned_context_window_at = now(), learned_context_window_reason = 'window_stop', learned_context_window_conversation = 9223372036854775807 WHERE provider_id = $1 AND model = 'forget-me'",
+    )
+    .bind(provider.id)
+    .execute(t.pool)
+    .await
+    .expect("seed the learned window");
+
+    let page = t.tab(t.url(&format!("providers/{}", provider.id))).await;
+    assert!(
+        wait_for_text(&page, "smelt learned 2,147,483,647 after a window stop", Duration::from_secs(15)).await,
+        "the learned window isn't shown under the Context window field"
+    );
+    assert!(
+        wait_for_text(&page, "(conversation #9223372036854775807)", Duration::from_secs(5)).await,
+        "the telling (which conversation) is missing"
+    );
+    wait_for_element(&page, ".provider-model-forget", Duration::from_secs(5)).await;
+
+    page.execute(
+        chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::new(360, 740, 1.0, false),
+    )
+    .await
+    .expect("narrow the page to 360 px");
+    let measured: serde_json::Value = page
+        .evaluate(
+            "(() => { const j = (el) => { const r = el.getBoundingClientRect(); return { top: r.top, bottom: r.bottom, left: r.left, right: r.right }; }; \
+             const line = j(document.querySelector('.provider-model-learned')); \
+             const input = j(document.querySelector('input[aria-label=\"Context window for forget-me\"]')); \
+             const button = j(document.querySelector('.provider-model-forget')); \
+             return JSON.stringify({ below: line.top >= input.bottom - 1, \
+               button_inside: button.left >= -1 && button.right <= 361 && button.bottom - button.top > 0, \
+               sideways: document.documentElement.scrollWidth - document.documentElement.clientWidth }); })()",
+        )
+        .await
+        .expect("measure the learned line")
+        .into_value()
+        .expect("a string");
+    let at_360: serde_json::Value = serde_json::from_str(measured.as_str().expect("the string")).expect("json");
+    assert!(at_360["below"].as_bool().unwrap_or(false), "at 360 px the line should wrap under the input: {at_360}");
+    assert!(at_360["button_inside"].as_bool().unwrap_or(false), "the button should end within the 360 px: {at_360}");
+    assert!(at_360["sideways"].as_f64().unwrap_or(1.0) <= 0.0, "the page shouldn't scroll sideways: {at_360}");
+
+    // The user scrolls to it, and it's clickable from there — below the
+    // fold at 740 is fine, unreachable is not.
+    page.evaluate("document.querySelector('.provider-model-forget').scrollIntoView({ block: 'center' });")
+        .await
+        .expect("scroll to the button");
+    let on_screen: bool = page
+        .evaluate("(() => { const r = document.querySelector('.provider-model-forget').getBoundingClientRect(); return r.top >= 0 && r.bottom <= 740; })()")
+        .await
+        .expect("measure the scrolled button")
+        .into_value()
+        .expect("a bool");
+    assert!(on_screen, "after scrolling, the button should sit fully on screen at 360 px");
+
+    click_when_present(&page, ".provider-model-forget", Duration::from_secs(5)).await;
+    assert!(
+        wait_for_text_gone(&page, "smelt learned 2,147,483,647", Duration::from_secs(10)).await,
+        "Forget left its line on the page"
+    );
+    let row = db::get_provider_model(t.pool, provider.id, "forget-me").await.expect("row").expect("exists");
+    assert_eq!(
+        (row.learned_context_window, row.learned_context_window_at, row.learned_context_window_reason.as_deref(), row.learned_context_window_conversation),
+        (None, None, None, None),
+        "the four learned columns went together"
+    );
+    db::delete_inference_provider(t.pool, provider.id).await.expect("delete the provider");
+}
+
 /// A test server that holds every answer until the test calls `release`
 /// (SME-118): a state that lasts only while a page or image is loading
 /// then lasts until the test has seen it, however slow the runner. A

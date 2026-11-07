@@ -43,6 +43,7 @@ pub(super) fn ProviderModelsSection(id: i64, refresh: Signal<u64>) -> Element {
                                 model,
                                 kind: listing.kind,
                                 efforts: effort_choices(listing.kind, listing.server_caps.as_ref()),
+                                forget_refresh: local_refresh,
                             }
                         }
                     }
@@ -97,6 +98,40 @@ pub(super) fn token_field(text: &str, name: &str) -> Result<Option<u32>, String>
         return Ok(None);
     }
     text.parse::<u32>().map(Some).map_err(|_| format!("{name} is a number of tokens."))
+}
+
+/// What smelt learned about this model, as one line under the Context
+/// window field (SME-439 PR 2): shown whenever a learned window exists —
+/// including when the user's own value also exists and wins the read,
+/// because that pairing is the incident made visible (the Decided note on
+/// the ticket's Questions). The tag follows the read path's positivity:
+/// a value a reader would ignore does not get to "win".
+pub(super) fn learned_window_line(model: &ModelInfo) -> Option<String> {
+    let learned = model.learned_context_window.filter(|w| *w > 0)?;
+    let telling = match model.learned_window_reason.as_deref() {
+        Some("window_stop") => "after a window stop",
+        Some("refusal") => "after a named refusal",
+        Some("ollama_ps") => "after Ollama's answer",
+        _ => "from a window measurement",
+    };
+    let mut line = format!("smelt learned {} {telling}", group_digits(learned));
+    if let Some(when) = model.learned_window_at.as_deref().and_then(learned_window_when) {
+        line.push_str(&format!(" on {when}"));
+    }
+    if let Some(conversation) = model.learned_window_conversation {
+        line.push_str(&format!(" (conversation #{conversation})"));
+    }
+    if model.context_window_override.is_some_and(|w| w > 0) {
+        line.push_str(" (not in use \u{2014} your Context window value wins)");
+    }
+    Some(line)
+}
+
+/// The learned instant as the line reads it, "Nov 6 16:14" (UTC, as
+/// stored); `None` for anything that isn't the ISO `model_info` writes.
+fn learned_window_when(iso: &str) -> Option<String> {
+    let at = chrono::NaiveDateTime::parse_from_str(iso, "%Y-%m-%dT%H:%M:%S").ok()?;
+    Some(at.format("%b %-d %H:%M").to_string())
 }
 
 /// A llama.cpp server's `/props`, as one line under the models' heading:
@@ -164,7 +199,7 @@ pub(super) fn effort_choices(kind: ProviderKind, caps: Option<&LlamaServerInfo>)
 }
 
 #[component]
-fn ProviderModelRow(id: i64, model: ModelInfo, kind: ProviderKind, efforts: Vec<crate::anthropic::Effort>) -> Element {
+fn ProviderModelRow(id: i64, model: ModelInfo, kind: ProviderKind, efforts: Vec<crate::anthropic::Effort>, forget_refresh: Signal<u64>) -> Element {
     let llama_cpp_efforts = kind == ProviderKind::LlamaCpp;
     let mut window = use_signal(|| model.context_window_override.map(|w| w.to_string()).unwrap_or_default());
     let mut max_output = use_signal(|| model.max_output_override.map(|n| n.to_string()).unwrap_or_default());
@@ -235,6 +270,32 @@ fn ProviderModelRow(id: i64, model: ModelInfo, kind: ProviderKind, efforts: Vec<
                         window.set(e.value());
                         saved.set(false);
                     } }
+            }
+            if let Some(line) = learned_window_line(&model) {
+                // SME-439 PR 2: what smelt learned, always shown when it
+                // learned one — beside the user's own value where that
+                // wins the read — with the way to take it back.
+                span { class: "provider-model-learned muted",
+                    "{line}"
+                    button { r#type: "button", class: "provider-model-forget",
+                        title: "Forget the Context window smelt learned. Your own value, if set, stays; smelt may learn again.",
+                        onclick: {
+                            let name = model.id.clone();
+                            let mut bump = forget_refresh;
+                            let mut shown = error;
+                            move |_| {
+                                let name = name.clone();
+                                spawn(async move {
+                                    match clear_learned_model_window(id, name).await {
+                                        Ok(()) => *bump.write() += 1,
+                                        Err(e) => shown.set(Some(server_error_message(&e))),
+                                    }
+                                });
+                            }
+                        },
+                        "Forget"
+                    }
+                }
             }
             label { class: "provider-model-window",
                 "Max reply tokens "

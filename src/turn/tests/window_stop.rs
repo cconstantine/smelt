@@ -33,6 +33,21 @@ pub(super) async fn set_reported_context_window(pool: &PgPool, window: i32) {
     .expect("seed the reported window");
 }
 
+/// Seeds `mock-model`'s **learned** Context window with its whole telling,
+/// as a learner would have written it (SME-439 PR 2: the clears' tests
+/// start from a learned number on the row).
+pub(super) async fn set_learned_context_window(pool: &PgPool, window: i32) {
+    sqlx::query(
+        "INSERT INTO provider_models (provider_id, model, learned_context_window, learned_context_window_at, learned_context_window_reason, learned_context_window_conversation) SELECT id, $1, $2, now(), 'window_stop', 42 FROM inference_providers
+         ON CONFLICT (provider_id, model) DO UPDATE SET learned_context_window = EXCLUDED.learned_context_window, learned_context_window_at = EXCLUDED.learned_context_window_at",
+    )
+    .bind(crate::providers::test_support::MOCK_MODEL)
+    .bind(window)
+    .execute(pool)
+    .await
+    .expect("seed the learned window");
+}
+
 /// W1: a llama.cpp slot that fills stops at `max_tokens` written far short
 /// of the budget — the notice reads the room left with what it wrote, the
 /// call's whole measured size (which is what the server reports per

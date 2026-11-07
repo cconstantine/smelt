@@ -216,6 +216,15 @@ pub struct ProviderModelRow {
     /// `reported_context_window`, so learning never overwrites the user's
     /// own value. Null means nothing learned (or not since it last mattered).
     pub learned_context_window: Option<i32>,
+    /// When smelt learned it, which learner wrote it, and from which
+    /// conversation (SME-439): the provider page quotes all three, and
+    /// the Forget button answers exactly this telling. `DateTime<Utc>`,
+    /// not the `NaiveDateTime` every `timestamp` column decodes to: this
+    /// column is the schema's one `timestamptz`, and sqlx refuses the
+    /// pair the moment it holds a value.
+    pub learned_context_window_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub learned_context_window_reason: Option<String>,
+    pub learned_context_window_conversation: Option<i64>,
     /// Added on the provider's page as a model its listing doesn't show,
     /// so it's shown even when the listing works and lacks it.
     pub added_by_hand: bool,
@@ -382,6 +391,58 @@ pub async fn save_learned_context_window(
     .bind(unsized_window)
     .bind(reason)
     .bind(conversation_id)
+    .execute(pool)
+    .await?;
+    Ok(written.rows_affected() > 0)
+}
+
+/// Forgets what smelt learned about a model's window (SME-439 PR 2): the
+/// Forget button's doing, so all four learned columns go together and
+/// nothing else moves — the user's own `context_window` and the provider's
+/// report are not this statement's to touch. No base_url guard: the user
+/// is renaming nothing; they are looking at the row. `true` if there was
+/// a learned window to forget.
+pub async fn clear_learned_context_window(pool: &PgPool, provider_id: i64, model: &str) -> Result<bool, sqlx::Error> {
+    let written = sqlx::query(
+        "UPDATE provider_models
+            SET learned_context_window = NULL,
+                learned_context_window_at = NULL,
+                learned_context_window_reason = NULL,
+                learned_context_window_conversation = NULL
+          WHERE provider_id = $1 AND model = $2 AND learned_context_window IS NOT NULL",
+    )
+    .bind(provider_id)
+    .bind(model)
+    .execute(pool)
+    .await?;
+    Ok(written.rows_affected() > 0)
+}
+
+/// A number bigger than what smelt learned about a model's window says
+/// the learned one is too small (SME-439 PR 2, Expected 3): a report that
+/// outgrows it (from `providers::store_details`, where llama.cpp's share
+/// per request is already divided out) or a whole reply that fit past it
+/// (from `turn::run`). Clears the four learned columns and only them —
+/// the user's own value and the provider's report are nobody's to touch
+/// here — only when `measured` is *strictly* bigger (an equal size proves
+/// nothing) and only while the provider still answers at `base_url`, the
+/// learner's own guard. `true` if it cleared.
+pub async fn clear_learned_context_window_below(pool: &PgPool, provider_id: i64, base_url: &str, model: &str, measured: i64) -> Result<bool, sqlx::Error> {
+    let written = sqlx::query(
+        "UPDATE provider_models
+            SET learned_context_window = NULL,
+                learned_context_window_at = NULL,
+                learned_context_window_reason = NULL,
+                learned_context_window_conversation = NULL
+          WHERE provider_id = $1 AND model = $2
+            AND learned_context_window IS NOT NULL
+            AND learned_context_window < $4
+            AND EXISTS (SELECT 1 FROM inference_providers WHERE id = $1 AND base_url = $3)",
+    )
+    .bind(provider_id)
+    .bind(model)
+    .bind(base_url)
+    .bind(measured)
     .execute(pool)
     .await?;
     Ok(written.rows_affected() > 0)

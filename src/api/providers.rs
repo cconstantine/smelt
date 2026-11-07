@@ -101,6 +101,16 @@ pub async fn set_model_settings(id: i64, model: String, settings: ModelSettings)
         .map_err(ServerFnError::new)
 }
 
+/// Forgets the Context window smelt learned about a model (SME-439 PR 2).
+/// The user's own Context window, if set, is not touched — that is the
+/// whole point of the button.
+#[post("/api/providers/{id}/models/learned/clear")]
+pub async fn clear_learned_model_window(id: i64, model: String) -> ServerFnResult<()> {
+    crate::providers::clear_learned_context_window(db::get(), id, &model)
+        .await
+        .map_err(ServerFnError::new)
+}
+
 /// Whether `base_url` answers `/props` as a llama.cpp server does, for
 /// the provider form's suggestion (SME-111). Asked without any key.
 #[post("/api/providers/probe-llama-cpp")]
