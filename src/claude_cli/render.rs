@@ -69,6 +69,14 @@ pub fn call_names(messages: &[AnthropicMessage]) -> HashMap<String, String> {
 /// A tool result as the model reads it in text, past tense and naming
 /// its tool when known, so it can't read as a call to make (review 1 L9).
 pub fn tool_result_text(tool_use_id: &str, name: Option<&str>, content: &str, is_error: bool) -> String {
+    // A question's answer comes a turn after its call, which smelt closed
+    // with a placeholder: it says which call it answers (SME-444).
+    if name == Some(crate::questions::ASK_USER) {
+        return format!("(This answers your earlier `ask_user` (call {tool_use_id}), which smelt showed the user; smelt ended that turn while they answered:)\n{content}");
+    }
+    if name == Some(crate::agents::ASK_PARENT) {
+        return format!("(This answers your earlier `ask_parent` (call {tool_use_id}), which smelt sent your parent; smelt ended that turn while it answered:)\n{content}");
+    }
     let what = if is_error { "it failed" } else { "it returned" };
     let ran = name.map_or_else(|| format!("smelt ran call {tool_use_id}"), |name| format!("smelt ran `{name}` (call {tool_use_id})"));
     format!("({ran}; {what}:)\n{content}")

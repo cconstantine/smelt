@@ -178,7 +178,7 @@ async fn test_ask_user_interrupts_the_run_and_the_answer_reaches_the_next(pool: 
     answer_question(pool.clone(), conversation.id, "toolu_ask".to_string(), answers).await.expect("answered");
     fake.until("the answer's run is sent its message", |f| !user_texts(f, 1).is_empty()).await;
     let sent = &user_texts(&fake, 1)[0];
-    assert!(sent.contains("(smelt ran `ask_user` (call toolu_ask); it returned:)\nThe user answered:\n1. Delete: Yes"), "{sent}");
+    assert!(sent.contains("(This answers your earlier `ask_user` (call toolu_ask), which smelt showed the user; smelt ended that turn while they answered:)\nThe user answered:\n1. Delete: Yes"), "{sent}");
 }
 
 /// Part 1, Stop while the CLI streams: the run is interrupted.
