@@ -178,8 +178,9 @@ pub(super) async fn call_model(
             crate::events::ConversationEvent::ReplyReset {},
         );
         let recorder = CallRecorder::new(pool, conversation_id, turn_model, db::ModelCallKind::Turn, request);
-        match anthropic::stream::stream_anthropic_message_metered(
-            &turn_model.endpoint,
+        match stream_for_kind(
+            conversation_id,
+            turn_model,
             request,
             &mut relay,
             recorder.meter(),
@@ -206,11 +207,32 @@ pub(super) async fn call_model(
     Err(CallError::Failed(ServerFnError::new(last_err)))
 }
 
+/// One streamed model call without a turn's CLI run, by provider kind
+/// (SME-431): an HTTP provider's request streams as always, and a Claude
+/// Code provider's (a tools-less, one-message request: the compaction
+/// summary) goes to a one-shot `claude -p` (`claude_cli::once`), in the
+/// slot the turn already holds.
+#[cfg(feature = "server")]
+pub(super) async fn stream_for_kind(
+    conversation_id: i64,
+    turn_model: &crate::providers::TurnModel,
+    request: &anthropic::CreateMessageRequest,
+    on_delta: &mut (dyn FnMut(&str) + Send),
+    meter: &anthropic::stream::UsageMeter,
+    slot: anthropic::stream::SlotPolicy<'_>,
+) -> Result<anthropic::stream::StreamedTurn, anthropic::stream::ModelError> {
+    if turn_model.kind == crate::providers::ProviderKind::ClaudeCli {
+        return crate::claude_cli::once::once(conversation_id, turn_model, request, on_delta, meter).await;
+    }
+    anthropic::stream::stream_anthropic_message_metered(&turn_model.endpoint, request, on_delta, meter, slot).await
+}
+
 /// `call_model` on a Claude Code provider (SME-430): one API call of the
 /// turn's CLI run, with no parse retries (the CLI talks to Anthropic
 /// itself). An API call the CLI made on its own after a cut-off reply
 /// (S6) is recorded as a call of its own, from `extra`'s drop. A request
-/// that didn't fit fails plainly until smelt compacts these (SME-431).
+/// that didn't fit is an overflow, which the turn's recovery compacts
+/// (SME-73, SME-431).
 #[cfg(feature = "server")]
 async fn call_claude_cli(
     pool: &PgPool,
@@ -226,7 +248,10 @@ async fn call_claude_cli(
     let extra = CallRecorder::new(pool, conversation_id, turn_model, db::ModelCallKind::Turn, request);
     let called = crate::claude_cli::run::call(pool, conversation_id, turn_model, request, relay, recorder.meter(), extra.meter(), cli).await;
     drop(extra);
-    called.map(|turn| (turn, recorder)).map_err(|e| CallError::Failed(ServerFnError::new(e)))
+    called.map(|turn| (turn, recorder)).map_err(|e| match cli.take_overflow() {
+        Some(overflow) => CallError::Overflow(overflow),
+        None => CallError::Failed(ServerFnError::new(e)),
+    })
 }
 
 /// Records one model call attempt's usage and cost (SME-106), however the

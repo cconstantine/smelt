@@ -96,9 +96,6 @@ pub(super) async fn build_request_with_room(
             // Only once: `compacted` is set now, and the next pass is settled
             // by the floor. Compacting can learn a smaller window, which the
             // next pass reads again.
-            BeforeSending::Compact if turn_model.kind == crate::providers::ProviderKind::ClaudeCli => {
-                return Err(ServerFnError::new(crate::claude_cli::CANT_COMPACT_YET));
-            }
             BeforeSending::Compact => {
                 compact_conversation(pool, conversation_id, turn_model, slot, refused.map(str::to_string)).await?;
                 // One answering a refusal counts as one (round 2 M4).
@@ -205,6 +202,14 @@ pub(super) async fn save_stop_notice(
                 .filter(|written| *written > 0)
                 .unwrap_or(budget.tokens),
             crate::api::chat::ReplyLimit::RoomLeft,
+        )),
+        // A reply that wrote past its budget ran under a larger cap: a
+        // Claude Code run kept from a call whose budget was larger (SME-430
+        // review 2 M3) takes its cap at launch. It names the cap it reached
+        // (SME-431 L19), and says that cap is why (PR #291 review 1 L2).
+        _ if u32::try_from(turn.usage.output_tokens).is_ok_and(|written| written > budget.tokens) => Some((
+            u32::try_from(turn.usage.output_tokens).unwrap_or(budget.tokens),
+            crate::api::chat::ReplyLimit::LaunchCap,
         )),
         _ => Some((budget.tokens, match budget.limit {
             crate::api::chat::ReplyLimit::OutputCap if turn_model.output_cap_is_models_own => {

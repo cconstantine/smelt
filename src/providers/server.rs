@@ -259,6 +259,18 @@ pub async fn learn_context_window(
     Ok(lowered)
 }
 
+/// Saves the window and reply cap Claude Code reports for a model (its
+/// `result.modelUsage`, SME-431) as the row's reported ones, and tells
+/// the app when that changed anything, as `learn_context_window` does
+/// (PR #291 review 1 L5).
+pub async fn learn_claude_cli_window(pool: &PgPool, provider_id: i64, model: &str, window: i32, max_output: Option<i32>) -> Result<bool, sqlx::Error> {
+    let changed = db::set_claude_cli_reported_window(pool, provider_id, model, window, max_output).await?;
+    if changed {
+        providers_changed();
+    }
+    Ok(changed)
+}
+
 /// The cap on a reply to a model on a `kind` provider (SME-111): the
 /// user's, else what the provider reported, else `UNKNOWN_OUTPUT_CAP`
 /// on an Anthropic or Other provider. `None`: only the window caps it.
