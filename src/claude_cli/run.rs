@@ -435,8 +435,10 @@ async fn start(call: &Call<'_>, resume: bool) -> Result<Run, String> {
             }
             // A recorded session this one replaces goes now: it holds the
             // conversation's tool output and the CLI's account email
-            // (PR #285 review 1 L20).
+            // (PR #285 review 1 L20). Once its last process has ended, so
+            // that one doesn't write it back (SME-431 L22).
             if let Some(old) = &call.recorded {
+                ended(conversation_id).await;
                 super::files::forget_session(conversation_id, &old.session_id);
             }
             let session_id = super::process::new_session_id();

@@ -175,7 +175,7 @@ async fn test_a_cli_that_wont_read_blocks_only_its_own_turn(pool: PgPool) {
 }
 
 /// The conversation's session files, as the CLI would keep them.
-fn session_file(conversation_id: i64, session_id: &str) -> std::path::PathBuf {
+pub(super) fn session_file(conversation_id: i64, session_id: &str) -> std::path::PathBuf {
     let env = crate::claude_cli::cli_env(|name| std::env::var_os(name));
     let config = std::path::PathBuf::from(env.into_iter().find(|(n, _)| n == "CLAUDE_CONFIG_DIR").expect("a config dir").1);
     let work = crate::claude_cli::files::work_dir(&config, conversation_id);

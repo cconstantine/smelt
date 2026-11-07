@@ -73,3 +73,32 @@ async fn test_a_timed_out_wait_kills_the_last_process_before_resuming(pool: PgPo
     assert!(fake.args(1).iter().any(|a| a == "--resume"), "{:?}", fake.args(1));
     assert_eq!(fake.alive_at_start(1), Vec::<String>::new(), "no earlier process ran as the resume started");
 }
+
+/// L22: a session replaced while its last process is still ending stays
+/// gone: the old process writes its file 1.5 s after its turn, and the
+/// new session's start waits for it to end before removing the file.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_replaced_sessions_file_doesnt_come_back(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let fake = FakeCli::new("l22", vec![
+        vec![json!({"read": true}), text_reply("one"), json!({"sleep_ms": 1_500}), json!({"write_session": true})],
+        vec![json!({"read": true}), text_reply("two")],
+    ]);
+    fake.pick_for(&pool, conversation.id).await;
+    let model = crate::providers::resolve_turn_model(&pool, conversation.id).await.expect("the model");
+    use super::review1::{one_call, said};
+    let mut first = crate::claude_cli::run::TurnCli::default();
+    one_call(&pool, conversation.id, &model, &mut first, vec![said("user", "hi")], 1_000).await.expect("call 1");
+    let old = db::get_claude_cli_session(&pool, conversation.id).await.expect("read").expect("a session").session_id;
+    drop(first);
+
+    // Another history: a new session replaces the old one.
+    let mut second = crate::claude_cli::run::TurnCli::default();
+    one_call(&pool, conversation.id, &model, &mut second, vec![said("user", "something else")], 1_000).await.expect("call 2");
+    fake.until("the first process ends", |f| f.dir.join("exited.0").exists()).await;
+
+    assert!(fake.args(1).iter().any(|a| a == "--session-id"), "{:?}", fake.args(1));
+    assert!(!super::review3::session_file(conversation.id, &old).exists(), "the replaced session's file stays gone");
+}
