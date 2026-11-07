@@ -54,6 +54,39 @@ fn test_blocks_read_as_text_without_thinking() {
     assert_eq!(failed, "(smelt ran `todoread` (call toolu_1); it failed:)\nboom");
 }
 
+/// SME-444: a question's result reads as the answer to the earlier call,
+/// which smelt ended the turn on; every other tool keeps its wording.
+#[test]
+fn test_a_questions_result_says_it_answers_the_earlier_call() {
+    let asked = tool_result_text("toolu_ask", Some(crate::questions::ASK_USER), "The user answered:\n1. Delete: Yes", false);
+    assert_eq!(
+        asked,
+        "(This answers your earlier `ask_user` (call toolu_ask), which smelt showed the user; smelt ended that turn while they answered:)\nThe user answered:\n1. Delete: Yes"
+    );
+    let parent = tool_result_text("toolu_up", Some(crate::agents::ASK_PARENT), "Go ahead.", false);
+    assert_eq!(
+        parent,
+        "(This answers your earlier `ask_parent` (call toolu_up), which smelt sent your parent; smelt ended that turn while it answered:)\nGo ahead."
+    );
+    let other = tool_result_text("toolu_1", Some("todoread"), "[]", false);
+    assert_eq!(other, "(smelt ran `todoread` (call toolu_1); it returned:)\n[]", "other tools keep today's wording");
+    let names = std::collections::HashMap::from([("toolu_ask".to_string(), crate::questions::ASK_USER.to_string())]);
+    let rendered = rehydrate(&[text("user", "hi"), text("assistant", "ok"), result("toolu_ask", "The user answered: x")], 1_000_000);
+    assert!(rendered.ends_with("### The new message\n(smelt ran call toolu_ask; it returned:)\nThe user answered: x"), "no call named, no tie: {rendered}");
+    let named = blocks_text(&result("toolu_ask", "The user answered: x").content, &names);
+    assert!(named.starts_with("(This answers your earlier `ask_user` (call toolu_ask)"), "{named}");
+}
+
+/// PR #295 review 1 L1: a question's error result (refused, or never
+/// asked) isn't worded as an answer the user gave; it keeps today's.
+#[test]
+fn test_a_questions_error_result_keeps_todays_wording() {
+    let refused = tool_result_text("toolu_ask", Some(crate::questions::ASK_USER), "ask one set of questions at a time", true);
+    assert_eq!(refused, "(smelt ran `ask_user` (call toolu_ask); it failed:)\nask one set of questions at a time");
+    let parent = tool_result_text("toolu_up", Some(crate::agents::ASK_PARENT), "ask_parent is only for an agent", true);
+    assert_eq!(parent, "(smelt ran `ask_parent` (call toolu_up); it failed:)\nask_parent is only for an agent");
+}
+
 #[test]
 fn test_a_new_conversation_sends_its_message_as_it_is() {
     assert_eq!(rehydrate(&[text("user", "hello"), text("user", "a notice")], 1_000_000), "hello\n\na notice");

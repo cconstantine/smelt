@@ -157,29 +157,8 @@ async fn test_a_turn_with_no_session_starts_from_smelts_history(pool: PgPool) {
     assert!(first[0].contains("### assistant\nHi there.") && first[0].ends_with("### The new message\nhello"), "{}", first[0]);
 }
 
-/// Part 1, ask_user: the turn ends with the question's call parked, so
-/// the run is interrupted (the CLI records the call as stopped); the
-/// answer's turn starts a new run, whose history carries the answer.
-#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_ask_user_interrupts_the_run_and_the_answer_reaches_the_next(pool: PgPool) {
-    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
-    let _guard = lock_turn_tests();
-    let conversation = db::create_conversation(&pool).await.expect("conversation");
-    let ask = json!({"questions": [{"question": "Delete the build directory?", "header": "Delete", "options": [{"label": "Yes"}, {"label": "No"}]}]});
-    let mut first = vec![json!({"read": true})];
-    first.extend(tool_reply(&[("toolu_ask", crate::questions::ASK_USER, ask)]));
-    let fake = FakeCli::new("ask", vec![first, vec![json!({"read": true}), text_reply("Deleting.")]]);
-    fake.pick_for(&pool, conversation.id).await;
-
-    run_turn(&pool, conversation.id, hello()).await.expect("asks");
-    fake.until("the run is interrupted", |f| f.stdin(0).iter().any(is_interrupt)).await;
-
-    let answers = vec![crate::questions::QuestionAnswer { selected: vec!["Yes".to_string()], other: None }];
-    answer_question(pool.clone(), conversation.id, "toolu_ask".to_string(), answers).await.expect("answered");
-    fake.until("the answer's run is sent its message", |f| !user_texts(f, 1).is_empty()).await;
-    let sent = &user_texts(&fake, 1)[0];
-    assert!(sent.contains("(smelt ran `ask_user` (call toolu_ask); it returned:)\nThe user answered:\n1. Delete: Yes"), "{sent}");
-}
+// The ask_user round trip is `questions::test_an_ask_user_round_trip_reads_as_a_success_and_its_answer`
+// since SME-444.
 
 /// Part 1, Stop while the CLI streams: the run is interrupted.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
@@ -296,3 +275,4 @@ mod review3;
 mod carried;
 mod compaction;
 mod round1;
+mod questions;

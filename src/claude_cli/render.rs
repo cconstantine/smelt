@@ -66,9 +66,33 @@ pub fn call_names(messages: &[AnthropicMessage]) -> HashMap<String, String> {
         .collect()
 }
 
+/// `messages` without the tool results whose calls are in `delivered`
+/// (SME-444: a closed run's session has them already); a message left
+/// with nothing goes too.
+pub fn without_delivered(messages: &[AnthropicMessage], delivered: &std::collections::HashSet<String>) -> Vec<AnthropicMessage> {
+    messages
+        .iter()
+        .map(|m| AnthropicMessage {
+            role: m.role.clone(),
+            content: m.content.iter().filter(|b| !matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if delivered.contains(tool_use_id))).cloned().collect(),
+        })
+        .filter(|m| !m.content.is_empty())
+        .collect()
+}
+
 /// A tool result as the model reads it in text, past tense and naming
 /// its tool when known, so it can't read as a call to make (review 1 L9).
 pub fn tool_result_text(tool_use_id: &str, name: Option<&str>, content: &str, is_error: bool) -> String {
+    // A question's answer comes a turn after its call, which smelt closed
+    // with a placeholder: it says which call it answers (SME-444). An
+    // error (a refused question, or one never asked) wasn't shown to
+    // anyone, so it keeps the wording below (PR #295 review 1 L1).
+    if !is_error && name == Some(crate::questions::ASK_USER) {
+        return format!("(This answers your earlier `ask_user` (call {tool_use_id}), which smelt showed the user; smelt ended that turn while they answered:)\n{content}");
+    }
+    if !is_error && name == Some(crate::agents::ASK_PARENT) {
+        return format!("(This answers your earlier `ask_parent` (call {tool_use_id}), which smelt sent your parent; smelt ended that turn while it answered:)\n{content}");
+    }
     let what = if is_error { "it failed" } else { "it returned" };
     let ran = name.map_or_else(|| format!("smelt ran call {tool_use_id}"), |name| format!("smelt ran `{name}` (call {tool_use_id})"));
     format!("({ran}; {what}:)\n{content}")

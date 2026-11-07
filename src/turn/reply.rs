@@ -294,6 +294,8 @@ pub(super) async fn run_tools(
     // The question this reply asked, if any: `ask_user`'s or (SME-238)
     // `ask_parent`'s. One per reply, of either kind.
     let mut asked: Option<&str> = None;
+    // Its call's id, once it's recorded (PR #295 review 1 M1).
+    let mut asked_id: Option<String> = None;
     let mut finished = false;
     every_call_unknown &= !turn.content.iter().any(|b| matches!(b, anthropic::ContentBlock::ToolUse { name, .. } if is_question(name)));
     for block in &turn.content {
@@ -322,6 +324,7 @@ pub(super) async fn run_tools(
                     Ok(questions) => {
                         ask(pool, conversation_id, id, questions).await?;
                         asked = Some(name);
+                        asked_id = Some(id.clone());
                         continue;
                     }
                     Err(e) => e,
@@ -329,6 +332,7 @@ pub(super) async fn run_tools(
                 None => match crate::agents::ask_parent(pool, conversation_id, id, input).await {
                     Ok(()) => {
                         asked = Some(name);
+                        asked_id = Some(id.clone());
                         continue;
                     }
                     Err(e) => e,
@@ -375,6 +379,7 @@ pub(super) async fn run_tools(
         results: result_blocks,
         ends: asked.is_some() || finished,
         unknown: unknown.filter(|_| every_call_unknown).map(str::to_string),
+        asked: asked_id,
     })
 }
 
@@ -385,6 +390,9 @@ pub(super) async fn run_tools(
 pub(super) struct RanTools {
     pub(super) results: Vec<anthropic::ContentBlock>,
     pub(super) ends: bool,
+    /// The id of the question it asked, once recorded: the one call a
+    /// Claude Code run's close may answer with a placeholder (SME-444).
+    pub(super) asked: Option<String>,
     pub(super) unknown: Option<String>,
 }
 

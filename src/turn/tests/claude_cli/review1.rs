@@ -272,6 +272,10 @@ async fn test_a_stop_mid_tool_interrupts_the_parked_run(pool: PgPool) {
     let ended = tokio::time::timeout(std::time::Duration::from_secs(5), turn).await.expect("the turn ends").expect("join");
     assert!(ended.expect_err("stopped").to_string().contains(TURN_STOPPED));
     fake.until("the parked run is interrupted", |f| f.stdin(0).iter().any(is_interrupt)).await;
+    // A Stop still reads as stopped (SME-444): the CLI records the call's
+    // stopped result, and no success was sent before the interrupt.
+    let stopped = |f: &FakeCli| f.transcript(0).iter().any(|e| e["tool_result"] == "toolu_mid" && e["is_error"] == true);
+    fake.until("the call reads as stopped", stopped).await;
     assert_eq!(fake.results(0), Vec::<Value>::new(), "the call got no result");
 }
 
