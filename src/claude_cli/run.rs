@@ -81,7 +81,7 @@ fn launch_hold() -> Duration {
     LAUNCH_HOLD
 }
 
-fn write_timeout() -> Duration {
+pub(super) fn write_timeout() -> Duration {
     #[cfg(test)]
     {
         let ms = WRITE_TIMEOUT_FOR_TESTS.load(std::sync::atomic::Ordering::SeqCst);
@@ -95,9 +95,14 @@ fn write_timeout() -> Duration {
 /// A start's hold on `LAUNCH`, let go at its first line (`release`) or,
 /// from a timer of its own, at `launch_hold()`, whatever the run is doing
 /// meanwhile (PR #285 review 1 L18).
-struct Launching(Arc<Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>>);
+pub(super) struct Launching(Arc<Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>>);
 
 impl Launching {
+    /// Takes the start lock: a one-shot call's start, too (SME-431).
+    pub(super) async fn take() -> Self {
+        Self::hold(LAUNCH.clone().lock_owned().await)
+    }
+
     fn hold(guard: tokio::sync::OwnedMutexGuard<()>) -> Self {
         let held = Arc::new(Mutex::new(Some(guard)));
         let timer = Arc::downgrade(&held);
@@ -110,7 +115,7 @@ impl Launching {
         Self(held)
     }
 
-    fn release(&self) {
+    pub(super) fn release(&self) {
         release(&self.0);
     }
 }
@@ -137,7 +142,7 @@ pub const NOT_THE_REPLYS: &str = "smelt refused this tool call: it isn't one of 
 #[cfg(test)]
 pub static SILENCE_FOR_TESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn silence() -> Duration {
+pub(super) fn silence() -> Duration {
     #[cfg(test)]
     {
         let ms = SILENCE_FOR_TESTS.load(std::sync::atomic::Ordering::SeqCst);
@@ -335,6 +340,15 @@ async fn call_run(
     cli: &mut TurnCli,
 ) -> Result<StreamedTurn, String> {
     let (conversation_id, request) = (call.conversation_id, call.request);
+    // A compaction replaced the history this run's session holds
+    // (SME-431): the run ends, and the call starts a new session from the
+    // summary (the state table's B2 row).
+    if super::session::take_reset(conversation_id)
+        && let Some(old) = cli.run.take()
+    {
+        tracing::info!(conversation_id, "compacted: ending the turn's Claude Code run");
+        old.end_in_background();
+    }
     // A process that died since the last call (an OOM kill while smelt ran
     // a tool) is replaced, as the state table's Dead row says (review 1 M1).
     if let Some(run) = cli.run.as_mut()
@@ -452,10 +466,15 @@ async fn start(call: &Call<'_>, resume: bool) -> Result<Run, String> {
             // A recorded session this one replaces goes now: it holds the
             // conversation's tool output and the CLI's account email
             // (PR #285 review 1 L20). Once its last process has ended, so
-            // that one doesn't write it back (SME-431 L22).
-            if let Some(old) = &call.recorded {
+            // that one doesn't write it back (SME-431 L22). So do those a
+            // compaction replaced (SME-431's reset).
+            let mut replaced = super::session::take_retired(conversation_id);
+            replaced.extend(call.recorded.iter().map(|old| old.session_id.clone()));
+            if !replaced.is_empty() {
                 ended(conversation_id).await;
-                super::files::forget_session(conversation_id, &old.session_id);
+            }
+            for old in &replaced {
+                super::files::forget_session(conversation_id, old);
             }
             let session_id = super::process::new_session_id();
             let mut run = Run::spawn(conversation_id, turn_model, request, SessionArg::New(&session_id)).await?;
@@ -746,11 +765,12 @@ async fn ended(conversation_id: i64) {
 
 mod deliver;
 mod read;
+pub(super) use read::apply;
 
 /// A run's files: its system prompt and its `--mcp-config` (which holds
 /// the bridge's token), removed when the run is dropped, however it ends
 /// (review 1 L6). The CLI reads both only as it starts.
-struct RunFiles(Vec<PathBuf>);
+pub(super) struct RunFiles(pub(super) Vec<PathBuf>);
 
 impl Drop for RunFiles {
     fn drop(&mut self) {
@@ -761,7 +781,7 @@ impl Drop for RunFiles {
 }
 
 /// Keeps the last `errors::MAX_QUOTED` bytes of the CLI's stderr.
-async fn keep_tail(mut stderr: tokio::process::ChildStderr, tail: Arc<Mutex<String>>) {
+pub(super) async fn keep_tail(mut stderr: tokio::process::ChildStderr, tail: Arc<Mutex<String>>) {
     let mut buffer = [0u8; 4096];
     while let Ok(n) = stderr.read(&mut buffer).await {
         if n == 0 {

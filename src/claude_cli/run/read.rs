@@ -222,7 +222,7 @@ impl Run {
 
 /// One `stream_event`'s API event, applied to the reply as
 /// `anthropic::stream` applies an SSE event.
-fn apply(blocks: &mut Blocks, stop_reason: &mut String, event: &Value, on_delta: &mut (dyn FnMut(&str) + Send), meter: &UsageMeter) -> Result<(), String> {
+pub(in crate::claude_cli) fn apply(blocks: &mut Blocks, stop_reason: &mut String, event: &Value, on_delta: &mut (dyn FnMut(&str) + Send), meter: &UsageMeter) -> Result<(), String> {
     let index = block_index(event);
     match interpret_stream_event(event) {
         StreamOutcome::TextDelta(text) => {

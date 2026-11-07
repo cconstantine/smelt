@@ -10,7 +10,6 @@ pub enum SessionArg<'a> {
     /// No session on disk (`--no-session-persistence`): the process holds
     /// the context, and it dies with it. Only the capture runs so since
     /// turns keep sessions (SME-430's second PR).
-    #[cfg_attr(not(feature = "claude-cli-capture"), expect(dead_code, reason = "only the capture's scenarios run without a session"))]
     Ephemeral,
     /// A new session with this id (`--session-id`).
     New(&'a str),

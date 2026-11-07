@@ -178,8 +178,9 @@ pub(super) async fn call_model(
             crate::events::ConversationEvent::ReplyReset {},
         );
         let recorder = CallRecorder::new(pool, conversation_id, turn_model, db::ModelCallKind::Turn, request);
-        match anthropic::stream::stream_anthropic_message_metered(
-            &turn_model.endpoint,
+        match stream_for_kind(
+            conversation_id,
+            turn_model,
             request,
             &mut relay,
             recorder.meter(),
@@ -204,6 +205,26 @@ pub(super) async fn call_model(
         }
     }
     Err(CallError::Failed(ServerFnError::new(last_err)))
+}
+
+/// One streamed model call without a turn's CLI run, by provider kind
+/// (SME-431): an HTTP provider's request streams as always, and a Claude
+/// Code provider's (a tools-less, one-message request: the compaction
+/// summary) goes to a one-shot `claude -p` (`claude_cli::once`), in the
+/// slot the turn already holds.
+#[cfg(feature = "server")]
+pub(super) async fn stream_for_kind(
+    conversation_id: i64,
+    turn_model: &crate::providers::TurnModel,
+    request: &anthropic::CreateMessageRequest,
+    on_delta: &mut (dyn FnMut(&str) + Send),
+    meter: &anthropic::stream::UsageMeter,
+    slot: anthropic::stream::SlotPolicy<'_>,
+) -> Result<anthropic::stream::StreamedTurn, anthropic::stream::ModelError> {
+    if turn_model.kind == crate::providers::ProviderKind::ClaudeCli {
+        return crate::claude_cli::once::once(conversation_id, turn_model, request, on_delta, meter).await;
+    }
+    anthropic::stream::stream_anthropic_message_metered(&turn_model.endpoint, request, on_delta, meter, slot).await
 }
 
 /// `call_model` on a Claude Code provider (SME-430): one API call of the

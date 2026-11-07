@@ -38,6 +38,8 @@ fn fixture(name: &str) -> &'static str {
         "thinking_off" => include_str!("../fixtures/thinking_off.jsonl"),
         "pending" => include_str!("../fixtures/pending.jsonl"),
         "missing" => include_str!("../fixtures/missing.jsonl"),
+        // Synthesised, not captured (SME-431): its first line says so.
+        "overflow" => include_str!("../fixtures/overflow.jsonl"),
         _ => "",
     }
 }
@@ -124,6 +126,11 @@ impl FakeCli {
     pub(crate) fn alive_at_start(&self, n: usize) -> Vec<String> {
         let text = std::fs::read_to_string(self.dir.join(format!("alive_at_start.{n}"))).expect("process n started");
         text.lines().map(str::to_string).collect()
+    }
+
+    /// The system prompt process `n` was given (`--system-prompt-file`).
+    pub(crate) fn prompt(&self, n: usize) -> String {
+        std::fs::read_to_string(self.dir.join(format!("prompt.{n}"))).unwrap_or_default()
     }
 
     /// Waits up to 10 s for `check` to hold.
@@ -288,6 +295,10 @@ async fn play(dir: &Path, n: usize) -> i32 {
         let token = server["headers"]["Authorization"].as_str().unwrap_or_default().trim_start_matches("Bearer ").to_string();
         (server["url"].as_str().unwrap_or_default().to_string(), token)
     });
+    // Its system prompt, which smelt removes once the run goes.
+    if let Some(file) = args.iter().position(|a| *a == "--system-prompt-file").and_then(|i| args.get(i + 1)) {
+        let _ = std::fs::copy(file, dir.join(format!("prompt.{n}")));
+    }
     let scenario: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("scenario.json")).expect("the scenario")).expect("JSON");
     let steps = scenario[n].as_array().cloned().unwrap_or_default();
     let mut fake = Fake {

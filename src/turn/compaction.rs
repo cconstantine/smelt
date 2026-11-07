@@ -689,6 +689,7 @@ async fn compact(
     db::clear_conversation_usage(pool, conversation_id)
         .await
         .map_err(ServerFnError::new)?;
+    crate::claude_cli::session::reset(pool, conversation_id, turn_model.kind).await;
     Ok(())
 }
 
@@ -730,8 +731,8 @@ async fn summarize(
     let mut discard_deltas = |_: &str| {};
     let recorder =
         CallRecorder::new(pool, conversation_id, turn_model, db::ModelCallKind::Compaction, &summarization_request);
-    let turn = anthropic::stream::stream_anthropic_message_metered(
-        &turn_model.endpoint,
+    let turn = super::call::stream_for_kind(
+        conversation_id, turn_model,
         &summarization_request,
         &mut discard_deltas,
         recorder.meter(),
