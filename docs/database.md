@@ -71,6 +71,8 @@ Any other violation (e.g. a duplicate `mcp_servers.name` or `sandbox_volumes.nam
 
 `migrations/*.sql`, applied in filename order by `sqlx::migrate!()` at startup. Never edit a migration once it has been applied anywhere: sqlx stores each applied migration's checksum and refuses to start against a database whose recorded checksum no longer matches the file. The schema changes by adding a new migration.
 
+An upgrade from before SME-439 gets only added columns (`20261106180000_learned_context_window.sql`), but the old learners wrote `context_window` itself, and their numbers are indistinguishable from values the user set (the 160,799 of the incident): clear any Context window value you don't recognize after upgrading (on the host, the incident row was hand-fixed before the upgrade).
+
 ## Schema
 
 The tables after every migration has run. All `id`s are `BIGINT GENERATED ALWAYS AS IDENTITY` and all timestamps are `TIMESTAMP` (no time zone) defaulting to `now()`, unless noted.
