@@ -54,6 +54,15 @@ case "$out" in *"::warning::"*) fail "a normal build printed a warning" ;; esac
 run "bash -c 'echo error: build failed; exit 3'"
 [ "$rc" -eq 3 ] || fail "a failed build: exit $rc, want 3"
 
+# The watched child sees RUSTUP_AUTO_INSTALL=0 (SME-457): dx's progress
+# estimate spawns `cargo +nightly rustc --unit-graph`, and rustup answers a
+# missing toolchain by downloading one from the network with no timeout — on
+# a stalled path dx then waits forever, silently. The estimate is cosmetic
+# (a failed one is ignored by dx), so it must fail fast instead. This fake
+# dx exits 7 unless its own environment says 0.
+run "bash -c '[ \"\$RUSTUP_AUTO_INSTALL\" = 0 ] || { echo RUSTUP_AUTO_INSTALL not 0; exit 7; }; exit 0'"
+[ "$rc" -eq 0 ] || fail "watched dx without RUSTUP_AUTO_INSTALL=0: exit $rc, want 0 (out: $out)"
+
 # The client completes, then dx hangs: stopped, with a warning and the
 # process list, and the step passes.
 start=$SECONDS
