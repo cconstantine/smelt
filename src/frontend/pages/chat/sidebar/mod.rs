@@ -57,6 +57,13 @@ pub(super) fn ConversationSidebar(
     // failed fetch means no markers and no error line, as for the dot.
     let live_commands = use_resource(move || {
         let _ = commands_changed();
+        // …and PodsChanged too (review round 1): a user Stop closes the
+        // pod row and publishes PodsChanged after that write lands, so
+        // this refetch sees the live-pod join already exclude the pod —
+        // the marker never outlives the green dot by a round trip, and a
+        // failed lost-marking can't strand it either. CommandsChanged
+        // still covers every other flip.
+        let _ = pods_changed();
         crate::api::pods::get_running_command_conversations()
     });
     let running_commands_for = move |id: i64| -> i64 {
