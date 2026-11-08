@@ -18,11 +18,34 @@ pub(super) struct InstallWatch<'a> {
     /// bound reads as an install still running.
     rc_read_failures: u32,
     rc_read_error: Option<String>,
+    /// How many reads of the record there were, and the slowest one
+    /// (SME-452's recurrence): an exec has no bound of its own, so one
+    /// read that hung for minutes would read like a silent install.
+    rc_reads: u32,
+    slowest_read: std::time::Duration,
+    /// What was still running at the timeout, once read.
+    processes: Option<Result<String, String>>,
 }
 
 impl<'a> InstallWatch<'a> {
     pub(super) fn new(name: &'a str, uid: &'a str) -> Self {
-        InstallWatch { name, uid, read_error: None, rc_read_failures: 0, rc_read_error: None }
+        InstallWatch {
+            name,
+            uid,
+            read_error: None,
+            rc_read_failures: 0,
+            rc_read_error: None,
+            rc_reads: 0,
+            slowest_read: std::time::Duration::ZERO,
+            processes: None,
+        }
+    }
+
+    /// A read of the install's record, got through or not, that took
+    /// `took`.
+    pub(super) fn rc_read_took(&mut self, took: std::time::Duration) {
+        self.rc_reads += 1;
+        self.slowest_read = self.slowest_read.max(took);
     }
 
     /// A read of the install's record that didn't get through.
@@ -57,16 +80,35 @@ impl<'a> InstallWatch<'a> {
             (0, _) | (_, None) => String::new(),
             (n, Some(e)) => format!("; its record couldn't be read {n} times (last: {e})"),
         };
+        let reads = match self.rc_reads {
+            0 => String::new(),
+            n => format!(
+                "; {n} record reads, the slowest {} s",
+                // f64's Display drops a whole number's ".0": "2 s", "2.345 s".
+                self.slowest_read.as_millis() as f64 / 1000.0
+            ),
+        };
         let output = match log {
             // npm writes nothing to a file until it ends (SME-452).
             Ok(log) if log.trim().is_empty() => ". It wrote no output.".to_string(),
             Ok(log) => format!(". Its output so far:\n{}", log.trim_end()),
             Err(e) => format!(" (its output couldn't be read: {e})"),
         };
+        let processes = match &self.processes {
+            None => String::new(),
+            Some(Ok(listing)) => format!("\nStill running then:\n{}", listing.trim_end()),
+            Some(Err(e)) => format!("\n(its processes couldn't be read: {e})"),
+        };
         format!(
-            "The install didn't finish within {within}{}{record}{output}",
+            "The install didn't finish within {within}{}{record}{reads}{output}{processes}",
             self.read_error.as_ref().map(|e| format!(" (last error reading the pod: {e})")).unwrap_or_default()
         )
+    }
+
+    /// What was running in the pod when the install ran out its bound
+    /// (`PROCESS_LISTING`'s output, or why it couldn't be read).
+    pub(super) fn saw_processes(&mut self, listing: Result<String, String>) {
+        self.processes = Some(listing);
     }
 }
 
@@ -131,7 +173,10 @@ pub(super) async fn wait_installed_within(
         if let Some(error) = watch.read(pods.get_opt(name).await.map_err(|e| e.to_string())) {
             return Err(error);
         }
-        match install_rc(client, name).await {
+        let asked = std::time::Instant::now();
+        let rc = install_rc(client, name).await;
+        watch.rc_read_took(asked.elapsed());
+        match rc {
             Ok(Some(rc)) => {
                 if rc == "0" {
                     return Ok(());
@@ -149,9 +194,52 @@ pub(super) async fn wait_installed_within(
             }
         }
         if started.elapsed() > bound {
-            return Err(watch.timed_out(bound, bounded_read(install_log(client, name), LOG_READ_TIMEOUT).await));
+            // Both reads at once, each bounded: the message waits at most
+            // one `LOG_READ_TIMEOUT` past the install's bound.
+            let (log, processes) = tokio::join!(
+                bounded_read(install_log(client, name), LOG_READ_TIMEOUT),
+                bounded_read(install_processes(client, name), LOG_READ_TIMEOUT),
+            );
+            watch.saw_processes(processes);
+            return Err(watch.timed_out(bound, log));
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+/// What was running in a server pod (SME-452's recurrence), for a
+/// timed-out install to name, since its pod is deleted after: its record
+/// (`install.rc`, if written), its log's size, and each process but the
+/// pod script (PID 1, whose command line is the install command itself)
+/// and this script's own shell, as `pid [state] <the first two words of
+/// its command line>` (`npm install`, `curl -fsSL`, `go install`). Never
+/// `environ`, and no more than 2,000 bytes. POSIX `sh` and `/proc` only,
+/// with `sed`, `tr`, `wc` and `head`, so it runs in Debian, busybox and
+/// Alpine images.
+pub(super) const PROCESS_LISTING: &str = r#"if [ -e /tmp/install.rc ]; then echo "install.rc: $(head -c 100 /tmp/install.rc)"; else echo "install.rc: not written"; fi
+echo "install.log: $(wc -c < /tmp/install.log 2>/dev/null || echo missing) bytes"
+out=""
+for d in /proc/[0-9]*; do
+  p=${d#/proc/}
+  if [ "$p" = 1 ] || [ "$p" = "$$" ]; then continue; fi
+  s=$(sed -n 's/^State:[[:space:]]*//p' "$d/status" 2>/dev/null) || continue
+  [ -n "$s" ] || continue
+  # The words split, never globbed (the loop's list is already expanded).
+  set -f
+  set -- $(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+  out="$out$p [$s] ${1:-} ${2:-}
+"
+done
+printf '%s' "$out" | head -c 2000"#;
+
+/// `PROCESS_LISTING`'s output in pod `name`'s server container.
+async fn install_processes(client: &kube::Client, name: &str) -> Result<String, String> {
+    let result = crate::sandbox::exec_with(client, name, "server", &["sh", "-c", PROCESS_LISTING], None)
+        .await
+        .map_err(|e| e.to_string())?;
+    match result.exit_code {
+        0 => Ok(result.stdout),
+        code => Err(format!("the listing exited {code}: {}", result.stderr.trim())),
     }
 }
 

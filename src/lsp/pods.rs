@@ -75,16 +75,21 @@ fn pod_script(install_command: &str) -> String {
 /// real `npm install pyright` was unchanged (`added 1 package in 4s`; its
 /// slowest fetch, the tarball, about 3 s). Audit, fund and the update
 /// notifier are each one more request that can stall, and an install
-/// needs none of them. The config's own `env` (in any of npm's spellings
-/// of the name) or the install command's own flags win over these; a
-/// `~/.npmrc` doesn't, since npm ranks its environment above it.
-pub const NPM_STALL_BOUNDS: [(&str, &str); 6] = [
+/// needs none of them. `loglevel=http` makes npm log each fetch as it
+/// finishes (`npm http fetch GET 200 … 292ms`, 4 lines for pyright),
+/// where by default it writes nothing to a file until it ends: a timed-out
+/// install's log then says how far npm got (SME-452's recurrence). The
+/// config's own `env` (in any of npm's spellings of the name) or the
+/// install command's own flags win over these; a `~/.npmrc` doesn't,
+/// since npm ranks its environment above it.
+pub const NPM_STALL_BOUNDS: [(&str, &str); 7] = [
     ("npm_config_fetch_timeout", "30000"),
     ("npm_config_fetch_retries", "3"),
     ("npm_config_fetch_retry_maxtimeout", "10000"),
     ("npm_config_audit", "false"),
     ("npm_config_fund", "false"),
     ("npm_config_update_notifier", "false"),
+    ("npm_config_loglevel", "http"),
 ];
 
 /// The server pod for `config` next to `sandbox`, its config version

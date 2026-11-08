@@ -122,6 +122,15 @@ fn test_npm_gives_up_on_a_stalled_registry_inside_the_install_bound() {
     }
 }
 
+/// SME-452's recurrence (Q1): npm logs each fetch as it finishes, so a
+/// timed-out npm install's log says how far it got. Without it npm
+/// writes nothing until it ends.
+#[test]
+fn test_a_server_pods_npm_logs_each_fetch() {
+    let env = pod_env(&config());
+    assert!(env.contains(&("npm_config_loglevel".to_string(), "http".to_string())), "{env:?}");
+}
+
 /// SME-452: a config's own npm setting wins over the stall bounds, and
 /// the pod has that name once (no reliance on Kubernetes' order for
 /// duplicate names). npm reads its names case-insensitively, with `-`
@@ -353,6 +362,24 @@ fn test_a_timed_out_install_says_its_log_was_empty_or_missing() {
     );
     assert_eq!(log_of(exec_result(-1, "", "exec failed: InternalError: …")), Err("tail exited -1: exec failed: InternalError: …".to_string()));
     assert_eq!(log_of(exec_result(0, "added 1 package\n", "")), Ok("added 1 package\n".to_string()));
+}
+
+/// SME-452's recurrence (B′): a timed-out install says how many reads of
+/// its record there were and how slow the slowest was, so one read that
+/// hung for minutes shows as a few reads and a slow one, not silence.
+#[test]
+fn test_a_timed_out_install_counts_its_reads_and_the_slowest() {
+    let mut watch = InstallWatch::new("lsp-7-ra", "a");
+    let error = watch.timed_out(INSTALL_TIMEOUT, Ok(String::new()));
+    assert!(!error.contains("record reads"), "no reads, nothing to say: {error}");
+    for millis in [1_000, 2_000, 250] {
+        watch.rc_read_took(std::time::Duration::from_millis(millis));
+    }
+    let error = watch.timed_out(INSTALL_TIMEOUT, Ok(String::new()));
+    assert!(error.contains("; 3 record reads, the slowest 2 s. It wrote no output."), "{error}");
+    watch.rc_read_took(std::time::Duration::from_millis(2_345));
+    let error = watch.timed_out(INSTALL_TIMEOUT, Ok(String::new()));
+    assert!(error.contains("; 4 record reads, the slowest 2.345 s."), "{error}");
 }
 
 /// A server pod with `status`, a status captured live.
