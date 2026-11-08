@@ -166,7 +166,7 @@ tier_db=postgres://u@localhost/smelt_browser_tier_$(basename "$PWD" | tr -c 'a-z
 expected="cargo fetch unlocked
 import unlocked
 import unlocked
-dx build --platform web unlocked
+dx build --platform web --verbose unlocked
 cargo test --features server browser-test --no-run unlocked
 sqlx database drop -y --database-url $tier_db unlocked
 sqlx database create --database-url $tier_db unlocked

@@ -9,8 +9,9 @@
 # starting there until the branch merges (SME-65), so this creates a scratch
 # database named after the checkout, runs the tier against it, and drops it
 # again, pass or fail. It also:
-# - builds the web bundle first (`dx build --platform web`): the tier serves
-#   a separately built one that `cargo test` never rebuilds;
+# - builds the web bundle first, through scripts/ci-web-bundle under a cap
+#   (SMELT_BROWSER_TIER_BUNDLE_TIMEOUT, SME-457): the tier serves a
+#   separately built one that `cargo test` never rebuilds;
 # - runs against this working tree's own sandbox image (SANDBOX_IMAGE, see
 #   scripts/sandbox-image-ref), checked by scripts/cluster-doctor first;
 # - points BROWSER_CHECK_CACHE at the main checkout's .browser-check-cache
@@ -77,7 +78,22 @@ echo "== web bundle"
 # session can run it unattended (SME-107).
 mkdir -p target/browser-tier
 log=target/browser-tier/web-bundle.log
-if ! dx build --platform web >"$log" 2>&1; then
+# scripts/ci-web-bundle, not a bare dx build: its watcher passes SME-67's
+# post-client silence with a warning instead of hanging, and it exports
+# RUSTUP_AUTO_INSTALL=0 so dx's unit-count estimate can't hang this step on a
+# stalled rustup toolchain download (SME-457). The cap bounds what the
+# watcher deliberately leaves open — silence *before* the client bundle, e.g.
+# a leftover cargo lock holder: unlike CI's step, a seat has no timeout to
+# hand that to. 1800 s is ~5x a cold in-stack bundle (warm ~15 s), so a red
+# here is a hung gate, never a merely slow one.
+bundle_timeout=${SMELT_BROWSER_TIER_BUNDLE_TIMEOUT:-1800}
+timeout -k 30 "$bundle_timeout" scripts/ci-web-bundle >"$log" 2>&1
+rc=$?
+if [ "$rc" -eq 124 ]; then
+    tail -30 "$log"
+    echo "the web bundle step timed out after ${bundle_timeout}s waiting on scripts/ci-web-bundle (dx build --platform web): a stalled toolchain download or cargo lock (SME-457), not a slow build. See docs/testing.md; cap: SMELT_BROWSER_TIER_BUNDLE_TIMEOUT (full log: $log)" >&2
+    exit 1
+elif [ "$rc" -ne 0 ]; then
     tail -30 "$log"
     echo "dx build failed (full log: $log)" >&2
     exit 1
