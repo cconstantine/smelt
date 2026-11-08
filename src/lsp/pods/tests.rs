@@ -122,6 +122,15 @@ fn test_npm_gives_up_on_a_stalled_registry_inside_the_install_bound() {
     }
 }
 
+/// SME-452's recurrence (Q1): npm logs each fetch as it finishes, so a
+/// timed-out npm install's log says how far it got. Without it npm
+/// writes nothing until it ends.
+#[test]
+fn test_a_server_pods_npm_logs_each_fetch() {
+    let env = pod_env(&config());
+    assert!(env.contains(&("npm_config_loglevel".to_string(), "http".to_string())), "{env:?}");
+}
+
 /// SME-452: a config's own npm setting wins over the stall bounds, and
 /// the pod has that name once (no reliance on Kubernetes' order for
 /// duplicate names). npm reads its names case-insensitively, with `-`
@@ -317,6 +326,62 @@ async fn test_a_timed_out_installs_log_read_is_bounded() {
     assert_eq!(bounded_read(async { Ok("npm http fetch".to_string()) }, LOG_READ_TIMEOUT).await, Ok("npm http fetch".to_string()));
 }
 
+fn exec_result(exit_code: i32, stdout: &str, stderr: &str) -> crate::sandbox::ExecResult {
+    crate::sandbox::ExecResult { stdout: stdout.to_string(), stderr: stderr.to_string(), exit_code, refused: false }
+}
+
+/// SME-452's recurrence: a record read the runtime never ran (exit -1,
+/// as an exec it refused reads since part 1) is a failed read, counted
+/// and named at the timeout, not "still running". A record not written
+/// yet is still running, and a written one is its rc.
+#[test]
+fn test_a_record_read_that_wasnt_run_is_a_failed_read() {
+    let refused = "exec failed: InternalError: OCI runtime exec failed";
+    assert_eq!(rc_of(exec_result(-1, "", refused)), Err(refused.to_string()));
+    assert_eq!(rc_of(exec_result(-1, "", "")), Err("the exec ended without a status".to_string()));
+    let missing = "cat: /tmp/install.rc: No such file or directory\n";
+    assert_eq!(rc_of(exec_result(1, "", missing)), Ok(None));
+    assert_eq!(rc_of(exec_result(0, "0\n", "")), Ok(Some("0".to_string())));
+    assert_eq!(rc_of(exec_result(0, "", "")), Ok(None), "a record being written");
+}
+
+/// SME-452's recurrence: an install that wrote nothing says so, and a
+/// log that couldn't be read (missing, or the exec refused) is an error
+/// that says why, not an empty log.
+#[test]
+fn test_a_timed_out_install_says_its_log_was_empty_or_missing() {
+    let watch = InstallWatch::new("lsp-7-ra", "a");
+    let error = watch.timed_out(INSTALL_TIMEOUT, Ok(String::new()));
+    assert!(error.ends_with("within 10 minutes. It wrote no output."), "{error}");
+    let error = watch.timed_out(INSTALL_TIMEOUT, Ok(" \n".to_string()));
+    assert!(error.ends_with(". It wrote no output."), "{error}");
+    let missing = "tail: cannot open '/tmp/install.log' for reading: No such file or directory\n";
+    assert_eq!(
+        log_of(exec_result(1, "", missing)),
+        Err("tail exited 1: tail: cannot open '/tmp/install.log' for reading: No such file or directory".to_string())
+    );
+    assert_eq!(log_of(exec_result(-1, "", "exec failed: InternalError: …")), Err("tail exited -1: exec failed: InternalError: …".to_string()));
+    assert_eq!(log_of(exec_result(0, "added 1 package\n", "")), Ok("added 1 package\n".to_string()));
+}
+
+/// SME-452's recurrence (B′): a timed-out install says how many reads of
+/// its record there were and how slow the slowest was, so one read that
+/// hung for minutes shows as a few reads and a slow one, not silence.
+#[test]
+fn test_a_timed_out_install_counts_its_reads_and_the_slowest() {
+    let mut watch = InstallWatch::new("lsp-7-ra", "a");
+    let error = watch.timed_out(INSTALL_TIMEOUT, Ok(String::new()));
+    assert!(!error.contains("record reads"), "no reads, nothing to say: {error}");
+    for millis in [1_000, 2_000, 250] {
+        watch.rc_read_took(std::time::Duration::from_millis(millis));
+    }
+    let error = watch.timed_out(INSTALL_TIMEOUT, Ok(String::new()));
+    assert!(error.contains("; 3 record reads, the slowest 2 s. It wrote no output."), "{error}");
+    watch.rc_read_took(std::time::Duration::from_millis(2_345));
+    let error = watch.timed_out(INSTALL_TIMEOUT, Ok(String::new()));
+    assert!(error.contains("; 4 record reads, the slowest 2.345 s."), "{error}");
+}
+
 /// A server pod with `status`, a status captured live.
 fn captured_server_pod(status: &str) -> Pod {
     Pod {
@@ -373,3 +438,10 @@ pub(crate) mod cluster;
 /// Real-cluster tests of installs that stall (SME-452), against a
 /// registry inside the server pod itself: no internet.
 mod stall;
+
+/// Real-cluster tests of an install that says nothing (SME-452's
+/// recurrence): an exec the runtime refused, and an npm still running.
+mod silent;
+
+/// The install wait's loop over fake reads (SME-452 round 1).
+mod install;

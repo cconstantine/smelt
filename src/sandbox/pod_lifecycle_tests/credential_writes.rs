@@ -238,6 +238,35 @@ async fn test_a_write_whose_stream_broke_cant_undo_a_delete(pool: PgPool) {
     .await;
 }
 
+/// SME-452 round 1, finding 3: a write the runtime refused (it never
+/// ran) fails at once. A refusal reads -1, like a status that never
+/// came, and was held to its attempt's deadline (`EXEC_STALL_AFTER`) and
+/// `CLOCK_SKEW_MARGIN` before the install answered.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_refused_write_fails_without_waiting_out_its_deadline(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        persona_agent(&pool, conversation.id).await;
+        let pod = create_pod(&pool, conversation.id, PodLimitOverrides::default()).await.expect("create_pod");
+        let name = pod_name(pod);
+
+        sqlx::query("INSERT INTO named_secrets (name, value) VALUES ('linear-key', 'SECRET-MARKER')")
+            .execute(&pool)
+            .await
+            .expect("a secret");
+        stall_hook::arm(&name, &["/etc/smelt/secrets/linear-key"], 1, Stall::Refused);
+        let started = std::time::Instant::now();
+        let saved = crate::credentials::install_into_pod(&pool, pod).await;
+        let took = started.elapsed();
+        assert_eq!(stall_hook::remaining(&name), 0, "the secret's write was never refused");
+        let error = saved.expect_err("a refused write saved").to_string();
+        assert!(error.contains("nonexistent-452"), "the refusal's reason: {error}");
+        assert!(took < crate::credentials::EXEC_STALL_AFTER, "a refused write was held for {took:?}");
+    })
+    .await;
+}
+
 /// SME-440 review R2-M2: an attempt that starts before its deadline but
 /// whose effect would land after it is killed, and the effect never
 /// lands. Here the attempt starts 3 s before its deadline, as a late start

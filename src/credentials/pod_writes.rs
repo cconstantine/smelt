@@ -217,12 +217,14 @@ impl Attempts {
             let bounded: Vec<&str> = bounded.iter().map(String::as_str).collect();
             match tokio::time::timeout(limit, shell.run(&bounded, stdin)).await {
                 Ok(ran) => {
-                    // Only an exit status says the command is done. A broken
-                    // stream (`Err`) or a status that never came (-1) can
-                    // leave it running in the pod until its deadline, so the
-                    // install is held for it like an unanswered one (SME-440
-                    // review R2-M1).
-                    if !matches!(&ran, Ok(r) if r.exit_code >= 0) {
+                    // Only an exit status says the command is done, and a
+                    // refusal that it isn't running (SME-452 rounds 1 and
+                    // 2: refused or abandoned by the runtime). A broken
+                    // stream (`Err`) or a status that never came (-1, not
+                    // refused) can leave it running in the pod until its
+                    // deadline, so the install is held for it like an
+                    // unanswered one (SME-440 review R2-M1).
+                    if !matches!(&ran, Ok(r) if r.exit_code >= 0 || r.refused) {
                         self.hold_until(deadline);
                     }
                     return ran;
