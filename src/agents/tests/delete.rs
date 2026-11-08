@@ -184,6 +184,99 @@ async fn test_the_parents_delete_holding_its_rows_then_a_finish(pool: PgPool) {
     assert!(!refused.contains("deadlock"), "{refused}");
 }
 
+/// A child `X` of a fresh root with one notice `M` queued from it to the
+/// root: what the root's drain delivers while the user deletes `X`.
+async fn child_with_a_queued_notice(pool: &PgPool) -> (i64, i64, db::AgentMessage) {
+    setup(pool, vec![text_reply("ok")]).await;
+    let root = db::create_conversation(pool).await.expect("create conversation").id;
+    let child = active_child(pool, root).await;
+    db::queue_notice(pool, root, child, &format!("agent #{child}"), "ended without a report").await.expect("queue M");
+    let row = db::undelivered_agent_messages(pool, root).await.expect("rows").remove(0);
+    (root, child, row)
+}
+
+fn deliver(pool: &PgPool, row: &db::AgentMessage) -> tokio::task::JoinHandle<Result<Option<crate::models::Message>, sqlx::Error>> {
+    let (pool, row) = (pool.clone(), row.clone());
+    tokio::spawn(async move {
+        let text = vec![ContentBlock::Text { text: "Notice: ended without a report".to_string() }];
+        db::deliver_agent_message(&pool, &row, &text).await
+    })
+}
+
+/// Both sides of the drain/delete race ended well (SME-293): the delete
+/// and the delivery both succeeded, with no deadlock either side.
+async fn assert_both_landed(
+    pool: &PgPool,
+    (root, child, row): (i64, i64, &db::AgentMessage),
+    delete: tokio::task::JoinHandle<Result<(), String>>,
+    drain: tokio::task::JoinHandle<Result<Option<crate::models::Message>, sqlx::Error>>,
+) {
+    let deleted = tokio::time::timeout(Duration::from_secs(10), delete).await.expect("the delete ends").expect("joined");
+    let drained = tokio::time::timeout(Duration::from_secs(10), drain).await.expect("the drain ends").expect("joined");
+    let drained = drained.map_err(|e| e.to_string());
+    assert!(deleted.is_ok(), "the delete: {deleted:?}");
+    assert!(matches!(drained, Ok(Some(_))), "the drain delivers M: {drained:?}");
+    assert!(!exists(pool, child).await, "the child is gone");
+    let (delivered, from) = sqlx::query_as::<_, (bool, Option<i64>)>(
+        "SELECT delivered_at IS NOT NULL AND delivered_message_id IS NOT NULL, from_conversation_id FROM agent_messages WHERE id = $1",
+    )
+    .bind(row.id)
+    .fetch_one(pool)
+    .await
+    .expect("M's row");
+    assert!(delivered, "M is delivered and linked");
+    assert_eq!(from, None, "M's sender is cleared by the delete's cascade");
+    assert!(queued_to(pool, root).await.contains(&format!("the user deleted agent #{child}")), "the delete's notice is queued");
+    eventually("the parent's turns are over", || async { !crate::turn::turn_running(root) }).await;
+}
+
+/// SME-293, the drain first: the root's drain holds M (marked delivered)
+/// when the child's delete comes. The delete waits for the drain, which
+/// then completes, with no deadlock.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_drain_holding_its_row_then_the_childs_delete(pool: PgPool) {
+    let _race = crate::git::test_support::ONE_AT_A_TIME.lock().await;
+    let (root, child, row) = child_with_a_queued_notice(&pool).await;
+    let (delete_reached, delete_release) = test_hooks::pause(test_hooks::DELETE_MARKED, child);
+    let delete = tokio::spawn({
+        let pool = pool.clone();
+        async move { delete_subtree(&pool, child).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), delete_reached).await.expect("the delete runs").expect("paused");
+    let (drain_reached, drain_release) = test_hooks::pause(test_hooks::DELIVER_MARKED, root);
+    let drain = deliver(&pool, &row);
+    tokio::time::timeout(Duration::from_secs(10), drain_reached).await.expect("the drain runs").expect("paused");
+    delete_release.send(()).expect("release the delete");
+    assert!(
+        crate::git::test_support::waiters_or_finished(&pool, 1, &delete).await,
+        "the delete waits for the drain's rows"
+    );
+    drain_release.send(()).expect("release the drain");
+    assert_both_landed(&pool, (root, child, &row), delete, drain).await;
+}
+
+/// SME-293, the delete first: the child's delete holds its rows when the
+/// root's drain comes. The drain waits for the delete, then delivers M
+/// from a sender that's now gone, with no deadlock.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_childs_delete_holding_its_rows_then_a_drain(pool: PgPool) {
+    let _race = crate::git::test_support::ONE_AT_A_TIME.lock().await;
+    let (root, child, row) = child_with_a_queued_notice(&pool).await;
+    let (reached, release) = test_hooks::pause(test_hooks::DELETE_LOCKED, child);
+    let delete = tokio::spawn({
+        let pool = pool.clone();
+        async move { delete_subtree(&pool, child).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), reached).await.expect("the delete runs").expect("paused");
+    let drain = deliver(&pool, &row);
+    assert!(
+        crate::git::test_support::waiters_or_finished(&pool, 1, &drain).await,
+        "the drain waits for the delete's rows"
+    );
+    release.send(()).expect("release the delete");
+    assert_both_landed(&pool, (root, child, &row), delete, drain).await;
+}
+
 /// Review 1, finding 2: two deletes of one child that both got past their
 /// mark (two tabs, a double confirm): the second finds it gone and succeeds
 /// without a notice, rather than failing on the notice's foreign key.

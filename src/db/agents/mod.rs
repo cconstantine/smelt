@@ -172,6 +172,14 @@ pub async fn lock_conversations(
     Ok(all)
 }
 
+/// Whether conversation `id` still exists, read in `conn`'s transaction.
+async fn conversation_exists_on(conn: &mut sqlx::PgConnection, id: i64) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM conversations WHERE id = $1)")
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await
+}
+
 /// The conversation's parent, `None` for the user's own conversations
 /// and for one that doesn't exist.
 pub async fn conversation_parent(pool: &PgPool, id: i64) -> Result<Option<i64>, sqlx::Error> {
@@ -703,9 +711,20 @@ async fn deliver_agent_message_owed(
     owed: bool,
 ) -> Result<Option<Message>, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    if !lock_conversations(&mut tx, &[(row.to_conversation_id, RowLock::NoKeyUpdate)]).await? {
-        return Ok(None);
+    // The sender too, `KEY SHARE`, before the row (SME-293): the second
+    // UPDATE below re-checks every FK on a row this transaction already
+    // wrote, `from_conversation_id` included, and that lock taken after
+    // the row's would cross a delete of the sender (whose cascade sets
+    // `from` NULL on this row) into a deadlock.
+    let mut locks = vec![(row.to_conversation_id, RowLock::NoKeyUpdate)];
+    if let Some(from) = row.from_conversation_id.filter(|from| *from != row.to_conversation_id) {
+        locks.push((from, RowLock::KeyShare));
     }
+    if !lock_conversations(&mut tx, &locks).await? && !conversation_exists_on(&mut tx, row.to_conversation_id).await? {
+        return Ok(None); // the recipient is gone
+    }
+    // A sender gone here was deleted while we waited: its cascade set
+    // `from` NULL, and the row still arrives under its kept `from_label`.
     let marked = sqlx::query("UPDATE agent_messages SET delivered_at = now() WHERE id = $1 AND delivered_at IS NULL")
         .bind(row.id)
         .execute(&mut *tx)
@@ -714,6 +733,8 @@ async fn deliver_agent_message_owed(
     if marked == 0 {
         return Ok(None);
     }
+    #[cfg(test)]
+    crate::agents::test_hooks::reach(crate::agents::test_hooks::DELIVER_MARKED, row.to_conversation_id).await;
     let saved = if owed {
         super::owed::create_owed_message_on(&mut tx, row.to_conversation_id, content).await?
     } else {

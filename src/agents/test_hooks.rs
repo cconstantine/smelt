@@ -91,6 +91,10 @@ pub const DELETE_MARKED: &str = "delete_marked";
 /// writes.
 pub const DELETE_LOCKED: &str = "delete_locked";
 
+/// The drain of a row to conversation `id`, after it marked the row
+/// delivered and before it saves the message (SME-293).
+pub const DELIVER_MARKED: &str = "deliver_marked";
+
 /// `turn::store_pause` for conversation `id`, after it read the pause from
 /// memory and before it writes it.
 pub const STORE_PAUSE_READ: &str = "store_pause_read";
