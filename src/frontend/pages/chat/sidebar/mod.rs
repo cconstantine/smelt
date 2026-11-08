@@ -41,6 +41,7 @@ pub(super) fn ConversationSidebar(
     pods_changed: Signal<u64>,
     turns_changed: Signal<u64>,
     questions_changed: Signal<u64>,
+    commands_changed: Signal<u64>,
 ) -> Element {
     let navigator = use_navigator();
     // Which conversations have a live pod, for the dot next to their title.
@@ -54,7 +55,10 @@ pub(super) fn ConversationSidebar(
     // Which conversations have running terminal commands on a live pod,
     // and how many — the amber marker beside the pod dot (SME-441). A
     // failed fetch means no markers and no error line, as for the dot.
-    let live_commands = use_resource(|| crate::api::pods::get_running_command_conversations());
+    let live_commands = use_resource(move || {
+        let _ = commands_changed();
+        crate::api::pods::get_running_command_conversations()
+    });
     let running_commands_for = move |id: i64| -> i64 {
         match &*live_commands.read() {
             Some(Ok(rows)) => rows
@@ -196,6 +200,7 @@ pub(super) fn ConversationSidebar(
         pods_changed,
         turns_changed,
         questions_changed,
+        commands_changed,
         app_live,
     );
 

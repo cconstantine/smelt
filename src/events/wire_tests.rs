@@ -22,6 +22,7 @@ fn test_app_events_round_trip_through_json() {
         AppEvent::ProvidersChanged,
         AppEvent::QuestionsChanged,
         AppEvent::ConversationsChanged,
+        AppEvent::CommandsChanged,
         AppEvent::NeedsUser { conversation_id: 7, attention: Attention::Failed, generation: 12 },
     ] {
         let json = serde_json::to_string(&event).expect("serialize");
@@ -44,6 +45,25 @@ fn test_a_list_change_event_round_trips_through_json() {
     );
     assert_eq!(
         serde_json::from_str::<ConversationEvent>(r#"{"type":"ConversationsChanged"}"#)
+            .expect("conversation event"),
+        conversation
+    );
+}
+
+/// SME-441, same shape as `ConversationsChanged`: the command marker's
+/// event rides both sidebar connections as a tagged object.
+#[test]
+fn test_a_commands_change_event_round_trips_through_json() {
+    let app = AppEvent::CommandsChanged;
+    assert_eq!(serde_json::to_string(&app).expect("serialize"), r#"{"type":"CommandsChanged"}"#);
+    assert_eq!(serde_json::from_str::<AppEvent>(r#"{"type":"CommandsChanged"}"#).expect("app event"), app);
+    let conversation = ConversationEvent::CommandsChanged {};
+    assert_eq!(
+        serde_json::to_string(&conversation).expect("serialize"),
+        r#"{"type":"CommandsChanged"}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<ConversationEvent>(r#"{"type":"CommandsChanged"}"#)
             .expect("conversation event"),
         conversation
     );
@@ -129,6 +149,7 @@ fn one_of_each() -> Vec<ConversationEvent> {
             generation: 3,
         },
         ConversationEvent::ConversationsChanged {},
+        ConversationEvent::CommandsChanged {},
         ConversationEvent::QuestionUpdate { question: None },
         ConversationEvent::QuestionUpdate {
             question: Some(crate::questions::PendingQuestion {
