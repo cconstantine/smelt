@@ -170,13 +170,25 @@ pub(crate) async fn exec_with(
         && let Some(status) = status
     {
         refused = true;
-        stderr.push_str(&format!(
-            "exec failed: {}: {}",
-            status.reason.unwrap_or_default(),
-            status.message.unwrap_or_default()
-        ));
+        append_refusal(&mut stderr, &status);
     }
     Ok(ExecResult { stdout, stderr, exit_code, refused })
+}
+
+/// `stderr` with why the runtime refused the command (`status`) after it,
+/// on a line of its own (SME-452 round 1).
+pub(super) fn append_refusal(
+    stderr: &mut String,
+    status: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Status,
+) {
+    if !stderr.is_empty() && !stderr.ends_with('\n') {
+        stderr.push('\n');
+    }
+    stderr.push_str(&format!(
+        "exec failed: {}: {}",
+        status.reason.as_deref().unwrap_or_default(),
+        status.message.as_deref().unwrap_or_default()
+    ));
 }
 
 /// On success the exec protocol's terminal `Status` is `Success`, with no

@@ -100,8 +100,9 @@ npm install --prefix /tmp/home/lsp trickle@1.0.0 --registry=http://127.0.0.1:808
 /// says how far npm got, its `npm http fetch` lines written mid-install
 /// (round 1: Q1's `loglevel=http` shown working), and names what was
 /// still running then (npm sets its process title to `npm install …`).
-/// An empty log's `It wrote no output.` is the unit tests'. A 90 s bound
-/// stands in for the 10 minutes, through the real wait.
+/// An empty log's `It wrote no output.` is the unit tests'. A 60 s bound
+/// (90 s until round 1) stands in for the 10 minutes, through the real
+/// wait.
 #[tokio::test]
 async fn test_a_silent_npm_install_that_runs_out_its_bound_names_what_was_running() {
     with_sandbox(|client, sandbox| async move {
@@ -123,7 +124,7 @@ async fn test_a_silent_npm_install_that_runs_out_its_bound_names_what_was_runnin
             .expect("create the server pod");
         let running = wait_running(&pods, &name).await;
         let installed = match &running {
-            Ok(uid) => Some(wait_installed_within(&client, &pods, &name, uid, std::time::Duration::from_secs(90)).await),
+            Ok(uid) => Some(wait_installed_within(&client, &pods, &name, uid, std::time::Duration::from_secs(60)).await),
             Err(_) => None,
         };
         let _ = pods.delete(&name, &crate::sandbox::pod_delete_params()).await;
