@@ -160,9 +160,15 @@ pub(super) const COMPACTION_PLACEHOLDER_PROMPT: &str = "Summarize the conversati
 /// needs (including the gist of whatever large content triggered
 /// compaction in the first place, since the summarization call sees
 /// everything up through it), so this is a plain continuation nudge, not
-/// a replay of anything.
+/// a replay of anything. Since SME-393 the nudge names what the summary
+/// is — a narration to verify, not a record to act on: on 2294639560 a
+/// seat read it as a record, "confirmed" imaginary HEADs against it, and
+/// destroyed its real uncommitted work restoring them.
 #[cfg(feature = "server")]
-pub(super) const COMPACTION_CONTINUATION_PROMPT: &str = "Continue based on the summary above.";
+pub(super) const COMPACTION_CONTINUATION_PROMPT: &str = "Continue based on the summary above. \
+The summary is a narration of the conversation, not a record of state: before acting on any \
+state it claims (commits, pushes, PRs, CI runs, files), verify that state with a tool call — \
+always before any command that would overwrite, discard or reset work.";
 
 /// The three synthetic messages one compaction pass inserts, in this
 /// order — pure construction, no I/O (see `compact_conversation` for what
@@ -224,8 +230,8 @@ pub(super) fn continuation_prompt(typed: &Typed, unanswered: &[String]) -> Strin
         prompt.push_str(
             " For reference, what the user (or your parent) wrote earlier in this conversation, \
              word for word, with their answers to your questions: the corrections and constraints \
-             in them still hold, but the summary says which requests are already done, so don't \
-             redo those.\n\n",
+             in them still hold, but the summary marks the requests it reports done, so don't \
+             redo those without checking them first.\n\n",
         );
         prompt.push_str(&typed.quotes.join(QUOTE_SEPARATOR));
         if typed.omitted > 0 {
