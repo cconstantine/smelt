@@ -26,6 +26,19 @@ async fn another_ended_command(pool: &PgPool, conversation_id: i64, command_id: 
     db::mark_terminal_command_finished(pool, command_id, 0).await.expect("mark it finished");
 }
 
+/// An answered question in `id`, after the model's call that asked it.
+async fn answered_question(pool: &PgPool, id: i64, tool_use_id: &str) {
+    db::create_message(pool, id, "user", &[ContentBlock::Text { text: "Ask me.".to_string() }]).await.expect("save");
+    let call = ContentBlock::ToolUse { id: tool_use_id.to_string(), name: "ask_user".to_string(), input: serde_json::json!({}) };
+    db::create_message(pool, id, "assistant", &[call]).await.expect("save");
+    sqlx::query("INSERT INTO pending_questions (conversation_id, tool_use_id, questions, answer) VALUES ($1, $2, '[]', '[]')")
+        .bind(id)
+        .bind(tool_use_id)
+        .execute(pool)
+        .await
+        .expect("an answered question");
+}
+
 /// D10 (review 1, L2): a `Deliver` whose wake stops at a question still
 /// waiting for the user is shown at once, as before the queue, and owes
 /// nothing: no turn will answer it until the question resolves.
@@ -113,4 +126,36 @@ async fn test_an_end_older_than_a_day_isnt_woken_after_a_restart(pool: PgPool) {
     for id in [old, recent] {
         crate::turn::forget_conversation_lock(id);
     }
+}
+
+/// Review 1, N1: a turn stopped while queued, whose message took an
+/// answered question, ends like any turn: nothing owed.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_turn_stopped_while_queued_owes_nothing(pool: PgPool) {
+    let requests = setup(&pool, vec![text_reply("Noted.")]).await;
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    answered_question(&pool, root, "toolu_n1").await;
+    let text = "N1, a notice as a turn's own message";
+    let turn = crate::turn::conversation_lock(root).lock_owned().await;
+    let (counted, go_on) = crate::turn::test_hooks::pause_after_turn_counted(root);
+    let (stopped, release) = crate::turn::test_hooks::pause_stopped_while_queued(root, text);
+    let message = crate::anthropic::AnthropicMessage { role: "user".to_string(), content: vec![ContentBlock::Text { text: text.to_string() }] };
+    let queued = tokio::spawn({
+        let pool = pool.clone();
+        async move { crate::turn::run_turn(&pool, root, message).await.map(|_| ()).map_err(|e| format!("{e:?}")) }
+    });
+    tokio::time::timeout(Duration::from_secs(10), counted).await.expect("the turn is counted").expect("the hook");
+    go_on.send(()).expect("the turn waits at the hook");
+    // The lock is held, so the stop is the only way on: the queued arm.
+    crate::turn::stop_conversation(&pool, root).await;
+    tokio::time::timeout(Duration::from_secs(10), stopped).await.expect("stopped while queued").expect("the hook");
+    release.send(()).expect("the turn waits at the hook");
+    drop(turn);
+    let ended = tokio::time::timeout(Duration::from_secs(10), queued).await.expect("the turn ends").expect("join");
+    assert!(ended.as_ref().is_err_and(|e| e.contains("Stopped")), "{ended:?}");
+
+    assert_eq!(transcript(&pool, root).await.iter().filter(|(_, said)| said == text).count(), 1, "the message, kept");
+    assert!(!db::answer_owed(&pool, root).await.expect("answer_owed"), "the stopped turn left an answer owed");
+    assert_eq!(requests.lock().expect("the request log").len(), 0, "the model was called");
+    crate::turn::forget_conversation_lock(root);
 }
