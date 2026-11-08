@@ -325,8 +325,8 @@ pub(super) async fn install_rc(client: &kube::Client, name: &str) -> Result<Opti
     rc_of(crate::sandbox::exec_with(client, name, "server", &["cat", INSTALL_RC], None).await.map_err(|e| e.to_string())?)
 }
 
-/// What a `cat` of the install's record says. An exec that never ran
-/// (-1: no status, or the runtime refused it) is a failed read, never
+/// What a `cat` of the install's record says. An exec with no exit
+/// (-1: no status, or the runtime refused or abandoned it) is a failed read, never
 /// "still running" (SME-452): a pod whose execs were all refused once
 /// timed out with nothing to say, even when its install had finished.
 pub(super) fn rc_of(result: crate::sandbox::ExecResult) -> Result<Option<String>, String> {

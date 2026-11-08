@@ -22,12 +22,14 @@ pub struct Sandbox {
 pub struct ExecResult {
     pub stdout: String,
     pub stderr: String,
-    /// -1 when the command never ran or its status never came; `refused`
-    /// tells those two apart.
+    /// -1 when the exec ended without an exit or its status never came;
+    /// `refused` tells those two apart.
     pub exit_code: i32,
-    /// The API server sent a status that wasn't an exit (the runtime
-    /// refused the command, SME-452): it certainly never ran, where a
-    /// status that never came (-1, not refused) leaves it unknown.
+    /// The API server ended the exec with a status that wasn't an exit
+    /// (SME-452): the runtime refused or abandoned it, and the command
+    /// isn't running, where a status that never came (-1, not refused)
+    /// leaves it unknown. It may have run: a runtime can send
+    /// `InternalError` after the process ended (SME-452 round 2).
     pub refused: bool,
 }
 
@@ -163,7 +165,7 @@ pub(crate) async fn exec_with(
     };
 
     let exit_code = extract_exit_code(status.clone());
-    // A command the runtime never ran says why, for callers that show
+    // A command the runtime refused or abandoned says why, for callers that show
     // stderr (SME-452).
     let mut refused = false;
     if exit_code == -1

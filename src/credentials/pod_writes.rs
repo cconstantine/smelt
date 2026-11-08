@@ -218,7 +218,8 @@ impl Attempts {
             match tokio::time::timeout(limit, shell.run(&bounded, stdin)).await {
                 Ok(ran) => {
                     // Only an exit status says the command is done, and a
-                    // refusal that it never ran (SME-452 round 1). A broken
+                    // refusal that it isn't running (SME-452 rounds 1 and
+                    // 2: refused or abandoned by the runtime). A broken
                     // stream (`Err`) or a status that never came (-1, not
                     // refused) can leave it running in the pod until its
                     // deadline, so the install is held for it like an
