@@ -160,9 +160,15 @@ pub(super) const COMPACTION_PLACEHOLDER_PROMPT: &str = "Summarize the conversati
 /// needs (including the gist of whatever large content triggered
 /// compaction in the first place, since the summarization call sees
 /// everything up through it), so this is a plain continuation nudge, not
-/// a replay of anything.
+/// a replay of anything. Since SME-393 the nudge names what the summary
+/// is — a narration to verify, not a record to act on: on 2294639560 a
+/// seat read it as a record, "confirmed" imaginary HEADs against it, and
+/// destroyed its real uncommitted work restoring them.
 #[cfg(feature = "server")]
-pub(super) const COMPACTION_CONTINUATION_PROMPT: &str = "Continue based on the summary above.";
+pub(super) const COMPACTION_CONTINUATION_PROMPT: &str = "Continue based on the summary above. \
+The summary is a narration of the conversation, not a record of state: before acting on any \
+state it claims (commits, pushes, PRs, CI runs, files), verify that state with a tool call — \
+always before any command that would overwrite, discard or reset work.";
 
 /// The three synthetic messages one compaction pass inserts, in this
 /// order — pure construction, no I/O (see `compact_conversation` for what
@@ -224,8 +230,8 @@ pub(super) fn continuation_prompt(typed: &Typed, unanswered: &[String]) -> Strin
         prompt.push_str(
             " For reference, what the user (or your parent) wrote earlier in this conversation, \
              word for word, with their answers to your questions: the corrections and constraints \
-             in them still hold, but the summary says which requests are already done, so don't \
-             redo those.\n\n",
+             in them still hold, but the summary marks the requests it reports done, so don't \
+             redo those without checking them first.\n\n",
         );
         prompt.push_str(&typed.quotes.join(QUOTE_SEPARATOR));
         if typed.omitted > 0 {
@@ -505,16 +511,29 @@ pub(super) fn cap_unanswered(texts: Vec<String>, budget: usize) -> Vec<String> {
 /// Explicitly demands every live id be preserved verbatim rather than
 /// trusting the model to notice one buried in a long transcript
 /// unprompted — see `describe_live_state` below, which hands them over
-/// directly rather than leaving them to be spotted.
+/// directly rather than leaving them to be spotted. And since SME-393 it
+/// binds the summary to evidence: Done only where a tool result completes
+/// the action, everything else Planned — a seat destroyed its real
+/// uncommitted work acting on commits a later model turn had narrated but
+/// no tool ever made.
 #[cfg(feature = "server")]
 pub(super) const COMPACTION_SYSTEM_PROMPT: &str = "You are compacting an AI coding agent's \
 conversation history to free up context window space. Write a concise summary \
 of the conversation so far: the user's original goal, key decisions made, the \
-current state of any files or code changed, and any unresolved next steps. You \
-MUST explicitly mention, by its exact id, every sandbox pod and terminal \
-listed below as currently live — never omit or paraphrase an \
+current state of any files or code changed, and any unresolved next steps. \
+Separate what tool results show from everything else: put under Done only \
+actions a tool result in the transcript completes — a commit SHA, a pushed \
+branch, a PR number, a test run — each naming the tool result that evidences \
+it; everything started, intended or mid-way goes under Planned, including \
+work whose file edits are visible but whose completing tool result is not \
+shown. An action is never done because earlier text — including the \
+assistant's own — said it happened: words are not evidence, tool results \
+are. After an [earlier conversation omitted] cut, say the state there is \
+unknown. You MUST explicitly mention, by its exact id, every sandbox pod and \
+terminal listed below as currently live — never omit or paraphrase an \
 id, since later tool calls still need a working reference to it. Write the \
-summary as plain prose.";
+summary as prose, or with its parts labelled Done and Planned where that \
+keeps the record straight.";
 
 /// A plain-text listing of every currently-live pod/terminal for
 /// `conversation_id`, handed to the summarization call so it can be told
@@ -562,6 +581,20 @@ pub(super) async fn describe_live_state(pool: &PgPool, conversation_id: i64) -> 
 /// The most a summary may write.
 #[cfg(feature = "server")]
 pub(super) const SUMMARY_MAX_TOKENS: u32 = 2048;
+
+/// What an HTTP kind's cut-off summary gets appended with on save
+/// (SME-393), whichever stop cut it — `SUMMARY_MAX_TOKENS` or the
+/// context window (`is_cut_off`) — so the marker's wording names the
+/// truncation, not a cause. The save itself is PR #291's decision —
+/// failing every summary that reaches the cap would fail every send of
+/// a long conversation — but a narration that stops mid-sentence must
+/// not read as a complete record: 2294639622's seat completed the
+/// cut-off sentence with fabrications 16 s after the cut.
+#[cfg(feature = "server")]
+pub(super) const SUMMARY_CUT_OFF_MARKER: &str = "\n\n[note: this summary is cut off mid-sentence — \
+    what came after the cut was never written. The state it was reaching for is \
+    unknown, not settled: verify it with a tool call before acting on it, and always before \
+    overwriting, discarding or resetting work.]";
 
 /// Runs one compaction pass: summarizes everything currently persisted (up
 /// through and including whatever's pending — the size trigger fired
@@ -753,5 +786,16 @@ async fn summarize(
         .unwrap_or_default();
     // On Claude Code, an empty or cut-off summary fails the compaction
     // rather than replace the history (PR #291 review 1 M1).
-    crate::claude_cli::summary::checked(turn_model.kind, summary, &turn.stop_reason)
+    let summary = crate::claude_cli::summary::checked(turn_model.kind, summary, &turn.stop_reason)?;
+    // An HTTP kind's cut-off summary saves — PR #291's decision, kept —
+    // but since SME-393 it saves *marked*: on 2294639622 an unmarked
+    // mid-sentence save read as complete, and 16 s later the seat had
+    // "assigned" a PR and a CI run that were never made, finishing the
+    // truncated sentence as fact.
+    if turn_model.kind != crate::providers::ProviderKind::ClaudeCli
+        && anthropic::stream::is_cut_off(&turn.stop_reason)
+    {
+        return Ok(format!("{summary}{}", SUMMARY_CUT_OFF_MARKER));
+    }
+    Ok(summary)
 }

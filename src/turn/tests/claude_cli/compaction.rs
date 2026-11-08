@@ -209,8 +209,10 @@ async fn test_the_clis_reported_window_is_learned(pool: PgPool) {
 
 /// The summary check is the Claude Code kind's only (the user's Q1, PR
 /// #291): on an HTTP kind a summary cut off at `SUMMARY_MAX_TOKENS` is
-/// saved as it always was, since hosted models' summaries do reach that
-/// cap and failing them would fail every send of a long conversation.
+/// still saved, since hosted models' summaries do reach that cap and
+/// failing them would fail every send of a long conversation — and since
+/// SME-393 the save carries a marker where it stopped (the marker itself
+/// is tested in `turn::tests::compaction_honesty`).
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_http_kinds_cut_off_summary_is_saved(pool: PgPool) {
     use super::super::overflow::{compaction_summaries, start_refusal_mock, too_long};
@@ -226,7 +228,10 @@ async fn test_an_http_kinds_cut_off_summary_is_saved(pool: PgPool) {
     run_turn(&pool, conversation.id, hello()).await.expect("the cut-off summary is saved and the turn carries on");
 
     assert_eq!(upstream.count(), 3, "refusal, summary, retry");
-    assert_eq!(compaction_summaries(&pool, conversation.id).await, ["Summary: it was"]);
+    let saved = compaction_summaries(&pool, conversation.id).await;
+    assert_eq!(saved.len(), 1, "still saved — the decision this test was written for");
+    assert!(saved[0].starts_with("Summary: it was"), "the text that made it saves as it is: {saved:?}");
+    assert!(saved[0].contains("cut off"), "…and says where it stopped (SME-393): {saved:?}");
 }
 
 /// A summary stopped by the window (`model_context_window_exceeded`, the
