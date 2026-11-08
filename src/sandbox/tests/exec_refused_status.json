@@ -1,0 +1,16 @@
+{
+  "apiVersion": "v1",
+  "kind": "Status",
+  "code": 500,
+  "details": {
+    "causes": [
+      {
+        "message": "Internal error occurred: error executing command in container: failed to exec in container: failed to start exec \"de45c62176855b9693ca73c1db685529d8afb6dc6cf4d98040a3960f1a6cedde\": OCI runtime exec failed: exec failed: unable to start container process: exec: \"/nonexistent-452\": stat /nonexistent-452: no such file or directory"
+      }
+    ]
+  },
+  "message": "Internal error occurred: Internal error occurred: error executing command in container: failed to exec in container: failed to start exec \"de45c62176855b9693ca73c1db685529d8afb6dc6cf4d98040a3960f1a6cedde\": OCI runtime exec failed: exec failed: unable to start container process: exec: \"/nonexistent-452\": stat /nonexistent-452: no such file or directory",
+  "metadata": {},
+  "reason": "InternalError",
+  "status": "Failure"
+}

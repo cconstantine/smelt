@@ -5,6 +5,8 @@
 //! an abandoned exec that acts after its caller has moved on.
 //! `ErrorAfterStart`: the command is running in the pod, acting after a
 //! delay, while `run` answers at once with a broken stream (`Err(Io)`).
+//! `Refused` (SME-452 round 1): the command never runs; `run` answers with
+//! a real refusal, an exec of a binary that doesn't exist in the pod.
 
 use super::{exec_with, ExecResult, SandboxError};
 use std::collections::HashMap;
@@ -16,6 +18,7 @@ pub(crate) enum Stall {
     NoReply,
     LateStart(Duration),
     ErrorAfterStart(Duration),
+    Refused,
 }
 
 struct Armed {
@@ -74,6 +77,7 @@ pub(super) async fn stall(
             None
         }
         Stall::LateStart(delay) | Stall::ErrorAfterStart(delay) => Some(delay),
+        Stall::Refused => return exec_with(client, pod_name, "sandbox", &["/nonexistent-452"], None).await,
     };
     if let Some(delay) = delay {
         let (client, pod) = (client.clone(), pod_name.to_string());

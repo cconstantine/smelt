@@ -281,3 +281,30 @@ fn test_exec_with_no_status_is_a_failure_not_a_success() {
     };
     assert_eq!(extract_exit_code(Some(success)), 0);
 }
+
+/// SME-452: an exec the container runtime refused to start ends with a
+/// `Failure` status and no `ExitCode` cause, captured live on k3s's
+/// containerd (`exec_refused_status.json`, an exec of a binary that
+/// doesn't exist). That's a failure, not the exit 0 it once read as.
+#[test]
+fn test_an_exec_the_runtime_refused_is_a_failure_not_a_success() {
+    let refused = serde_json::from_str(include_str!("exec_refused_status.json")).expect("the captured status");
+    assert_eq!(extract_exit_code(Some(refused)), -1);
+}
+
+/// SME-452 round 1, finding 8: a refusal's reason goes on a line of its
+/// own after any stderr the exec had, never run into it.
+#[test]
+fn test_a_refusals_reason_is_its_own_line_of_stderr() {
+    let refused: k8s_openapi::apimachinery::pkg::apis::meta::v1::Status =
+        serde_json::from_str(include_str!("exec_refused_status.json")).expect("the captured status");
+    let appended = |stderr: &str| {
+        let mut stderr = stderr.to_string();
+        append_refusal(&mut stderr, &refused);
+        stderr
+    };
+    let reason = appended("");
+    assert!(reason.starts_with("exec failed: InternalError: "), "{reason}");
+    assert_eq!(appended("half a line"), format!("half a line\n{reason}"));
+    assert_eq!(appended("a line\n"), format!("a line\n{reason}"));
+}

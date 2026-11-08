@@ -1,0 +1,204 @@
+//! The install wait's loop over fake reads (SME-452 round 1): what it
+//! does when one read hangs, or a failed install's log can't be read.
+
+use super::super::*;
+use super::unready_server_pod;
+
+/// One read's answer: given at once, or never.
+#[derive(Clone)]
+enum Answer<T> {
+    Now(Result<T, String>),
+    Never,
+}
+
+impl<T: Clone> Answer<T> {
+    async fn give(&self) -> Result<T, String> {
+        match self {
+            Answer::Now(answer) => answer.clone(),
+            Answer::Never => std::future::pending().await,
+        }
+    }
+}
+
+/// `InstallReads` that answer as told, with the pod always running.
+struct FakeReads {
+    rc: Answer<Option<String>>,
+    log: Answer<String>,
+    processes: Answer<String>,
+}
+
+impl InstallReads for FakeReads {
+    async fn pod(&self) -> Result<Option<Pod>, String> {
+        Ok(Some(unready_server_pod("a", "Running", None, false)))
+    }
+    async fn rc(&self) -> Result<Option<String>, String> {
+        self.rc.give().await
+    }
+    async fn log(&self) -> Result<String, String> {
+        self.log.give().await
+    }
+    async fn processes(&self) -> Result<String, String> {
+        self.processes.give().await
+    }
+}
+
+/// `PROCESS_LISTING` run here, by this machine's `sh`, with `rc` and
+/// `log` as the record and log paths and `proc` as its `/proc`.
+fn listing_in(rc: &str, log: &str, proc: &str) -> String {
+    let ran = std::process::Command::new("sh")
+        .args(["-c", PROCESS_LISTING, "sh", rc, log, proc])
+        .output()
+        .expect("run the listing");
+    assert!(ran.status.success(), "the listing failed: {}", String::from_utf8_lossy(&ran.stderr));
+    String::from_utf8_lossy(&ran.stdout).into_owned()
+}
+
+/// `listing_in` over this machine's own `/proc`.
+fn listing(rc: &str, log: &str) -> String {
+    listing_in(rc, log, "/proc")
+}
+
+/// A scratch `/proc` of `processes` (pid, command line's words), each
+/// sleeping (SME-452 round 2): the listing over the host's own `/proc`
+/// cut its 2,000 bytes before a test's processes on a busy host.
+fn fake_proc(name: &str, processes: &[(u32, &[&str])]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("sme-452-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (pid, words) in processes {
+        let d = dir.join(pid.to_string());
+        std::fs::create_dir_all(&d).expect("a fake process directory");
+        std::fs::write(d.join("status"), "Name:\tx\nState:\tS (sleeping)\n").expect("write its status");
+        let cmdline: String = words.iter().map(|w| format!("{w}\0")).collect();
+        std::fs::write(d.join("cmdline"), cmdline).expect("write its cmdline");
+    }
+    dir
+}
+
+/// SME-452 round 1, finding 2: a process's second word is printed only
+/// when it's a plain word. Measured: `curl http://user:SECRET@…` was
+/// listed whole, credential and all, into a tool result and the logs.
+/// Round 2, finding 1: over a fake `/proc` holding just these, since the
+/// host's own could cut them off.
+#[test]
+fn test_the_process_listing_never_prints_a_second_word_that_isnt_plain() {
+    let proc = fake_proc(
+        "listing-words",
+        &[
+            (41, &["yes", "http://user:SECRET-452@10.255.255.1/"]),
+            (42, &["npm", "install"]),
+            (43, &["curl", "-fsSL", "https://example.com/"]),
+            // Round 2, finding 2: a bare token, which the old character
+            // set let through whole.
+            (44, &["some-cli", "ghp_SECRETtoken0123456789"]),
+            // Longer than a subcommand's 16 letters.
+            (45, &["some-cli", "abcdefghijklmnopq"]),
+        ],
+    );
+    let listed = listing_in("/nonexistent/install.rc", "/nonexistent/install.log", proc.to_str().expect("a path"));
+    let _ = std::fs::remove_dir_all(&proc);
+    assert!(!listed.contains("SECRET"), "the listing printed a credential: {listed}");
+    assert!(listed.lines().any(|line| line == "44 [S (sleeping)] some-cli …"), "{listed}");
+    assert!(listed.lines().any(|line| line == "45 [S (sleeping)] some-cli …"), "{listed}");
+    assert!(listed.lines().any(|line| line == "41 [S (sleeping)] yes …"), "{listed}");
+    assert!(listed.lines().any(|line| line == "42 [S (sleeping)] npm install"), "a plain word is kept: {listed}");
+    assert!(listed.lines().any(|line| line == "43 [S (sleeping)] curl -fsSL"), "a flag is kept: {listed}");
+}
+
+/// SME-452 round 1, finding 5: the listing reads the record and log at
+/// the paths it's given (`INSTALL_RC`, `INSTALL_LOG`), not paths of its
+/// own, and a missing log reads "missing", not "missing bytes".
+#[test]
+fn test_the_process_listing_reads_the_record_and_log_it_is_given() {
+    let dir = std::env::temp_dir().join(format!("sme-452-listing-paths-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    let (rc, log) = (dir.join("my.rc"), dir.join("my.log"));
+    let (rc, log) = (rc.to_str().expect("a path"), log.to_str().expect("a path"));
+    let listed = listing(rc, log);
+    assert!(listed.starts_with("my.rc: not written\nmy.log: missing\n"), "{listed}");
+    std::fs::write(rc, "0\n").expect("write the record");
+    std::fs::write(log, "added").expect("write the log");
+    let listed = listing(rc, log);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(listed.starts_with("my.rc: 0\nmy.log: 5 bytes\n"), "{listed}");
+}
+
+/// SME-452 round 1, (B′): a record read that never answers is given up
+/// on after `RC_READ_TIMEOUT` and counted as a failed read, so the wait
+/// still ends at its bound and says so. It once hung the wait, and
+/// `start_language_server`, for good, with nothing said.
+#[tokio::test(start_paused = true)]
+async fn test_a_record_read_that_never_answers_still_ends_the_wait() {
+    let reads = FakeReads {
+        rc: Answer::Never,
+        log: Answer::Now(Ok(String::new())),
+        processes: Answer::Now(Ok("8 [S (sleeping)] npm install\n".to_string())),
+    };
+    let bound = std::time::Duration::from_secs(5);
+    let limit = bound + RC_READ_TIMEOUT + LOG_READ_TIMEOUT + std::time::Duration::from_secs(5);
+    let waited = tokio::time::timeout(limit, wait_install(&reads, "lsp-7-ra", "a", bound)).await;
+    let error = waited.expect("a record read that never answered held the wait past its bound").expect_err("installed");
+    assert!(
+        error.starts_with(
+            "The install didn't finish within 5 s; its record couldn't be read 1 time (last: the read didn't answer \
+             within 30 s); 1 record reads, the slowest 30 s. It wrote no output."
+        ),
+        "{error}"
+    );
+}
+
+/// SME-452 round 2, nit 4: one failed read of the record is "1 time",
+/// and more are "N times". It once said "1 times".
+#[test]
+fn test_a_timed_out_install_counts_its_failed_record_reads_in_words() {
+    let mut watch = InstallWatch::new("lsp-7-ra", "a");
+    watch.rc_read_failed("refused".to_string());
+    let error = watch.timed_out(INSTALL_TIMEOUT, Ok(String::new()));
+    assert!(error.contains("; its record couldn't be read 1 time (last: refused)"), "{error}");
+    watch.rc_read_failed("refused again".to_string());
+    let error = watch.timed_out(INSTALL_TIMEOUT, Ok(String::new()));
+    assert!(error.contains("; its record couldn't be read 2 times (last: refused again)"), "{error}");
+}
+
+/// SME-452 round 1, finding 6: a timed-out install names what was still
+/// running when the listing came through, and says why when it didn't.
+#[test]
+fn test_a_timed_out_install_names_its_processes_or_why_it_couldnt() {
+    let mut watch = InstallWatch::new("lsp-7-ra", "a");
+    watch.saw_processes(Ok("install.rc: not written\n8 [S (sleeping)] npm install\n".to_string()));
+    let error = watch.timed_out(INSTALL_TIMEOUT, Ok(String::new()));
+    assert!(
+        error.ends_with(". It wrote no output.\nStill running then:\ninstall.rc: not written\n8 [S (sleeping)] npm install"),
+        "{error}"
+    );
+    watch.saw_processes(Err("the read didn't answer within 10 s".to_string()));
+    let error = watch.timed_out(INSTALL_TIMEOUT, Ok(String::new()));
+    assert!(
+        error.ends_with(". It wrote no output.\n(its processes couldn't be read: the read didn't answer within 10 s)"),
+        "{error}"
+    );
+}
+
+/// What a failed install (exit 1) says, given its log read's answer.
+async fn failed_with(log: Answer<String>) -> String {
+    let reads = FakeReads { rc: Answer::Now(Ok(Some("1".to_string()))), log, processes: Answer::Never };
+    let limit = LOG_READ_TIMEOUT + std::time::Duration::from_secs(5);
+    let waited = tokio::time::timeout(limit, wait_install(&reads, "lsp-7-ra", "a", INSTALL_TIMEOUT)).await;
+    waited.expect("a failed install's log read held the call past its bound").expect_err("installed")
+}
+
+/// SME-452 round 1, finding 4: a failed install says why its log
+/// couldn't be read, or that it wrote nothing, as a timed-out one does,
+/// and its log read is bounded too. It once dropped `log_of`'s error and
+/// ended a bare `The install failed (exit 1):`.
+#[tokio::test(start_paused = true)]
+async fn test_a_failed_install_says_what_became_of_its_output() {
+    let error = failed_with(Answer::Now(Err("tail exited 1: no such file".to_string()))).await;
+    assert_eq!(error, "The install failed (exit 1) (its output couldn't be read: tail exited 1: no such file)");
+    let error = failed_with(Answer::Now(Ok(String::new()))).await;
+    assert_eq!(error, "The install failed (exit 1). It wrote no output.");
+    let error = failed_with(Answer::Now(Ok("npm error 404\n".to_string()))).await;
+    assert_eq!(error, "The install failed (exit 1). Its output:\nnpm error 404");
+    let error = failed_with(Answer::Never).await;
+    assert_eq!(error, "The install failed (exit 1) (its output couldn't be read: the read didn't answer within 10 s)");
+}
