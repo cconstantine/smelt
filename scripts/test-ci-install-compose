@@ -23,6 +23,7 @@ trap cleanup EXIT
 
 passes=0
 failures=0
+skips=0
 
 # The fixture compose: what every source serves, and its sha256 the pin.
 fixture=$work/fixture-compose
@@ -309,8 +310,18 @@ case_no_cache_dir() {
     verdict 1
 }
 
+# File modes don't stop root, so a case that relies on them can't be set
+# up as root: it says so and counts as skipped (SME-458 review 1, L5).
+# Returns 0 when the case should stop there.
+skip_as_root() {
+    [ "$(id -u)" -eq 0 ] || return 1
+    echo "ok $case_name (skipped: running as root, which file modes don't stop)"
+    skips=$((skips + 1))
+}
+
 # A cache volume that can't be written to costs the caching, not the step.
 case_cache_readonly() {
+    skip_as_root && return
     start_server ok
     mkdir -p "$CI_CACHE_DIR/tools" && chmod 555 "$CI_CACHE_DIR/tools"
     run_installer 1
@@ -366,5 +377,9 @@ done
 wants=()
 case_pin
 
-echo "$passes passed, $failures failed"
+if [ "$skips" -gt 0 ]; then
+    echo "$passes passed, $failures failed, $skips skipped"
+else
+    echo "$passes passed, $failures failed"
+fi
 [ "$failures" -eq 0 ]
