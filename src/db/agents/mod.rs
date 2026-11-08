@@ -683,7 +683,7 @@ pub async fn deliver_agent_message(
     if marked == 0 {
         return Ok(None);
     }
-    let saved = super::conversations::create_message_on(&mut tx, row.to_conversation_id, "user", content).await?;
+    let saved = super::owed::create_owed_message_on(&mut tx, row.to_conversation_id, content).await?;
     sqlx::query("UPDATE agent_messages SET delivered_message_id = $2 WHERE id = $1")
         .bind(row.id)
         .bind(saved.id)

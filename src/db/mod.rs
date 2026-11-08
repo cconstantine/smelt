@@ -77,8 +77,10 @@ mod secrets;
 mod storage_grace;
 mod script_mcp;
 mod claude_cli;
+mod owed;
 
 pub use agents::*;
+pub use owed::*;
 pub use conversations::*;
 pub use usage::*;
 pub use questions::*;

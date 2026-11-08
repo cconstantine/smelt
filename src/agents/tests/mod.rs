@@ -19,6 +19,7 @@ mod pause;
 mod persona;
 mod reports;
 mod restart;
+mod restart_owed;
 pub(super) mod repo;
 mod rules;
 mod start;

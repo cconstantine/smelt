@@ -108,7 +108,19 @@ pub(super) async fn wake_conversation(
     // under the turn lock still decides; this only skips wakes sure to
     // find nothing.
     match db::wake_has_work(pool, conversation_id).await {
-        Ok(false) => return Ok(Vec::new()),
+        // An answer owed with no turn running is one a restart dropped
+        // (SME-450): this wake answers it. While a turn runs, the mark is
+        // that turn's own, so a wake with nothing else still isn't
+        // counted (SME-218).
+        Ok(false) if turn_running(conversation_id) => return Ok(Vec::new()),
+        Ok(false) => match db::answer_owed(pool, conversation_id).await {
+            Ok(true) => {}
+            Ok(false) => return Ok(Vec::new()),
+            Err(e) => {
+                tracing::warn!(conversation_id, error = %e, "couldn't check a wake for an answer owed");
+                return Ok(Vec::new());
+            }
+        },
         Ok(true) => {}
         // Let in as before, so a notice is never dropped; the drain
         // reports the failure if it persists.

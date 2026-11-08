@@ -187,6 +187,13 @@ pub async fn create_message_taking_question(
         return Ok(None);
     }
     let saved = create_message_on(&mut tx, conversation_id, role, &blocks).await?;
+    // An answer taken for a turn that isn't the user's own send (the
+    // card's answer turn, a wake's take, a parent's reply) is owed the
+    // model's answer (SME-450); the user's own message isn't (D2).
+    // `include_waiting` is set exactly for the user's own send.
+    if !include_waiting && question.as_ref().is_some_and(|q| q.answer.is_some()) {
+        super::owed::mark_answer_owed_on(&mut tx, conversation_id).await?;
+    }
     tx.commit().await?;
     Ok(Some((saved, question)))
 }

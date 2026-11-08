@@ -793,7 +793,7 @@ pub async fn save_command_notice(
         tx.rollback().await?;
         return Ok(None);
     }
-    let saved = create_message_on(&mut tx, conversation_id, "user", content).await?;
+    let saved = create_owed_message_on(&mut tx, conversation_id, content).await?;
     tx.commit().await?;
     Ok(Some(saved))
 }
@@ -930,7 +930,7 @@ pub async fn save_idle_notice(
         tx.rollback().await?;
         return Ok(None);
     }
-    let saved = create_message_on(&mut tx, conversation_id, "user", content).await?;
+    let saved = create_owed_message_on(&mut tx, conversation_id, content).await?;
     tx.commit().await?;
     Ok(Some(saved))
 }

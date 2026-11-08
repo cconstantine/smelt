@@ -127,7 +127,8 @@ pub(super) async fn save_reply(
     // that was nothing but the call it was cut in is one (SME-126).
     let reply = without_blank_text(turn.content.clone());
     if !reply.is_empty() {
-        let saved = db::create_message(pool, conversation_id, "assistant", &reply)
+        // With the reply, nothing before it is owed an answer (SME-450).
+        let saved = db::save_reply_message(pool, conversation_id, &reply)
             .await
             .map_err(ServerFnError::new)?;
         record_saved(conversation_id, persisted, saved);
