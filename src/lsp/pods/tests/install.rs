@@ -87,11 +87,18 @@ fn test_the_process_listing_never_prints_a_second_word_that_isnt_plain() {
             (41, &["yes", "http://user:SECRET-452@10.255.255.1/"]),
             (42, &["npm", "install"]),
             (43, &["curl", "-fsSL", "https://example.com/"]),
+            // Round 2, finding 2: a bare token, which the old character
+            // set let through whole.
+            (44, &["some-cli", "ghp_SECRETtoken0123456789"]),
+            // Longer than a subcommand's 16 letters.
+            (45, &["some-cli", "abcdefghijklmnopq"]),
         ],
     );
     let listed = listing_in("/nonexistent/install.rc", "/nonexistent/install.log", proc.to_str().expect("a path"));
     let _ = std::fs::remove_dir_all(&proc);
-    assert!(!listed.contains("SECRET-452"), "the listing printed a credential: {listed}");
+    assert!(!listed.contains("SECRET"), "the listing printed a credential: {listed}");
+    assert!(listed.lines().any(|line| line == "44 [S (sleeping)] some-cli …"), "{listed}");
+    assert!(listed.lines().any(|line| line == "45 [S (sleeping)] some-cli …"), "{listed}");
     assert!(listed.lines().any(|line| line == "41 [S (sleeping)] yes …"), "{listed}");
     assert!(listed.lines().any(|line| line == "42 [S (sleeping)] npm install"), "a plain word is kept: {listed}");
     assert!(listed.lines().any(|line| line == "43 [S (sleeping)] curl -fsSL"), "a flag is kept: {listed}");

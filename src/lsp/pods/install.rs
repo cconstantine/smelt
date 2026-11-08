@@ -275,8 +275,9 @@ pub(super) async fn wait_install(
 /// pod script (PID 1, whose command line is the install command itself)
 /// and this script's own shell, as `pid [state] <the first two words of
 /// its command line>` (`npm install`, `curl -fsSL`, `go install`), the
-/// second only when it's a plain word, `…` otherwise (SME-452 round 1: a
-/// `curl http://user:SECRET@…` was listed whole). Never `environ`, and no
+/// second only when it's letters and `-`, at most 16 (a subcommand or a
+/// flag), `…` otherwise (SME-452 round 1: a `curl http://user:SECRET@…`
+/// was listed whole; round 2: a bare `ghp_…` token was too). Never `environ`, and no
 /// more than 2,000 bytes. `$3` is the proc root, `/proc` unless a test
 /// passes a fake one (SME-452 round 2: over a busy host's own `/proc`,
 /// the cut hid the test's processes). POSIX `sh` and `/proc` only,
@@ -294,10 +295,11 @@ for d in "$proc"/[0-9]*; do
   # The words split, never globbed (the loop's list is already expanded).
   set -f
   set -- $(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
-  # The second word only when it's a plain word (`install`, `-fsSL`): a
-  # URL, a `K=V` or anything else could carry a credential.
+  # The second word only when it's shaped like a subcommand or a flag
+  # (`install`, `-fsSL`): letters and `-`, at most 16. A URL, a `K=V`, a
+  # path or a bare token could carry a credential.
   w=${2:-}
-  case "$w" in *[!A-Za-z0-9._/@-]*|*//*) w='…';; esac
+  case "$w" in ?????????????????*|*[!A-Za-z-]*) w='…';; esac
   out="$out$p [$s] ${1:-} $w
 "
 done
