@@ -180,7 +180,7 @@ s.bind(("0.0.0.0",8123)); s.listen(128)
 while True: time.sleep(60)'
 hole=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' sme457-hole)
 docker compose run --rm --no-deps -T smelt bash -c \
-  "timeout 120 env RUSTUP_DIST_SERVER=http://$hole:8123 dx build --platform web; echo rc=\$?"  # hangs: rc=124, silent
+  "timeout 120 env -u RUSTUP_AUTO_INSTALL RUSTUP_DIST_SERVER=http://$hole:8123 dx build --platform web; echo rc=\$?"  # hangs: rc=124, silent (-u: the stack env sets the guard itself now)
 docker compose run --rm --no-deps -T smelt bash -c \
   "RUSTUP_DIST_SERVER=http://$hole:8123 scripts/ci-web-bundle"  # green; warm ~15 s
 docker rm -f sme457-hole
