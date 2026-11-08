@@ -25,8 +25,8 @@ async fn raw_status(client: &kube::Client, name: &str, command: &[&str]) -> Stri
 /// SME-452 (B): an exec the container runtime can't start (here a
 /// binary that doesn't exist) is a failure that says why, not exit 0
 /// with nothing on stderr. The kubelet ends such an exec with a `Failure`
-/// status and no `ExitCode` cause; the wait loop read that as \"still
-/// running\" and the log read as an empty log.
+/// status and no `ExitCode` cause; the wait loop read that as "still
+/// running" and the log read as an empty log.
 #[tokio::test]
 async fn test_an_exec_the_runtime_cant_start_reads_as_a_failure() {
     with_sandbox(|client, sandbox| async move {

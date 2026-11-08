@@ -58,6 +58,8 @@ impl<'a> InstallWatch<'a> {
             (n, Some(e)) => format!("; its record couldn't be read {n} times (last: {e})"),
         };
         let output = match log {
+            // npm writes nothing to a file until it ends (SME-452).
+            Ok(log) if log.trim().is_empty() => ". It wrote no output.".to_string(),
             Ok(log) => format!(". Its output so far:\n{}", log.trim_end()),
             Err(e) => format!(" (its output couldn't be read: {e})"),
         };
@@ -78,10 +80,21 @@ pub(super) async fn wait_installed(client: &kube::Client, pods: &kube::Api<Pod>,
 
 /// The install's output so far (its last 4,000 bytes).
 async fn install_log(client: &kube::Client, name: &str) -> Result<String, String> {
-    crate::sandbox::exec_with(client, name, "server", &["tail", "-c", "4000", INSTALL_LOG], None)
-        .await
-        .map(|r| r.stdout)
-        .map_err(|e| e.to_string())
+    log_of(
+        crate::sandbox::exec_with(client, name, "server", &["tail", "-c", "4000", INSTALL_LOG], None)
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+}
+
+/// What a `tail` of the install's log says. A `tail` that failed (no log
+/// at all, or an exec the runtime refused) is an error saying why, not
+/// an empty log (SME-452).
+pub(super) fn log_of(result: crate::sandbox::ExecResult) -> Result<String, String> {
+    match result.exit_code {
+        0 => Ok(result.stdout),
+        code => Err(format!("tail exited {code}: {}", result.stderr.trim())),
+    }
 }
 
 /// How long a timed-out install's log read may take (SME-452 review 1):
@@ -148,7 +161,18 @@ pub(super) async fn wait_installed_within(
 /// it the way it once did (SME-426: one dropped exec read a Ready server
 /// as not running).
 pub(super) async fn install_rc(client: &kube::Client, name: &str) -> Result<Option<String>, String> {
-    let result = crate::sandbox::exec_with(client, name, "server", &["cat", INSTALL_RC], None).await.map_err(|e| e.to_string())?;
+    rc_of(crate::sandbox::exec_with(client, name, "server", &["cat", INSTALL_RC], None).await.map_err(|e| e.to_string())?)
+}
+
+/// What a `cat` of the install's record says. An exec that never ran
+/// (-1: no status, or the runtime refused it) is a failed read, never
+/// "still running" (SME-452): a pod whose execs were all refused once
+/// timed out with nothing to say, even when its install had finished.
+pub(super) fn rc_of(result: crate::sandbox::ExecResult) -> Result<Option<String>, String> {
+    if result.exit_code == -1 {
+        let why = result.stderr.trim();
+        return Err(if why.is_empty() { "the exec ended without a status".to_string() } else { why.to_string() });
+    }
     let rc = result.stdout.trim();
     Ok((result.exit_code == 0 && !rc.is_empty()).then(|| rc.to_string()))
 }

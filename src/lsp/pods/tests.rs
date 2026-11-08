@@ -317,6 +317,44 @@ async fn test_a_timed_out_installs_log_read_is_bounded() {
     assert_eq!(bounded_read(async { Ok("npm http fetch".to_string()) }, LOG_READ_TIMEOUT).await, Ok("npm http fetch".to_string()));
 }
 
+fn exec_result(exit_code: i32, stdout: &str, stderr: &str) -> crate::sandbox::ExecResult {
+    crate::sandbox::ExecResult { stdout: stdout.to_string(), stderr: stderr.to_string(), exit_code }
+}
+
+/// SME-452's recurrence: a record read the runtime never ran (exit -1,
+/// as an exec it refused reads since part 1) is a failed read, counted
+/// and named at the timeout, not "still running". A record not written
+/// yet is still running, and a written one is its rc.
+#[test]
+fn test_a_record_read_that_wasnt_run_is_a_failed_read() {
+    let refused = "exec failed: InternalError: OCI runtime exec failed";
+    assert_eq!(rc_of(exec_result(-1, "", refused)), Err(refused.to_string()));
+    assert_eq!(rc_of(exec_result(-1, "", "")), Err("the exec ended without a status".to_string()));
+    let missing = "cat: /tmp/install.rc: No such file or directory\n";
+    assert_eq!(rc_of(exec_result(1, "", missing)), Ok(None));
+    assert_eq!(rc_of(exec_result(0, "0\n", "")), Ok(Some("0".to_string())));
+    assert_eq!(rc_of(exec_result(0, "", "")), Ok(None), "a record being written");
+}
+
+/// SME-452's recurrence: an install that wrote nothing says so, and a
+/// log that couldn't be read (missing, or the exec refused) is an error
+/// that says why, not an empty log.
+#[test]
+fn test_a_timed_out_install_says_its_log_was_empty_or_missing() {
+    let watch = InstallWatch::new("lsp-7-ra", "a");
+    let error = watch.timed_out(INSTALL_TIMEOUT, Ok(String::new()));
+    assert!(error.ends_with("within 10 minutes. It wrote no output."), "{error}");
+    let error = watch.timed_out(INSTALL_TIMEOUT, Ok(" \n".to_string()));
+    assert!(error.ends_with(". It wrote no output."), "{error}");
+    let missing = "tail: cannot open '/tmp/install.log' for reading: No such file or directory\n";
+    assert_eq!(
+        log_of(exec_result(1, "", missing)),
+        Err("tail exited 1: tail: cannot open '/tmp/install.log' for reading: No such file or directory".to_string())
+    );
+    assert_eq!(log_of(exec_result(-1, "", "exec failed: InternalError: …")), Err("tail exited -1: exec failed: InternalError: …".to_string()));
+    assert_eq!(log_of(exec_result(0, "added 1 package\n", "")), Ok("added 1 package\n".to_string()));
+}
+
 /// A server pod with `status`, a status captured live.
 fn captured_server_pod(status: &str) -> Pod {
     Pod {
