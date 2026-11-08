@@ -87,3 +87,30 @@ async fn test_two_admitted_wakes_answer_an_owed_turn_once(pool: PgPool) {
     assert!(!db::answer_owed(&pool, root).await.expect("answer_owed"), "still owed");
     crate::turn::forget_conversation_lock(root);
 }
+
+/// D11 (review 1, L5): an end recorded more than a day before the restart
+/// is left alone, so the first start after this ships doesn't wake every
+/// old conversation whose wake was lost long ago.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_end_older_than_a_day_isnt_woken_after_a_restart(pool: PgPool) {
+    let requests = setup(&pool, vec![text_reply("Noted.")]).await;
+    let old = db::create_conversation(&pool).await.expect("create conversation").id;
+    command(&pool, old, "d11-old", true).await;
+    sqlx::query("UPDATE terminal_commands SET finished_at = now() - interval '25 hours' WHERE command_id = 'd11-old'")
+        .execute(&pool)
+        .await
+        .expect("an old end");
+    let recent = db::create_conversation(&pool).await.expect("create conversation").id;
+    command(&pool, recent, "d11-recent", true).await;
+    sqlx::query("UPDATE terminal_commands SET finished_at = now() - interval '23 hours' WHERE command_id = 'd11-recent'")
+        .execute(&pool)
+        .await
+        .expect("a recent end");
+
+    restart(&pool, &[old, recent]).await;
+    assert_eq!(requests_ending_in(&requests, &command_notice("d11-old")), 0, "#{old}'s old end was woken");
+    assert_eq!(requests_ending_in(&requests, &command_notice("d11-recent")), 1, "#{recent} wasn't woken");
+    for id in [old, recent] {
+        crate::turn::forget_conversation_lock(id);
+    }
+}

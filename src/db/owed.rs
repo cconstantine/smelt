@@ -23,6 +23,10 @@ use crate::models::Message;
 const WAKEABLE: &str = "c.paused_at IS NULL AND c.deleting_at IS NULL \
     AND (a.state IS NULL OR a.state NOT IN ('stopped', 'failed', 'starting'))";
 
+/// How recent an undrained command end the startup sweep still wakes for
+/// (D11, review 1 L5), as a Postgres interval.
+const UNNOTIFIED_END_WINDOW: &str = "24 hours";
+
 /// Marks `conversation_id` owed an answer, keeping an earlier mark.
 pub(super) async fn mark_answer_owed_on(conn: &mut sqlx::PgConnection, conversation_id: i64) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE conversations SET answer_owed_at = COALESCE(answer_owed_at, now()) WHERE id = $1")
@@ -92,12 +96,16 @@ pub async fn conversations_owed_an_answer(pool: &PgPool) -> Result<Vec<i64>, sql
 /// Every conversation a wake may run in with a command whose end is
 /// recorded and whose notice no drain has saved (`UNNOTIFIED_END`): its
 /// wake died before draining, in a restart (SME-450 E). The startup sweep
-/// wakes them, and their drain saves the notice as any wake's would.
+/// wakes them, and their drain saves the notice as any wake's would. Only
+/// an end recorded in the last `UNNOTIFIED_END_WINDOW`, by its
+/// `finished_at` (D11): an older one is a wake lost long before this
+/// restart, and its conversation has moved on.
 pub async fn conversations_with_unnotified_ends(pool: &PgPool) -> Result<Vec<i64>, sqlx::Error> {
     sqlx::query_scalar::<_, i64>(&format!(
         "SELECT c.id FROM conversations c LEFT JOIN agents a ON a.conversation_id = c.id
          WHERE {WAKEABLE}
-           AND EXISTS (SELECT 1 FROM terminal_commands tc WHERE tc.conversation_id = c.id AND {})
+           AND EXISTS (SELECT 1 FROM terminal_commands tc WHERE tc.conversation_id = c.id AND {}
+                       AND tc.finished_at > now() - interval '{UNNOTIFIED_END_WINDOW}')
          ORDER BY c.id",
         super::sandbox::UNNOTIFIED_END
     ))
