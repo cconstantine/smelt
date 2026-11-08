@@ -7,9 +7,10 @@ use super::*;
 /// to leave it Terminating rather than finish (SME-253 review 1). A pod
 /// only holds a claim once it's scheduled and the protection controller
 /// has caught up, so deleting the moment after creating the holder is a
-/// race, not a held claim. Holders ask for tiny resources explicitly:
-/// the namespaces' LimitRange otherwise defaults every container to a
-/// 64Gi request, which no node here can fit.
+/// race, not a held claim. Holders ask for tiny resources explicitly,
+/// rather than what the namespaces' LimitRange default happens to give:
+/// before SME-335 it gave every container a 64Gi request, which no node
+/// here could fit.
 async fn wait_holder_mounting(client: &kube::Client, holder: &str, claim: &str) {
     let running = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
@@ -85,9 +86,10 @@ async fn test_a_terminating_claim_is_not_reused_by_the_next_pod(pool: PgPool) {
             "spec": {
                 "restartPolicy": "Never",
                 // A request of its own: given none, the namespace's
-                // LimitRange (max only, 64Gi) makes the default request
-                // 64Gi too, which no test node has, so the holder was never
-                // scheduled and never held the claim (SME-341).
+                // LimitRange default gives it one — before SME-335 that
+                // was 64Gi (the range set only a `max`), which no test
+                // node has, so the holder was never scheduled and never
+                // held the claim (SME-341).
                 "containers": [{
                     "name": "sandbox",
                     "image": "smelt.invalid/none:0",
@@ -327,8 +329,8 @@ async fn test_removal_stops_the_conversations_language_server_pods_and_frees_the
                 // exits, so a removal that didn't wait for it would return
                 // while it's still there (SME-341 review), and one that does
                 // waits about 5 s, well inside its 30 s. A request of its
-                // own, as the namespace's LimitRange would otherwise make it
-                // 64Gi.
+                // own, rather than what the namespace's LimitRange default
+                // happens to give (64Gi, before SME-335 set it to zero).
                 "containers": [{
                     "name": "sleep",
                     "image": default_sandbox_image(),

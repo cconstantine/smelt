@@ -5,9 +5,10 @@
 #
 #   k3d cluster create smelt-test --image rancher/k3s:v1.34.6-k3s1 \
 #     --port "18080:80@loadbalancer" --wait
-#   terraform init && terraform apply && ./check-secret-env.sh
+#   terraform init && terraform apply && ./check-secret-env.sh && ./check-limitrange.sh
 #
-# The last step checks `secret_env` (see its header).
+# The last steps check `secret_env` and the sandbox-pod LimitRange (see
+# their headers).
 #
 # The k3s image matters: sandbox pods use native sidecar containers, which a
 # k3d default image (1.28-era) refuses. Pin the one docs/setup.md pins.

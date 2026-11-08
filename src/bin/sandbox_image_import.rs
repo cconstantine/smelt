@@ -170,12 +170,14 @@ async fn start_loader(pods: &Api<Pod>, name: &str, lifetime: Duration, image_fs:
 }
 
 fn loader_pod_spec(name: &str, lifetime: Duration, image_fs: bool) -> Pod {
-    // Explicit and small, on purpose: `smelt-park`'s `LimitRange` sets only
-    // a `max` (64Gi/16 cores, see k8s/smelt-park-rbac.yaml), no `default` —
-    // Kubernetes fills that gap by making an unspecified request/limit
-    // default to `max` itself, which no CI runner can schedule. Found via a
-    // real CI failure (`FailedScheduling ... Insufficient cpu, Insufficient
-    // memory`) that a bigger real cluster's spare capacity had masked.
+    // Explicit and small, on purpose, rather than what `smelt-park`'s
+    // `LimitRange` default happens to give a container naming no resources
+    // of its own (see k8s/smelt-park-rbac.yaml). Until SME-335 there was a
+    // harder reason: the range set only a `max`, and Kubernetes made an
+    // unspecified request/limit default to that — which no CI runner can
+    // schedule. Found via a real CI failure (`FailedScheduling ...
+    // Insufficient cpu, Insufficient memory`) that a bigger real cluster's
+    // spare capacity had masked.
     let mut requests = std::collections::BTreeMap::new();
     requests.insert("cpu".to_string(), Quantity("100m".to_string()));
     requests.insert("memory".to_string(), Quantity("128Mi".to_string()));
