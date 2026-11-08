@@ -298,6 +298,20 @@ fn test_a_timed_out_install_says_its_output_and_its_records_failed_reads() {
     assert!(error.ends_with(" (its output couldn't be read: the pod is gone)"), "{error}");
 }
 
+/// SME-452 review 1: a timed-out install's log read that never answers
+/// is given up on after `LOG_READ_TIMEOUT`, and the message says so,
+/// so the read can't hold the call past the install's bound. A read
+/// that answers comes through as is.
+#[tokio::test(start_paused = true)]
+async fn test_a_timed_out_installs_log_read_is_bounded() {
+    let hung = tokio::time::timeout(2 * LOG_READ_TIMEOUT, bounded_read(std::future::pending(), LOG_READ_TIMEOUT)).await;
+    let hung = hung.expect("the log read held the call past its bound");
+    assert_eq!(hung, Err("the read didn't answer within 10 s".to_string()));
+    let error = InstallWatch::new("lsp-7-ra", "a").timed_out(INSTALL_TIMEOUT, hung);
+    assert!(error.ends_with(" (its output couldn't be read: the read didn't answer within 10 s)"), "{error}");
+    assert_eq!(bounded_read(async { Ok("npm http fetch".to_string()) }, LOG_READ_TIMEOUT).await, Ok("npm http fetch".to_string()));
+}
+
 /// A server pod with `status`, a status captured live.
 fn captured_server_pod(status: &str) -> Pod {
     Pod {

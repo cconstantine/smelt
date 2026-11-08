@@ -425,6 +425,21 @@ async fn install_log(client: &kube::Client, name: &str) -> Result<String, String
         .map_err(|e| e.to_string())
 }
 
+/// How long a timed-out install's log read may take (SME-452 review 1):
+/// an exec has no bound of its own, and the message mustn't hold the
+/// call past the install's bound.
+const LOG_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `read`, given up on after `limit`.
+async fn bounded_read(
+    read: impl std::future::Future<Output = Result<String, String>>,
+    limit: std::time::Duration,
+) -> Result<String, String> {
+    tokio::time::timeout(limit, read)
+        .await
+        .unwrap_or_else(|_| Err(format!("the read didn't answer within {} s", limit.as_secs())))
+}
+
 /// `wait_installed` with its bound: only a test passes another than
 /// `INSTALL_TIMEOUT`, to reach the timeout without waiting it out. A
 /// timed-out install says what it was doing (SME-452): its output so
@@ -462,7 +477,7 @@ async fn wait_installed_within(
             }
         }
         if started.elapsed() > bound {
-            return Err(watch.timed_out(bound, install_log(client, name).await));
+            return Err(watch.timed_out(bound, bounded_read(install_log(client, name), LOG_READ_TIMEOUT).await));
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
