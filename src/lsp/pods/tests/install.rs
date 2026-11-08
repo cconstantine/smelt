@@ -140,11 +140,24 @@ async fn test_a_record_read_that_never_answers_still_ends_the_wait() {
     let error = waited.expect("a record read that never answered held the wait past its bound").expect_err("installed");
     assert!(
         error.starts_with(
-            "The install didn't finish within 5 s; its record couldn't be read 1 times (last: the read didn't answer \
+            "The install didn't finish within 5 s; its record couldn't be read 1 time (last: the read didn't answer \
              within 30 s); 1 record reads, the slowest 30 s. It wrote no output."
         ),
         "{error}"
     );
+}
+
+/// SME-452 round 2, nit 4: one failed read of the record is "1 time",
+/// and more are "N times". It once said "1 times".
+#[test]
+fn test_a_timed_out_install_counts_its_failed_record_reads_in_words() {
+    let mut watch = InstallWatch::new("lsp-7-ra", "a");
+    watch.rc_read_failed("refused".to_string());
+    let error = watch.timed_out(INSTALL_TIMEOUT, Ok(String::new()));
+    assert!(error.contains("; its record couldn't be read 1 time (last: refused)"), "{error}");
+    watch.rc_read_failed("refused again".to_string());
+    let error = watch.timed_out(INSTALL_TIMEOUT, Ok(String::new()));
+    assert!(error.contains("; its record couldn't be read 2 times (last: refused again)"), "{error}");
 }
 
 /// SME-452 round 1, finding 6: a timed-out install names what was still

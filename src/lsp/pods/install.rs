@@ -78,6 +78,7 @@ impl<'a> InstallWatch<'a> {
         };
         let record = match (self.rc_read_failures, &self.rc_read_error) {
             (0, _) | (_, None) => String::new(),
+            (1, Some(e)) => format!("; its record couldn't be read 1 time (last: {e})"),
             (n, Some(e)) => format!("; its record couldn't be read {n} times (last: {e})"),
         };
         let reads = match self.rc_reads {
