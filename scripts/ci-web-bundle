@@ -15,9 +15,20 @@
 # through. A hang before the client is done is left to the step's timeout.
 #
 # CI_WEB_BUNDLE_DX replaces the dx command, for scripts/test-ci-web-bundle.
+#
+# RUSTUP_AUTO_INSTALL=0 is exported for the watched child (SME-457): dx
+# estimates its progress display by spawning `cargo +nightly rustc
+# --unit-graph`, the stack image has stable only, and rustup's shim answers a
+# missing toolchain by downloading one from the network with no timeout — on
+# a stalled path that child never returns and dx waits on it forever,
+# silently (SME-67's post-client hang in CI is plausibly the same mechanism;
+# unverified there). The estimate is cosmetic — dx ignores a failed one — so
+# make it fail fast. Same posture as CARGO_NET_OFFLINE=true (SME-442): the
+# gate's network behaviour is chosen, not hoped for.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+export RUSTUP_AUTO_INSTALL=0
 dx=${CI_WEB_BUNDLE_DX:-dx build --platform web --verbose}
 silence=${CI_WEB_BUNDLE_SILENCE_SECS:-120}
 
