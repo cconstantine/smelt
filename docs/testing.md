@@ -170,7 +170,8 @@ hung dx the tell is the child `cargo +nightly rustc --unit-graph …` in state
 `…/usr/local/rustup/tmp/<rand>_file` and a socket. To reproduce on demand,
 point `RUSTUP_DIST_SERVER` at a listener that accepts and sleeps: a bundle
 through `scripts/ci-web-bundle` completes against it (the estimate fails in
-ms and dx ignores it), a bare `dx build --platform web` does not:
+ms and dx ignores it), a bare `dx build --platform web` — guard cleared, as
+below — does not:
 
 ```bash
 docker compose run -d --name sme457-hole --no-deps --entrypoint python3 smelt -c \
