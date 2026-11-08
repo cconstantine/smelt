@@ -166,5 +166,12 @@ pub(super) async fn scenario_live_command_marker(t: &Scenario<'_>) {
     assert!(measured[1].parse::<f64>().unwrap_or(1.0) <= 0.0, "the page scrolls sideways at 390px: {measured:?}");
     phone.close().await.expect("close the tab");
 
+    // g. The agent's pod stop clears its marker too — plan 5.e's promise,
+    //    asserted rather than left as cleanup: `close_pod_terminals`
+    //    publishes once per close, for the agent's conversation and on
+    //    both relays.
     sandbox::stop_pod_for_user(pool, agent_pod).await.expect("stop the agent's pod");
+    for (tab, what) in [(&home, "home tab"), (&conv, "conversation tab")] {
+        assert!(wait_for_count(tab, &agent_marker, 0, Duration::from_secs(10)).await, "{what}: the agent's marker should clear with its pod too");
+    }
 }
