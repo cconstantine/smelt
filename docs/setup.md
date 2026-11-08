@@ -165,6 +165,18 @@ Four things trip a conversation sandbox's stack (SME-257's retrospective, propos
   connections (its header lists the cases and verdicts; results in
   `target/repro-net/<case>/`).
 
+**The stack's toolchain env posture: stable only, and never a downloaded
+toolchain** (SME-457). The image has no nightly, and dioxus-cli's build
+progress estimate runs `cargo +nightly rustc --unit-graph` — rustup's shim
+treats a missing toolchain as an invitation to download one from the network,
+with no timeout, and a stalled download hangs `dx build`/`dx serve` silently
+forever. So every dx the gate runs gets `RUSTUP_AUTO_INSTALL=0`:
+`scripts/ci-web-bundle` exports it, `scripts/check-server` passes it to its
+`dx serve`, and the `smelt` service in `docker-compose.yml` sets it so a
+hand-run `dx serve`/`dx build` gets the same protection. A failed estimate is
+cosmetic — dx ignores it. A seat that really wants nightly installs it into
+the image (or unsets the variable per call).
+
 Helper scripts: `scripts/check.sh` (the gate at every push point, before the
 PR opens and at each review round's tip, per `docs/process/rules-commits.md`: both
 builds and the test build with no warnings, plus the server tests), `scripts/check-server`

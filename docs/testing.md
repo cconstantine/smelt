@@ -147,6 +147,45 @@ Most logic lives behind the `server` feature; plain `cargo test` compiles but sk
 
 **The scripts a session runs for the gate and for hands-on checks delete no files** (`check.sh`, `browser-tier`, `check-server`, `build-sandbox-image.sh`, `with-cluster-lock`, `cluster-test`, `clean-test-namespace.sh`): Claude Code's safety check refuses a command whose scripts remove files at paths it can't resolve, and only a person can approve it (SME-107). Logs go to fixed paths under `target/`, overwritten by the next run (`browser-tier`'s `dx build` log is `target/browser-tier/web-bundle.log`), and `check-server` empties its state files (`.check-server.pid`, `.check-server.scratch-db` and, since SME-129, `.check-server.kubeconfig`, the cluster the server was started with, in the check worktree) rather than removing them: an empty or missing one means nothing is running, there's no scratch database to clean up or drop, or the cleanup tool should use the inherited `KUBECONFIG`. It also takes a lock on the scratch database's name (`$SMELT_LOCK_DIR/smelt-check-scratch-<name>.lock`, SME-129), held by a start until its pid file is written and by a stop through its cleanup, so the two can't act on the database at once. Dropping scratch databases and stopping processes stay. `scripts/test-gate-scripts`, `scripts/test-check-server` and its sibling suites `scripts/test-check-server-scratch`, `test-check-server-guards`, `test-check-server-db-inputs`, `test-check-server-ports` and `test-check-server-previews`, `scripts/test-cluster-lock` and `scripts/test-dotenv-value` check both, and the locks (what each gate script runs locked and unlocked, re-entry, `check-server`'s port lock, its bounded wait for a port another check server holds and its scratch lock), with stubs for `cargo`, `dx`, `sqlx`, `curl`, `python3`, the image check and the cleanup tool, shared in `scripts/lib/test-check-scripts.sh` — `test-dotenv-value` needs none of them, being the `.env` reader's own table of fixtures (SME-186); `scripts/check.sh` runs all of them, and you can run the one for the script you changed. Their scratch clones under `target/` (the check worktrees, `repo-env`) are made once and reused through `shared_clone`, which points a reused clone's alternate at this checkout's object store before taking it: a `--shared` clone records that store as an absolute path, so one made on the host at `/workspace/smelt` failed at once under the compose service's `/app`, the same `target/` through the bind mount (SME-251). One that still can't read its HEAD is named for a person to remove. Every suite that sources `test-check-scripts.sh` records the HEAD and branch of the checkout it runs in and fails at `finish` if the run moved either: `check-server` checks the served ref out in its check worktree, and a `CHECK_WORKTREE` that isn't a working tree of its own moved the repository around it until SME-265 refused that shape (its `start` names the directory and exits 1).
 
+**The browser tier bounds its `== web bundle` step** (SME-457). It runs
+`scripts/ci-web-bundle` — not a bare `dx build` — under
+`timeout -k 30 ${SMELT_BROWSER_TIER_BUNDLE_TIMEOUT:-1800}`: the watcher
+handles SME-67's post-client silence with a warning and exports
+`RUSTUP_AUTO_INSTALL=0`; the cap catches what the watcher deliberately leaves
+open — silence *before* the client bundle — and fails naming the step, the
+cap and where to look. A red there is a hung build, never a slow one: a warm
+bundle is ~15 s, a cold in-stack one minutes.
+
+The hang this fixed at its mechanism, and what to look for when a `dx build`
+goes silent: dioxus-cli's build estimates its progress display with
+`cargo +nightly rustc --unit-graph -Z unstable-options …`, and the stack image
+has no nightly; unless `RUSTUP_AUTO_INSTALL=0` is set (the gate scripts and
+the stack env set it — `setup.md`'s toolchain-posture note), rustup's `cargo`
+shim answers a missing toolchain by downloading one from `RUSTUP_DIST_SERVER`
+with **no timeout**. On a path that accepts but never answers, the estimate
+child hangs, `dx build` waits on it forever, and no line is ever logged —
+while `check.sh` stays green, because it never runs `cargo +nightly`. On a
+hung dx the tell is the child `cargo +nightly rustc --unit-graph …` in state
+`S` (`wchan=futex_wait`) at ~0 CPU, with an fd at
+`…/usr/local/rustup/tmp/<rand>_file` and a socket. To reproduce on demand,
+point `RUSTUP_DIST_SERVER` at a listener that accepts and sleeps: a bundle
+through `scripts/ci-web-bundle` completes against it (the estimate fails in
+ms and dx ignores it), a bare `dx build --platform web` does not:
+
+```bash
+docker compose run -d --name sme457-hole --no-deps --entrypoint python3 smelt -c \
+  'import socket,time
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(("0.0.0.0",8123)); s.listen(128)
+while True: time.sleep(60)'
+hole=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' sme457-hole)
+docker compose run --rm --no-deps -T smelt bash -c \
+  "timeout 120 env RUSTUP_DIST_SERVER=http://$hole:8123 dx build --platform web; echo rc=\$?"  # hangs: rc=124, silent
+docker compose run --rm --no-deps -T smelt bash -c \
+  "RUSTUP_DIST_SERVER=http://$hole:8123 scripts/ci-web-bundle"  # green; warm ~15 s
+docker rm -f sme457-hole
+```
+
 **A check server's previews are its own** (SME-96). `start` gives the server `SMELT_PREVIEW_ADDR=0.0.0.0:<CHECK_PORT+200>` (8281 for the default 8081), preview links on that port, and `SMELT_BASE_URL=http://localhost:<CHECK_PORT>`. So preview links and the pages that link back to a conversation work out of the box, and never reach the dev server's 8181 or Grafana's 8182. Only a `-- NAME=VALUE` override changes them. The environment and `.env` hold the dev server's values here (compose sets `SMELT_BASE_URL` for every shell), so `start` ignores them and names each one it ignored. Given only an address, the links follow its port; given a link template on another port, `start` warns. An empty `SMELT_PREVIEW_ADDR` or `SMELT_PREVIEW_URL` is refused, while an empty `SMELT_BASE_URL` is passed on. A preview port something already listens on is refused before anything is checked out, created or started, as the app's port is (SME-175). `start` prints what it chose, with whose each value is. `scripts/test-check-server-previews` covers it.
 
 `mcp::tests::client::test_live_exa_search_through_smelt_mcp_client` checks the built-in Exa MCP server against the real service: smelt's own MCP client connects keylessly, sees only `web_search_exa`, and gets results back. It needs the internet and depends on Exa's unpublished free limits, so it's `#[ignore]`d **and** skips unless `SMELT_LIVE_EXA=1` is set. CI's browser job runs every ignored test, and this one shouldn't depend on Exa there. It's a `#[sqlx::test]`, since a connect reads its server's row (SME-167), so run it under the cluster lock: `SMELT_LIVE_EXA=1 scripts/cluster-test --features server -- --ignored --exact mcp::tests::client::test_live_exa_search_through_smelt_mcp_client`. See [Definition of done](process/done.md) for the full two-target check.
