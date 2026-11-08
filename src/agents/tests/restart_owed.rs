@@ -320,7 +320,8 @@ async fn test_an_answer_owed_is_answered_once(pool: PgPool) {
 
 /// T8: what isn't owed, or can't be answered, isn't woken: a root the
 /// user stopped, a stopped and a failed child, each with a notice saved,
-/// and a root whose last message is the user's own send (D2).
+/// a root whose last message is the user's own send (D2), and one being
+/// deleted.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_what_isnt_owed_isnt_woken_after_a_restart(pool: PgPool) {
     let requests = setup(&pool, vec![text_reply("Noted.")]).await;
@@ -345,6 +346,16 @@ async fn test_what_isnt_owed_isnt_woken_after_a_restart(pool: PgPool) {
     let sent = db::create_conversation(&pool).await.expect("create conversation").id;
     db::create_message(&pool, sent, "user", &[ContentBlock::Text { text: "Hello.".to_string() }]).await.expect("save");
     ids.push(sent);
+    // Being deleted, owed an answer and with an end undrained (review 1,
+    // N3); the D2 case through the real send is restart_owed_edges'.
+    let deleting = db::create_conversation(&pool).await.expect("create conversation").id;
+    command(&pool, deleting, "t8-deleting", true).await;
+    sqlx::query("UPDATE conversations SET deleting_at = now(), answer_owed_at = now() WHERE id = $1")
+        .bind(deleting)
+        .execute(&pool)
+        .await
+        .expect("mark it deleting");
+    ids.push(deleting);
 
     restart(&pool, &ids).await;
     assert_eq!(requests.lock().expect("the request log").len(), 0, "something was woken");

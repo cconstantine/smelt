@@ -2,7 +2,7 @@
 //! queued `Deliver` — no mark where no turn will answer, a second admitted
 //! wake answering nothing, and the age bound on undrained ends.
 
-use super::restart_owed::{command, command_notice, docker_restarted, drain_command, requests_ending_in};
+use super::restart_owed::{command, command_notice, docker_restarted, drain_command, hold_the_one_slot, mock_provider, requests_ending_in};
 use super::*;
 
 /// How many of `id`'s queued rows are still undelivered.
@@ -157,5 +157,31 @@ async fn test_a_turn_stopped_while_queued_owes_nothing(pool: PgPool) {
     assert_eq!(transcript(&pool, root).await.iter().filter(|(_, said)| said == text).count(), 1, "the message, kept");
     assert!(!db::answer_owed(&pool, root).await.expect("answer_owed"), "the stopped turn left an answer owed");
     assert_eq!(requests.lock().expect("the request log").len(), 0, "the model was called");
+    crate::turn::forget_conversation_lock(root);
+}
+
+/// Review 1, N3 (D2, through the real send): the user's own send that
+/// takes an answered question owes nothing while it waits for its slot.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_users_send_taking_an_answer_owes_nothing(pool: PgPool) {
+    let requests = setup(&pool, vec![text_reply("Noted.")]).await;
+    let provider = mock_provider(&pool).await;
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    answered_question(&pool, root, "toolu_n3").await;
+    let held = hold_the_one_slot(&pool, provider).await;
+    let parked = crate::turn::test_hooks::watch_before_turn_slot(root);
+    crate::turn::start_turn(pool.clone(), root, "My own words.".to_string()).await.expect("the send");
+    tokio::time::timeout(Duration::from_secs(10), parked).await.expect("the send reaches the slot").expect("the hook");
+
+    assert!(db::get_pending_question(&pool, root).await.expect("the question").is_none(), "the send didn't take the answer");
+    assert!(!db::answer_owed(&pool, root).await.expect("answer_owed"), "the user's own send marked it owed");
+    assert!(!db::conversations_owed_an_answer(&pool).await.expect("owed").contains(&root), "a restart would answer it");
+
+    drop(held);
+    eventually("the send's turn is over", || async {
+        requests.lock().expect("the request log").len() == 1 && !crate::turn::turn_running(root)
+    })
+    .await;
+    crate::providers::limiter::forget(provider);
     crate::turn::forget_conversation_lock(root);
 }
