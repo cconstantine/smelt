@@ -6,14 +6,14 @@
 use super::*;
 
 /// `content`'s text as a finished command's notice says it.
-fn command_notice(command_id: &str) -> String {
+pub(super) fn command_notice(command_id: &str) -> String {
     crate::api::chat::mark_notice(&format!("Terminal command {command_id} finished: exit code 0."))
 }
 
 /// A command in `conversation_id` that started running (with a 300 s idle
 /// interval) and, when `finished`, ended with exit code 0: its end is
 /// recorded and its notice not yet saved, as `turn/tests/wake.rs` makes it.
-async fn command(pool: &PgPool, conversation_id: i64, command_id: &str, finished: bool) {
+pub(super) async fn command(pool: &PgPool, conversation_id: i64, command_id: &str, finished: bool) {
     let pod = db::create_sandbox_pod(pool, conversation_id).await.expect("create sandbox pod");
     let terminal = db::create_sandbox_terminal(pool, pod.id).await.expect("create sandbox terminal");
     db::create_terminal_command(pool, conversation_id, terminal.id, command_id, "echo hi", 300)
@@ -25,7 +25,7 @@ async fn command(pool: &PgPool, conversation_id: i64, command_id: &str, finished
 }
 
 /// Saves `command_id`'s notice as its drain would, marking it notified.
-async fn drain_command(pool: &PgPool, conversation_id: i64, command_id: &str) {
+pub(super) async fn drain_command(pool: &PgPool, conversation_id: i64, command_id: &str) {
     let content = [ContentBlock::Text { text: command_notice(command_id) }];
     db::save_command_notice(pool, conversation_id, command_id, &content)
         .await
@@ -34,7 +34,7 @@ async fn drain_command(pool: &PgPool, conversation_id: i64, command_id: &str) {
 }
 
 /// How many of `id`'s messages hold `needle`, in any block.
-async fn messages_holding(pool: &PgPool, id: i64, needle: &str) -> usize {
+pub(super) async fn messages_holding(pool: &PgPool, id: i64, needle: &str) -> usize {
     db::list_messages(pool, id)
         .await
         .expect("list messages")
@@ -44,7 +44,7 @@ async fn messages_holding(pool: &PgPool, id: i64, needle: &str) -> usize {
 }
 
 /// The requests whose last message holds `needle`.
-fn requests_ending_in(requests: &Mutex<Vec<serde_json::Value>>, needle: &str) -> usize {
+pub(super) fn requests_ending_in(requests: &Mutex<Vec<serde_json::Value>>, needle: &str) -> usize {
     requests
         .lock()
         .expect("the request log")
@@ -54,7 +54,7 @@ fn requests_ending_in(requests: &Mutex<Vec<serde_json::Value>>, needle: &str) ->
 }
 
 /// The newest provider: the mock `setup` saved.
-async fn mock_provider(pool: &PgPool) -> i64 {
+pub(super) async fn mock_provider(pool: &PgPool) -> i64 {
     sqlx::query_scalar::<_, i64>("SELECT id FROM inference_providers ORDER BY id DESC LIMIT 1")
         .fetch_one(pool)
         .await
@@ -64,7 +64,7 @@ async fn mock_provider(pool: &PgPool) -> i64 {
 /// Gives `provider` one request slot, in its row and in its pool, as a
 /// one-slot server's provider has (strata), and takes that slot: what a
 /// running turn's `TurnSlot` holds.
-async fn hold_the_one_slot(pool: &PgPool, provider: i64) -> crate::providers::limiter::Slot {
+pub(super) async fn hold_the_one_slot(pool: &PgPool, provider: i64) -> crate::providers::limiter::Slot {
     let version = sqlx::query_scalar::<_, chrono::NaiveDateTime>(
         "UPDATE inference_providers SET max_concurrent_requests = 1 WHERE id = $1 RETURNING updated_at",
     )
@@ -77,7 +77,7 @@ async fn hold_the_one_slot(pool: &PgPool, provider: i64) -> crate::providers::li
 }
 
 /// Ends `task` as a process death ends it: dropped wherever it waits.
-async fn kill(task: tokio::task::JoinHandle<()>) {
+pub(super) async fn kill(task: tokio::task::JoinHandle<()>) {
     task.abort();
     let ended = tokio::time::timeout(Duration::from_secs(10), task).await.expect("the task ends");
     assert!(ended.as_ref().is_err_and(|e| e.is_cancelled()), "the task ran to its end: {ended:?}");
@@ -85,7 +85,7 @@ async fn kill(task: tokio::task::JoinHandle<()>) {
 
 /// A parent for a test's child, stopped by the user, so the child's turn
 /// ending without a report wakes no one (SME-236).
-async fn quiet_parent(pool: &PgPool) -> i64 {
+pub(super) async fn quiet_parent(pool: &PgPool) -> i64 {
     let parent = db::create_conversation(pool).await.expect("create conversation").id;
     crate::turn::stop_conversation(pool, parent).await;
     parent
@@ -220,7 +220,7 @@ async fn test_a_notice_saved_just_before_the_restart_is_answered(pool: PgPool) {
 
 /// What smelt tells a conversation when Docker restarts, as
 /// `sandbox/claims.rs` says it.
-fn docker_restarted() -> String {
+pub(super) fn docker_restarted() -> String {
     crate::api::chat::mark_notice("Docker in sandbox pod 1 was restarted, so the containers it was running have stopped.")
 }
 
@@ -259,7 +259,10 @@ async fn test_a_stop_ending_a_queued_deliver_still_saves_it_at_once(pool: PgPool
     let (reached, release) = crate::turn::test_hooks::pause_after_notice_admitted(root);
     let deliver = crate::turn::notify(&pool, root, vec![crate::turn::Notice::Deliver(text.clone())]);
     tokio::time::timeout(Duration::from_secs(10), reached).await.expect("the notice is admitted").expect("the hook");
-    // Stopped once let in: with the lock held, only the stop is ready.
+    // Stopped once let in. The yields usually let the wake reach its wait
+    // for the held lock first, so the stop ends it there; landing after
+    // the lock is free instead, the stop ends it mid-turn, before any
+    // model call. Either way the notice is saved at once, as asserted.
     crate::turn::stop_conversation(&pool, root).await;
     release.send(()).expect("the wake waits at the hook");
     for _ in 0..3 {
@@ -267,6 +270,9 @@ async fn test_a_stop_ending_a_queued_deliver_still_saves_it_at_once(pool: PgPool
     }
     drop(turn);
     tokio::time::timeout(Duration::from_secs(10), deliver).await.expect("the delivery ends").expect("the task");
+    // No turn will answer it: a mark here would say a restart dropped one
+    // (review 1, L1).
+    assert!(!db::answer_owed(&pool, root).await.expect("answer_owed"), "the saved notice marked it owed");
 
     let told = transcript(&pool, root).await.into_iter().filter(|(_, said)| said == &text).count();
     assert_eq!(told, 1, "the notice, once");

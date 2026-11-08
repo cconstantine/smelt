@@ -675,11 +675,32 @@ pub async fn undelivered_agent_messages(pool: &PgPool, to: i64) -> Result<Vec<Ag
 /// Delivers one queued row: its `user` message saved, and the row marked
 /// delivered and linked to it, in one transaction, so a stop between the
 /// two can't save it twice. `None` when another drain delivered it first
-/// or the recipient is gone.
+/// or the recipient is gone. A turn's drain delivers it, so the message
+/// is owed the model's answer (SME-450).
 pub async fn deliver_agent_message(
     pool: &PgPool,
     row: &AgentMessage,
     content: &[ContentBlock],
+) -> Result<Option<Message>, sqlx::Error> {
+    deliver_agent_message_owed(pool, row, content, true).await
+}
+
+/// `deliver_agent_message` for a row saved where no turn will answer it
+/// (a paused conversation's notice, D9): no answer is owed, since a mark
+/// with no turn running says a restart dropped one (review 1, L1).
+pub async fn deliver_agent_message_unanswered(
+    pool: &PgPool,
+    row: &AgentMessage,
+    content: &[ContentBlock],
+) -> Result<Option<Message>, sqlx::Error> {
+    deliver_agent_message_owed(pool, row, content, false).await
+}
+
+async fn deliver_agent_message_owed(
+    pool: &PgPool,
+    row: &AgentMessage,
+    content: &[ContentBlock],
+    owed: bool,
 ) -> Result<Option<Message>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     if !lock_conversations(&mut tx, &[(row.to_conversation_id, RowLock::NoKeyUpdate)]).await? {
@@ -693,7 +714,11 @@ pub async fn deliver_agent_message(
     if marked == 0 {
         return Ok(None);
     }
-    let saved = super::owed::create_owed_message_on(&mut tx, row.to_conversation_id, content).await?;
+    let saved = if owed {
+        super::owed::create_owed_message_on(&mut tx, row.to_conversation_id, content).await?
+    } else {
+        super::conversations::create_message_on(&mut tx, row.to_conversation_id, "user", content).await?
+    };
     sqlx::query("UPDATE agent_messages SET delivered_message_id = $2 WHERE id = $1")
         .bind(row.id)
         .bind(saved.id)

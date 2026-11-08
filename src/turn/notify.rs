@@ -73,9 +73,10 @@ pub(super) async fn deliver_notice(pool: &PgPool, conversation_id: i64, text: St
 }
 
 /// Saves `conversation_id`'s queued `server_notice` rows into its
-/// transcript, holding the turn lock, with no model call (D9): each
-/// through `db::deliver_agent_message`, so a drain racing it can't save
-/// one twice. Other kinds stay queued for the next turn.
+/// transcript, holding the turn lock, with no model call (D9): each in
+/// `deliver_agent_message`'s transaction, so a drain racing it can't save
+/// one twice, and without the answer-owed mark, since no turn follows.
+/// Other kinds stay queued for the next turn.
 #[cfg(feature = "server")]
 async fn save_queued_server_notices(pool: &PgPool, conversation_id: i64) {
     let saved = {
@@ -86,7 +87,8 @@ async fn save_queued_server_notices(pool: &PgPool, conversation_id: i64) {
             Ok(rows) => {
                 for row in rows.iter().filter(|row| row.kind == db::KIND_SERVER_NOTICE) {
                     let content = [anthropic::ContentBlock::Text { text: agent_message_text(row) }];
-                    match db::deliver_agent_message(pool, row, &content).await {
+                    // No turn will answer it now: owed nothing (review 1, L1).
+                    match db::deliver_agent_message_unanswered(pool, row, &content).await {
                         Ok(Some(message)) => saved.push(message),
                         Ok(None) => {}
                         Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't save a queued notice"),
