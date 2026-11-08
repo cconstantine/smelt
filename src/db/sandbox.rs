@@ -736,7 +736,7 @@ pub async fn read_terminal_output(
 /// yet, in one fragment shared by the turn's drain and a wake's check for
 /// work, so the two can't disagree (SME-218). Both terminal states need
 /// exactly one notification each. `terminal_commands` must be aliased `tc`.
-const UNNOTIFIED_END: &str = "tc.status IN ('finished', 'lost') AND tc.notified_at IS NULL";
+pub(crate) const UNNOTIFIED_END: &str = "tc.status IN ('finished', 'lost') AND tc.notified_at IS NULL";
 
 /// Backs the completion-notification check in `run_turn_bounded`'s loop — both
 /// terminal states (`finished` and `lost`) need exactly one notification
@@ -793,7 +793,7 @@ pub async fn save_command_notice(
         tx.rollback().await?;
         return Ok(None);
     }
-    let saved = create_message_on(&mut tx, conversation_id, "user", content).await?;
+    let saved = create_owed_message_on(&mut tx, conversation_id, content).await?;
     tx.commit().await?;
     Ok(Some(saved))
 }
@@ -818,8 +818,9 @@ const IDLE_NOTICE_DUE: &str = "tc.status = 'running' AND tc.idle_notice_secs > 0
 /// Whether a wake of `conversation_id` has anything to act on: an ended
 /// command's notice, a due idle notice, an answered question no turn has
 /// taken, or an agent's report or notice not yet delivered (SME-236) — exactly what its turn's first step drains or takes (SME-218). A
-/// question still waiting is no work: that turn would stop at it. Read
-/// before the wake is counted, so one with nothing to do tells no tab a turn
+/// question still waiting is no work: that turn would stop at it. An
+/// answer owed with nothing pending is `db::answer_owed`'s, which the wake
+/// asks next (SME-450). Read before the wake is counted, so one with nothing to do tells no tab a turn
 /// started; the drain under the turn lock still decides what's saved.
 pub async fn wake_has_work(pool: &PgPool, conversation_id: i64) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, bool>(&format!(
@@ -930,7 +931,7 @@ pub async fn save_idle_notice(
         tx.rollback().await?;
         return Ok(None);
     }
-    let saved = create_message_on(&mut tx, conversation_id, "user", content).await?;
+    let saved = create_owed_message_on(&mut tx, conversation_id, content).await?;
     tx.commit().await?;
     Ok(Some(saved))
 }

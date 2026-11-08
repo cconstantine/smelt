@@ -60,6 +60,16 @@ async fn note_failure(pool: &PgPool, conversation_id: i64, reason: &str) -> bool
     }
 }
 
+/// Clears `conversation_id`'s answer owed at a turn's end, holding the
+/// turn lock (SME-450). A failure only logs: the mark stays, and the next
+/// wake or restart answers it once.
+#[cfg(feature = "server")]
+pub(super) async fn clear_answer_owed(pool: &PgPool, conversation_id: i64) {
+    if let Err(e) = db::clear_answer_owed(pool, conversation_id).await {
+        tracing::warn!(conversation_id, error = %e, "couldn't clear an answer owed at a turn's end");
+    }
+}
+
 /// Records how many model calls a turn made on its span once the turn ends,
 /// whichever way it does (a return, an error, a stop dropping it).
 struct TurnSteps {
@@ -100,6 +110,9 @@ pub(super) fn run_turn_body<'a: 'b, 'b>(
         // Moved in, so the lock is held for as long as the turn runs.
         let _turn = turn_lock;
         let result = run_turn_steps(pool, conversation_id, &held, persisted, new_content, max_turns, generation).await;
+        // The turn has ended, Ok or Err: what it was owed, it tried to
+        // answer, and neither a restart nor the next wake tries again (D7).
+        clear_answer_owed(pool, conversation_id).await;
         note_drained_activity(conversation_id);
         let Err(e) = result else {
             return result.map_err(TurnFailure::Failed);
@@ -257,7 +270,11 @@ fn run_turn_loop<'c>(
             // returns before ever building a request. Only possible on the
             // very first iteration: every later one already has a real
             // tool_use turn's results to send regardless.
-            if is_wake && persisted.is_empty() {
+            // Unless a turn a restart dropped left an answer owed
+            // (SME-450): the model answers its history as stored, which
+            // ends in what it was owed. Checked under the turn lock, so a
+            // second wake for the same answer finds it cleared and stops.
+            if is_wake && persisted.is_empty() && !db::answer_owed(pool, conversation_id).await.map_err(ServerFnError::new)? {
                 return Ok(persisted);
             }
             // A wake (or an answer turn) with notices to tell is a newer
@@ -284,6 +301,8 @@ fn run_turn_loop<'c>(
             let slot = match &mut turn_slot {
                 Some(slot) => slot,
                 slot @ None => {
+                    #[cfg(test)]
+                    test_hooks::before_turn_slot(conversation_id);
                     let acquired = TurnSlot::acquire(turn_model).await;
                     slot.insert(acquired)
                 }

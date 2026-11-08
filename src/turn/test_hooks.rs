@@ -147,6 +147,24 @@ pub async fn after_notice_admitted(conversation_id: i64) {
     reach(&AFTER_NOTICE_ADMITTED, conversation_id).await;
 }
 
+static BEFORE_TURN_SLOT: LazyLock<Mutex<HashMap<i64, oneshot::Sender<()>>>> = LazyLock::new(Default::default);
+
+/// Fires once `conversation_id`'s next turn reaches its provider's slot,
+/// right before it waits for one (SME-450): its drains have saved and
+/// marked what they found. Reach-only: the turn goes on into the wait.
+pub fn watch_before_turn_slot(conversation_id: i64) -> oneshot::Receiver<()> {
+    let (reached_tx, reached_rx) = oneshot::channel();
+    BEFORE_TURN_SLOT.lock().unwrap_or_else(|e| e.into_inner()).insert(conversation_id, reached_tx);
+    reached_rx
+}
+
+pub fn before_turn_slot(conversation_id: i64) {
+    let watch = BEFORE_TURN_SLOT.lock().unwrap_or_else(|e| e.into_inner()).remove(&conversation_id);
+    if let Some(reached) = watch {
+        let _ = reached.send(());
+    }
+}
+
 static STOPPED_WHILE_QUEUED: LazyLock<Mutex<HashMap<(i64, String), Pause>>> = LazyLock::new(Default::default);
 
 /// Pauses `conversation_id`'s turn whose message is `text` in its stop

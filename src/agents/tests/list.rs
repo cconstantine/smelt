@@ -26,15 +26,34 @@ async fn test_list_agents_shows_only_the_callers_children_with_their_status(pool
     let gate = Arc::new(tokio::sync::Notify::new());
     // Once set, every agent's model call is held until the gate opens.
     let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // SME-281's interleaving, forced every time: the running child's held
+    // call reaches the gate only once the starting child's first call has
+    // been answered, as it can under a full gate's load. The one permit
+    // then has to be the running child's.
+    let starting_id = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let (starting_answered, starting_seen) = tokio::sync::watch::channel(false);
+    let starting_answered = Arc::new(starting_answered);
     {
         let gate = gate.clone();
         let hold = hold.clone();
+        let starting_id = starting_id.clone();
         mock_with(&pool, move |request| {
-            let held = agent_of(request).is_some() && hold.load(std::sync::atomic::Ordering::SeqCst);
+            let agent = agent_of(request);
+            let held = agent.is_some() && hold.load(std::sync::atomic::Ordering::SeqCst);
+            let is_starting = agent.is_some() && agent == Some(starting_id.load(std::sync::atomic::Ordering::SeqCst));
+            let is_running = held && !is_starting;
             let gate = gate.clone();
+            let starting_answered = starting_answered.clone();
+            let mut starting_seen = starting_seen.clone();
             Box::pin(async move {
+                if is_running {
+                    let _ = starting_seen.wait_for(|answered| *answered).await;
+                }
                 if held {
                     gate.notified().await;
+                }
+                if is_starting {
+                    let _ = starting_answered.send(true);
                 }
                 text_reply("ok")
             })
@@ -75,6 +94,7 @@ async fn test_list_agents_shows_only_the_callers_children_with_their_status(pool
     // One still starting, and one running (its model call held).
     let (reached, release) = test_hooks::pause(test_hooks::BEFORE_START_DONE, root);
     let starting = start_child(&pool, root, "Starting.").await;
+    starting_id.store(starting, std::sync::atomic::Ordering::SeqCst);
     tokio::time::timeout(Duration::from_secs(10), reached).await.expect("the start runs").expect("paused");
     hold.store(true, std::sync::atomic::Ordering::SeqCst);
     let running = start_child(&pool, root, "Running.").await;
@@ -105,6 +125,9 @@ async fn test_list_agents_shows_only_the_callers_children_with_their_status(pool
     assert!(idle_row["persona"].is_null());
     assert!(idle_row["last_message_at"].is_string(), "{idle_row}");
 
+    // Only the running child's call is held: the starting child's first
+    // call, once released, isn't, so it can't take the one permit (SME-281).
+    hold.store(false, std::sync::atomic::Ordering::SeqCst);
     gate.notify_one();
     release.send(()).expect("release the start");
     eventually("every turn is over", || async {
