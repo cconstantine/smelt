@@ -334,6 +334,35 @@ case_cache_readonly() {
     verdict 1
 }
 
+# A cached copy that can't be read, or a corrupt one that can't be removed,
+# costs the cache, not the step: one line, then the network sources
+# (SME-458 review 1, L2).
+case_cache_unreadable() {
+    skip_as_root && return
+    start_server ok
+    mkdir -p "$CI_CACHE_DIR/tools" && cp "$fixture" "$(cache_file)" && chmod 000 "$(cache_file)"
+    run_installer 1
+    chmod 644 "$(cache_file)" 2>/dev/null
+    [ "$rc" -eq 0 ] || want "exit 0"
+    has "install-compose: cached copy couldn't be read (sha256sum: "
+    has "install-compose: fetched from github releases on attempt 1 of 3, sha256 ok; cached at $(cache_file)"
+    same_as "$(plugin)" "$fixture" "the plugin is the fixture"
+    verdict 1
+}
+
+case_cache_corrupt_readonly() {
+    skip_as_root && return
+    start_server ok
+    mkdir -p "$CI_CACHE_DIR/tools" && cp "$other" "$(cache_file)" && chmod 555 "$CI_CACHE_DIR/tools"
+    run_installer 1
+    chmod 755 "$CI_CACHE_DIR/tools"
+    [ "$rc" -eq 0 ] || want "exit 0"
+    has "install-compose: cached copy failed its sha256 (got $(sha256sum "$other" | cut -d' ' -f1)) and couldn't be discarded (rm: "
+    has "install-compose: fetched from github releases on attempt 1 of 3, sha256 ok; not cached"
+    same_as "$(plugin)" "$fixture" "the plugin is the fixture"
+    verdict 1
+}
+
 case_all_down() {
     start_server always-504
     export STUB_PULL_FAIL=all
@@ -368,7 +397,8 @@ case_pin() {
 }
 
 all=(present gh-504-once gh-down-image gh-down-image-local gh-hang gh-bad-sha
-    gh-bad-sha-all-down foreign-tmp cache-hit cache-corrupt second-run no-cache-dir cache-readonly all-down)
+    gh-bad-sha-all-down foreign-tmp cache-hit cache-corrupt second-run no-cache-dir cache-readonly
+    cache-unreadable cache-corrupt-readonly all-down)
 [ $# -gt 0 ] && all=("$@")
 for c in "${all[@]}"; do
     new_case "$c"

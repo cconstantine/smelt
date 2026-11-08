@@ -67,15 +67,21 @@ install_plugin() {
 cache_state=none
 if [ -n "$cache" ]; then
     cache_state=miss
+    # A copy that can't be read, or a bad one that can't be removed (a broken
+    # volume), costs the cache, not the step: one line, then the network
+    # sources (SME-458 review 1).
     if [ -f "$cache" ]; then
-        got=$(sha_of "$cache")
-        if [ "$got" = "$want" ]; then
+        if ! got=$(sha256sum "$cache" 2>&1); then
+            say "cached copy couldn't be read ($(echo "$got" | tail -n 1)); fetching instead"
+        elif got=${got%% *} && [ "$got" = "$want" ]; then
             install_plugin "$cache"
             say "cache hit, sha256 ok ($cache)"
             exit 0
+        elif gone=$(rm -f "$cache" 2>&1); then
+            say "cached copy failed its sha256 (got $got); discarded"
+        else
+            say "cached copy failed its sha256 (got $got) and couldn't be discarded ($(echo "$gone" | tail -n 1))"
         fi
-        rm -f "$cache"
-        say "cached copy failed its sha256 (got $got); discarded"
     fi
 fi
 
