@@ -79,6 +79,60 @@ fn test_a_server_pod_sits_next_to_its_sandbox_and_goes_with_it() {
     assert!(script.contains(INSTALL_RC) && script.contains("trap 'exit 0' TERM"), "{script}");
 }
 
+/// A server pod's container env, in order.
+fn pod_env(config: &LanguageServerConfig) -> Vec<(String, String)> {
+    let pod = server_pod_spec(&sandbox(), config, "v1");
+    pod.spec.expect("spec").containers[0]
+        .env
+        .clone()
+        .expect("env")
+        .into_iter()
+        .map(|e| (e.name, e.value.unwrap_or_default()))
+        .collect()
+}
+
+/// SME-452: npm's worst case for one registry request that never
+/// answers, from a pod's env (npm 10's defaults for what it leaves
+/// unset), is inside the install bound: npm gives up and says why
+/// before the bound throws its error and log away.
+#[test]
+fn test_npm_gives_up_on_a_stalled_registry_inside_the_install_bound() {
+    let env = pod_env(&config());
+    let setting = |key: &str, default: u64| -> u64 {
+        env.iter()
+            .find(|(name, _)| name == &format!("npm_config_{key}"))
+            .map_or(default, |(_, value)| value.parse().expect("a number"))
+    };
+    let timeout = setting("fetch_timeout", 300_000);
+    let retries = setting("fetch_retries", 2);
+    let min = setting("fetch_retry_mintimeout", 10_000);
+    let factor = setting("fetch_retry_factor", 10);
+    let max = setting("fetch_retry_maxtimeout", 60_000);
+    let backoff: u64 = (0..retries).map(|i| (min * factor.pow(i as u32)).min(max)).sum();
+    let worst = std::time::Duration::from_millis((retries + 1) * timeout + backoff);
+    assert!(
+        worst < INSTALL_TIMEOUT,
+        "npm's worst case on a stalled registry is {} s, not under the install bound's {} s",
+        worst.as_secs(),
+        INSTALL_TIMEOUT.as_secs()
+    );
+    for key in ["audit", "fund", "update_notifier"] {
+        let name = format!("npm_config_{key}");
+        assert!(env.contains(&(name.clone(), "false".to_string())), "{name} isn't false: {env:?}");
+    }
+}
+
+/// SME-452: a config's own npm setting wins over the stall bounds, and
+/// the pod has that name once (no reliance on Kubernetes' order for
+/// duplicate names).
+#[test]
+fn test_a_users_own_npm_setting_wins_over_the_stall_bounds() {
+    let mut config = config();
+    config.env.insert("npm_config_fetch_timeout".to_string(), "90000".to_string());
+    let named: Vec<_> = pod_env(&config).into_iter().filter(|(name, _)| name == "npm_config_fetch_timeout").collect();
+    assert_eq!(named, vec![("npm_config_fetch_timeout".to_string(), "90000".to_string())]);
+}
+
 fn server_pod(uid: &str, phase: &str, reason: Option<&str>, deleting: bool) -> Pod {
     let mut pod = unready_server_pod(uid, phase, reason, deleting);
     pod.metadata.annotations = Some([(READY_ANNOTATION.to_string(), "true".to_string())].into());
@@ -265,3 +319,7 @@ fn test_an_empty_install_still_records_success() {
 /// Real-cluster tests: a stand-in sandbox pod (the real image, idle)
 /// and its conversation's workspace claim, with `cat` as the "server".
 pub(crate) mod cluster;
+
+/// Real-cluster tests of installs that stall (SME-452), against a
+/// registry inside the server pod itself: no internet.
+mod stall;

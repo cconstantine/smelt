@@ -57,6 +57,30 @@ fn pod_script(install_command: &str) -> String {
     )
 }
 
+/// npm's own stall detection, bounded inside `INSTALL_TIMEOUT` (SME-452),
+/// as `npm_config_*` variables in every server pod; only npm and npx read
+/// them. npm 10's defaults (a 5-minute `fetch-timeout`, 2 retries, up to
+/// 60 s apart) keep one registry request that never answers alive for up
+/// to 970 s: measured against a registry that accepts and never answers,
+/// `npm install pyright` gave up after 971 s, so the 600 s install bound
+/// fired first and the pod went with npm's error and log. With these,
+/// npm drops a stalled request after 30 s and retries on a fresh
+/// connection, at most 4 × 30 s + 3 × 10 s = 150 s in all (measured:
+/// 151 s, `npm error network timeout`); a transient stall recovers
+/// inside the bound, and a dead registry fails with npm's own error. A
+/// real `npm install pyright` was unchanged (`added 1 package in 4s`; its
+/// slowest fetch, the tarball, about 3 s). Audit, fund and the update
+/// notifier are each one more request that can stall, and an install
+/// needs none of them. A name the config's own `env` sets wins.
+pub const NPM_STALL_BOUNDS: [(&str, &str); 6] = [
+    ("npm_config_fetch_timeout", "30000"),
+    ("npm_config_fetch_retries", "3"),
+    ("npm_config_fetch_retry_maxtimeout", "10000"),
+    ("npm_config_audit", "false"),
+    ("npm_config_fund", "false"),
+    ("npm_config_update_notifier", "false"),
+];
+
 /// The server pod for `config` next to `sandbox`, its config version
 /// `config_version`.
 #[expect(clippy::expect_used, reason = "a fixed Pod shape; the values from the user (env, image, limits) are strings, which the fields they fill take")]
@@ -65,6 +89,13 @@ pub fn server_pod_spec(sandbox: &SandboxRef, config: &LanguageServerConfig, conf
         json!({"name": "HOME", "value": POD_HOME}),
         json!({"name": "CARGO_HOME", "value": format!("{POD_HOME}/.cargo")}),
     ];
+    // The config's own value wins, and the pod has each name once.
+    env.extend(
+        NPM_STALL_BOUNDS
+            .iter()
+            .filter(|(name, _)| !config.env.contains_key(*name))
+            .map(|(name, value)| json!({"name": name, "value": value})),
+    );
     env.extend(config.env.iter().map(|(name, value)| json!({"name": name, "value": value})));
     serde_json::from_value(json!({
         "metadata": {
