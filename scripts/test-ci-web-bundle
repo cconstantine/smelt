@@ -36,10 +36,14 @@ fail() {
 }
 
 # Runs ci-web-bundle with $1 as dx, a 3 s silence limit, and a 20 s cap on
-# the whole run so a missing watchdog fails here instead of hanging.
+# the whole run so a missing watchdog fails here instead of hanging. RUSTUP_
+# AUTO_INSTALL is cleared first (SME-457 round 1): the stack's compose env now
+# sets it to 0 for exactly the processes this suite starts, so without the
+# clear the env-assert case below could pass with no export in the script at
+# all — a vacuous pin. Cleared, only ci-web-bundle's own export can set it.
 # Sets $out and $rc.
 run() {
-    out=$(CI_WEB_BUNDLE_DX="$1" CI_WEB_BUNDLE_SILENCE_SECS=3 timeout 20 scripts/ci-web-bundle 2>&1)
+    out=$(env -u RUSTUP_AUTO_INSTALL CI_WEB_BUNDLE_DX="$1" CI_WEB_BUNDLE_SILENCE_SECS=3 timeout 20 scripts/ci-web-bundle 2>&1)
     rc=$?
 }
 
