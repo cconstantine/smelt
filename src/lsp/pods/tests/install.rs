@@ -42,6 +42,44 @@ impl InstallReads for FakeReads {
     }
 }
 
+/// `PROCESS_LISTING` run here, by this machine's `sh`, with `rc` and
+/// `log` as the record and log paths.
+fn listing(rc: &str, log: &str) -> String {
+    let ran = std::process::Command::new("sh")
+        .args(["-c", PROCESS_LISTING, "sh", rc, log])
+        .output()
+        .expect("run the listing");
+    assert!(ran.status.success(), "the listing failed: {}", String::from_utf8_lossy(&ran.stderr));
+    String::from_utf8_lossy(&ran.stdout).into_owned()
+}
+
+/// SME-452 round 1, finding 2: a process's second word is printed only
+/// when it's a plain word. Measured: `curl http://user:SECRET@…` was
+/// listed whole, credential and all, into a tool result and the logs.
+#[test]
+fn test_the_process_listing_never_prints_a_second_word_that_isnt_plain() {
+    let secret = "http://user:SECRET-452@10.255.255.1/";
+    // `yes` takes the URL as its argv[1] and blocks on the full pipe.
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", r#"yes "$1" | sleep 30"#, "sh", secret])
+        .spawn()
+        .expect("spawn the process to list");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut listed = String::new();
+    while std::time::Instant::now() < deadline {
+        listed = listing("/nonexistent/install.rc", "/nonexistent/install.log");
+        if listed.contains("] yes ") && listed.contains("] sleep 30") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(!listed.contains("SECRET-452"), "the listing printed a credential: {listed}");
+    assert!(listed.lines().any(|line| line.ends_with("] yes …")), "{listed}");
+    assert!(listed.lines().any(|line| line.ends_with("] sleep 30")), "a plain word is kept: {listed}");
+}
+
 /// SME-452 round 1, (B′): a record read that never answers is given up
 /// on after `RC_READ_TIMEOUT` and counted as a failed read, so the wait
 /// still ends at its bound and says so. It once hung the wait, and

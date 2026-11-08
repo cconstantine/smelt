@@ -265,8 +265,10 @@ pub(super) async fn wait_install(
 /// (`install.rc`, if written), its log's size, and each process but the
 /// pod script (PID 1, whose command line is the install command itself)
 /// and this script's own shell, as `pid [state] <the first two words of
-/// its command line>` (`npm install`, `curl -fsSL`, `go install`). Never
-/// `environ`, and no more than 2,000 bytes. POSIX `sh` and `/proc` only,
+/// its command line>` (`npm install`, `curl -fsSL`, `go install`), the
+/// second only when it's a plain word, `…` otherwise (SME-452 round 1: a
+/// `curl http://user:SECRET@…` was listed whole). Never `environ`, and no
+/// more than 2,000 bytes. POSIX `sh` and `/proc` only,
 /// with `sed`, `tr`, `wc` and `head`, so it runs in Debian, busybox and
 /// Alpine images.
 pub(super) const PROCESS_LISTING: &str = r#"if [ -e /tmp/install.rc ]; then echo "install.rc: $(head -c 100 /tmp/install.rc)"; else echo "install.rc: not written"; fi
@@ -280,7 +282,11 @@ for d in /proc/[0-9]*; do
   # The words split, never globbed (the loop's list is already expanded).
   set -f
   set -- $(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
-  out="$out$p [$s] ${1:-} ${2:-}
+  # The second word only when it's a plain word (`install`, `-fsSL`): a
+  # URL, a `K=V` or anything else could carry a credential.
+  w=${2:-}
+  case "$w" in *[!A-Za-z0-9._/@-]*|*//*) w='…';; esac
+  out="$out$p [$s] ${1:-} $w
 "
 done
 printf '%s' "$out" | head -c 2000"#;
