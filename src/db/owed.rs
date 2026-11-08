@@ -6,8 +6,12 @@
 //! the message it's for, and cleared in the reply's transaction and at the
 //! turn's end, all under the turn lock. So in a running server it's set
 //! only while the turn that set it runs; set with no turn running, a
-//! restart (or a panic) dropped that turn, and the startup sweep and the
-//! next wake answer it, once (`wake_conversation`, `run_turn_steps`).
+//! restart dropped that turn, and the startup sweep or the next wake
+//! answers it, once (`wake_conversation`, `run_turn_steps`). A turn that
+//! panics keeps its mark too (nothing catches the unwind), so it's tried
+//! again at the next wake or restart, and a turn that panics every time
+//! is tried again at each of them (review 1, N2). A save where no turn
+//! will answer (D9, D10) sets no mark.
 
 use sqlx::PgPool;
 
