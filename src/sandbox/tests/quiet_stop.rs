@@ -275,6 +275,34 @@ async fn test_a_running_command_keeps_its_pod_until_it_ends_and_the_threshold_pa
     assert_eq!(pass(&pool, 60).await, vec![pod], "the threshold passed from finished_at");
 }
 
+/// SME-441: the stop that marks a running command lost moves the sidebar's
+/// command markers, so the app channel has to hear it — this is the one site
+/// covering every pod-loss path (user Stop, Remove volumes, crash cleanup,
+/// gone-pod pass) without a pod to outlive the mark.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_users_stop_with_a_command_running_publishes_commands_changed(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let (conversation, pod) = idle_pod(&pool, 90).await;
+    let terminal = db::create_sandbox_terminal(&pool, pod).await.expect("terminal");
+    let command = format!("stop-{pod}");
+    db::create_terminal_command(&pool, conversation, terminal.id, &command, "sleep 300", 300)
+        .await
+        .expect("command");
+    let mut app = events::subscribe_app();
+
+    stop_pod_for_user_with(&pool, pod, deleted(pod)).await.expect("the user's stop");
+
+    let row = db::get_terminal_command(&pool, &command).await.expect("read").expect("row");
+    assert_eq!(row.status, "lost", "the stop marks the running command lost");
+    let (mut saw_pods_changed, mut saw_commands_changed) = (false, false);
+    while let Ok(event) = app.try_recv() {
+        saw_pods_changed |= matches!(event, events::AppEvent::PodsChanged);
+        saw_commands_changed |= matches!(event, events::AppEvent::CommandsChanged);
+    }
+    assert!(saw_pods_changed, "PodsChanged");
+    assert!(saw_commands_changed, "CommandsChanged: the marker counts refetch on the stop");
+}
+
 /// SME-78 review 1 (A1): a flush that fails under the locks skips the
 /// candidate for this pass, rather than stopping it on a `last_active_at`
 /// that misses the activity just noted. The next pass, its flush through,
