@@ -122,3 +122,27 @@ async fn test_a_record_read_that_never_answers_still_ends_the_wait() {
         "{error}"
     );
 }
+
+/// What a failed install (exit 1) says, given its log read's answer.
+async fn failed_with(log: Answer<String>) -> String {
+    let reads = FakeReads { rc: Answer::Now(Ok(Some("1".to_string()))), log, processes: Answer::Never };
+    let limit = LOG_READ_TIMEOUT + std::time::Duration::from_secs(5);
+    let waited = tokio::time::timeout(limit, wait_install(&reads, "lsp-7-ra", "a", INSTALL_TIMEOUT)).await;
+    waited.expect("a failed install's log read held the call past its bound").expect_err("installed")
+}
+
+/// SME-452 round 1, finding 4: a failed install says why its log
+/// couldn't be read, or that it wrote nothing, as a timed-out one does,
+/// and its log read is bounded too. It once dropped `log_of`'s error and
+/// ended a bare `The install failed (exit 1):`.
+#[tokio::test(start_paused = true)]
+async fn test_a_failed_install_says_what_became_of_its_output() {
+    let error = failed_with(Answer::Now(Err("tail exited 1: no such file".to_string()))).await;
+    assert_eq!(error, "The install failed (exit 1) (its output couldn't be read: tail exited 1: no such file)");
+    let error = failed_with(Answer::Now(Ok(String::new()))).await;
+    assert_eq!(error, "The install failed (exit 1). It wrote no output.");
+    let error = failed_with(Answer::Now(Ok("npm error 404\n".to_string()))).await;
+    assert_eq!(error, "The install failed (exit 1). Its output:\nnpm error 404");
+    let error = failed_with(Answer::Never).await;
+    assert_eq!(error, "The install failed (exit 1) (its output couldn't be read: the read didn't answer within 10 s)");
+}

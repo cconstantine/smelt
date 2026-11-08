@@ -88,12 +88,8 @@ impl<'a> InstallWatch<'a> {
                 self.slowest_read.as_millis() as f64 / 1000.0
             ),
         };
-        let output = match log {
-            // npm writes nothing to a file until it ends (SME-452).
-            Ok(log) if log.trim().is_empty() => ". It wrote no output.".to_string(),
-            Ok(log) => format!(". Its output so far:\n{}", log.trim_end()),
-            Err(e) => format!(" (its output couldn't be read: {e})"),
-        };
+        // npm writes nothing to a file until it ends (SME-452).
+        let output = output_of(log, "Its output so far");
         let processes = match &self.processes {
             None => String::new(),
             Some(Ok(listing)) => format!("\nStill running then:\n{}", listing.trim_end()),
@@ -109,6 +105,17 @@ impl<'a> InstallWatch<'a> {
     /// (`PROCESS_LISTING`'s output, or why it couldn't be read).
     pub(super) fn saw_processes(&mut self, listing: Result<String, String>) {
         self.processes = Some(listing);
+    }
+}
+
+/// What an install's message says of its output (`log`, or why it
+/// couldn't be read), after `heading`, for a timed-out install and a
+/// failed one alike (SME-452 round 1).
+fn output_of(log: Result<String, String>, heading: &str) -> String {
+    match log {
+        Ok(log) if log.trim().is_empty() => ". It wrote no output.".to_string(),
+        Ok(log) => format!(". {heading}:\n{}", log.trim_end()),
+        Err(e) => format!(" (its output couldn't be read: {e})"),
     }
 }
 
@@ -234,8 +241,9 @@ pub(super) async fn wait_install(
                 if rc == "0" {
                     return Ok(());
                 }
-                let log = reads.log().await.unwrap_or_default();
-                return Err(format!("The install failed (exit {rc}):\n{}", log.trim_end()));
+                // Bounded like the timeout's reads (SME-452 round 1).
+                let log = bounded_read(reads.log(), LOG_READ_TIMEOUT).await;
+                return Err(format!("The install failed (exit {rc}){}", output_of(log, "Its output")));
             }
             // Ok(None): the install is still running. Err: this read didn't
             // get through — say so and ask again next second; the timeout
