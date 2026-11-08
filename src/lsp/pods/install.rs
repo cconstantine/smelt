@@ -262,7 +262,8 @@ pub(super) async fn wait_install(
 
 /// What was running in a server pod (SME-452's recurrence), for a
 /// timed-out install to name, since its pod is deleted after: its record
-/// (`install.rc`, if written), its log's size, and each process but the
+/// (`$1`, `INSTALL_RC`, if written), its log's size (`$2`, `INSTALL_LOG`,
+/// or `missing`), each labelled by its file name, and each process but the
 /// pod script (PID 1, whose command line is the install command itself)
 /// and this script's own shell, as `pid [state] <the first two words of
 /// its command line>` (`npm install`, `curl -fsSL`, `go install`), the
@@ -271,8 +272,9 @@ pub(super) async fn wait_install(
 /// more than 2,000 bytes. POSIX `sh` and `/proc` only,
 /// with `sed`, `tr`, `wc` and `head`, so it runs in Debian, busybox and
 /// Alpine images.
-pub(super) const PROCESS_LISTING: &str = r#"if [ -e /tmp/install.rc ]; then echo "install.rc: $(head -c 100 /tmp/install.rc)"; else echo "install.rc: not written"; fi
-echo "install.log: $(wc -c < /tmp/install.log 2>/dev/null || echo missing) bytes"
+pub(super) const PROCESS_LISTING: &str = r#"rc=$1 log=$2
+if [ -e "$rc" ]; then echo "${rc##*/}: $(head -c 100 "$rc")"; else echo "${rc##*/}: not written"; fi
+if n=$(wc -c 2>/dev/null < "$log"); then echo "${log##*/}: $n bytes"; else echo "${log##*/}: missing"; fi
 out=""
 for d in /proc/[0-9]*; do
   p=${d#/proc/}
@@ -293,7 +295,7 @@ printf '%s' "$out" | head -c 2000"#;
 
 /// `PROCESS_LISTING`'s output in pod `name`'s server container.
 async fn install_processes(client: &kube::Client, name: &str) -> Result<String, String> {
-    let result = crate::sandbox::exec_with(client, name, "server", &["sh", "-c", PROCESS_LISTING], None)
+    let result = crate::sandbox::exec_with(client, name, "server", &["sh", "-c", PROCESS_LISTING, "sh", INSTALL_RC, INSTALL_LOG], None)
         .await
         .map_err(|e| e.to_string())?;
     match result.exit_code {

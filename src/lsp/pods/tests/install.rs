@@ -80,6 +80,25 @@ fn test_the_process_listing_never_prints_a_second_word_that_isnt_plain() {
     assert!(listed.lines().any(|line| line.ends_with("] sleep 30")), "a plain word is kept: {listed}");
 }
 
+/// SME-452 round 1, finding 5: the listing reads the record and log at
+/// the paths it's given (`INSTALL_RC`, `INSTALL_LOG`), not paths of its
+/// own, and a missing log reads "missing", not "missing bytes".
+#[test]
+fn test_the_process_listing_reads_the_record_and_log_it_is_given() {
+    let dir = std::env::temp_dir().join(format!("sme-452-listing-paths-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    let (rc, log) = (dir.join("my.rc"), dir.join("my.log"));
+    let (rc, log) = (rc.to_str().expect("a path"), log.to_str().expect("a path"));
+    let listed = listing(rc, log);
+    assert!(listed.starts_with("my.rc: not written\nmy.log: missing\n"), "{listed}");
+    std::fs::write(rc, "0\n").expect("write the record");
+    std::fs::write(log, "added").expect("write the log");
+    let listed = listing(rc, log);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(listed.starts_with("my.rc: 0\nmy.log: 5 bytes\n"), "{listed}");
+}
+
 /// SME-452 round 1, (B′): a record read that never answers is given up
 /// on after `RC_READ_TIMEOUT` and counted as a failed read, so the wait
 /// still ends at its bound and says so. It once hung the wait, and
