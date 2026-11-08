@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Installs the docker compose plugin when the runner lacks it; start-stack's
+# first step (SME-458). COMPOSE_URL overrides the download, for tests.
+set -euo pipefail
+
+url=${COMPOSE_URL:-https://github.com/docker/compose/releases/download/v5.5.1/docker-compose-linux-x86_64}
+
+if ! docker compose version > /dev/null 2>&1; then
+  mkdir -p ~/.docker/cli-plugins
+  curl -fsSL -o ~/.docker/cli-plugins/docker-compose \
+    "$url"
+  chmod +x ~/.docker/cli-plugins/docker-compose
+fi

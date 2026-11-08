@@ -19,12 +19,7 @@ runs:
       # runner image includes it.
       shell: bash
       run: |
-        if ! docker compose version > /dev/null 2>&1; then
-          mkdir -p ~/.docker/cli-plugins
-          curl -fsSL -o ~/.docker/cli-plugins/docker-compose \
-            https://github.com/docker/compose/releases/download/v5.5.1/docker-compose-linux-x86_64
-          chmod +x ~/.docker/cli-plugins/docker-compose
-        fi
+        scripts/ci-install-compose
         docker compose version
 
     - name: Remove anything a previous run left behind
