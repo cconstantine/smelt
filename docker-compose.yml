@@ -51,6 +51,12 @@ services:
       # Unset it (or leave tempo down) and smelt runs as before; with
       # tempo down, a failed export logs one error per batch.
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4318
+      # Never let the cargo rustup shim auto-install a toolchain mid-run
+      # (SME-457): dx's progress estimate spawns `cargo +nightly`, the image
+      # has stable only, and the download has no timeout — a stalled one
+      # hangs dx build/dx serve forever with no output. The gate scripts set
+      # this too; this covers hand-run dx in this container.
+      - RUSTUP_AUTO_INSTALL=0
     # No auto-started dev server — exec in and run `dx serve` yourself so
     # cargo/test output isn't mixed with `docker compose up` logs:
     #   docker compose up -d
