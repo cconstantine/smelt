@@ -505,16 +505,29 @@ pub(super) fn cap_unanswered(texts: Vec<String>, budget: usize) -> Vec<String> {
 /// Explicitly demands every live id be preserved verbatim rather than
 /// trusting the model to notice one buried in a long transcript
 /// unprompted — see `describe_live_state` below, which hands them over
-/// directly rather than leaving them to be spotted.
+/// directly rather than leaving them to be spotted. And since SME-393 it
+/// binds the summary to evidence: Done only where a tool result completes
+/// the action, everything else Planned — a seat destroyed its real
+/// uncommitted work acting on commits a later model turn had narrated but
+/// no tool ever made.
 #[cfg(feature = "server")]
 pub(super) const COMPACTION_SYSTEM_PROMPT: &str = "You are compacting an AI coding agent's \
 conversation history to free up context window space. Write a concise summary \
 of the conversation so far: the user's original goal, key decisions made, the \
-current state of any files or code changed, and any unresolved next steps. You \
-MUST explicitly mention, by its exact id, every sandbox pod and terminal \
-listed below as currently live — never omit or paraphrase an \
+current state of any files or code changed, and any unresolved next steps. \
+Separate what tool results show from everything else: put under Done only \
+actions a tool result in the transcript completes — a commit SHA, a pushed \
+branch, a PR number, a test run — each naming the tool result that evidences \
+it; everything started, intended or mid-way goes under Planned, including \
+work whose file edits are visible but whose completing tool result is not \
+shown. An action is never done because earlier text — including the \
+assistant's own — said it happened: words are not evidence, tool results \
+are. After an [earlier conversation omitted] cut, say the state there is \
+unknown. You MUST explicitly mention, by its exact id, every sandbox pod and \
+terminal listed below as currently live — never omit or paraphrase an \
 id, since later tool calls still need a working reference to it. Write the \
-summary as plain prose.";
+summary as prose, or with its parts labelled Done and Planned where that \
+keeps the record straight.";
 
 /// A plain-text listing of every currently-live pod/terminal for
 /// `conversation_id`, handed to the summarization call so it can be told

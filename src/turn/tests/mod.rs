@@ -495,6 +495,7 @@ mod overflow;
 mod window_stop;
 mod window_learning;
 mod compaction_progress;
+mod compaction_honesty;
 mod transcript;
 mod room_limited;
 mod named_refusal;
