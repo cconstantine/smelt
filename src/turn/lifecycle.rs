@@ -265,6 +265,9 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
                         Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't keep a stopped turn's message"),
                     }
                 }
+                // A stop ends this turn as any end does: an answer its
+                // message took is owed nothing (SME-450 review 1, N1).
+                clear_answer_owed(pool, conversation_id).await;
                 end_stopped_turn(pool, conversation_id, stopped_by).await;
                 return Err(TurnFailure::Stopped);
             }
@@ -322,6 +325,8 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
         // Stopped mid-turn: the body, and its hold on the lock, is gone.
         let stopped_by = *stop.borrow_and_update();
         let _turn = lock.lock().await;
+        // A stop ends the turn as any end does (SME-450, D7).
+        clear_answer_owed(pool, conversation_id).await;
         note_drained_activity(conversation_id);
         end_stopped_turn(pool, conversation_id, stopped_by).await;
         Err(TurnFailure::Stopped)

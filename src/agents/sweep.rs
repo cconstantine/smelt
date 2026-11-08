@@ -1,5 +1,8 @@
-//! The startup sweep: no start survives a restart, and nothing wakes a
-//! conversation for what was queued to it before one.
+//! The startup sweep: no start survives a restart, and every conversation
+//! the restart left something to answer is woken once, roots included:
+//! one with a report or notice queued to it, one owed an answer by a turn
+//! the restart dropped, and one whose command's end is recorded but whose
+//! wake never drained it (SME-450).
 
 use super::*;
 
@@ -11,10 +14,11 @@ pub(crate) const RESTARTED_MID_TURN: &str = "smelt restarted during your turn; c
 
 /// Fails every child still `starting` (its start ran in a task the restart
 /// ended), as `fail_start` does, and cleans up after it as a start's exit
-/// would; then wakes every conversation with an undelivered report or
-/// notice that isn't a `stopped` agent nor paused by the user (the pause
-/// is stored, SME-238, and restored before this runs). Returns the wakes'
-/// tasks.
+/// would; then wakes, once each, every conversation with an undelivered
+/// report or notice, every one owed an answer and every one with a
+/// command's end undrained, that isn't a `stopped`
+/// agent nor paused by the user (the pause is stored, SME-238, and
+/// restored before this runs). Returns the wakes' tasks.
 pub(crate) async fn startup_sweep(pool: &PgPool) -> Vec<tokio::task::JoinHandle<()>> {
     let mut wakes = Vec::new();
     match db::starting_agents(pool).await {
@@ -33,13 +37,21 @@ pub(crate) async fn startup_sweep(pool: &PgPool) -> Vec<tokio::task::JoinHandle<
         Err(e) => tracing::warn!(error = %e, "couldn't list the agents a restart cut off"),
     }
     notify_cut_off_turns(pool).await;
+    let mut to_wake = std::collections::BTreeSet::new();
     match db::conversations_with_queued_messages(pool).await {
-        Ok(ids) => {
-            for id in ids {
-                wakes.push(crate::turn::notify(pool, id, vec![crate::turn::Notice::Wake]));
-            }
-        }
+        Ok(ids) => to_wake.extend(ids),
         Err(e) => tracing::warn!(error = %e, "couldn't list conversations with queued agent messages"),
+    }
+    match db::conversations_owed_an_answer(pool).await {
+        Ok(ids) => to_wake.extend(ids),
+        Err(e) => tracing::warn!(error = %e, "couldn't list conversations owed an answer"),
+    }
+    match db::conversations_with_unnotified_ends(pool).await {
+        Ok(ids) => to_wake.extend(ids),
+        Err(e) => tracing::warn!(error = %e, "couldn't list conversations with undrained command ends"),
+    }
+    for id in to_wake {
+        wakes.push(crate::turn::notify(pool, id, vec![crate::turn::Notice::Wake]));
     }
     wakes
 }

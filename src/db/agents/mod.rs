@@ -39,6 +39,9 @@ pub const KIND_NOTICE: &str = "notice";
 pub const KIND_MESSAGE: &str = "message";
 /// `agent_messages.kind`: a child's `ask_parent`, queued to its parent.
 pub const KIND_QUESTION: &str = "question";
+/// `agent_messages.kind`: a `Notice::Deliver` waiting for its wake, its
+/// body the notice as said, already marked (SME-450).
+pub const KIND_SERVER_NOTICE: &str = "server_notice";
 
 /// One queued report or notice, as the drain reads it.
 #[derive(Clone, Debug, sqlx::FromRow)]
@@ -543,6 +546,13 @@ pub async fn queue_notice(pool: &PgPool, to: i64, from: i64, from_label: &str, b
     queue_agent_message(&mut conn, to, Some(from), from_label, KIND_NOTICE, body).await
 }
 
+/// Queues `text`, a `Notice::Deliver`'s already-marked words, to `to` for
+/// its wake to drain verbatim (SME-450): queued, it survives a restart.
+pub async fn queue_server_notice(pool: &PgPool, to: i64, text: &str) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    queue_agent_message(&mut conn, to, None, "smelt", KIND_SERVER_NOTICE, text).await
+}
+
 /// The idle check's own query (`$1` the conversation id, `$2` active,
 /// `$3` starting), a constant so the running-command clause is
 /// EXPLAIN-tested as written, not paraphrased (SME-389 R1-1).
@@ -665,11 +675,32 @@ pub async fn undelivered_agent_messages(pool: &PgPool, to: i64) -> Result<Vec<Ag
 /// Delivers one queued row: its `user` message saved, and the row marked
 /// delivered and linked to it, in one transaction, so a stop between the
 /// two can't save it twice. `None` when another drain delivered it first
-/// or the recipient is gone.
+/// or the recipient is gone. A turn's drain delivers it, so the message
+/// is owed the model's answer (SME-450).
 pub async fn deliver_agent_message(
     pool: &PgPool,
     row: &AgentMessage,
     content: &[ContentBlock],
+) -> Result<Option<Message>, sqlx::Error> {
+    deliver_agent_message_owed(pool, row, content, true).await
+}
+
+/// `deliver_agent_message` for a row saved where no turn will answer it
+/// (a paused conversation's notice, D9): no answer is owed, since a mark
+/// with no turn running says a restart dropped one (review 1, L1).
+pub async fn deliver_agent_message_unanswered(
+    pool: &PgPool,
+    row: &AgentMessage,
+    content: &[ContentBlock],
+) -> Result<Option<Message>, sqlx::Error> {
+    deliver_agent_message_owed(pool, row, content, false).await
+}
+
+async fn deliver_agent_message_owed(
+    pool: &PgPool,
+    row: &AgentMessage,
+    content: &[ContentBlock],
+    owed: bool,
 ) -> Result<Option<Message>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     if !lock_conversations(&mut tx, &[(row.to_conversation_id, RowLock::NoKeyUpdate)]).await? {
@@ -683,7 +714,11 @@ pub async fn deliver_agent_message(
     if marked == 0 {
         return Ok(None);
     }
-    let saved = super::conversations::create_message_on(&mut tx, row.to_conversation_id, "user", content).await?;
+    let saved = if owed {
+        super::owed::create_owed_message_on(&mut tx, row.to_conversation_id, content).await?
+    } else {
+        super::conversations::create_message_on(&mut tx, row.to_conversation_id, "user", content).await?
+    };
     sqlx::query("UPDATE agent_messages SET delivered_message_id = $2 WHERE id = $1")
         .bind(row.id)
         .bind(saved.id)
