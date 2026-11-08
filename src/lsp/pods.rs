@@ -50,12 +50,42 @@ pub fn server_pod_name(pod_id: i64, server: &str) -> String {
     format!("lsp-{pod_id}-{server}")
 }
 
+/// How long a TLS connect may take during an install (SME-452's
+/// mechanism): the DNS lookup, the TCP connect and the handshake alike.
+/// npm bounds none of them: `@npmcli/agent` hard-codes its connection
+/// timeout to 0, and `fetch-timeout` (`NPM_STALL_BOUNDS`) starts only once
+/// the agent hands over a connected socket. So a connection that opens
+/// and then goes quiet before TLS completes (a peer that never answers
+/// the ClientHello, a path that goes dark after the SYN-ACK) held npm
+/// silent past the 600 s install bound, never retried, with 0 bytes of
+/// log: measured through `test_pyright_from_the_catalog_answers` against
+/// a k3s-node tarpit holding only the first connection, with a working
+/// registry one retry away. The install preloads `connect_bound.js`,
+/// which destroys such a connect with `ECONNECTIONTIMEOUT`; npm retries
+/// that on a fresh connection and logs each attempt. Worst case per
+/// request: 4 tries × (30 s connect + 30 s fetch) + 3 × 10 s backoff =
+/// 270 s, inside `INSTALL_TIMEOUT`. A real handshake takes well under 1 s.
+pub const CONNECT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Where the pod script writes the connect bound's preload.
+const CONNECT_BOUND_JS: &str = "/tmp/smelt-connect-bound.js";
+
 /// The script a server pod runs: the install, its outcome recorded, then
 /// idle until deleted (the server itself is started over `pods/exec`).
+/// The install's subshell alone preloads `CONNECT_BOUND`'s
+/// `connect_bound.js` through `NODE_OPTIONS`, after any of the config's
+/// own; installs that don't run node ignore it. If the preload can't be
+/// written, the install runs without it.
 fn pod_script(install_command: &str) -> String {
     let install = if install_command.trim().is_empty() { "true" } else { install_command };
+    let preload = include_str!("pods/connect_bound.js")
+        .trim_end()
+        .replace("__CONNECT_BOUND_MS__", &CONNECT_BOUND.as_millis().to_string());
     format!(
-        "mkdir -p \"$HOME\" && ( {install} ) > {INSTALL_LOG} 2>&1; echo $? > {INSTALL_RC}; \
+        "cat > {CONNECT_BOUND_JS} <<'SMELT_EOF'\n{preload}\nSMELT_EOF\n\
+         mkdir -p \"$HOME\" && ( [ -f {CONNECT_BOUND_JS} ] && \
+         NODE_OPTIONS=\"${{NODE_OPTIONS:+$NODE_OPTIONS }}--require={CONNECT_BOUND_JS}\" && \
+         export NODE_OPTIONS; {install} ) > {INSTALL_LOG} 2>&1; echo $? > {INSTALL_RC}; \
          trap 'exit 0' TERM; while :; do sleep 1 & wait; done"
     )
 }
@@ -81,7 +111,8 @@ fn pod_script(install_command: &str) -> String {
 /// install's log then says how far npm got (SME-452's recurrence). The
 /// config's own `env` (in any of npm's spellings of the name) or the
 /// install command's own flags win over these; a `~/.npmrc` doesn't,
-/// since npm ranks its environment above it.
+/// since npm ranks its environment above it. These bound only what comes
+/// after the socket: opening the connection is `CONNECT_BOUND`'s.
 pub const NPM_STALL_BOUNDS: [(&str, &str); 7] = [
     ("npm_config_fetch_timeout", "30000"),
     ("npm_config_fetch_retries", "3"),

@@ -94,7 +94,10 @@ fn pod_env(config: &LanguageServerConfig) -> Vec<(String, String)> {
 /// SME-452: npm's worst case for one registry request that never
 /// answers, from a pod's env (npm 10's defaults for what it leaves
 /// unset), is inside the install bound: npm gives up and says why
-/// before the bound throws its error and log away.
+/// before the bound throws its error and log away. The env bounds only
+/// what comes after the socket; each try's connect adds up to
+/// `CONNECT_BOUND` more (4 × (30 + 30) + 3 × 10 = 270 s, still inside),
+/// which `pod_script`'s preload enforces and this test doesn't read.
 #[test]
 fn test_npm_gives_up_on_a_stalled_registry_inside_the_install_bound() {
     let env = pod_env(&config());
@@ -428,7 +431,34 @@ fn test_a_stop_explains_an_oom_and_names_any_other_reason() {
 
 #[test]
 fn test_an_empty_install_still_records_success() {
-    assert!(pod_script("  ").contains("( true )"));
+    assert!(pod_script("  ").contains(" true ) > /tmp/install.log"), "{}", pod_script("  "));
+}
+
+/// SME-452's mechanism: npm bounds no part of opening a connection, so
+/// the install runs with a preload that bounds every TLS connect at 30 s,
+/// written by the script itself. Only the install's subshell loads it:
+/// the language server, started later over `pods/exec`, never does.
+#[test]
+fn test_a_node_install_gets_a_connect_bound_and_the_server_doesnt() {
+    let preload = include_str!("connect_bound.js");
+    assert!(!preload.lines().any(|line| line.trim() == "SMELT_EOF"), "the preload would end its own heredoc");
+    let script = pod_script("npm install x");
+    let (head, rest) = script
+        .split_once("<<'SMELT_EOF'\n")
+        .unwrap_or_else(|| panic!("no smelt-connect-bound.js written: {script}"));
+    assert!(head.ends_with("cat > /tmp/smelt-connect-bound.js "), "{script}");
+    let (body, after) = rest.split_once("\nSMELT_EOF\n").unwrap_or_else(|| panic!("no SMELT_EOF line: {script}"));
+    assert_eq!(body, preload.trim_end().replace("__CONNECT_BOUND_MS__", "30000"));
+    let (subshell, tail) = after
+        .split_once(") > /tmp/install.log 2>&1")
+        .unwrap_or_else(|| panic!("no install subshell: {after}"));
+    let require = "[ -f /tmp/smelt-connect-bound.js ] && \
+                   NODE_OPTIONS=\"${NODE_OPTIONS:+$NODE_OPTIONS }--require=/tmp/smelt-connect-bound.js\" && \
+                   export NODE_OPTIONS;";
+    let at = subshell.find(require).unwrap_or_else(|| panic!("no NODE_OPTIONS in the subshell: {subshell}"));
+    assert!(subshell[at..].contains("npm install x"), "the install doesn't come after it: {subshell}");
+    assert!(!tail.contains("NODE_OPTIONS"), "outside the install's subshell: {tail}");
+    assert!(tail.contains("echo $? > /tmp/install.rc"), "{tail}");
 }
 
 /// Real-cluster tests: a stand-in sandbox pod (the real image, idle)
@@ -445,3 +475,7 @@ mod silent;
 
 /// The install wait's loop over fake reads (SME-452 round 1).
 mod install;
+
+/// A real-cluster test of an install whose TLS handshake never answers
+/// (SME-452's mechanism), against a tarpit inside the server pod.
+mod handshake;
