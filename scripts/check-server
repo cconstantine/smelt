@@ -502,6 +502,13 @@ start() {
     no_color=$(effective_value NO_COLOR)
     overrides+=("RUST_LOG=$log_level" "NO_COLOR=${no_color:-1}")
 
+    # dx serve runs the same unit-count estimate dx build does: it spawns
+    # `cargo +nightly rustc --unit-graph`, and rustup's shim answers a missing
+    # toolchain by downloading one from the network with no timeout — a
+    # stalled download hangs this server forever, logging nothing (SME-457).
+    # Before the caller's overrides, so an explicit one still wins.
+    overrides=("RUSTUP_AUTO_INSTALL=0" "${overrides[@]}")
+
     # The run before is kept, so one more start can't lose the run being
     # looked into.
     [ -s "$(log_file)" ] && cp "$(log_file)" "$(log_file).prev"
