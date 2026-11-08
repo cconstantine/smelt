@@ -59,19 +59,27 @@ async fn test_an_exec_the_runtime_cant_start_reads_as_a_failure() {
     .await;
 }
 
-/// A registry on `127.0.0.1:8080` inside the server pod that answers
-/// `GET /trickle`'s packument with its `content-length` set and then one
-/// byte every 20 s: never idle long enough for npm's 30 s fetch timeout,
-/// never done. npm has no bound on a request's total time, and writes
-/// nothing to a file until it ends, so the install sits silent, the
+/// A registry on `127.0.0.1:8080` inside the server pod. `GET /trickle`'s
+/// packument comes at once, its 1.0.0 depending on `trickle-dep`, so npm
+/// logs that fetch (`loglevel=http`, SME-452 round 1). `GET /trickle-dep`'s
+/// comes with its `content-length` set and then one byte every 20 s:
+/// never idle long enough for npm's 30 s fetch timeout, never done. npm
+/// has no bound on a request's total time, so the install sits there, the
 /// recurrence's mechanism (A) (the Planner's M2). The registry's own
 /// output goes nowhere, so the log is npm's alone.
 const TRICKLING_REGISTRY_INSTALL: &str = r#"set -e
 cat > /tmp/registry.js <<'EOF'
 const http = require('http'), fs = require('fs');
-const body = JSON.stringify({name: 'trickle', 'dist-tags': {latest: '1.0.0'}, versions: {}});
+const first = JSON.stringify({name: 'trickle', 'dist-tags': {latest: '1.0.0'}, versions: {'1.0.0': {
+  name: 'trickle', version: '1.0.0', dependencies: {'trickle-dep': '1.0.0'},
+  dist: {tarball: 'http://127.0.0.1:8080/trickle-1.0.0.tgz'}}}});
+const body = JSON.stringify({name: 'trickle-dep', 'dist-tags': {latest: '1.0.0'}, versions: {}});
 http.createServer((req, res) => {
-  if (req.url !== '/trickle') { res.statusCode = 404; return res.end('{}'); }
+  if (req.url === '/trickle') {
+    res.writeHead(200, {'content-type': 'application/json'});
+    return res.end(first);
+  }
+  if (req.url !== '/trickle-dep') { res.statusCode = 404; return res.end('{}'); }
   res.writeHead(200, {'content-type': 'application/json', 'content-length': Buffer.byteLength(body)});
   let sent = 0;
   const next = () => { if (sent < body.length) res.write(body[sent++]); };
@@ -89,9 +97,11 @@ npm install --prefix /tmp/home/lsp trickle@1.0.0 --registry=http://127.0.0.1:808
 /// SME-452's recurrence, on demand: an npm install still running, and
 /// silent, when its bound runs out gave CI's `The install didn't finish
 /// within 10 minutes. Its output so far:` with nothing after it. It now
-/// says it wrote no output and names what was still running then (npm
-/// sets its process title to `npm install …`). A 90 s bound stands in
-/// for the 10 minutes, through the real wait.
+/// says how far npm got, its `npm http fetch` lines written mid-install
+/// (round 1: Q1's `loglevel=http` shown working), and names what was
+/// still running then (npm sets its process title to `npm install …`).
+/// An empty log's `It wrote no output.` is the unit tests'. A 90 s bound
+/// stands in for the 10 minutes, through the real wait.
 #[tokio::test]
 async fn test_a_silent_npm_install_that_runs_out_its_bound_names_what_was_running() {
     with_sandbox(|client, sandbox| async move {
@@ -121,7 +131,11 @@ async fn test_a_silent_npm_install_that_runs_out_its_bound_names_what_was_runnin
         let error = installed.expect("waited").expect_err("an install from a trickling registry finished");
         eprintln!("the timed-out install said: {error:?}");
         assert!(error.starts_with("The install didn't finish within 1 minute"), "{error}");
-        assert!(error.contains("It wrote no output"), "{error}");
+        assert!(
+            error.lines().any(|line| line.starts_with("npm http fetch GET 200 http://127.0.0.1:8080/trickle ")),
+            "no fetch logged: {error}"
+        );
+        assert!(!error.contains("/trickle-dep "), "the trickled fetch can't have ended: {error}");
         assert!(error.lines().any(|line| line.contains("] npm install")), "no npm process named: {error}");
     })
     .await;

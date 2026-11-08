@@ -123,6 +123,25 @@ async fn test_a_record_read_that_never_answers_still_ends_the_wait() {
     );
 }
 
+/// SME-452 round 1, finding 6: a timed-out install names what was still
+/// running when the listing came through, and says why when it didn't.
+#[test]
+fn test_a_timed_out_install_names_its_processes_or_why_it_couldnt() {
+    let mut watch = InstallWatch::new("lsp-7-ra", "a");
+    watch.saw_processes(Ok("install.rc: not written\n8 [S (sleeping)] npm install\n".to_string()));
+    let error = watch.timed_out(INSTALL_TIMEOUT, Ok(String::new()));
+    assert!(
+        error.ends_with(". It wrote no output.\nStill running then:\ninstall.rc: not written\n8 [S (sleeping)] npm install"),
+        "{error}"
+    );
+    watch.saw_processes(Err("the read didn't answer within 10 s".to_string()));
+    let error = watch.timed_out(INSTALL_TIMEOUT, Ok(String::new()));
+    assert!(
+        error.ends_with(". It wrote no output.\n(its processes couldn't be read: the read didn't answer within 10 s)"),
+        "{error}"
+    );
+}
+
 /// What a failed install (exit 1) says, given its log read's answer.
 async fn failed_with(log: Answer<String>) -> String {
     let reads = FakeReads { rc: Answer::Now(Ok(Some("1".to_string()))), log, processes: Answer::Never };
