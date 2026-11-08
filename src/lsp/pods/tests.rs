@@ -296,6 +296,11 @@ fn test_a_timed_out_install_says_its_output_and_its_records_failed_reads() {
     let error = watch.timed_out(std::time::Duration::from_secs(5), Err("the pod is gone".to_string()));
     assert!(error.starts_with("The install didn't finish within 5 s"), "{error}");
     assert!(error.ends_with(" (its output couldn't be read: the pod is gone)"), "{error}");
+    // Review 1: one minute is singular.
+    let error = watch.timed_out(std::time::Duration::from_secs(90), Ok(String::new()));
+    assert!(error.starts_with("The install didn't finish within 1 minute;"), "{error}");
+    let error = watch.timed_out(std::time::Duration::from_secs(120), Ok(String::new()));
+    assert!(error.starts_with("The install didn't finish within 2 minutes;"), "{error}");
 }
 
 /// SME-452 review 1: a timed-out install's log read that never answers

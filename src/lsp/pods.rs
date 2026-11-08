@@ -58,20 +58,23 @@ fn pod_script(install_command: &str) -> String {
 }
 
 /// npm's own stall detection, bounded inside `INSTALL_TIMEOUT` (SME-452),
-/// as `npm_config_*` variables in every server pod; only npm and npx read
-/// them. npm 10's defaults (a 5-minute `fetch-timeout`, 2 retries, up to
+/// as `npm_config_*` variables in every server pod; npm and npx read
+/// them, and pnpm and yarn classic too, harmlessly. npm 10's defaults (a 5-minute `fetch-timeout`, 2 retries, up to
 /// 60 s apart) keep one registry request that never answers alive for up
 /// to 970 s: measured against a registry that accepts and never answers,
 /// `npm install pyright` gave up after 971 s, so the 600 s install bound
 /// fired first and the pod went with npm's error and log. With these,
 /// npm drops a stalled request after 30 s and retries on a fresh
-/// connection, at most 4 × 30 s + 3 × 10 s = 150 s in all (measured:
+/// connection, at most 4 × 30 s + 3 × 10 s = 150 s per request (an
+/// install makes several, each with its own 150 s; measured for one:
 /// 151 s, `npm error network timeout`); a transient stall recovers
 /// inside the bound, and a dead registry fails with npm's own error. A
 /// real `npm install pyright` was unchanged (`added 1 package in 4s`; its
 /// slowest fetch, the tarball, about 3 s). Audit, fund and the update
 /// notifier are each one more request that can stall, and an install
-/// needs none of them. A name the config's own `env` sets wins.
+/// needs none of them. The config's own `env` (in any of npm's spellings
+/// of the name) or the install command's own flags win over these; a
+/// `~/.npmrc` doesn't, since npm ranks its environment above it.
 pub const NPM_STALL_BOUNDS: [(&str, &str); 6] = [
     ("npm_config_fetch_timeout", "30000"),
     ("npm_config_fetch_retries", "3"),
@@ -389,10 +392,10 @@ impl<'a> InstallWatch<'a> {
     /// The error for an install still running after `bound`, with its
     /// output so far (`log`, or why it couldn't be read).
     fn timed_out(&self, bound: std::time::Duration, log: Result<String, String>) -> String {
-        let within = if bound.as_secs() >= 60 {
-            format!("{} minutes", bound.as_secs() / 60)
-        } else {
-            format!("{} s", bound.as_secs())
+        let within = match bound.as_secs() / 60 {
+            0 => format!("{} s", bound.as_secs()),
+            1 => "1 minute".to_string(),
+            minutes => format!("{minutes} minutes"),
         };
         let record = match (self.rc_read_failures, &self.rc_read_error) {
             (0, _) | (_, None) => String::new(),
