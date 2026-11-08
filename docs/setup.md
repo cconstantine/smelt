@@ -165,7 +165,8 @@ Four things trip a conversation sandbox's stack (SME-257's retrospective, propos
   connections (its header lists the cases and verdicts; results in
   `target/repro-net/<case>/`).
 
-Helper scripts: `scripts/check.sh` (the checks every commit must pass: both
+Helper scripts: `scripts/check.sh` (the gate on every commit, or every push
+point in a sandbox seat, per `docs/process/rules-commits.md`: both
 builds and the test build with no warnings, plus the server tests), `scripts/check-server`
 (`dx serve` from a separate worktree, for hands-on checks), and
 `scripts/clean-test-namespace.sh` (deletes every pod and Docker data claim in the
