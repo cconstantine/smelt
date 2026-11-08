@@ -144,6 +144,7 @@ In [api/events.md](api/events.md#the-browsing-panels-own-live-channel).
 | `get_pods` | `GET /api/pods` | every live pod with status, node (SME-304), activity, limits and usage, see above |
 | `stop_pod` | `POST /api/pods/{pod_id}/stop` | the user stopping a pod, see above |
 | `get_live_pod_conversations` | `GET /api/pods/conversations` | conversations with a live pod, for the sidebar |
+| `get_running_command_conversations` | `GET /api/pods/commands` | conversations with terminal commands running on a live pod, with the counts, for the sidebar's markers (SME-441) |
 | `subscribe_app_events` | `GET /api/app-events` | always-open app-wide stream (`AppEvent`), for the pods page and for a chat tab with no conversation open (SME-269) |
 | `get_build_id` (`api::version`) | `GET /api/build-id` | the server's `SMELT_BUILD_ID`; a tab asks on every stream (re)connect and offers a reload when it isn't its own (see [architecture.md](architecture.md#live-channels)). The browser tier can override it (`test_override`, `browser-test` only) |
 | `list_conversation_repos` | `GET /api/conversations/{id}/repos` | the conversation's repos, for the sandbox panel, see `ReposUpdate` above |
