@@ -238,6 +238,28 @@ case_gh_bad_sha_all_down() {
     verdict 1
 }
 
+# Another pod on the same cache volume has its own PID namespace, so its
+# step can hold this run's pid: a temp file named after the pid would be
+# shared (SME-458 review 1, L1). The other pod's temp file is made here at
+# the installer's own pid (exec keeps it) and must come through untouched.
+case_foreign_tmp() {
+    start_server ok
+    mkdir -p "$CI_CACHE_DIR/tools"
+    export HOME=$dir/home1 DOCKER_CONFIG=$dir/home1/.docker
+    mkdir -p "$HOME"
+    out=$(COMPOSE_URL=$url PATH="$work/bin:$PATH" timeout 30 bash -c \
+        'printf "the other pod'\''s download" >"$1.tmp.$$"; echo "$1.tmp.$$" >"$2"; exec "$3"' \
+        _ "$(cache_file)" "$dir/foreign" "$installer" 2>&1)
+    rc=$?
+    foreign=$(cat "$dir/foreign")
+    [ "$rc" -eq 0 ] || want "exit 0"
+    has "install-compose: fetched from github releases on attempt 1 of 3, sha256 ok; cached at $(cache_file)"
+    [ "$(cat "$foreign" 2>/dev/null)" = "the other pod's download" ] ||
+        want "the other pod's temp file ${foreign##*/} untouched"
+    same_as "$(cache_file)" "$fixture" "the cache holds the fixture"
+    verdict 1
+}
+
 case_cache_hit() {
     start_server ok
     mkdir -p "$CI_CACHE_DIR/tools" && cp "$fixture" "$(cache_file)"
@@ -335,7 +357,7 @@ case_pin() {
 }
 
 all=(present gh-504-once gh-down-image gh-down-image-local gh-hang gh-bad-sha
-    gh-bad-sha-all-down cache-hit cache-corrupt second-run no-cache-dir cache-readonly all-down)
+    gh-bad-sha-all-down foreign-tmp cache-hit cache-corrupt second-run no-cache-dir cache-readonly all-down)
 [ $# -gt 0 ] && all=("$@")
 for c in "${all[@]}"; do
     new_case "$c"

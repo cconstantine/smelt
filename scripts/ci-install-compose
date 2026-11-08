@@ -80,12 +80,14 @@ if [ -n "$cache" ]; then
 fi
 
 # Downloads land in a temp file next to the cache, so the rename into it is
-# atomic: two jobs at once can't leave a torn file. A cache dir that can't
+# atomic: two jobs at once can't leave a torn file. Its name is mktemp's,
+# not the pid's: pods sharing the volume have their own pid namespaces, so
+# two steps can hold the same pid (SME-458 review 1). A cache dir that can't
 # be written to (a broken volume) only costs the caching: the download goes
 # to a temp file elsewhere. The trap removes the temp file on any exit.
 tmp=
-if [ -n "$cache" ] && mkdir -p "${cache%/*}" 2>/dev/null && : 2>/dev/null >"$cache.tmp.$$"; then
-    tmp=$cache.tmp.$$
+if [ -n "$cache" ] && mkdir -p "${cache%/*}" 2>/dev/null; then
+    tmp=$(mktemp "$cache.tmp.XXXXXX" 2>/dev/null) || tmp=
 fi
 trap 'rm -f "$tmp"' EXIT
 [ -n "$tmp" ] || tmp=$(mktemp)
@@ -129,7 +131,7 @@ try_source() {
     local name=$1 fetch=$2 k got where moved
     for ((k = 1; k <= attempts; k++)); do
         how= err=
-        rm -f "$tmp"
+        : >"$tmp" # emptied, not removed: the name stays this run's
         if "$fetch"; then
             got=$(sha_of "$tmp")
             if [ "$got" = "$want" ]; then
