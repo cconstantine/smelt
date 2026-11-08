@@ -63,6 +63,11 @@ pub(super) async fn scenario_live_command_marker(t: &Scenario<'_>) {
             .into_value()
             .expect("strings");
         assert_ne!(colors[0], colors[1], "{what}: the marker is the pod dot's colour: {colors:?}");
+        // And it has a colour at all: with the `.live-command-dot` rule (or
+        // its background) gone the computed bg is the transparent initial
+        // value, which ≠ green would happily pass — Done-when's *visible*
+        // dot demands more than difference.
+        assert_ne!(colors[0], "rgba(0, 0, 0, 0)", "{what}: the marker is invisible — computed background is transparent: {colors:?}");
     }
 
     // c. The command finishes by itself; the marker goes on both tabs —
