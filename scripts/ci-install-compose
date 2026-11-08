@@ -110,13 +110,19 @@ fetch_github() {
 }
 
 fetch_image() {
-    local id
+    local id rc
     if docker image inspect "$image" >/dev/null 2>&1; then
         how="already in the daemon"
     elif err=$(timeout "$pull_timeout" docker pull "$image" 2>&1); then
         how=pulled
     else
-        err=$(last_line "${err:-docker pull gave up after ${pull_timeout}s}")
+        rc=$?
+        # Killed by its timeout: the output's last line is only progress.
+        if [ "$rc" -eq 124 ]; then
+            err="docker pull gave up after ${pull_timeout}s"
+        else
+            err=$(last_line "${err:-docker pull failed with exit $rc and no message}")
+        fi
         return 1
     fi
     if ! id=$(docker create "$image" x 2>&1); then

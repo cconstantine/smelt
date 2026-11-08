@@ -35,7 +35,8 @@ printf '#!/bin/sh\necho "some other compose"\n' >"$other"
 
 # The stub docker. `compose version` works once a plugin is installed where
 # the real CLI looks (or with STUB_COMPOSE_PRESENT=1); the image calls follow
-# STUB_IMAGE_LOCAL, STUB_PULL_FAIL (N or all) and STUB_IMAGE_FILE. Every call
+# STUB_IMAGE_LOCAL, STUB_PULL_FAIL (N or all), STUB_PULL_HANG (print a
+# progress line, then hang) and STUB_IMAGE_FILE. Every call
 # is appended to $STUB_CALLS.
 mkdir -p "$work/bin"
 cat >"$work/bin/docker" <<'STUB'
@@ -58,6 +59,10 @@ image)
 pull)
     n=$(($(cat "$STUB_CALLS.pulls" 2>/dev/null || echo 0) + 1))
     echo "$n" >"$STUB_CALLS.pulls"
+    if [ -n "${STUB_PULL_HANG:-}" ]; then
+        echo "abc123: Downloading"
+        exec sleep 60
+    fi
     if [ "${STUB_PULL_FAIL:-0}" = all ] || [ "$n" -le "${STUB_PULL_FAIL:-0}" ]; then
         echo "Error response from daemon: Get \"https://registry-1.docker.io/v2/\": dial tcp: lookup registry-1.docker.io: no such host" >&2
         exit 1
@@ -101,7 +106,7 @@ new_case() {
     : >"$dir/server.log"
     : >"$dir/calls"
     wants=()
-    unset STUB_COMPOSE_PRESENT STUB_IMAGE_LOCAL STUB_PULL_FAIL
+    unset STUB_COMPOSE_PRESENT STUB_IMAGE_LOCAL STUB_PULL_FAIL STUB_PULL_HANG
     export STUB_CALLS=$dir/calls STUB_IMAGE_FILE=$fixture
     export CI_CACHE_DIR=$dir/cache
     export COMPOSE_SHA256=$fixture_sha COMPOSE_IMAGE=stub/compose-bin:vTEST
@@ -363,6 +368,19 @@ case_cache_corrupt_readonly() {
     verdict 1
 }
 
+# A pull its timeout kills says so, not its last progress line (SME-458
+# review 1, L3).
+case_pull_hang() {
+    start_server always-504
+    export STUB_PULL_HANG=1 COMPOSE_PULL_TIMEOUT=1
+    run_installer 1
+    [ "$rc" -eq 1 ] || want "exit 1"
+    [ "$(lines 'stub/compose-bin:vTEST attempt [123] of 3 failed: docker pull gave up after 1s$')" -eq 3 ] ||
+        want "3 image attempts ending 'docker pull gave up after 1s'"
+    has "stub/compose-bin:vTEST: 3 attempts, last: docker pull gave up after 1s), an outage"
+    verdict 1
+}
+
 case_all_down() {
     start_server always-504
     export STUB_PULL_FAIL=all
@@ -398,7 +416,7 @@ case_pin() {
 
 all=(present gh-504-once gh-down-image gh-down-image-local gh-hang gh-bad-sha
     gh-bad-sha-all-down foreign-tmp cache-hit cache-corrupt second-run no-cache-dir cache-readonly
-    cache-unreadable cache-corrupt-readonly all-down)
+    cache-unreadable cache-corrupt-readonly pull-hang all-down)
 [ $# -gt 0 ] && all=("$@")
 for c in "${all[@]}"; do
     new_case "$c"
