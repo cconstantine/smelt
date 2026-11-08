@@ -247,6 +247,41 @@ async fn test_a_deliver_to_a_stopped_conversation_is_saved_at_once(pool: PgPool)
     crate::turn::forget_conversation_lock(root);
 }
 
+/// D9: a Stop that ends a `Deliver`'s wake while it's queued behind a
+/// running turn still shows the notice at once, as before the queue and
+/// as D4 does: saved once, its row delivered, and no model call.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_stop_ending_a_queued_deliver_still_saves_it_at_once(pool: PgPool) {
+    let requests = setup(&pool, vec![text_reply("Noted.")]).await;
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    let text = docker_restarted();
+    let turn = crate::turn::conversation_lock(root).lock_owned().await;
+    let (reached, release) = crate::turn::test_hooks::pause_after_notice_admitted(root);
+    let deliver = crate::turn::notify(&pool, root, vec![crate::turn::Notice::Deliver(text.clone())]);
+    tokio::time::timeout(Duration::from_secs(10), reached).await.expect("the notice is admitted").expect("the hook");
+    // Stopped once let in: with the lock held, only the stop is ready.
+    crate::turn::stop_conversation(&pool, root).await;
+    release.send(()).expect("the wake waits at the hook");
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+    }
+    drop(turn);
+    tokio::time::timeout(Duration::from_secs(10), deliver).await.expect("the delivery ends").expect("the task");
+
+    let told = transcript(&pool, root).await.into_iter().filter(|(_, said)| said == &text).count();
+    assert_eq!(told, 1, "the notice, once");
+    let undelivered = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1 AND delivered_at IS NULL",
+    )
+    .bind(root)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(undelivered, 0, "its row is still queued");
+    assert_eq!(requests.lock().expect("the request log").len(), 0, "the model was called");
+    crate::turn::forget_conversation_lock(root);
+}
+
 /// T5: a child owed an answer that SME-238 also tells about its cut-off
 /// turn is answered once, with both in the one request.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
@@ -403,5 +438,39 @@ async fn test_a_reply_saved_before_the_restart_owes_nothing(pool: PgPool) {
 
     restart(&pool, &[root]).await;
     assert_eq!(requests.lock().expect("the request log").len(), 0, "the model was called on its own reply");
+    crate::turn::forget_conversation_lock(root);
+}
+
+/// T2: a `Deliver` waiting for a running turn's lock when smelt restarts:
+/// its text survives, and is answered once.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_deliver_waiting_for_the_turn_lock_survives_a_restart(pool: PgPool) {
+    let requests = setup(&pool, vec![text_reply("Noted.")]).await;
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    let text = docker_restarted();
+    // Stands in for a running turn.
+    let turn = crate::turn::conversation_lock(root).lock_owned().await;
+    let (reached, release) = crate::turn::test_hooks::pause_after_notice_admitted(root);
+    let deliver = crate::turn::notify(&pool, root, vec![crate::turn::Notice::Deliver(text.clone())]);
+    tokio::time::timeout(Duration::from_secs(10), reached).await.expect("the notice is admitted").expect("the hook");
+    kill(deliver).await;
+    drop(release);
+    drop(turn);
+
+    restart(&pool, &[root]).await;
+    let told = transcript(&pool, root).await.into_iter().filter(|(_, said)| said == &text).count();
+    assert_eq!(told, 1, "the notice, once");
+    let calls = requests_for(&requests, None);
+    assert_eq!(calls.len(), 1, "#{root} wasn't woken");
+    let last = calls[0]["messages"].as_array().expect("messages").last().expect("a message").to_string();
+    assert!(last.contains("Docker in sandbox pod 1 was restarted"), "{last}");
+    let delivered = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1 AND delivered_at IS NOT NULL",
+    )
+    .bind(root)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(delivered, 1, "its row");
     crate::turn::forget_conversation_lock(root);
 }

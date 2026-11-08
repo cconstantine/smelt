@@ -37,19 +37,80 @@ pub(super) async fn save_notice_between_turns(
 
 /// Tells the model about something that happened outside a turn (Docker
 /// restarting, the user's trust decision) and lets it answer: the notice
-/// is the next message, and a turn runs for it once no turn is running.
-/// After the user stopped the conversation, it's only saved, for their
-/// next message. Call it from a spawned task: it waits for a running turn.
+/// is queued (`db::queue_server_notice`) and a wake drains it, at a
+/// running turn's next step or in a turn of its own (D5), so a restart
+/// before it lands loses nothing: the startup sweep wakes what's queued
+/// (SME-450). After the user stopped the conversation, or to a child
+/// that takes no notices, it's only saved, at once, for the next turn
+/// (D4). Call it from a spawned task: it waits for a running turn.
 #[cfg(feature = "server")]
 pub(super) async fn deliver_notice(pool: &PgPool, conversation_id: i64, text: String) {
     // A child still starting, stopped or failed is only told (SME-236):
     // its next turn, if it has one, reads it.
-    if !crate::agents::admits_notices(pool, conversation_id).await {
+    if !crate::agents::admits_notices(pool, conversation_id).await || is_paused(conversation_id) {
         if let Err(e) = save_notice_between_turns(pool, conversation_id, text).await {
             tracing::warn!(conversation_id, error = %e, "couldn't save a notice");
         }
         return;
     }
+    match db::queue_server_notice(pool, conversation_id, &text).await {
+        Ok(()) => {
+            // A failure is already reported inside.
+            let woke = wake_conversation(pool, conversation_id).await;
+            // A Stop that ended (or refused) the wake leaves the notice
+            // queued: shown at once all the same, as before the queue and
+            // as a paused conversation's is (D9).
+            if matches!(woke, Err(TurnFailure::Stopped)) || is_paused(conversation_id) {
+                save_queued_server_notices(pool, conversation_id).await;
+            }
+        }
+        // Today's way, in memory: a database error costs durability only.
+        Err(e) => {
+            tracing::warn!(conversation_id, error = %e, "couldn't queue a notice; delivering it directly");
+            deliver_notice_directly(pool, conversation_id, text).await;
+        }
+    }
+}
+
+/// Saves `conversation_id`'s queued `server_notice` rows into its
+/// transcript, holding the turn lock, with no model call (D9): each
+/// through `db::deliver_agent_message`, so a drain racing it can't save
+/// one twice. Other kinds stay queued for the next turn.
+#[cfg(feature = "server")]
+async fn save_queued_server_notices(pool: &PgPool, conversation_id: i64) {
+    let saved = {
+        let lock = conversation_lock(conversation_id);
+        let _turn = lock.lock().await;
+        let mut saved = Vec::new();
+        match db::undelivered_agent_messages(pool, conversation_id).await {
+            Ok(rows) => {
+                for row in rows.iter().filter(|row| row.kind == db::KIND_SERVER_NOTICE) {
+                    let content = [anthropic::ContentBlock::Text { text: agent_message_text(row) }];
+                    match db::deliver_agent_message(pool, row, &content).await {
+                        Ok(Some(message)) => saved.push(message),
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't save a queued notice"),
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't read the queued notices"),
+        }
+        saved
+    };
+    if !turn_running(conversation_id) {
+        release_idle_turn_state(conversation_id);
+    }
+    if saved.is_empty() {
+        return;
+    }
+    crate::events::publish(conversation_id, crate::events::ConversationEvent::MessagesAppended { messages: saved });
+    crate::events::publish_app(crate::events::AppEvent::ConversationsChanged);
+}
+
+/// `deliver_notice` without the queue: the notice is the next turn's own
+/// message, held in this task until the turn lock is free.
+#[cfg(feature = "server")]
+async fn deliver_notice_directly(pool: &PgPool, conversation_id: i64, text: String) {
     // Let in past the pause in the same step that counts it, so a Stop
     // either refuses it or ends it (SME-217).
     let Some(turn) = TurnInFlight::start_unless_paused(conversation_id) else {
@@ -319,6 +380,8 @@ fn agent_message_text(row: &db::AgentMessage) -> String {
             ),
             None => format!("Question from {} (since deleted):\n\n{}", row.from_label, row.body),
         },
+        // A `Notice::Deliver`'s words, already marked, as said (SME-450).
+        db::KIND_SERVER_NOTICE => row.body.clone(),
         // SME-357: a queued notice is server-written, so it carries the mark
         // like every saved notice; reports, messages and questions are
         // another agent's typed words and stay unmarked.
@@ -369,9 +432,11 @@ pub(crate) enum Notice {
     /// Saved between turns, without waking the model: it reads it on its
     /// next turn (the user stopping a pod).
     Save(String),
-    /// Saved and answered: a turn runs for it, unless the user has stopped
-    /// the conversation, when it's only saved (Docker restarting, the
-    /// user's trust decision).
+    /// Queued and answered: a wake drains it (a running turn's next step
+    /// takes it first) and the model answers, and a restart before then
+    /// loses nothing (SME-450). Unless the user has stopped the
+    /// conversation, when it's only saved (Docker restarting, the user's
+    /// trust decision).
     Deliver(String),
     /// Saves finished commands' notices and wakes the model for them; a
     /// no-op when none is pending or the conversation is stopped.

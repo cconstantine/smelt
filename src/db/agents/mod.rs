@@ -39,6 +39,9 @@ pub const KIND_NOTICE: &str = "notice";
 pub const KIND_MESSAGE: &str = "message";
 /// `agent_messages.kind`: a child's `ask_parent`, queued to its parent.
 pub const KIND_QUESTION: &str = "question";
+/// `agent_messages.kind`: a `Notice::Deliver` waiting for its wake, its
+/// body the notice as said, already marked (SME-450).
+pub const KIND_SERVER_NOTICE: &str = "server_notice";
 
 /// One queued report or notice, as the drain reads it.
 #[derive(Clone, Debug, sqlx::FromRow)]
@@ -541,6 +544,13 @@ pub async fn reactivate_finished(pool: &PgPool, id: i64) -> Result<(), sqlx::Err
 pub async fn queue_notice(pool: &PgPool, to: i64, from: i64, from_label: &str, body: &str) -> Result<(), sqlx::Error> {
     let mut conn = pool.acquire().await?;
     queue_agent_message(&mut conn, to, Some(from), from_label, KIND_NOTICE, body).await
+}
+
+/// Queues `text`, a `Notice::Deliver`'s already-marked words, to `to` for
+/// its wake to drain verbatim (SME-450): queued, it survives a restart.
+pub async fn queue_server_notice(pool: &PgPool, to: i64, text: &str) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    queue_agent_message(&mut conn, to, None, "smelt", KIND_SERVER_NOTICE, text).await
 }
 
 /// The idle check's own query (`$1` the conversation id, `$2` active,
