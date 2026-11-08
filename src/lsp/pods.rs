@@ -89,11 +89,14 @@ pub fn server_pod_spec(sandbox: &SandboxRef, config: &LanguageServerConfig, conf
         json!({"name": "HOME", "value": POD_HOME}),
         json!({"name": "CARGO_HOME", "value": format!("{POD_HOME}/.cargo")}),
     ];
-    // The config's own value wins, and the pod has each name once.
+    // The config's own value wins, and the pod has each npm setting once:
+    // npm reads `npm_config_*` case-insensitively, with `-` for `_`.
+    let npm_name = |name: &str| name.to_lowercase().replace('-', "_");
+    let users: std::collections::HashSet<String> = config.env.keys().map(|name| npm_name(name)).collect();
     env.extend(
         NPM_STALL_BOUNDS
             .iter()
-            .filter(|(name, _)| !config.env.contains_key(*name))
+            .filter(|(name, _)| !users.contains(&npm_name(name)))
             .map(|(name, value)| json!({"name": name, "value": value})),
     );
     env.extend(config.env.iter().map(|(name, value)| json!({"name": name, "value": value})));

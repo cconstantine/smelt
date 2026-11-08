@@ -124,13 +124,19 @@ fn test_npm_gives_up_on_a_stalled_registry_inside_the_install_bound() {
 
 /// SME-452: a config's own npm setting wins over the stall bounds, and
 /// the pod has that name once (no reliance on Kubernetes' order for
-/// duplicate names).
+/// duplicate names). npm reads its names case-insensitively, with `-`
+/// for `_` (review 1), so an uppercase or dashed name is the same setting.
 #[test]
 fn test_a_users_own_npm_setting_wins_over_the_stall_bounds() {
-    let mut config = config();
-    config.env.insert("npm_config_fetch_timeout".to_string(), "90000".to_string());
-    let named: Vec<_> = pod_env(&config).into_iter().filter(|(name, _)| name == "npm_config_fetch_timeout").collect();
-    assert_eq!(named, vec![("npm_config_fetch_timeout".to_string(), "90000".to_string())]);
+    for user_name in ["npm_config_fetch_timeout", "NPM_CONFIG_FETCH_TIMEOUT", "npm_config_fetch-timeout"] {
+        let mut config = config();
+        config.env.insert(user_name.to_string(), "90000".to_string());
+        let named: Vec<_> = pod_env(&config)
+            .into_iter()
+            .filter(|(name, _)| name.to_lowercase().replace('-', "_") == "npm_config_fetch_timeout")
+            .collect();
+        assert_eq!(named, vec![(user_name.to_string(), "90000".to_string())], "{user_name}");
+    }
 }
 
 fn server_pod(uid: &str, phase: &str, reason: Option<&str>, deleting: bool) -> Pod {
