@@ -371,6 +371,8 @@ fn test_apply_event_counters_and_the_stale_bundle_are_left_to_the_page() {
         assert_eq!(apply_event(state, ConversationEvent::QuestionsChanged {}), EventEffect::QuestionsChanged);
         // SME-269: the row a Home tab's list is missing, renamed or sorted.
         assert_eq!(apply_event(state, ConversationEvent::ConversationsChanged {}), EventEffect::ConversationsChanged);
+        // SME-441: the sidebar's command markers refetch on it.
+        assert_eq!(apply_event(state, ConversationEvent::CommandsChanged {}), EventEffect::CommandsChanged);
         assert_eq!(apply_event(state, ConversationEvent::ModelChanged {}), EventEffect::ModelChanged);
         assert_eq!(apply_event(state, ConversationEvent::ProvidersChanged {}), EventEffect::ModelChanged);
         assert_eq!(apply_event(state, ConversationEvent::Unknown), EventEffect::StaleBundle);

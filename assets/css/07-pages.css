@@ -69,6 +69,25 @@
     background: #1baf7a;
 }
 
+/* A conversation whose model turn is not running but whose sandbox has
+   a command still running (SME-441): the busy dot's own pulse in the
+   warning amber, so it reads distinctly from the pod's green (#1baf7a)
+   and from the busy dot it replaces (they never show at once). */
+.live-command-dot {
+    flex-shrink: 0;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--warn);
+    animation: turn-working-pulse 1.2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .live-command-dot {
+        animation: none;
+    }
+}
+
 /* The width every settings page has (SME-123 DR15); its tables' cells
    wrap to fit. */
 .pods-page {

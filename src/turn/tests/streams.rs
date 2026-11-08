@@ -38,6 +38,26 @@ async fn test_a_conversation_stream_relays_pods_changed() {
     );
 }
 
+/// SME-441: and the same for command changes, which is what makes the
+/// sidebar's command markers live on a conversation tab.
+#[tokio::test]
+async fn test_a_conversation_stream_relays_commands_changed() {
+    let stream = conversation_event_stream(9_000_000_012);
+    futures_util::pin_mut!(stream);
+    // Another test's app event first, as one running alongside can
+    // publish.
+    events::publish_app(events::AppEvent::TurnsChanged);
+    events::publish_app(events::AppEvent::CommandsChanged);
+    let event = next_skipping_other_app_relays(&mut stream, |e| {
+        matches!(e, events::ConversationEvent::CommandsChanged {})
+    })
+    .await;
+    assert!(
+        matches!(event, Some(Ok(events::ConversationEvent::CommandsChanged {}))),
+        "got {event:?}"
+    );
+}
+
 /// Whether `event` is one a conversation's stream relays from the
 /// app-wide channel, which every test running alongside can publish to.
 fn is_app_relay(event: &events::ConversationEvent) -> bool {
@@ -48,6 +68,7 @@ fn is_app_relay(event: &events::ConversationEvent) -> bool {
             | events::ConversationEvent::QuestionsChanged {}
             | events::ConversationEvent::ProvidersChanged {}
             | events::ConversationEvent::ConversationsChanged {}
+            | events::ConversationEvent::CommandsChanged {}
             | events::ConversationEvent::NeedsUser { .. }
     )
 }

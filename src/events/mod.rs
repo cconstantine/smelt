@@ -210,6 +210,10 @@ pub enum ConversationEvent {
     /// model was added, edited or removed), relayed like `PodsChanged` so
     /// the model picker and the no-provider notice stay current (SME-72).
     ProvidersChanged {},
+    /// An app-wide `AppEvent::CommandsChanged` (a terminal command started
+    /// or finished somewhere), relayed like `PodsChanged` so the sidebar
+    /// marks conversations whose commands still run (SME-441).
+    CommandsChanged {},
     /// Whether a model turn is running (or queued) in this conversation,
     /// published when that changes, so every tab watching it can offer a
     /// Stop button, including for turns it didn't start. `elapsed` is how
@@ -294,6 +298,10 @@ pub enum AppEvent {
     /// A model provider or the default model was added, edited or
     /// removed. Carries nothing: listeners refetch (SME-72).
     ProvidersChanged,
+    /// A terminal command started or finished somewhere (SME-441): the
+    /// sidebar's command markers. Carries nothing: listeners refetch
+    /// `api::pods::get_running_command_conversations`.
+    CommandsChanged,
     /// As `ConversationEvent::Unknown`.
     #[serde(other)]
     Unknown,

@@ -266,11 +266,12 @@ pub(super) async fn close_pod_terminals(pool: &PgPool, pod_id: i64) -> (Option<i
         .ok()
         .flatten();
     let mut found_live_terminal = false;
+    let mut marked_lost = false;
     if let Ok(terminals) = db::list_sandbox_terminals_for_pod(pool, pod_id).await {
         for terminal in terminals {
             found_live_terminal = true;
             if let Ok(Some(running)) = db::terminal_command_is_running(pool, terminal.id).await {
-                let _ = db::mark_terminal_command_lost(pool, &running.command_id).await;
+                marked_lost |= db::mark_terminal_command_lost(pool, &running.command_id).await.is_ok();
             }
             let _ = db::terminate_sandbox_terminal(pool, terminal.id).await;
             if let Some(conversation_id) = conversation_id {
@@ -285,6 +286,13 @@ pub(super) async fn close_pod_terminals(pool: &PgPool, pod_id: i64) -> (Option<i
                 );
             }
         }
+    }
+    // SME-441: commands stopped counting as running; the sidebar's command
+    // markers refetch. One publish for the whole close, and only once a
+    // `lost` mark actually landed — published after the write, like every
+    // other CommandsChanged site.
+    if marked_lost {
+        events::publish_app(events::AppEvent::CommandsChanged);
     }
     (conversation_id, found_live_terminal)
 }

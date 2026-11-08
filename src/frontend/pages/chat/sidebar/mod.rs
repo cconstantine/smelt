@@ -41,6 +41,7 @@ pub(super) fn ConversationSidebar(
     pods_changed: Signal<u64>,
     turns_changed: Signal<u64>,
     questions_changed: Signal<u64>,
+    commands_changed: Signal<u64>,
 ) -> Element {
     let navigator = use_navigator();
     // Which conversations have a live pod, for the dot next to their title.
@@ -50,6 +51,30 @@ pub(super) fn ConversationSidebar(
     });
     let has_live_pod = move |id: i64| {
         matches!(&*live_pods.read(), Some(Ok(ids)) if ids.contains(&id))
+    };
+    // Which conversations have running terminal commands on a live pod,
+    // and how many — the amber marker beside the pod dot (SME-441). A
+    // failed fetch means no markers and no error line, as for the dot.
+    let live_commands = use_resource(move || {
+        let _ = commands_changed();
+        // …and PodsChanged too (review round 1): a user Stop closes the
+        // pod row and publishes PodsChanged after that write lands, so
+        // this refetch sees the live-pod join already exclude the pod —
+        // the marker never outlives the green dot by a round trip, and a
+        // failed lost-marking can't strand it either. CommandsChanged
+        // still covers every other flip.
+        let _ = pods_changed();
+        crate::api::pods::get_running_command_conversations()
+    });
+    let running_commands_for = move |id: i64| -> i64 {
+        match &*live_commands.read() {
+            Some(Ok(rows)) => rows
+                .iter()
+                .find(|row| row.conversation_id == id)
+                .map(|row| row.running_commands)
+                .unwrap_or(0),
+            _ => 0,
+        }
     };
     // Every conversation with its marks: a turn running (SME-41 D9), a
     // question or trust card waiting for the user (SME-34), and an agent's
@@ -182,6 +207,7 @@ pub(super) fn ConversationSidebar(
         pods_changed,
         turns_changed,
         questions_changed,
+        commands_changed,
         app_live,
     );
 
@@ -234,6 +260,7 @@ pub(super) fn ConversationSidebar(
                             key: "{row.node.id}",
                             active: selected() == Some(row.node.id),
                             live_pod: has_live_pod(row.node.id),
+                            running_commands: running_commands_for(row.node.id),
                             age: now_utc().map(|now| short_age((now - row.node.updated_at).num_seconds())),
                             armed: pending_delete() == Some(row.node.id),
                             confirm: delete_confirm_label(&conversations(), row.node.id),
@@ -291,6 +318,7 @@ fn ConversationRow(
     row: TreeRow,
     active: bool,
     live_pod: bool,
+    running_commands: i64,
     age: Option<String>,
     armed: bool,
     confirm: String,
@@ -369,6 +397,12 @@ fn ConversationRow(
             if live_pod {
                 span { class: "live-pod-dot", role: "img", title: "Sandbox running", aria_label: "Sandbox running" }
             }
+            // An idle conversation whose sandbox still runs a command
+            // pulses amber beside the green dot (SME-441); while a turn
+            // runs, the busy spinner above wins and this stays hidden.
+            if let Some(title) = command_marker(running_commands, row.node.busy) {
+                span { class: "live-command-dot", role: "img", title: "{title}", aria_label: "{title}" }
+            }
             if let Some(age) = age {
                 span { class: "conversation-age", "{age}" }
             }
@@ -441,6 +475,18 @@ fn tree_summary(row: &TreeRow) -> Element {
                 span { class: "agent-status status-running", "{row.busy_under} working" }
             }
         }
+    }
+}
+
+/// The sidebar's command marker's title: `Some` when the conversation
+/// isn't running a turn (the busy mark wins — Decided (SME-441)) and has
+/// running commands on its live pod. The count is the whole title: no
+/// command text reaches the attribute, whatever the command is running.
+pub(super) fn command_marker(running_commands: i64, busy: bool) -> Option<String> {
+    match (running_commands, busy) {
+        (0, _) | (_, true) => None,
+        (1, _) => Some("1 command running".into()),
+        (n, _) => Some(format!("{n} commands running")),
     }
 }
 

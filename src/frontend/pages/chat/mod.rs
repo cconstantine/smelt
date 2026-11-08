@@ -153,6 +153,10 @@ pub fn Chat() -> Element {
     // Bumped when a conversation starts or stops waiting on an answer to
     // the model's question (`ConversationEvent::QuestionsChanged`, SME-34).
     let questions_changed = use_signal(|| 0u64);
+    // Bumped when a terminal command starts or finishes in any conversation
+    // (`AppEvent::CommandsChanged`, relayed like `PodsChanged`), for the
+    // sidebar's running-command markers (SME-441).
+    let commands_changed = use_signal(|| 0u64);
     // The conversation tree, as the sidebar last fetched it: its own list,
     // and the header's, which once fetched a second copy on every turn
     // event (SME-354 B18).
@@ -160,8 +164,8 @@ pub fn Chat() -> Element {
 
     rsx! {
         div { class: "chat-layout",
-            ConversationSidebar { selected, conversations: conversation_nodes, conversations_changed, pods_changed, turns_changed, questions_changed }
-            ChatPanel { selected, conversation_nodes, conversations_changed, pods_changed, turns_changed, questions_changed }
+            ConversationSidebar { selected, conversations: conversation_nodes, conversations_changed, pods_changed, turns_changed, questions_changed, commands_changed }
+            ChatPanel { selected, conversation_nodes, conversations_changed, pods_changed, turns_changed, questions_changed, commands_changed }
         }
     }
 }
@@ -174,6 +178,7 @@ fn ChatPanel(
     pods_changed: Signal<u64>,
     turns_changed: Signal<u64>,
     questions_changed: Signal<u64>,
+    commands_changed: Signal<u64>,
 ) -> Element {
     // Tagged with its conversation (SME-185 B38): a restarted resource
     // keeps its last value until the new load lands, so on a switch it
@@ -287,6 +292,7 @@ fn ChatPanel(
         pods_changed,
         turns_changed,
         questions_changed,
+        commands_changed,
         model_changed,
     );
     #[cfg(feature = "web")]
