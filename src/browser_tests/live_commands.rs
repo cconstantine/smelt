@@ -123,7 +123,7 @@ pub(super) async fn scenario_live_command_marker(t: &Scenario<'_>) {
         agent1,
         &agent_command,
         "run_terminal_command",
-        &serde_json::json!({"terminal_id": agent_terminal, "command": "sleep 30"}),
+        &serde_json::json!({"terminal_id": agent_terminal, "command": "sleep 120"}),
     )
     .await
     .expect("run_terminal_command (agent)");
