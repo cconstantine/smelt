@@ -116,9 +116,9 @@ fn test_compaction_transcript_keeps_the_most_recent_part_within_its_budget() {
 }
 
 /// SME-40 F3: compaction runs after the new user message is saved, so
-/// the summary covers it and the model only saw "Continue based on the
-/// summary above" — it answered from the summary's gist, or resumed
-/// older work, instead of the request itself.
+/// the summary covers it and the model only saw the continuation
+/// nudge — it answered from the summary's gist, or resumed older work,
+/// instead of the request itself.
 #[test]
 fn test_the_continuation_quotes_what_the_model_hasnt_answered() {
     let messages = vec![
