@@ -795,8 +795,13 @@ pub(super) async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConne
             }
         }
         AgentMessage::Exit { id, terminal_id, code } => {
-            if let Err(e) = db::mark_terminal_command_finished(pool, &id, code).await {
-                tracing::error!(command_id = %id, error = %e, "failed to record command completion");
+            match db::mark_terminal_command_finished(pool, &id, code).await {
+                Ok(()) => {
+                    // SME-441: that row stopped counting as running, once
+                    // the row says so; the sidebar's markers refetch.
+                    events::publish_app(events::AppEvent::CommandsChanged);
+                }
+                Err(e) => tracing::error!(command_id = %id, error = %e, "failed to record command completion"),
             }
             if let Ok(terminal_id) = terminal_id.parse::<i64>() {
                 events::publish(

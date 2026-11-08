@@ -58,6 +58,57 @@ async fn test_list_live_pods_reports_each_live_pod_and_its_activity(pool: PgPool
 }
 
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_running_command_conversation_counts_pods_and_lives(pool: PgPool) {
+    let a = test_conversation(&pool).await;
+    let a_pod = create_sandbox_pod(&pool, a.id).await.expect("A pod");
+    let t1 = create_sandbox_terminal(&pool, a_pod.id).await.expect("A terminal");
+    create_terminal_command(&pool, a.id, t1.id, "a-run", "sleep 100", 300)
+        .await
+        .expect("A command");
+    assert_eq!(
+        running_command_conversation_counts(&pool).await.expect("counts"),
+        vec![(a.id, 1)],
+        "one running command on a live pod marks its conversation once"
+    );
+
+    let t2 = create_sandbox_terminal(&pool, a_pod.id).await.expect("second terminal");
+    create_terminal_command(&pool, a.id, t2.id, "a-run-2", "sleep 100", 300)
+        .await
+        .expect("second command");
+    assert_eq!(
+        running_command_conversation_counts(&pool).await.expect("counts"),
+        vec![(a.id, 2)],
+        "a running command on a second terminal of the same pod adds to the count"
+    );
+
+    mark_terminal_command_finished(&pool, "a-run", 0).await.expect("finish");
+    assert_eq!(
+        running_command_conversation_counts(&pool).await.expect("counts"),
+        vec![(a.id, 1)],
+        "a finished row drops out"
+    );
+
+    let b = test_conversation(&pool).await;
+    let b_pod = create_sandbox_pod(&pool, b.id).await.expect("B pod");
+    let b_terminal = create_sandbox_terminal(&pool, b_pod.id).await.expect("B terminal");
+    create_terminal_command(&pool, b.id, b_terminal.id, "b-run", "sleep 100", 300)
+        .await
+        .expect("B command");
+    assert_eq!(
+        running_command_conversation_counts(&pool).await.expect("counts"),
+        vec![(a.id, 1), (b.id, 1)],
+        "two conversations, oldest first"
+    );
+
+    terminate_sandbox_pod(&pool, b_pod.id).await.expect("terminate B");
+    assert_eq!(
+        running_command_conversation_counts(&pool).await.expect("counts"),
+        vec![(a.id, 1)],
+        "a terminated pod's still-running row vanishes with its green dot"
+    );
+}
+
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_sandbox_pod_and_terminate_is_idempotent(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let pod = create_sandbox_pod(&pool, conversation.id)

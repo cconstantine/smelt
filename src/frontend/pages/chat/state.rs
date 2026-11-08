@@ -125,6 +125,9 @@ pub(super) enum EventEffect {
     PodsChanged,
     TurnsChanged,
     QuestionsChanged,
+    /// A terminal command started or finished somewhere (SME-441): the
+    /// sidebar refetches its command-marker counts.
+    CommandsChanged,
     /// The conversation's model or the providers changed: the model picker
     /// refetches, and so does the context meter, which measures against
     /// the model's window.
@@ -283,6 +286,9 @@ pub(super) fn apply_event(state: Store<ConversationState>, event: ConversationEv
         ConversationEvent::PodsChanged {} => return EventEffect::PodsChanged,
         ConversationEvent::TurnsChanged {} => return EventEffect::TurnsChanged,
         ConversationEvent::QuestionsChanged {} => return EventEffect::QuestionsChanged,
+        // SME-441: a command started or finished somewhere; the sidebar's
+        // marker counts refetch.
+        ConversationEvent::CommandsChanged {} => return EventEffect::CommandsChanged,
         // SME-71: handed untouched to the layout's NotifierFeed.
         ConversationEvent::NeedsUser { conversation_id, attention, generation } => {
             return EventEffect::NeedsUser { conversation_id, attention, generation };

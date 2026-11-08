@@ -53,7 +53,7 @@ pub(super) async fn scenario_delete_names_its_agents(t: &Scenario<'_>) {
 
 /// An agent row under `parent` in `state`, as `start_agent` leaves one,
 /// with a persona at `persona_path` when given.
-async fn seed_agent(pool: &sqlx::PgPool, parent: i64, title: &str, persona_path: Option<&str>) -> i64 {
+pub(super) async fn seed_agent(pool: &sqlx::PgPool, parent: i64, title: &str, persona_path: Option<&str>) -> i64 {
     let child = sqlx::query_scalar::<_, i64>("INSERT INTO conversations (title, parent_id) VALUES ($1, $2) RETURNING id")
         .bind(title)
         .bind(parent)

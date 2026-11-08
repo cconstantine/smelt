@@ -184,6 +184,7 @@ fn scenarios() -> Vec<Entry> {
         entry("missing_conversation", 30, Runs::Beside, |t| Box::pin(scenario_missing_conversation(t))),
         entry("notification_failure_stays", 60, Runs::Beside, |t| Box::pin(scenario_notification_failure_stays(t))),
         entry("pods", 120, Runs::Alone, |t| Box::pin(scenario_pods(t))),
+        entry("live_command_marker", 180, Runs::Alone, |t| Box::pin(scenario_live_command_marker(t))),
         entry("stop_a_turn", 60, Runs::Beside, |t| Box::pin(scenario_stop_a_turn(t))),
         entry("reply_on_conversation_stream", 60, Runs::Beside, |t| Box::pin(scenario_reply_on_conversation_stream(t))),
         entry("busy_session_layout", 120, Runs::Beside, |t| Box::pin(scenario_busy_session_layout(t))),
@@ -452,6 +453,7 @@ mod agents;
 mod text_calls;
 mod notifications;
 mod notifier_leader;
+mod live_commands;
 
 use harness::*;
 use mock::*;
@@ -473,3 +475,4 @@ use agents::*;
 use text_calls::*;
 use notifications::*;
 use notifier_leader::*;
+use live_commands::*;

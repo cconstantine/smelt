@@ -224,6 +224,9 @@ pub async fn run_command(
     // immediately, before any output, so the panel shows it started
     // (SME-10).
     publish_command_update(conversation_id, terminal_id, command_id, Some(command), "running");
+    // SME-441: a row started counting as running, and this is the awaited
+    // insert's success; the sidebar's command markers refetch.
+    crate::events::publish_app(crate::events::AppEvent::CommandsChanged);
 
     if let Err(e) = send_command(pool, terminal_id, command_id, command).await {
         // Nothing is actually running — don't leave a dangling
@@ -232,7 +235,11 @@ pub async fn run_command(
         // once the row says so: if the mark fails, the row (and a reload)
         // still say running, so the tabs keep saying it too.
         match db::mark_terminal_command_lost(pool, command_id).await {
-            Ok(()) => publish_command_update(conversation_id, terminal_id, command_id, None, "lost"),
+            Ok(()) => {
+                publish_command_update(conversation_id, terminal_id, command_id, None, "lost");
+                // SME-441: that row stopped counting, once the row says so.
+                crate::events::publish_app(crate::events::AppEvent::CommandsChanged);
+            }
             Err(mark) => tracing::error!(command_id, error = %mark, "couldn't mark an unsent command lost"),
         }
         return Err(RunCommandError::Failed(e.to_string()));

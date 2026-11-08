@@ -97,6 +97,7 @@ pub(super) fn use_conversation_events(
     pods_changed: Signal<u64>,
     turns_changed: Signal<u64>,
     questions_changed: Signal<u64>,
+    commands_changed: Signal<u64>,
     model_changed: Signal<u64>,
 ) {
     let mut state = state;
@@ -105,6 +106,7 @@ pub(super) fn use_conversation_events(
     let mut pods_changed = pods_changed;
     let mut turns_changed = turns_changed;
     let mut questions_changed = questions_changed;
+    let mut commands_changed = commands_changed;
     let mut model_changed = model_changed;
     let mut messages = state.messages();
     let mut load_error = state.load_error();
@@ -252,6 +254,9 @@ pub(super) fn use_conversation_events(
                                     feed.bump_revalidate();
                                 }
                             }
+                            // SME-441: a command started or finished; the
+                            // sidebar's marker counts refetch.
+                            EventEffect::CommandsChanged => *commands_changed.write() += 1,
                             EventEffect::ModelChanged => {
                                 *model_changed.write() += 1;
                                 // Another model can mean another context window: the
@@ -320,6 +325,7 @@ pub(super) fn use_sidebar_app_events(
     mut pods_changed: Signal<u64>,
     mut turns_changed: Signal<u64>,
     mut questions_changed: Signal<u64>,
+    mut commands_changed: Signal<u64>,
     mut app_live: Signal<bool>,
 ) {
     let mut task: Signal<Option<Task>> = use_signal(|| None);
@@ -348,6 +354,7 @@ pub(super) fn use_sidebar_app_events(
                     *pods_changed.write() += 1;
                     *turns_changed.write() += 1;
                     *questions_changed.write() += 1;
+                    *commands_changed.write() += 1;
                     crate::frontend::check_build_id().await;
                     app_live.set(true);
                     while let Some(Ok(event)) = events.recv().await {
@@ -356,6 +363,8 @@ pub(super) fn use_sidebar_app_events(
                             crate::events::AppEvent::PodsChanged => *pods_changed.write() += 1,
                             crate::events::AppEvent::TurnsChanged => *turns_changed.write() += 1,
                             crate::events::AppEvent::QuestionsChanged => *questions_changed.write() += 1,
+                            // SME-441: the sidebar's command markers refetch.
+                            crate::events::AppEvent::CommandsChanged => *commands_changed.write() += 1,
                             // The model picker's, and with no conversation
                             // open there is no picker on screen.
                             crate::events::AppEvent::ProvidersChanged => {}
