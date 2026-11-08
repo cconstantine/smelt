@@ -373,3 +373,7 @@ pub(crate) mod cluster;
 /// Real-cluster tests of installs that stall (SME-452), against a
 /// registry inside the server pod itself: no internet.
 mod stall;
+
+/// Real-cluster tests of an install that says nothing (SME-452's
+/// recurrence): an exec the runtime refused, and an npm still running.
+mod silent;

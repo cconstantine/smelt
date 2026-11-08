@@ -147,7 +147,7 @@ pub(crate) async fn exec_with(
     stdout_res.map_err(SandboxError::Io)?;
     stderr_res.map_err(SandboxError::Io)?;
     let stdout = String::from_utf8_lossy(&stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&stderr).into_owned();
+    let mut stderr = String::from_utf8_lossy(&stderr).into_owned();
 
     let status = attached.take_status();
     attached.join().await.ok();
@@ -156,35 +156,50 @@ pub(crate) async fn exec_with(
         None => None,
     };
 
-    Ok(ExecResult {
-        stdout,
-        stderr,
-        exit_code: extract_exit_code(status),
-    })
+    let exit_code = extract_exit_code(status.clone());
+    // A command the runtime never ran says why, for callers that show
+    // stderr (SME-452).
+    if exit_code == -1
+        && let Some(status) = status
+    {
+        stderr.push_str(&format!(
+            "exec failed: {}: {}",
+            status.reason.unwrap_or_default(),
+            status.message.unwrap_or_default()
+        ));
+    }
+    Ok(ExecResult { stdout, stderr, exit_code })
 }
 
-/// On success the exec protocol's terminal `Status` carries no exit code at
-/// all (implying 0); on a non-zero exit it's a `StatusCause` with
+/// On success the exec protocol's terminal `Status` is `Success`, with no
+/// exit code at all; on a non-zero exit it's a `StatusCause` with
 /// `reason == "ExitCode"` and the code itself, as a string, in `message`.
 /// Verified against a real cluster, not assumed — see SME-7's plan.
 ///
-/// No status at all means the connection ended before the API server said
-/// how the command did, so it counts as a failure (-1), not a success.
+/// Anything else is a failure (-1), not a success: no status at all (the
+/// connection ended before the API server said how the command did), or
+/// another status, such as the kubelet's `InternalError` when the
+/// container runtime couldn't run the command (captured live, SME-452).
 pub(super) fn extract_exit_code(
     status: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Status>,
 ) -> i32 {
     let Some(status) = status else {
         return -1;
     };
-    status
+    let code = status
         .details
-        .and_then(|d| d.causes)
+        .as_ref()
+        .and_then(|d| d.causes.as_ref())
         .into_iter()
         .flatten()
         .find(|cause| cause.reason.as_deref() == Some("ExitCode"))
-        .and_then(|cause| cause.message)
-        .and_then(|message| message.parse().ok())
-        .unwrap_or(0)
+        .and_then(|cause| cause.message.as_deref())
+        .and_then(|message| message.parse().ok());
+    match code {
+        Some(code) => code,
+        None if status.status.as_deref() == Some("Success") => 0,
+        None => -1,
+    }
 }
 
 impl Drop for Sandbox {

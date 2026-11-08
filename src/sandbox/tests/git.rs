@@ -281,3 +281,13 @@ fn test_exec_with_no_status_is_a_failure_not_a_success() {
     };
     assert_eq!(extract_exit_code(Some(success)), 0);
 }
+
+/// SME-452: an exec the container runtime refused to start ends with a
+/// `Failure` status and no `ExitCode` cause, captured live on k3s's
+/// containerd (`exec_refused_status.json`, an exec of a binary that
+/// doesn't exist). That's a failure, not the exit 0 it once read as.
+#[test]
+fn test_an_exec_the_runtime_refused_is_a_failure_not_a_success() {
+    let refused = serde_json::from_str(include_str!("exec_refused_status.json")).expect("the captured status");
+    assert_eq!(extract_exit_code(Some(refused)), -1);
+}
