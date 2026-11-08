@@ -79,6 +79,66 @@ fn test_a_server_pod_sits_next_to_its_sandbox_and_goes_with_it() {
     assert!(script.contains(INSTALL_RC) && script.contains("trap 'exit 0' TERM"), "{script}");
 }
 
+/// A server pod's container env, in order.
+fn pod_env(config: &LanguageServerConfig) -> Vec<(String, String)> {
+    let pod = server_pod_spec(&sandbox(), config, "v1");
+    pod.spec.expect("spec").containers[0]
+        .env
+        .clone()
+        .expect("env")
+        .into_iter()
+        .map(|e| (e.name, e.value.unwrap_or_default()))
+        .collect()
+}
+
+/// SME-452: npm's worst case for one registry request that never
+/// answers, from a pod's env (npm 10's defaults for what it leaves
+/// unset), is inside the install bound: npm gives up and says why
+/// before the bound throws its error and log away.
+#[test]
+fn test_npm_gives_up_on_a_stalled_registry_inside_the_install_bound() {
+    let env = pod_env(&config());
+    let setting = |key: &str, default: u64| -> u64 {
+        env.iter()
+            .find(|(name, _)| name == &format!("npm_config_{key}"))
+            .map_or(default, |(_, value)| value.parse().expect("a number"))
+    };
+    let timeout = setting("fetch_timeout", 300_000);
+    let retries = setting("fetch_retries", 2);
+    let min = setting("fetch_retry_mintimeout", 10_000);
+    let factor = setting("fetch_retry_factor", 10);
+    let max = setting("fetch_retry_maxtimeout", 60_000);
+    let backoff: u64 = (0..retries).map(|i| (min * factor.pow(i as u32)).min(max)).sum();
+    let worst = std::time::Duration::from_millis((retries + 1) * timeout + backoff);
+    assert!(
+        worst < INSTALL_TIMEOUT,
+        "npm's worst case on a stalled registry is {} s, not under the install bound's {} s",
+        worst.as_secs(),
+        INSTALL_TIMEOUT.as_secs()
+    );
+    for key in ["audit", "fund", "update_notifier"] {
+        let name = format!("npm_config_{key}");
+        assert!(env.contains(&(name.clone(), "false".to_string())), "{name} isn't false: {env:?}");
+    }
+}
+
+/// SME-452: a config's own npm setting wins over the stall bounds, and
+/// the pod has that name once (no reliance on Kubernetes' order for
+/// duplicate names). npm reads its names case-insensitively, with `-`
+/// for `_` (review 1), so an uppercase or dashed name is the same setting.
+#[test]
+fn test_a_users_own_npm_setting_wins_over_the_stall_bounds() {
+    for user_name in ["npm_config_fetch_timeout", "NPM_CONFIG_FETCH_TIMEOUT", "npm_config_fetch-timeout"] {
+        let mut config = config();
+        config.env.insert(user_name.to_string(), "90000".to_string());
+        let named: Vec<_> = pod_env(&config)
+            .into_iter()
+            .filter(|(name, _)| name.to_lowercase().replace('-', "_") == "npm_config_fetch_timeout")
+            .collect();
+        assert_eq!(named, vec![(user_name.to_string(), "90000".to_string())], "{user_name}");
+    }
+}
+
 fn server_pod(uid: &str, phase: &str, reason: Option<&str>, deleting: bool) -> Pod {
     let mut pod = unready_server_pod(uid, phase, reason, deleting);
     pod.metadata.annotations = Some([(READY_ANNOTATION.to_string(), "true".to_string())].into());
@@ -204,13 +264,57 @@ fn test_an_evicted_server_says_it_was_evicted() {
 #[test]
 fn test_a_timed_out_install_names_only_a_read_error_that_is_still_the_latest() {
     let running = || Ok(Some(unready_server_pod("a", "Running", None, false)));
-    let mut watch = InstallWatch { name: "lsp-7-ra", uid: "a", read_error: None };
+    let mut watch = InstallWatch::new("lsp-7-ra", "a");
+    let timed_out = |watch: &InstallWatch| watch.timed_out(INSTALL_TIMEOUT, Ok(String::new()));
     assert_eq!(watch.read(Err("the API server is busy".to_string())), None, "a failed read isn't a death");
-    assert!(watch.timed_out().contains("(last error reading the pod: the API server is busy)"), "{}", watch.timed_out());
+    assert!(timed_out(&watch).contains("(last error reading the pod: the API server is busy)"), "{}", timed_out(&watch));
     assert_eq!(watch.read(running()), None);
-    assert!(!watch.timed_out().contains("last error"), "{}", watch.timed_out());
-    assert!(watch.timed_out().starts_with("The install didn't finish within 10 minutes"), "{}", watch.timed_out());
+    assert!(!timed_out(&watch).contains("last error"), "{}", timed_out(&watch));
+    assert!(timed_out(&watch).starts_with("The install didn't finish within 10 minutes"), "{}", timed_out(&watch));
     assert!(watch.read(Ok(None)).is_some_and(|e| e.contains("deleted")));
+}
+
+/// SME-452: a timed-out install says what it was doing, since its pod
+/// (and the log in it) is deleted after: how often its record couldn't
+/// be read, and its output so far, or why that couldn't be read.
+#[test]
+fn test_a_timed_out_install_says_its_output_and_its_records_failed_reads() {
+    let mut watch = InstallWatch::new("lsp-7-ra", "a");
+    let error = watch.timed_out(INSTALL_TIMEOUT, Ok("npm http fetch GET /pyright\n".to_string()));
+    assert!(!error.contains("couldn't be read"), "{error}");
+    assert!(error.ends_with(". Its output so far:\nnpm http fetch GET /pyright"), "{error}");
+    watch.rc_read_failed("exec refused".to_string());
+    watch.rc_read_failed("the connection was reset".to_string());
+    let error = watch.timed_out(INSTALL_TIMEOUT, Ok("npm http fetch GET /pyright\n".to_string()));
+    assert!(
+        error.starts_with(
+            "The install didn't finish within 10 minutes; its record couldn't be read 2 times (last: the connection \
+             was reset). Its output so far:\n"
+        ),
+        "{error}"
+    );
+    let error = watch.timed_out(std::time::Duration::from_secs(5), Err("the pod is gone".to_string()));
+    assert!(error.starts_with("The install didn't finish within 5 s"), "{error}");
+    assert!(error.ends_with(" (its output couldn't be read: the pod is gone)"), "{error}");
+    // Review 1: one minute is singular.
+    let error = watch.timed_out(std::time::Duration::from_secs(90), Ok(String::new()));
+    assert!(error.starts_with("The install didn't finish within 1 minute;"), "{error}");
+    let error = watch.timed_out(std::time::Duration::from_secs(120), Ok(String::new()));
+    assert!(error.starts_with("The install didn't finish within 2 minutes;"), "{error}");
+}
+
+/// SME-452 review 1: a timed-out install's log read that never answers
+/// is given up on after `LOG_READ_TIMEOUT`, and the message says so,
+/// so the read can't hold the call past the install's bound. A read
+/// that answers comes through as is.
+#[tokio::test(start_paused = true)]
+async fn test_a_timed_out_installs_log_read_is_bounded() {
+    let hung = tokio::time::timeout(2 * LOG_READ_TIMEOUT, bounded_read(std::future::pending(), LOG_READ_TIMEOUT)).await;
+    let hung = hung.expect("the log read held the call past its bound");
+    assert_eq!(hung, Err("the read didn't answer within 10 s".to_string()));
+    let error = InstallWatch::new("lsp-7-ra", "a").timed_out(INSTALL_TIMEOUT, hung);
+    assert!(error.ends_with(" (its output couldn't be read: the read didn't answer within 10 s)"), "{error}");
+    assert_eq!(bounded_read(async { Ok("npm http fetch".to_string()) }, LOG_READ_TIMEOUT).await, Ok("npm http fetch".to_string()));
 }
 
 /// A server pod with `status`, a status captured live.
@@ -265,3 +369,7 @@ fn test_an_empty_install_still_records_success() {
 /// Real-cluster tests: a stand-in sandbox pod (the real image, idle)
 /// and its conversation's workspace claim, with `cat` as the "server".
 pub(crate) mod cluster;
+
+/// Real-cluster tests of installs that stall (SME-452), against a
+/// registry inside the server pod itself: no internet.
+mod stall;
