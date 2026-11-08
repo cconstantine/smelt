@@ -258,13 +258,38 @@ fn test_an_evicted_server_says_it_was_evicted() {
 #[test]
 fn test_a_timed_out_install_names_only_a_read_error_that_is_still_the_latest() {
     let running = || Ok(Some(unready_server_pod("a", "Running", None, false)));
-    let mut watch = InstallWatch { name: "lsp-7-ra", uid: "a", read_error: None };
+    let mut watch = InstallWatch::new("lsp-7-ra", "a");
+    let timed_out = |watch: &InstallWatch| watch.timed_out(INSTALL_TIMEOUT, Ok(String::new()));
     assert_eq!(watch.read(Err("the API server is busy".to_string())), None, "a failed read isn't a death");
-    assert!(watch.timed_out().contains("(last error reading the pod: the API server is busy)"), "{}", watch.timed_out());
+    assert!(timed_out(&watch).contains("(last error reading the pod: the API server is busy)"), "{}", timed_out(&watch));
     assert_eq!(watch.read(running()), None);
-    assert!(!watch.timed_out().contains("last error"), "{}", watch.timed_out());
-    assert!(watch.timed_out().starts_with("The install didn't finish within 10 minutes"), "{}", watch.timed_out());
+    assert!(!timed_out(&watch).contains("last error"), "{}", timed_out(&watch));
+    assert!(timed_out(&watch).starts_with("The install didn't finish within 10 minutes"), "{}", timed_out(&watch));
     assert!(watch.read(Ok(None)).is_some_and(|e| e.contains("deleted")));
+}
+
+/// SME-452: a timed-out install says what it was doing, since its pod
+/// (and the log in it) is deleted after: how often its record couldn't
+/// be read, and its output so far, or why that couldn't be read.
+#[test]
+fn test_a_timed_out_install_says_its_output_and_its_records_failed_reads() {
+    let mut watch = InstallWatch::new("lsp-7-ra", "a");
+    let error = watch.timed_out(INSTALL_TIMEOUT, Ok("npm http fetch GET /pyright\n".to_string()));
+    assert!(!error.contains("couldn't be read"), "{error}");
+    assert!(error.ends_with(". Its output so far:\nnpm http fetch GET /pyright"), "{error}");
+    watch.rc_read_failed("exec refused".to_string());
+    watch.rc_read_failed("the connection was reset".to_string());
+    let error = watch.timed_out(INSTALL_TIMEOUT, Ok("npm http fetch GET /pyright\n".to_string()));
+    assert!(
+        error.starts_with(
+            "The install didn't finish within 10 minutes; its record couldn't be read 2 times (last: the connection \
+             was reset). Its output so far:\n"
+        ),
+        "{error}"
+    );
+    let error = watch.timed_out(std::time::Duration::from_secs(5), Err("the pod is gone".to_string()));
+    assert!(error.starts_with("The install didn't finish within 5 s"), "{error}");
+    assert!(error.ends_with(" (its output couldn't be read: the pod is gone)"), "{error}");
 }
 
 /// A server pod with `status`, a status captured live.

@@ -1,5 +1,5 @@
 use super::super::*;
-use super::cluster::with_sandbox;
+use super::cluster::{echo_server, with_sandbox};
 
 /// A registry on `127.0.0.1:8080` inside the server pod, serving one
 /// package, `stallpkg@1.0.0`, packed in the pod first: it leaves the
@@ -79,6 +79,32 @@ async fn test_an_npm_install_rides_out_a_registry_that_stalls_twice() {
         assert_eq!(result, Ok(Started::Started), "after {} s", took.as_secs());
         assert_eq!(stalls.as_deref().ok(), Some("2"), "the registry didn't stall twice");
         eprintln!("installed through two stalls in {} s", took.as_secs());
+    })
+    .await;
+}
+
+/// SME-452: an install that runs out its bound says what it was doing:
+/// its output so far comes back in the error, since its pod (and the log
+/// in it) is deleted after. A 5 s bound stands in for the 10 minutes.
+#[tokio::test]
+async fn test_a_timed_out_install_says_what_it_was_doing() {
+    with_sandbox(|client, sandbox| async move {
+        let config = echo_server("hang", "echo fetching-marker-452; sleep 3600");
+        let pods = crate::sandbox::pods_api(&client);
+        let name = server_pod_name(sandbox.pod_id, &config.name);
+        pods.create(&kube::api::PostParams::default(), &server_pod_spec(&sandbox, &config, "v1"))
+            .await
+            .expect("create the server pod");
+        let running = wait_running(&pods, &name).await;
+        let installed = match &running {
+            Ok(uid) => Some(wait_installed_within(&client, &pods, &name, uid, std::time::Duration::from_secs(5)).await),
+            Err(_) => None,
+        };
+        let _ = pods.delete(&name, &crate::sandbox::pod_delete_params()).await;
+        running.expect("the server pod runs");
+        let error = installed.expect("waited").expect_err("an install sleeping for an hour finished");
+        assert!(error.contains("didn't finish within 5 s"), "{error}");
+        assert!(error.contains("fetching-marker-452"), "{error}");
     })
     .await;
 }

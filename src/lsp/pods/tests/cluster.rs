@@ -356,7 +356,7 @@ async fn assert_left_nothing(client: &kube::Client, id: i64) {
     assert_eq!(left, (false, false), "(pod, claim) left behind");
 }
 
-fn echo_server(name: &str, install: &str) -> LanguageServerConfig {
+pub(super) fn echo_server(name: &str, install: &str) -> LanguageServerConfig {
     LanguageServerConfig {
         name: name.to_string(),
         image: "debian:trixie-slim".to_string(),

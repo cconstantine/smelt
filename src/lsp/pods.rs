@@ -351,9 +351,24 @@ struct InstallWatch<'a> {
     /// isn't a death (the API server may be busy), and goes in the
     /// timeout's message only while it's still the latest news.
     read_error: Option<String>,
+    /// How many reads of the install's record failed, and the last one's
+    /// error (SME-452): a record that couldn't be read for the whole
+    /// bound reads as an install still running.
+    rc_read_failures: u32,
+    rc_read_error: Option<String>,
 }
 
-impl InstallWatch<'_> {
+impl<'a> InstallWatch<'a> {
+    fn new(name: &'a str, uid: &'a str) -> Self {
+        InstallWatch { name, uid, read_error: None, rc_read_failures: 0, rc_read_error: None }
+    }
+
+    /// A read of the install's record that didn't get through.
+    fn rc_read_failed(&mut self, error: String) {
+        self.rc_read_failures += 1;
+        self.rc_read_error = Some(error);
+    }
+
     /// The error to end the wait with, if the pod as read says so.
     fn read(&mut self, pod: Result<Option<Pod>, String>) -> Option<String> {
         match pod {
@@ -368,10 +383,24 @@ impl InstallWatch<'_> {
         }
     }
 
-    fn timed_out(&self) -> String {
+    /// The error for an install still running after `bound`, with its
+    /// output so far (`log`, or why it couldn't be read).
+    fn timed_out(&self, bound: std::time::Duration, log: Result<String, String>) -> String {
+        let within = if bound.as_secs() >= 60 {
+            format!("{} minutes", bound.as_secs() / 60)
+        } else {
+            format!("{} s", bound.as_secs())
+        };
+        let record = match (self.rc_read_failures, &self.rc_read_error) {
+            (0, _) | (_, None) => String::new(),
+            (n, Some(e)) => format!("; its record couldn't be read {n} times (last: {e})"),
+        };
+        let output = match log {
+            Ok(log) => format!(". Its output so far:\n{}", log.trim_end()),
+            Err(e) => format!(" (its output couldn't be read: {e})"),
+        };
         format!(
-            "The install didn't finish within {} minutes{}",
-            INSTALL_TIMEOUT.as_secs() / 60,
+            "The install didn't finish within {within}{}{record}{output}",
             self.read_error.as_ref().map(|e| format!(" (last error reading the pod: {e})")).unwrap_or_default()
         )
     }
@@ -382,10 +411,32 @@ impl InstallWatch<'_> {
 /// (SME-171): its install can't finish then, and every exec into it
 /// fails, which reads as "not finished yet".
 async fn wait_installed(client: &kube::Client, pods: &kube::Api<Pod>, name: &str, uid: &str) -> Result<(), String> {
+    wait_installed_within(client, pods, name, uid, INSTALL_TIMEOUT).await
+}
+
+/// The install's output so far (its last 4,000 bytes).
+async fn install_log(client: &kube::Client, name: &str) -> Result<String, String> {
+    crate::sandbox::exec_with(client, name, "server", &["tail", "-c", "4000", INSTALL_LOG], None)
+        .await
+        .map(|r| r.stdout)
+        .map_err(|e| e.to_string())
+}
+
+/// `wait_installed` with its bound: only a test passes another than
+/// `INSTALL_TIMEOUT`, to reach the timeout without waiting it out. A
+/// timed-out install says what it was doing (SME-452): its output so
+/// far, and its record's failed reads, since its pod is deleted after.
+async fn wait_installed_within(
+    client: &kube::Client,
+    pods: &kube::Api<Pod>,
+    name: &str,
+    uid: &str,
+    bound: std::time::Duration,
+) -> Result<(), String> {
     #[cfg(test)]
     test_hooks::reached_install_wait(name);
     let started = std::time::Instant::now();
-    let mut watch = InstallWatch { name, uid, read_error: None };
+    let mut watch = InstallWatch::new(name, uid);
     loop {
         if let Some(error) = watch.read(pods.get_opt(name).await.map_err(|e| e.to_string())) {
             return Err(error);
@@ -395,20 +446,20 @@ async fn wait_installed(client: &kube::Client, pods: &kube::Api<Pod>, name: &str
                 if rc == "0" {
                     return Ok(());
                 }
-                let log = crate::sandbox::exec_with(client, name, "server", &["tail", "-c", "4000", INSTALL_LOG], None)
-                    .await
-                    .map(|r| r.stdout)
-                    .unwrap_or_default();
+                let log = install_log(client, name).await.unwrap_or_default();
                 return Err(format!("The install failed (exit {rc}):\n{}", log.trim_end()));
             }
             // Ok(None): the install is still running. Err: this read didn't
             // get through — say so and ask again next second; the timeout
             // below is the bound.
             Ok(None) => {}
-            Err(e) => tracing::info!(pod = name, error = %e, "couldn't read the install's exit code"),
+            Err(e) => {
+                tracing::info!(pod = name, error = %e, "couldn't read the install's exit code");
+                watch.rc_read_failed(e);
+            }
         }
-        if started.elapsed() > INSTALL_TIMEOUT {
-            return Err(watch.timed_out());
+        if started.elapsed() > bound {
+            return Err(watch.timed_out(bound, install_log(client, name).await));
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
