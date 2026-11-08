@@ -9,7 +9,9 @@ use crate::providers::ProviderKind;
 /// The summary, or why it isn't saved over the history. Only the Claude
 /// Code kind is checked (the user's Q1): an HTTP kind's summary has no
 /// thinking in its cap, and one cut off at that cap is saved as it always
-/// was, since failing it would fail every send of a long conversation.
+/// was, since failing it would fail every send of a long conversation —
+/// though since SME-393 the save is *marked* where it stopped, in
+/// `turn::compaction::summarize`.
 pub fn checked(kind: ProviderKind, summary: String, stop_reason: &str) -> Result<String, ModelError> {
     if kind != ProviderKind::ClaudeCli {
         return Ok(summary);

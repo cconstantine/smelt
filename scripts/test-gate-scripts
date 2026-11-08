@@ -166,7 +166,7 @@ tier_db=postgres://u@localhost/smelt_browser_tier_$(basename "$PWD" | tr -c 'a-z
 expected="cargo fetch unlocked
 import unlocked
 import unlocked
-dx build --platform web unlocked
+dx build --platform web --verbose unlocked
 cargo test --features server browser-test --no-run unlocked
 sqlx database drop -y --database-url $tier_db unlocked
 sqlx database create --database-url $tier_db unlocked
@@ -183,6 +183,21 @@ if out=$(timeout 60 "${gate_env[@]}" CARGO_FAIL="--no-run" scripts/browser-tier 
     fail "browser-tier passed with a failing test build: $out"
 fi
 grep -q " locked$" "$CALLS" && fail "browser-tier took the lock after a failing test build: $(cat "$CALLS")"
+
+# 8b. browser-tier bounds its web-bundle step (SME-457): a bundle build that
+# logs nothing and never exits — the shape of the stalled rustup toolchain
+# download behind dx's unit-count estimate — must fail the tier within its
+# cap, naming the step, not hang it. CI_WEB_BUNDLE_DX points the watched
+# bundle build at a stub that sleeps silently; SMELT_BROWSER_TIER_BUNDLE_TIMEOUT=6
+# is the cap, and this case's own timeout 90 guard is what a missing cap
+# fails by — it never gets to run for 90 s.
+hang_dx=$dir/hang-dx.sh
+printf '#!/usr/bin/env bash\n# logs nothing, never exits, like the stalled download\nexec sleep 60\n' >"$hang_dx"
+chmod +x "$hang_dx"
+out=$(timeout 90 "${gate_env[@]}" SMELT_BROWSER_TIER_BUNDLE_TIMEOUT=6 CI_WEB_BUNDLE_DX="$hang_dx" scripts/browser-tier 2>&1)
+rc=$?
+[ "$rc" -ne 0 ] || fail "browser-tier passed a bundle step that hangs (rc $rc): $out"
+grep -q "web bundle step timed out" <<<"$out" || fail "browser-tier didn't name the timed-out web bundle step (rc $rc): $out"
 
 # 9. cluster-test: the same cargo test, built with --no-run unlocked (before
 # the first --, or last when there's none), then run locked.

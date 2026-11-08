@@ -11,6 +11,9 @@ use serde_json::json;
 use crate::lsp::catalog::POD_HOME;
 use crate::models::LanguageServerConfig;
 
+mod install;
+use install::*;
+
 /// The conversation a server pod works for. Kept apart from the sandbox
 /// pod's own `smelt/conversation`, so waiting for a conversation's sandbox
 /// pod to go doesn't wait on its servers too.
@@ -72,16 +75,21 @@ fn pod_script(install_command: &str) -> String {
 /// real `npm install pyright` was unchanged (`added 1 package in 4s`; its
 /// slowest fetch, the tarball, about 3 s). Audit, fund and the update
 /// notifier are each one more request that can stall, and an install
-/// needs none of them. The config's own `env` (in any of npm's spellings
-/// of the name) or the install command's own flags win over these; a
-/// `~/.npmrc` doesn't, since npm ranks its environment above it.
-pub const NPM_STALL_BOUNDS: [(&str, &str); 6] = [
+/// needs none of them. `loglevel=http` makes npm log each fetch as it
+/// finishes (`npm http fetch GET 200 … 292ms`, 4 lines for pyright),
+/// where by default it writes nothing to a file until it ends: a timed-out
+/// install's log then says how far npm got (SME-452's recurrence). The
+/// config's own `env` (in any of npm's spellings of the name) or the
+/// install command's own flags win over these; a `~/.npmrc` doesn't,
+/// since npm ranks its environment above it.
+pub const NPM_STALL_BOUNDS: [(&str, &str); 7] = [
     ("npm_config_fetch_timeout", "30000"),
     ("npm_config_fetch_retries", "3"),
     ("npm_config_fetch_retry_maxtimeout", "10000"),
     ("npm_config_audit", "false"),
     ("npm_config_fund", "false"),
     ("npm_config_update_notifier", "false"),
+    ("npm_config_loglevel", "http"),
 ];
 
 /// The server pod for `config` next to `sandbox`, its config version
@@ -150,7 +158,6 @@ pub fn server_pod_spec(sandbox: &SandboxRef, config: &LanguageServerConfig, conf
 /// How long a server pod may take to start (an image pull included), and
 /// its install to finish.
 const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
-const INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// What `start_with` did.
 #[derive(Clone, Debug, PartialEq)]
@@ -347,154 +354,6 @@ async fn wait_running(pods: &kube::Api<Pod>, name: &str) -> Result<String, Strin
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-}
-
-/// What `wait_installed` makes of each read of its pod.
-struct InstallWatch<'a> {
-    name: &'a str,
-    uid: &'a str,
-    /// The last read's error, when the last read failed: a failed read
-    /// isn't a death (the API server may be busy), and goes in the
-    /// timeout's message only while it's still the latest news.
-    read_error: Option<String>,
-    /// How many reads of the install's record failed, and the last one's
-    /// error (SME-452): a record that couldn't be read for the whole
-    /// bound reads as an install still running.
-    rc_read_failures: u32,
-    rc_read_error: Option<String>,
-}
-
-impl<'a> InstallWatch<'a> {
-    fn new(name: &'a str, uid: &'a str) -> Self {
-        InstallWatch { name, uid, read_error: None, rc_read_failures: 0, rc_read_error: None }
-    }
-
-    /// A read of the install's record that didn't get through.
-    fn rc_read_failed(&mut self, error: String) {
-        self.rc_read_failures += 1;
-        self.rc_read_error = Some(error);
-    }
-
-    /// The error to end the wait with, if the pod as read says so.
-    fn read(&mut self, pod: Result<Option<Pod>, String>) -> Option<String> {
-        match pod {
-            Ok(pod) => {
-                self.read_error = None;
-                install_interrupted(self.name, self.uid, pod.as_ref())
-            }
-            Err(e) => {
-                self.read_error = Some(e);
-                None
-            }
-        }
-    }
-
-    /// The error for an install still running after `bound`, with its
-    /// output so far (`log`, or why it couldn't be read).
-    fn timed_out(&self, bound: std::time::Duration, log: Result<String, String>) -> String {
-        let within = match bound.as_secs() / 60 {
-            0 => format!("{} s", bound.as_secs()),
-            1 => "1 minute".to_string(),
-            minutes => format!("{minutes} minutes"),
-        };
-        let record = match (self.rc_read_failures, &self.rc_read_error) {
-            (0, _) | (_, None) => String::new(),
-            (n, Some(e)) => format!("; its record couldn't be read {n} times (last: {e})"),
-        };
-        let output = match log {
-            Ok(log) => format!(". Its output so far:\n{}", log.trim_end()),
-            Err(e) => format!(" (its output couldn't be read: {e})"),
-        };
-        format!(
-            "The install didn't finish within {within}{}{record}{output}",
-            self.read_error.as_ref().map(|e| format!(" (last error reading the pod: {e})")).unwrap_or_default()
-        )
-    }
-}
-
-/// Waits for the pod's install to finish; a failure comes back with its
-/// output. Pod `uid` stopping or going ends the wait at once, saying why
-/// (SME-171): its install can't finish then, and every exec into it
-/// fails, which reads as "not finished yet".
-async fn wait_installed(client: &kube::Client, pods: &kube::Api<Pod>, name: &str, uid: &str) -> Result<(), String> {
-    wait_installed_within(client, pods, name, uid, INSTALL_TIMEOUT).await
-}
-
-/// The install's output so far (its last 4,000 bytes).
-async fn install_log(client: &kube::Client, name: &str) -> Result<String, String> {
-    crate::sandbox::exec_with(client, name, "server", &["tail", "-c", "4000", INSTALL_LOG], None)
-        .await
-        .map(|r| r.stdout)
-        .map_err(|e| e.to_string())
-}
-
-/// How long a timed-out install's log read may take (SME-452 review 1):
-/// an exec has no bound of its own, and the message mustn't hold the
-/// call past the install's bound.
-const LOG_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// `read`, given up on after `limit`.
-async fn bounded_read(
-    read: impl std::future::Future<Output = Result<String, String>>,
-    limit: std::time::Duration,
-) -> Result<String, String> {
-    tokio::time::timeout(limit, read)
-        .await
-        .unwrap_or_else(|_| Err(format!("the read didn't answer within {} s", limit.as_secs())))
-}
-
-/// `wait_installed` with its bound: only a test passes another than
-/// `INSTALL_TIMEOUT`, to reach the timeout without waiting it out. A
-/// timed-out install says what it was doing (SME-452): its output so
-/// far, and its record's failed reads, since its pod is deleted after.
-async fn wait_installed_within(
-    client: &kube::Client,
-    pods: &kube::Api<Pod>,
-    name: &str,
-    uid: &str,
-    bound: std::time::Duration,
-) -> Result<(), String> {
-    #[cfg(test)]
-    test_hooks::reached_install_wait(name);
-    let started = std::time::Instant::now();
-    let mut watch = InstallWatch::new(name, uid);
-    loop {
-        if let Some(error) = watch.read(pods.get_opt(name).await.map_err(|e| e.to_string())) {
-            return Err(error);
-        }
-        match install_rc(client, name).await {
-            Ok(Some(rc)) => {
-                if rc == "0" {
-                    return Ok(());
-                }
-                let log = install_log(client, name).await.unwrap_or_default();
-                return Err(format!("The install failed (exit {rc}):\n{}", log.trim_end()));
-            }
-            // Ok(None): the install is still running. Err: this read didn't
-            // get through — say so and ask again next second; the timeout
-            // below is the bound.
-            Ok(None) => {}
-            Err(e) => {
-                tracing::info!(pod = name, error = %e, "couldn't read the install's exit code");
-                watch.rc_read_failed(e);
-            }
-        }
-        if started.elapsed() > bound {
-            return Err(watch.timed_out(bound, bounded_read(install_log(client, name), LOG_READ_TIMEOUT).await));
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
-}
-
-/// The install's exit code, once it has finished. `Err` means the check
-/// itself couldn't run (the exec failed): the install's state is then
-/// unknown — *not* "not finished" — and no caller may report liveness from
-/// it the way it once did (SME-426: one dropped exec read a Ready server
-/// as not running).
-async fn install_rc(client: &kube::Client, name: &str) -> Result<Option<String>, String> {
-    let result = crate::sandbox::exec_with(client, name, "server", &["cat", INSTALL_RC], None).await.map_err(|e| e.to_string())?;
-    let rc = result.stdout.trim();
-    Ok((result.exit_code == 0 && !rc.is_empty()).then(|| rc.to_string()))
 }
 
 /// The server pods working for `conversation_id`.
