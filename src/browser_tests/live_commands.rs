@@ -76,9 +76,12 @@ pub(super) async fn scenario_live_command_marker(t: &Scenario<'_>) {
         assert!(wait_for_count(tab, &marker, 0, Duration::from_secs(30)).await, "{what}: the marker should clear when the command finishes");
     }
 
-    // d. Pod stop while a command runs: both marks go, live — fails
-    //    without the `close_pod_terminals` publish (the query's live-pod
-    //    join alone leaves a stale marker with nothing refetching).
+    // d. Pod stop while a command runs: both marks go, live. Two carriers,
+    //    either one on its own enough here: `live_commands` refetches on
+    //    `pods_changed()`, and `close_pod_terminals` publishes
+    //    CommandsChanged once a `lost` mark landed — stub that publish and
+    //    this scenario still passes, PodsChanged alone carries this path
+    //    (f175981b's red-first); `quiet_stop.rs`'s user-stop test holds it.
     let long_id = unique_id("cmd-long");
     anthropic::tools::execute(
         pool,
@@ -167,9 +170,10 @@ pub(super) async fn scenario_live_command_marker(t: &Scenario<'_>) {
     phone.close().await.expect("close the tab");
 
     // g. The agent's pod stop clears its marker too — plan 5.e's promise,
-    //    asserted rather than left as cleanup: `close_pod_terminals`
-    //    publishes once per close, for the agent's conversation and on
-    //    both relays.
+    //    asserted rather than left as cleanup. The same two carriers as
+    //    step d: the `pods_changed()` refetch this scenario drives, and
+    //    the `close_pod_terminals` publish (`quiet_stop.rs`'s user-stop
+    //    test), reaching the agent's own conversation on both relays.
     sandbox::stop_pod_for_user(pool, agent_pod).await.expect("stop the agent's pod");
     for (tab, what) in [(&home, "home tab"), (&conv, "conversation tab")] {
         assert!(wait_for_count(tab, &agent_marker, 0, Duration::from_secs(10)).await, "{what}: the agent's marker should clear with its pod too");
