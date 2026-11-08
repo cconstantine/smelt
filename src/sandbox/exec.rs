@@ -22,7 +22,13 @@ pub struct Sandbox {
 pub struct ExecResult {
     pub stdout: String,
     pub stderr: String,
+    /// -1 when the command never ran or its status never came; `refused`
+    /// tells those two apart.
     pub exit_code: i32,
+    /// The API server sent a status that wasn't an exit (the runtime
+    /// refused the command, SME-452): it certainly never ran, where a
+    /// status that never came (-1, not refused) leaves it unknown.
+    pub refused: bool,
 }
 
 impl Sandbox {
@@ -159,16 +165,18 @@ pub(crate) async fn exec_with(
     let exit_code = extract_exit_code(status.clone());
     // A command the runtime never ran says why, for callers that show
     // stderr (SME-452).
+    let mut refused = false;
     if exit_code == -1
         && let Some(status) = status
     {
+        refused = true;
         stderr.push_str(&format!(
             "exec failed: {}: {}",
             status.reason.unwrap_or_default(),
             status.message.unwrap_or_default()
         ));
     }
-    Ok(ExecResult { stdout, stderr, exit_code })
+    Ok(ExecResult { stdout, stderr, exit_code, refused })
 }
 
 /// On success the exec protocol's terminal `Status` is `Success`, with no

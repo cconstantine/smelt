@@ -327,7 +327,7 @@ async fn test_a_timed_out_installs_log_read_is_bounded() {
 }
 
 fn exec_result(exit_code: i32, stdout: &str, stderr: &str) -> crate::sandbox::ExecResult {
-    crate::sandbox::ExecResult { stdout: stdout.to_string(), stderr: stderr.to_string(), exit_code }
+    crate::sandbox::ExecResult { stdout: stdout.to_string(), stderr: stderr.to_string(), exit_code, refused: false }
 }
 
 /// SME-452's recurrence: a record read the runtime never ran (exit -1,
