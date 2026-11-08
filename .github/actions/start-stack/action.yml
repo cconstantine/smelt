@@ -14,9 +14,12 @@ runs:
   using: composite
   steps:
     - name: Install the docker compose plugin if missing
-      # The self-hosted ARC runner image has the Docker CLI but not the
-      # compose plugin (GitHub's ubuntu-latest has both). A no-op once the
-      # runner image includes it.
+      # The self-hosted ARC runner image has the Docker CLI, and its compose
+      # plugin has come and gone (GitHub's ubuntu-latest has both). The
+      # script keeps a present one, else installs the pinned v5.5.1 from the
+      # runner's cache volume, GitHub releases or docker/compose-bin, in that
+      # order, checked against its sha256, and its one `install-compose:`
+      # line says which (SME-458; docs/setup.md's CI section).
       shell: bash
       run: |
         scripts/ci-install-compose

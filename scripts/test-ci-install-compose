@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# Checks scripts/ci-install-compose (SME-458) against a stub release server
+# (scripts/lib/flaky-http-server.py) and a stub `docker` first on PATH, with
+# no network and no real Docker. Each case gets its own HOME, DOCKER_CONFIG
+# and CI_CACHE_DIR and runs under `timeout 30`; it prints `ok <case>` or
+# `FAIL <case>: <what it wanted>` and what it got. A case whose stubs were
+# never reached says `harness didn't bite` instead of passing. Needs no
+# cluster or database; check.sh runs it with the other script tests.
+#
+#   scripts/test-ci-install-compose [case ...]   # every case by default
+set -uo pipefail
+cd "$(dirname "$0")/.."
+repo=$PWD
+installer=${CI_INSTALL_COMPOSE:-$repo/scripts/ci-install-compose}
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/test-ci-install-compose.XXXXXX")
+server_pid=
+cleanup() {
+    [ -n "$server_pid" ] && kill "$server_pid" 2>/dev/null
+    rm -rf "$work"
+}
+trap cleanup EXIT
+
+passes=0
+failures=0
+
+# The fixture compose: what every source serves, and its sha256 the pin.
+fixture=$work/fixture-compose
+printf '#!/bin/sh\necho "Docker Compose version vTEST"\n' >"$fixture"
+chmod +x "$fixture"
+fixture_sha=$(sha256sum "$fixture" | cut -d' ' -f1)
+other=$work/other-bytes
+printf '#!/bin/sh\necho "some other compose"\n' >"$other"
+
+# The stub docker. `compose version` works once a plugin is installed where
+# the real CLI looks (or with STUB_COMPOSE_PRESENT=1); the image calls follow
+# STUB_IMAGE_LOCAL, STUB_PULL_FAIL (N or all) and STUB_IMAGE_FILE. Every call
+# is appended to $STUB_CALLS.
+mkdir -p "$work/bin"
+cat >"$work/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >>"$STUB_CALLS"
+case "$1" in
+compose)
+    if [ -n "${STUB_COMPOSE_PRESENT:-}" ]; then
+        echo "Docker Compose version vPRESENT"
+        exit 0
+    fi
+    plugin=${DOCKER_CONFIG:-$HOME/.docker}/cli-plugins/docker-compose
+    [ -x "$plugin" ] && exec "$plugin" "${@:2}"
+    echo "docker: unknown command: docker compose" >&2
+    exit 1 ;;
+image)
+    [ -n "${STUB_IMAGE_LOCAL:-}" ] && { echo '[{}]'; exit 0; }
+    echo "Error response from daemon: No such image: $3" >&2
+    exit 1 ;;
+pull)
+    n=$(($(cat "$STUB_CALLS.pulls" 2>/dev/null || echo 0) + 1))
+    echo "$n" >"$STUB_CALLS.pulls"
+    if [ "${STUB_PULL_FAIL:-0}" = all ] || [ "$n" -le "${STUB_PULL_FAIL:-0}" ]; then
+        echo "Error response from daemon: Get \"https://registry-1.docker.io/v2/\": dial tcp: lookup registry-1.docker.io: no such host" >&2
+        exit 1
+    fi
+    echo "$2: Pulled" ;;
+create) echo stubcontainer ;;
+cp) cp "$STUB_IMAGE_FILE" "$3" ;;
+rm) echo "$2" ;;
+*) echo "stub docker: unexpected call: $*" >&2; exit 1 ;;
+esac
+STUB
+chmod +x "$work/bin/docker"
+
+# Starts the stub server in mode "$@" for the current case; sets $url.
+start_server() {
+    rm -f "$dir/port"
+    python3 -I "$repo/scripts/lib/flaky-http-server.py" --ready "$dir/port" \
+        --log "$dir/server.log" --file "$fixture" --lifetime 120 "$@" &
+    server_pid=$!
+    for _ in $(seq 100); do
+        [ -s "$dir/port" ] && break
+        kill -0 "$server_pid" 2>/dev/null || break
+        sleep 0.05
+    done
+    [ -s "$dir/port" ] && kill -0 "$server_pid" 2>/dev/null ||
+        { echo "the stub server didn't start" >&2; exit 2; }
+    url="http://127.0.0.1:$(cat "$dir/port")/v5.5.1/docker-compose-linux-x86_64"
+}
+
+stop_server() {
+    [ -n "$server_pid" ] && kill "$server_pid" 2>/dev/null
+    wait "$server_pid" 2>/dev/null
+    server_pid=
+}
+
+# A fresh case: its dirs, and the env every run of it shares.
+new_case() {
+    case_name=$1
+    dir=$work/$1
+    mkdir -p "$dir/cache"
+    : >"$dir/server.log"
+    : >"$dir/calls"
+    wants=()
+    unset STUB_COMPOSE_PRESENT STUB_IMAGE_LOCAL STUB_PULL_FAIL
+    export STUB_CALLS=$dir/calls STUB_IMAGE_FILE=$fixture
+    export CI_CACHE_DIR=$dir/cache
+    export COMPOSE_SHA256=$fixture_sha COMPOSE_IMAGE=stub/compose-bin:vTEST
+    export COMPOSE_INSTALL_PAUSES='0 0' COMPOSE_MAX_TIME=2 COMPOSE_PULL_TIMEOUT=5
+}
+
+# One run of the installer, as a fresh pod: a new HOME. Sets $out and $rc.
+run_installer() {
+    export HOME=$dir/home$1
+    export DOCKER_CONFIG=$HOME/.docker
+    mkdir -p "$HOME"
+    out=$(COMPOSE_URL=$url PATH="$work/bin:$PATH" timeout 30 "$installer" 2>&1)
+    rc=$?
+}
+
+cache_file() { echo "$CI_CACHE_DIR/tools/docker-compose-v5.5.1-linux-x86_64"; }
+plugin() { echo "$DOCKER_CONFIG/cli-plugins/docker-compose"; }
+gets() { grep -c '^#' "$dir/server.log"; }
+lines() { grep -c -- "$1" <<<"$out"; }
+want() { wants+=("$1"); }
+has() { grep -qF -- "$1" <<<"$out" || want "a line with '$1'"; }
+same_as() { cmp -s "$1" "$2" || want "$3"; }
+
+# Ends a case: ok, FAIL with what it wanted and what it got, or FAIL as a
+# harness that never reached its stubs: the stub docker never called, or
+# (in a case that $1 says needs GETs) the installer reporting a github
+# releases attempt the stub server never saw, which means it went somewhere
+# else. A case the code simply skipped the fetch in is an ordinary FAIL.
+verdict() {
+    stop_server
+    if ! grep -q '^compose version' "$dir/calls" ||
+        { [ "$1" -gt 0 ] && [ "$(gets)" -eq 0 ] &&
+            grep -qE '^(curl: |install-compose: (github releases|fetched from github))' <<<"$out"; }; then
+        echo "FAIL $case_name: harness didn't bite (GETs: $(gets); docker calls: $(wc -l <"$dir/calls"))"
+        failures=$((failures + 1))
+    elif [ ${#wants[@]} -eq 0 ]; then
+        echo "ok $case_name"
+        passes=$((passes + 1))
+        return
+    else
+        local w
+        w=$(printf '%s; ' "${wants[@]}")
+        echo "FAIL $case_name: ${w%; }"
+        failures=$((failures + 1))
+    fi
+    echo "    actual: exit $rc, $(gets) GETs"
+    sed 's/^/    | /' <<<"$out"
+    sed 's/^/    server: /' "$dir/server.log"
+    sed 's/^/    docker: /' "$dir/calls"
+}
+
+case_present() {
+    start_server ok
+    export STUB_COMPOSE_PRESENT=1
+    run_installer 1
+    [ "$rc" -eq 0 ] || want "exit 0"
+    has "install-compose: already present (Docker Compose version vPRESENT)"
+    [ "$(gets)" -eq 0 ] || want "0 GETs"
+    grep -qv '^compose' "$dir/calls" && want "no docker image calls"
+    verdict 0
+}
+
+# The ticket's signature: one 504 from GitHub releases.
+case_gh_504_once() {
+    start_server fail-first 1
+    run_installer 1
+    [ "$rc" -eq 0 ] || want "exit 0"
+    has "install-compose: github releases attempt 1 of 3 failed: curl: (22) The requested URL returned error: 504"
+    has "install-compose: fetched from github releases on attempt 2 of 3, sha256 ok; cached at $(cache_file)"
+    [ "$(gets)" -eq 2 ] || want "2 GETs"
+    same_as "$(cache_file)" "$fixture" "the cache holds the fixture"
+    same_as "$(plugin)" "$fixture" "the plugin is the fixture"
+    verdict 1
+}
+
+case_gh_down_image() {
+    start_server always-504
+    run_installer 1
+    [ "$rc" -eq 0 ] || want "exit 0"
+    [ "$(lines 'github releases attempt [123] of 3 failed: curl: (22)')" -eq 3 ] || want "3 failed github lines"
+    has "install-compose: fetched from stub/compose-bin:vTEST (pulled) on attempt 1 of 3, sha256 ok; cached at $(cache_file)"
+    grep -q '^pull ' "$dir/calls" || want "a docker pull"
+    same_as "$(cache_file)" "$fixture" "the cache holds the fixture"
+    same_as "$(plugin)" "$fixture" "the plugin is the fixture"
+    verdict 1
+}
+
+case_gh_down_image_local() {
+    start_server always-504
+    export STUB_IMAGE_LOCAL=1
+    run_installer 1
+    [ "$rc" -eq 0 ] || want "exit 0"
+    has "install-compose: fetched from stub/compose-bin:vTEST (already in the daemon) on attempt 1 of 3"
+    grep -q '^image inspect' "$dir/calls" || want "a docker image inspect"
+    grep -q '^pull ' "$dir/calls" && want "no docker pull"
+    same_as "$(plugin)" "$fixture" "the plugin is the fixture"
+    verdict 1
+}
+
+case_gh_hang() {
+    start_server hang
+    run_installer 1
+    [ "$rc" -eq 0 ] || want "exit 0 (124 is the case's timeout)"
+    [ "$(lines 'github releases attempt [123] of 3 failed: curl: (28)')" -eq 3 ] || want "3 github attempts ending in curl (28)"
+    has "install-compose: fetched from stub/compose-bin:vTEST (pulled) on attempt 1 of 3"
+    same_as "$(plugin)" "$fixture" "the plugin is the fixture"
+    verdict 1
+}
+
+case_gh_bad_sha() {
+    start_server bad-bytes
+    run_installer 1
+    [ "$rc" -eq 0 ] || want "exit 0"
+    bad_sha=$(printf '#!/bin/sh\necho %s\n' "'not the pinned compose'" | sha256sum | cut -d' ' -f1)
+    [ "$(lines "failed: sha256 $bad_sha is not the pinned one")" -eq 3 ] || want "3 'sha256 $bad_sha is not the pinned one' lines"
+    has "install-compose: fetched from stub/compose-bin:vTEST (pulled) on attempt 1 of 3"
+    same_as "$(plugin)" "$fixture" "the plugin is the fixture, not the bad bytes"
+    same_as "$(cache_file)" "$fixture" "the cache holds the fixture, not the bad bytes"
+    verdict 1
+}
+
+case_cache_hit() {
+    start_server ok
+    mkdir -p "$CI_CACHE_DIR/tools" && cp "$fixture" "$(cache_file)"
+    run_installer 1
+    [ "$rc" -eq 0 ] || want "exit 0"
+    has "install-compose: cache hit, sha256 ok ($(cache_file))"
+    [ "$(gets)" -eq 0 ] || want "0 GETs"
+    grep -qv '^compose' "$dir/calls" && want "no docker image calls"
+    same_as "$(plugin)" "$fixture" "the plugin is the fixture"
+    verdict 0
+}
+
+case_cache_corrupt() {
+    start_server ok
+    mkdir -p "$CI_CACHE_DIR/tools" && cp "$other" "$(cache_file)"
+    run_installer 1
+    [ "$rc" -eq 0 ] || want "exit 0"
+    has "install-compose: cached copy failed its sha256 (got $(sha256sum "$other" | cut -d' ' -f1)); discarded"
+    has "install-compose: fetched from github releases on attempt 1 of 3"
+    same_as "$(cache_file)" "$fixture" "the cache now holds the fixture"
+    verdict 1
+}
+
+# Two fresh pods on one cache volume: the second fetches nothing.
+case_second_run() {
+    start_server ok
+    run_installer 1
+    first=$out first_rc=$rc
+    grep -qF "install-compose: fetched from github releases on attempt 1 of 3" <<<"$first" ||
+        want "run 1 fetched from github releases"
+    run_installer 2
+    [ "$first_rc" -eq 0 ] && [ "$rc" -eq 0 ] || want "both runs exit 0 (got $first_rc, $rc)"
+    has "install-compose: cache hit, sha256 ok"
+    [ "$(gets)" -eq 1 ] || want "1 GET over both runs"
+    out="$first"$'\n--- run 2 ---\n'"$out"
+    verdict 1
+}
+
+case_no_cache_dir() {
+    start_server ok
+    unset CI_CACHE_DIR
+    run_installer 1
+    [ "$rc" -eq 0 ] || want "exit 0"
+    has "install-compose: no CI_CACHE_DIR, so nothing is cached"
+    has "install-compose: fetched from github releases on attempt 1 of 3"
+    same_as "$(plugin)" "$fixture" "the plugin is the fixture"
+    verdict 1
+}
+
+# A cache volume that can't be written to costs the caching, not the step.
+case_cache_readonly() {
+    start_server ok
+    mkdir -p "$CI_CACHE_DIR/tools" && chmod 555 "$CI_CACHE_DIR/tools"
+    run_installer 1
+    chmod 755 "$CI_CACHE_DIR/tools"
+    [ "$rc" -eq 0 ] || want "exit 0"
+    has "install-compose: couldn't cache ("
+    has "install-compose: fetched from github releases on attempt 1 of 3, sha256 ok; not cached"
+    same_as "$(plugin)" "$fixture" "the plugin is the fixture"
+    [ -z "$(ls -A "$CI_CACHE_DIR/tools")" ] || want "nothing written to the cache dir"
+    verdict 1
+}
+
+case_all_down() {
+    start_server always-504
+    export STUB_PULL_FAIL=all
+    run_installer 1
+    [ "$rc" -eq 1 ] || want "exit 1"
+    [ "$(lines '::error::')" -eq 1 ] || want "exactly one ::error:: line"
+    has "::error::install-compose: every source failed (cache: miss; github releases: 3 attempts, last: curl: (22) The requested URL returned error: 504; stub/compose-bin:vTEST: 3 attempts, last: Error response from daemon:"
+    has "), an outage of GitHub releases and Docker Hub, not the change"
+    [ -z "$(ls -A "$DOCKER_CONFIG/cli-plugins" 2>/dev/null)" ] || want "cli-plugins empty"
+    [ -z "$(ls -A "$CI_CACHE_DIR/tools" 2>/dev/null)" ] || want "nothing left in the cache dir"
+    verdict 1
+}
+
+# The pin: one version line, and the URL and image both made from it.
+case_pin() {
+    local s=$installer
+    dir=$work/pin
+    [ "$(grep -cE '^version=v[0-9]+\.[0-9]+\.[0-9]+$' "$s")" -eq 1 ] || want "one version=vX.Y.Z line"
+    [ "$(grep -cE '^sha256=[0-9a-f]{64}$' "$s")" -eq 1 ] || want "one sha256= line of 64 hex characters"
+    grep -qF 'https://github.com/docker/compose/releases/download/$version/docker-compose-linux-x86_64' "$s" ||
+        want "the release URL made from \$version"
+    grep -qF 'docker/compose-bin:$version' "$s" || want "the image made from \$version"
+    if [ ${#wants[@]} -eq 0 ]; then
+        echo "ok pin"
+        passes=$((passes + 1))
+    else
+        local w
+        w=$(printf '%s; ' "${wants[@]}")
+        echo "FAIL pin: ${w%; }"
+        failures=$((failures + 1))
+    fi
+}
+
+all=(present gh-504-once gh-down-image gh-down-image-local gh-hang gh-bad-sha
+    cache-hit cache-corrupt second-run no-cache-dir cache-readonly all-down)
+[ $# -gt 0 ] && all=("$@")
+for c in "${all[@]}"; do
+    new_case "$c"
+    "case_${c//-/_}"
+done
+wants=()
+case_pin
+
+echo "$passes passed, $failures failed"
+[ "$failures" -eq 0 ]

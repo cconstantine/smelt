@@ -1,13 +1,164 @@
 #!/usr/bin/env bash
 # Installs the docker compose plugin when the runner lacks it; start-stack's
-# first step (SME-458). COMPOSE_URL overrides the download, for tests.
+# first step (SME-458). The ARC runner image has carried the plugin and
+# lost it, so a fresh pod may have none. Sources, first that works:
+#
+#   1. already present: any version, left alone;
+#   2. a copy cached on the runner's cache volume ($CI_CACHE_DIR/tools/),
+#      used only when its sha256 is the pinned one;
+#   3. GitHub releases, 3 attempts;
+#   4. the docker/compose-bin image, from the daemon or a pull, 3 attempts.
+#
+# A fetched copy is checked against the pin, installed, and cached through a
+# temp file and a rename, so a fresh pod on the same volume needs no network.
+# Exactly one `install-compose:` line says which path was taken; each failed
+# attempt adds one line before it; when every source fails the last line is
+# a single ::error:: annotation and the script exits 1, having installed
+# nothing.
+#
+# COMPOSE_URL, COMPOSE_IMAGE and COMPOSE_SHA256 replace the pin, and
+# COMPOSE_INSTALL_PAUSES, COMPOSE_MAX_TIME and COMPOSE_PULL_TIMEOUT the
+# waits: for scripts/test-ci-install-compose only.
 set -euo pipefail
 
-url=${COMPOSE_URL:-https://github.com/docker/compose/releases/download/v5.5.1/docker-compose-linux-x86_64}
+version=v5.5.1
+sha256=db1889184726840f75c4f9c001048430d4f25b3be3cb084d3ddd762bc0aed576
 
-if ! docker compose version > /dev/null 2>&1; then
-  mkdir -p ~/.docker/cli-plugins
-  curl -fsSL -o ~/.docker/cli-plugins/docker-compose \
-    "$url"
-  chmod +x ~/.docker/cli-plugins/docker-compose
+url=${COMPOSE_URL:-https://github.com/docker/compose/releases/download/$version/docker-compose-linux-x86_64}
+image=${COMPOSE_IMAGE:-docker/compose-bin:$version}
+want=${COMPOSE_SHA256:-$sha256}
+read -r -a pauses <<<"${COMPOSE_INSTALL_PAUSES:-5 15}"
+max_time=${COMPOSE_MAX_TIME:-60}
+pull_timeout=${COMPOSE_PULL_TIMEOUT:-120}
+attempts=3
+
+say() { echo "install-compose: $*"; }
+
+if present=$(docker compose version 2>/dev/null); then
+    say "already present (${present%%$'\n'*})"
+    exit 0
 fi
+
+arch=$(uname -m)
+if [ "$arch" != x86_64 ]; then
+    echo "::error::install-compose: no pinned compose for $arch"
+    exit 1
+fi
+
+plugins=${DOCKER_CONFIG:-$HOME/.docker}/cli-plugins
+cache=
+if [ -n "${CI_CACHE_DIR:-}" ]; then
+    cache=$CI_CACHE_DIR/tools/docker-compose-$version-linux-x86_64
+else
+    say "no CI_CACHE_DIR, so nothing is cached"
+fi
+
+sha_of() { sha256sum "$1" | cut -d' ' -f1; }
+
+# Copies a verified file into cli-plugins, through a temp file there too.
+install_plugin() {
+    mkdir -p "$plugins"
+    cp "$1" "$plugins/.docker-compose.tmp.$$"
+    chmod +x "$plugins/.docker-compose.tmp.$$"
+    mv -f "$plugins/.docker-compose.tmp.$$" "$plugins/docker-compose"
+}
+
+# 2. The cache.
+cache_state=none
+if [ -n "$cache" ]; then
+    cache_state=miss
+    if [ -f "$cache" ]; then
+        got=$(sha_of "$cache")
+        if [ "$got" = "$want" ]; then
+            install_plugin "$cache"
+            say "cache hit, sha256 ok ($cache)"
+            exit 0
+        fi
+        rm -f "$cache"
+        say "cached copy failed its sha256 (got $got); discarded"
+    fi
+fi
+
+# Downloads land in a temp file next to the cache, so the rename into it is
+# atomic: two jobs at once can't leave a torn file. A cache dir that can't
+# be written to (a broken volume) only costs the caching: the download goes
+# to a temp file elsewhere. The trap removes the temp file on any exit.
+tmp=
+if [ -n "$cache" ] && mkdir -p "${cache%/*}" 2>/dev/null && : 2>/dev/null >"$cache.tmp.$$"; then
+    tmp=$cache.tmp.$$
+fi
+trap 'rm -f "$tmp"' EXIT
+[ -n "$tmp" ] || tmp=$(mktemp)
+
+# Each fetch_* writes the candidate to $tmp, or sets $err to its error line
+# and fails. $how says how the image was had.
+last_line() { local s=${1%$'\n'}; echo "${s##*$'\n'}"; }
+
+fetch_github() {
+    if ! err=$(curl -fsSL --connect-timeout 15 --max-time "$max_time" -o "$tmp" "$url" 2>&1); then
+        err=$(last_line "${err:-curl failed with no message}")
+        return 1
+    fi
+}
+
+fetch_image() {
+    local id
+    if docker image inspect "$image" >/dev/null 2>&1; then
+        how="already in the daemon"
+    elif err=$(timeout "$pull_timeout" docker pull "$image" 2>&1); then
+        how=pulled
+    else
+        err=$(last_line "${err:-docker pull gave up after ${pull_timeout}s}")
+        return 1
+    fi
+    if ! id=$(docker create "$image" x 2>&1); then
+        err=$(last_line "$id")
+        return 1
+    fi
+    if ! err=$(docker cp "$id:/docker-compose" "$tmp" 2>&1); then
+        docker rm "$id" >/dev/null 2>&1 || true
+        err=$(last_line "$err")
+        return 1
+    fi
+    docker rm "$id" >/dev/null 2>&1 || true
+}
+
+# Tries $2 up to $attempts times as source $1; on success installs and
+# caches the file and exits; on failure sets $last to the last error line.
+try_source() {
+    local name=$1 fetch=$2 k got where moved
+    for ((k = 1; k <= attempts; k++)); do
+        how= err=
+        rm -f "$tmp"
+        if "$fetch"; then
+            got=$(sha_of "$tmp")
+            if [ "$got" = "$want" ]; then
+                install_plugin "$tmp"
+                where="not cached (no CI_CACHE_DIR)"
+                if [ -n "$cache" ]; then
+                    if moved=$(mv -f "$tmp" "$cache" 2>&1); then
+                        where="cached at $cache"
+                    else
+                        say "couldn't cache ($(last_line "$moved"))"
+                        where="not cached"
+                    fi
+                fi
+                say "fetched from $name${how:+ ($how)} on attempt $k of $attempts, sha256 ok; $where"
+                exit 0
+            fi
+            err="sha256 $got is not the pinned one"
+        fi
+        last=$err
+        say "$name attempt $k of $attempts failed: $err"
+        if [ "$k" -lt "$attempts" ]; then
+            sleep "${pauses[k - 1]:-0}"
+        fi
+    done
+}
+
+# 3. and 4.
+try_source "github releases" fetch_github
+gh_last=$last
+try_source "$image" fetch_image
+echo "::error::install-compose: every source failed (cache: $cache_state; github releases: $attempts attempts, last: $gh_last; $image: $attempts attempts, last: $last), an outage of GitHub releases and Docker Hub, not the change"
+exit 1
