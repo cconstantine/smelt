@@ -289,6 +289,7 @@ async fn test_a_cut_off_http_summary_saves_marked(pool: PgPool) {
     // stack (5 commits, all with exact `Co-Authored-By: …`").
     let cut = text_reply_body("Fix stack (5 commits, all with exact trailer")
         .replace(r#""stop_reason":"end_turn""#, r#""stop_reason":"max_tokens""#);
+    assert!(cut.contains("max_tokens"), "shape guard: the summary is cut off at the cap: {cut}");
     start_recording_mock_upstream(&pool, vec![cut, text_reply_body("Carrying on.")]).await;
 
     run_turn(&pool, conversation.id, hello())
