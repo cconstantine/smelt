@@ -582,15 +582,17 @@ pub(super) async fn describe_live_state(pool: &PgPool, conversation_id: i64) -> 
 #[cfg(feature = "server")]
 pub(super) const SUMMARY_MAX_TOKENS: u32 = 2048;
 
-/// What an HTTP kind's summary cut off at `SUMMARY_MAX_TOKENS` gets
-/// appended with on save (SME-393). The save itself is PR #291's decision
-/// — failing every summary that reaches the cap would fail every send of
-/// a long conversation — but a narration that stops mid-sentence must not
-/// read as a complete record: 2294639622's seat completed the cut-off
-/// sentence with fabrications 16 s after the cut.
+/// What an HTTP kind's cut-off summary gets appended with on save
+/// (SME-393), whichever stop cut it — `SUMMARY_MAX_TOKENS` or the
+/// context window (`is_cut_off`) — so the marker's wording names the
+/// truncation, not a cause. The save itself is PR #291's decision —
+/// failing every summary that reaches the cap would fail every send of
+/// a long conversation — but a narration that stops mid-sentence must
+/// not read as a complete record: 2294639622's seat completed the
+/// cut-off sentence with fabrications 16 s after the cut.
 #[cfg(feature = "server")]
-pub(super) const SUMMARY_CUT_OFF_MARKER: &str = "\n\n[note: this summary hit its reply cap and is cut \
-    off mid-sentence — what came after the cut was never written. The state it was reaching for is \
+pub(super) const SUMMARY_CUT_OFF_MARKER: &str = "\n\n[note: this summary is cut off mid-sentence — \
+    what came after the cut was never written. The state it was reaching for is \
     unknown, not settled: verify it with a tool call before acting on it, and always before \
     overwriting, discarding or resetting work.]";
 

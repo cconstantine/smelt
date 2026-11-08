@@ -306,3 +306,70 @@ async fn test_a_cut_off_http_summary_saves_marked(pool: PgPool) {
         "marked where it stopped, so the seat sees the truncation (SME-393): {saved:?}"
     );
 }
+
+/// The marker fires for either cut-off stop — `max_tokens` at the cap or
+/// the window (`model_context_window_exceeded`, `stream::is_cut_off`) —
+/// so its wording must stay reason-neutral: blaming the cap for a window
+/// stop points the seat at the provider's reply-token dial when the
+/// window was the cause (SME-393 round 1, L1). The 2294639622 shape
+/// again, stopped by the window: the save must name the truncation (the
+/// pinned "cut off" and "mid-sentence") and no cause.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_window_stopped_cut_off_marker_blames_no_cause(pool: PgPool) {
+    use super::overflow::compaction_summaries;
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    db::create_message(
+        &pool,
+        conversation.id,
+        "user",
+        &[anthropic::ContentBlock::Text { text: "earlier".to_string() }],
+    )
+    .await
+    .expect("seed");
+    db::create_message(
+        &pool,
+        conversation.id,
+        "assistant",
+        &[anthropic::ContentBlock::Text { text: "reply".to_string() }],
+    )
+    .await
+    .expect("seed");
+    db::upsert_conversation_usage(
+        &pool,
+        conversation.id,
+        &anthropic::TokenUsage {
+            input_tokens: 190_000,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        },
+    )
+    .await
+    .expect("seed usage");
+    // The same mid-claim truncation as the test above, this time stopped
+    // by the context window rather than the reply cap.
+    let cut = text_reply_body("Fix stack (5 commits, all with exact trailer")
+        .replace(r#""stop_reason":"end_turn""#, r#""stop_reason":"model_context_window_exceeded""#);
+    assert!(
+        cut.contains("model_context_window_exceeded"),
+        "shape guard: the summary is the window's stop, not the cap's: {cut}"
+    );
+    start_recording_mock_upstream(&pool, vec![cut, text_reply_body("Carrying on.")]).await;
+
+    run_turn(&pool, conversation.id, hello())
+        .await
+        .expect("the window-stopped summary saves and the turn carries on");
+
+    let saved = compaction_summaries(&pool, conversation.id).await;
+    assert_eq!(saved.len(), 1, "a window-stopped cut-off still saves (PR #291's decision)");
+    assert!(
+        saved[0].contains("cut off") && saved[0].contains("mid-sentence"),
+        "marked where it stopped, whatever stopped it (SME-393): {saved:?}"
+    );
+    assert!(
+        !saved[0].to_lowercase().contains("reply cap"),
+        "the marker names the truncation, not a cause this save doesn't have (SME-393 L1): {saved:?}"
+    );
+}
