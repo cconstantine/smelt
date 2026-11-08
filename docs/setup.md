@@ -213,12 +213,14 @@ has (any version). Without one it installs the pinned v5.5.1, checked against
 the sha256 at the script's top, from the first source that works: the copy
 cached at `$CI_CACHE_DIR/tools/`, then GitHub releases (3 attempts), then the
 `docker/compose-bin` image (3 attempts). It caches what it fetched, so after
-one fetch per cache volume a fresh pod needs no network for it. Exactly one
-`install-compose:` line says which: `already present (…)`, `cache hit, sha256
-ok`, `fetched from <source> on attempt k of 3`, or the single
-`::error::install-compose: every source failed (…)` that fails the step. Each
-failed attempt adds one line before it. `no CI_CACHE_DIR, so nothing is
-cached` means the runner image stopped setting the variable.
+one fetch per cache volume a fresh pod needs no network for it. One
+`install-compose:` line names the path taken: `already present (…)`, `cache
+hit, sha256 ok`, `fetched from <source> on attempt k of 3`, or the single
+`::error::install-compose: every source failed (…)` that fails the step.
+Notes about the cache (`no CI_CACHE_DIR`, a copy unreadable or discarded,
+`couldn't cache`) and one line per failed attempt come before it. `no
+CI_CACHE_DIR, so nothing is cached` means the runner image stopped setting
+the variable.
 `scripts/test-ci-install-compose` (in `check.sh`) runs every path against
 stubs.
 

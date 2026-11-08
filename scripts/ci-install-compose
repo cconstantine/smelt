@@ -11,10 +11,11 @@
 #
 # A fetched copy is checked against the pin, installed, and cached through a
 # temp file and a rename, so a fresh pod on the same volume needs no network.
-# Exactly one `install-compose:` line says which path was taken; each failed
-# attempt adds one line before it; when every source fails the last line is
-# a single ::error:: annotation and the script exits 1, having installed
-# nothing.
+# One line names the path taken: `already present`, `cache hit`, `fetched
+# from …`, or, when every source fails, a single ::error:: annotation, after
+# which the script exits 1 having installed nothing. Notes about the cache
+# (none, unreadable, discarded, couldn't cache) and one line per failed
+# attempt come before it.
 #
 # COMPOSE_URL, COMPOSE_IMAGE and COMPOSE_SHA256 replace the pin, and
 # COMPOSE_INSTALL_PAUSES, COMPOSE_MAX_TIME and COMPOSE_PULL_TIMEOUT the
