@@ -36,10 +36,14 @@ fail() {
 }
 
 # Runs ci-web-bundle with $1 as dx, a 3 s silence limit, and a 20 s cap on
-# the whole run so a missing watchdog fails here instead of hanging.
+# the whole run so a missing watchdog fails here instead of hanging. RUSTUP_
+# AUTO_INSTALL is cleared first (SME-457 round 1): the stack's compose env now
+# sets it to 0 for exactly the processes this suite starts, so without the
+# clear the env-assert case below could pass with no export in the script at
+# all — a vacuous pin. Cleared, only ci-web-bundle's own export can set it.
 # Sets $out and $rc.
 run() {
-    out=$(CI_WEB_BUNDLE_DX="$1" CI_WEB_BUNDLE_SILENCE_SECS=3 timeout 20 scripts/ci-web-bundle 2>&1)
+    out=$(env -u RUSTUP_AUTO_INSTALL CI_WEB_BUNDLE_DX="$1" CI_WEB_BUNDLE_SILENCE_SECS=3 timeout 20 scripts/ci-web-bundle 2>&1)
     rc=$?
 }
 
@@ -53,6 +57,15 @@ case "$out" in *"::warning::"*) fail "a normal build printed a warning" ;; esac
 # dx fails: its status comes through.
 run "bash -c 'echo error: build failed; exit 3'"
 [ "$rc" -eq 3 ] || fail "a failed build: exit $rc, want 3"
+
+# The watched child sees RUSTUP_AUTO_INSTALL=0 (SME-457): dx's progress
+# estimate spawns `cargo +nightly rustc --unit-graph`, and rustup answers a
+# missing toolchain by downloading one from the network with no timeout — on
+# a stalled path dx then waits forever, silently. The estimate is cosmetic
+# (a failed one is ignored by dx), so it must fail fast instead. This fake
+# dx exits 7 unless its own environment says 0.
+run "bash -c '[ \"\$RUSTUP_AUTO_INSTALL\" = 0 ] || { echo RUSTUP_AUTO_INSTALL not 0; exit 7; }; exit 0'"
+[ "$rc" -eq 0 ] || fail "watched dx without RUSTUP_AUTO_INSTALL=0: exit $rc, want 0 (out: $out)"
 
 # The client completes, then dx hangs: stopped, with a warning and the
 # process list, and the step passes.
