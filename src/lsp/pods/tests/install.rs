@@ -43,41 +43,58 @@ impl InstallReads for FakeReads {
 }
 
 /// `PROCESS_LISTING` run here, by this machine's `sh`, with `rc` and
-/// `log` as the record and log paths.
-fn listing(rc: &str, log: &str) -> String {
+/// `log` as the record and log paths and `proc` as its `/proc`.
+fn listing_in(rc: &str, log: &str, proc: &str) -> String {
     let ran = std::process::Command::new("sh")
-        .args(["-c", PROCESS_LISTING, "sh", rc, log])
+        .args(["-c", PROCESS_LISTING, "sh", rc, log, proc])
         .output()
         .expect("run the listing");
     assert!(ran.status.success(), "the listing failed: {}", String::from_utf8_lossy(&ran.stderr));
     String::from_utf8_lossy(&ran.stdout).into_owned()
 }
 
+/// `listing_in` over this machine's own `/proc`.
+fn listing(rc: &str, log: &str) -> String {
+    listing_in(rc, log, "/proc")
+}
+
+/// A scratch `/proc` of `processes` (pid, command line's words), each
+/// sleeping (SME-452 round 2): the listing over the host's own `/proc`
+/// cut its 2,000 bytes before a test's processes on a busy host.
+fn fake_proc(name: &str, processes: &[(u32, &[&str])]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("sme-452-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (pid, words) in processes {
+        let d = dir.join(pid.to_string());
+        std::fs::create_dir_all(&d).expect("a fake process directory");
+        std::fs::write(d.join("status"), "Name:\tx\nState:\tS (sleeping)\n").expect("write its status");
+        let cmdline: String = words.iter().map(|w| format!("{w}\0")).collect();
+        std::fs::write(d.join("cmdline"), cmdline).expect("write its cmdline");
+    }
+    dir
+}
+
 /// SME-452 round 1, finding 2: a process's second word is printed only
 /// when it's a plain word. Measured: `curl http://user:SECRET@…` was
 /// listed whole, credential and all, into a tool result and the logs.
+/// Round 2, finding 1: over a fake `/proc` holding just these, since the
+/// host's own could cut them off.
 #[test]
 fn test_the_process_listing_never_prints_a_second_word_that_isnt_plain() {
-    let secret = "http://user:SECRET-452@10.255.255.1/";
-    // `yes` takes the URL as its argv[1] and blocks on the full pipe.
-    let mut child = std::process::Command::new("sh")
-        .args(["-c", r#"yes "$1" | sleep 30"#, "sh", secret])
-        .spawn()
-        .expect("spawn the process to list");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let mut listed = String::new();
-    while std::time::Instant::now() < deadline {
-        listed = listing("/nonexistent/install.rc", "/nonexistent/install.log");
-        if listed.contains("] yes ") && listed.contains("] sleep 30") {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
+    let proc = fake_proc(
+        "listing-words",
+        &[
+            (41, &["yes", "http://user:SECRET-452@10.255.255.1/"]),
+            (42, &["npm", "install"]),
+            (43, &["curl", "-fsSL", "https://example.com/"]),
+        ],
+    );
+    let listed = listing_in("/nonexistent/install.rc", "/nonexistent/install.log", proc.to_str().expect("a path"));
+    let _ = std::fs::remove_dir_all(&proc);
     assert!(!listed.contains("SECRET-452"), "the listing printed a credential: {listed}");
-    assert!(listed.lines().any(|line| line.ends_with("] yes …")), "{listed}");
-    assert!(listed.lines().any(|line| line.ends_with("] sleep 30")), "a plain word is kept: {listed}");
+    assert!(listed.lines().any(|line| line == "41 [S (sleeping)] yes …"), "{listed}");
+    assert!(listed.lines().any(|line| line == "42 [S (sleeping)] npm install"), "a plain word is kept: {listed}");
+    assert!(listed.lines().any(|line| line == "43 [S (sleeping)] curl -fsSL"), "a flag is kept: {listed}");
 }
 
 /// SME-452 round 1, finding 5: the listing reads the record and log at

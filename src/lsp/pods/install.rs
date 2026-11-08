@@ -277,15 +277,17 @@ pub(super) async fn wait_install(
 /// its command line>` (`npm install`, `curl -fsSL`, `go install`), the
 /// second only when it's a plain word, `…` otherwise (SME-452 round 1: a
 /// `curl http://user:SECRET@…` was listed whole). Never `environ`, and no
-/// more than 2,000 bytes. POSIX `sh` and `/proc` only,
+/// more than 2,000 bytes. `$3` is the proc root, `/proc` unless a test
+/// passes a fake one (SME-452 round 2: over a busy host's own `/proc`,
+/// the cut hid the test's processes). POSIX `sh` and `/proc` only,
 /// with `sed`, `tr`, `wc` and `head`, so it runs in Debian, busybox and
 /// Alpine images.
-pub(super) const PROCESS_LISTING: &str = r#"rc=$1 log=$2
+pub(super) const PROCESS_LISTING: &str = r#"rc=$1 log=$2 proc=${3:-/proc}
 if [ -e "$rc" ]; then echo "${rc##*/}: $(head -c 100 "$rc")"; else echo "${rc##*/}: not written"; fi
 if n=$(wc -c 2>/dev/null < "$log"); then echo "${log##*/}: $n bytes"; else echo "${log##*/}: missing"; fi
 out=""
-for d in /proc/[0-9]*; do
-  p=${d#/proc/}
+for d in "$proc"/[0-9]*; do
+  p=${d##*/}
   if [ "$p" = 1 ] || [ "$p" = "$$" ]; then continue; fi
   s=$(sed -n 's/^State:[[:space:]]*//p' "$d/status" 2>/dev/null) || continue
   [ -n "$s" ] || continue
