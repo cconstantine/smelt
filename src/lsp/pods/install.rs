@@ -19,8 +19,8 @@ pub(super) struct InstallWatch<'a> {
     rc_read_failures: u32,
     rc_read_error: Option<String>,
     /// How many reads of the record there were, and the slowest one
-    /// (SME-452's recurrence): an exec has no bound of its own, so one
-    /// read that hung for minutes would read like a silent install.
+    /// (SME-452's recurrence): a slow read shows here, and one that
+    /// never answers is given up on at `RC_READ_TIMEOUT` (round 1).
     rc_reads: u32,
     slowest_read: std::time::Duration,
     /// What was still running at the timeout, once read.
@@ -144,14 +144,54 @@ pub(super) fn log_of(result: crate::sandbox::ExecResult) -> Result<String, Strin
 /// call past the install's bound.
 pub(super) const LOG_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long one read of the install's record may take (SME-452 round 1,
+/// its (B′)): an exec has no bound of its own, and the wait checks its
+/// bound only after a read returns, so one read that never answered hung
+/// the wait, and its caller, for good, with nothing said. A record read
+/// answers in well under a second (the slowest of T5's 84 was 0.05 s).
+/// It's a bound inside the install's, not a widening of it.
+pub(super) const RC_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// `read`, given up on after `limit`.
-pub(super) async fn bounded_read(
-    read: impl std::future::Future<Output = Result<String, String>>,
+pub(super) async fn bounded_read<T>(
+    read: impl std::future::Future<Output = Result<T, String>>,
     limit: std::time::Duration,
-) -> Result<String, String> {
+) -> Result<T, String> {
     tokio::time::timeout(limit, read)
         .await
         .unwrap_or_else(|_| Err(format!("the read didn't answer within {} s", limit.as_secs())))
+}
+
+/// The reads `wait_install` makes of a server pod: the pod itself, its
+/// install's record and log, and what's running in it. A trait so a test
+/// can make one of them hang (SME-452 round 1).
+pub(super) trait InstallReads {
+    async fn pod(&self) -> Result<Option<Pod>, String>;
+    async fn rc(&self) -> Result<Option<String>, String>;
+    async fn log(&self) -> Result<String, String>;
+    async fn processes(&self) -> Result<String, String>;
+}
+
+/// `InstallReads` of pod `name` through the cluster.
+struct KubeReads<'a> {
+    client: &'a kube::Client,
+    pods: &'a kube::Api<Pod>,
+    name: &'a str,
+}
+
+impl InstallReads for KubeReads<'_> {
+    async fn pod(&self) -> Result<Option<Pod>, String> {
+        self.pods.get_opt(self.name).await.map_err(|e| e.to_string())
+    }
+    async fn rc(&self) -> Result<Option<String>, String> {
+        install_rc(self.client, self.name).await
+    }
+    async fn log(&self) -> Result<String, String> {
+        install_log(self.client, self.name).await
+    }
+    async fn processes(&self) -> Result<String, String> {
+        install_processes(self.client, self.name).await
+    }
 }
 
 /// `wait_installed` with its bound: only a test passes another than
@@ -167,21 +207,34 @@ pub(super) async fn wait_installed_within(
 ) -> Result<(), String> {
     #[cfg(test)]
     test_hooks::reached_install_wait(name);
-    let started = std::time::Instant::now();
+    wait_install(&KubeReads { client, pods, name }, name, uid, bound).await
+}
+
+/// `wait_installed_within`'s loop, over `reads` of pod `name`.
+pub(super) async fn wait_install(
+    reads: &impl InstallReads,
+    name: &str,
+    uid: &str,
+    bound: std::time::Duration,
+) -> Result<(), String> {
+    // tokio's clock, so a test can run the loop on paused time.
+    let started = tokio::time::Instant::now();
     let mut watch = InstallWatch::new(name, uid);
     loop {
-        if let Some(error) = watch.read(pods.get_opt(name).await.map_err(|e| e.to_string())) {
+        if let Some(error) = watch.read(reads.pod().await) {
             return Err(error);
         }
-        let asked = std::time::Instant::now();
-        let rc = install_rc(client, name).await;
+        let asked = tokio::time::Instant::now();
+        // Bounded, so a read that never answers is a failed read and the
+        // bound below is still checked (SME-452 round 1).
+        let rc = bounded_read(reads.rc(), RC_READ_TIMEOUT).await;
         watch.rc_read_took(asked.elapsed());
         match rc {
             Ok(Some(rc)) => {
                 if rc == "0" {
                     return Ok(());
                 }
-                let log = install_log(client, name).await.unwrap_or_default();
+                let log = reads.log().await.unwrap_or_default();
                 return Err(format!("The install failed (exit {rc}):\n{}", log.trim_end()));
             }
             // Ok(None): the install is still running. Err: this read didn't
@@ -197,8 +250,8 @@ pub(super) async fn wait_installed_within(
             // Both reads at once, each bounded: the message waits at most
             // one `LOG_READ_TIMEOUT` past the install's bound.
             let (log, processes) = tokio::join!(
-                bounded_read(install_log(client, name), LOG_READ_TIMEOUT),
-                bounded_read(install_processes(client, name), LOG_READ_TIMEOUT),
+                bounded_read(reads.log(), LOG_READ_TIMEOUT),
+                bounded_read(reads.processes(), LOG_READ_TIMEOUT),
             );
             watch.saw_processes(processes);
             return Err(watch.timed_out(bound, log));

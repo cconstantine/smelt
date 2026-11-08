@@ -442,3 +442,6 @@ mod stall;
 /// Real-cluster tests of an install that says nothing (SME-452's
 /// recurrence): an exec the runtime refused, and an npm still running.
 mod silent;
+
+/// The install wait's loop over fake reads (SME-452 round 1).
+mod install;
