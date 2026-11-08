@@ -59,8 +59,13 @@ pub(super) async fn deliver_notice(pool: &PgPool, conversation_id: i64, text: St
             let woke = wake_conversation(pool, conversation_id).await;
             // A Stop that ended (or refused) the wake leaves the notice
             // queued: shown at once all the same, as before the queue and
-            // as a paused conversation's is (D9).
-            if matches!(woke, Err(TurnFailure::Stopped)) || is_paused(conversation_id) {
+            // as a paused conversation's is (D9). So does a question still
+            // waiting for its answer, where the wake's turn stops before
+            // its drains (D10, review 1 L2).
+            if matches!(woke, Err(TurnFailure::Stopped))
+                || is_paused(conversation_id)
+                || question_waits(pool, conversation_id).await
+            {
                 save_queued_server_notices(pool, conversation_id).await;
             }
         }
@@ -68,6 +73,20 @@ pub(super) async fn deliver_notice(pool: &PgPool, conversation_id: i64, text: St
         Err(e) => {
             tracing::warn!(conversation_id, error = %e, "couldn't queue a notice; delivering it directly");
             deliver_notice_directly(pool, conversation_id, text).await;
+        }
+    }
+}
+
+/// Whether `conversation_id` has a question still waiting for its answer,
+/// at which every turn stops before its drains (SME-409). A failed read
+/// counts as none: the notice then stays queued for the next turn.
+#[cfg(feature = "server")]
+async fn question_waits(pool: &PgPool, conversation_id: i64) -> bool {
+    match db::get_pending_question(pool, conversation_id).await {
+        Ok(question) => question.is_some_and(|q| q.answer.is_none()),
+        Err(e) => {
+            tracing::warn!(conversation_id, error = %e, "couldn't read a conversation's question");
+            false
         }
     }
 }
