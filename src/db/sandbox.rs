@@ -736,7 +736,7 @@ pub async fn read_terminal_output(
 /// yet, in one fragment shared by the turn's drain and a wake's check for
 /// work, so the two can't disagree (SME-218). Both terminal states need
 /// exactly one notification each. `terminal_commands` must be aliased `tc`.
-const UNNOTIFIED_END: &str = "tc.status IN ('finished', 'lost') AND tc.notified_at IS NULL";
+pub(crate) const UNNOTIFIED_END: &str = "tc.status IN ('finished', 'lost') AND tc.notified_at IS NULL";
 
 /// Backs the completion-notification check in `run_turn_bounded`'s loop — both
 /// terminal states (`finished` and `lost`) need exactly one notification

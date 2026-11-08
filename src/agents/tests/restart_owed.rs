@@ -474,3 +474,17 @@ async fn test_a_deliver_waiting_for_the_turn_lock_survives_a_restart(pool: PgPoo
     assert_eq!(delivered, 1, "its row");
     crate::turn::forget_conversation_lock(root);
 }
+
+/// T4, the ticket's own inferred state: a command's end was recorded and
+/// smelt restarted before any wake drained it.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_end_recorded_before_the_restart_is_drained_after_it(pool: PgPool) {
+    let requests = setup(&pool, vec![text_reply("Noted.")]).await;
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    command(&pool, root, "t4", true).await;
+
+    restart(&pool, &[root]).await;
+    assert_eq!(requests_ending_in(&requests, &command_notice("t4")), 1, "#{root} wasn't woken");
+    assert!(db::unnotified_finished_terminal_commands(&pool, root).await.expect("query").is_empty(), "the command");
+    crate::turn::forget_conversation_lock(root);
+}

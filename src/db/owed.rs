@@ -88,3 +88,19 @@ pub async fn conversations_owed_an_answer(pool: &PgPool) -> Result<Vec<i64>, sql
     .fetch_all(pool)
     .await
 }
+
+/// Every conversation a wake may run in with a command whose end is
+/// recorded and whose notice no drain has saved (`UNNOTIFIED_END`): its
+/// wake died before draining, in a restart (SME-450 E). The startup sweep
+/// wakes them, and their drain saves the notice as any wake's would.
+pub async fn conversations_with_unnotified_ends(pool: &PgPool) -> Result<Vec<i64>, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT c.id FROM conversations c LEFT JOIN agents a ON a.conversation_id = c.id
+         WHERE {WAKEABLE}
+           AND EXISTS (SELECT 1 FROM terminal_commands tc WHERE tc.conversation_id = c.id AND {})
+         ORDER BY c.id",
+        super::sandbox::UNNOTIFIED_END
+    ))
+    .fetch_all(pool)
+    .await
+}
