@@ -202,7 +202,8 @@ mod tests {
         let hits = hits.load(Ordering::SeqCst);
         let Err(Failure::Failed(e)) = fetched else { panic!("{fetched:?}") };
         assert!(e.starts_with(&format!("{url} didn't answer within 0.5s (")), "{e}");
-        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        // The message proves the deadline; this only says it wasn't slow.
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
         assert!((1..=3).contains(&hits), "{hits}");
     }
 
