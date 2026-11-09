@@ -11,11 +11,43 @@ async fn stand_in() -> String {
         .route(
             "/packages/huge/package.yaml",
             axum::routing::get(|| async { "x".repeat(3 * 1024 * 1024) }),
-        );
+        )
+        .route("/packages/flaky/package.yaml", busy_once(include_str!("../fixtures/mason-pyright.yaml")))
+        .route("/flaky-languages.toml", busy_once(HELIX));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move { axum::serve(listener, router).await.expect("serve") });
     format!("http://{addr}")
+}
+
+/// Answers 503 to its first GET and `body` after that, as
+/// raw.githubusercontent.com does in a blip (SME-470).
+fn busy_once(body: &'static str) -> axum::routing::MethodRouter {
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    axum::routing::get(move || {
+        let first = hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+        async move {
+            if first {
+                (axum::http::StatusCode::SERVICE_UNAVAILABLE, "busy")
+            } else {
+                (axum::http::StatusCode::OK, body)
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn test_a_lookup_rides_out_one_503_from_masons_registry() {
+    let base = stand_in().await;
+    let found = lookup("flaky", &base, &format!("{base}/languages.toml")).await;
+    assert_eq!(found.map(|s| s.config.name), Ok("pyright".to_string()));
+}
+
+#[tokio::test]
+async fn test_a_lookup_rides_out_one_503_from_helixs_languages_toml() {
+    let base = stand_in().await;
+    let found = lookup("pyright", &base, &format!("{base}/flaky-languages.toml")).await;
+    assert_eq!(found.map(|s| s.config.name), Ok("pyright".to_string()));
 }
 
 #[test]

@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::anthropic::TokenUsage;
+use crate::http_fetch::{Fetched, Policy, get_text};
 
 /// One set of prices, in dollars per million tokens. A missing cache
 /// price is charged at the input price.
@@ -165,9 +166,16 @@ pub const DEFAULT_CATALOG_URL: &str = "https://models.dev/api.json";
 
 /// How often the catalog is fetched again, as opencode does.
 const REFRESH_EVERY: std::time::Duration = std::time::Duration::from_secs(60 * 60);
-const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-/// The whole catalog was 5.3 MB on 2026-10-05.
-const FETCH_MAX_BYTES: usize = 32 * 1024 * 1024;
+/// How each fetch tries (SME-470): a blip is asked again rather than
+/// waiting an hour for the next refresh. The whole catalog was 5.3 MB on
+/// 2026-10-05.
+const FETCH: Policy = Policy {
+    attempts: 3,
+    backoff: &[std::time::Duration::from_secs(2), std::time::Duration::from_secs(5)],
+    per_try: std::time::Duration::from_secs(60),
+    deadline: std::time::Duration::from_secs(120),
+    max_bytes: 32 * 1024 * 1024,
+};
 
 /// A catalog and when it was fetched.
 #[derive(Clone, Debug, PartialEq)]
@@ -240,7 +248,11 @@ impl CatalogStore {
     }
 
     async fn refresh_unspanned(&self, pool: &sqlx::PgPool, url: &str) -> Result<(), String> {
-        let providers = parse(&fetch(url).await?)?;
+        let text = match get_text(url, &FETCH).await? {
+            Fetched::Body(text) => text,
+            Fetched::NotFound => return Err(format!("{url} answered 404 Not Found")),
+        };
+        let providers = parse(&text)?;
         if providers.values().all(|p| p.models.is_empty()) {
             return Err(format!("{url} lists no prices"));
         }
@@ -253,25 +265,6 @@ impl CatalogStore {
             .await
             .map_err(|e| format!("fetched the price catalog but couldn't save it: {e}"))
     }
-}
-
-async fn fetch(url: &str) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(FETCH_TIMEOUT)
-        .build()
-        .map_err(|e| format!("couldn't make an HTTP client: {e}"))?;
-    let mut response = client.get(url).send().await.map_err(|e| format!("couldn't reach {url}: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!("{url} answered {}", response.status()));
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
-        body.extend_from_slice(&chunk);
-        if body.len() > FETCH_MAX_BYTES {
-            return Err(format!("{url} is too big (over {} MB)", FETCH_MAX_BYTES / 1024 / 1024));
-        }
-    }
-    String::from_utf8(body).map_err(|_| format!("{url} isn't text"))
 }
 
 /// `SMELT_PRICE_CATALOG_URL`, set-but-empty treated as unset (as
@@ -522,6 +515,15 @@ mod tests {
         let restarted = CatalogStore::new();
         restarted.load_saved(&pool).await.expect("load");
         assert_eq!(restarted.current().as_deref(), Some(fetched.as_ref()), "a restart has the saved copy");
+    }
+
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+    async fn test_a_refresh_rides_out_one_503(pool: sqlx::PgPool) {
+        let url = catalog_server(vec![(503, "busy".to_string()), (200, CATALOG.to_string())]).await;
+        let store = CatalogStore::new();
+        assert_eq!(store.refresh(&pool, &url).await, Ok(()));
+        let fetched = store.current().expect("in memory");
+        assert!(model_prices(&fetched.providers, "anthropic", "claude-opus-5-5").is_some());
     }
 
     #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
