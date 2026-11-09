@@ -152,6 +152,7 @@ async fn test_a_turn_takes_the_default_and_keeps_it(pool: PgPool) {
             output_cap: None,
             reasoning_cap: None,
             output_cap_is_models_own: false,
+            reported_max_output: None,
             context_window: 64_000,
             thinking_stripped_through: None,
             adaptive_thinking: true,

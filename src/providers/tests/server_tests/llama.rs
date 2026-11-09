@@ -14,6 +14,7 @@ fn llama_turn_model(template: Option<TemplateSettings>) -> TurnModel {
         output_cap: None,
         reasoning_cap: None,
         output_cap_is_models_own: false,
+        reported_max_output: None,
         context_window: 262_144,
         thinking_stripped_through: None,
     }

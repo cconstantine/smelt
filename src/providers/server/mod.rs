@@ -30,6 +30,12 @@ pub struct TurnModel {
     /// `output_cap` is an Anthropic model's own, which "Max reply
     /// tokens" can't raise (SME-111 review 2).
     pub output_cap_is_models_own: bool,
+    /// What the model itself reported as its output cap
+    /// (`provider_models.reported_max_output`), independent of the user's
+    /// "Max reply tokens" — which can mask which cap is applied
+    /// (`output_cap_is_models_own`), while the model's own still bounds
+    /// what it can answer (SME-443 review 1).
+    pub reported_max_output: Option<u32>,
     /// For a llama.cpp provider, the chat template's settings it sends
     /// (SME-111).
     pub template: Option<TemplateSettings>,
@@ -406,6 +412,7 @@ async fn resolve_once(pool: &PgPool, conversation_id: i64) -> Result<Option<Turn
         output_cap_is_models_own: kind == ProviderKind::Anthropic
             && settings.as_ref().and_then(|r| positive(r.reported_max_output)).is_some()
             && settings.as_ref().and_then(|r| positive(r.reported_max_output)) == output_cap(kind, &model, settings.as_ref()),
+        reported_max_output: settings.as_ref().and_then(|r| positive(r.reported_max_output)),
         kind,
         thinking: thinking(settings.as_ref()),
         context_window: context_window(&model, settings.as_ref()).0,

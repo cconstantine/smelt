@@ -135,10 +135,12 @@ pub(super) const SUMMARY_MAX_TOKENS_CEILING: u32 = 8_192;
 /// summarization request actually carries, so it grows for the continuation
 /// request. The 2,048 floor wins over a stingy room: a request the provider
 /// then refuses as too big is exactly what `compact`'s existing overflow
-/// arm answers — learn the window, retry with half the transcript. A model's
-/// own `output_cap` clamps the result (over it Anthropic 400s, SME-111);
-/// the user's "Max reply tokens" deliberately does not apply — the summary
-/// is not a reply.
+/// arm answers — learn the window, retry with half the transcript. The
+/// model's own *reported* cap clamps the result whatever the user's "Max
+/// reply tokens" made the applied cap: over its own cap Anthropic 400s
+/// "maximum allowed", a refusal the overflow arm deliberately does not
+/// answer (review 1). The user's cap itself does not apply — a summary is
+/// not a reply (SME-111).
 #[cfg(feature = "server")]
 pub(super) fn summary_max_tokens(turn_model: &crate::providers::TurnModel, request_chars: usize) -> u32 {
     let room = (i64::from(turn_model.context_window)
@@ -146,10 +148,10 @@ pub(super) fn summary_max_tokens(turn_model: &crate::providers::TurnModel, reque
         - i64::from(COMPACTION_SAFETY_BUFFER))
         .max(1) as u32;
     let mut tokens = room.min(SUMMARY_MAX_TOKENS_CEILING).max(SUMMARY_MAX_TOKENS);
-    if turn_model.output_cap_is_models_own
-        && let Some(cap) = turn_model.output_cap
+    if turn_model.kind == crate::providers::ProviderKind::Anthropic
+        && let Some(own) = turn_model.reported_max_output
     {
-        tokens = tokens.min(cap);
+        tokens = tokens.min(own);
     }
     tokens
 }

@@ -46,10 +46,12 @@ async fn conversation_past_the_trigger(pool: &PgPool) -> i64 {
     conversation.id
 }
 
-/// A turn model for the pure formula tests: `context_window`, and an
-/// `output_cap` that may or may not be the model's own (SME-111's
-/// distinction — only the model's own clamps the summary).
-fn room_model(context_window: u32, output_cap: Option<u32>, models_own: bool) -> crate::providers::TurnModel {
+/// A turn model for the pure formula tests: `context_window`, the applied
+/// `output_cap` (the user's "Max reply tokens" can lower the model's own,
+/// SME-111), and `reported`, the cap the model itself reported — which
+/// clamps the summary whatever the user's setting did to it (SME-443
+/// review 1).
+fn room_model(context_window: u32, output_cap: Option<u32>, reported: Option<u32>) -> crate::providers::TurnModel {
     crate::providers::TurnModel {
         endpoint: crate::anthropic::stream::Endpoint {
             base_url: "http://room.test".to_string(),
@@ -65,7 +67,8 @@ fn room_model(context_window: u32, output_cap: Option<u32>, models_own: bool) ->
         kind: crate::providers::ProviderKind::Anthropic,
         output_cap,
         reasoning_cap: None,
-        output_cap_is_models_own: models_own,
+        output_cap_is_models_own: reported.is_some() && output_cap == reported,
+        reported_max_output: reported,
         template: None,
         context_window,
         thinking_stripped_through: None,
@@ -75,32 +78,79 @@ fn room_model(context_window: u32, output_cap: Option<u32>, models_own: bool) ->
 
 /// A8: the derived summary budget, exact numbers (`compaction_progress`'s
 /// "value itself" style). room = window − request_chars/3 − 4,096, floored
-/// at 2,048, clamped at the 8,192 ceiling and a model's own output cap.
-/// *Expected red before the fix (the stub returned today's constant for
-/// every case): `left: 2048, right: 8192`.*
+/// at 2,048, clamped at the 8,192 ceiling and the model's reported output
+/// cap. *Expected red before the fix (the stub returned today's constant
+/// for every case): `left: 2048, right: 8192`. Before review 1's clamp
+/// fix, the user-below-reported case: `left: 8192, right: 4096`.*
 #[test]
 fn test_the_summary_budget_formula() {
     use crate::turn::compaction::summary_max_tokens;
     // A roomy window and a small request: room dwarfs the ceiling → 8,192.
-    assert_eq!(summary_max_tokens(&room_model(200_000, None, false), 3_000), 8_192);
+    assert_eq!(summary_max_tokens(&room_model(200_000, None, None), 3_000), 8_192);
     // Room between the floor and the ceiling is sent as it is:
     // 20,000 − 30,000/3 − 4,096 = 5,904.
-    assert_eq!(summary_max_tokens(&room_model(20_000, None, false), 30_000), 5_904);
+    assert_eq!(summary_max_tokens(&room_model(20_000, None, None), 30_000), 5_904);
     // A stingy room loses to the 2,048 floor:
     // 12,000 − 20,000/3 − 4,096 = 1,238 → 2,048. The request, not the
     // budget, is what `compact`'s overflow arm then answers.
-    assert_eq!(summary_max_tokens(&room_model(12_000, None, false), 20_000), 2_048);
+    assert_eq!(summary_max_tokens(&room_model(12_000, None, None), 20_000), 2_048);
     // A request past the whole window: room clamps at 1, the floor still
     // holds — the overflow arm owns that request, not the budget.
-    assert_eq!(summary_max_tokens(&room_model(16_384, None, false), 60_000), 2_048);
-    // A model's own cap clamps the result: Anthropic 400s above it.
-    assert_eq!(summary_max_tokens(&room_model(200_000, Some(4_096), true), 3_000), 4_096);
+    assert_eq!(summary_max_tokens(&room_model(16_384, None, None), 60_000), 2_048);
+    // A model's own reported cap clamps the result: Anthropic 400s above it.
+    assert_eq!(summary_max_tokens(&room_model(200_000, Some(4_096), Some(4_096)), 3_000), 4_096);
     // Below the floor, the model's own cap still wins — sending a request
     // the provider would 400 on is worse than a short summary budget.
-    assert_eq!(summary_max_tokens(&room_model(200_000, Some(1_024), true), 3_000), 1_024);
-    // The user's "Max reply tokens" (a cap that is not the model's own)
-    // does not apply — a summary is not a reply (SME-111).
-    assert_eq!(summary_max_tokens(&room_model(200_000, Some(4_096), false), 3_000), 8_192);
+    assert_eq!(summary_max_tokens(&room_model(200_000, Some(1_024), Some(1_024)), 3_000), 1_024);
+    // The user's "Max reply tokens" below the model's own cap neither
+    // applies to the summary (it is not a reply) nor skips its clamp:
+    // that setting flips `output_cap_is_models_own` false, and sending
+    // the ceiling over the model's own 4,096 is the 400 no arm answers
+    // (review 1, Medium).
+    assert_eq!(summary_max_tokens(&room_model(200_000, Some(2_000), Some(4_096)), 3_000), 4_096);
+    // A user cap with no reported cap at all still does not apply: the
+    // ceiling holds.
+    assert_eq!(summary_max_tokens(&room_model(200_000, Some(2_000), None), 3_000), 8_192);
+}
+
+/// SME-443 review 1 (Medium), on the wire: the model reports 4,096, the
+/// user's "Max output" is 2,000 (so `output_cap_is_models_own` is false
+/// and the applied cap is the user's), and a long conversation compacts —
+/// the summary request must stay at the model's own 4,096. Above it
+/// Anthropic answers "maximum allowed", a 400 `compact`'s overflow arm
+/// deliberately does not answer, so every send of the conversation would
+/// fail raw. *Expected red before the fix: `left: Some(8192),
+/// right: Some(4096)`.*
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_summary_budget_stays_under_the_models_own_cap_when_the_users_is_lower(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation_id = conversation_past_the_trigger(&pool).await;
+    let requests = start_recording_mock_upstream(&pool, vec![
+        text_reply_body("Summary: nothing live."),
+        text_reply_body("Carrying on."),
+    ])
+    .await;
+    // After the mock provider exists — the SELECT joins `inference_providers`,
+    // and zero rows would cap nothing (cut_off.rs's order).
+    let inserted = sqlx::query("INSERT INTO provider_models (provider_id, model, reported_max_output, max_output) SELECT id, $1, 4096, 2000 FROM inference_providers")
+        .bind(crate::providers::test_support::MOCK_MODEL)
+        .execute(&pool)
+        .await
+        .expect("reported cap 4,096, user \"Max output\" 2,000");
+    assert!(inserted.rows_affected() >= 1, "the mock provider's model row was capped");
+
+    run_turn(&pool, conversation_id, hello())
+        .await
+        .expect("the compaction fits the model's own cap and the turn carries on");
+
+    let requests = requests.lock().expect("the request log");
+    assert_eq!(requests.len(), 2, "a compaction call, then the real turn");
+    assert_eq!(
+        requests[0]["max_tokens"].as_u64(),
+        Some(4_096),
+        "the model's reported cap clamps the summary budget even when a lower user \"Max output\" masks it (SME-443 review 1)"
+    );
 }
 
 /// A1: on the wire. A compaction against a default-200k-window model with a
