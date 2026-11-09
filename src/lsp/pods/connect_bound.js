@@ -1,7 +1,7 @@
 // SME-452: a bound on opening every connection node makes during a
 // language server's install: the DNS lookup, the TCP connect, an http://
 // or https:// proxy's CONNECT reply and the TLS handshake alike, none of which npm bounds
-// (see CONNECT_BOUND in src/lsp/pods.rs). A connect that hasn't finished
+// (see CONNECT_BOUND in src/lsp/pods/script.rs). A connect that hasn't finished
 // in time is destroyed with ECONNECTIONTIMEOUT, which npm retries on a
 // fresh connection and logs. pod_script writes this file with the bound
 // filled in, and preloads it into the install alone.
