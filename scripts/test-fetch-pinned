@@ -127,6 +127,22 @@ case_fail_first() {
     verdict
 }
 
+# Review round 1, N3: a 429 (rate limited) and a 408 (request timeout) are
+# blips too, retried like a 5xx, though every other 4xx isn't.
+retried_once() {
+    start_server --status "$1" fail-first 1
+    run_fetch "$fixture_sha"
+    [ "$rc" -eq 0 ] || want "exit 0"
+    has "fetch-pinned: $url attempt 1 of 4 failed: HTTP $1"
+    has "fetch-pinned: $url -> $out_file (sha256 ok, attempt 2 of 4)"
+    [ "$(gets)" -eq 2 ] || want "2 GETs"
+    same_as "$out_file" "$fixture" "OUT is the fixture"
+    no_temp
+    verdict
+}
+case_429_first() { retried_once 429; }
+case_408_first() { retried_once 408; }
+
 # T2: a body cut off partway, then the whole file: OUT is byte-exact.
 case_cut_first() {
     start_server cut-first 1
@@ -222,7 +238,7 @@ case_no_pin() {
     verdict
 }
 
-all=(ok fail-first cut-first cut-always hang bad-bytes not-found always-504 no-pin)
+all=(ok fail-first 429-first 408-first cut-first cut-always hang bad-bytes not-found always-504 no-pin)
 [ $# -gt 0 ] && all=("$@")
 for c in "${all[@]}"; do
     new_case "$c"

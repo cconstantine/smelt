@@ -6,7 +6,7 @@ scripts/test-fetch-pinned (SME-470).
 Serves F on every GET, except as MODE says:
 
     ok            serve F
-    fail-first N  answer 504 to the first N GETs, then serve F
+    fail-first N  answer 504 (or --status S) to the first N GETs, then serve F
     always-504    answer 504 to every GET
     hang          accept the connection and never answer
     bad-bytes     answer 200 with bytes that aren't F's
@@ -33,6 +33,7 @@ parser.add_argument("--ready", required=True)
 parser.add_argument("--log", required=True)
 parser.add_argument("--file", required=True)
 parser.add_argument("--lifetime", type=int, default=600)
+parser.add_argument("--status", type=int, default=504)
 parser.add_argument(
     "mode", choices=["ok", "fail-first", "always-504", "hang", "bad-bytes", "cut-first", "not-found"]
 )
@@ -50,8 +51,10 @@ def decide():
     with lock:
         state["n"] += 1
         n = state["n"]
-    if args.mode == "always-504" or (args.mode == "fail-first" and n <= args.n):
+    if args.mode == "always-504":
         return n, 504
+    if args.mode == "fail-first" and n <= args.n:
+        return n, args.status
     if args.mode == "not-found":
         return n, 404
     if args.mode == "hang":
@@ -72,7 +75,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(404, "Not Found")
             return
         if status not in (200, "200 cut"):
-            self.send_error(status, "Gateway Time-out")
+            self.send_error(status)
             return
         if args.mode == "bad-bytes":
             body = b"#!/bin/sh\necho 'not the pinned compose'\n"
