@@ -41,7 +41,12 @@ struct Ran {
     took: std::time::Duration,
     /// `/tmp/held`, read before the pod was deleted.
     held: Result<String, String>,
+    /// Every process's command line in the pod once the wait ended.
+    processes: Result<String, String>,
 }
+
+/// Each process's command line in the server container, one a line.
+const COMMAND_LINES: &str = "for d in /proc/[0-9]*; do tr '\\0' ' ' < \"$d/cmdline\" 2>/dev/null; echo; done";
 
 async fn run_in_golang_pod(server: &str, install: String, bound: std::time::Duration) -> Ran {
     let ran = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -70,23 +75,56 @@ async fn run_in_golang_pod(server: &str, install: String, bound: std::time::Dura
             Err(_) => None,
         };
         let took = started.elapsed();
-        let held = match &running {
-            Ok(_) => Some(
-                crate::sandbox::exec_with(&client, &name, "server", &["cat", "/tmp/held"], None)
+        let read = |command: &'static [&'static str]| {
+            let (client, name) = (client.clone(), name.clone());
+            async move {
+                crate::sandbox::exec_with(&client, &name, "server", command, None)
                     .await
                     .map(|r| r.stdout)
-                    .map_err(|e| e.to_string()),
-            ),
+                    .map_err(|e| e.to_string())
+            }
+        };
+        let read = match &running {
+            Ok(_) => Some((read(&["cat", "/tmp/held"]).await, read(&["sh", "-c", COMMAND_LINES]).await)),
             Err(_) => None,
         };
         let _ = pods.delete(&name, &crate::sandbox::pod_delete_params()).await;
         running.expect("the server pod runs");
-        let ran = Ran { result: installed.expect("waited"), took, held: held.expect("ran") };
+        let (held, processes) = read.expect("ran");
+        let ran = Ran { result: installed.expect("waited"), took, held, processes };
         *out.lock().unwrap_or_else(|e| e.into_inner()) = Some(ran);
     })
     .await;
     let ran = ran.lock().unwrap_or_else(|e| e.into_inner()).take();
     ran.expect("the install ran")
+}
+
+/// SME-456: cmd/go bounds no fetch past the TLS handshake and writes
+/// nothing while it fetches, so a module proxy that takes the request and
+/// never answers held `go install` (gopls) silent to the install bound
+/// (`The install didn't finish within …`, `It wrote no output`). With
+/// `-x` and the go watchdog the install fails with go's own status in
+/// about 125 s, its log naming the stalled URL and why go was stopped,
+/// and no watchdog is left in the pod after the install.
+#[tokio::test]
+async fn test_a_go_install_ends_on_a_proxy_that_never_answers() {
+    let install = never_answering(
+        "GOPROXY=http://127.0.0.1:8080 GOSUMDB=off GOBIN=/tmp/home/go/bin go install example.com/stalled@v1.0.0",
+    );
+    let ran = run_in_golang_pod("gostall", install, std::time::Duration::from_secs(180)).await;
+    let error = ran.result.expect_err("an install from a proxy that never answers finished");
+    eprintln!("after {} s the install said: {error:?}", ran.took.as_secs());
+    assert!(error.starts_with("The install failed (exit "), "{error}");
+    assert!(error.contains("# get http://127.0.0.1:8080/"), "{error}");
+    assert!(error.contains("smelt: go wrote nothing and received under 1 KB/s for 120 s"), "{error}");
+    assert!(ran.took < std::time::Duration::from_secs(170), "took {} s", ran.took.as_secs());
+    assert!(ran.held.expect("read /tmp/held").lines().count() >= 1, "go never reached the proxy");
+    let processes = ran.processes.expect("read the pod's processes");
+    // The watchdog and its subshells, not the pod script (PID 1), whose
+    // own command line holds the watchdog's path too.
+    let watchdogs: Vec<&str> = processes.lines().filter(|l| l.starts_with("sh /tmp/smelt-go-idle.sh ")).collect();
+    assert!(watchdogs.is_empty(), "the watchdog outlived the install: {watchdogs:?}");
+    assert!(processes.lines().any(|l| l.starts_with("python3 /tmp/hold.py")), "the listing missed the pod's processes:\n{processes}");
 }
 
 /// A release download in the catalog's tar.gz shape, as

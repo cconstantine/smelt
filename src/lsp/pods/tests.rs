@@ -433,7 +433,7 @@ fn test_a_stop_explains_an_oom_and_names_any_other_reason() {
 
 #[test]
 fn test_an_empty_install_still_records_success() {
-    assert!(pod_script("  ").contains(" true ) > /tmp/install.log"), "{}", pod_script("  "));
+    assert!(pod_script("  ").contains(" true ) >> /tmp/install.log"), "{}", pod_script("  "));
 }
 
 /// SME-452's mechanism: npm bounds no part of opening a connection, so
@@ -452,7 +452,7 @@ fn test_a_node_install_gets_a_connect_bound_and_the_server_doesnt() {
     let (body, after) = rest.split_once("\nSMELT_EOF\n").unwrap_or_else(|| panic!("no SMELT_EOF line: {script}"));
     assert_eq!(body, preload.trim_end().replace("__CONNECT_BOUND_MS__", "30000"));
     let (subshell, tail) = after
-        .split_once(") > /tmp/install.log 2>&1")
+        .split_once(") >> /tmp/install.log 2>&1")
         .unwrap_or_else(|| panic!("no install subshell: {after}"));
     let require = "[ -f /tmp/smelt-connect-bound.js ] && \
                    NODE_OPTIONS=\"${NODE_OPTIONS:+$NODE_OPTIONS }--require=/tmp/smelt-connect-bound.js\" && \
@@ -460,7 +460,7 @@ fn test_a_node_install_gets_a_connect_bound_and_the_server_doesnt() {
     let at = subshell.find(require).unwrap_or_else(|| panic!("no NODE_OPTIONS in the subshell: {subshell}"));
     assert!(subshell[at..].contains("npm install x"), "the install doesn't come after it: {subshell}");
     assert!(!tail.contains("NODE_OPTIONS"), "outside the install's subshell: {tail}");
-    assert!(tail.contains("echo $? > /tmp/install.rc"), "{tail}");
+    assert!(tail.contains("echo $rc > /tmp/install.rc"), "{tail}");
 }
 
 /// Real-cluster tests: a stand-in sandbox pod (the real image, idle)
@@ -489,3 +489,6 @@ mod script;
 /// Real-cluster tests of curl and go installs whose server never answers
 /// (SME-456), against a server inside the pod: no internet.
 mod installers;
+
+/// The go watchdog in the pod script, run on this host (SME-456).
+mod go_idle;

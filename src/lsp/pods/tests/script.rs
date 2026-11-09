@@ -34,6 +34,62 @@ fn test_an_install_gets_curls_stall_bounds_and_the_server_doesnt() {
     assert!(!tail.contains("CURL_HOME"), "outside the install's subshell: {tail}");
 }
 
+/// The line that makes the install's go log each fetch and build step,
+/// after the config's own `GOFLAGS`.
+const GOFLAGS_LINE: &str = "GOFLAGS=\"${GOFLAGS:+$GOFLAGS }-x\"; export GOFLAGS;";
+
+/// SME-456: cmd/go writes nothing while it fetches, so a stalled module
+/// proxy left an empty log. With `-x`, appended to the config's own
+/// `GOFLAGS` (never replacing them), go logs each `# get <url>` and each
+/// build step: the log is the watchdog's sign of progress, and a stall's
+/// log names its URL. The language server never gets it.
+#[test]
+fn test_a_go_install_logs_its_fetches_and_the_server_doesnt() {
+    let script = pod_script("go install x@v1");
+    let (subshell, tail) = install_subshell(&script);
+    let at = subshell.find(GOFLAGS_LINE).unwrap_or_else(|| panic!("no GOFLAGS in the subshell: {subshell}"));
+    assert!(subshell[at..].contains("go install x@v1"), "the install doesn't come after it: {subshell}");
+    assert!(!tail.contains("GOFLAGS"), "outside the install's subshell: {tail}");
+}
+
+/// SME-456: the go watchdog runs next to the install, which runs in the
+/// background, its log opened for append: the watchdog's line about why
+/// it stopped go survives the install's next write. The record is
+/// written once the install and its watchdog have both ended.
+#[test]
+fn test_the_install_log_is_appended_to() {
+    let watchdog = include_str!("../go_idle.sh");
+    assert!(!watchdog.lines().any(|line| line.trim() == "SMELT_EOF"), "the watchdog would end its own heredoc");
+    let filled = watchdog.trim_end().replace("__GO_IDLE_S__", "120");
+    assert!(!filled.contains("__"), "a placeholder left unfilled: {filled}");
+    let script = pod_script("go install x@v1");
+    let written = format!("cat > /tmp/smelt-go-idle.sh <<'SMELT_EOF'\n{filled}\nSMELT_EOF\n");
+    assert!(script.contains(&written), "no watchdog written: {script}");
+    let mut rest = script.as_str();
+    for step in [
+        ": > /tmp/install.log; mkdir -p \"$HOME\" && ( ",
+        ") >> /tmp/install.log 2>&1 & install=$!;",
+        "sh /tmp/smelt-go-idle.sh \"$install\" /tmp/install.log /proc/net/dev & watch=$!;",
+        "wait \"$install\"; rc=$?;",
+        "kill \"$watch\" 2>/dev/null; wait \"$watch\";",
+        "echo $rc > /tmp/install.rc;",
+        "trap 'exit 0' TERM;",
+    ] {
+        let at = rest.find(step).unwrap_or_else(|| panic!("no {step:?} after what came before: {script}"));
+        rest = &rest[at + step.len()..];
+    }
+}
+
+/// The pod script's paths in a server pod are the ones the install's
+/// waiters read.
+#[test]
+fn test_the_pod_scripts_record_and_log_are_the_ones_read() {
+    let at = &super::super::script::IN_THE_POD;
+    assert_eq!(format!("{}/{}", at.tmp, super::super::script::INSTALL_LOG_FILE), INSTALL_LOG);
+    assert_eq!(format!("{}/{}", at.tmp, super::super::script::INSTALL_RC_FILE), INSTALL_RC);
+    assert_eq!(at.go_idle, std::time::Duration::from_secs(120));
+}
+
 /// What the catalog suggested for rust-analyzer before SME-360
 /// (`config.rs`'s `OLD_INSTALL`, copied): the x86-64 asset on every node.
 const OLD_INSTALL: &str = "mkdir -p /tmp/home/bin && curl -fsSL \
@@ -66,7 +122,8 @@ fn test_saved_and_edited_installs_run_with_the_stall_bounds_as_written() {
         let script = pod_script(install);
         let (subshell, _) = install_subshell(&script);
         let at = subshell.find(CURL_HOME_LINE).unwrap_or_else(|| panic!("no CURL_HOME before {install}: {subshell}"));
-        let after = &subshell[at + CURL_HOME_LINE.len()..];
+        let after = subshell[at + CURL_HOME_LINE.len()..].trim_start();
+        let after = after.strip_prefix(GOFLAGS_LINE).unwrap_or_else(|| panic!("no GOFLAGS before {install}: {subshell}"));
         assert_eq!(after.trim_start(), format!("{install} "), "the install isn't run as written");
     }
     assert_eq!(
