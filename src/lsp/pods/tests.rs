@@ -481,3 +481,11 @@ mod install;
 /// A real-cluster test of an install whose TLS handshake never answers
 /// (SME-452's mechanism), against a tarpit inside the server pod.
 mod handshake;
+
+/// The pod script's stall bounds for curl and go, and saved installs
+/// under them (SME-456).
+mod script;
+
+/// Real-cluster tests of curl and go installs whose server never answers
+/// (SME-456), against a server inside the pod: no internet.
+mod installers;
