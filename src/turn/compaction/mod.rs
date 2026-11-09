@@ -350,8 +350,9 @@ async fn summarize(
     }
     match crate::claude_cli::summary::http_first(summary, &turn.stop_reason) {
         crate::claude_cli::summary::HttpStep::Save(text) | crate::claude_cli::summary::HttpStep::SaveMarked(text) => Ok(text),
-        // The one continuation — an `if`, not a loop: a compaction can
-        // at most ask twice, so it can never spin (the plan's 2c).
+        // The one continuation — an `if`, not a loop: no continuation ever
+        // follows a continuation, so it can never spin (2c; `compact`'s
+        // overflow retry is bounded too — see `continue_summary`).
         crate::claude_cli::summary::HttpStep::Continue(part1) => {
             continue_summary(pool, conversation_id, turn_model, slot, &prompt, &part1).await
         }
@@ -412,9 +413,12 @@ fn summary_text(turn: &anthropic::stream::StreamedTurn) -> String {
 /// ending on `user`, so no provider needs prefill support — and a
 /// freshly derived budget for the larger request. Its own recorder, so
 /// its cost is its own `compaction` usage row (SME-106). An overflow
-/// here propagates as from any mid-compaction failure: `compact`'s
-/// overflow arm wraps only the first call, and the turn fails with the
-/// history intact — 2c's bound.
+/// from here propagates through `summarize` into `compact`'s overflow
+/// arm like one from the first call (review 1's correction to 2c): the
+/// window is learned and the half-sized transcript retried, and that
+/// retry can itself continue — at most 4 `compaction` calls in one pass,
+/// bounded, no loop. The 2-call bound describes the refusal path, whose
+/// `Other` errors propagate and fail the turn with the history intact.
 async fn continue_summary(
     pool: &PgPool,
     conversation_id: i64,
