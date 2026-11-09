@@ -11,7 +11,8 @@ fn install_subshell(script: &str) -> (&str, &str) {
 
 /// The line that points the install's curl at smelt's `.curlrc`, unless
 /// the config's env names a `CURL_HOME` of its own.
-const CURL_HOME_LINE: &str = "[ -n \"$CURL_HOME\" ] || { CURL_HOME=/tmp/smelt-curl; export CURL_HOME; };";
+const CURL_HOME_LINE: &str = "[ -n \"$CURL_HOME\" ] || [ -f \"$HOME/.curlrc\" ] || \
+    [ -f \"${XDG_CONFIG_HOME:-$HOME/.config}/curlrc\" ] || { CURL_HOME=/tmp/smelt-curl; export CURL_HOME; };";
 
 /// SME-456: curl bounds nothing after a connection opens, and its connect
 /// default is 300 s. The pod script writes smelt's `.curlrc` (30 s to

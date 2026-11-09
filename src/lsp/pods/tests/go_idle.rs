@@ -1,6 +1,7 @@
-//! The go watchdog (SME-456), run in the pod script on this host: a fake
-//! `go` on `PATH`, the script's files in a directory of the test's own,
-//! and a 3 s bound for 120 s.
+//! The pod script run on this host (SME-456): the go watchdog, and
+//! where the install's curl reads its config. A fake `go` on `PATH`, the
+//! script's files in a directory of the test's own, and a 3 s bound for
+//! 120 s unless a test says otherwise.
 //! Needs `sh` and `/proc`, as the test container and CI have; no cluster.
 
 use super::super::script::{ScriptAt, pod_script_at};
@@ -63,31 +64,66 @@ impl Drop for Traffic {
     }
 }
 
+/// The directory a run named `name` keeps its files in; `$HOME` is its
+/// `home`.
+fn test_dir(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("sme-456-go-idle-{name}-{}", std::process::id()))
+}
+
+/// How to run the pod script on this host.
+struct Run<'a> {
+    name: &'a str,
+    /// The fake `go`'s shell script.
+    go_body: &'a str,
+    install: &'a str,
+    env: &'a [(&'a str, &'a str)],
+    /// Files written under `$HOME` before the script starts.
+    home_files: &'a [(&'a str, &'a str)],
+    /// How long to wait for the install's record.
+    wait: Duration,
+    /// `Traffic` on this host's network while it runs.
+    traffic: bool,
+    go_idle: Duration,
+}
+
+impl Default for Run<'_> {
+    fn default() -> Self {
+        Run {
+            name: "",
+            go_body: "exit 0",
+            install: "go install x@v1",
+            env: &[],
+            home_files: &[],
+            wait: Duration::from_secs(15),
+            traffic: false,
+            go_idle: Duration::from_secs(3),
+        }
+    }
+}
+
 /// Runs the pod script for `install`, with `go` on `PATH` the shell
 /// script `go_body` and `env` set, and waits up to `wait` for its record.
 fn run_pod_script(name: &str, go_body: &str, install: &str, env: &[(&str, &str)], wait: Duration) -> Ran {
-    run_pod_script_with(name, go_body, install, env, wait, false)
+    run(Run { name, go_body, install, env, wait, ..Default::default() })
 }
 
-/// `run_pod_script`, with `Traffic` on this host's network while it runs
-/// when `traffic`.
-fn run_pod_script_with(
-    name: &str,
-    go_body: &str,
-    install: &str,
-    env: &[(&str, &str)],
-    wait: Duration,
-    traffic: bool,
-) -> Ran {
-    let dir = std::env::temp_dir().join(format!("sme-456-go-idle-{name}-{}", std::process::id()));
+/// Runs the pod script as `run` says.
+fn run(run: Run) -> Ran {
+    let Run { name, go_body, install, env, home_files, wait, traffic, go_idle } = run;
+    let dir = test_dir(name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("bin")).expect("the test's directory");
+    for (path, content) in home_files {
+        let path = dir.join("home").join(path);
+        std::fs::create_dir_all(path.parent().expect("a file in a directory")).expect("its directory");
+        std::fs::write(&path, content).expect("a file in $HOME");
+    }
     let go = dir.join("bin/go");
     std::fs::write(&go, format!("#!/bin/sh\n{go_body}\n")).expect("the fake go");
     std::fs::set_permissions(&go, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("chmod");
     let _traffic = traffic.then(Traffic::start);
     let tmp = dir.to_str().expect("a UTF-8 path");
-    let at = ScriptAt { tmp, go_idle: Duration::from_secs(3) };
+    let at = ScriptAt { tmp, go_idle };
     let script = pod_script_at(install, &at);
     let path = format!("{}:{}", dir.join("bin").display(), std::env::var("PATH").unwrap_or_default());
     let mut child = std::process::Command::new("sh")
@@ -96,6 +132,8 @@ fn run_pod_script_with(
         .env("HOME", dir.join("home"))
         .env("PATH", path)
         .env_remove("GOFLAGS")
+        .env_remove("CURL_HOME")
+        .env_remove("XDG_CONFIG_HOME")
         .envs(env.iter().copied())
         .process_group(0)
         .spawn()
@@ -146,7 +184,7 @@ fn test_a_silent_go_is_stopped_and_says_why() {
 #[test]
 fn test_a_silent_go_is_stopped_while_other_traffic_arrives() {
     let go = "trap 'kill $! 2>/dev/null; exit 143' TERM; sleep 600 & wait";
-    let ran = run_pod_script_with("traffic", go, "go install x@v1", &[], Duration::from_secs(15), true);
+    let ran = run(Run { name: "traffic", go_body: go, traffic: true, ..Default::default() });
     let rc = ran.rc.unwrap_or_else(|| panic!("no record within 15 s; the log: {:?}", ran.log));
     assert_ne!(rc, "0", "{}", ran.log);
     assert!(ran.log.trim_end().ends_with(STOPPED), "{:?}", ran.log);
@@ -196,4 +234,31 @@ fn test_a_go_install_keeps_the_configs_goflags() {
     let ran = run_pod_script("goflags", "echo \"flags: $GOFLAGS\"", "go install x@v1", &[("GOFLAGS", "-mod=mod")], Duration::from_secs(15));
     assert_eq!(ran.rc.as_deref(), Some("0"), "{:?}", ran.log);
     assert!(ran.log.contains("flags: -mod=mod -x\n"), "{:?}", ran.log);
+}
+
+/// The `CURL_HOME` the install's curl ran with, given `home_files` and
+/// `env`: the fake go prints it.
+fn curl_home_with(name: &str, home_files: &[(&str, &str)], env: &[(&str, &str)]) -> String {
+    let go = "echo \"CURL_HOME=[$CURL_HOME]\"";
+    let ran = run(Run { name, go_body: go, home_files, env, ..Default::default() });
+    assert_eq!(ran.rc.as_deref(), Some("0"), "{:?}", ran.log);
+    ran.log.lines().find_map(|l| l.strip_prefix("CURL_HOME=[")?.strip_suffix(']').map(str::to_string)).expect("printed")
+}
+
+/// SME-456 review 1 (Low 1): curl reads only the first `.curlrc` it finds,
+/// and `CURL_HOME`'s comes first, so smelt's would hide a user's own. When
+/// the install starts with one in `$HOME` or `$XDG_CONFIG_HOME` (or
+/// `~/.config`), `CURL_HOME` is left unset and curl reads the user's;
+/// otherwise the install's curl gets smelt's bounds.
+#[test]
+fn test_a_users_own_curlrc_is_honoured() {
+    let smelt = curl_home_with("curl-none", &[], &[]);
+    assert!(smelt.ends_with("/smelt-curl"), "no CURL_HOME without a .curlrc of the user's: {smelt:?}");
+    let rc = "proxy = http://example.invalid:3128\n";
+    assert_eq!(curl_home_with("curl-home", &[(".curlrc", rc)], &[]), "", "~/.curlrc hidden");
+    assert_eq!(curl_home_with("curl-config", &[(".config/curlrc", rc)], &[]), "", "~/.config/curlrc hidden");
+    let xdg = test_dir("curl-xdg").join("home/xdg");
+    let xdg = xdg.to_str().expect("a UTF-8 path");
+    assert_eq!(curl_home_with("curl-xdg", &[("xdg/curlrc", rc)], &[("XDG_CONFIG_HOME", xdg)]), "", "$XDG_CONFIG_HOME/curlrc hidden");
+    assert_eq!(curl_home_with("curl-own", &[], &[("CURL_HOME", "/elsewhere")]), "/elsewhere", "the config's CURL_HOME replaced");
 }

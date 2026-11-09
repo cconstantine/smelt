@@ -46,6 +46,12 @@ pub(super) const INSTALL_RC_FILE: &str = "install.rc";
 /// was unchanged. The command line wins over a `.curlrc`, so a user's
 /// own `--connect-timeout` or `--speed-time` beats these, `curl -q`
 /// skips the file, and a `CURL_HOME` in the config's env replaces it.
+/// curl reads only the first `.curlrc` it finds, `CURL_HOME`'s first, so
+/// this one would hide a user's own: when the install starts with a
+/// `$HOME/.curlrc` or a `${XDG_CONFIG_HOME:-$HOME/.config}/curlrc`, it
+/// isn't used, and that install's curl runs with the user's file and
+/// without these bounds (SME-456 review 1). A `.curlrc` the install
+/// writes itself, once it has started, is still hidden by this one.
 /// No `--retry`: curl can't rewind a body it already piped into `tar`.
 const CURL_STALL_BOUNDS: &str = include_str!("curlrc");
 
@@ -93,7 +99,8 @@ const GO_WATCHDOG_SH: &str = "smelt-go-idle.sh";
 /// and `tls.connect`) through `NODE_OPTIONS`, after any of the config's
 /// own; installs that don't run node ignore it. If the preload can't be
 /// written, the install runs without it. It points the install's curl at
-/// `CURL_STALL_BOUNDS` too, unless the config's env sets a `CURL_HOME`,
+/// `CURL_STALL_BOUNDS` too, unless the config's env sets a `CURL_HOME` or
+/// the user has a `.curlrc` of their own,
 /// and runs its go with `-x` and `GO_WATCHDOG` (`GO_IDLE_BOUND`).
 pub(super) fn pod_script(install_command: &str) -> String {
     pod_script_at(install_command, &IN_THE_POD)
@@ -132,7 +139,9 @@ pub(super) fn pod_script_at(install_command: &str, at: &ScriptAt) -> String {
          : > {log}; mkdir -p \"$HOME\" && ( [ -f {js} ] && \
          NODE_OPTIONS=\"${{NODE_OPTIONS:+$NODE_OPTIONS }}--require={js}\" && \
          export NODE_OPTIONS; \
-         [ -n \"$CURL_HOME\" ] || {{ CURL_HOME={curl_home}; export CURL_HOME; }}; \
+         [ -n \"$CURL_HOME\" ] || [ -f \"$HOME/.curlrc\" ] || \
+         [ -f \"${{XDG_CONFIG_HOME:-$HOME/.config}}/curlrc\" ] || \
+         {{ CURL_HOME={curl_home}; export CURL_HOME; }}; \
          GOFLAGS=\"${{GOFLAGS:+$GOFLAGS }}-x\"; export GOFLAGS; \
          {install} ) >> {log} 2>&1 & install=$!; \
          watch=; if [ -f {watch} ]; then sh {watch} \"$install\" {log} & watch=$!; fi; \
