@@ -64,6 +64,7 @@ async fn test_an_unknown_name_the_cli_refused_carries_the_turn_on(pool: PgPool) 
     run_turn(&pool, conversation.id, hello()).await.expect("the turn carries on");
 
     assert_eq!(fake.started(), 1, "the same run carried on, no restart");
+    assert_eq!(usage_rows(&pool, conversation.id).await.len(), 2, "one row per API call: the slip's and the reply's, none for the echo (review 2 L3)");
     let saved = saved(&pool, conversation.id).await;
     // The reply rides in the record under the model's own name — the CLI
     // was never given it, so nothing maps it back.
@@ -134,6 +135,34 @@ async fn test_a_real_call_resets_the_unknown_count(pool: PgPool) {
     assert!(saved.iter().any(|(role, blocks)| role == "assistant"
         && matches!(&blocks[..], [anthropic::ContentBlock::Text { text }] if text == "Done.")), "{saved:?}");
     assert!(!saved_json(&saved).contains("refused locally"), "{saved:?}");
+}
+
+/// Review 1's Low 2: an `init` with an empty `tools` array is no list to
+/// check against. A `connected` init naming no tools contradicts the arm
+/// that admitted it (a turn always has tools), so it must not stand as
+/// authoritative — uncheckable stays today's loud divergence, never a
+/// carry-on that could swallow every divergence of the run.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_empty_tools_init_is_no_list_to_check_against(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let empty_init = json!({"type": "system", "subtype": "init", "session_id": "00000000-0000-4000-8000-000000000001",
+        "tools": [],
+        "mcp_servers": [{"name": "smelt", "status": "connected"}]});
+    let fake = FakeCli::new("empty-init", vec![vec![
+        json!({"read": true}),
+        json!({"emit": [empty_init]}),
+        bad_call("toolu_bad"),
+        json!({"emit": [refusal("toolu_bad")]}),
+        text_reply("Unrelated."),
+    ]]);
+    fake.pick_for(&pool, conversation.id).await;
+
+    let error = run_turn(&pool, conversation.id, hello()).await.expect_err("no tool names listed: uncheckable, so divergence");
+    assert!(error.to_string().contains("answered tool call toolu_bad itself"), "{error}");
+    let saved = saved(&pool, conversation.id).await;
+    assert!(!saved.iter().any(|(_, blocks)| blocks.iter().any(|b| matches!(b, anthropic::ContentBlock::Text { text } if text == "Unrelated."))), "{saved:?}");
 }
 
 /// Decision 1(b) with an `init` seen: the rule is the name, not the

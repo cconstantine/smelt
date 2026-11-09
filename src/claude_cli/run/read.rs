@@ -208,11 +208,13 @@ impl Run {
         match (event["type"].as_str(), event["subtype"].as_str()) {
             (Some("rate_limit_event"), _) => self.rate = Some(RateLimit::from_event(event)),
             (Some("system"), Some("init")) => {
-                // What this process's CLI says it can call (SME-447), in its
-                // own `mcp__smelt__…` forms — the one list a refusal echo is
-                // judged against. No array of strings: leave what's there,
-                // uncheckable staying today's loud divergence.
-                if let Some(tools) = event["tools"].as_array()
+                // What this process's CLI says it can call (SME-447), the
+                // witness that echoes are checkable at all. A non-empty
+                // array of strings only: an empty one from a `connected`
+                // init contradicts the arm that admitted it (a turn always
+                // has tools) and is no list to check against — uncheckable
+                // stays today's loud divergence (review 1 L2).
+                if let Some(tools) = event["tools"].as_array().filter(|tools| !tools.is_empty())
                     && let Some(names) = tools.iter().map(|t| t.as_str()).collect::<Option<Vec<&str>>>()
                 {
                     self.cli_tools = Some(names.into_iter().map(str::to_string).collect());
