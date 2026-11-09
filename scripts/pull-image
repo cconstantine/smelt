@@ -9,7 +9,9 @@
 # per failed attempt (`pull-image: REF attempt k of 3 failed: REASON`; a
 # timeout says `docker pull gave up after Ns`), then `pull-image: REF pulled
 # on attempt k of 3`, or `pull-image: REF: 3 attempts, last: REASON` and
-# exit 1. A pull is content-addressed (the registry protocol checks every
+# exit 1. An error no retry can fix (`manifest unknown`, `not found`,
+# `denied`, `unauthorized`) fails at once instead, as fetch-pinned fails a
+# 4xx: `pull-image: REF: not retried: REASON`. A pull is content-addressed (the registry protocol checks every
 # layer's digest), so there is no checksum of ours to add.
 # scripts/test-pull-image covers it.
 set -euo pipefail
@@ -50,6 +52,12 @@ for ((k = 1; k <= attempts; k++)); do
         last=${err##*$'\n'}
         last=${last:-docker pull failed with exit $rc and no message}
     fi
+    # A wrong or retired ref, or no access: no retry can fix it.
+    case $last in
+    *"manifest unknown"* | *"not found"* | *denied* | *unauthorized*)
+        say "$ref: not retried: $last"
+        exit 1 ;;
+    esac
     say "$ref attempt $k of $attempts failed: $last"
     if [ "$k" -lt "$attempts" ]; then
         sleep "${pauses[k - 1]:-0}"
