@@ -137,11 +137,11 @@ pub(super) const SUMMARY_MAX_TOKENS_CEILING: u32 = 8_192;
 /// request. The 2,048 floor wins over a stingy room: a request the provider
 /// then refuses as too big is exactly what `compact`'s existing overflow
 /// arm answers — learn the window, retry with half the transcript. The
-/// model's own *reported* cap clamps the result whatever the user's "Max
-/// reply tokens" made the applied cap: over its own cap Anthropic 400s
-/// "maximum allowed", a refusal the overflow arm deliberately does not
-/// answer (review 1). The user's cap itself does not apply — a summary is
-/// not a reply (SME-111).
+/// model's own *reported* cap clamps the result on Anthropic-kind models
+/// — the only kind whose over-cap 400 sits outside the overflow arm —
+/// whatever the user's "Max reply tokens" made the applied cap (review 1).
+/// The user's cap itself does not apply — a summary is not a reply
+/// (SME-111).
 #[cfg(feature = "server")]
 pub(super) fn summary_max_tokens(turn_model: &crate::providers::TurnModel, request_chars: usize) -> u32 {
     let room = (i64::from(turn_model.context_window)
