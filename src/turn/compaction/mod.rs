@@ -131,8 +131,9 @@ pub(super) const SUMMARY_MAX_TOKENS_CEILING: u32 = 8_192;
 /// built request's size at 3 chars/token — `compaction_transcript_budget`'s
 /// own conservative rate, so transcript size and budget stay consistent —
 /// less `COMPACTION_SAFETY_BUFFER`, floored at today's 2,048 and held to
-/// `SUMMARY_MAX_TOKENS_CEILING`. `request_chars` is the text the
-/// summarization request actually carries, so it grows for the continuation
+/// `SUMMARY_MAX_TOKENS_CEILING`. `request_chars` is the transcript prompt
+/// the request carries — the system prompt and JSON framing ride on top,
+/// inside the 4,096 buffer's margin — so it grows for the continuation
 /// request. The 2,048 floor wins over a stingy room: a request the provider
 /// then refuses as too big is exactly what `compact`'s existing overflow
 /// arm answers — learn the window, retry with half the transcript. The
