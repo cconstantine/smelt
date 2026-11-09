@@ -236,6 +236,20 @@ the variable.
 `scripts/test-ci-install-compose` (in `check.sh`) runs every path against
 stubs.
 
+**Fetches at build time** (SME-470). Every download the Dockerfiles make
+goes through `scripts/fetch-pinned URL OUT SHA256` (`-` for a key or manifest
+checked on the next line): to a temp file, up to 4 attempts, bounded by a
+connect timeout, a minimum speed and a max time, checked against its sha256,
+then renamed, never piped. dx comes from its release tarball (`DX_VERSION`,
+which must equal Cargo.lock's `dioxus`), not cargo-binstall; the dev image's
+`claude` is the `claude` stage's pinned binary. Image pulls in
+`build-sandbox-image.sh` and start-stack go through `scripts/pull-image`
+(3 attempts, each under a timeout). CI's failure diagnostics use the k3s
+container's own `kubectl`. `src/repo_lints/fetches.rs` fails on a `curl` or
+`wget` of a remote URL in a Dockerfile, workflow or script that doesn't go
+through these, unless it says why in a `# fetch: <reason>` comment, and on
+any fetch piped into a shell.
+
 **A change to docs alone doesn't run the tests** (SME-341). A first job,
 `changes`, compares the change's files: when every one is under `docs/`, a
 top-level `*.md` or a `.agents/**/*.md` (never `src/`, whose Markdown the
