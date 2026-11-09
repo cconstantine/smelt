@@ -57,6 +57,24 @@ fn test_cli_tool_names_are_plain() {
     assert_eq!(cli_tool_name("github.create_issue"), "mcp__smelt__github_create_issue");
 }
 
+/// SME-447 review 1 L1: whether the CLI was given a tool is membership
+/// against `register`'s own map — never a re-derivation, which diverges
+/// from what `register` handed for a tool whose smelt name already
+/// starts with the CLI's prefix (an MCP server named `smelt`: its tools
+/// are offered as `mcp__smelt__<tool>`, `register`'s `trim_start_matches`
+/// strips the prefix *repeatedly*, and the CLI was given the stripped
+/// short name the classifier could never re-derive).
+#[tokio::test]
+async fn test_handed_membership_follows_register_not_a_rederivation() {
+    let bridge = bridge().await.expect("the bridge starts");
+    let run = bridge.register(&[tool("todoread"), tool("mcp__smelt__get_issue")]);
+    assert!(run.was_handed("todoread"), "its short name is mcp__smelt__todoread");
+    assert!(run.was_handed("mcp__smelt__get_issue"), "handed under register's fully stripped short name");
+    assert!(!run.was_handed("mcp__linear__list_comments"), "never this run's: the CLI was given nothing it could call it under");
+    assert!(!run.was_handed("mcp__smelt__mcp__smelt__get_issue"), "the re-derived double-prefixed form names no handed tool");
+    assert_ne!(cli_tool_name("mcp__smelt__get_issue"), "mcp__smelt__get_issue", "and this is exactly the second derivation the membership test must not use");
+}
+
 #[tokio::test]
 async fn test_a_call_parks_under_its_tool_use_id_until_smelt_answers() {
     let bridge = bridge().await.expect("the bridge starts");
