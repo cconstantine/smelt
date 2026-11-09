@@ -84,6 +84,8 @@ http.server.HTTPServer(("127.0.0.1", 18080), H).serve_forever()' &
     # point Docker makes in a dir it creates leaves that dir root-owned.
     ln -s /dx-offline-target target || exit 1
     log=/tmp/leg.log
+    # The dev leg's .wasm must be this run's: target/ is a warm volume.
+    touch /tmp/leg-start
     if [ "$leg" = guard ]; then
         mkdir -p /tmp/fakebin
         printf '#!/bin/sh\necho boom >&2\nexit 1\n' >/tmp/fakebin/wasm-opt
@@ -136,8 +138,8 @@ http.server.HTTPServer(("127.0.0.1", 18080), H).serve_forever()' &
         find /app/image/smelt/public -name '*.wasm' | grep -q . \
             || { echo "FAIL: server: no .wasm in /app/image/smelt/public"; exit 1; }
     else
-        find target/dx -path '*/web/public/*' -name '*.wasm' | grep -q . \
-            || { echo "FAIL: dev: no .wasm under target/dx/*/web/public"; exit 1; }
+        find target/dx -path '*/web/public/*' -name '*.wasm' -newer /tmp/leg-start | grep -q . \
+            || { echo "FAIL: dev: no .wasm under target/dx/*/web/public written by this run"; exit 1; }
     fi
     echo "PASS: $leg"
     exit 0
