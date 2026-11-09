@@ -187,6 +187,18 @@ docker compose run --rm --no-deps -T smelt bash -c \
 docker rm -f sme457-hole
 ```
 
+**dx's tools come from the image, and dx downloads none** (SME-413). The
+Dockerfile's `dx-tools` stage installs wasm-bindgen (crates.io, at
+Cargo.lock's version) and esbuild (npm, sha256-pinned); wasm-opt is Debian's
+binaryen; `base` and `build-env` set `NO_DOWNLOADS=1`, so dx takes them from
+PATH or fails with `Missing …`. A `dx build` that logs `Installing
+wasm-bindgen-cli`, `esbuild` or `wasm-opt` is running in a stale image:
+rebuild it (`docker compose build smelt`). `scripts/test-dx-offline
+[server|dev|guard]`, run by hand on the seat's host, bundles with GitHub and
+npm blocked — the release bundle, CI's `scripts/ci-web-bundle`, and the
+guard that fails a release build whose wasm-opt fails — and keeps each leg's
+log under `target/test-dx-offline/`.
+
 **A check server's previews are its own** (SME-96). `start` gives the server `SMELT_PREVIEW_ADDR=0.0.0.0:<CHECK_PORT+200>` (8281 for the default 8081), preview links on that port, and `SMELT_BASE_URL=http://localhost:<CHECK_PORT>`. So preview links and the pages that link back to a conversation work out of the box, and never reach the dev server's 8181 or Grafana's 8182. Only a `-- NAME=VALUE` override changes them. The environment and `.env` hold the dev server's values here (compose sets `SMELT_BASE_URL` for every shell), so `start` ignores them and names each one it ignored. Given only an address, the links follow its port; given a link template on another port, `start` warns. An empty `SMELT_PREVIEW_ADDR` or `SMELT_PREVIEW_URL` is refused, while an empty `SMELT_BASE_URL` is passed on. A preview port something already listens on is refused before anything is checked out, created or started, as the app's port is (SME-175). `start` prints what it chose, with whose each value is. `scripts/test-check-server-previews` covers it.
 
 `mcp::tests::client::test_live_exa_search_through_smelt_mcp_client` checks the built-in Exa MCP server against the real service: smelt's own MCP client connects keylessly, sees only `web_search_exa`, and gets results back. It needs the internet and depends on Exa's unpublished free limits, so it's `#[ignore]`d **and** skips unless `SMELT_LIVE_EXA=1` is set. CI's browser job runs every ignored test, and this one shouldn't depend on Exa there. It's a `#[sqlx::test]`, since a connect reads its server's row (SME-167), so run it under the cluster lock: `SMELT_LIVE_EXA=1 scripts/cluster-test --features server -- --ignored --exact mcp::tests::client::test_live_exa_search_through_smelt_mcp_client`. See [Definition of done](process/done.md) for the full two-target check.
