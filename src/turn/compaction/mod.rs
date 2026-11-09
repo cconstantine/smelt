@@ -449,7 +449,11 @@ async fn continue_summary(
     // Recorded as soon as it completes: the tokens are spent whether or
     // not the join is saved (SME-106).
     recorder.finish(&turn, None).await.map_err(|e| anthropic::stream::ModelError::Other(e.to_string()))?;
-    Ok(match crate::claude_cli::summary::http_continued(part1, summary_text(&turn), &turn.stop_reason) {
-        crate::claude_cli::summary::ContinuedStep::Save(text) | crate::claude_cli::summary::ContinuedStep::SaveMarked(text) => text,
-    })
+    match crate::claude_cli::summary::http_continued(part1, summary_text(&turn), &turn.stop_reason) {
+        crate::claude_cli::summary::ContinuedStep::Save(text) | crate::claude_cli::summary::ContinuedStep::SaveMarked(text) => Ok(text),
+        // Cut off again: the compaction is refused, not saved — no
+        // divider, no progress marked, the plan's at-most-2 bound
+        // (SME-443 step 3; 2c).
+        crate::claude_cli::summary::ContinuedStep::Fail(why) => Err(anthropic::stream::ModelError::Other(why)),
+    }
 }

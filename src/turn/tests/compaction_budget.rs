@@ -214,3 +214,102 @@ async fn test_a_summary_that_spends_its_budget_on_reasoning_gets_room_and_contin
     assert_eq!(saved[0], format!("{part1}{rest}"), "first Text only, joined verbatim: {saved:?}");
     assert!(!saved[0].contains("reasoning"), "thinking blocks are never saved: {saved:?}");
 }
+
+/// A3: a summary whose continuation is *also* cut off is refused —
+/// loudly, with the history kept — rather than saved as a marked
+/// torso (SME-443). Exactly two model calls: the once is a once, and a
+/// refused compaction marks no progress (the plan's 2c; escape and
+/// compaction_progress stay green). *Expected red before the refusal
+/// step (with the continuation in, commit 4's stub-back): compaction
+/// saves marked, no error.*
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_summary_still_cut_off_after_its_continuation_fails_and_keeps_the_history(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation_id = conversation_past_the_trigger(&pool).await;
+    let cut = |t: &str| text_reply_body(t).replace(r#""stop_reason":"end_turn""#, r#""stop_reason":"max_tokens""#);
+    let requests = start_recording_mock_upstream(&pool, vec![
+        cut("Done: split the file. Planned: con"),
+        cut("tinue once, then refuse — the torso of a"),
+        text_reply_body("Never sent."),
+    ])
+    .await;
+
+    let error = run_turn(&pool, conversation_id, hello())
+        .await
+        .expect_err("a summary still cut off after its one continuation fails the compaction")
+        .to_string();
+
+    assert!(
+        error.contains("cut off again after one continuation"),
+        "the refusal names what happened: {error}"
+    );
+    let requests = requests.lock().expect("the request log");
+    assert_eq!(requests.len(), 2, "summary, continuation — no third call (the once): {requests:?}");
+    drop(requests);
+    assert!(
+        compaction_summaries(&pool, conversation_id).await.is_empty(),
+        "no divider: the history was kept as it is"
+    );
+}
+
+/// A6: an HTTP summary that comes back **empty** fails the compaction
+/// on HTTP kinds too (SME-443 step 3), whatever stopped it — and
+/// short-circuits: there is nothing to continue, so no continuation
+/// call. *Expected red before the refusal step: empty summary saves
+/// unmarked, turn proceeds.*
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_empty_summary_fails_the_compaction_on_http_kinds(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation_id = conversation_past_the_trigger(&pool).await;
+    let requests = start_recording_mock_upstream(&pool, vec![
+        text_blocks_body(&[], "end_turn"),
+        text_reply_body("Never sent."),
+    ])
+    .await;
+
+    let error = run_turn(&pool, conversation_id, hello())
+        .await
+        .expect_err("an empty summary is refused, not saved")
+        .to_string();
+
+    assert!(error.contains("came back empty"), "the refusal names the empty summary: {error}");
+    let requests = requests.lock().expect("the request log");
+    assert_eq!(requests.len(), 1, "no continuation of an empty, no turn: {requests:?}");
+    drop(requests);
+    assert!(
+        compaction_summaries(&pool, conversation_id).await.is_empty(),
+        "no divider: the history was kept as it is"
+    );
+}
+
+/// A7: a summary that spends its whole budget on reasoning — cut off,
+/// with no text at all — is the same refusal as A6: empty beats
+/// continuation, there is nothing to continue (SME-443). *Expected red
+/// before the refusal step: empty saves with marker.*
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_summary_all_of_reasoning_and_no_text_fails_as_empty(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation_id = conversation_past_the_trigger(&pool).await;
+    let requests = start_recording_mock_upstream(&pool, vec![
+        text_blocks_body(&[Block::Thinking("every token went here")], "max_tokens"),
+        text_reply_body("Never sent."),
+    ])
+    .await;
+
+    let error = run_turn(&pool, conversation_id, hello())
+        .await
+        .expect_err("a reasoning-only summary is empty, and empty is refused")
+        .to_string();
+
+    assert!(error.contains("came back empty"), "empty beats continuation: {error}");
+    let requests = requests.lock().expect("the request log");
+    assert_eq!(requests.len(), 1, "no continuation without text: {requests:?}");
+    drop(requests);
+    assert!(
+        compaction_summaries(&pool, conversation_id).await.is_empty(),
+        "no divider: the history was kept as it is"
+    );
+}
