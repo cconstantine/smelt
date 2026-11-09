@@ -45,8 +45,18 @@ RUN printf '%s\n' \
 # daemon runs in the pod's `docker` sidecar, not here (SME-33): this
 # container stays unprivileged. Pinned to the sidecar's major version
 # (docker:29-dind, see src/sandbox.rs's default_docker_image).
+# Docker's repo key is pinned, not trusted on first use (SME-470): by the
+# sha256 of the file served on 2026-11-09, whose one key is Docker's
+# release key 9DC858229FC7DD38854AE2D88D81803C0EBFCD88, as Docker's docs
+# gave it (docker/docker.github.io engine/install/debian.md, "Verify that
+# you now have the key with the fingerprint ..."). A new file there means
+# a new pin here. Downloaded to a file with retries and bounds, then checked.
+# fetch: this build's context is target/sandbox-agent/, which has no scripts/fetch-pinned, so its guard is written out here
 RUN install -m 0755 -d /etc/apt/keyrings \
-    && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
+    && curl -fsSL --retry 4 --retry-all-errors --connect-timeout 30 --speed-limit 1024 --speed-time 60 \
+        --max-time 300 -o /etc/apt/keyrings/docker.asc https://download.docker.com/linux/debian/gpg \
+    && echo "1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570  /etc/apt/keyrings/docker.asc" \
+        | sha256sum -c - \
     && echo "deb [signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian trixie stable" \
         > /etc/apt/sources.list.d/docker.list \
     && apt-get update && apt-get install -y --no-install-recommends \
