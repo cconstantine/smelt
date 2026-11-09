@@ -50,9 +50,9 @@ pub fn server_pod_name(pod_id: i64, server: &str) -> String {
     format!("lsp-{pod_id}-{server}")
 }
 
-/// How long a TLS connect may take during an install (SME-452's
-/// mechanism): the DNS lookup, the TCP connect and the handshake alike.
-/// npm bounds none of them: `@npmcli/agent` hard-codes its connection
+/// How long opening a connection may take during an install (SME-452's
+/// mechanism): the DNS lookup, the TCP connect, a proxy's `CONNECT` reply
+/// (round 1) and the TLS handshake alike. npm bounds none of them: `@npmcli/agent` hard-codes its connection
 /// timeout to 0, and `fetch-timeout` (`NPM_STALL_BOUNDS`) starts only once
 /// the agent hands over a connected socket. So a connection that opens
 /// and then goes quiet before TLS completes (a peer that never answers
@@ -73,7 +73,8 @@ const CONNECT_BOUND_JS: &str = "/tmp/smelt-connect-bound.js";
 /// The script a server pod runs: the install, its outcome recorded, then
 /// idle until deleted (the server itself is started over `pods/exec`).
 /// The install's subshell alone preloads `CONNECT_BOUND`'s
-/// `connect_bound.js` through `NODE_OPTIONS`, after any of the config's
+/// `connect_bound.js` (it wraps node's `net.connect`/`createConnection`
+/// and `tls.connect`) through `NODE_OPTIONS`, after any of the config's
 /// own; installs that don't run node ignore it. If the preload can't be
 /// written, the install runs without it.
 fn pod_script(install_command: &str) -> String {
