@@ -101,6 +101,17 @@ impl RunBridge {
         self.names.get(short).map(String::as_str)
     }
 
+    /// Whether `register` handed the CLI the tool smelt calls
+    /// `smelt_name` (SME-447 review 1 L1): membership in the run's own
+    /// short-name map — the one record of what the CLI was actually
+    /// given — never a re-derivation, which disagrees with `register`'s
+    /// repeated `trim_start_matches` for a tool whose smelt name starts
+    /// with the CLI's own prefix (an MCP server named `smelt`), and
+    /// would misjudge that offered name's echo.
+    pub fn was_handed(&self, smelt_name: &str) -> bool {
+        self.names.values().any(|name| name == smelt_name)
+    }
+
     /// The `--mcp-config` JSON for this run: one HTTP server, `smelt`.
     pub fn mcp_config(&self) -> Value {
         serde_json::json!({

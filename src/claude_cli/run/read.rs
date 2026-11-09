@@ -17,12 +17,12 @@ impl Run {
             // L1) — taking that call first would judge it while the slip's
             // un-taken result still fills `answers`, which is the very test
             // L1 reads as "the CLI is still making that reply's calls". The
-            // order is the CLI's own: it writes a refusal echo to stdout
-            // before it makes its own next API call, so a call racing its
-            // echo's line was written after it, and reading the line first
-            // is the order reality gives. A call then waits only until the
-            // next poll with nothing left to read; the quiet-stdout case is
-            // unaffected.
+            // order is the CLI's own: its refusal echo goes out *before* it
+            // issues its own next API call, so a call racing an echo's line
+            // was issued after that line went out, and reading the line
+            // first is the order reality gives. A call then waits only
+            // until the next poll with nothing left to read; the
+            // quiet-stdout case is unaffected.
             tokio::select! { biased;
                 line = tokio::time::timeout(silence(), self.lines.next_line()) => {
                     let line = match line {
@@ -170,11 +170,17 @@ impl Run {
                 if self.answered.contains(id) {
                     return None;
                 }
-                // The name decides, never the wording: what the CLI runs is
-                // what its `init` listed, `bridge::register`'s form of each
-                // smelt name — and of the names it never registered, which
-                // keep the model's own spelling and so match nothing.
-                Some(if self.cli_tools.as_ref().is_some_and(|list| !list.contains(&crate::claude_cli::bridge::cli_tool_name(&ours.name))) {
+                // The name decides, never the wording. A call of a tool
+                // this run handed the CLI — membership in `register`'s own
+                // map, the record of what the CLI was given (review 1 L1:
+                // never a re-derivation, which parts company with
+                // `register`'s repeated strip for a name starting with the
+                // CLI's own prefix) — can only be an answer the bridge
+                // never saw: divergence. Of a name it was never given, the
+                // echo can only be its local unknown-name refusal — with
+                // no `init` list to prove the run checkable, keep today's
+                // loud failure.
+                Some(if self.cli_tools.is_some() && !self.bridge.was_handed(&ours.name) {
                     CliAnswered::Slip { id: id.to_string(), name: ours.name.clone() }
                 } else {
                     CliAnswered::Diverged { id: id.to_string() }
