@@ -244,7 +244,8 @@ then renamed, never piped. dx comes from its release tarball (`DX_VERSION`,
 which must equal Cargo.lock's `dioxus`), not cargo-binstall; the dev image's
 `claude` is the `claude` stage's pinned binary. Image pulls in
 `build-sandbox-image.sh` and start-stack go through `scripts/pull-image`
-(3 attempts, each under a timeout). CI's failure diagnostics use the k3s
+(3 attempts, each under a timeout; a missing image or no access fails at
+once). CI's failure diagnostics use the k3s
 container's own `kubectl`. `src/repo_lints/fetches.rs` fails on a `curl` or
 `wget` of a remote URL in a Dockerfile, workflow or script that doesn't go
 through these, unless it says why in a `# fetch: <reason>` comment, and on
