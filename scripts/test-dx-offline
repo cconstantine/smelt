@@ -23,7 +23,9 @@
 # (default below); nothing listens on the container's loopback, so every
 # fetch there is refused. crates.io and deb.debian.org stay reachable: cargo
 # needs the crates. A preflight in the same container checks the block
-# bites before dx runs. Images and volumes are this script's own
+# bites before dx runs. rustup's dist server is a local stand-in that
+# records requests, and any request fails the leg: a toolchain install at
+# bundle time (static.rust-lang.org is blocked too). Images and volumes are this script's own
 # (smelt-dx-offline-*); target/ and the cargo registry are named volumes,
 # so a second run is warm. Each leg's log is kept under
 # target/test-dx-offline/.
@@ -33,7 +35,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-default_hosts="github.com api.github.com codeload.github.com objects.githubusercontent.com release-assets.githubusercontent.com raw.githubusercontent.com registry.npmjs.org"
+default_hosts="github.com api.github.com codeload.github.com objects.githubusercontent.com release-assets.githubusercontent.com raw.githubusercontent.com registry.npmjs.org static.rust-lang.org"
 hosts=${DX_OFFLINE_HOSTS:-$default_hosts}
 tools_re='Installing (wasm-opt|wasm-bindgen|esbuild)'
 guard_msg="dx's wasm-opt failed and dx shipped the unoptimised wasm (SME-413)"
@@ -48,6 +50,27 @@ if [ "${1:-}" = "--inside" ]; then
         fi
     done
     echo "preflight: every blocked host refused ($hosts)"
+    # rustup's dist server is a local stand-in that records every request
+    # (SME-413 review L1): dx's progress estimate runs `cargo +nightly`, and
+    # rustup's shim would install nightly, with no timeout, unless
+    # RUSTUP_AUTO_INSTALL=0. dx swallows that child's output and a failed
+    # estimate, so only a request here shows the fetch was tried.
+    python3 -I -c 'import http.server
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(s):
+        open("/tmp/dist-requests", "a").write(s.path + "\n")
+        s.send_response(404); s.end_headers()
+    do_HEAD = do_GET
+    def log_message(s, *a): pass
+http.server.HTTPServer(("127.0.0.1", 18080), H).serve_forever()' &
+    dist=$!
+    for _ in $(seq 50); do
+        curl -s -o /dev/null http://127.0.0.1:18080/__ready && break
+        kill -0 "$dist" 2>/dev/null || { echo "FAIL: the dist stand-in died"; exit 1; }
+        sleep 0.1
+    done
+    grep -qx /__ready /tmp/dist-requests 2>/dev/null || { echo "FAIL: the dist stand-in never answered"; exit 1; }
+    export RUSTUP_DIST_SERVER=http://127.0.0.1:18080 RUSTUP_UPDATE_ROOT=http://127.0.0.1:18080/rustup
     work=$3
     mkdir -p "$work"
     tar -C /src --exclude=./target --exclude=./.git -cf - . | tar -C "$work" -xf - || exit 1
@@ -86,6 +109,10 @@ if [ "${1:-}" = "--inside" ]; then
             ;;
     esac
     echo "== $leg: rc=$rc"
+    if grep -vx /__ready /tmp/dist-requests; then
+        echo "FAIL: $leg: rustup fetched from its dist server at bundle time (above): a toolchain install"
+        exit 1
+    fi
     if [ "$leg" = guard ]; then
         if [ "$rc" -eq 0 ]; then
             echo "FAIL: guard: the bundle passed with a failing wasm-opt"

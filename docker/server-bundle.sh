@@ -4,6 +4,14 @@
 # that scripts/test-dx-offline runs exactly what the stage runs (SME-413).
 set -euo pipefail
 
+# dx estimates its progress display with `cargo +nightly rustc --unit-graph`;
+# this image has stable only, and rustup's shim answers a missing toolchain by
+# installing it from the network with no timeout (SME-457's hang). The
+# estimate is cosmetic and dx falls back on a failed one (dioxus-cli 0.7.9's
+# get_unit_count_estimate), so make it fail fast, as scripts/ci-web-bundle
+# does (SME-413 review L1).
+export RUSTUP_AUTO_INSTALL=0
+
 # --debug-symbols false: dioxus-cli 0.7.9 defaults it to true, which keeps
 # the wasm's DWARF and runs wasm-opt with --debuginfo, and Debian's wasm-opt
 # 120 aborts (SIGABRT) on that DWARF. Off, wasm-opt gets --strip-debug. The
