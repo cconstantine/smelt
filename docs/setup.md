@@ -248,7 +248,8 @@ which must equal Cargo.lock's `dioxus`), not cargo-binstall; the dev image's
 container's own `kubectl`. `src/repo_lints/fetches.rs` fails on a `curl` or
 `wget` of a remote URL in a Dockerfile, workflow or script that doesn't go
 through these, unless it says why in a `# fetch: <reason>` comment, and on
-any fetch piped into a shell.
+any fetch a shell runs, whatever its comment: `| sudo -E bash`, `| /bin/sh`,
+`bash <(curl …)`, `sh -c "$(curl …)"`.
 
 **A change to docs alone doesn't run the tests** (SME-341). A first job,
 `changes`, compares the change's files: when every one is under `docs/`, a

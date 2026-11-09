@@ -6,8 +6,10 @@
 //! has its own sources). One that can't, such as the sandbox image's, whose
 //! build context has no `scripts/`, says why in a `# fetch: <reason>`
 //! comment, on the command's last line or the comment lines right above it.
-//! A fetch piped into a shell fails whatever its comment says: the shell
-//! runs a body cut off partway as readily as a whole one.
+//! A fetch piped into a shell (`| sudo -E bash`, `| /bin/sh` too), or handed
+//! to one as `bash <(curl …)` or `sh -c "$(curl …)"`, fails whatever its
+//! comment says: the shell runs a body cut off partway as readily as a
+//! whole one.
 
 /// The files the build and CI run: Dockerfiles, the workflows and their
 /// actions, and the scripts, except the scripts' own tests and test helpers
@@ -28,7 +30,14 @@ const EXEMPT: &[&str] = &["scripts/fetch-pinned", "scripts/ci-install-compose"];
 /// One `path:line: why: text` per unguarded fetch in `text`.
 pub(crate) fn unguarded_fetches(path: &str, text: &str) -> Vec<String> {
     let fetch = regex::Regex::new(r#"(?:^|[\s;&|(!])(?:curl|wget)\s+(?:-|["']|https?://|\$)"#).expect("a valid regex");
-    let piped = regex::Regex::new(r"\b(?:curl|wget)\b[^#]*\|\s*(?:sudo\s+)?(?:ba)?sh\b").expect("a valid regex");
+    // A shell by name or path (`bash`, `/usr/bin/sh`, `zsh`), reading a
+    // fetch from a pipe (through `sudo [-E …]` or `env` too), from `<(…)`,
+    // or running it from `-c "$(…)"`.
+    let shell = r"(?:\S*/)?(?:ba|z|da|k)?sh\b";
+    let piped = regex::Regex::new(&format!(
+        r#"\b(?:curl|wget)\b[^#]*\|\s*(?:sudo(?:\s+-\S+)*\s+)?(?:env\s+)?{shell}|(?:^|[\s;&|(!]){shell}\s+(?:<\(|(?:-\S+\s+)*["']?\$\()\s*(?:curl|wget)\b"#
+    ))
+    .expect("a valid regex");
     let url = regex::Regex::new(r"https?://(\[[^\]]*\]|[^/\s'`$:]+)").expect("a valid regex");
     let mut findings = Vec::new();
     let mut comments_above = String::new();
@@ -97,6 +106,42 @@ mod tests {
         assert_eq!(f.len(), 1, "{f:?}");
         assert!(f[0].contains("pipes a fetch into a shell"), "{f:?}");
         assert_eq!(found("RUN curl -sSf https://x.example/i.sh \\\n    | sudo sh\n").len(), 1);
+    }
+
+    fn piped_even_with_a_reason(line: &str) {
+        let f = found(&format!("{line} # fetch: because\n"));
+        assert_eq!(f.len(), 1, "{line}: {f:?}");
+        assert!(f[0].contains("pipes a fetch into a shell"), "{line}: {f:?}");
+    }
+
+    #[test]
+    fn test_a_fetch_piped_into_sudo_with_flags_is_found() {
+        piped_even_with_a_reason("curl -fsSL https://x.example/i.sh | sudo -E bash");
+        piped_even_with_a_reason("wget -qO- https://x.example/i.sh | sudo -E -H sh");
+        piped_even_with_a_reason("curl -fsSL https://x.example/i.sh | sudo bash -s -- --yes");
+    }
+
+    #[test]
+    fn test_a_fetch_piped_into_a_shell_by_path_is_found() {
+        piped_even_with_a_reason("curl -fsSL https://x.example/i.sh | /bin/bash");
+        piped_even_with_a_reason("curl -fsSL https://x.example/i.sh | /usr/bin/sh");
+        piped_even_with_a_reason("curl -fsSL https://x.example/i.sh | sudo /usr/local/bin/bash");
+        piped_even_with_a_reason("curl -fsSL https://x.example/i.sh | env bash");
+        piped_even_with_a_reason("curl -fsSL https://x.example/i.sh | zsh");
+        assert_eq!(found("curl -fsSL https://x.example/a | sha256sum # fetch: a probe\n").len(), 0, "sha256sum isn't a shell");
+    }
+
+    #[test]
+    fn test_a_shell_reading_a_fetch_by_process_substitution_is_found() {
+        piped_even_with_a_reason("bash <(curl -fsSL https://x.example/i.sh)");
+        piped_even_with_a_reason("sh <( wget -qO- https://x.example/i.sh )");
+    }
+
+    #[test]
+    fn test_a_shell_running_a_fetch_by_command_substitution_is_found() {
+        piped_even_with_a_reason(r#"sh -c "$(curl -fsSL https://x.example/i.sh)""#);
+        piped_even_with_a_reason(r#"bash -c "$(wget -qO- https://x.example/i.sh)""#);
+        piped_even_with_a_reason(r#"/bin/bash -ec "$(curl -fsSL https://x.example/i.sh)""#);
     }
 
     #[test]
