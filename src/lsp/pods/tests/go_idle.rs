@@ -202,16 +202,19 @@ fn test_a_silent_go_that_keeps_reading_is_left_alone() {
     assert!(ran.watchdogs.is_empty(), "the watchdog outlived the install: {:?}", ran.watchdogs);
 }
 
-/// (b) A go that keeps writing to the log is never stopped, however long
-/// it takes past the bound. It logs with builtins alone, one `sleep` for
-/// the whole 8 s: a child that exits adds its reads to its parent's
-/// `rchar`, so a `sleep` per line would read as progress by itself and
-/// the test wouldn't show that log growth counts.
+/// (b) An install whose log keeps growing is never stopped, however long
+/// go takes past the bound. The log is written beside go, outside its
+/// process tree, and go itself only waits on one `sleep`: so go reads
+/// nothing until it ends (a child's reads join its parent's `rchar` only
+/// when it's reaped), and only log growth can be the progress that keeps
+/// it running (SME-456 review 1).
 #[test]
 fn test_a_go_that_keeps_logging_is_left_alone() {
-    let go = "sleep 8 & s=$!; i=0; while kill -0 $s 2>/dev/null; do i=$((i+1)); \
-              [ $((i % 50000)) -ne 0 ] || echo step $i; done";
-    let ran = run_pod_script("logging", go, "go install x@v1", &[], Duration::from_secs(20));
+    let writer = "(i=0; while [ $i -lt 8 ]; do echo step $i; sleep 1; i=$((i+1)); done) &";
+    // go isn't the install's last command, so the shell doesn't exec it
+    // and the writer isn't its child.
+    let install = format!("{writer} go install x@v1; r=$?; wait; exit $r");
+    let ran = run_pod_script("logging", "sleep 8 & wait", &install, &[], Duration::from_secs(20));
     assert_eq!(ran.rc.as_deref(), Some("0"), "{:?}", ran.log);
     assert!(!ran.log.contains("smelt: go"), "{:?}", ran.log);
     assert!(ran.watchdogs.is_empty(), "the watchdog outlived the install: {:?}", ran.watchdogs);
