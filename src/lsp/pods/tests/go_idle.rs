@@ -220,6 +220,25 @@ fn test_a_go_that_keeps_logging_is_left_alone() {
     assert!(ran.watchdogs.is_empty(), "the watchdog outlived the install: {:?}", ran.watchdogs);
 }
 
+/// Idle time adds up across checks and resets on progress (SME-456
+/// review 1): with a 10 s bound, a go that logs a line every 7 s is quiet
+/// for at most one 5 s check in a row, so it's never stopped, though
+/// over its 56 s it has quiet checks adding up to well past 10 s.
+#[test]
+fn test_idle_resets_on_progress_and_adds_up_across_checks() {
+    let go = "i=0; while [ $i -lt 8 ]; do echo step $i; sleep 7; i=$((i+1)); done";
+    let ran = run(Run {
+        name: "every7",
+        go_body: go,
+        wait: Duration::from_secs(80),
+        go_idle: Duration::from_secs(10),
+        ..Default::default()
+    });
+    assert_eq!(ran.rc.as_deref(), Some("0"), "{:?}", ran.log);
+    assert!(!ran.log.contains("smelt: go"), "{:?}", ran.log);
+    assert!(ran.watchdogs.is_empty(), "the watchdog outlived the install: {:?}", ran.watchdogs);
+}
+
 /// (c) A silent install that isn't go (a compile, a sleep) is never
 /// stopped: the watchdog watches go alone (the Driver's Q4).
 #[test]
