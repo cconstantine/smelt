@@ -62,7 +62,9 @@ fi
 
 # The crates first, with retries, so the tier's cargo tests below run
 # offline and no network retry's `warning:` line reaches their build's
-# warning check (SME-442). Not dx build: it may fetch its own tools.
+# warning check (SME-442). dx build fetches nothing (NO_DOWNLOADS, SME-413),
+# but the crates still come first so a retry's warning can't reach the test
+# build.
 echo "== crates (cargo fetch)"
 scripts/cargo-fetch || exit 1
 

@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# dx's bundles with GitHub and npm unreachable (SME-413), run by hand from
+# the seat's host (not in check.sh: the server leg is a release build).
+#
+#   scripts/test-dx-offline [server|dev|guard]...   # none: all three
+#
+# dx 0.7.9 downloads wasm-bindgen, esbuild and (release only) wasm-opt at
+# bundle time unless NO_DOWNLOADS is set, and its wasm-opt download takes a
+# 504 page for an archive and then runs a file that isn't there (SME-413).
+# The images now carry those tools and set NO_DOWNLOADS=1; this shows a
+# bundle needs none of dx's fetches:
+#
+#   server  `docker build --target build-env` (network open: the image's
+#           own pinned fetches happen there), then docker/server-bundle.sh
+#           in it with the hosts blocked. Passes on rc 0, no `Installing
+#           <tool>` line in dx's log, and a .wasm in /app/image/smelt/public.
+#   dev     `docker build --target dev`, then scripts/ci-web-bundle (CI's
+#           entry point) in it with the hosts blocked: rc 0, no `Installing`.
+#   guard   the server leg's image with a wasm-opt on PATH that fails:
+#           docker/server-bundle.sh must fail with its SME-413 guard error.
+#
+# The block is `--add-host <host>:127.0.0.1` for each of DX_OFFLINE_HOSTS
+# (default below); nothing listens on the container's loopback, so every
+# fetch there is refused. crates.io and deb.debian.org stay reachable: cargo
+# needs the crates. A preflight in the same container checks the block
+# bites before dx runs. Images and volumes are this script's own
+# (smelt-dx-offline-*); target/ and the cargo registry are named volumes,
+# so a second run is warm. Each leg's log is kept under
+# target/test-dx-offline/.
+#
+# A tree without docker/server-bundle.sh (main before SME-413, for the
+# red-first run) gets its server-build stage's old inline command instead.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+default_hosts="github.com api.github.com codeload.github.com objects.githubusercontent.com release-assets.githubusercontent.com raw.githubusercontent.com registry.npmjs.org"
+hosts=${DX_OFFLINE_HOSTS:-$default_hosts}
+tools_re='Installing (wasm-opt|wasm-bindgen|esbuild)'
+guard_msg="dx's wasm-opt failed and dx shipped the unoptimised wasm (SME-413)"
+
+# ── Inside the container ────────────────────────────────────────────────────
+if [ "${1:-}" = "--inside" ]; then
+    leg=$2
+    for h in $hosts; do
+        if curl -sS -m 10 -o /dev/null "https://$h/" 2>/dev/null; then
+            echo "FAIL: preflight: https://$h/ answered, so the block doesn't bite"
+            exit 1
+        fi
+    done
+    echo "preflight: every blocked host refused ($hosts)"
+    work=$3
+    mkdir -p "$work"
+    tar -C /src --exclude=./target --exclude=./.git -cf - . | tar -C "$work" -xf - || exit 1
+    cd "$work" || exit 1
+    # The target volume is mounted beside the work dir, not in it: a mount
+    # point Docker makes in a dir it creates leaves that dir root-owned.
+    ln -s /dx-offline-target target || exit 1
+    log=/tmp/leg.log
+    if [ "$leg" = guard ]; then
+        mkdir -p /tmp/fakebin
+        printf '#!/bin/sh\necho boom >&2\nexit 1\n' >/tmp/fakebin/wasm-opt
+        chmod +x /tmp/fakebin/wasm-opt
+        export PATH=/tmp/fakebin:$PATH
+        echo "wasm-opt is now $(command -v wasm-opt)"
+    fi
+    case "$leg" in
+        server|guard)
+            if [ -f docker/server-bundle.sh ]; then
+                bash docker/server-bundle.sh 2>&1 | tee "$log"
+                rc=${PIPESTATUS[0]}
+            else
+                echo "(no docker/server-bundle.sh: running the old inline dx bundle)"
+                (
+                    set -e
+                    dx bundle --platform web --release
+                    public="$(find target/dx dist -type d -name public 2>/dev/null | head -n1)"
+                    install -d /app/image/smelt
+                    cp -a "$(dirname "$public")/." /app/image/smelt/
+                ) 2>&1 | tee "$log"
+                rc=${PIPESTATUS[0]}
+            fi
+            ;;
+        dev)
+            scripts/ci-web-bundle 2>&1 | tee "$log"
+            rc=${PIPESTATUS[0]}
+            ;;
+    esac
+    echo "== $leg: rc=$rc"
+    if [ "$leg" = guard ]; then
+        if [ "$rc" -eq 0 ]; then
+            echo "FAIL: guard: the bundle passed with a failing wasm-opt"
+            exit 1
+        fi
+        grep -qF "$guard_msg" "$log" || { echo "FAIL: guard: rc=$rc but no guard error"; exit 1; }
+        echo "PASS: guard: the bundle failed with the guard's error"
+        exit 0
+    fi
+    [ "$rc" -eq 0 ] || { echo "FAIL: $leg: dx's bundle failed (rc=$rc)"; exit 1; }
+    if grep -E "$tools_re" "$log"; then
+        echo "FAIL: $leg: dx installed a tool (above)"
+        exit 1
+    fi
+    if [ "$leg" = server ]; then
+        find /app/image/smelt/public -name '*.wasm' | grep -q . \
+            || { echo "FAIL: server: no .wasm in /app/image/smelt/public"; exit 1; }
+    else
+        find target/dx -path '*/web/public/*' -name '*.wasm' | grep -q . \
+            || { echo "FAIL: dev: no .wasm under target/dx/*/web/public"; exit 1; }
+    fi
+    echo "PASS: $leg"
+    exit 0
+fi
+
+# ── On the host ─────────────────────────────────────────────────────────────
+legs=("$@")
+[ "${#legs[@]}" -eq 0 ] && legs=(server dev guard)
+for leg in "${legs[@]}"; do
+    case "$leg" in server|dev|guard) ;; *) echo "usage: $0 [server|dev|guard]..." >&2; exit 2 ;; esac
+done
+
+add_hosts=()
+for h in $hosts; do add_hosts+=(--add-host "$h:127.0.0.1"); done
+mkdir -p target/test-dx-offline
+
+build() { # <target> <tag>
+    echo "== docker build --target $1 -t $2"
+    docker build -f Dockerfile --target "$1" -t "$2" . >"target/test-dx-offline/build-$1.log" 2>&1 \
+        || { tail -40 "target/test-dx-offline/build-$1.log"; echo "FAIL: docker build --target $1" >&2; return 1; }
+}
+
+run_leg() { # <leg> <image> <user> <work dir> <cargo registry dir>
+    local leg=$1 image=$2 user=$3 work=$4 registry=$5 vol=smelt-dx-offline-${1/guard/server}
+    # A fresh named volume comes up root-owned; the dev leg runs as uid 1000.
+    docker run --rm --user 0 -v "$vol-target:/t" -v "$vol-registry:/r" "$image" \
+        chown "$user" /t /r >/dev/null || return 1
+    local log=target/test-dx-offline/$leg.log
+    echo "== $leg (log: $log)"
+    docker run --rm --user "$user" "${add_hosts[@]}" -e DX_OFFLINE_HOSTS="$hosts" \
+        -v "$PWD:/src:ro" -v "$vol-target:/dx-offline-target" -v "$vol-registry:$registry" \
+        "$image" bash /src/scripts/test-dx-offline --inside "$leg" "$work" >"$log" 2>&1
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then
+        tail -40 "$log"
+    else
+        grep -E '^(preflight|== |PASS)' "$log"
+    fi
+    return "$rc"
+}
+
+failed=()
+server_image=smelt-dx-offline-build-env:local
+dev_image=smelt-dx-offline-dev:local
+built_server=""
+for leg in "${legs[@]}"; do
+    case "$leg" in
+        server|guard)
+            if [ -z "$built_server" ]; then
+                build build-env "$server_image" || { failed+=("$leg"); continue; }
+                built_server=1
+            fi
+            run_leg "$leg" "$server_image" 0 /app /usr/local/cargo/registry || failed+=("$leg")
+            ;;
+        dev)
+            build dev "$dev_image" || { failed+=(dev); continue; }
+            run_leg dev "$dev_image" 1000 /home/dev/work /usr/local/cargo/registry || failed+=(dev)
+            ;;
+    esac
+done
+if [ "${#failed[@]}" -ne 0 ]; then
+    echo "test-dx-offline: FAILED: ${failed[*]}" >&2
+    exit 1
+fi
+echo "test-dx-offline: all passed: ${legs[*]}"
