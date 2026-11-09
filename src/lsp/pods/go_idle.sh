@@ -11,8 +11,11 @@
 # the bridge's traffic to every pod kept those growing (SME-456's
 # full-gate red). It ends with the install, or on TERM.
 # $1: the install's pid, $2: its log.
-install=$1 log=$2 limit=__GO_IDLE_S__ nap= gos= tree= last_reads= delta=0
-trap '[ -z "$nap" ] || kill "$nap" 2>/dev/null; exit 0' TERM
+install=$1 log=$2 limit=__GO_IDLE_S__ gos= tree= last_reads= delta=0
+# The nap's `sleep` goes too: `$!` is set the moment it starts (only the
+# nap runs in the background here), so a TERM between its start and the
+# `wait` doesn't leave it running.
+trap 'kill $! 2>/dev/null; exit 0' TERM
 size() { wc -c < "$log" 2>/dev/null || echo 0; }
 # The value of field $1 in file $2 (`PPid:` in a status, `rchar:` in an
 # io), in $value, empty if it can't be read. Builtins only: a check runs
@@ -67,9 +70,8 @@ idle=0 last_size=$(size)
 scan
 reads
 while kill -0 "$install" 2>/dev/null; do
-  sleep 5 & nap=$!
-  wait "$nap"
-  nap=
+  sleep 5 &
+  wait $!
   now_size=$(size)
   scan
   reads
