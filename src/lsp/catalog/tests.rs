@@ -11,11 +11,60 @@ async fn stand_in() -> String {
         .route(
             "/packages/huge/package.yaml",
             axum::routing::get(|| async { "x".repeat(3 * 1024 * 1024) }),
-        );
+        )
+        .route("/packages/flaky/package.yaml", busy_once(include_str!("../fixtures/mason-pyright.yaml")))
+        .route("/flaky-languages.toml", busy_once(HELIX));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move { axum::serve(listener, router).await.expect("serve") });
     format!("http://{addr}")
+}
+
+/// Answers 503 to its first GET and `body` after that, as
+/// raw.githubusercontent.com does in a blip (SME-470).
+fn busy_once(body: &'static str) -> axum::routing::MethodRouter {
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    axum::routing::get(move || {
+        let first = hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+        async move {
+            if first {
+                (axum::http::StatusCode::SERVICE_UNAVAILABLE, "busy")
+            } else {
+                (axum::http::StatusCode::OK, body)
+            }
+        }
+    })
+}
+
+/// `FETCH` with millisecond pauses, so a test that meets a failure doesn't
+/// sleep for seconds.
+const QUICK: Policy = Policy { backoff: &[Duration::from_millis(10)], ..FETCH };
+
+#[tokio::test]
+async fn test_a_lookup_rides_out_one_503_from_masons_registry() {
+    let base = stand_in().await;
+    let found = lookup_with("flaky", &base, &format!("{base}/languages.toml"), &QUICK).await;
+    assert_eq!(found.map(|s| s.config.name), Ok("pyright".to_string()));
+}
+
+#[tokio::test]
+async fn test_a_lookup_rides_out_one_503_from_helixs_languages_toml() {
+    let base = stand_in().await;
+    let found = lookup_with("pyright", &base, &format!("{base}/flaky-languages.toml"), &QUICK).await;
+    assert_eq!(found.map(|s| s.config.name), Ok("pyright".to_string()));
+}
+
+/// A registry nobody answers at is named once, in reqwest's own text, as
+/// before SME-470.
+#[tokio::test]
+async fn test_an_unreachable_registry_is_named_once() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    drop(listener);
+    let e = lookup_with("pyright", &base, &format!("{base}/languages.toml"), &QUICK).await.expect_err("refused");
+    let yaml_url = format!("{base}/packages/pyright/package.yaml");
+    assert!(e.starts_with("Couldn't reach mason's registry: error sending request"), "{e}");
+    assert_eq!(e.matches(&yaml_url).count(), 1, "{e}");
 }
 
 #[test]
