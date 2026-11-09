@@ -3,6 +3,7 @@
 # the seat's host (not in check.sh: the server leg is a release build).
 #
 #   scripts/test-dx-offline [server|dev|guard]...   # none: all three
+#   scripts/test-dx-offline clean   # remove its images and volumes
 #
 # dx 0.7.9 downloads wasm-bindgen, esbuild and (release only) wasm-opt at
 # bundle time unless NO_DOWNLOADS is set, and its wasm-opt download takes a
@@ -139,10 +140,24 @@ http.server.HTTPServer(("127.0.0.1", 18080), H).serve_forever()' &
 fi
 
 # ── On the host ─────────────────────────────────────────────────────────────
+images="smelt-dx-offline-bundle-env:local smelt-dx-offline-build-env:local smelt-dx-offline-dev:local"
+volumes="smelt-dx-offline-server-target smelt-dx-offline-server-registry smelt-dx-offline-dev-target smelt-dx-offline-dev-registry"
+if [ "${1:-}" = clean ] && [ "$#" -eq 1 ]; then
+    # This script's own images and volumes, and nothing else: the server
+    # target is a release target/ of several GB (SME-413 review L3).
+    rc=0
+    for i in $images; do
+        if docker image inspect "$i" >/dev/null 2>&1; then docker image rm "$i" >/dev/null && echo "removed image $i" || rc=1; fi
+    done
+    for v in $volumes; do
+        if docker volume inspect "$v" >/dev/null 2>&1; then docker volume rm "$v" >/dev/null && echo "removed volume $v" || rc=1; fi
+    done
+    exit "$rc"
+fi
 legs=("$@")
 [ "${#legs[@]}" -eq 0 ] && legs=(server dev guard)
 for leg in "${legs[@]}"; do
-    case "$leg" in server|dev|guard) ;; *) echo "usage: $0 [server|dev|guard]..." >&2; exit 2 ;; esac
+    case "$leg" in server|dev|guard) ;; *) echo "usage: $0 [server|dev|guard]... | $0 clean" >&2; exit 2 ;; esac
 done
 
 add_hosts=()
