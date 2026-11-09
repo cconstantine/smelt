@@ -31,19 +31,28 @@ pub(crate) enum Fetched {
     NotFound,
 }
 
+/// Why a fetch failed, so each caller keeps its own wording.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Failure {
+    /// The last try got no answer: reqwest's own text, which names the URL.
+    Unreachable(String),
+    /// Anything else, its text naming the URL.
+    Failed(String),
+}
+
 /// The text at `url`, fetched as `policy` says.
-pub(crate) async fn get_text(url: &str, policy: &Policy) -> Result<Fetched, String> {
+pub(crate) async fn get_text(url: &str, policy: &Policy) -> Result<Fetched, Failure> {
     let client = reqwest::Client::builder()
         .timeout(policy.per_try)
         .build()
-        .map_err(|e| format!("couldn't make an HTTP client: {e}"))?;
+        .map_err(|e| Failure::Failed(format!("couldn't make an HTTP client: {e}")))?;
     let mut tries = 0;
     match tokio::time::timeout(policy.deadline, tries_until_done(&client, url, policy, &mut tries)).await {
         Ok(fetched) => fetched,
-        Err(_) => Err(format!(
+        Err(_) => Err(Failure::Failed(format!(
             "{url} didn't answer within {}s ({tries} tries)",
             policy.deadline.as_secs_f64()
-        )),
+        ))),
     }
 }
 
@@ -54,20 +63,20 @@ async fn tries_until_done(
     url: &str,
     policy: &Policy,
     tries: &mut u32,
-) -> Result<Fetched, String> {
+) -> Result<Fetched, Failure> {
     loop {
         *tries += 1;
         let last = *tries >= policy.attempts;
         match client.get(url).send().await {
             Err(e) if !last && (e.is_connect() || e.is_timeout() || e.is_request()) => {}
-            Err(e) => return Err(format!("couldn't reach {url}: {e}")),
+            Err(e) => return Err(Failure::Unreachable(e.to_string())),
             Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => return Ok(Fetched::NotFound),
             // Once a body has begun, a failure is final.
             Ok(response) if response.status().is_success() => {
-                return read_body(response, url, policy.max_bytes).await.map(Fetched::Body);
+                return read_body(response, url, policy.max_bytes).await.map(Fetched::Body).map_err(Failure::Failed);
             }
             Ok(response) if !last && transient(response.status()) => {}
-            Ok(response) => return Err(format!("{url} answered {}", response.status())),
+            Ok(response) => return Err(Failure::Failed(format!("{url} answered {}", response.status()))),
         }
         let pause = policy.backoff.get(*tries as usize - 1).or(policy.backoff.last());
         tokio::time::sleep(pause.copied().unwrap_or_default()).await;
@@ -160,7 +169,7 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 2, "429 then 200");
 
         let (url, hits) = scripted(&[400, 200]).await;
-        assert_eq!(get_text(&url, &QUICK).await, Err(format!("{url} answered 400 Bad Request")));
+        assert_eq!(get_text(&url, &QUICK).await, Err(Failure::Failed(format!("{url} answered 400 Bad Request"))));
         assert_eq!(hits.load(Ordering::SeqCst), 1, "a 400 isn't asked again");
 
         let (url, hits) = scripted(&[404, 200]).await;
@@ -171,7 +180,10 @@ mod tests {
     #[tokio::test]
     async fn test_a_server_that_always_fails_is_tried_attempts_times() {
         let (url, hits) = scripted(&[500]).await;
-        assert_eq!(get_text(&url, &QUICK).await, Err(format!("{url} answered 500 Internal Server Error")));
+        assert_eq!(
+            get_text(&url, &QUICK).await,
+            Err(Failure::Failed(format!("{url} answered 500 Internal Server Error")))
+        );
         assert_eq!(hits.load(Ordering::SeqCst), 3);
     }
 
@@ -188,7 +200,7 @@ mod tests {
         let fetched = tokio::time::timeout(Duration::from_secs(5), get_text(&url, &policy)).await.expect("no hang");
         let elapsed = started.elapsed();
         let hits = hits.load(Ordering::SeqCst);
-        let e = fetched.expect_err("stalled");
+        let Err(Failure::Failed(e)) = fetched else { panic!("{fetched:?}") };
         assert!(e.starts_with(&format!("{url} didn't answer within 0.5s (")), "{e}");
         assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
         assert!((1..=3).contains(&hits), "{hits}");

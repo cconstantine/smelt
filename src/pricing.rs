@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::anthropic::TokenUsage;
-use crate::http_fetch::{Fetched, Policy, get_text};
+use crate::http_fetch::{Failure, Fetched, Policy, get_text};
 
 /// One set of prices, in dollars per million tokens. A missing cache
 /// price is charged at the input price.
@@ -254,9 +254,11 @@ impl CatalogStore {
     }
 
     async fn refresh_unspanned(&self, pool: &sqlx::PgPool, url: &str, policy: &Policy) -> Result<(), String> {
-        let text = match get_text(url, policy).await? {
-            Fetched::Body(text) => text,
-            Fetched::NotFound => return Err(format!("{url} answered 404 Not Found")),
+        let text = match get_text(url, policy).await {
+            Ok(Fetched::Body(text)) => text,
+            Ok(Fetched::NotFound) => return Err(format!("{url} answered 404 Not Found")),
+            Err(Failure::Unreachable(e)) => return Err(format!("couldn't reach {url}: {e}")),
+            Err(Failure::Failed(e)) => return Err(e),
         };
         let providers = parse(&text)?;
         if providers.values().all(|p| p.models.is_empty()) {
@@ -554,6 +556,14 @@ mod tests {
             assert!(store.refresh_with(&pool, &url, &QUICK).await.is_err(), "{body}");
             assert_eq!(store.current(), Some(good.clone()), "memory unchanged after {body}");
         }
+
+        // Nobody answering: named once by us, then in reqwest's own text.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!("http://{}/api.json", closed.local_addr().expect("addr"));
+        drop(closed);
+        let e = store.refresh_with(&pool, &url, &QUICK).await.expect_err("refused");
+        assert!(e.starts_with(&format!("couldn't reach {url}: error sending request")), "{e}");
+        assert_eq!(store.current(), Some(good.clone()), "memory unchanged after no answer");
         let restarted = CatalogStore::new();
         restarted.load_saved(&pool).await.expect("load");
         assert_eq!(restarted.current().map(|c| c.fetched_at), Some(good.fetched_at), "saved copy unchanged");

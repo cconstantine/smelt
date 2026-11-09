@@ -6,7 +6,7 @@
 use std::borrow::Cow;
 use std::time::Duration;
 
-use crate::http_fetch::{Fetched, Policy, get_text};
+use crate::http_fetch::{Failure, Fetched, Policy, get_text};
 use crate::models::LanguageServerConfig;
 
 /// Where a server pod's installs go: its HOME (SME-35's spike).
@@ -128,6 +128,12 @@ fn sources(registry: Option<&str>, helix: Option<&str>) -> (String, String) {
 /// Looks `package` up in mason's registry at `registry` and suggests a
 /// config, run as Helix's file at `helix_url` says.
 pub async fn lookup(package: &str, registry: &str, helix_url: &str) -> Result<Suggestion, String> {
+    lookup_with(package, registry, helix_url, &FETCH).await
+}
+
+/// `lookup`, fetching as `policy` says: the tests' policy pauses for
+/// milliseconds, not `FETCH`'s seconds.
+async fn lookup_with(package: &str, registry: &str, helix_url: &str, policy: &Policy) -> Result<Suggestion, String> {
     let package = package.trim();
     let name_ok = !package.is_empty()
         && package.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
@@ -136,16 +142,18 @@ pub async fn lookup(package: &str, registry: &str, helix_url: &str) -> Result<Su
         return Err(format!("{package:?} isn't a mason package name (e.g. rust-analyzer, pyright)."));
     }
     let yaml_url = format!("{}/packages/{package}/package.yaml", registry.trim_end_matches('/'));
-    let (yaml, helix) = tokio::join!(get_text(&yaml_url, &FETCH), get_text(helix_url, &FETCH));
+    let (yaml, helix) = tokio::join!(get_text(&yaml_url, policy), get_text(helix_url, policy));
     let yaml = match yaml {
         Ok(Fetched::Body(text)) => text,
         Ok(Fetched::NotFound) => return Err(format!("mason's registry has no package named {package}.")),
-        Err(e) => return Err(format!("Couldn't reach mason's registry: {e}")),
+        Err(Failure::Unreachable(e) | Failure::Failed(e)) => return Err(format!("Couldn't reach mason's registry: {e}")),
     };
     let helix = match helix {
         Ok(Fetched::Body(text)) => text,
         Ok(Fetched::NotFound) => return Err("Helix's languages.toml wasn't found.".to_string()),
-        Err(e) => return Err(format!("Couldn't reach Helix's languages.toml: {e}")),
+        Err(Failure::Unreachable(e) | Failure::Failed(e)) => {
+            return Err(format!("Couldn't reach Helix's languages.toml: {e}"));
+        }
     };
     suggest(&yaml, &helix)
 }
