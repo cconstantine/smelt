@@ -11,17 +11,18 @@
 //! comment says: the shell runs a body cut off partway as readily as a
 //! whole one.
 
-/// The files the build and CI run: Dockerfiles, the workflows and their
-/// actions, and the scripts, except the scripts' own tests and test helpers
+/// The files the build and CI run: Dockerfiles and the images' shell
+/// scripts, the workflows and their actions, and the scripts, `scripts/lib/`
+/// included (review round 1, N1), except the scripts' own test suites
 /// (their fetches are of a stub server or a probe).
 pub(crate) fn in_scope(path: &str) -> bool {
     if EXEMPT.contains(&path) {
         return false;
     }
     path == "Dockerfile"
-        || (path.starts_with("docker/") && path.ends_with("/Dockerfile"))
+        || (path.starts_with("docker/") && (path.ends_with("/Dockerfile") || path.ends_with(".sh")))
         || (path.starts_with(".github/") && (path.ends_with(".yml") || path.ends_with(".yaml")))
-        || (path.starts_with("scripts/") && !path.starts_with("scripts/test-") && !path.starts_with("scripts/lib/"))
+        || (path.starts_with("scripts/") && !path.starts_with("scripts/test-"))
 }
 
 /// The guards themselves.
@@ -187,7 +188,12 @@ mod tests {
         for p in ["Dockerfile", "docker/sandbox/Dockerfile", ".github/workflows/ci.yml", ".github/actions/start-stack/action.yml", "scripts/browser-check/setup.sh", "scripts/check-server"] {
             assert!(in_scope(p), "{p} is in scope");
         }
-        for p in ["scripts/fetch-pinned", "scripts/ci-install-compose", "scripts/test-fetch-pinned", "scripts/lib/flaky-http-server.py", "src/lsp/pods/script.rs", "docs/setup.md"] {
+        // Review round 1, N1: check-server's sourced libraries, their test
+        // helpers, and the shell scripts the images run.
+        for p in ["scripts/lib/check-server-url.sh", "scripts/lib/dotenv-value", "scripts/lib/test-check-scripts.sh", "scripts/lib/flaky-http-server.py", "docker/server-bundle.sh", "docker/sandbox/start-dockerd.sh"] {
+            assert!(in_scope(p), "{p} is in scope");
+        }
+        for p in ["scripts/fetch-pinned", "scripts/ci-install-compose", "scripts/test-fetch-pinned", "src/lsp/pods/script.rs", "docs/setup.md", "docker/sandbox/README.md"] {
             assert!(!in_scope(p), "{p} is out of scope");
         }
     }
