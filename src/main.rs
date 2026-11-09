@@ -29,6 +29,8 @@ mod id_alloc;
 mod lsp;
 mod markdown;
 #[cfg(feature = "server")]
+mod http_fetch;
+#[cfg(feature = "server")]
 mod http_request;
 #[cfg(feature = "server")]
 mod mcp;

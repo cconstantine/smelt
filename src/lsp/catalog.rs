@@ -4,7 +4,9 @@
 //! fetched text; the page shows the result for the user to check and edit.
 
 use std::borrow::Cow;
+use std::time::Duration;
 
+use crate::http_fetch::{Failure, Fetched, Policy, get_text};
 use crate::models::LanguageServerConfig;
 
 /// Where a server pod's installs go: its HOME (SME-35's spike).
@@ -126,6 +128,12 @@ fn sources(registry: Option<&str>, helix: Option<&str>) -> (String, String) {
 /// Looks `package` up in mason's registry at `registry` and suggests a
 /// config, run as Helix's file at `helix_url` says.
 pub async fn lookup(package: &str, registry: &str, helix_url: &str) -> Result<Suggestion, String> {
+    lookup_with(package, registry, helix_url, &FETCH).await
+}
+
+/// `lookup`, fetching as `policy` says: the tests' policy pauses for
+/// milliseconds, not `FETCH`'s seconds.
+async fn lookup_with(package: &str, registry: &str, helix_url: &str, policy: &Policy) -> Result<Suggestion, String> {
     let package = package.trim();
     let name_ok = !package.is_empty()
         && package.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
@@ -133,48 +141,34 @@ pub async fn lookup(package: &str, registry: &str, helix_url: &str) -> Result<Su
     if !name_ok {
         return Err(format!("{package:?} isn't a mason package name (e.g. rust-analyzer, pyright)."));
     }
-    let client = reqwest::Client::builder()
-        .timeout(FETCH_TIMEOUT)
-        .build()
-        .map_err(|e| format!("couldn't make an HTTP client: {e}"))?;
     let yaml_url = format!("{}/packages/{package}/package.yaml", registry.trim_end_matches('/'));
-    let (yaml, helix) = tokio::join!(fetch(&client, &yaml_url), fetch(&client, helix_url));
+    let (yaml, helix) = tokio::join!(get_text(&yaml_url, policy), get_text(helix_url, policy));
     let yaml = match yaml {
-        Ok(Some(text)) => text,
-        Ok(None) => return Err(format!("mason's registry has no package named {package}.")),
-        Err(e) => return Err(format!("Couldn't reach mason's registry: {e}")),
+        Ok(Fetched::Body(text)) => text,
+        Ok(Fetched::NotFound) => return Err(format!("mason's registry has no package named {package}.")),
+        Err(Failure::Unreachable(e) | Failure::Failed(e)) => return Err(format!("Couldn't reach mason's registry: {e}")),
     };
     let helix = match helix {
-        Ok(Some(text)) => text,
-        Ok(None) => return Err("Helix's languages.toml wasn't found.".to_string()),
-        Err(e) => return Err(format!("Couldn't reach Helix's languages.toml: {e}")),
+        Ok(Fetched::Body(text)) => text,
+        Ok(Fetched::NotFound) => return Err("Helix's languages.toml wasn't found.".to_string()),
+        Err(Failure::Unreachable(e) | Failure::Failed(e)) => {
+            return Err(format!("Couldn't reach Helix's languages.toml: {e}"));
+        }
     };
     suggest(&yaml, &helix)
 }
 
-/// Each catalog fetch's time limit and size cap (Helix's file is about
-/// 250 KB).
-const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-const FETCH_MAX_BYTES: usize = 2 * 1024 * 1024;
-
-/// The body at `url`, `None` for a 404.
-async fn fetch(client: &reqwest::Client, url: &str) -> Result<Option<String>, String> {
-    let mut response = client.get(url).send().await.map_err(|e| e.to_string())?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    if !response.status().is_success() {
-        return Err(format!("{url} answered {}", response.status()));
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
-        body.extend_from_slice(&chunk);
-        if body.len() > FETCH_MAX_BYTES {
-            return Err(format!("{url} is too big (over {} MB)", FETCH_MAX_BYTES / 1024 / 1024));
-        }
-    }
-    String::from_utf8(body).map(Some).map_err(|_| format!("{url} isn't text"))
-}
+/// How each catalog fetch tries (SME-470): a blip from
+/// raw.githubusercontent.com is asked again, and the two fetches, run
+/// together, keep the user waiting at most the deadline. Helix's file is
+/// about 250 KB.
+const FETCH: Policy = Policy {
+    attempts: 3,
+    backoff: &[Duration::from_secs(1), Duration::from_secs(2)],
+    per_try: Duration::from_secs(15),
+    deadline: Duration::from_secs(30),
+    max_bytes: 2 * 1024 * 1024,
+};
 
 /// Settings a server needs to share `/workspace` with the sandbox, beyond
 /// what Helix gives. rust-analyzer's `cargo check` would otherwise use the
