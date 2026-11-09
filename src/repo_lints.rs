@@ -148,12 +148,18 @@ mod tests {
     fn test_dockerfile_pins_cargo_locks_wasm_bindgen() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let lock = std::fs::read_to_string(root.join("Cargo.lock")).expect("read Cargo.lock");
-        let locked = lock
+        let locked: Vec<&str> = lock
             .split("[[package]]")
-            .find(|p| p.lines().any(|l| l.trim() == r#"name = "wasm-bindgen""#))
-            .and_then(|p| p.lines().find_map(|l| l.trim().strip_prefix("version = ")))
-            .map(|v| v.trim_matches('"').to_string())
-            .expect("Cargo.lock locks wasm-bindgen");
+            .filter(|p| p.lines().any(|l| l.trim() == r#"name = "wasm-bindgen""#))
+            .filter_map(|p| p.lines().find_map(|l| l.trim().strip_prefix("version = ")))
+            .map(|v| v.trim_matches('"'))
+            .collect();
+        assert_eq!(
+            locked.len(),
+            1,
+            "Cargo.lock should lock exactly one wasm-bindgen, for the Dockerfile's one pin: {locked:?}"
+        );
+        let locked = locked[0];
         let dockerfile = std::fs::read_to_string(root.join("Dockerfile")).expect("read the Dockerfile");
         let pins: Vec<&str> =
             dockerfile.lines().filter_map(|l| l.trim().strip_prefix("ARG WASM_BINDGEN_VERSION=")).collect();
