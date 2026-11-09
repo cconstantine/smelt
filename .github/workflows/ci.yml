@@ -197,32 +197,23 @@ jobs:
 
       - name: Dump sandbox pod diagnostics on failure
         if: failure()
-        # kubectl runs *inside* the smelt service (docker compose run),
-        # not on the bare runner: the kubeconfig's server address is the
-        # compose-network-internal hostname `k3s`, which only resolves
-        # from a container on that network. Downloading the binary onto
-        # the runner and bind-mounting it in avoids needing to add it to
-        # the dev image just for this diagnostic step. The `park` service
-        # account's RBAC (k8s/smelt-park-rbac.yaml) has no `nodes` access,
-        # so the node describe is expected to 403 — kept anyway in case
-        # that ever changes, with `|| true` so it can't fail this step.
+        # The k3s container's own kubectl, with k3s's admin kubeconfig: no
+        # download (SME-470; it was a curl of dl.k8s.io with no retry, bound
+        # or checksum), the cluster's own version, and node access too.
+        # `|| true` so a diagnostic can't fail this step.
         run: |
-          curl -fsSLo kubectl-diag "https://dl.k8s.io/release/v1.34.0/bin/linux/amd64/kubectl"
-          chmod +x kubectl-diag
           # smelt-park-test, not smelt-park: this step follows the test run,
           # which is built under cfg(test), where sandbox::NAMESPACE is
           # smelt-park-test (src/sandbox/mod.rs) — the dev namespace holds
-          # nothing these tests made (SME-186, B43). The `park` service
-          # account can list pods and events in it (k8s/smelt-park-rbac.yaml).
+          # nothing these tests made (SME-186, B43).
           echo "--- pods (smelt-park-test) ---"
-          docker compose run --rm smelt ./kubectl-diag get pods -n smelt-park-test -o wide || true
+          docker compose exec -T k3s kubectl get pods -n smelt-park-test -o wide || true
           echo "--- pod descriptions ---"
-          docker compose run --rm smelt ./kubectl-diag describe pods -n smelt-park-test || true
+          docker compose exec -T k3s kubectl describe pods -n smelt-park-test || true
           echo "--- events, most recent first ---"
-          docker compose run --rm smelt ./kubectl-diag get events -n smelt-park-test --sort-by=.lastTimestamp || true
-          echo "--- node describe (capacity/allocatable/conditions; may 403, RBAC has no nodes access) ---"
-          docker compose run --rm smelt ./kubectl-diag describe nodes || true
-          rm -f kubectl-diag
+          docker compose exec -T k3s kubectl get events -n smelt-park-test --sort-by=.lastTimestamp || true
+          echo "--- node describe (capacity/allocatable/conditions) ---"
+          docker compose exec -T k3s kubectl describe nodes || true
 
       - name: cargo check (wasm target)
         run: |
@@ -305,18 +296,16 @@ jobs:
 
       - name: Dump sandbox pod diagnostics on failure (browser tests)
         if: failure()
+        # The k3s container's own kubectl, as in the server job (SME-470).
         run: |
-          curl -fsSLo kubectl-diag "https://dl.k8s.io/release/v1.34.0/bin/linux/amd64/kubectl"
-          chmod +x kubectl-diag
           # The browser tests serve the app in-process (src/browser_tests/harness.rs)
           # under cfg(test), so their pods are in smelt-park-test (SME-186, B43).
           echo "--- pods (smelt-park-test) ---"
-          docker compose run --rm smelt ./kubectl-diag get pods -n smelt-park-test -o wide || true
+          docker compose exec -T k3s kubectl get pods -n smelt-park-test -o wide || true
           echo "--- pod descriptions ---"
-          docker compose run --rm smelt ./kubectl-diag describe pods -n smelt-park-test || true
+          docker compose exec -T k3s kubectl describe pods -n smelt-park-test || true
           echo "--- events, most recent first ---"
-          docker compose run --rm smelt ./kubectl-diag get events -n smelt-park-test --sort-by=.lastTimestamp || true
-          rm -f kubectl-diag
+          docker compose exec -T k3s kubectl get events -n smelt-park-test --sort-by=.lastTimestamp || true
 
       # The `browser-test` feature's code is compiled only in this job's test
       # step (SME-361). After the diagnostics: those are for a test failure.

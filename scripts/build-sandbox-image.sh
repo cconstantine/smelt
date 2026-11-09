@@ -72,10 +72,13 @@ cargo run --bin sandbox_image_import --features server -- "$TAR_PATH"
 # The pod's Docker sidecar (SME-33) runs dockerd from docker:dind. Delivered
 # the same way, so pods start without a pull and CI doesn't depend on
 # Docker Hub at pod-start time. Keep the tag in step with
-# src/sandbox/spec.rs's default_docker_image.
+# src/sandbox/spec.rs's default_docker_image. Pulled every time, so the
+# floating tag gets its newest build, through scripts/pull-image: a
+# registry blip is retried and a stalled pull is bounded (SME-470). A tag,
+# not a digest, because the pod sidecar's default names the same tag.
 DOCKER_IMAGE=docker:29-dind
 DOCKER_TAR_PATH=target/sandbox-image/docker-dind.tar
-docker pull -q "$DOCKER_IMAGE"
+scripts/pull-image "$DOCKER_IMAGE"
 docker save -o "$DOCKER_TAR_PATH" "$DOCKER_IMAGE"
 cargo run --bin sandbox_image_import --features server -- "$DOCKER_TAR_PATH"
 

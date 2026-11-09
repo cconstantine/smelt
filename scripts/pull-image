@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Pulls one image, retrying a registry blip and bounding a stall (SME-470).
+#
+#   pull-image REF               # always pulls (a floating tag gets its newest)
+#   pull-image --if-missing REF  # pulls only when the daemon lacks REF
+#
+# Up to 3 attempts of `docker pull -q REF`, each under `timeout
+# PULL_TIMEOUT` (300 s), with PULL_PAUSES ("15 45") between them. One line
+# per failed attempt (`pull-image: REF attempt k of 3 failed: REASON`; a
+# timeout says `docker pull gave up after Ns`), then `pull-image: REF pulled
+# on attempt k of 3`, or `pull-image: REF: 3 attempts, last: REASON` and
+# exit 1. An error no retry can fix (`manifest unknown`, `not found`,
+# `denied`, `unauthorized`) fails at once instead, as fetch-pinned fails a
+# 4xx: `pull-image: REF: not retried: REASON`. A pull is content-addressed (the registry protocol checks every
+# layer's digest), so there is no checksum of ours to add.
+# scripts/test-pull-image covers it.
+set -euo pipefail
+
+if_missing=no
+if [ "${1:-}" = --if-missing ]; then
+    if_missing=yes
+    shift
+fi
+if [ $# -ne 1 ]; then
+    echo "usage: pull-image [--if-missing] REF" >&2
+    exit 2
+fi
+ref=$1
+attempts=3
+timeout_s=${PULL_TIMEOUT:-300}
+read -r -a pauses <<<"${PULL_PAUSES:-15 45}"
+say() { echo "pull-image: $*" >&2; }
+
+if [ "$if_missing" = yes ] && docker image inspect "$ref" >/dev/null 2>&1; then
+    say "$ref already present"
+    exit 0
+fi
+
+last=
+for ((k = 1; k <= attempts; k++)); do
+    if err=$(timeout "$timeout_s" docker pull -q "$ref" 2>&1); then
+        say "$ref pulled on attempt $k of $attempts"
+        exit 0
+    else
+        rc=$?
+    fi
+    # Killed by its timeout: the output's last line is only progress.
+    if [ "$rc" -eq 124 ]; then
+        last="docker pull gave up after ${timeout_s}s"
+    else
+        err=${err%$'\n'}
+        last=${err##*$'\n'}
+        last=${last:-docker pull failed with exit $rc and no message}
+    fi
+    # A wrong or retired ref, or no access: no retry can fix it.
+    case $last in
+    *"manifest unknown"* | *"not found"* | *denied* | *unauthorized*)
+        say "$ref: not retried: $last"
+        exit 1 ;;
+    esac
+    say "$ref attempt $k of $attempts failed: $last"
+    if [ "$k" -lt "$attempts" ]; then
+        sleep "${pauses[k - 1]:-0}"
+    fi
+done
+say "$ref: $attempts attempts, last: $last"
+exit 1

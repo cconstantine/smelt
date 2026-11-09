@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# Checks scripts/fetch-pinned (SME-470) against a stub server
+# (scripts/lib/flaky-http-server.py), with no network. Each case gets its own
+# directory and runs under `timeout 60`; it prints `ok <case>` or
+# `FAIL <case>: <what it wanted>` and what it got. A case whose server saw no
+# GET says `harness didn't bite` instead of passing. Needs no cluster or
+# database; check.sh runs it with the other script tests.
+#
+#   scripts/test-fetch-pinned [case ...]   # every case by default
+set -uo pipefail
+cd "$(dirname "$0")/.."
+repo=$PWD
+fetcher=${FETCH_PINNED:-$repo/scripts/fetch-pinned}
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/test-fetch-pinned.XXXXXX")
+server_pid=
+cleanup() {
+    [ -n "$server_pid" ] && kill "$server_pid" 2>/dev/null
+    rm -rf "$work"
+}
+trap cleanup EXIT
+
+passes=0
+failures=0
+
+# The fixture: 64 KiB, so a cut-off copy (half of it) is a real partial body.
+fixture=$work/fixture.bin
+head -c 65536 /dev/urandom >"$fixture"
+fixture_sha=$(sha256sum "$fixture" | cut -d' ' -f1)
+bad_sha=$(printf '#!/bin/sh\necho %s\n' "'not the pinned compose'" | sha256sum | cut -d' ' -f1)
+old=$work/old-bytes
+printf 'an earlier good copy\n' >"$old"
+
+# Starts the stub server in mode "$@" for the current case; sets $url.
+start_server() {
+    rm -f "$dir/port"
+    python3 -I "$repo/scripts/lib/flaky-http-server.py" --ready "$dir/port" \
+        --log "$dir/server.log" --file "$fixture" --lifetime 120 "$@" &
+    server_pid=$!
+    for _ in $(seq 100); do
+        [ -s "$dir/port" ] && break
+        kill -0 "$server_pid" 2>/dev/null || break
+        sleep 0.05
+    done
+    [ -s "$dir/port" ] && kill -0 "$server_pid" 2>/dev/null ||
+        { echo "the stub server didn't start" >&2; exit 2; }
+    url="http://127.0.0.1:$(cat "$dir/port")/v1/fixture.bin"
+}
+
+stop_server() {
+    [ -n "$server_pid" ] && kill "$server_pid" 2>/dev/null
+    wait "$server_pid" 2>/dev/null
+    server_pid=
+}
+
+new_case() {
+    case_name=$1
+    dir=$work/$1
+    mkdir -p "$dir/out"
+    : >"$dir/server.log"
+    wants=()
+    out_file=$dir/out/fixture.bin
+    export FETCH_PAUSES='0 0 0'
+    unset FETCH_ATTEMPTS FETCH_CONNECT_TIMEOUT FETCH_SPEED_TIME FETCH_MAX_TIME
+}
+
+# One run: fetch-pinned "$url" "$out_file" "$1". Sets $out, $rc and $secs.
+run_fetch() {
+    local start=$SECONDS
+    out=$(timeout 60 "$fetcher" "$url" "$out_file" "$1" 2>&1)
+    rc=$?
+    secs=$((SECONDS - start))
+}
+
+gets() { grep -c '^#' "$dir/server.log"; }
+lines() { grep -c -- "$1" <<<"$out"; }
+want() { wants+=("$1"); }
+has() { grep -qF -- "$1" <<<"$out" || want "a line with '$1'"; }
+same_as() { cmp -s "$1" "$2" || want "$3"; }
+no_temp() {
+    local left
+    left=$(find "$dir/out" -name '*.tmp.*' | head -n 3)
+    [ -z "$left" ] || want "no temp file left (found: ${left//$'\n'/ })"
+}
+
+verdict() {
+    stop_server
+    if [ "$(gets)" -eq 0 ]; then
+        echo "FAIL $case_name: harness didn't bite (no GET reached the stub server)"
+        failures=$((failures + 1))
+    elif [ ${#wants[@]} -eq 0 ]; then
+        echo "ok $case_name"
+        passes=$((passes + 1))
+        return
+    else
+        local w
+        w=$(printf '%s; ' "${wants[@]}")
+        echo "FAIL $case_name: ${w%; }"
+        failures=$((failures + 1))
+    fi
+    echo "    actual: exit $rc, $(gets) GETs, ${secs}s"
+    sed 's/^/    | /' <<<"$out"
+    sed 's/^/    server: /' "$dir/server.log"
+}
+
+case_ok() {
+    start_server ok
+    run_fetch "$fixture_sha"
+    [ "$rc" -eq 0 ] || want "exit 0"
+    has "fetch-pinned: $url -> $out_file (sha256 ok, attempt 1 of 4)"
+    [ "$(gets)" -eq 1 ] || want "1 GET"
+    same_as "$out_file" "$fixture" "OUT is the fixture"
+    no_temp
+    verdict
+}
+
+# T1: a 5xx, then the file.
+case_fail_first() {
+    start_server fail-first 1
+    run_fetch "$fixture_sha"
+    [ "$rc" -eq 0 ] || want "exit 0"
+    has "fetch-pinned: $url attempt 1 of 4 failed: HTTP 504"
+    has "fetch-pinned: $url -> $out_file (sha256 ok, attempt 2 of 4)"
+    [ "$(gets)" -eq 2 ] || want "2 GETs"
+    same_as "$out_file" "$fixture" "OUT is the fixture"
+    no_temp
+    verdict
+}
+
+# Review round 1, N3: a 429 (rate limited) and a 408 (request timeout) are
+# blips too, retried like a 5xx, though every other 4xx isn't.
+retried_once() {
+    start_server --status "$1" fail-first 1
+    run_fetch "$fixture_sha"
+    [ "$rc" -eq 0 ] || want "exit 0"
+    has "fetch-pinned: $url attempt 1 of 4 failed: HTTP $1"
+    has "fetch-pinned: $url -> $out_file (sha256 ok, attempt 2 of 4)"
+    [ "$(gets)" -eq 2 ] || want "2 GETs"
+    same_as "$out_file" "$fixture" "OUT is the fixture"
+    no_temp
+    verdict
+}
+case_429_first() { retried_once 429; }
+case_408_first() { retried_once 408; }
+
+# T2: a body cut off partway, then the whole file: OUT is byte-exact.
+case_cut_first() {
+    start_server cut-first 1
+    run_fetch "$fixture_sha"
+    [ "$rc" -eq 0 ] || want "exit 0"
+    has "fetch-pinned: $url attempt 1 of 4 failed: curl: (18)"
+    has "fetch-pinned: $url -> $out_file (sha256 ok, attempt 2 of 4)"
+    [ "$(gets)" -eq 2 ] || want "2 GETs"
+    same_as "$out_file" "$fixture" "OUT is byte-exact"
+    no_temp
+    verdict
+}
+
+# A cut-off body with no whole copy after it never reaches OUT: an earlier
+# good copy stays as it was.
+case_cut_always() {
+    start_server cut-first 99
+    cp "$old" "$out_file"
+    export FETCH_ATTEMPTS=2
+    run_fetch "$fixture_sha"
+    [ "$rc" -eq 1 ] || want "exit 1"
+    [ "$(lines 'attempt [12] of 2 failed: curl: (18)')" -eq 2 ] || want "2 attempts failing with curl (18)"
+    has "fetch-pinned: gave up on $url after 2 attempts (last: curl: (18)"
+    same_as "$out_file" "$old" "OUT unchanged"
+    no_temp
+    verdict
+}
+
+# T3: a server that accepts and never answers is a stall the speed bound
+# ends, each attempt in about FETCH_SPEED_TIME seconds.
+case_hang() {
+    start_server hang
+    export FETCH_SPEED_TIME=2 FETCH_CONNECT_TIMEOUT=2
+    run_fetch "$fixture_sha"
+    [ "$rc" -eq 1 ] || want "exit 1 (124 is the case's 60 s guard)"
+    [ "$(lines 'attempt [1-4] of 4 failed: curl: (28)')" -eq 4 ] || want "4 attempts ending in curl (28)"
+    has "fetch-pinned: gave up on $url after 4 attempts (last: curl: (28)"
+    [ "$secs" -le 20 ] || want "done within 20 s (took ${secs}s)"
+    [ -e "$out_file" ] && want "no OUT"
+    no_temp
+    verdict
+}
+
+# T4: 200 with the wrong bytes (an error page served as 200) is retried, and
+# never replaces an earlier copy.
+case_bad_bytes() {
+    start_server bad-bytes
+    cp "$old" "$out_file"
+    run_fetch "$fixture_sha"
+    [ "$rc" -eq 1 ] || want "exit 1"
+    [ "$(lines "failed: sha256 $bad_sha is not the pinned one")" -eq 4 ] ||
+        want "4 'sha256 $bad_sha is not the pinned one' lines"
+    has "fetch-pinned: gave up on $url after 4 attempts (last: sha256 $bad_sha is not the pinned one)"
+    same_as "$out_file" "$old" "OUT unchanged"
+    no_temp
+    verdict
+}
+
+# T5: a 404 is a wrong pin or URL, not a blip: one GET, no retry.
+case_not_found() {
+    start_server not-found
+    run_fetch "$fixture_sha"
+    [ "$rc" -eq 1 ] || want "exit 1"
+    [ "$(gets)" -eq 1 ] || want "1 GET"
+    has "fetch-pinned: $url answered HTTP 404, which isn't transient: not retried"
+    [ -e "$out_file" ] && want "no OUT"
+    no_temp
+    verdict
+}
+
+# T6: 504 every time: every attempt, then the one give-up line.
+case_always_504() {
+    start_server always-504
+    run_fetch "$fixture_sha"
+    [ "$rc" -eq 1 ] || want "exit 1"
+    [ "$(gets)" -eq 4 ] || want "4 GETs"
+    [ "$(lines 'attempt [1-4] of 4 failed: HTTP 504')" -eq 4 ] || want "4 'HTTP 504' lines"
+    has "fetch-pinned: gave up on $url after 4 attempts (last: HTTP 504)"
+    [ -e "$out_file" ] && want "no OUT"
+    no_temp
+    verdict
+}
+
+# `-`: no sha256 of ours (a key or manifest its caller checks next); still
+# whole or nothing, and retried.
+case_no_pin() {
+    start_server fail-first 1
+    run_fetch -
+    [ "$rc" -eq 0 ] || want "exit 0"
+    has "fetch-pinned: $url -> $out_file (no sha256 pin: the caller checks it, attempt 2 of 4)"
+    same_as "$out_file" "$fixture" "OUT is the fixture"
+    no_temp
+    verdict
+}
+
+all=(ok fail-first 429-first 408-first cut-first cut-always hang bad-bytes not-found always-504 no-pin)
+[ $# -gt 0 ] && all=("$@")
+for c in "${all[@]}"; do
+    new_case "$c"
+    "case_${c//-/_}"
+done
+
+echo "$passes passed, $failures failed"
+[ "$failures" -eq 0 ]

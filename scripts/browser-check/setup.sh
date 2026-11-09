@@ -81,15 +81,17 @@ if [ ! -x "$BIN" ] || LD_LIBRARY_PATH="$LIBDIR:$LIBDIR/dri:${LD_LIBRARY_PATH:-}"
     # forces a URL for every named package regardless of dpkg state, while
     # keeping apt's name resolution (libatk1.0-0 → its t64 package on
     # trixie) and its fetching of not-yet-installed dependencies, both of
-    # which `apt-get download` does not do.
-    URLS=$(apt-get -o Dir::State::lists="$APT_DIR/lists" \
+    # which `apt-get download` does not do. Each line is `'<url>' <file>
+    # <size>`: <file> is the name apt saves the .deb under in debs/.
+    URIS=$(apt-get -o Dir::State::lists="$APT_DIR/lists" \
                     -o Dir::Cache="$APT_DIR" \
                     -o Dir::Cache::archives="$CACHE_DIR/debs" \
                     -o APT::Install-Recommends=false \
                     -o APT::Install-Suggests=false \
-                    --print-uris -qq --reinstall install $PKGS | awk -F"'" '{print $2}')
+                    --print-uris -qq --reinstall install $PKGS)
+    DEBS=$(awk '{print $2}' <<< "$URIS")
 
-    if [ -z "$URLS" ]; then
+    if [ -z "$DEBS" ]; then
         echo "error: apt-get --print-uris returned no package URLs. The update above fetched a real index (see the listing before this), so re-running the same install non-quietly to see apt's actual reasoning (already satisfied? unavailable? something else):" >&2
         apt-get -o Dir::State::lists="$APT_DIR/lists" \
                 -o Dir::Cache="$APT_DIR" \
@@ -102,20 +104,30 @@ if [ ! -x "$BIN" ] || LD_LIBRARY_PATH="$LIBDIR:$LIBDIR/dri:${LD_LIBRARY_PATH:-}"
         exit 1
     fi
 
-    # ~120 packages for Debian's Chromium (the old Chrome-for-Testing list was
-    # ~15): four at a time, each retried, and -f so an error page never
-    # lands as a .deb. Eight at once had deb.debian.org refusing
-    # connections ("Failed to connect … port 80") partway through.
-    (cd "$CACHE_DIR/debs" && printf '%s\n' "$URLS" \
-        | xargs -P 4 -n 1 curl -fsSL --retry 3 --retry-connrefused --retry-delay 2 -O)
+    # ~120 packages for Debian's Chromium, downloaded by apt itself
+    # (SME-470), not curl: apt retries a transient failure (Acquire::Retries,
+    # 3 by default, with 408 and 5xx counted transient), times out a stalled
+    # connection, and checks every .deb against the SHA256 in the signed
+    # index before keeping it. Over Debian's plain http:// mirrors that
+    # check is the integrity, and curl had none: apt 3.0's --print-uris no
+    # longer prints the hashes. Non-root works with Debug::NoLocking and the
+    # scratch dirs above; `timeout 900` bounds the whole download.
+    timeout 900 apt-get -o Dir::State::lists="$APT_DIR/lists" \
+            -o Dir::Cache="$APT_DIR" \
+            -o Dir::Cache::archives="$CACHE_DIR/debs" \
+            -o Debug::NoLocking=1 \
+            -o APT::Install-Recommends=false \
+            -o APT::Install-Suggests=false \
+            --reinstall --download-only -y -q install $PKGS
 
-    # Only this run's .debs, by the names curl -O saved them under (each
-    # URL's last part): debs/ keeps every earlier run's too, and unpacking
+    # Only this run's .debs, by the names apt saved them under (the second
+    # field of --print-uris: a `+` stays `+`, where a URL's last part has
+    # `%2b`): debs/ keeps every earlier run's too, and unpacking
     # them all let an older build overwrite a newer one wherever it sorted
     # later (2.4-1+deb13u9 after +deb13u10; SME-386 A5).
-    while IFS= read -r url; do
-        dpkg-deb -x "$CACHE_DIR/debs/${url##*/}" "$CACHE_DIR/libs"
-    done <<< "$URLS"
+    while IFS= read -r deb; do
+        dpkg-deb -x "$CACHE_DIR/debs/$deb" "$CACHE_DIR/libs"
+    done <<< "$DEBS"
 
     # libpulse finds its private libpulsecommon through an absolute path to
     # the system's pulseaudio/ directory, which the cache's copy can't
