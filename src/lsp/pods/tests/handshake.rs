@@ -1,22 +1,53 @@
 use super::super::*;
 use super::cluster::with_sandbox;
 
+/// A throwaway self-signed certificate for `127.0.0.1` and its key, for
+/// the TLS tarpit (`node:22-slim` has no `openssl` to make one). It
+/// guards nothing: only the test's npm trusts it (`NODE_EXTRA_CA_CERTS`
+/// in the test config's env; npm's `strict-ssl` overrides
+/// `NODE_TLS_REJECT_UNAUTHORIZED`).
+const TARPIT_TLS: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgTQ9cqopPkWQGzGIf
+HCvC/OJQptxakhGE5QQ0fG2fsGmhRANCAAR0j1UBBCeUQhuKScSMwAGpSC8WBPIn
+awGcWzHOZiE3e+5cQuhl2dxigFz9Rt43CY7jDgLYi+B11v5gJ5yNMc5f
+-----END PRIVATE KEY-----
+-----BEGIN CERTIFICATE-----
+MIIBkDCCATagAwIBAgIUYpJQoUQ5DaMYToRxjsfFgdUEQoYwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJMTI3LjAuMC4xMCAXDTI2MTEwOTAxMzUwMloYDzIxMjYxMDE2
+MDEzNTAyWjAUMRIwEAYDVQQDDAkxMjcuMC4wLjEwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAAR0j1UBBCeUQhuKScSMwAGpSC8WBPInawGcWzHOZiE3e+5cQuhl2dxi
+gFz9Rt43CY7jDgLYi+B11v5gJ5yNMc5fo2QwYjAdBgNVHQ4EFgQUQ2d8YdxgWdeV
+iVPGlY20/HQG0YUwHwYDVR0jBBgwFoAUQ2d8YdxgWdeViVPGlY20/HQG0YUwDwYD
+VR0TAQH/BAUwAwEB/zAPBgNVHREECDAGhwR/AAABMAoGCCqGSM49BAMCA0gAMEUC
+IQDsCD4b2Mc3f+JOAR8SCIaXphlS0BPiOseDwTUI7pfnAgIgYuFJP0Rls3xYSEV9
+RoErN5Lo8Ywi+JaWoK5DXlm7dgQ=
+-----END CERTIFICATE-----";
+
 /// A tarpit on `127.0.0.1:<port>` inside the server pod: it accepts each
-/// connection, appends a line to `/tmp/held`, and never answers anything,
-/// neither a ClientHello nor a proxy's `CONNECT`. Then `npm install
-/// stalled@1.0.0 <npm_args>`. No certificate is needed: the handshake
-/// never gets that far. The tarpit's own output goes nowhere, so the log
-/// is npm's alone.
-fn tarpit_install(port: u16, npm_args: &str) -> String {
+/// connection (with `tls`, completes the handshake first), appends a line
+/// to `/tmp/held`, and never answers anything after, neither a
+/// ClientHello nor a proxy's `CONNECT`. Then `npm install stalled@1.0.0
+/// <npm_args>`. The tarpit's own output goes nowhere, so the log is npm's
+/// alone.
+fn tarpit_install(port: u16, tls: bool, npm_args: &str) -> String {
+    let server = if tls {
+        "require('tls').createServer({key: fs.readFileSync('/tmp/tarpit.pem'), cert: fs.readFileSync('/tmp/tarpit.pem')}, hold)"
+    } else {
+        "net.createServer(hold)"
+    };
     format!(
         r#"set -e
+cat > /tmp/tarpit.pem <<'EOF'
+{TARPIT_TLS}
+EOF
 cat > /tmp/tarpit.js <<'EOF'
 const net = require('net'), fs = require('fs');
 const held = [];
-net.createServer(s => {{
+const hold = s => {{
   held.push(s);
   fs.appendFileSync('/tmp/held', new Date().toISOString() + ' held ' + held.length + '\n');
-}}).listen({port}, '127.0.0.1', () => fs.writeFileSync('/tmp/tarpit.ready', ''));
+}};
+{server}.listen({port}, '127.0.0.1', () => fs.writeFileSync('/tmp/tarpit.ready', ''));
 EOF
 node /tmp/tarpit.js > /dev/null 2>&1 &
 i=0
@@ -90,7 +121,7 @@ async fn assert_the_connect_bound_ends_it(server: &str, install: String, env: &[
 /// and the install fails with npm's own logged reason, in about 70 s.
 #[tokio::test]
 async fn test_an_npm_install_rides_past_a_tls_handshake_that_never_answers() {
-    let install = tarpit_install(8443, "--registry=https://127.0.0.1:8443/");
+    let install = tarpit_install(8443, false, "--registry=https://127.0.0.1:8443/");
     assert_the_connect_bound_ends_it("handshake", install, &[]).await;
 }
 
@@ -98,9 +129,21 @@ async fn test_an_npm_install_rides_past_a_tls_handshake_that_never_answers() {
 /// env), npm opens the proxy's socket with `net.connect` and waits for
 /// its `CONNECT` reply before any TLS starts, with no bound either. A
 /// proxy that accepts and never answers held npm silent as the handshake
-/// did; the connect bound now runs until the proxy's first byte.
+/// did; the connect bound now runs until the tunnel is handed to TLS.
 #[tokio::test]
 async fn test_an_npm_install_rides_past_a_proxy_that_never_answers_its_connect() {
-    let install = tarpit_install(3128, "--registry=https://registry.npmjs.org/");
+    let install = tarpit_install(3128, false, "--registry=https://registry.npmjs.org/");
     assert_the_connect_bound_ends_it("proxy", install, &[("HTTPS_PROXY", "http://127.0.0.1:3128")]).await;
+}
+
+/// SME-452 round 2 (H1): an `https://` proxy's socket is a TLS one, made
+/// by `tls.connect`, and its handshake with the proxy completes; the
+/// `CONNECT` after it had no bound. A proxy that finishes the handshake
+/// and never answers held npm silent; the bound now runs past
+/// `secureConnect` on a tunnel, until it's handed to TLS.
+#[tokio::test]
+async fn test_an_npm_install_rides_past_an_https_proxy_that_never_answers_its_connect() {
+    let install = tarpit_install(3129, true, "--registry=https://registry.npmjs.org/");
+    let env = [("HTTPS_PROXY", "https://127.0.0.1:3129"), ("NODE_EXTRA_CA_CERTS", "/tmp/tarpit.pem")];
+    assert_the_connect_bound_ends_it("tlsproxy", install, &env).await;
 }

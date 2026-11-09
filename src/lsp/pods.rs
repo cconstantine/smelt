@@ -51,8 +51,9 @@ pub fn server_pod_name(pod_id: i64, server: &str) -> String {
 }
 
 /// How long opening a connection may take during an install (SME-452's
-/// mechanism): the DNS lookup, the TCP connect, a proxy's `CONNECT` reply
-/// (round 1) and the TLS handshake alike. npm bounds none of them: `@npmcli/agent` hard-codes its connection
+/// mechanism): the DNS lookup, the TCP connect, an `http://` or
+/// `https://` proxy's `CONNECT` reply (rounds 1 and 2) and the TLS
+/// handshake alike. npm bounds none of them: `@npmcli/agent` hard-codes its connection
 /// timeout to 0, and `fetch-timeout` (`NPM_STALL_BOUNDS`) starts only once
 /// the agent hands over a connected socket. So a connection that opens
 /// and then goes quiet before TLS completes (a peer that never answers
