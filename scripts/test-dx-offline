@@ -44,9 +44,13 @@ guard_msg="dx's wasm-opt failed and dx shipped the unoptimised wasm (SME-413)"
 # ── Inside the container ────────────────────────────────────────────────────
 if [ "${1:-}" = "--inside" ]; then
     leg=$2
+    # Connection refused is curl's rc 7, and only that counts as blocked: a
+    # curl that can't run (127) or a timeout (28) proves nothing.
     for h in $hosts; do
-        if curl -sS -m 10 -o /dev/null "https://$h/" 2>/dev/null; then
-            echo "FAIL: preflight: https://$h/ answered, so the block doesn't bite"
+        curl -sS -m 10 -o /dev/null "https://$h/" 2>/dev/null
+        rc=$?
+        if [ "$rc" -ne 7 ]; then
+            echo "FAIL: preflight: https://$h/ gave curl rc $rc, not 7 (connection refused), so the block isn't shown to bite"
             exit 1
         fi
     done
