@@ -76,6 +76,16 @@ runs:
       shell: bash
       run: docker compose build smelt
 
+    # `compose up` pulls a missing image once, with no retry and no bound
+    # (a cold ubuntu-latest fork run, or a pruned ARC daemon). Each service
+    # image goes through scripts/pull-image first: 3 attempts, each under a
+    # timeout. --if-missing keeps `up`'s own "pull only what's absent", so a
+    # warm runner makes no registry call (SME-470).
+    - name: Pull the service images if missing
+      if: inputs.full == 'true'
+      shell: bash
+      run: docker compose config --images postgres docker k3s k3s-bootstrap | xargs -n1 scripts/pull-image --if-missing
+
     - name: Start service dependencies (postgres, docker-in-docker, k3s)
       if: inputs.full == 'true'
       shell: bash

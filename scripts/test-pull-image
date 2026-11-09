@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# Checks scripts/pull-image (SME-470) against a stub `docker` first on PATH,
+# with no network and no real Docker. Each case runs under `timeout 60` and
+# prints `ok <case>` or `FAIL <case>: <what it wanted>` and what it got. A
+# case whose stub was never called says `harness didn't bite` instead of
+# passing. Needs no cluster or database; check.sh runs it with the other
+# script tests.
+#
+#   scripts/test-pull-image [case ...]   # every case by default
+set -uo pipefail
+cd "$(dirname "$0")/.."
+repo=$PWD
+puller=${PULL_IMAGE:-$repo/scripts/pull-image}
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/test-pull-image.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+
+passes=0
+failures=0
+ref=stub/image:1
+
+# The stub docker. `image inspect` finds the image with STUB_IMAGE_LOCAL;
+# `pull` fails its first STUB_PULL_FAIL calls (N or all) with a registry
+# 503, or hangs with STUB_PULL_HANG. Every call is appended to $STUB_CALLS.
+mkdir -p "$work/bin"
+cat >"$work/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >>"$STUB_CALLS"
+case "$1" in
+image)
+    [ -n "${STUB_IMAGE_LOCAL:-}" ] && { echo '[{}]'; exit 0; }
+    echo "Error response from daemon: No such image: $3" >&2
+    exit 1 ;;
+pull)
+    n=$(($(cat "$STUB_CALLS.pulls" 2>/dev/null || echo 0) + 1))
+    echo "$n" >"$STUB_CALLS.pulls"
+    if [ -n "${STUB_PULL_HANG:-}" ]; then
+        echo "abc123: Downloading"
+        exec sleep 60
+    fi
+    if [ "${STUB_PULL_FAIL:-0}" = all ] || [ "$n" -le "${STUB_PULL_FAIL:-0}" ]; then
+        echo "Error response from daemon: received unexpected HTTP status: 503 Service Unavailable" >&2
+        exit 1
+    fi
+    echo "docker.io/$3" ;;
+*) echo "stub docker: unexpected call: $*" >&2; exit 1 ;;
+esac
+STUB
+chmod +x "$work/bin/docker"
+
+new_case() {
+    case_name=$1
+    dir=$work/$1
+    mkdir -p "$dir"
+    : >"$dir/calls"
+    wants=()
+    unset STUB_IMAGE_LOCAL STUB_PULL_FAIL STUB_PULL_HANG PULL_TIMEOUT
+    export STUB_CALLS=$dir/calls PULL_PAUSES='0 0'
+}
+
+# One run of pull-image "$@". Sets $out, $rc and $secs.
+run_pull() {
+    local start=$SECONDS
+    out=$(PATH="$work/bin:$PATH" timeout 60 "$puller" "$@" 2>&1)
+    rc=$?
+    secs=$((SECONDS - start))
+}
+
+pulls() { grep -c '^pull ' "$dir/calls"; }
+lines() { grep -c -- "$1" <<<"$out"; }
+want() { wants+=("$1"); }
+has() { grep -qF -- "$1" <<<"$out" || want "a line with '$1'"; }
+
+verdict() {
+    if [ ! -s "$dir/calls" ]; then
+        echo "FAIL $case_name: harness didn't bite (the stub docker was never called)"
+        failures=$((failures + 1))
+    elif [ ${#wants[@]} -eq 0 ]; then
+        echo "ok $case_name"
+        passes=$((passes + 1))
+        return
+    else
+        local w
+        w=$(printf '%s; ' "${wants[@]}")
+        echo "FAIL $case_name: ${w%; }"
+        failures=$((failures + 1))
+    fi
+    echo "    actual: exit $rc, $(pulls) pulls, ${secs}s"
+    sed 's/^/    | /' <<<"$out"
+    sed 's/^/    docker: /' "$dir/calls"
+}
+
+# T7: a registry 503, then the pull.
+case_503_once() {
+    export STUB_PULL_FAIL=1
+    run_pull "$ref"
+    [ "$rc" -eq 0 ] || want "exit 0"
+    [ "$(pulls)" -eq 2 ] || want "2 pulls"
+    has "pull-image: $ref attempt 1 of 3 failed: Error response from daemon: received unexpected HTTP status: 503 Service Unavailable"
+    has "pull-image: $ref pulled on attempt 2 of 3"
+    verdict
+}
+
+# T8: a pull that never ends is a stall its timeout ends, each attempt.
+case_hang() {
+    export STUB_PULL_HANG=1 PULL_TIMEOUT=1
+    run_pull "$ref"
+    [ "$rc" -eq 1 ] || want "exit 1 (124 is the case's 60 s guard)"
+    [ "$(pulls)" -eq 3 ] || want "3 pulls"
+    [ "$(lines "attempt [123] of 3 failed: docker pull gave up after 1s$")" -eq 3 ] ||
+        want "3 attempts ending 'docker pull gave up after 1s'"
+    has "pull-image: $ref: 3 attempts, last: docker pull gave up after 1s"
+    [ "$secs" -le 15 ] || want "done within 15 s (took ${secs}s)"
+    verdict
+}
+
+case_always_503() {
+    export STUB_PULL_FAIL=all
+    run_pull "$ref"
+    [ "$rc" -eq 1 ] || want "exit 1"
+    [ "$(pulls)" -eq 3 ] || want "3 pulls"
+    has "pull-image: $ref: 3 attempts, last: Error response from daemon: received unexpected HTTP status: 503 Service Unavailable"
+    verdict
+}
+
+# T9: --if-missing with the image present pulls nothing.
+case_if_missing_present() {
+    export STUB_IMAGE_LOCAL=1
+    run_pull --if-missing "$ref"
+    [ "$rc" -eq 0 ] || want "exit 0"
+    [ "$(pulls)" -eq 0 ] || want "no pull"
+    has "pull-image: $ref already present"
+    verdict
+}
+
+case_if_missing_absent() {
+    export STUB_PULL_FAIL=1
+    run_pull --if-missing "$ref"
+    [ "$rc" -eq 0 ] || want "exit 0"
+    grep -q '^image inspect' "$dir/calls" || want "a docker image inspect"
+    [ "$(pulls)" -eq 2 ] || want "2 pulls"
+    has "pull-image: $ref pulled on attempt 2 of 3"
+    verdict
+}
+
+# Without --if-missing it always pulls, as build-sandbox-image.sh did: a
+# floating tag (docker:29-dind) gets its newest build.
+case_always_pulls() {
+    export STUB_IMAGE_LOCAL=1
+    run_pull "$ref"
+    [ "$rc" -eq 0 ] || want "exit 0"
+    [ "$(pulls)" -eq 1 ] || want "1 pull"
+    verdict
+}
+
+all=(503-once hang always-503 if-missing-present if-missing-absent always-pulls)
+[ $# -gt 0 ] && all=("$@")
+for c in "${all[@]}"; do
+    new_case "$c"
+    "case_${c//-/_}"
+done
+
+echo "$passes passed, $failures failed"
+[ "$failures" -eq 0 ]
