@@ -3,9 +3,9 @@
 # wasm-opt on every release one, from GitHub and npm, and takes an error
 # page for an archive: it logs "wasm-opt installed from Github" and then
 # fails running a file it never wrote. Here each comes from crates.io or
-# npm, pinned and checked, and fails loudly; `base` and `build-env` copy
-# them in and set NO_DOWNLOADS. wasm-opt is Debian's binaryen, which both
-# stages already apt-install. Same image as `base` and `build-env`, so the
+# npm, pinned and checked, and fails loudly; `base` and `bundle-env` copy
+# them in and set NO_DOWNLOADS. wasm-opt is Debian's binaryen, which `base`
+# and `build-env` already apt-install. Same image as `base` and `build-env`, so the
 # same glibc.
 FROM rust:1.96-trixie AS dx-tools
 # Must equal Cargo.lock's `wasm-bindgen` (dx refuses any other version);
@@ -163,16 +163,20 @@ RUN rustup target add wasm32-unknown-unknown
 RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh \
         | bash \
     && cargo binstall -y --locked dioxus-cli@0.7.9
-# The same as base's: dx's tools from dx-tools, and no downloads (SME-413).
+
+WORKDIR /app
+
+# build-env plus dx's bundle tools, the same as base's: from dx-tools, with no
+# downloads (SME-413). A stage of its own so that publish-images' sandbox-image
+# job, which builds build-env and never runs dx, doesn't build dx-tools.
+FROM build-env AS bundle-env
 COPY --from=dx-tools /opt/dx-tools/bin/wasm-bindgen /opt/dx-tools/bin/esbuild /usr/local/bin/
 ENV NO_DOWNLOADS=1
 RUN wasm-opt --version | grep -q '^wasm-opt version 120'
 
-WORKDIR /app
-
 # The release server binary and its web bundle: docker/server-bundle.sh,
 # which scripts/test-dx-offline also runs, with GitHub and npm blocked.
-FROM build-env AS server-build
+FROM bundle-env AS server-build
 COPY . .
 RUN docker/server-bundle.sh
 

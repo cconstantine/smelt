@@ -10,7 +10,7 @@
 # The images now carry those tools and set NO_DOWNLOADS=1; this shows a
 # bundle needs none of dx's fetches:
 #
-#   server  `docker build --target build-env` (network open: the image's
+#   server  `docker build --target bundle-env` (network open: the image's
 #           own pinned fetches happen there), then docker/server-bundle.sh
 #           in it with the hosts blocked. Passes on rc 0, no `Installing
 #           <tool>` line in dx's log, and a .wasm in /app/image/smelt/public.
@@ -175,14 +175,17 @@ run_leg() { # <leg> <image> <user> <work dir> <cargo registry dir>
 }
 
 failed=()
-server_image=smelt-dx-offline-build-env:local
+server_image=smelt-dx-offline-bundle-env:local
 dev_image=smelt-dx-offline-dev:local
+# server-build's own base stage; a tree from before SME-413 has only build-env.
+server_target=bundle-env
+grep -q '^FROM .* AS bundle-env' Dockerfile || server_target=build-env
 built_server=""
 for leg in "${legs[@]}"; do
     case "$leg" in
         server|guard)
             if [ -z "$built_server" ]; then
-                build build-env "$server_image" || { failed+=("$leg"); continue; }
+                build "$server_target" "$server_image" || { failed+=("$leg"); continue; }
                 built_server=1
             fi
             run_leg "$leg" "$server_image" 0 /app /usr/local/cargo/registry || failed+=("$leg")
