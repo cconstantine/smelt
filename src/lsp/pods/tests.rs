@@ -96,8 +96,10 @@ fn pod_env(config: &LanguageServerConfig) -> Vec<(String, String)> {
 /// unset), is inside the install bound: npm gives up and says why
 /// before the bound throws its error and log away. The env bounds only
 /// what comes after the socket; each try's connect adds up to
-/// `CONNECT_BOUND` more (4 × (30 + 30) + 3 × 10 = 270 s, still inside),
-/// which `pod_script`'s preload enforces and this test doesn't read.
+/// `CONNECT_BOUND` more (4 × (30 + 30) + 3 × 10 = 270 s for one
+/// request, still inside), which `pod_script`'s preload enforces and this
+/// test doesn't read. The bound is per request, not per install: a dark
+/// registry fails the install's first request, which is why it holds.
 #[test]
 fn test_npm_gives_up_on_a_stalled_registry_inside_the_install_bound() {
     let env = pod_env(&config());

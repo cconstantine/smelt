@@ -62,9 +62,13 @@ pub fn server_pod_name(pod_id: i64, server: &str) -> String {
 /// a k3s-node tarpit holding only the first connection, with a working
 /// registry one retry away. The install preloads `connect_bound.js`,
 /// which destroys such a connect with `ECONNECTIONTIMEOUT`; npm retries
-/// that on a fresh connection and logs each attempt. Worst case per
+/// that on a fresh connection and logs each attempt. Worst case for one
 /// request: 4 tries × (30 s connect + 30 s fetch) + 3 × 10 s backoff =
-/// 270 s, inside `INSTALL_TIMEOUT`. A real handshake takes well under 1 s.
+/// 270 s, inside `INSTALL_TIMEOUT`. That's per request, not per install:
+/// an install makes several (packument, tarball, dependencies), and
+/// several that each stall a while could add up past 600 s. In practice a
+/// dark registry or path fails the first request and ends the install
+/// there. A real handshake takes well under 1 s.
 pub const CONNECT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Where the pod script writes the connect bound's preload.
