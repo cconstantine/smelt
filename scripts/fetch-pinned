@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Downloads one pinned file, whole and checked, or nothing (SME-470).
+#
+#   fetch-pinned URL OUT SHA256    # OUT only once its sha256 is SHA256
+#   fetch-pinned URL OUT -         # no pin of ours: the caller checks OUT
+#                                  # next (a signing key by its fingerprint,
+#                                  # a manifest by its signature)
+#
+# Each attempt downloads to a temp file beside OUT (never a pipe), bounded
+# by a connect timeout, a minimum speed and a max time. A failed attempt is
+# retried: a connect, reset, timeout or cut-off body; HTTP 408, 429 or 5xx;
+# or bytes that aren't the pinned ones (an error page served as 200). Any
+# other 4xx is a wrong pin or URL, not a blip, and fails at once. Only a
+# whole, checked file is renamed into OUT, so a body cut off partway never
+# reaches a consumer and a failed run leaves an earlier OUT as it was.
+#
+# Lines, all on stderr: one per failed attempt (`fetch-pinned: URL attempt
+# k of n failed: REASON`), then `fetch-pinned: URL -> OUT (sha256 ok,
+# attempt k of n)` or `fetch-pinned: gave up on URL after n attempts (last:
+# REASON)` and exit 1.
+#
+# FETCH_ATTEMPTS (4), FETCH_PAUSES ("2 5 15"), FETCH_CONNECT_TIMEOUT (30),
+# FETCH_SPEED_TIME (60: under 1 KB/s for that long is a stall) and
+# FETCH_MAX_TIME (300) set the retries and bounds; scripts/test-fetch-pinned
+# shortens them. Worst case with the defaults: 4 stalls of 30 + 60 s plus
+# 22 s of pauses, about 6.4 minutes; 4 slow-but-moving downloads, about 20.
+# http:// is allowed: the sha256 is the integrity check.
+set -euo pipefail
+
+if [ $# -ne 3 ]; then
+    echo "usage: fetch-pinned URL OUT SHA256|-" >&2
+    exit 2
+fi
+url=$1 out=$2 want=$3
+case "$want" in
+    -) ;;
+    *[!0-9a-f]* | "") echo "fetch-pinned: '$want' isn't a lowercase sha256 or -" >&2; exit 2 ;;
+    *) [ ${#want} -eq 64 ] || { echo "fetch-pinned: '$want' isn't a sha256 (64 hex characters) or -" >&2; exit 2; } ;;
+esac
+
+attempts=${FETCH_ATTEMPTS:-4}
+read -r -a pauses <<<"${FETCH_PAUSES:-2 5 15}"
+say() { echo "fetch-pinned: $*" >&2; }
+
+# The temp file is mktemp's, beside OUT so the rename is atomic, and the
+# trap removes it (and the status code curl writes beside it) on any exit.
+mkdir -p "$(dirname "$out")"
+tmp=$(mktemp "$out.tmp.XXXXXX")
+trap 'rm -f "$tmp" "$tmp.code"' EXIT
+
+last=
+for ((k = 1; k <= attempts; k++)); do
+    : >"$tmp" # emptied, not removed: the name stays this run's
+    code=000
+    if err=$(curl -fsSL --connect-timeout "${FETCH_CONNECT_TIMEOUT:-30}" \
+        --speed-limit 1024 --speed-time "${FETCH_SPEED_TIME:-60}" \
+        --max-time "${FETCH_MAX_TIME:-300}" -w '%{http_code}' -o "$tmp" "$url" 2>&1 >"$tmp.code"); then
+        code=$(cat "$tmp.code")
+        rm -f "$tmp.code"
+        got=$(sha256sum "$tmp" | cut -d' ' -f1)
+        if [ "$want" = - ] || [ "$got" = "$want" ]; then
+            chmod 0644 "$tmp"
+            mv -f "$tmp" "$out"
+            if [ "$want" = - ]; then
+                say "$url -> $out (no sha256 pin: the caller checks it, attempt $k of $attempts)"
+            else
+                say "$url -> $out (sha256 ok, attempt $k of $attempts)"
+            fi
+            exit 0
+        fi
+        last="sha256 $got is not the pinned one"
+    else
+        code=$(cat "$tmp.code" 2>/dev/null || echo 000)
+        rm -f "$tmp.code"
+        case "$code" in
+            408 | 429 | 5??) last="HTTP $code" ;;
+            4??)
+                say "$url answered HTTP $code, which isn't transient: not retried"
+                exit 1
+                ;;
+            *)
+                err=${err%$'\n'}
+                last=${err##*$'\n'}
+                last=${last:-curl failed with no message}
+                ;;
+        esac
+    fi
+    say "$url attempt $k of $attempts failed: $last"
+    if [ "$k" -lt "$attempts" ]; then
+        sleep "${pauses[k - 1]:-0}"
+    fi
+done
+say "gave up on $url after $attempts attempts (last: $last)"
+exit 1
