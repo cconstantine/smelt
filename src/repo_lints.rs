@@ -141,6 +141,38 @@ mod tests {
         assert!(broken.is_empty(), "links that don't resolve:\n{}", broken.join("\n"));
     }
 
+    /// The Dockerfile's dx-tools stage installs the wasm-bindgen CLI that
+    /// Cargo.lock's `wasm-bindgen` needs (SME-413): with NO_DOWNLOADS dx
+    /// refuses any other version, and this says so before an image is built.
+    #[test]
+    fn test_dockerfile_pins_cargo_locks_wasm_bindgen() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let lock = std::fs::read_to_string(root.join("Cargo.lock")).expect("read Cargo.lock");
+        let locked: Vec<&str> = lock
+            .split("[[package]]")
+            .filter(|p| p.lines().any(|l| l.trim() == r#"name = "wasm-bindgen""#))
+            .filter_map(|p| p.lines().find_map(|l| l.trim().strip_prefix("version = ")))
+            .map(|v| v.trim_matches('"'))
+            .collect();
+        assert_eq!(
+            locked.len(),
+            1,
+            "Cargo.lock should lock exactly one wasm-bindgen, for the Dockerfile's one pin: {locked:?}"
+        );
+        let locked = locked[0];
+        let dockerfile = std::fs::read_to_string(root.join("Dockerfile")).expect("read the Dockerfile");
+        let pins: Vec<&str> =
+            dockerfile.lines().filter_map(|l| l.trim().strip_prefix("ARG WASM_BINDGEN_VERSION=")).collect();
+        assert!(!pins.is_empty(), "no ARG WASM_BINDGEN_VERSION= line in Dockerfile");
+        assert_eq!(pins.len(), 1, "more than one ARG WASM_BINDGEN_VERSION= line in Dockerfile: {pins:?}");
+        assert_eq!(
+            pins[0], locked,
+            "the Dockerfile pins wasm-bindgen-cli {} but Cargo.lock locks wasm-bindgen {locked}: \
+             bump the Dockerfile's dx-tools pin with Cargo.lock (SME-413)",
+            pins[0]
+        );
+    }
+
     /// The app links every part of its stylesheet, in order, and the browser
     /// tier serves each (SME-163): a part left out would leave pages partly
     /// unstyled, and parts out of order would change which rule wins a tie.

@@ -1,3 +1,34 @@
+# dx's tools, so that dx fetches none of them at bundle time (SME-413). dx
+# 0.7.9 otherwise downloads wasm-bindgen and esbuild on every bundle, and
+# wasm-opt on every release one, from GitHub and npm, and takes an error
+# page for an archive: it logs "wasm-opt installed from Github" and then
+# fails running a file it never wrote. Here each comes from crates.io or
+# npm, pinned and checked, and fails loudly; `base` and `bundle-env` copy
+# them in and set NO_DOWNLOADS. wasm-opt is Debian's binaryen, which `base`
+# and `build-env` already apt-install. Same image as `base` and `build-env`, so the
+# same glibc.
+FROM rust:1.96-trixie AS dx-tools
+# Must equal Cargo.lock's `wasm-bindgen` (dx refuses any other version);
+# src/repo_lints.rs checks it.
+ARG WASM_BINDGEN_VERSION=0.2.126
+# dioxus-cli 0.7.9's ESBUILD_VERSION: bump it with `dioxus-cli@0.7.9` below
+# (dx doesn't check esbuild's version), and re-check wasm-opt then too.
+ARG ESBUILD_VERSION=0.27.3
+RUN cargo install --locked --root /opt/dx-tools wasm-bindgen-cli@${WASM_BINDGEN_VERSION}
+RUN set -eu; \
+    case "$(uname -m)" in \
+        x86_64) plat=linux-x64; sha=066e20cdb882994160e18524a552b97e03648eb9aa0c7cdf5680a6493be65ab2 ;; \
+        aarch64) plat=linux-arm64; sha=04f0bfb132b8b0800c23b22caa9ad7a7adf41e2434c027fc8571318b9904712f ;; \
+        *) echo "error: no esbuild pin for $(uname -m)"; exit 1 ;; \
+    esac; \
+    work="$(mktemp -d)"; cd "$work"; \
+    curl -fsSL --retry 5 -o esbuild.tgz "https://registry.npmjs.org/@esbuild/$plat/-/$plat-${ESBUILD_VERSION}.tgz"; \
+    echo "$sha  esbuild.tgz" | sha256sum -c -; \
+    tar -xzf esbuild.tgz package/bin/esbuild; \
+    install -m 0755 package/bin/esbuild /opt/dx-tools/bin/esbuild; \
+    cd /; rm -rf "$work"
+RUN /opt/dx-tools/bin/wasm-bindgen --version && /opt/dx-tools/bin/esbuild --version
+
 FROM rust:1.96-trixie AS base
 
 RUN apt-get update && apt-get install -y \
@@ -84,6 +115,14 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 # `dx` CLI refuses to serve/build the project at all.
 RUN cargo binstall -y --locked dioxus-cli@0.7.9
 
+# dx's tools from the dx-tools stage, and dx told to use them from PATH and
+# never download (dioxus-cli's `prefer_no_downloads`, SME-413). Debian's
+# wasm-opt is the one dx now runs: a binaryen bump is a deliberate change.
+COPY --from=dx-tools /opt/dx-tools/bin/wasm-bindgen /opt/dx-tools/bin/esbuild /usr/local/bin/
+ENV NO_DOWNLOADS=1
+RUN v="$(wasm-opt --version)" && echo "$v" && echo "$v" | grep -qE '^wasm-opt version 120( |$)' \
+    || { echo "error: dx runs Debian's binaryen 120 (SME-413), found: $v"; exit 1; }
+
 WORKDIR /app
 
 # Dev target: adds sqlx-cli for local migration/query work (slow to compile,
@@ -128,24 +167,20 @@ RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/ca
 
 WORKDIR /app
 
-# The release server binary and its web bundle.
-FROM build-env AS server-build
+# build-env plus dx's bundle tools, the same as base's: from dx-tools, with no
+# downloads (SME-413). A stage of its own so that publish-images' sandbox-image
+# job, which builds build-env and never runs dx, doesn't build dx-tools.
+FROM build-env AS bundle-env
+COPY --from=dx-tools /opt/dx-tools/bin/wasm-bindgen /opt/dx-tools/bin/esbuild /usr/local/bin/
+ENV NO_DOWNLOADS=1
+RUN v="$(wasm-opt --version)" && echo "$v" && echo "$v" | grep -qE '^wasm-opt version 120( |$)' \
+    || { echo "error: dx runs Debian's binaryen 120 (SME-413), found: $v"; exit 1; }
+
+# The release server binary and its web bundle: docker/server-bundle.sh,
+# which scripts/test-dx-offline also runs, with GitHub and npm blocked.
+FROM bundle-env AS server-build
 COPY . .
-# dx prints where it put things, but the path has moved between dx versions
-# and isn't something to bake into this file. So: find the web bundle, and
-# take the executable beside it. Loudly give up with what's actually there if
-# that doesn't work, rather than building an image that can only fail at
-# startup.
-RUN dx bundle --platform web --release \
-    && { public="$(find target/dx dist -type d -name public 2>/dev/null | head -n1)"; \
-         test -n "$public" || { echo "error: no web bundle under target/dx or dist — see dx's output above"; ls -R target/dx 2>/dev/null | head -40; exit 1; }; \
-         bindir="$(dirname "$public")"; \
-         server="$(find "$bindir" -maxdepth 1 -type f -perm -u+x 2>/dev/null | head -n1)"; \
-         test -n "$server" || { echo "error: no executable beside $public"; ls -l "$bindir"; exit 1; }; \
-         install -d /app/image/smelt; \
-         cp -a "$bindir/." /app/image/smelt/; \
-         mv "/app/image/smelt/$(basename "$server")" /app/image/smelt/smelt; \
-         echo "server image: $server (renamed smelt) with the bundle from $public"; }
+RUN docker/server-bundle.sh
 
 # Headless Chromium (Debian's chromium-headless-shell, SME-360) for webfetch
 # and browsing sessions, laid out the way smelt reads it from
