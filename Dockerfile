@@ -120,7 +120,8 @@ RUN cargo binstall -y --locked dioxus-cli@0.7.9
 # wasm-opt is the one dx now runs: a binaryen bump is a deliberate change.
 COPY --from=dx-tools /opt/dx-tools/bin/wasm-bindgen /opt/dx-tools/bin/esbuild /usr/local/bin/
 ENV NO_DOWNLOADS=1
-RUN wasm-opt --version | grep -q '^wasm-opt version 120'
+RUN v="$(wasm-opt --version)" && echo "$v" && echo "$v" | grep -qE '^wasm-opt version 120( |$)' \
+    || { echo "error: dx runs Debian's binaryen 120 (SME-413), found: $v"; exit 1; }
 
 WORKDIR /app
 
@@ -172,7 +173,8 @@ WORKDIR /app
 FROM build-env AS bundle-env
 COPY --from=dx-tools /opt/dx-tools/bin/wasm-bindgen /opt/dx-tools/bin/esbuild /usr/local/bin/
 ENV NO_DOWNLOADS=1
-RUN wasm-opt --version | grep -q '^wasm-opt version 120'
+RUN v="$(wasm-opt --version)" && echo "$v" && echo "$v" | grep -qE '^wasm-opt version 120( |$)' \
+    || { echo "error: dx runs Debian's binaryen 120 (SME-413), found: $v"; exit 1; }
 
 # The release server binary and its web bundle: docker/server-bundle.sh,
 # which scripts/test-dx-offline also runs, with GitHub and npm blocked.
