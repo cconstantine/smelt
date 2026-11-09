@@ -69,7 +69,7 @@ fn test_the_install_log_is_appended_to() {
     for step in [
         ": > /tmp/install.log; mkdir -p \"$HOME\" && ( ",
         ") >> /tmp/install.log 2>&1 & install=$!;",
-        "sh /tmp/smelt-go-idle.sh \"$install\" /tmp/install.log /proc/net/dev & watch=$!;",
+        "sh /tmp/smelt-go-idle.sh \"$install\" /tmp/install.log & watch=$!;",
         "wait \"$install\"; rc=$?;",
         "kill \"$watch\" 2>/dev/null; wait \"$watch\";",
         "echo $rc > /tmp/install.rc;",

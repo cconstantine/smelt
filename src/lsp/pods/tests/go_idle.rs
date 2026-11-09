@@ -1,6 +1,6 @@
 //! The go watchdog (SME-456), run in the pod script on this host: a fake
 //! `go` on `PATH`, the script's files in a directory of the test's own,
-//! a received-bytes table that never grows, and a 3 s bound for 120 s.
+//! and a 3 s bound for 120 s.
 //! Needs `sh` and `/proc`, as the test container and CI have; no cluster.
 
 use super::super::script::{ScriptAt, pod_script_at};
@@ -31,21 +31,63 @@ fn running(script: &str) -> Vec<String> {
         .collect()
 }
 
+/// Traffic the install never asked for, while it runs: UDP to a socket of
+/// the test's own on loopback, about 50 KB/s, as a busy node's bridge
+/// sends every pod on it (SME-456's full-gate red: 1–2.5 KB/s on `eth0`).
+struct Traffic(std::sync::Arc<std::sync::atomic::AtomicBool>, Option<std::thread::JoinHandle<()>>);
+
+impl Traffic {
+    fn start() -> Traffic {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a receiver");
+        let to = receiver.local_addr().expect("its address");
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a sender");
+        let stopping = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let _receiver = receiver;
+            while !stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = sender.send_to(&[0u8; 1000], to);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        Traffic(stop, Some(thread))
+    }
+}
+
+impl Drop for Traffic {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.1.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// Runs the pod script for `install`, with `go` on `PATH` the shell
 /// script `go_body` and `env` set, and waits up to `wait` for its record.
 fn run_pod_script(name: &str, go_body: &str, install: &str, env: &[(&str, &str)], wait: Duration) -> Ran {
+    run_pod_script_with(name, go_body, install, env, wait, false)
+}
+
+/// `run_pod_script`, with `Traffic` on this host's network while it runs
+/// when `traffic`.
+fn run_pod_script_with(
+    name: &str,
+    go_body: &str,
+    install: &str,
+    env: &[(&str, &str)],
+    wait: Duration,
+    traffic: bool,
+) -> Ran {
     let dir = std::env::temp_dir().join(format!("sme-456-go-idle-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("bin")).expect("the test's directory");
     let go = dir.join("bin/go");
     std::fs::write(&go, format!("#!/bin/sh\n{go_body}\n")).expect("the fake go");
     std::fs::set_permissions(&go, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("chmod");
-    // Never grows: only the log counts as progress.
-    let net_dev = dir.join("net-dev");
-    std::fs::write(&net_dev, "Inter-|   Receive\n face |bytes\n    lo:    1000 10 0 0 0 0 0 0 1000 10 0 0 0 0 0 0\n")
-        .expect("net-dev");
+    let _traffic = traffic.then(Traffic::start);
     let tmp = dir.to_str().expect("a UTF-8 path");
-    let at = ScriptAt { tmp, net_dev: net_dev.to_str().expect("a UTF-8 path"), go_idle: Duration::from_secs(3) };
+    let at = ScriptAt { tmp, go_idle: Duration::from_secs(3) };
     let script = pod_script_at(install, &at);
     let path = format!("{}:{}", dir.join("bin").display(), std::env::var("PATH").unwrap_or_default());
     let mut child = std::process::Command::new("sh")
@@ -97,11 +139,40 @@ fn test_a_silent_go_is_stopped_and_says_why() {
     eprintln!("stopped after {} s, rc {rc}", ran.took.as_secs());
 }
 
+/// (d) SME-456's full-gate red: a silent go is stopped even while the pod
+/// receives traffic that isn't the install's (on a busy node, the
+/// bridge's broadcasts reach every pod). Only what go itself reads
+/// counts.
+#[test]
+fn test_a_silent_go_is_stopped_while_other_traffic_arrives() {
+    let go = "trap 'kill $! 2>/dev/null; exit 143' TERM; sleep 600 & wait";
+    let ran = run_pod_script_with("traffic", go, "go install x@v1", &[], Duration::from_secs(15), true);
+    let rc = ran.rc.unwrap_or_else(|| panic!("no record within 15 s; the log: {:?}", ran.log));
+    assert_ne!(rc, "0", "{}", ran.log);
+    assert!(ran.log.trim_end().ends_with(STOPPED), "{:?}", ran.log);
+    assert!(ran.watchdogs.is_empty(), "the watchdog outlived the install: {:?}", ran.watchdogs);
+}
+
+/// (e) A go that writes nothing but keeps reading (a download between
+/// `-x` lines) is never stopped: 4 KB a second is over the bound's 1 KB.
+#[test]
+fn test_a_silent_go_that_keeps_reading_is_left_alone() {
+    let go = "printf '%4096s\\n' x > \"$HOME/line\"; i=0; while [ $i -lt 10 ]; do read -r l < \"$HOME/line\"; sleep 1; i=$((i+1)); done";
+    let ran = run_pod_script("reading", go, "go install x@v1", &[], Duration::from_secs(25));
+    assert_eq!(ran.rc.as_deref(), Some("0"), "{:?}", ran.log);
+    assert!(!ran.log.contains("smelt: go"), "{:?}", ran.log);
+    assert!(ran.watchdogs.is_empty(), "the watchdog outlived the install: {:?}", ran.watchdogs);
+}
+
 /// (b) A go that keeps writing to the log is never stopped, however long
-/// it takes past the bound.
+/// it takes past the bound. It logs with builtins alone, one `sleep` for
+/// the whole 8 s: a child that exits adds its reads to its parent's
+/// `rchar`, so a `sleep` per line would read as progress by itself and
+/// the test wouldn't show that log growth counts.
 #[test]
 fn test_a_go_that_keeps_logging_is_left_alone() {
-    let go = "i=0; while [ $i -lt 8 ]; do echo step $i; sleep 1; i=$((i+1)); done";
+    let go = "sleep 8 & s=$!; i=0; while kill -0 $s 2>/dev/null; do i=$((i+1)); \
+              [ $((i % 50000)) -ne 0 ] || echo step $i; done";
     let ran = run_pod_script("logging", go, "go install x@v1", &[], Duration::from_secs(20));
     assert_eq!(ran.rc.as_deref(), Some("0"), "{:?}", ran.log);
     assert!(!ran.log.contains("smelt: go"), "{:?}", ran.log);

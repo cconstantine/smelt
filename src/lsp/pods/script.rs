@@ -54,7 +54,10 @@ const CURL_STALL_BOUNDS: &str = include_str!("curlrc");
 const CURL_HOME_DIR: &str = "smelt-curl";
 
 /// How long a `go` in the install may go without writing to the log or
-/// receiving 1 KB/s before `GO_WATCHDOG` stops it (SME-456). cmd/go's
+/// reading 1 KB/s before `GO_WATCHDOG` stops it (SME-456): it and the
+/// processes under it, by their own `rchar`, never the pod's network
+/// counters (a busy node's bridge traffic kept those growing for a
+/// stalled go: SME-456's full-gate red, 1–2.5 KB/s on `eth0`). cmd/go's
 /// fetches use a copy of `http.DefaultClient`, with no `Timeout`: only the
 /// 30 s dial and the 10 s TLS handshake are bounded, there's no retry,
 /// and without `-x` it writes nothing until it ends. So a module proxy
@@ -63,11 +66,11 @@ const CURL_HOME_DIR: &str = "smelt-curl";
 /// bound (each past 700 s, measured with go1.27.3). The install's
 /// subshell gets `-x` after the config's own `GOFLAGS`, so go logs each
 /// `# get <url>` and build step, and the watchdog ends a `go` that has
-/// gone quiet on both the log and the network this long: measured at
+/// gone quiet on both the log and its reads this long: measured at
 /// about 125 s for each stall, the stalled URL last in the log. A real
 /// gopls install's largest gap between log lines was 5.4 s at 1 CPU and
 /// 9.2 s at 0.5 CPU, so 120 s is about 13 times the worst. An idle bound,
-/// not a total one (SME-452's Q3): a go that keeps logging or receiving
+/// not a total one (SME-452's Q3): a go that keeps logging or reading
 /// is never stopped, and only `go` is, never the install's shell, so the
 /// install fails with its own status and log.
 pub(super) const GO_IDLE_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
@@ -96,19 +99,16 @@ pub(super) fn pod_script(install_command: &str) -> String {
     pod_script_at(install_command, &IN_THE_POD)
 }
 
-/// Where a pod script keeps its files and reads its traffic, and its go
-/// bound: `IN_THE_POD` for a server pod, a temporary directory for a test
-/// that runs the script on its own host (SME-456).
+/// Where a pod script keeps its files, and its go bound: `IN_THE_POD` for
+/// a server pod, a temporary directory for a test that runs the script on
+/// its own host (SME-456).
 pub(super) struct ScriptAt<'a> {
     /// The directory of the preload, `.curlrc`, watchdog, log and record.
     pub tmp: &'a str,
-    /// The received-bytes table the go watchdog reads.
-    pub net_dev: &'a str,
     pub go_idle: std::time::Duration,
 }
 
-pub(super) const IN_THE_POD: ScriptAt<'static> =
-    ScriptAt { tmp: "/tmp", net_dev: "/proc/net/dev", go_idle: GO_IDLE_BOUND };
+pub(super) const IN_THE_POD: ScriptAt<'static> = ScriptAt { tmp: "/tmp", go_idle: GO_IDLE_BOUND };
 
 /// `pod_script`, its files in `at.tmp`.
 pub(super) fn pod_script_at(install_command: &str, at: &ScriptAt) -> String {
@@ -120,8 +120,8 @@ pub(super) fn pod_script_at(install_command: &str, at: &ScriptAt) -> String {
     let watchdog = GO_WATCHDOG.trim_end().replace("__GO_IDLE_S__", &at.go_idle.as_secs().to_string());
     let tmp = at.tmp;
     let (js, curl_home) = (format!("{tmp}/{CONNECT_BOUND_JS}"), format!("{tmp}/{CURL_HOME_DIR}"));
-    let (log, rc, watch, net_dev) =
-        (format!("{tmp}/{INSTALL_LOG_FILE}"), format!("{tmp}/{INSTALL_RC_FILE}"), format!("{tmp}/{GO_WATCHDOG_SH}"), at.net_dev);
+    let (log, rc, watch) =
+        (format!("{tmp}/{INSTALL_LOG_FILE}"), format!("{tmp}/{INSTALL_RC_FILE}"), format!("{tmp}/{GO_WATCHDOG_SH}"));
     // The install runs in the background, its log opened for append (the
     // watchdog's line survives the install's next write), with the
     // watchdog next to it; the record is written once both have ended.
@@ -135,7 +135,7 @@ pub(super) fn pod_script_at(install_command: &str, at: &ScriptAt) -> String {
          [ -n \"$CURL_HOME\" ] || {{ CURL_HOME={curl_home}; export CURL_HOME; }}; \
          GOFLAGS=\"${{GOFLAGS:+$GOFLAGS }}-x\"; export GOFLAGS; \
          {install} ) >> {log} 2>&1 & install=$!; \
-         watch=; if [ -f {watch} ]; then sh {watch} \"$install\" {log} {net_dev} & watch=$!; fi; \
+         watch=; if [ -f {watch} ]; then sh {watch} \"$install\" {log} & watch=$!; fi; \
          wait \"$install\"; rc=$?; \
          [ -z \"$watch\" ] || {{ kill \"$watch\" 2>/dev/null; wait \"$watch\"; }}; \
          echo $rc > {rc}; \
