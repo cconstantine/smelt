@@ -232,13 +232,19 @@ impl CatalogStore {
     /// refresh saves again.
     /// In a `pricing_refresh` span (SME-137), failed when the refresh is.
     pub async fn refresh(&self, pool: &sqlx::PgPool, url: &str) -> Result<(), String> {
+        self.refresh_with(pool, url, &FETCH).await
+    }
+
+    /// `refresh`, fetching as `policy` says: the tests' policy pauses
+    /// for milliseconds, not `FETCH`'s seconds.
+    async fn refresh_with(&self, pool: &sqlx::PgPool, url: &str, policy: &Policy) -> Result<(), String> {
         let span = tracing::info_span!(
             "pricing_refresh",
             otel.status_code = tracing::field::Empty,
             otel.status_description = tracing::field::Empty,
         );
         crate::telemetry::in_span(span.clone(), async move {
-            let result = self.refresh_unspanned(pool, url).await;
+            let result = self.refresh_unspanned(pool, url, policy).await;
             if let Err(e) = &result {
                 crate::telemetry::mark_error(&span, e);
             }
@@ -247,8 +253,8 @@ impl CatalogStore {
         .await
     }
 
-    async fn refresh_unspanned(&self, pool: &sqlx::PgPool, url: &str) -> Result<(), String> {
-        let text = match get_text(url, &FETCH).await? {
+    async fn refresh_unspanned(&self, pool: &sqlx::PgPool, url: &str, policy: &Policy) -> Result<(), String> {
+        let text = match get_text(url, policy).await? {
             Fetched::Body(text) => text,
             Fetched::NotFound => return Err(format!("{url} answered 404 Not Found")),
         };
@@ -502,6 +508,10 @@ mod tests {
         format!("http://{addr}/api.json")
     }
 
+    /// `FETCH` with millisecond pauses, so a refresh answered 5xx doesn't
+    /// sleep for seconds under the cluster lock.
+    const QUICK: Policy = Policy { backoff: &[std::time::Duration::from_millis(10)], ..FETCH };
+
     #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
     async fn test_a_refresh_keeps_the_catalog_in_memory_and_saved(pool: sqlx::PgPool) {
         let url = catalog_server(vec![(200, CATALOG.to_string())]).await;
@@ -521,28 +531,28 @@ mod tests {
     async fn test_a_refresh_rides_out_one_503(pool: sqlx::PgPool) {
         let url = catalog_server(vec![(503, "busy".to_string()), (200, CATALOG.to_string())]).await;
         let store = CatalogStore::new();
-        assert_eq!(store.refresh(&pool, &url).await, Ok(()));
+        assert_eq!(store.refresh_with(&pool, &url, &QUICK).await, Ok(()));
         let fetched = store.current().expect("in memory");
         assert!(model_prices(&fetched.providers, "anthropic", "claude-opus-5-5").is_some());
     }
 
     #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
     async fn test_a_failed_refresh_keeps_the_last_good_catalog(pool: sqlx::PgPool) {
-        let url = catalog_server(vec![
-            (200, CATALOG.to_string()),
-            (500, "oops".to_string()),
-            (200, "<html>rate limited</html>".to_string()),
-            (200, "{}".to_string()),
-            (200, r#"{"anthropic": "nope"}"#.to_string()),
-        ])
-        .await;
+        let url = catalog_server(vec![(200, CATALOG.to_string()), (500, "oops".to_string())]).await;
         let store = CatalogStore::new();
         store.refresh(&pool, &url).await.expect("first refresh");
         let good = store.current().expect("in memory");
 
-        for _ in 0..4 {
-            assert!(store.refresh(&pool, &url).await.is_err());
-            assert_eq!(store.current(), Some(good.clone()), "memory unchanged");
+        // A server that answers 5xx to every try.
+        let failed = store.refresh_with(&pool, &url, &QUICK).await;
+        assert_eq!(failed, Err(format!("{url} answered 500 Internal Server Error")));
+        assert_eq!(store.current(), Some(good.clone()), "memory unchanged after a 5xx");
+
+        // A 200 whose body isn't the catalog.
+        for body in ["<html>rate limited</html>", "{}", r#"{"anthropic": "nope"}"#] {
+            let url = catalog_server(vec![(200, body.to_string())]).await;
+            assert!(store.refresh_with(&pool, &url, &QUICK).await.is_err(), "{body}");
+            assert_eq!(store.current(), Some(good.clone()), "memory unchanged after {body}");
         }
         let restarted = CatalogStore::new();
         restarted.load_saved(&pool).await.expect("load");
@@ -555,7 +565,7 @@ mod tests {
     async fn test_a_failed_refresh_is_a_failed_span(pool: sqlx::PgPool) {
         let url = catalog_server(vec![(500, "oops".to_string())]).await;
         let store = CatalogStore::new();
-        let (result, spans) = crate::telemetry::capture_spans(store.refresh(&pool, &url)).await;
+        let (result, spans) = crate::telemetry::capture_spans(store.refresh_with(&pool, &url, &QUICK)).await;
         assert!(result.is_err());
         let span = spans.iter().find(|span| span.name == "pricing_refresh").expect("the refresh's span");
         assert!(matches!(span.status, opentelemetry::trace::Status::Error { .. }), "{:?}", span.status);
