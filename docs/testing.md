@@ -68,6 +68,10 @@ In [testing/sandbox.md](testing/sandbox.md#language-servers-sme-35).
 
 In [testing/techniques.md](testing/techniques.md).
 
+## Testing a fetch's retries and bounds (SME-470)
+
+The server's own fetches of a text file (mason's registry and Helix's `languages.toml` for the LSP catalog, models.dev's price catalog) go through `src/http_fetch.rs`'s `get_text`. Its tests run against local stand-ins with a hit counter, no network: a 503 or 429 then a 200 (2 hits), a 400 or 404 (1 hit), an always-500 (`attempts` hits), a stalled server that accepts and never answers (fails at the policy's deadline), and a 200 whose body is cut off partway (fails with 1 hit: no retry once a body began). Tests give a `Policy` of 10 ms pauses; the callers' own tests (`lsp::catalog::tests`, `pricing::tests`) ride out one 503 at the real policies' first pause (1 s and 2 s).
+
 ## Testing spans (SME-137)
 
 In [testing/techniques.md](testing/techniques.md).
