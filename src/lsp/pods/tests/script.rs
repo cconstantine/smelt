@@ -26,7 +26,7 @@ fn test_an_install_gets_curls_stall_bounds_and_the_server_doesnt() {
     let script = pod_script("curl -fsSL x");
     let written = format!("cat > /tmp/smelt-curl/.curlrc <<'SMELT_EOF'\n{}\nSMELT_EOF\n", curlrc.trim_end());
     assert!(script.contains(&written), "no .curlrc written: {script}");
-    for bound in ["connect-timeout = 30", "speed-limit = 1024", "speed-time = 60"] {
+    for bound in ["connect-timeout = 30", "speed-limit = 1024", "speed-time = 60", "retry = 3", "retry-max-time = 20"] {
         assert!(curlrc.lines().any(|line| line == bound), "{bound} isn't in the .curlrc: {curlrc}");
     }
     let (subshell, tail) = install_subshell(&script);
@@ -132,4 +132,28 @@ fn test_saved_and_edited_installs_run_with_the_stall_bounds_as_written() {
         Some(rust_analyzer.as_str()),
         "the saved pre-SME-360 install no longer re-derives"
     );
+}
+
+/// The `.curlrc`'s whole-number setting `name`.
+fn curlrc_setting(name: &str) -> u64 {
+    include_str!("../curlrc")
+        .lines()
+        .find_map(|line| line.strip_prefix(name)?.trim_start().strip_prefix('=')?.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no {name} in the .curlrc"))
+}
+
+/// SME-466: curl's retry never follows a timeout, so a download that was
+/// cut off after some of its body went into `tar` is never sent again
+/// (the Driver's Q5): its earliest timeout is `connect-timeout` in, and
+/// it starts no retry once `retry-max-time` has passed. And its worst
+/// case stays far inside the install bound: the retries start within
+/// `retry-max-time`, and the last one has its own connects (a redirect
+/// hop's too) and the low-speed time.
+#[test]
+fn test_curls_retries_never_follow_a_timeout_and_stay_inside_the_install_bound() {
+    let (connect, speed, max) = (curlrc_setting("connect-timeout"), curlrc_setting("speed-time"), curlrc_setting("retry-max-time"));
+    assert!(max < connect.min(speed), "a timed-out download could be retried into the same pipe");
+    assert!(curlrc_setting("retry") >= 1);
+    let worst = std::time::Duration::from_secs(max + 2 * connect + speed);
+    assert!(worst * 4 < INSTALL_TIMEOUT, "curl's worst case, {} s, isn't well inside the install bound", worst.as_secs());
 }

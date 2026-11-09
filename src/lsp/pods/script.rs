@@ -52,7 +52,21 @@ pub(super) const INSTALL_RC_FILE: &str = "install.rc";
 /// isn't used, and that install's curl runs with the user's file and
 /// without these bounds (SME-456 review 1). A `.curlrc` the install
 /// writes itself, once it has started, is still hidden by this one.
-/// No `--retry`: curl can't rewind a body it already piped into `tar`.
+///
+/// It retries what fails before any of the body (SME-466: GitHub's
+/// release download answered 504 once, and the install failed on it):
+/// `retry = 3`, at curl's own 1, 2 and 4 s backoff, for an HTTP 408, 429
+/// or 5xx. Never after a timeout, though curl would: it can't rewind a
+/// body it already piped into `tar`, and a retry then feeds `tar` a
+/// second copy after half the first (measured: `gzip: stdin: invalid
+/// compressed data--format violated`). `retry-max-time = 20` lets it
+/// start no retry 20 s after the first try, and its earliest timeout is
+/// `connect-timeout`'s 30 s, so a timeout is never retried: a body cut
+/// off mid-way fails after one GET with `(28) Operation too slow`
+/// (measured at 66 s), and the stalls above end as before (30 s, 60 s).
+/// Worst case for one curl: retries starting within 20 s, the last one
+/// with its own two connects (a redirect hop's too) and the low-speed
+/// time: 20 + 2 × 30 + 60 = 140 s, inside `INSTALL_TIMEOUT`.
 const CURL_STALL_BOUNDS: &str = include_str!("curlrc");
 
 /// The `CURL_HOME` the install's curl reads `CURL_STALL_BOUNDS` from, in

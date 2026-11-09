@@ -171,3 +171,88 @@ async fn test_a_github_download_ends_on_a_tls_handshake_that_never_answers() {
     assert!(ran.took < std::time::Duration::from_secs(80), "took {} s", ran.took.as_secs());
     assert!(ran.held.expect("read /tmp/held").lines().count() >= 1, "curl never reached the server");
 }
+
+/// A release server on `127.0.0.1:8081` inside the server pod, serving a
+/// real `tool.tar.gz` (built in the pod: `tool` and 300 KB of noise) at
+/// any path, and logging each GET to `/tmp/held`. Its first GET of a path
+/// under `/504/` is answered 504; its first GET under `/cut/` gets a 200
+/// with the full length, half the body, then nothing. Every other GET
+/// gets the whole file. Then `install`.
+fn release_server(install: &str) -> String {
+    format!(
+        r#"set -e
+mkdir -p /tmp/pkg && head -c 300000 /dev/urandom > /tmp/pkg/blob && printf '#!/bin/sh\n' > /tmp/pkg/tool
+tar -czf /tmp/tool.tar.gz -C /tmp/pkg tool blob
+cat > /tmp/release.py <<'EOF'
+import http.server, socketserver, time
+body = open('/tmp/tool.tar.gz', 'rb').read()
+seen = set()
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    def log_message(self, *a):
+        pass
+    def do_GET(self):
+        first = self.path not in seen
+        seen.add(self.path)
+        with open('/tmp/held', 'a') as f:
+            f.write('GET %s\n' % self.path)
+        if first and self.path.startswith('/504/'):
+            self.send_response(504)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        if first and self.path.startswith('/cut/'):
+            self.wfile.write(body[:len(body) // 2])
+            self.wfile.flush()
+            time.sleep(3600)
+            return
+        self.wfile.write(body)
+class S(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+s = S(('127.0.0.1', 8081), H)
+open('/tmp/release.ready', 'w').close()
+s.serve_forever()
+EOF
+python3 /tmp/release.py > /dev/null 2>&1 &
+i=0
+until [ -e /tmp/release.ready ]; do i=$((i+1)); [ $i -lt 100 ] || exit 9; sleep 0.1; done
+{install}"#
+    )
+}
+
+/// SME-466: GitHub's release download answered 504 once, and the
+/// catalog's `curl -fsSL … | tar -xz` failed the whole install on it
+/// (CI's `curl: (22) The requested URL returned error: 504`). curl now
+/// retries an error that comes before any of the body, and the install
+/// goes through.
+#[tokio::test]
+async fn test_a_github_download_rides_out_a_504() {
+    let install = release_server(&release_install("http://127.0.0.1:8081/504/"));
+    let ran = run_in_golang_pod("curl504", install, std::time::Duration::from_secs(60)).await;
+    let held = ran.held.expect("read /tmp/held");
+    eprintln!("after {} s: {:?}; the server saw:\n{held}", ran.took.as_secs(), ran.result);
+    ran.result.expect("an install through one 504 failed");
+    assert_eq!(held.lines().count(), 2, "not one 504 and one retry: {held}");
+}
+
+/// SME-466, the Driver's Q5: a download cut off mid-body is never
+/// retried, since a retry would feed a second copy into the `tar` that
+/// already has half the first. curl retries a timeout too, and its
+/// earliest is 30 s in (`connect-timeout`), while `retry-max-time` lets
+/// it start no retry after 20 s: the install fails with curl's own error
+/// after one GET.
+#[tokio::test]
+async fn test_a_github_download_cut_off_midway_is_never_fed_twice() {
+    let install = release_server(&release_install("http://127.0.0.1:8081/cut/"));
+    let ran = run_in_golang_pod("curlcut", install, std::time::Duration::from_secs(120)).await;
+    let held = ran.held.expect("read /tmp/held");
+    let error = ran.result.expect_err("a download cut off midway finished");
+    eprintln!("after {} s the install said: {error:?}; the server saw:\n{held}", ran.took.as_secs());
+    assert!(error.starts_with("The install failed (exit "), "{error}");
+    assert!(error.contains("curl: (28) Operation too slow"), "{error}");
+    assert_eq!(held.lines().count(), 1, "the cut-off download was retried into the same tar: {held}");
+    assert!(ran.took < std::time::Duration::from_secs(110), "took {} s", ran.took.as_secs());
+}
