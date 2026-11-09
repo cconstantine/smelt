@@ -154,19 +154,15 @@ pub(super) fn summary_max_tokens(turn_model: &crate::providers::TurnModel, reque
     tokens
 }
 
-/// What an HTTP kind's cut-off summary gets appended with on save
-/// (SME-393), whichever stop cut it — `SUMMARY_MAX_TOKENS` or the
-/// context window (`is_cut_off`) — so the marker's wording names the
-/// truncation, not a cause. The save itself is PR #291's decision —
-/// failing every summary that reaches the cap would fail every send of
-/// a long conversation — but a narration that stops mid-sentence must
-/// not read as a complete record: 2294639622's seat completed the
-/// cut-off sentence with fabrications 16 s after the cut.
+/// What the one continuation (SME-443) asks for: exactly what follows
+/// the text above, never a repeat of it — the join is verbatim (Q3
+/// decided). The request ends on `user`, so no provider needs prefill
+/// support: a request *ending* on a partial assistant is the prefill
+/// case; continuing on a trailing assistant message is the normal shape.
 #[cfg(feature = "server")]
-pub(super) const SUMMARY_CUT_OFF_MARKER: &str = "\n\n[note: this summary is cut off mid-sentence — \
-    what came after the cut was never written. The state it was reaching for is \
-    unknown, not settled: verify it with a tool call before acting on it, and always before \
-    overwriting, discarding or resetting work.]";
+pub(super) const SUMMARY_CONTINUE_PROMPT: &str = "Continue the summary exactly where it stopped. \
+    Write only what follows the text above, never repeat it; keep the same record and the \
+    Done/Planned rule.";
 
 /// Runs one compaction pass: summarizes everything currently persisted (up
 /// through and including whatever's pending — the size trigger fired
@@ -300,8 +296,10 @@ async fn compact(
 
 /// The summarization call itself: a plain, tools-less request over the
 /// transcript, in its own recorder (a refused attempt is recorded by
-/// its drop, SME-178). Answers with the summary's text, or with the
-/// typed error so the caller can answer an overflow (SME-73).
+/// its drop, SME-178). Answers with the summary's text — for an HTTP
+/// kind, after the one continuation its budget cut-off gets (SME-443),
+/// marked where it honestly stopped — or with the typed error so the
+/// caller can answer an overflow (SME-73).
 async fn summarize(
     pool: &PgPool,
     conversation_id: i64,
@@ -316,31 +314,14 @@ async fn summarize(
     );
     let request_chars = prompt.chars().count();
 
-    let summarization_request = anthropic::CreateMessageRequest {
-        model: turn_model.model.clone(),
-        // HTTP kinds send the room-derived budget (SME-443); Claude Code
-        // keeps the constant — its cap already carries the thinking that
-        // can't be turned off (`once::THINKING_ROOM`), and SME-431 checks
-        // its summary rather than growing it.
-        max_tokens: if turn_model.kind == crate::providers::ProviderKind::ClaudeCli {
-            SUMMARY_MAX_TOKENS
-        } else {
-            summary_max_tokens(turn_model, request_chars)
-        },
-        system: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
-        messages: vec![anthropic::AnthropicMessage {
+    let summarization_request = summary_request(
+        turn_model,
+        vec![anthropic::AnthropicMessage {
             role: "user".to_string(),
-            content: vec![anthropic::ContentBlock::Text { text: prompt }],
+            content: vec![anthropic::ContentBlock::Text { text: prompt.clone() }],
         }],
-        stream: true,
-        tools: vec![],
-        thinking: None,
-        prompt_caching: false,
-        output_config: None,
-        // Thinking off, said so a llama.cpp template doesn't reason
-        // anyway and spend the summary's tokens on it (SME-111).
-        chat_template_kwargs: turn_model.chat_template_kwargs(false),
-    };
+        request_chars,
+    );
 
     let mut discard_deltas = |_: &str| {};
     let recorder =
@@ -357,26 +338,118 @@ async fn summarize(
     // not the summary is saved below (SME-106). One stopped or failed
     // before then is recorded by the recorder's drop (SME-178).
     recorder.finish(&turn, None).await.map_err(|e| anthropic::stream::ModelError::Other(e.to_string()))?;
-    let summary = turn
-        .content
-        .into_iter()
+    let summary = summary_text(&turn);
+    // On Claude Code, an empty or cut-off summary fails the compaction
+    // rather than replace the history (PR #291 review 1 M1) — an HTTP
+    // kind's decisions follow beside `checked` (SME-443).
+    let summary = crate::claude_cli::summary::checked(turn_model.kind, summary, &turn.stop_reason)?;
+    if turn_model.kind == crate::providers::ProviderKind::ClaudeCli {
+        return Ok(summary);
+    }
+    match crate::claude_cli::summary::http_first(summary, &turn.stop_reason) {
+        crate::claude_cli::summary::HttpStep::Save(text) | crate::claude_cli::summary::HttpStep::SaveMarked(text) => Ok(text),
+        // The one continuation — an `if`, not a loop: a compaction can
+        // at most ask twice, so it can never spin (the plan's 2c).
+        crate::claude_cli::summary::HttpStep::Continue(part1) => {
+            continue_summary(pool, conversation_id, turn_model, slot, &prompt, &part1).await
+        }
+    }
+}
+
+/// The summarization request shape (SME-443): tools-less, thinking off,
+/// and on HTTP kinds the room-derived budget. The first call and its one
+/// continuation differ only in their messages — and in the request's
+/// size, which the budget is derived from.
+#[cfg(feature = "server")]
+fn summary_request(
+    turn_model: &crate::providers::TurnModel,
+    messages: Vec<anthropic::AnthropicMessage>,
+    request_chars: usize,
+) -> anthropic::CreateMessageRequest {
+    anthropic::CreateMessageRequest {
+        model: turn_model.model.clone(),
+        // HTTP kinds send the room-derived budget (SME-443); Claude Code
+        // keeps the constant — its cap already carries the thinking that
+        // can't be turned off (`once::THINKING_ROOM`), and SME-431 checks
+        // its summary rather than growing it.
+        max_tokens: if turn_model.kind == crate::providers::ProviderKind::ClaudeCli {
+            SUMMARY_MAX_TOKENS
+        } else {
+            summary_max_tokens(turn_model, request_chars)
+        },
+        system: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
+        messages,
+        stream: true,
+        tools: vec![],
+        thinking: None,
+        prompt_caching: false,
+        output_config: None,
+        // Thinking off, said so a llama.cpp template doesn't reason
+        // anyway and spend the summary's tokens on it (SME-111).
+        chat_template_kwargs: turn_model.chat_template_kwargs(false),
+    }
+}
+
+/// The reply's first text block — thinking is narration for the model
+/// alone, never the saved record (SME-443: a strata-style body leads
+/// with reasoning; only its Text is the summary).
+#[cfg(feature = "server")]
+fn summary_text(turn: &anthropic::stream::StreamedTurn) -> String {
+    turn.content
+        .iter()
         .find_map(|block| match block {
-            anthropic::ContentBlock::Text { text } => Some(text),
+            anthropic::ContentBlock::Text { text } => Some(text.clone()),
             _ => None,
         })
-        .unwrap_or_default();
-    // On Claude Code, an empty or cut-off summary fails the compaction
-    // rather than replace the history (PR #291 review 1 M1).
-    let summary = crate::claude_cli::summary::checked(turn_model.kind, summary, &turn.stop_reason)?;
-    // An HTTP kind's cut-off summary saves — PR #291's decision, kept —
-    // but since SME-393 it saves *marked*: on 2294639622 an unmarked
-    // mid-sentence save read as complete, and 16 s later the seat had
-    // "assigned" a PR and a CI run that were never made, finishing the
-    // truncated sentence as fact.
-    if turn_model.kind != crate::providers::ProviderKind::ClaudeCli
-        && anthropic::stream::is_cut_off(&turn.stop_reason)
-    {
-        return Ok(format!("{summary}{}", SUMMARY_CUT_OFF_MARKER));
-    }
-    Ok(summary)
+        .unwrap_or_default()
+}
+
+/// The one continuation an HTTP kind's budget-cut summary gets
+/// (SME-443): same system prompt and thinking-off flags, messages
+/// `[user(prompt), assistant(part1), user(SUMMARY_CONTINUE_PROMPT)]` —
+/// ending on `user`, so no provider needs prefill support — and a
+/// freshly derived budget for the larger request. Its own recorder, so
+/// its cost is its own `compaction` usage row (SME-106). An overflow
+/// here propagates as from any mid-compaction failure: `compact`'s
+/// overflow arm wraps only the first call, and the turn fails with the
+/// history intact — 2c's bound.
+async fn continue_summary(
+    pool: &PgPool,
+    conversation_id: i64,
+    turn_model: &crate::providers::TurnModel,
+    slot: anthropic::stream::SlotPolicy<'_>,
+    prompt: &str,
+    part1: &str,
+) -> Result<String, anthropic::stream::ModelError> {
+    let message = |role: &str, text: &str| anthropic::AnthropicMessage {
+        role: role.to_string(),
+        content: vec![anthropic::ContentBlock::Text { text: text.to_string() }],
+    };
+    let request_chars = prompt.chars().count() + part1.chars().count() + SUMMARY_CONTINUE_PROMPT.chars().count();
+    let continuation_request = summary_request(
+        turn_model,
+        vec![
+            message("user", prompt),
+            message("assistant", part1),
+            message("user", SUMMARY_CONTINUE_PROMPT),
+        ],
+        request_chars,
+    );
+    let mut discard_deltas = |_: &str| {};
+    let recorder =
+        CallRecorder::new(pool, conversation_id, turn_model, db::ModelCallKind::Compaction, &continuation_request);
+    let turn = super::call::stream_for_kind(
+        conversation_id, turn_model,
+        &continuation_request,
+        &mut discard_deltas,
+        recorder.meter(),
+        slot,
+    )
+    .await?;
+    // Recorded as soon as it completes: the tokens are spent whether or
+    // not the join is saved (SME-106).
+    recorder.finish(&turn, None).await.map_err(|e| anthropic::stream::ModelError::Other(e.to_string()))?;
+    Ok(match crate::claude_cli::summary::http_continued(part1, summary_text(&turn), &turn.stop_reason) {
+        crate::claude_cli::summary::ContinuedStep::Save(text) | crate::claude_cli::summary::ContinuedStep::SaveMarked(text) => text,
+    })
 }

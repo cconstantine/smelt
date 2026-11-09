@@ -6,6 +6,8 @@
 //! and logs every request parsed, so the summary call's `max_tokens`, the
 //! continuation's message shape and the exact join are pinned on the wire.
 
+use super::overflow::compaction_summaries;
+use super::text_calls::{text_blocks_body, Block};
 use super::*;
 
 /// A conversation already past the compaction ceiling on the mock's default
@@ -127,4 +129,88 @@ async fn test_the_summary_budget_grows_with_the_room(pool: PgPool) {
         Some(8_192),
         "the summary asks for the room-derived ceiling, not a fixed 2,048 (SME-443)"
     );
+}
+
+/// A2: an HTTP summary cut off at its budget is continued **once**, and
+/// the join saves whole — verbatim, no separator, no marker (SME-443;
+/// Q3 decided the verbatim join). *Expected red before the fix: two
+/// requests, saved text = part1 + marker.*
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_cut_off_summary_is_continued_once_and_saved_whole(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation_id = conversation_past_the_trigger(&pool).await;
+    // Mid-sentence at the cap, the strata shape: half a Planned line.
+    let part1 = "Done: split the file, proof green. Planned: conti";
+    let rest = "nue once, then refuse the unusable.";
+    let cut = text_reply_body(part1).replace(r#""stop_reason":"end_turn""#, r#""stop_reason":"max_tokens""#);
+    assert!(cut.contains("max_tokens"), "shape guard: the summary is cut off: {cut}");
+    let requests = start_recording_mock_upstream(&pool, vec![
+        cut,
+        text_reply_body(rest),
+        text_reply_body("Carrying on."),
+    ])
+    .await;
+
+    run_turn(&pool, conversation_id, hello())
+        .await
+        .expect("the continuation saves the summary whole and the turn carries on");
+
+    let requests = requests.lock().expect("the request log");
+    assert_eq!(requests.len(), 3, "summary, continuation, then the real turn");
+    let msgs = requests[1]["messages"].as_array().expect("the continuation's messages");
+    let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().expect("a role")).collect();
+    assert_eq!(roles, ["user", "assistant", "user"], "the request ends on user — no prefill (SME-443)");
+    assert_eq!(msgs[1]["content"][0]["text"].as_str(), Some(part1), "part 1 rides as the assistant message");
+    assert!(
+        msgs[2]["content"][0]["text"].as_str().unwrap_or_default().contains("never repeat it"),
+        "the condition prompt is the third message: {:?}",
+        msgs[2]
+    );
+    assert_eq!(requests[1]["max_tokens"].as_u64(), Some(8_192), "the continuation gets a fresh derived budget");
+    drop(requests);
+
+    let saved = compaction_summaries(&pool, conversation_id).await;
+    assert_eq!(saved.len(), 1, "one divider");
+    assert_eq!(saved[0], format!("{part1}{rest}"), "the verbatim join, no separator (Q3 decided)");
+}
+
+/// A4: the strata shape — thinking spent the budget, the text stopped
+/// mid-record — gets room on the first call and the one continuation;
+/// thinking blocks are never saved, only the first Text (SME-443).
+/// *Expected red before the fix: saved = part1 + marker, 2 requests.*
+/// (The plan's `with_usage(…, output 2048)` on this body would only
+/// change what the recorder stores, not any decision here, so the
+/// body keeps its own usage — `text_blocks_body` builds it.)
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_summary_that_spends_its_budget_on_reasoning_gets_room_and_continuation(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation_id = conversation_past_the_trigger(&pool).await;
+    let part1 = "The session so far: goal fixed, tests";
+    let rest = " green at the tip.";
+    let cut = text_blocks_body(
+        &[Block::Thinking("lots of reasoning about the fix"), Block::Text(part1)],
+        "max_tokens",
+    );
+    let requests = start_recording_mock_upstream(&pool, vec![
+        cut,
+        text_reply_body(rest),
+        text_reply_body("Carrying on."),
+    ])
+    .await;
+
+    run_turn(&pool, conversation_id, hello())
+        .await
+        .expect("the reasoning-only head still gets its continuation");
+
+    let requests = requests.lock().expect("the request log");
+    assert_eq!(requests.len(), 3, "summary, continuation, turn");
+    assert_eq!(requests[0]["max_tokens"].as_u64(), Some(8_192), "the first call asked for the room");
+    drop(requests);
+
+    let saved = compaction_summaries(&pool, conversation_id).await;
+    assert_eq!(saved.len(), 1, "one divider");
+    assert_eq!(saved[0], format!("{part1}{rest}"), "first Text only, joined verbatim: {saved:?}");
+    assert!(!saved[0].contains("reasoning"), "thinking blocks are never saved: {saved:?}");
 }

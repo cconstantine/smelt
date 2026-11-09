@@ -245,15 +245,15 @@ fn tool_result(id: &str, content: &str) -> anthropic::ContentBlock {
     }
 }
 
-/// 2294639622's trigger: an HTTP-kind summary cut off at
-/// `SUMMARY_MAX_TOKENS` still replaces the history — PR #291's decision,
-/// kept; failing it would fail every send of a long conversation — but
-/// since SME-393 it no longer saves unmarked: the seat after the cut must
-/// be able to see the narration is truncated, not complete the last
-/// sentence as fact.
+/// 2294639622's trigger, after SME-443: an HTTP-kind summary cut off at
+/// its budget is continued once — and when that continuation ends its
+/// turn with nothing more to say, what the first call wrote still saves,
+/// marked (PR #291's decision kept for the truncation itself; SME-393's
+/// marker makes the seat see it). The marker stays reason-neutral.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_a_cut_off_http_summary_saves_marked(pool: PgPool) {
+async fn test_a_cut_off_http_summary_still_saves_marked_when_the_continuation_is_done(pool: PgPool) {
     use super::overflow::compaction_summaries;
+    use super::text_calls::text_blocks_body;
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
@@ -286,25 +286,53 @@ async fn test_a_cut_off_http_summary_saves_marked(pool: PgPool) {
     .await
     .expect("seed usage");
     // Cut off at the cap mid-claim, like 2294639622's last summary ("Fix
-    // stack (5 commits, all with exact `Co-Authored-By: …`").
+    // stack (5 commits, all with exact `Co-Authored-By: …`"); the
+    // continuation ends its turn empty — the model says it is done.
     let cut = text_reply_body("Fix stack (5 commits, all with exact trailer")
         .replace(r#""stop_reason":"end_turn""#, r#""stop_reason":"max_tokens""#);
     assert!(cut.contains("max_tokens"), "shape guard: the summary is cut off at the cap: {cut}");
-    start_recording_mock_upstream(&pool, vec![cut, text_reply_body("Carrying on.")]).await;
+    let requests = start_recording_mock_upstream(&pool, vec![
+        cut,
+        text_blocks_body(&[], "end_turn"),
+        text_reply_body("Carrying on."),
+    ])
+    .await;
 
     run_turn(&pool, conversation.id, hello())
         .await
-        .expect("the cut-off summary saves and the turn carries on");
+        .expect("the marked save stands and the turn carries on");
 
+    // The continuation was asked — pinned on its shape, not a count an
+    // old-code nudge can fake: this request must carry part 1.
+    let requests = requests.lock().expect("the request log");
+    let msgs = requests[1]["messages"].as_array().expect("the continuation's messages");
+    let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().expect("a role")).collect();
+    assert_eq!(roles, ["user", "assistant", "user"], "the request ends on user — no prefill (SME-443)");
+    assert_eq!(
+        msgs[1]["content"][0]["text"].as_str(),
+        Some("Fix stack (5 commits, all with exact trailer"),
+        "the continuation carries part 1 (SME-443)"
+    );
+    assert!(
+        msgs[2]["content"][0]["text"].as_str().unwrap_or_default().contains("never repeat it"),
+        "the condition prompt is the third message: {:?}",
+        msgs[2]
+    );
+    assert_eq!(requests.len(), 3, "summary, continuation, turn");
+    drop(requests);
     let saved = compaction_summaries(&pool, conversation.id).await;
-    assert_eq!(saved.len(), 1, "the cut-off summary still saves (PR #291's decision)");
+    assert_eq!(saved.len(), 1, "one divider: the cut-off part still saves (PR #291's decision)");
     assert!(
         saved[0].starts_with("Fix stack (5 commits, all with exact trailer"),
         "the text that made it saves as it is: {saved:?}"
     );
     assert!(
         saved[0].contains("cut off") && saved[0].contains("mid-sentence"),
-        "marked where it stopped, so the seat sees the truncation (SME-393): {saved:?}"
+        "the continuation declared itself done, so the truncation stays marked (SME-393): {saved:?}"
+    );
+    assert!(
+        !saved[0].to_lowercase().contains("reply cap"),
+        "the marker names the truncation, not a cause this save doesn't have (SME-393 L1): {saved:?}"
     );
 }
 

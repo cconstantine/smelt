@@ -207,31 +207,40 @@ async fn test_the_clis_reported_window_is_learned(pool: PgPool) {
     assert_eq!((window, cap), (Some(200_000), Some(64_000)));
 }
 
-/// The summary check is the Claude Code kind's only (the user's Q1, PR
-/// #291): on an HTTP kind a summary cut off at `SUMMARY_MAX_TOKENS` is
-/// still saved, since hosted models' summaries do reach that cap and
-/// failing them would fail every send of a long conversation — and since
-/// SME-393 the save carries a marker where it stopped (the marker itself
-/// is tested in `turn::tests::compaction_honesty`).
+/// The summary check grew (SME-443): an HTTP kind's cut-off summary is
+/// no longer saved as it is — it gets one continuation and saves whole,
+/// unmarked. This test was the live guard of the old save-marked
+/// decision (the refusal-retry shape around it is what it tests); the
+/// empty and still-cut-off refusals follow in `turn::tests::
+/// compaction_budget`.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_an_http_kinds_cut_off_summary_is_saved(pool: PgPool) {
+async fn test_an_http_kinds_cut_off_summary_is_continued_once(pool: PgPool) {
     use super::super::overflow::{compaction_summaries, start_refusal_mock, too_long};
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let _guard = lock_turn_tests();
     let cut = super::super::text_reply_body("Summary: it was").replace(r#""stop_reason":"end_turn""#, r#""stop_reason":"max_tokens""#);
     assert!(cut.contains("max_tokens"), "the summary is cut off: {cut}");
-    let upstream = start_refusal_mock(&pool, vec![too_long(120_000, 131_072), Ok(cut), Ok(super::super::text_reply_body("Done now."))]).await;
+    let upstream = start_refusal_mock(&pool, vec![
+        too_long(120_000, 131_072),
+        Ok(cut),
+        Ok(super::super::text_reply_body(" written the whole record.")),
+        Ok(super::super::text_reply_body("Done now.")),
+    ])
+    .await;
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     db::create_message(&pool, conversation.id, "user", &[anthropic::ContentBlock::Text { text: "earlier".to_string() }]).await.expect("seed");
     db::create_message(&pool, conversation.id, "assistant", &[anthropic::ContentBlock::Text { text: "reply".to_string() }]).await.expect("seed");
 
-    run_turn(&pool, conversation.id, hello()).await.expect("the cut-off summary is saved and the turn carries on");
+    run_turn(&pool, conversation.id, hello()).await.expect("the continued summary is saved and the turn carries on");
 
-    assert_eq!(upstream.count(), 3, "refusal, summary, retry");
+    assert_eq!(upstream.count(), 4, "refusal, summary, continuation, retry");
     let saved = compaction_summaries(&pool, conversation.id).await;
-    assert_eq!(saved.len(), 1, "still saved — the decision this test was written for");
-    assert!(saved[0].starts_with("Summary: it was"), "the text that made it saves as it is: {saved:?}");
-    assert!(saved[0].contains("cut off"), "…and says where it stopped (SME-393): {saved:?}");
+    assert_eq!(saved.len(), 1, "one divider");
+    assert_eq!(
+        saved[0],
+        "Summary: it was written the whole record.",
+        "continued once and saved whole — no marker (SME-443): {saved:?}"
+    );
 }
 
 /// A summary stopped by the window (`model_context_window_exceeded`, the
