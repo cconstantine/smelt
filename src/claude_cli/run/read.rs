@@ -10,8 +10,20 @@ impl Run {
     /// The next line from the CLI, the bridge's calls taken as they come.
     pub(super) async fn next_event(&mut self) -> Result<Value, String> {
         loop {
-            tokio::select! {
-                Some(parked) = self.bridge.calls.recv() => self.take_call(parked),
+            // Lines before calls, once both wait (SME-447): a line may be
+            // the CLI's local refusal of a name it was never given, and
+            // reading it is what lets the *next* reply's bridge call be
+            // held for its result rather than refused as a stray (review 1
+            // L1) — taking that call first would judge it while the slip's
+            // un-taken result still fills `answers`, which is the very test
+            // L1 reads as "the CLI is still making that reply's calls". The
+            // order is the CLI's own: it writes a refusal echo to stdout
+            // before it makes its own next API call, so a call racing its
+            // echo's line was written after it, and reading the line first
+            // is the order reality gives. A call then waits only until the
+            // next poll with nothing left to read; the quiet-stdout case is
+            // unaffected.
+            tokio::select! { biased;
                 line = tokio::time::timeout(silence(), self.lines.next_line()) => {
                     let line = match line {
                         Err(_) => {
@@ -50,6 +62,7 @@ impl Run {
                         return Ok(value);
                     }
                 }
+                Some(parked) = self.bridge.calls.recv() => self.take_call(parked),
             }
         }
     }
@@ -90,9 +103,35 @@ impl Run {
                     return Err("Claude Code couldn't connect to smelt's tools, so smelt stopped the call rather than let it run without them. Send another message to try again; if this keeps happening, the server's log says why.".to_string());
                 }
                 Some("user") => {
-                    if let Some(id) = self.answered_by_the_cli(&event) {
+                    let answers = self.answered_by_the_cli(&event);
+                    // An answer to a call of a name the CLI was given, or
+                    // an echo with no `init` list to check: its context and
+                    // smelt's no longer agree (review 1 L2).
+                    if let Some(id) = answers.iter().find_map(|a| match a {
+                        CliAnswered::Diverged { id } => Some(id),
+                        CliAnswered::Slip { .. } => None,
+                    }) {
                         self.healthy = false;
                         return Err(format!("Claude Code answered tool call {id} itself, so its context and smelt's no longer agree; smelt stopped the call. Send another message to carry on from smelt's record."));
+                    }
+                    // A name the CLI was never given is its own local
+                    // unknown-name refusal (SME-447): the slip an HTTP kind
+                    // gets smelt's correction for. Warn — never quoting the
+                    // CLI's wording, which changes between versions — and
+                    // carry on reading: the reply's call goes through
+                    // `run_tools` and counts toward the shared unknown-name
+                    // bound, as on HTTP.
+                    for answer in answers {
+                        if let CliAnswered::Slip { id, name } = answer {
+                            // The answer `send_tail` queued for it waits on
+                            // a bridge call the CLI will never make: drop it,
+                            // so `answers` keeps meaning "results the CLI may
+                            // still take" — a stale entry there makes a real
+                            // call arriving mid-`stream` read as a stray
+                            // (review 1 L1). The record carries the correction.
+                            self.answers.remove(&id);
+                            tracing::warn!(conversation_id = self.conversation_id, tool_use_id = %id, tool = %name, "Claude Code refused a call to a name it was never given; smelt carries on and answers it from its own record");
+                        }
                     }
                 }
                 Some("result") => {
@@ -114,14 +153,34 @@ impl Run {
         }
     }
 
-    /// The id of a call of the parked reply that the CLI's echoed
-    /// `tool_result` answers though smelt never did (review 1 L2).
-    pub(super) fn answered_by_the_cli(&self, event: &Value) -> Option<String> {
-        event["message"]["content"].as_array()?.iter().find_map(|block| {
-            let id = block["tool_use_id"].as_str()?;
-            let ours = self.expected.iter().any(|e| e.id == id);
-            (block["type"] == "tool_result" && ours && !self.answered.contains(id)).then(|| id.to_string())
-        })
+    /// The CLI's echoed `tool_result`s for calls of the parked reply that
+    /// smelt never answered, one per block — the CLI can echo several in
+    /// one event, and now that a slip carries on, a second block must not
+    /// hide behind the first (review 1 L2, SME-447).
+    pub(super) fn answered_by_the_cli(&self, event: &Value) -> Vec<CliAnswered> {
+        let Some(blocks) = event["message"]["content"].as_array() else { return Vec::new() };
+        blocks
+            .iter()
+            .filter_map(|block| {
+                if block["type"] != "tool_result" {
+                    return None;
+                }
+                let id = block["tool_use_id"].as_str()?;
+                let ours = self.expected.iter().find(|e| e.id == id)?;
+                if self.answered.contains(id) {
+                    return None;
+                }
+                // The name decides, never the wording: what the CLI runs is
+                // what its `init` listed, `bridge::register`'s form of each
+                // smelt name — and of the names it never registered, which
+                // keep the model's own spelling and so match nothing.
+                Some(if self.cli_tools.as_ref().is_some_and(|list| !list.contains(&crate::claude_cli::bridge::cli_tool_name(&ours.name))) {
+                    CliAnswered::Slip { id: id.to_string(), name: ours.name.clone() }
+                } else {
+                    CliAnswered::Diverged { id: id.to_string() }
+                })
+            })
+            .collect()
     }
 
     /// The window and reply cap a `result` reports for the run's model
@@ -142,6 +201,17 @@ impl Run {
     pub(super) fn note(&mut self, event: &Value) {
         match (event["type"].as_str(), event["subtype"].as_str()) {
             (Some("rate_limit_event"), _) => self.rate = Some(RateLimit::from_event(event)),
+            (Some("system"), Some("init")) => {
+                // What this process's CLI says it can call (SME-447), in its
+                // own `mcp__smelt__…` forms — the one list a refusal echo is
+                // judged against. No array of strings: leave what's there,
+                // uncheckable staying today's loud divergence.
+                if let Some(tools) = event["tools"].as_array()
+                    && let Some(names) = tools.iter().map(|t| t.as_str()).collect::<Option<Vec<&str>>>()
+                {
+                    self.cli_tools = Some(names.into_iter().map(str::to_string).collect());
+                }
+            }
             (Some("system"), Some("api_retry")) => {
                 tracing::info!(attempt = event["attempt"].as_i64(), error = event["error"].as_str(), "Claude Code is retrying an API call");
             }
@@ -259,6 +329,18 @@ pub(in crate::claude_cli) fn apply(blocks: &mut Blocks, stop_reason: &mut String
         }
     }
     Ok(())
+}
+
+/// What an echoed `tool_result` for an expected call smelt never answered
+/// is (SME-447): `Slip`, the CLI's own local refusal of a name it was never
+/// given — the same mistake an HTTP kind gets smelt's unknown-call
+/// correction for, so the turn carries on and the shared bound counts it;
+/// or `Diverged`, an answer to a call the CLI was given, or an echo with no
+/// `init` tool list to check against, where the two contexts no longer
+/// agree (review 1 L2, unchanged).
+pub(super) enum CliAnswered {
+    Slip { id: String, name: String },
+    Diverged { id: String },
 }
 
 /// Whether a `result` says the session to resume doesn't exist, as the

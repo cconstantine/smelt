@@ -292,6 +292,12 @@ struct Run {
     held: Vec<ParkedCall>,
     /// Whether it was given smelt's tools (an `--mcp-config`).
     has_tools: bool,
+    /// The tool names the CLI's `init` listed as callable, in the CLI's own
+    /// `mcp__smelt__…` forms (SME-447): an echoed `tool_result` for a name
+    /// not in it can only be the CLI's local unknown-name refusal, judged
+    /// by name and never by wording. `None` till one is seen — an
+    /// uncheckable echo stays today's divergence.
+    cli_tools: Option<std::collections::HashSet<String>>,
     /// The conversation it's a turn of.
     conversation_id: i64,
     /// How this call failed, if it did.
@@ -663,6 +669,7 @@ impl Run {
             failure: Failure::Diverged,
             conversation_id,
             has_tools: !request.tools.is_empty(),
+            cli_tools: None,
             held: Vec::new(),
             session_id: String::new(),
             resumed: false,
