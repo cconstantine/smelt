@@ -268,7 +268,7 @@ async fn test_a_turns_reply_budget_grows_with_the_room_left(pool: PgPool) {
 
     let requests = requests.lock().expect("the request log");
     assert_eq!(requests.len(), 3, "a compaction, then two turns");
-    assert_eq!(requests[0]["max_tokens"], 2048, "the summary's own");
+    assert_eq!(requests[0]["max_tokens"], 8_192, "the summary's own: room-derived from the 262k window, held to the ceiling (SME-443)");
     assert_eq!(requests[1]["max_tokens"], 131_072, "half the window, after compacting: {}", requests[1]["max_tokens"]);
     // 262,144 - (40,010 measured + "hello") - 4,096 of headroom.
     let second = requests[2]["max_tokens"].as_u64().expect("a number");

@@ -112,9 +112,47 @@ pub(super) async fn describe_live_state(pool: &PgPool, conversation_id: i64) -> 
     }
 }
 
-/// The most a summary may write.
+/// The most a summary may write (floor of the derived budget since
+/// SME-443 — `summary_max_tokens` sends HTTP kinds more when their window
+/// leaves room; Claude Code keeps this constant, `claude_cli::once` adding
+/// its `THINKING_ROOM` on top).
 #[cfg(feature = "server")]
 pub(super) const SUMMARY_MAX_TOKENS: u32 = 2048;
+
+/// The ceiling of a room-derived summary budget (SME-443): 4× the floor,
+/// ~3% of a 262k window, and below current models' own output caps —
+/// which `summary_max_tokens` clamps to anyway, Anthropic 400s above them.
+/// Decided (Driver) Q1, 2026-11-09; the ticket's cap-report measurement can
+/// revise it before merge.
+#[cfg(feature = "server")]
+pub(super) const SUMMARY_MAX_TOKENS_CEILING: u32 = 8_192;
+
+/// The summary call's `max_tokens` (SME-443): the model's window less the
+/// built request's size at 3 chars/token — `compaction_transcript_budget`'s
+/// own conservative rate, so transcript size and budget stay consistent —
+/// less `COMPACTION_SAFETY_BUFFER`, floored at today's 2,048 and held to
+/// `SUMMARY_MAX_TOKENS_CEILING`. `request_chars` is the text the
+/// summarization request actually carries, so it grows for the continuation
+/// request. The 2,048 floor wins over a stingy room: a request the provider
+/// then refuses as too big is exactly what `compact`'s existing overflow
+/// arm answers — learn the window, retry with half the transcript. A model's
+/// own `output_cap` clamps the result (over it Anthropic 400s, SME-111);
+/// the user's "Max reply tokens" deliberately does not apply — the summary
+/// is not a reply.
+#[cfg(feature = "server")]
+pub(super) fn summary_max_tokens(turn_model: &crate::providers::TurnModel, request_chars: usize) -> u32 {
+    let room = (i64::from(turn_model.context_window)
+        - (request_chars as i64) / 3
+        - i64::from(COMPACTION_SAFETY_BUFFER))
+        .max(1) as u32;
+    let mut tokens = room.min(SUMMARY_MAX_TOKENS_CEILING).max(SUMMARY_MAX_TOKENS);
+    if turn_model.output_cap_is_models_own
+        && let Some(cap) = turn_model.output_cap
+    {
+        tokens = tokens.min(cap);
+    }
+    tokens
+}
 
 /// What an HTTP kind's cut-off summary gets appended with on save
 /// (SME-393), whichever stop cut it — `SUMMARY_MAX_TOKENS` or the
@@ -276,10 +314,19 @@ async fn summarize(
         "Conversation so far:\n{transcript}\n\nCurrently live (preserve these \
          exact ids in your summary):\n{live_state}"
     );
+    let request_chars = prompt.chars().count();
 
     let summarization_request = anthropic::CreateMessageRequest {
         model: turn_model.model.clone(),
-        max_tokens: SUMMARY_MAX_TOKENS,
+        // HTTP kinds send the room-derived budget (SME-443); Claude Code
+        // keeps the constant — its cap already carries the thinking that
+        // can't be turned off (`once::THINKING_ROOM`), and SME-431 checks
+        // its summary rather than growing it.
+        max_tokens: if turn_model.kind == crate::providers::ProviderKind::ClaudeCli {
+            SUMMARY_MAX_TOKENS
+        } else {
+            summary_max_tokens(turn_model, request_chars)
+        },
         system: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
         messages: vec![anthropic::AnthropicMessage {
             role: "user".to_string(),
