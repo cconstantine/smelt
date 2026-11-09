@@ -9,6 +9,7 @@
 mod citations;
 mod cluster_lock;
 mod components;
+mod fetches;
 mod id_alloc;
 mod links;
 mod personas;
