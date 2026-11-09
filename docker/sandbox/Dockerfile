@@ -51,6 +51,10 @@ RUN printf '%s\n' \
 # gave it (docker/docker.github.io engine/install/debian.md, "Verify that
 # you now have the key with the fingerprint ..."). A new file there means
 # a new pin here. Downloaded to a file with retries and bounds, then checked.
+# `--retry-all-errors`, not fetch-pinned's "retry only a blip": curl's own
+# `--retry` skips a reset connection or a body cut off partway, which are
+# the blips this guards against. The cost is that a 403 or 404 is tried 5
+# times too (bounded), and the sha256 check after it fails a wrong body.
 # fetch: this build's context is target/sandbox-agent/, which has no scripts/fetch-pinned, so its guard is written out here
 RUN install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL --retry 4 --retry-all-errors --connect-timeout 30 --speed-limit 1024 --speed-time 60 \
