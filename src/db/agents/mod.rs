@@ -561,20 +561,44 @@ pub async fn queue_server_notice(pool: &PgPool, to: i64, text: &str) -> Result<(
     queue_agent_message(&mut conn, to, None, "smelt", KIND_SERVER_NOTICE, text).await
 }
 
-/// The idle check's own query (`$1` the conversation id, `$2` active,
-/// `$3` starting), a constant so the running-command clause is
-/// EXPLAIN-tested as written, not paraphrased (SME-389 R1-1).
-pub(crate) const IDLE_AGENT_WITHOUT_REPORT_SQL: &str =
-    "SELECT c.parent_id,
-            (SELECT m.content FROM messages m WHERE m.conversation_id = c.id AND m.role = 'assistant'
-             ORDER BY m.id DESC LIMIT 1)
-     FROM conversations c JOIN agents a ON a.conversation_id = c.id
-     WHERE c.id = $1 AND c.parent_id IS NOT NULL AND a.state = $2
-       AND NOT EXISTS (SELECT 1 FROM pending_questions q WHERE q.conversation_id = c.id AND q.answer IS NULL)
-       AND NOT EXISTS (SELECT 1 FROM instruction_requests r WHERE r.conversation_id = c.id)
-       AND NOT EXISTS (SELECT 1 FROM terminal_commands t WHERE t.conversation_id = c.id AND t.status = 'running')
-       AND NOT EXISTS (SELECT 1 FROM agents g JOIN conversations gc ON gc.id = g.conversation_id
-                       WHERE gc.parent_id = c.id AND g.state IN ($3, $2))";
+/// The "owes a report with nothing running" predicate (SME-455): an
+/// `active` agent with a parent and none of a question waiting, a trust
+/// card waiting, a terminal command running, or an agent of its own still
+/// starting or active. One shared expression, used only by
+/// `IDLE_AGENT_WITHOUT_REPORT_SQL` and the tree's `REPORT_OWED_CASE`;
+/// both alias `conversations` as `c` and have its `agents` row as `a`.
+/// The state words are inline literals mirroring `AGENT_ACTIVE` and
+/// `AGENT_STARTING` (the two hosts bind different parameter lists);
+/// `test_the_stuck_predicate_quotes_its_state_literals` keeps them in
+/// step. SME-389 R1-1: EXPLAIN-test each host query as it is written.
+macro_rules! stuck_without_report {
+    () => {
+        "c.parent_id IS NOT NULL AND a.state = 'active' \
+         AND NOT EXISTS (SELECT 1 FROM pending_questions q WHERE q.conversation_id = c.id AND q.answer IS NULL) \
+         AND NOT EXISTS (SELECT 1 FROM instruction_requests r WHERE r.conversation_id = c.id) \
+         AND NOT EXISTS (SELECT 1 FROM terminal_commands t WHERE t.conversation_id = c.id AND t.status = 'running') \
+         AND NOT EXISTS (SELECT 1 FROM agents g JOIN conversations gc ON gc.id = g.conversation_id \
+                         WHERE gc.parent_id = c.id AND g.state IN ('starting', 'active'))"
+    };
+}
+
+/// The idle check's own query (`$1` the conversation id), a constant so
+/// the running-command clause is EXPLAIN-tested as written, not
+/// paraphrased (SME-389 R1-1), and built from `stuck_without_report` so
+/// the tree's mark and this check cannot drift.
+pub(crate) const IDLE_AGENT_WITHOUT_REPORT_SQL: &str = concat!(
+    "SELECT c.parent_id,\n            (SELECT m.content FROM messages m WHERE m.conversation_id = c.id AND m.role = 'assistant'\n             ORDER BY m.id DESC LIMIT 1)\n     FROM conversations c JOIN agents a ON a.conversation_id = c.id\n     WHERE c.id = $1 AND (",
+    stuck_without_report!(),
+    ")"
+);
+
+/// The tree query's gated mark (SME-455): `agents.report_owed_at` shows
+/// only while `stuck_without_report` still holds, so the mark self-hides
+/// while the seat runs something or waits on someone and returns with its
+/// original age when those go — it never stopped owing. `state = 'active'`
+/// inside the predicate keeps it off stopped, failed and finished seats.
+/// Aliases as in the tree query: `conversations c LEFT JOIN agents a`.
+pub(crate) const REPORT_OWED_CASE: &str = concat!("CASE WHEN (", stuck_without_report!(), ") THEN a.report_owed_at END");
 
 /// Whether `id` is an `active` agent with nothing to wait on: no question
 /// to the user unanswered, no AGENTS.md card, no terminal command running
@@ -583,8 +607,6 @@ pub(crate) const IDLE_AGENT_WITHOUT_REPORT_SQL: &str =
 pub async fn idle_agent_without_report(pool: &PgPool, id: i64) -> Result<Option<(i64, String)>, sqlx::Error> {
     let row = sqlx::query_as::<_, (i64, Option<String>)>(IDLE_AGENT_WITHOUT_REPORT_SQL)
     .bind(id)
-    .bind(AGENT_ACTIVE)
-    .bind(AGENT_STARTING)
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(parent, content)| {

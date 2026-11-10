@@ -190,6 +190,7 @@ mod tests {
             status: None,
             busy: false,
             waiting_for_user: false,
+            report_owed_at: None,
         }
     }
 
