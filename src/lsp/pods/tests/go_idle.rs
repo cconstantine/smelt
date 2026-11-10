@@ -318,10 +318,18 @@ fn test_a_record_caught_empty_is_read_again() {
         assert!(Instant::now() < deadline, "the redirect never created the record");
         std::thread::sleep(Duration::from_millis(1));
     }
+    let started = Instant::now();
     let rc = read_record(&record, Duration::from_secs(5));
+    let took = started.elapsed();
     let _ = writer.wait();
     let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(rc.as_deref(), Some("0"), "an empty record was taken as the record");
+    // A fix that returned at the caught-empty moment would take well under
+    // the write's 300 ms; the bytes cannot exist before the writer's sleep
+    // ends, so a correct read_record cannot return sooner (round-1 F1: the
+    // floor kills the vacuous pass where a stall between catching the file
+    // empty and the first read let a broken reader return the bytes at once).
+    assert!(took >= Duration::from_millis(150), "read_record returned {rc:?} after only {took:?} — before the forced write could have landed, so this proved nothing");
+    assert_eq!(rc.as_deref(), Some("0"), "an empty record was taken as the record: {rc:?}");
 }
 
 /// The config's own `GOFLAGS` are kept, with `-x` after them (the
