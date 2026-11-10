@@ -405,3 +405,53 @@ async fn test_an_npm_install_rides_past_a_proxy_that_answers_its_connect_in_part
     assert_eq!(held.lines().filter(|l| l.contains(" replied ")).count(), 2, "the proxy never answered in part: {held}");
 }
 
+/// SME-464 round 1's L1: the plan required the reply-watch guard to let any
+/// unexpected chunk shape fall through to the original `push` — and
+/// `chunk !== null` let `undefined` through to `typeof chunk.byteLength`,
+/// which throws where bare node `push` returns cleanly (reviewer's run:
+/// `push(undefined)` → false, `push()` → undefined). Fast by construction,
+/// no bound wait: an hpagent-shaped client writes a CONNECT to a silent
+/// in-pod proxy (arming the bound and installing the watch), then pushes
+/// `undefined` and nothing on the tunnel socket and compares the returns
+/// against a never-written oracle socket — node owns those values, so none
+/// are hardcoded. Pre-guard-fix the client dies with the TypeError; that is
+/// the red.
+const PUSH_SHAPE_INSTALL: &str = r#"set -e
+cat > /tmp/silent.js <<'EOF'
+const net = require('net'), fs = require('fs');
+// a proxy that accepts and never answers: the watch stays installed and the
+// bound armed for the whole run of the client's pushes
+net.createServer(() => {}).listen(3134, '127.0.0.1', () => fs.writeFileSync('/tmp/silent.ready', ''));
+EOF
+cat > /tmp/shapes.js <<'EOF'
+const net = require('net'), fs = require('fs');
+const bare = net.connect(3134, '127.0.0.1'); // oracle: never writes CONNECT, so its push is the prototype's
+bare.on('error', () => {});
+const s = net.connect(3134, '127.0.0.1');
+s.on('error', () => {});
+s.on('connect', () => {
+  s.write('CONNECT 127.0.0.1:8080 HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n');
+  const b1 = String(bare.push(undefined)), b2 = String(bare.push());
+  const r1 = String(s.push(undefined)), r2 = String(s.push());
+  const match = r1 === b1 && r2 === b2;
+  fs.writeFileSync('/tmp/shapes', `tunnel push(undefined)=${r1} push()=${r2}; bare push(undefined)=${b1} push()=${b2}; match=${match}\n`);
+  process.exit(match ? 0 : 1);
+});
+EOF
+node /tmp/silent.js > /dev/null 2>&1 &
+i=0
+until [ -e /tmp/silent.ready ]; do i=$((i+1)); [ $i -lt 100 ] || exit 9; sleep 0.1; done
+node /tmp/shapes.js"#;
+
+/// L1's assertion: the client exits 0 and the watched tunnel socket's
+/// `push(undefined)`/`push()` returned exactly what the never-written oracle
+/// socket's returned.
+#[tokio::test]
+async fn test_a_tunnel_socket_push_of_undefined_or_nothing_behaves_like_bare_push() {
+    let ran = run_in_node_pod("shapes", PUSH_SHAPE_INSTALL.to_string(), &[], &["/tmp/shapes"]).await;
+    let shapes = ran.files[0].as_ref().expect("read /tmp/shapes");
+    eprintln!("after {} s the install said: {:?}; shapes: {shapes}", ran.took.as_secs(), ran.result);
+    ran.result.expect("a client that pushed only undefined and nothing died — the shape guard must fall through to the original push, not throw");
+    assert!(shapes.contains("match=true"), "the watched push didn't return what bare push returns: {shapes}");
+}
+

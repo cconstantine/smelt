@@ -56,10 +56,13 @@ function bound (socket, what, still) {
 // path, which sees every incoming byte without touching flow mode. Chunks
 // arrive as FastBuffers (a Uint8Array that is not a Buffer), so scan
 // through a Buffer view, and `push`'s return value passes through unchanged
-// (node's onStreamRead calls readStop() on a falsy one). Past REPLY_CAP
-// with no terminator it was never a complete header: stop watching and the
-// bound stays armed, so a proxy that answers in part and stalls is bounded
-// just the same.
+// (node's onStreamRead calls readStop() on a falsy one); non-chunks — a
+// `null` EOF, an `undefined` or empty push — are no scan material and fall
+// straight through (round 1's L1: the guard must not throw where bare push
+// returns). The watch scans at most REPLY_CAP bytes plus the one chunk that
+// crosses it; past that with no terminator it was never a complete header:
+// stop watching and the bound stays armed, so a proxy that answers in part
+// and stalls is bounded just the same.
 const REPLY_CAP = 16384
 const REPLY_END = Buffer.from('\r\n\r\n')
 function watch_reply (socket) {
@@ -67,7 +70,7 @@ function watch_reply (socket) {
   const got = []
   let size = 0
   socket.push = function (chunk) {
-    if (chunk !== null && typeof chunk.byteLength === 'number' && chunk.buffer !== undefined && size < REPLY_CAP) {
+    if (chunk != null && typeof chunk.byteLength === 'number' && chunk.buffer !== undefined && size < REPLY_CAP) {
       // A view per push, copied out: node may reuse the read buffer.
       const view = Buffer.from(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength))
       got.push(view)
