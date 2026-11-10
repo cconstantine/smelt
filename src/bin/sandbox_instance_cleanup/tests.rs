@@ -289,10 +289,16 @@ async fn fresh_counting_database(conn: &mut PgConnection) -> String {
     .await
     .expect("list leaked counting databases");
     for (name,) in leaked {
+        // Best-effort: a crashed run's backend can still lag on a leaked
+        // database, and Postgres refuses the drop (55006). That must not
+        // become a panic path for every later run — an undroppable leak
+        // waits for the sweep after its backend is gone, the bound this
+        // fixture already trades (SME-462's review). Loud elsewhere:
+        // listing and creating stay `expect`s.
         sqlx::query(&format!("DROP DATABASE {name}"))
             .execute(&mut *conn)
             .await
-            .expect("sweep a leaked counting database");
+            .ok();
     }
     let name = format!("{COUNT_DB_PREFIX}{}", unique());
     sqlx::query(&format!("CREATE DATABASE {name}"))
@@ -300,6 +306,40 @@ async fn fresh_counting_database(conn: &mut PgConnection) -> String {
         .await
         .expect("create the counting database");
     name
+}
+
+/// The sweep's housekeeping is best-effort (SME-285's review): a leaked
+/// counting database can still carry a crashed run's lagging backend,
+/// and Postgres refuses to drop a database in use. Losing the sweep to
+/// that would turn old debris into a new panic path for every next run —
+/// the sweep must pass the undroppable leak by and still hand back a
+/// fresh database. The leak is left for the run after the backend's
+/// gone, which is exactly the bound the design trades.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_sweep_passes_by_a_database_still_connected(pool: PgPool) {
+    let options: PgConnectOptions = pool.connect_options().as_ref().clone();
+    let mut conn = connection(&pool).await;
+    let leaked = format!("{COUNT_DB_PREFIX}leak_{}", unique());
+    sqlx::query(&format!("CREATE DATABASE {leaked}"))
+        .execute(&mut conn)
+        .await
+        .expect("create the leaked counting database");
+    let hold = PgConnection::connect_with(&options.clone().database(&leaked))
+        .await
+        .expect("a backend still on the leak");
+    let fresh = fresh_counting_database(&mut conn).await;
+    assert!(fresh.starts_with(COUNT_DB_PREFIX) && fresh != leaked, "the fresh one is this run's own: {fresh}");
+    sqlx::query("SELECT 1")
+        .execute(&mut PgConnection::connect_with(&options.clone().database(&fresh)).await.expect("the fresh database is usable"))
+        .await
+        .expect("the fresh database answers");
+    // Leave no more than the design's bound: best-effort drops, with the
+    // backend just closed (its teardown may lag — the next sweep takes
+    // whatever remains, the same as for any crash leak).
+    hold.close().await.ok();
+    for name in [leaked.as_str(), fresh.as_str()] {
+        sqlx::query(&format!("DROP DATABASE IF EXISTS {name}")).execute(&mut conn).await.ok();
+    }
 }
 
 /// Guard 5 counts every other connection to the database, and never this
