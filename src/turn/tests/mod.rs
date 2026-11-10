@@ -500,6 +500,7 @@ mod compaction_honesty;
 mod compaction_budget;
 mod transcript;
 mod room_limited;
+mod unread_results;
 mod named_refusal;
 mod escape;
 mod claude_cli;

@@ -26,6 +26,7 @@ pub fn compaction_messages(
     typed: &Typed,
     unanswered: &[String],
     todos: &[anthropic::tools::TodoItem],
+    unread: &[String],
     refused: Option<String>,
 ) -> [(&'static str, Vec<anthropic::ContentBlock>); 3] {
     [
@@ -46,7 +47,7 @@ pub fn compaction_messages(
         (
             "user",
             vec![anthropic::ContentBlock::CompactionPlaceholder {
-                text: continuation_prompt(typed, unanswered, todos),
+                text: continuation_prompt(typed, unanswered, todos, unread),
             }],
         ),
     ]
@@ -63,11 +64,16 @@ pub fn compaction_messages(
 /// todo list verbatim (`todos`, SME-462) — the model's own progress tracker,
 /// which a summary can drop and `todoread` only restores if the model
 /// thinks to ask.
+/// And when the compaction covered tool results the model never read
+/// (`unread`, SME-414 scenario 2 — the loop of its title is usually this),
+/// it names them: not their content, which would undo the compaction, just
+/// that they exist and were covered unseen.
 #[cfg(feature = "server")]
 pub fn continuation_prompt(
     typed: &Typed,
     unanswered: &[String],
     todos: &[anthropic::tools::TodoItem],
+    unread: &[String],
 ) -> String {
     let mut prompt = COMPACTION_CONTINUATION_PROMPT.to_string();
     if !typed.quotes.is_empty() {
@@ -96,6 +102,13 @@ pub fn continuation_prompt(
         prompt.push_str("\n\n");
         prompt.push_str(block);
     }
+    // The unread-results section, beside the pinned ones and before the
+    // unanswered tail, which stays last (SME-414).
+    let unread_block = unread_results_text(unread);
+    if let Some(block) = &unread_block {
+        prompt.push_str("\n\n");
+        prompt.push_str(block);
+    }
     if unanswered.is_empty() {
         return prompt;
     }
@@ -103,9 +116,67 @@ pub fn continuation_prompt(
     format!(
         "{prompt}{}The summary includes these latest messages, which you haven't answered yet; \
          respond to them now:\n\n{}",
-        if typed.quotes.is_empty() && pinned.is_none() { " " } else { "\n\n" },
+        if typed.quotes.is_empty() && pinned.is_none() && unread_block.is_none() { " " } else { "\n\n" },
         quoted.join("\n\n")
     )
+}
+
+/// The pinned phrase of the unread-results section (SME-414): tests pin
+/// this, not the whole sentence.
+#[cfg(feature = "server")]
+const UNREAD_RESULTS_MARKER: &str = "summarized above before you read them";
+
+/// The unread-results section's cap: naming is cheap, so this one is a
+/// plain count, not a budget; past eight the rest are just counted.
+#[cfg(feature = "server")]
+const UNREAD_RESULTS_MAX: usize = 8;
+
+/// The unread-results block (SME-414 scenario 2): the calls named, capped,
+/// and told to be re-run narrowly — their raw results are not quoted,
+/// which would undo the compaction. `None` for nothing unread.
+#[cfg(feature = "server")]
+fn unread_results_text(unread: &[String]) -> Option<String> {
+    if unread.is_empty() {
+        return None;
+    }
+    let shown = unread.iter().take(UNREAD_RESULTS_MAX).cloned().collect::<Vec<_>>().join(", ");
+    let more = if unread.len() > UNREAD_RESULTS_MAX {
+        format!(" (and {} more)", unread.len() - UNREAD_RESULTS_MAX)
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "These results from your own calls were {UNREAD_RESULTS_MARKER}: {shown}{more}. Don't assume you saw \
+         them; if you still need what's in one, re-run the call narrowly (an offset, a limit, a filter) \
+         rather than whole."
+    ))
+}
+
+/// The tool results of the model's last reply that a compaction happening
+/// now would cover before it reads them: the `ToolResult` blocks of the
+/// user messages after the last assistant message, each named by the tool
+/// that made it (SME-414 scenario 2 — the loop of its title steps on this).
+#[cfg(feature = "server")]
+pub fn unread_tool_results(messages: &[Message]) -> Vec<String> {
+    let Some(last) = messages.iter().rposition(|m| m.role == "assistant") else {
+        return Vec::new();
+    };
+    let blocks = messages[last].blocks().unwrap_or_default();
+    let names: std::collections::HashMap<&str, &str> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            anthropic::ContentBlock::ToolUse { id, name, .. } => Some((id.as_str(), name.as_str())),
+            _ => None,
+        })
+        .collect();
+    messages[last + 1..]
+        .iter()
+        .flat_map(|m| m.blocks().unwrap_or_default())
+        .filter_map(|b| match b {
+            anthropic::ContentBlock::ToolResult { tool_use_id, .. } => names.get(tool_use_id.as_str()).map(|name| name.to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// One message as a continuation quotes it: in part at most, since a huge
