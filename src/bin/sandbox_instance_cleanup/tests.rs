@@ -73,6 +73,9 @@ fn test_to_delete_matches_nothing_for_an_empty_instance() {
 // --- Pure: guards ---
 
 const SCRATCH: &str = "postgres://smelt:smelt@postgres/smelt_scratch_worktree";
+/// This test's own counting databases (SME-285): created fresh per run,
+/// swept at the next run's start.
+const COUNT_DB_PREFIX: &str = "smelt_instance_cleanup_fresh_";
 const DEV: &str = "postgres://smelt:smelt@postgres/smelt";
 const UUID: &str = "0f8e2a5c-1b2d-4e6f-8a9b-0c1d2e3f4a5b";
 
@@ -272,36 +275,85 @@ async fn test_a_missing_database_reads_as_absent(pool: PgPool) {
     );
 }
 
+/// A fresh empty database to count in, swept of any earlier one first: a
+/// run that died between creating and sweeping leaks one, and the next run
+/// takes it back. A green run deliberately leaves its own: dropping a
+/// database can wait on closing backends of it — the same asynchronous
+/// backend teardown this fixture exists to keep out of a count.
+async fn fresh_counting_database(conn: &mut PgConnection) -> String {
+    let leaked: Vec<(String,)> = sqlx::query_as(
+        "SELECT datname FROM pg_database WHERE starts_with(datname, $1)",
+    )
+    .bind(COUNT_DB_PREFIX)
+    .fetch_all(&mut *conn)
+    .await
+    .expect("list leaked counting databases");
+    for (name,) in leaked {
+        sqlx::query(&format!("DROP DATABASE {name}"))
+            .execute(&mut *conn)
+            .await
+            .expect("sweep a leaked counting database");
+    }
+    let name = format!("{COUNT_DB_PREFIX}{}", unique());
+    sqlx::query(&format!("CREATE DATABASE {name}"))
+        .execute(&mut *conn)
+        .await
+        .expect("create the counting database");
+    name
+}
+
 /// Guard 5 counts every other connection to the database, and never this
 /// one's own.
+///
+/// The first count happens in a fresh counting database, not the
+/// `#[sqlx::test]` one: the harness's pool and migrator connections close
+/// as the test starts, and Postgres can still list their backends in
+/// `pg_stat_activity` until it reaps them — counted in the old shape, that
+/// teardown raced the first assertion and flaked (SME-285:
+/// `left: [475229], right: []` twice on gates touching nothing this binary
+/// builds from). A database nobody but this test ever connected to has no
+/// such residue by construction, so a backend the first count sees there
+/// is either this connection (which the count must exclude) or genuinely
+/// external (which it must not miss); the two failures the old assertion
+/// conflated are now distinguishable. The stray stays open on the harness
+/// database throughout: if residue of that kind ever reads as an "other"
+/// again, the first assertion proves it.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_other_connections_counts_every_other_connection(pool: PgPool) {
-    let database = pool
-        .connect_options()
-        .get_database()
-        .unwrap_or_default()
-        .to_string();
     let options: PgConnectOptions = pool.connect_options().as_ref().clone();
-    let mut ours = connection(&pool).await;
+    // The SME-285 provocation, permanent: a stray pool/harness-type
+    // connection, open before any counting and never closed — `detach()`
+    // keeps it out of `pool.close()`'s reach, exactly like the harness
+    // connections the flake counted.
+    let mut stray: PgConnection = pool.acquire().await.expect("stray").detach();
+    pool.close().await;
+
+    let fresh = fresh_counting_database(&mut stray).await;
+    let fresh_options = options.database(&fresh);
+    let mut ours = PgConnection::connect_with(&fresh_options)
+        .await
+        .expect("our connection to the fresh database");
     assert_eq!(
-        other_connections(&mut ours, &database)
+        other_connections(&mut ours, &fresh)
             .await
             .expect("count"),
         Vec::<i32>::new(),
         "this tool's own connection must not count"
     );
-    let other = PgConnection::connect_with(&options)
+    let other = PgConnection::connect_with(&fresh_options)
         .await
         .expect("a second connection");
-    let pids = other_connections(&mut ours, &database)
+    let pids = other_connections(&mut ours, &fresh)
         .await
         .expect("count");
     assert_eq!(
         pids.len(),
         1,
-        "another open connection to {database} must be counted: {pids:?}"
+        "another open connection to {fresh} must be counted: {pids:?}"
     );
     other.close().await.ok();
+    ours.close().await.ok();
+    stray.close().await.ok();
 }
 
 // --- Against the real cluster, in `smelt-park-test` only ---
