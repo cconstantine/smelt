@@ -384,14 +384,16 @@ const TODOS_REST_POINTER: &str = "; todoread lists every todo whole";
 /// The conversation's todo list as a block pinned into a continuation
 /// message (SME-462): each item verbatim in list order as
 /// `- {content} ({status})`, under the lead-in marking them as the model's
-/// own claims. `None` for an empty list — a conversation that never used
+/// own claims. `pub(crate)` rather than turn's usual `pub(super)` reach
+/// because the context view calls this same builder, so the view can't
+/// drift from what a compaction would pin. `None` for an empty list — a conversation that never used
 /// todos gains no section. Held to `CONTINUATION_TODOS_MAX_CHARS`: whole
 /// items in order while they fit, the first that doesn't fit kept in part
 /// via `quote_to` at what's left of the budget, and what's dropped said at
 /// the end in `cap_unanswered`'s grammar — a cut always names the `todoread`
 /// pointer to the full DB list.
 #[cfg(feature = "server")]
-pub fn pinned_todos_text(todos: &[anthropic::tools::TodoItem]) -> Option<String> {
+pub(crate) fn pinned_todos_text(todos: &[anthropic::tools::TodoItem]) -> Option<String> {
     if todos.is_empty() {
         return None;
     }

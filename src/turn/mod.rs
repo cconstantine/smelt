@@ -34,6 +34,8 @@ pub(crate) mod tests;
 
 use self::call::*;
 use self::compaction::*;
+#[cfg(feature = "server")]
+pub(crate) use self::compaction::pinned_todos_text;
 use self::compaction_progress::{CompactionProgress, CompactionStep, FloorAnswer, MIN_USEFUL_REPLY};
 use self::compaction_transcript::*;
 pub(crate) use self::failure::*;

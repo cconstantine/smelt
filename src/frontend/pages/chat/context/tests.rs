@@ -99,6 +99,7 @@ mod detail_shown_tests {
             group_spend: Default::default(),
             group_root_title: None,
             subscription: false,
+            pinned_todos: None,
         }
     }
 
@@ -339,6 +340,7 @@ mod group_spend_tests {
             group_spend,
             group_root_title: group_root_title.map(|t| t.to_string()),
             subscription: false,
+            pinned_todos: None,
         }
     }
 
@@ -426,6 +428,7 @@ mod summary_first_tests {
             group_spend: Default::default(),
             group_root_title: None,
             subscription: false,
+            pinned_todos: None,
         };
         let html = dioxus::ssr::render_element(render_context_detail_body(Some(&Ok(detail))));
         assert!(html.contains("262,144"), "{html}");
@@ -436,4 +439,45 @@ mod summary_first_tests {
         assert!(html.contains("<details class=\"context-detail-system\""), "the prompt is folded: {html}");
     }
 
+}
+
+/// SME-462: the dialog folds the pinned todo list under a heading when the
+/// snapshot carries one — the block verbatim — and shows no section at all
+/// when it doesn't.
+#[cfg(all(test, feature = "server"))]
+mod pinned_todos_view_tests {
+    use super::*;
+
+    fn detail(pinned_todos: Option<&str>) -> ContextDetailSnapshot {
+        ContextDetailSnapshot {
+            system: None,
+            instructions: vec![],
+            tools: vec![],
+            message_count: 0,
+            usage: None,
+            context_window: 200_000,
+            spend: Default::default(),
+            prices_as_of: None,
+            group_spend: Default::default(),
+            group_root_title: None,
+            subscription: false,
+            pinned_todos: pinned_todos.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_the_context_view_shows_the_pinned_todo_list_verbatim() {
+        let block = "Your own todo list as of this compaction \u{2014} not verified facts.\n\n- Ship the pinned list (in_progress)\n- Bury the stale copy (pending)";
+        let html =
+            dioxus::ssr::render_element(render_context_detail_body(Some(&Ok(detail(Some(block))))));
+        assert!(html.contains("Pinned todo list"), "a block gets its heading: {html}");
+        assert!(html.contains("- Ship the pinned list (in_progress)"), "the block shows verbatim: {html}");
+        assert!(html.contains("- Bury the stale copy (pending)"), "whole: {html}");
+    }
+
+    #[test]
+    fn test_the_context_view_shows_no_pinned_todo_section_without_a_list() {
+        let html = dioxus::ssr::render_element(render_context_detail_body(Some(&Ok(detail(None)))));
+        assert!(!html.contains("Pinned todo list"), "None renders nothing: {html}");
+    }
 }

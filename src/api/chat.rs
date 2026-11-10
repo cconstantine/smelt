@@ -412,6 +412,10 @@ pub struct ContextDetailSnapshot {
     /// cost is what the API would charge, and the subscription pays.
     #[serde(default)]
     pub subscription: bool,
+    /// The current todo list exactly as the next compaction would pin it
+    /// (SME-462). `None` for a conversation that never called `todowrite`.
+    #[serde(default)]
+    pub pinned_todos: Option<String>,
 }
 
 #[get("/api/conversations/{id}/context-detail")]
@@ -468,6 +472,13 @@ pub(crate) async fn context_detail(pool: &PgPool, id: i64) -> ServerFnResult<Con
             .map_err(ServerFnError::new)?,
         group_root_title,
         subscription,
+        // The same builder the continuation pins with, over a fresh read of
+        // the list — one source, so the view can't drift from what the next
+        // compaction would pin (`pinned_todos_text`'s comment, SME-462).
+        // Best-effort like `compact()`'s read: a failure means no block.
+        pinned_todos: pinned_todos_text(
+            &db::get_conversation_todos(pool, id).await.unwrap_or_default(),
+        ),
     })
 }
 

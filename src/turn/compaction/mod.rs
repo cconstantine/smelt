@@ -6,6 +6,10 @@ mod budgets;
 mod continuation;
 pub(super) use budgets::*;
 pub(super) use continuation::*;
+// The context view builds its "Pinned todo list" with this same builder
+// (SME-462), so it crosses into `api::chat` through `turn`'s re-export.
+#[cfg(feature = "server")]
+pub(crate) use continuation::pinned_todos_text;
 /// Whether it's safe to end a compaction's covered range right after a
 /// message with this content — i.e. it contains no `tool_use` block whose
 /// paired `tool_result` (always the very next persisted message, in this
