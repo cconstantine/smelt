@@ -58,7 +58,7 @@ Reports and notices reach a conversation through `agent_messages`, never `Notice
 
 - `finish` (report), a failed start (report), the start's done step (a notice to the child itself; and to the parent when the persona's model wasn't found);
 - the user's Stop on an `active` child not already paused (`agents::user_stop`, a notice to its parent); a Stop on a `starting` child is refused;
-- a child's last turn ending while it's `active` with nothing to wait on (no unanswered question, card, running command or live agent of its own) and not paused (`agents::after_last_turn`, a notice with the first 500 characters of its last reply, and the failure when the turn failed); not after a stop, nor a wake that did nothing;
+- a child's last turn ending while it's `active` with nothing to wait on (no unanswered question, card, running command, live agent of its own, or pending wake — an undelivered row, a command end never drained, or an untaken answer, SME-455) and not paused (`agents::after_last_turn`, a notice with the first 500 characters of its last reply, and the failure when the turn failed); not after a stop, nor a wake that did nothing. Since SME-455 a plain, model-ended such end goes to the seat first: the first queues `REPORT_OWE_NUDGE` to it (a `server_notice` row and `agents.report_owed_at`, one transaction, the seat woken after commit), and the second sends the notice; an end of any other kind reaches the parent at once. The owed mark clears when the seat reports (`finish`), writes to its parent (`message_agent`, `ask_parent`) or the user's send or answer starts it up again;
 - deleting a child (a notice to its parent, in the delete's own transaction);
 - `message_agent` and `ask_parent` (SME-238, below).
 
