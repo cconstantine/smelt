@@ -288,3 +288,56 @@ async fn test_an_attempt_cant_act_past_its_deadline_however_late_it_started(pool
     })
     .await;
 }
+
+/// SME-410 close evidence: a save whose secret write goes unanswered on
+/// every try is abandoned at the install's final bound, and its in-pod
+/// commands can then never undo a later delete. All three of the write's
+/// attempts stall as `NoReply` — the exec answers nothing, so the installer
+/// retries at 10 s, 20 s and the remaining ~30 s, then gives up at
+/// `INSTALL_TIMEOUT` without the write ever answering. The delete's install
+/// runs after that and reports success; across a window provably past the
+/// last moment any abandoned attempt can act, the secret's file stays gone.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_write_abandoned_at_the_installs_final_bound_cant_undo_a_delete(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        persona_agent(&pool, conversation.id).await;
+        let pod = create_pod(&pool, conversation.id, PodLimitOverrides::default()).await.expect("create_pod");
+        let name = pod_name(pod);
+
+        sqlx::query("INSERT INTO named_secrets (name, value) VALUES ('linear-key', 'SECRET-MARKER')")
+            .execute(&pool)
+            .await
+            .expect("a secret");
+        // Three tries, every one the install will make of this write:
+        // try_limit gives 10 s, then 20 s, then the remaining ~30 s; the
+        // fourth turn sees less than a second left and gives up.
+        stall_hook::arm(&name, &["/etc/smelt/secrets/linear-key"], 3, Stall::NoReply);
+        let started = std::time::Instant::now();
+        let saved = crate::credentials::install_into_pod(&pool, pod).await;
+        let took = started.elapsed();
+        let error = saved.expect_err("a save whose every write attempt went unanswered").to_string();
+        assert!(error.contains("writing credential files"), "the give-up's own words, not another failure: {error}");
+        assert!(took >= crate::credentials::INSTALL_TIMEOUT, "the save gave up before the final bound, after {took:?}");
+        assert_eq!(stall_hook::remaining(&name), 0, "the stall was armed but no exec took it");
+        // The first attempt's write landed before its deadline — design
+        // behaviour — so the delete below erases a file this install really
+        // wrote, and the close is not vacuous.
+        sh_ok(&client, pod, "test -e /etc/smelt/secrets/linear-key").await;
+        stall_hook::arm(&name, &[], 0, Stall::NoReply);
+
+        sqlx::query("DELETE FROM named_secrets WHERE name = 'linear-key'").execute(&pool).await.expect("delete");
+        crate::credentials::install_into_pod(&pool, pod).await.expect("the delete's install");
+        let (code, _) = sh(&client, pod, "test -e /etc/smelt/secrets/linear-key").await;
+        assert_eq!(code, 1, "the delete's install left the secret's file");
+        // The last abandoned attempt could act until the final bound plus
+        // `CLOCK_SKEW_MARGIN` (its deadline is the bound; settle waits the
+        // margin before the save returned). This window ends well past
+        // that, so a late landing could only fall inside it.
+        tokio::time::sleep(crate::credentials::CLOCK_SKEW_MARGIN + Duration::from_secs(15)).await;
+        let (code, _) = sh(&client, pod, "test -e /etc/smelt/secrets/linear-key").await;
+        assert_eq!(code, 1, "the deleted secret came back: an abandoned write landed after the delete");
+    })
+    .await;
+}
