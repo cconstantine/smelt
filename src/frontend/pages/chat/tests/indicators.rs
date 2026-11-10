@@ -98,3 +98,20 @@ fn test_the_command_marker_counts_commands_and_loses_to_a_running_turn() {
     assert_eq!(command_marker(1, false).as_deref(), Some("1 command running"));
     assert_eq!(command_marker(3, false).as_deref(), Some("3 commands running"));
 }
+
+/// SME-455: the report-owed marker's title is the fixed words plus the
+/// age of the owed moment only (the SME-441 quoting rule — the mark reads
+/// a column, never model words), it loses to a running turn like the
+/// command marker, and under a minute there's no age to say yet.
+#[test]
+fn test_the_report_marker_ages_the_owed_moment_and_loses_to_a_running_turn() {
+    let clock = |h, m, s| chrono::NaiveDate::from_ymd_opt(2026, 11, 10).unwrap().and_hms_opt(h, m, s).unwrap();
+    let now = clock(12, 0, 0);
+    assert_eq!(report_marker(None, false, Some(now)), None, "nothing owed, no mark");
+    assert_eq!(report_marker(Some(now), true, Some(now)), None, "the running turn wins");
+    assert_eq!(report_marker(Some(now), false, None), None, "the browser clock isn't ready yet");
+    assert_eq!(report_marker(Some(clock(11, 59, 40)), false, Some(now)).as_deref(), Some("owes its parent a report"), "under a minute: no age to say yet");
+    assert_eq!(report_marker(Some(clock(11, 54, 40)), false, Some(now)).as_deref(), Some("owes its parent a report for 5m"));
+    assert_eq!(report_marker(Some(clock(10, 0, 0)), false, Some(now)).as_deref(), Some("owes its parent a report for 2h"));
+    assert_eq!(report_marker(Some(clock(0, 0, 0)), false, Some(now)).as_deref(), Some("owes its parent a report for 12h"));
+}

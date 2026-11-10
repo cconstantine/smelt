@@ -262,6 +262,7 @@ pub(super) fn ConversationSidebar(
                             live_pod: has_live_pod(row.node.id),
                             running_commands: running_commands_for(row.node.id),
                             age: now_utc().map(|now| short_age((now - row.node.updated_at).num_seconds())),
+                            report_owed: report_marker(row.node.report_owed_at, row.node.busy, now_utc()),
                             armed: pending_delete() == Some(row.node.id),
                             confirm: delete_confirm_label(&conversations(), row.node.id),
                             on_open: move |id| open_conversation(id),
@@ -320,6 +321,7 @@ fn ConversationRow(
     live_pod: bool,
     running_commands: i64,
     age: Option<String>,
+    report_owed: Option<String>,
     armed: bool,
     confirm: String,
     on_open: EventHandler<i64>,
@@ -402,6 +404,13 @@ fn ConversationRow(
             // runs, the busy spinner above wins and this stays hidden.
             if let Some(title) = command_marker(running_commands, row.node.busy) {
                 span { class: "live-command-dot", role: "img", title: "{title}", aria_label: "{title}" }
+            }
+            // A live seat that ended its turn owing its parent a report
+            // with nothing running (SME-455). The title is fixed words
+            // plus the age only — no model words, no command text
+            // (the SME-441 quoting rule); it reads the gated tree column.
+            if let Some(title) = report_owed {
+                span { class: "conversation-report-owed", role: "img", title: "{title}", aria_label: "{title}", "!" }
             }
             if let Some(age) = age {
                 span { class: "conversation-age", "{age}" }
@@ -487,6 +496,26 @@ pub(super) fn command_marker(running_commands: i64, busy: bool) -> Option<String
         (0, _) | (_, true) => None,
         (1, _) => Some("1 command running".into()),
         (n, _) => Some(format!("{n} commands running")),
+    }
+}
+
+/// The sidebar's report-owed marker's title (SME-455): `Some` when the
+/// seat owes its parent a report (the gated `report_owed_at` the tree
+/// carries) and isn't running a turn — the busy mark wins, as with the
+/// command marker — and the browser clock is ready. The age is the owed
+/// moment's, so it survives the predicate flickering; under a minute
+/// `short_age` still says `now`, and there's no age to tell yet.
+pub(super) fn report_marker(owed_at: Option<chrono::NaiveDateTime>, busy: bool, now: Option<chrono::NaiveDateTime>) -> Option<String> {
+    match (owed_at, busy, now) {
+        (Some(owed_at), false, Some(now)) => {
+            let age = short_age((now - owed_at).num_seconds());
+            Some(if age == "now" {
+                "owes its parent a report".into()
+            } else {
+                format!("owes its parent a report for {age}")
+            })
+        }
+        _ => None,
     }
 }
 
