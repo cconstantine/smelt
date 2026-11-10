@@ -3,7 +3,8 @@
 // or https:// proxy's CONNECT reply and the TLS handshake alike, none of which npm bounds
 // (see CONNECT_BOUND in src/lsp/pods/script.rs). A connect that hasn't finished
 // in time is destroyed with ECONNECTIONTIMEOUT, which npm retries on a
-// fresh connection and logs. pod_script writes this file with the bound
+// fresh connection and logs. A tunnel's bound ends at a complete proxy
+// reply header too (SME-464). pod_script writes this file with the bound
 // filled in, and preloads it into the install alone.
 'use strict'
 const net = require('net')
@@ -48,13 +49,46 @@ function bound (socket, what, still) {
   return settled
 }
 
+// The first `\r\n\r\n` pushed after a tunnel's CONNECT is the proxy's reply
+// in full (SME-464): the tunnel is open, the client owns the socket from
+// here — yarn berry's hpagent tunnels plain-http targets and never hands
+// them to TLS — so it ends the bound. Watch `push`, the stream's own data
+// path, which sees every incoming byte without touching flow mode. Chunks
+// arrive as FastBuffers (a Uint8Array that is not a Buffer), so scan
+// through a Buffer view, and `push`'s return value passes through unchanged
+// (node's onStreamRead calls readStop() on a falsy one). Past REPLY_CAP
+// with no terminator it was never a complete header: stop watching and the
+// bound stays armed, so a proxy that answers in part and stalls is bounded
+// just the same.
+const REPLY_CAP = 16384
+const REPLY_END = Buffer.from('\r\n\r\n')
+function watch_reply (socket) {
+  const pushed = socket.push
+  const got = []
+  let size = 0
+  socket.push = function (chunk) {
+    if (chunk !== null && typeof chunk.byteLength === 'number' && chunk.buffer !== undefined && size < REPLY_CAP) {
+      // A view per push, copied out: node may reuse the read buffer.
+      const view = Buffer.from(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength))
+      got.push(view)
+      size += view.byteLength
+      const data = got.length === 1 ? view : Buffer.concat(got)
+      const answered = data.includes(REPLY_END)
+      if (answered) pending.get(socket)?.()
+      if (answered || size >= REPLY_CAP) delete socket.push
+    }
+    return pushed.apply(socket, arguments)
+  }
+}
+
 // Bounds opening `socket`: until its `ready` event (TCP's `connect`, TLS's
 // `secureConnect`). A socket whose first write is a proxy's `CONNECT` is
 // a tunnel (an http:// proxy's TCP socket, or an https:// proxy's TLS
-// one): it's opening until it's handed to tls.connect({socket}) or
-// closes, so a proxy that never answers, or answers in part and stalls,
-// is bounded too. That holds whether the CONNECT was written before
-// `ready` or after.
+// one): it's opening until it's handed to tls.connect({socket}), its
+// reply header completes (watch_reply), or it closes, so a proxy that
+// never answers, or answers in part and stalls, is bounded too, while
+// one that answers in full isn't (SME-464). That holds whether the
+// CONNECT was written before `ready` or after.
 function opening (socket, what, ready, connecting) {
   let tunnel = false
   const label = () => tunnel ? `${what} (a proxy's CONNECT)` : what
@@ -64,6 +98,7 @@ function opening (socket, what, ready, connecting) {
     if (head === 'CONNECT ') {
       tunnel = true
       if (!pending.has(socket) && !socket.destroyed) bound(socket, label, () => true)
+      watch_reply(socket)
     }
     return socket.write(chunk, ...rest)
   }
