@@ -63,7 +63,7 @@ fn test_a_stopped_request_isnt_quoted_as_unanswered() {
 #[test]
 fn test_the_continuation_quotes_a_huge_message_only_in_part() {
     let huge = "x".repeat(100_000);
-    let prompt = continuation_prompt(&Typed::default(), &[huge]);
+    let prompt = continuation_prompt(&Typed::default(), &[huge], &[]);
     assert!(prompt.chars().count() < 10_000, "{} chars", prompt.chars().count());
     assert!(prompt.contains("cut"), "it should say the quote was cut");
 }
@@ -79,7 +79,7 @@ fn compacted_once() -> Vec<Message> {
         text_message(1, "user", "ancient question"),
         text_message(2, "assistant", "ancient answer"),
     ];
-    for (offset, (role, blocks)) in compaction_messages("the earlier summary".to_string(), 2, &Typed::default(), &[], None)
+    for (offset, (role, blocks)) in compaction_messages("the earlier summary".to_string(), 2, &Typed::default(), &[], &[], None)
         .into_iter()
         .enumerate()
     {
@@ -145,7 +145,7 @@ fn test_the_continuation_quotes_what_the_model_hasnt_answered() {
         ]
     );
 
-    let [_, _, (_, continuation)] = compaction_messages("the summary".to_string(), 5, &Typed::default(), &unanswered, None);
+    let [_, _, (_, continuation)] = compaction_messages("the summary".to_string(), 5, &Typed::default(), &unanswered, &[], None);
     let text = format!("{continuation:?}");
     assert!(text.contains("Reply with just: ok"), "the request isn't in the continuation: {text}");
     assert!(text.contains("Terminal command abc finished"), "{text}");
@@ -154,7 +154,7 @@ fn test_the_continuation_quotes_what_the_model_hasnt_answered() {
 
 #[test]
 fn test_compaction_messages_start_with_user_and_alternate_correctly() {
-    let inserted = compaction_messages("the summary".to_string(), 42, &Typed::default(), &[], None);
+    let inserted = compaction_messages("the summary".to_string(), 42, &Typed::default(), &[], &[], None);
     let roles: Vec<&str> = inserted.iter().map(|(role, _)| *role).collect();
     assert_eq!(
         roles,
@@ -482,7 +482,7 @@ fn test_typed_words_are_quoted_and_notices_arent() {
         },
         "the unanswered tail is quoted as such, not here"
     );
-    let prompt = continuation_prompt(&typed, &unanswered_user_text(&messages));
+    let prompt = continuation_prompt(&typed, &unanswered_user_text(&messages), &[]);
     assert!(prompt.contains(correction), "{prompt}");
     assert!(prompt.contains("And the next thing?"), "{prompt}");
     assert!(!prompt.contains("exit code 0") && !prompt.contains("Report from"), "{prompt}");
@@ -504,7 +504,7 @@ fn test_typed_words_over_the_budget_keep_the_first_and_the_newest() {
     assert!(typed.omitted > 0 && typed.quotes.len() + typed.omitted == 41, "{} kept, {} left out", typed.quotes.len(), typed.omitted);
     let size: usize = typed.quotes.iter().map(|q| q.chars().count()).sum();
     assert!(size <= CONTINUATION_TYPED_MAX_CHARS, "{size}");
-    let prompt = continuation_prompt(&typed, &[]);
+    let prompt = continuation_prompt(&typed, &[], &[]);
     assert!(prompt.contains(&format!("({} more they wrote in between are left out here", typed.omitted)), "{prompt}");
 }
 

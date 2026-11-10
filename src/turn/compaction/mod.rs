@@ -280,7 +280,11 @@ async fn compact(
 
     let unanswered = cap_unanswered(unanswered_user_text(&messages), typed_budget(turn_model.context_window));
     let typed = typed_user_text(&messages, turn_model.context_window);
-    for (role, content) in compaction_messages(summary, covers_through_message_id, &typed, &unanswered, refused) {
+    // The conversation's todo list, pinned verbatim into the continuation
+    // (SME-462). Best-effort in `describe_live_state`'s policy: a read
+    // failure means no section, never a failed compaction.
+    let todos = db::get_conversation_todos(pool, conversation_id).await.unwrap_or_default();
+    for (role, content) in compaction_messages(summary, covers_through_message_id, &typed, &unanswered, &todos, refused) {
         let saved = db::create_message(pool, conversation_id, role, &content)
             .await
             .map_err(ServerFnError::new)?;
