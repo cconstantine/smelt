@@ -153,11 +153,24 @@ fn run(run: Run) -> Ran {
 }
 
 /// The install's record, or `None` if none came within `wait`.
+///
+/// An empty read is **not the record**: the script writes it in two
+/// steps — `echo $rc > {rc}` creates/truncates the file, then writes
+/// the bytes (script.rs) — so a present, 0-byte record is a real state
+/// of every install's write, and taking it records `Some("")`, the
+/// SME-476 flake. Mirrors `rc_of` (install.rs): empty means not written
+/// yet, so keep polling within `wait` (the 100 ms poll and the caller's
+/// bound are unchanged; a never-written record still ends `wait` with
+/// `None`). A future reader of `/tmp/install.rc` must treat an empty
+/// record as not-written the same way.
 fn read_record(record: &std::path::Path, wait: Duration) -> Option<String> {
     let started = Instant::now();
     loop {
         if let Ok(rc) = std::fs::read_to_string(record) {
-            break Some(rc.trim().to_string());
+            let rc = rc.trim();
+            if !rc.is_empty() {
+                break Some(rc.to_string());
+            }
         }
         if started.elapsed() > wait {
             break None;
