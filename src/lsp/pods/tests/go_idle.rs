@@ -140,15 +140,7 @@ fn run(run: Run) -> Ran {
         .expect("sh runs");
     let started = Instant::now();
     let record = dir.join("install.rc");
-    let rc = loop {
-        if let Ok(rc) = std::fs::read_to_string(&record) {
-            break Some(rc.trim().to_string());
-        }
-        if started.elapsed() > wait {
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    let rc = read_record(&record, wait);
     let took = started.elapsed();
     let watchdogs = running(&format!("{tmp}/smelt-go-idle.sh"));
     // The script idles once its record is written; end it and anything
@@ -158,6 +150,33 @@ fn run(run: Run) -> Ran {
     let log = std::fs::read_to_string(dir.join("install.log")).unwrap_or_default();
     let _ = std::fs::remove_dir_all(&dir);
     Ran { rc, log, took, watchdogs }
+}
+
+/// The install's record, or `None` if none came within `wait`.
+///
+/// An empty read is **not the record**: the script writes it in two
+/// steps — `echo $rc > {rc}` creates/truncates the file, then writes
+/// the bytes (script.rs) — so a present, 0-byte record is a real state
+/// of every install's write, and taking it records `Some("")`, the
+/// SME-476 flake. Mirrors `rc_of` (install.rs): empty means not written
+/// yet, so keep polling within `wait` (the 100 ms poll and the caller's
+/// bound are unchanged; a never-written record still ends `wait` with
+/// `None`). A future reader of `/tmp/install.rc` must treat an empty
+/// record as not-written the same way.
+fn read_record(record: &std::path::Path, wait: Duration) -> Option<String> {
+    let started = Instant::now();
+    loop {
+        if let Ok(rc) = std::fs::read_to_string(record) {
+            let rc = rc.trim();
+            if !rc.is_empty() {
+                break Some(rc.to_string());
+            }
+        }
+        if started.elapsed() > wait {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 const STOPPED: &str = "smelt: go wrote nothing and received under 1 KB/s for 3 s, so it was stopped";
@@ -247,6 +266,70 @@ fn test_a_silent_install_that_isnt_go_is_left_alone() {
     assert_eq!(ran.rc.as_deref(), Some("0"), "{:?}", ran.log);
     assert!(!ran.log.contains("smelt: go"), "{:?}", ran.log);
     assert!(ran.watchdogs.is_empty(), "the watchdog outlived the install: {:?}", ran.watchdogs);
+}
+
+/// SME-476 R-a: an empty record file is the redirect before its write —
+/// the record write is two steps, create/truncate then echo — so it is
+/// not the record. `read_record` must end `wait` with `None` — bounded,
+/// never stuck on an empty file — and never take the empty read (the
+/// flake's recorded `Some("")`).
+#[test]
+fn test_an_empty_record_is_never_the_record() {
+    let dir = test_dir("rc-empty");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the test's directory");
+    let record = dir.join("install.rc");
+    std::fs::write(&record, "").expect("an empty record file");
+    let waiter = record.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(read_record(&waiter, Duration::from_millis(300)));
+    });
+    let rc = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("read_record ended its wait on an empty record within its bound");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(rc, None, "an empty record was taken as the record");
+}
+
+/// SME-476 R-b: the flake's exact shape, forced. A writer performs the
+/// script's two steps — the redirect creates the file, the write follows
+/// 300 ms later (`{ sleep 0.3; echo 0; } > …`, the pair `echo $rc > {rc}`
+/// does µs apart). Caught at 0 bytes, `read_record` must keep polling
+/// within `wait` and return the bytes: `Some("0")`.
+#[test]
+fn test_a_record_caught_empty_is_read_again() {
+    let dir = test_dir("rc-caught-empty");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the test's directory");
+    let record = dir.join("install.rc");
+    let mut writer = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ sleep 0.3; echo 0; }} > '{}'", record.display()))
+        .spawn()
+        .expect("sh runs");
+    // Catch the file between the redirect's create and the write's bytes.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(len) = std::fs::metadata(&record).map(|m| m.len()) {
+            assert_eq!(len, 0, "the write landed before the create was caught");
+            break;
+        }
+        assert!(Instant::now() < deadline, "the redirect never created the record");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let started = Instant::now();
+    let rc = read_record(&record, Duration::from_secs(5));
+    let took = started.elapsed();
+    let _ = writer.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    // A fix that returned at the caught-empty moment would take well under
+    // the write's 300 ms; the bytes cannot exist before the writer's sleep
+    // ends, so a correct read_record cannot return sooner (round-1 F1: the
+    // floor kills the vacuous pass where a stall between catching the file
+    // empty and the first read let a broken reader return the bytes at once).
+    assert!(took >= Duration::from_millis(150), "read_record returned {rc:?} after only {took:?} — before the forced write could have landed, so this proved nothing");
+    assert_eq!(rc.as_deref(), Some("0"), "an empty record was taken as the record: {rc:?}");
 }
 
 /// The config's own `GOFLAGS` are kept, with `-x` after them (the
