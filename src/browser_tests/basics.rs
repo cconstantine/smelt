@@ -204,14 +204,15 @@ pub(super) async fn scenario_context_usage(t: &Scenario<'_>) {
     // that scrolled both ways (SME-41 D7).
     let prompt_view: Vec<String> = context_page
         .evaluate(
-            "(() => { const p = document.querySelector('.context-detail-prompt'); const panel = document.querySelector('.context-detail-panel'); \
-             return [p ? getComputedStyle(p).whiteSpace : 'missing', String(panel.scrollWidth - panel.clientWidth)]; })()",
+            "(() => { const p = document.querySelector('.context-detail-system .context-detail-prompt'); const panel = document.querySelector('.context-detail-panel'); \
+             return [p ? getComputedStyle(p).whiteSpace : 'missing', String(panel.scrollWidth - panel.clientWidth), String(p !== null && p.closest('.context-detail-system') !== null)]; })()",
         )
         .await
         .expect("inspect the detail view")
         .into_value()
         .expect("strings");
     assert_eq!(prompt_view[0], "pre-wrap", "the system prompt should keep its line breaks: {prompt_view:?}");
+    assert_eq!(prompt_view[2], "true", "the line-break assertion should measure the System prompt pane's own pre, not whichever `.context-detail-prompt` comes first: {prompt_view:?}");
     assert!(prompt_view[1].parse::<f64>().unwrap_or(1.0) <= 0.0, "the detail view scrolls sideways: {prompt_view:?}");
 
     // The pinned todo list pane (SME-462) shows when the conversation
