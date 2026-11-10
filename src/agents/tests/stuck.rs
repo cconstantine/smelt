@@ -121,6 +121,15 @@ async fn test_second_and_later_stuck_ends_tell_the_parent_and_never_loop(pool: P
     eventually("every turn is over", || async { !crate::turn::turn_running(parent) && !crate::turn::turn_running(seat) }).await;
     assert!(owed_at(&pool, seat).await.is_some(), "the owed mark stands until the seat reports");
 
+    // Settle the parent's own turn for the notice before the quiet window:
+    // the escalation wakes it (restart.rs's shape), and `turn_running` says
+    // nothing about a wake already in flight — the count plus the turn
+    // ending settles it (round-1 CI red: the no-loop assert caught this
+    // wake arriving inside its own window, left: 3, right: 2).
+    eventually("the parent's turn for the notice is over", || async {
+        requests_for(&requests, None).len() == 1 && !crate::turn::turn_running(parent)
+    })
+    .await;
     // Nothing loops: with both turns over, the request log grows no more.
     let before = requests.lock().expect("the request log").len();
     tokio::time::sleep(Duration::from_millis(200)).await;
