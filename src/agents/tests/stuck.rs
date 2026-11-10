@@ -195,6 +195,45 @@ async fn test_a_seat_with_a_pending_wake_is_not_nudged(pool: PgPool) {
     }
 }
 
+/// Seam A's Medium (SME-455 round 1): the three pending-wake clauses hold
+/// the **nudge decision** — a plain end with a wake coming is left alone
+/// (test 5) — but they must not hold the reason branch: a failure, cut-off
+/// or refusal end with a wake pending still tells the parent at once,
+/// with the reason, or the reason is lost for good (the SME-386 N6
+/// guarantee: the child is not notified of those because the parent
+/// reports them — and it can't report what it wasn't told).
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_reason_end_with_a_pending_wake_still_tells_the_parent(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    mock_upstream(&pool, vec![text_reply("ok")]).await;
+    let parent = quiet_parent(&pool).await;
+    // Test 5's two wake shapes: an undelivered `agent_messages` row, and a
+    // command end recorded but never drained — seam A's concrete case is a
+    // `sleep` ending a beat before its turn's last call fails.
+    let by_message = active_child(&pool, parent).await;
+    db::queue_notice(&pool, by_message, parent, "parent", "A note for later").await.expect("queue it");
+    let by_command = active_child(&pool, parent).await;
+    command(&pool, by_command, "stuck-reason-wake", true).await;
+
+    for seat in [by_message, by_command] {
+        crate::agents::after_last_turn(&pool, seat, Some("it failed: boom".to_string())).await;
+    }
+
+    let told = queued_to(&pool, parent).await;
+    for seat in [by_message, by_command] {
+        let expected = format!("agent #{seat}'s turn ended without a report (it failed: boom); its last message: ");
+        let mine: Vec<&String> = told.iter().filter(|b| b.starts_with(&format!("agent #{seat}'s"))).collect();
+        assert_eq!(mine, vec![&expected], "#{seat}: a failed end keeps telling the parent at once, reason and all");
+    }
+    for seat in [by_message, by_command] {
+        assert!(queued_to(&pool, seat).await.iter().all(|b| b != &marked_nudge()), "#{seat}: a reason end never nudges");
+        assert!(owed_at(&pool, seat).await.is_none(), "#{seat}: and never marks owed");
+    }
+    for id in [parent, by_message, by_command] {
+        crate::turn::forget_conversation_lock(id);
+    }
+}
+
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_seat_with_a_question_to_the_user_is_not_nudged(pool: PgPool) {
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");

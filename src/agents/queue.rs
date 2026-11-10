@@ -174,9 +174,12 @@ pub(crate) const REPORT_OWE_NUDGE: &str =
 /// first such stuck end of a spell nudges it (its own wake, nothing to
 /// the parent), and the second one brings the parent notice below. The
 /// CAS in `db::queue_report_owed_nudge` is the only first/second decider.
-/// A turn ended by anything else — a failure, a cut-off, a refusal
-/// (SME-386 F6) — keeps reaching the parent at once: an SME-386 N6
-/// guarantee this delays nothing.
+/// The pending-wake clauses hold that nudge decision only: a wake
+/// already coming wakes the seat itself, so a plain end with one pending
+/// is left alone entirely. A turn ended by anything else — a failure, a
+/// cut-off, a refusal (SME-386 F6) — is gated by the idle check's base
+/// clauses alone and so keeps reaching the parent at once with its
+/// reason: an SME-386 N6 guarantee this delays nothing.
 pub(crate) async fn after_last_turn(pool: &PgPool, conversation_id: i64, why: Option<String>) {
     // A finished agent's turn ended with its report: its pod stops at once,
     // unless a command still runs (SME-78). It didn't end "without a report".
@@ -201,13 +204,20 @@ pub(crate) async fn after_last_turn(pool: &PgPool, conversation_id: i64, why: Op
             return;
         }
     };
-    let (parent, last) = parent;
+    let (parent, last, wake_clear) = parent;
     // SME-455: the first plain stuck end of a spell is the seat's own to
-    // answer, not the parent's to read. The CAS queues nudge and owed
-    // mark in one transaction; `false` means a later end (or the seat
-    // stopped mid-check) and today's notice goes on below — and a failed
-    // queue costs only the nudge: the parent still hears, now.
+    // answer, not the parent's to read. A wake already coming (an
+    // undelivered row, an undrained command end, an untaken answer) wakes
+    // the seat by itself — no nudge, no owed mark, and the parent hears
+    // nothing (the test 5 guard); the owed spell starts at the plain end
+    // the wake's turn ends on. The CAS queues nudge and owed mark in one
+    // transaction; `false` means a later end (or the seat stopped
+    // mid-check) and today's notice goes on below — and a failed queue
+    // costs only the nudge: the parent still hears, now.
     if why.is_none() {
+        if !wake_clear {
+            return;
+        }
         let nudge = crate::api::chat::mark_notice(REPORT_OWE_NUDGE);
         match db::queue_report_owed_nudge(pool, conversation_id, &nudge).await {
             Ok(true) => {
