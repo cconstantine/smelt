@@ -25,6 +25,7 @@ pub fn compaction_messages(
     covers_through_message_id: i64,
     typed: &Typed,
     unanswered: &[String],
+    todos: &[anthropic::tools::TodoItem],
     refused: Option<String>,
 ) -> [(&'static str, Vec<anthropic::ContentBlock>); 3] {
     [
@@ -45,7 +46,7 @@ pub fn compaction_messages(
         (
             "user",
             vec![anthropic::ContentBlock::CompactionPlaceholder {
-                text: continuation_prompt(typed, unanswered),
+                text: continuation_prompt(typed, unanswered, todos),
             }],
         ),
     ]
@@ -58,9 +59,16 @@ pub fn compaction_messages(
 /// It also quotes, word for word, what the user (or the agent's parent)
 /// wrote earlier (`typed`, SME-367): a summary can paraphrase a mid-run
 /// correction away, and on SME-73 a seat whose correction it lost made the
-/// same mistake again after two compactions.
+/// same mistake again after two compactions. And it pins the conversation's
+/// todo list verbatim (`todos`, SME-462) — the model's own progress tracker,
+/// which a summary can drop and `todoread` only restores if the model
+/// thinks to ask.
 #[cfg(feature = "server")]
-pub fn continuation_prompt(typed: &Typed, unanswered: &[String]) -> String {
+pub fn continuation_prompt(
+    typed: &Typed,
+    unanswered: &[String],
+    todos: &[anthropic::tools::TodoItem],
+) -> String {
     let mut prompt = COMPACTION_CONTINUATION_PROMPT.to_string();
     if !typed.quotes.is_empty() {
         prompt.push_str(
@@ -79,6 +87,15 @@ pub fn continuation_prompt(typed: &Typed, unanswered: &[String]) -> String {
             ));
         }
     }
+    // The pinned list sits beside the typed quotes — persisted transcript
+    // content, riding the moving cache breakpoint exactly as they do — and
+    // before the unanswered tail, which stays last with its "respond to
+    // them now" (SME-462).
+    let pinned = pinned_todos_text(todos);
+    if let Some(block) = &pinned {
+        prompt.push_str("\n\n");
+        prompt.push_str(block);
+    }
     if unanswered.is_empty() {
         return prompt;
     }
@@ -86,7 +103,7 @@ pub fn continuation_prompt(typed: &Typed, unanswered: &[String]) -> String {
     format!(
         "{prompt}{}The summary includes these latest messages, which you haven't answered yet; \
          respond to them now:\n\n{}",
-        if typed.quotes.is_empty() { " " } else { "\n\n" },
+        if typed.quotes.is_empty() && pinned.is_none() { " " } else { "\n\n" },
         quoted.join("\n\n")
     )
 }
@@ -340,4 +357,85 @@ pub fn cap_unanswered(texts: Vec<String>, budget: usize) -> Vec<String> {
     }
     kept.reverse();
     kept
+}
+
+/// The cap on the pinned todo block (SME-462): about 500 tokens. A constant,
+/// not window-scaled like `typed_budget` — an eighth of a 16k-token window
+/// already exceeds it, so the small-window rule (SME-386) never binds below
+/// it.
+#[cfg(feature = "server")]
+pub const CONTINUATION_TODOS_MAX_CHARS: usize = 2_000;
+
+/// The pinned todo block's lead-in (SME-462): what the list is — the model's
+/// own tracker, echoed back to it — and what it isn't: verified state. It
+/// echoes, and cannot weaken, SME-393's verify-before-act nudge. Tests pin
+/// the marker phrase `not verified facts`, not this whole sentence.
+#[cfg(feature = "server")]
+const PINNED_TODOS_LEAD_IN: &str = "Your own todo list as of this compaction — your own tracker, \
+    i.e. your own claims about your progress, not verified facts: a `completed` here is not \
+    evidence the work was done (verify as you verify the summary), and it is a snapshot of \
+    this moment, not the live panel.";
+
+/// What a cut todo says of the rest of its line (SME-462) — the same pointer
+/// as the trailing note gives.
+#[cfg(feature = "server")]
+const TODOS_REST_POINTER: &str = "; todoread lists every todo whole";
+
+/// The conversation's todo list as a block pinned into a continuation
+/// message (SME-462): each item verbatim in list order as
+/// `- {content} ({status})`, under the lead-in marking them as the model's
+/// own claims. `pub(crate)` rather than turn's usual `pub(super)` reach
+/// because the context view calls this same builder, so the view can't
+/// drift from what a compaction would pin. `None` for an empty list — a conversation that never used
+/// todos gains no section. Held to `CONTINUATION_TODOS_MAX_CHARS`: whole
+/// items in order while they fit, the first that doesn't fit kept in part
+/// via `quote_to` at what's left of the budget, and what's dropped said at
+/// the end in `cap_unanswered`'s grammar — a cut always names the `todoread`
+/// pointer to the full DB list.
+#[cfg(feature = "server")]
+pub(crate) fn pinned_todos_text(todos: &[anthropic::tools::TodoItem]) -> Option<String> {
+    if todos.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = todos
+        .iter()
+        .map(|todo| format!("- {} ({})", todo.content, todo.status.as_str()))
+        .collect();
+    let whole = lines.join("\n");
+    if whole.chars().count() <= CONTINUATION_TODOS_MAX_CHARS {
+        return Some(format!("{PINNED_TODOS_LEAD_IN}\n\n{whole}"));
+    }
+    let mut kept: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    for line in &lines {
+        let size = line.chars().count();
+        let separator = usize::from(!kept.is_empty());
+        if used + separator + size <= CONTINUATION_TODOS_MAX_CHARS {
+            used += separator + size;
+            kept.push(line.clone());
+            continue;
+        }
+        // The first item that doesn't fit whole is kept in part: its head
+        // still says what the todo is, to what the budget has left.
+        // `saturating_sub`: whole items can fill the budget exactly, and
+        // then a further item's separator leaves nothing — zero goes to
+        // no partial line below, `remaining > 0` covers it (a bare
+        // subtract panicked there, SME-462 review).
+        let remaining = CONTINUATION_TODOS_MAX_CHARS.saturating_sub(used + separator);
+        if remaining > 0 {
+            kept.push(quote_to(line, remaining, TODOS_REST_POINTER));
+        }
+        break;
+    }
+    if kept.len() < lines.len() {
+        let dropped = lines.len() - kept.len();
+        kept.push(format!(
+            "({} of {} todos {} shown here; the rest {} left out here; todoread lists the whole list.)",
+            kept.len(),
+            lines.len(),
+            if kept.len() == 1 { "is" } else { "are" },
+            if dropped == 1 { "is" } else { "are" },
+        ));
+    }
+    Some(format!("{PINNED_TODOS_LEAD_IN}\n\n{}", kept.join("\n")))
 }

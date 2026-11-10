@@ -165,6 +165,18 @@ pub(super) async fn seed_usage(pool: &sqlx::PgPool, conversation: i64, input_tok
 pub(super) async fn scenario_context_usage(t: &Scenario<'_>) {
     let context_conversation = t.conversation().await;
     seed_usage(t.pool, context_conversation.id, 40_000, 10_000).await;
+    // The pinned todo list pane (SME-462) shows only when the
+    // conversation has a list: seed one through the tool's own writer.
+    db::set_conversation_todos(
+        t.pool,
+        context_conversation.id,
+        &[crate::anthropic::tools::TodoItem {
+            content: "Check the context dialog".to_string(),
+            status: crate::anthropic::tools::TodoStatus::InProgress,
+        }],
+    )
+    .await
+    .expect("seed a todo list");
 
     let context_page = t.tab(t.url(&format!("conversation/{}", context_conversation.id))).await;
     assert!(
@@ -192,15 +204,40 @@ pub(super) async fn scenario_context_usage(t: &Scenario<'_>) {
     // that scrolled both ways (SME-41 D7).
     let prompt_view: Vec<String> = context_page
         .evaluate(
-            "(() => { const p = document.querySelector('.context-detail-prompt'); const panel = document.querySelector('.context-detail-panel'); \
-             return [p ? getComputedStyle(p).whiteSpace : 'missing', String(panel.scrollWidth - panel.clientWidth)]; })()",
+            "(() => { const p = document.querySelector('.context-detail-system .context-detail-prompt'); const panel = document.querySelector('.context-detail-panel'); \
+             return [p ? getComputedStyle(p).whiteSpace : 'missing', String(panel.scrollWidth - panel.clientWidth), String(p !== null && p.closest('.context-detail-system') !== null)]; })()",
         )
         .await
         .expect("inspect the detail view")
         .into_value()
         .expect("strings");
     assert_eq!(prompt_view[0], "pre-wrap", "the system prompt should keep its line breaks: {prompt_view:?}");
+    assert_eq!(prompt_view[2], "true", "the line-break assertion should measure the System prompt pane's own pre, not whichever `.context-detail-prompt` comes first: {prompt_view:?}");
     assert!(prompt_view[1].parse::<f64>().unwrap_or(1.0) <= 0.0, "the detail view scrolls sideways: {prompt_view:?}");
+
+    // The pinned todo list pane (SME-462) shows when the conversation
+    // has a list, and its heading is the toggle like every sibling's
+    // (SME-123 DR11): with the per-pane `display: inline` on the
+    // summary h4 it shares the disclosure marker's row, while a bare
+    // h4 keeps its block box and renders on a line of its own below
+    // the marker. Measured against the summary's own box rather than
+    // the marker pseudo-element, which no DOM API can measure.
+    wait_for_element(&context_page, ".context-detail-pinned-todos", Duration::from_secs(5)).await;
+    let toggle_row: Vec<f64> = context_page
+        .evaluate(
+            "(() => { const s = document.querySelector('.context-detail-pinned-todos summary'); \
+             const h = s.querySelector('h4'); \
+             const m = s.getBoundingClientRect(); const r = h.getBoundingClientRect(); \
+             return [m.top, m.left, r.top, r.left]; })()",
+        )
+        .await
+        .expect("evaluate the pinned-todo heading row")
+        .into_value()
+        .expect("four numbers");
+    assert!(
+        toggle_row[3] > toggle_row[1] + 1.0 && toggle_row[2] - toggle_row[0] < 10.0,
+        "the pinned-todo heading should ride the disclosure marker's row like every sibling's: {toggle_row:?}"
+    );
 }
 
 /// Scenario 6: a compaction event renders as a distinct, collapsed-by-default

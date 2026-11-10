@@ -290,6 +290,16 @@ pub(super) fn render_context_detail_body(detail: Option<&Result<ContextDetailSna
                     }
                 }
             }
+            // SME-462: the list as the next compaction would pin it — the
+            // same block the model will be shown, reconstructed from the
+            // current list (the view's contract), `None` rendering nothing.
+            if let Some(pinned_todos) = &detail.pinned_todos {
+                details { class: "context-detail-pinned-todos",
+                    summary { h4 { class: "context-detail-heading", "Pinned todo list" } }
+                    p { class: "muted", "The list the next compaction pins verbatim into the continuation the model reads on — its own claims about its progress, not verified facts. The live list stays one `todoread` away." }
+                    {shown_pre(pinned_todos, Some("context-detail-prompt"))}
+                }
+            }
             details { class: "context-detail-system",
                 summary { h4 { class: "context-detail-heading", "System prompt" } }
                 if let Some(system) = &detail.system {

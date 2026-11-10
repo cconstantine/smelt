@@ -218,3 +218,30 @@ async fn test_a_deletes_teardown_is_a_child_of_its_request(pool: PgPool) {
     let teardown = spans.iter().find(|span| span.name == "teardown_conversation").expect("teardown's span");
     assert_eq!(teardown.parent_span_id, request.span_context.span_id(), "{spans:?}");
 }
+
+/// SME-462: the context view carries the same block the next compaction
+/// would pin — `Some`, with the items verbatim under the pin's marker,
+/// once `todowrite` has saved a list, and `None` while the conversation
+/// never used todos.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_context_detail_carries_the_pinned_todo_list(pool: PgPool) {
+    use crate::anthropic::tools::{TodoItem, TodoStatus};
+    let id = db::create_conversation(&pool).await.expect("conversation").id;
+    let detail = context_detail(&pool, id).await.expect("context detail without todos");
+    assert_eq!(detail.pinned_todos, None, "a conversation that never used todos has no block");
+    db::set_conversation_todos(
+        &pool,
+        id,
+        &[
+            TodoItem { content: "Ship the pinned list".to_string(), status: TodoStatus::InProgress },
+            TodoItem { content: "Bury the stale copy".to_string(), status: TodoStatus::Pending },
+        ],
+    )
+    .await
+    .expect("set todos");
+    let detail = context_detail(&pool, id).await.expect("context detail with todos");
+    let pinned = detail.pinned_todos.expect("a list gets a block");
+    assert!(pinned.contains("not verified facts"), "the marker the pin uses: {pinned}");
+    assert!(pinned.contains("- Ship the pinned list (in_progress)"), "items verbatim: {pinned}");
+    assert!(pinned.contains("- Bury the stale copy (pending)"), "items verbatim: {pinned}");
+}

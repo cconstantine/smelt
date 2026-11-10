@@ -38,7 +38,7 @@ fn long_turn(ask: &str, steps: i64) -> Vec<Message> {
 /// `messages` compacted once with `summary`, as `compact` saves it.
 fn with_summary(mut messages: Vec<Message>, summary: &str) -> Vec<Message> {
     let last = messages.last().map_or(0, |m| m.id);
-    for (offset, (role, blocks)) in compaction_messages(summary.to_string(), last, &Typed::default(), &[], None).into_iter().enumerate() {
+    for (offset, (role, blocks)) in compaction_messages(summary.to_string(), last, &Typed::default(), &[], &[], None).into_iter().enumerate() {
         messages.push(message_with_blocks(last + 1 + offset as i64, role, blocks));
     }
     messages

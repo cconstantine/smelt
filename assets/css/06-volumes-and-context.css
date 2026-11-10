@@ -486,3 +486,14 @@
 .context-detail-system summary h4 {
     display: inline;
 }
+
+/* The pinned todo list, folded under the context view's summary
+   (SME-462) — heading-is-the-toggle like the System prompt's (SME-123
+   DR11). */
+.context-detail-pinned-todos summary {
+    cursor: pointer;
+}
+
+.context-detail-pinned-todos summary h4 {
+    display: inline;
+}

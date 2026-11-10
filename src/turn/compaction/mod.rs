@@ -6,6 +6,10 @@ mod budgets;
 mod continuation;
 pub(super) use budgets::*;
 pub(super) use continuation::*;
+// The context view builds its "Pinned todo list" with this same builder
+// (SME-462), so it crosses into `api::chat` through `turn`'s re-export.
+#[cfg(feature = "server")]
+pub(crate) use continuation::pinned_todos_text;
 /// Whether it's safe to end a compaction's covered range right after a
 /// message with this content — i.e. it contains no `tool_use` block whose
 /// paired `tool_result` (always the very next persisted message, in this
@@ -280,7 +284,11 @@ async fn compact(
 
     let unanswered = cap_unanswered(unanswered_user_text(&messages), typed_budget(turn_model.context_window));
     let typed = typed_user_text(&messages, turn_model.context_window);
-    for (role, content) in compaction_messages(summary, covers_through_message_id, &typed, &unanswered, refused) {
+    // The conversation's todo list, pinned verbatim into the continuation
+    // (SME-462). Best-effort in `describe_live_state`'s policy: a read
+    // failure means no section, never a failed compaction.
+    let todos = db::get_conversation_todos(pool, conversation_id).await.unwrap_or_default();
+    for (role, content) in compaction_messages(summary, covers_through_message_id, &typed, &unanswered, &todos, refused) {
         let saved = db::create_message(pool, conversation_id, role, &content)
             .await
             .map_err(ServerFnError::new)?;
