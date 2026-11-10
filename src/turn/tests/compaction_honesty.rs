@@ -385,6 +385,43 @@ fn test_pinned_todos_caps_a_long_list_with_a_note_naming_todoread() {
     assert!(block.chars().count() < 3_000, "the block stays near its 2,000-char cap, not the list's ~29,000");
 }
 
+/// The cap's boundary (SME-462's review): a whole item that fills the
+/// 2,000-char item budget exactly, followed by any other todo — the
+/// next item's subtraction then has nothing left, and it must stay
+/// whole-item arithmetic: no underflow (debug panicked inside
+/// `compact()`), no wrapped budget silently appending the next item
+/// whole and dropping the cut note (release). Fixture arithmetic:
+/// 1,988 chars of content in `- {content} (pending)` framing is exactly
+/// 2,000 chars; one more todo follows.
+#[test]
+fn test_pinned_todos_exactly_at_the_cap_still_cuts_the_next_item() {
+    use crate::anthropic::tools::TodoStatus;
+    let big = "x".repeat(1_988);
+    let block = pinned_todos_text(&[
+        todo_item(&big, TodoStatus::Pending),
+        todo_item("Bury the stale copy", TodoStatus::Pending),
+    ])
+    .expect("a list gets a block, and exactly-at-cap gets one too");
+    assert!(block.contains(&format!("- {big} (pending)")), "the exactly-filling item is kept whole");
+    let note_start = block.rfind("\n(").expect("the cut needs the trailing note");
+    let note = &block[note_start + 1..];
+    assert!(note.starts_with("(1 of 2 todos"), "the next item is cut, and the note counts it: {note}");
+    assert!(note.contains("todoread lists the whole list"), "…naming where the whole list lives: {note}");
+    assert!(!block.contains("- Bury the stale copy (pending)"), "the item past the cap is not appended whole");
+    let items_part = &block[..note_start];
+    let gap = items_part.rfind("\n\n").expect("the lead-in gap");
+    assert_eq!(
+        items_part[gap..].chars().count() - 2, // the gap itself, not counted
+        CONTINUATION_TODOS_MAX_CHARS,
+        "the item lines stop at exactly the cap"
+    );
+    assert!(
+        block.chars().count() <= CONTINUATION_TODOS_MAX_CHARS + 425,
+        "total stays cap + the documented ~425-char lead-in/marker/note overhead: {}",
+        block.chars().count()
+    );
+}
+
 /// 2294639622's trigger, after SME-443: an HTTP-kind summary cut off at
 /// its budget is continued once — and when that continuation ends its
 /// turn with nothing more to say, what the first call wrote still saves,

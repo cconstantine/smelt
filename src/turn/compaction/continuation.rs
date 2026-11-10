@@ -417,7 +417,11 @@ pub(crate) fn pinned_todos_text(todos: &[anthropic::tools::TodoItem]) -> Option<
         }
         // The first item that doesn't fit whole is kept in part: its head
         // still says what the todo is, to what the budget has left.
-        let remaining = CONTINUATION_TODOS_MAX_CHARS - (used + separator);
+        // `saturating_sub`: whole items can fill the budget exactly, and
+        // then a further item's separator leaves nothing — zero goes to
+        // no partial line below, `remaining > 0` covers it (a bare
+        // subtract panicked there, SME-462 review).
+        let remaining = CONTINUATION_TODOS_MAX_CHARS.saturating_sub(used + separator);
         if remaining > 0 {
             kept.push(quote_to(line, remaining, TODOS_REST_POINTER));
         }
