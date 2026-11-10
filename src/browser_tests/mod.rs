@@ -272,6 +272,7 @@ fn scenarios() -> Vec<Entry> {
         entry("notifier_setting_off_then_leaving", 60, Runs::Alone, |t| Box::pin(scenario_notifier_setting_off_then_leaving(t))),
         entry("notifier_event_queued_at_demotion", 60, Runs::Alone, |t| Box::pin(scenario_notifier_event_queued_at_demotion(t))),
         entry("agent_reference_links", 90, Runs::Beside, |t| Box::pin(scenario_agent_reference_links(t))),
+        entry("report_owed_marker", 60, Runs::Beside, |t| Box::pin(scenario_report_owed_marker(t))),
     ]
 }
 
@@ -454,6 +455,7 @@ mod text_calls;
 mod notifications;
 mod notifier_leader;
 mod live_commands;
+mod report_owed;
 
 use harness::*;
 use mock::*;
@@ -476,3 +478,4 @@ use text_calls::*;
 use notifications::*;
 use notifier_leader::*;
 use live_commands::*;
+use report_owed::*;
