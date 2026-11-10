@@ -321,3 +321,113 @@ fn test_cache_tokens_are_input_and_output_isnt() {
     );
     assert_eq!(progress.after, Some(60));
 }
+
+/// The loop's own shape (SME-414): one accepted step between each
+/// compaction. The opening compaction has no step before it and counts
+/// neither way.
+fn thrash(progress: &mut CompactionProgress, n: u32) {
+    progress.compacted(WINDOW);
+    for _ in 0..n {
+        progress.step_taken();
+        progress.compacted(WINDOW);
+    }
+}
+
+#[test]
+fn test_one_step_between_compactions_counts_the_loop_and_two_clear_it() {
+    let mut progress = CompactionProgress::default();
+    thrash(&mut progress, 3);
+    assert_eq!(progress.thrash, 3, "one step between each");
+    progress.step_taken();
+    progress.compacted(WINDOW);
+    assert_eq!(progress.thrash, 4, "the count goes on while the shape does");
+    progress.step_taken();
+    progress.step_taken();
+    progress.compacted(WINDOW);
+    assert_eq!(progress.thrash, 0, "two worked steps mean the room was used");
+    progress.step_taken();
+    progress.compacted(WINDOW);
+    assert_eq!(progress.thrash, 1, "the run starts over from there");
+    thrash(&mut progress, 2);
+    progress.compacted(WINDOW);
+    assert_eq!(progress.thrash, 3, "no step between: MAX_REFUSAL_COMPACTIONS' job, not this one");
+}
+
+#[test]
+fn test_the_notice_fires_once_at_its_number_and_the_turn_ends_at_end_at() {
+    let mut progress = CompactionProgress::default();
+    thrash(&mut progress, NOTICE_AT - 1);
+    assert_eq!(progress.take_thrash_notice(), None, "not yet");
+    progress.step_taken();
+    progress.compacted(WINDOW);
+    let notice = progress.take_thrash_notice().expect("told at NOTICE_AT");
+    assert!(notice.contains("bigger than the room a compaction leaves"), "{notice}");
+    assert_eq!(progress.take_thrash_notice(), None, "once only");
+    // The loop goes on being counted to the end, and the next step ends
+    // the turn and arms the stop.
+    for _ in 0..(END_AT - NOTICE_AT) {
+        progress.step_taken();
+        progress.compacted(WINDOW);
+    }
+    let CompactionStep::Stuck(why) = step(&mut progress, TRIGGER) else { panic!("it ends the turn") };
+    assert!(why.contains("one step between each"), "{why}");
+    assert!(why.contains(&END_AT.to_string()), "{why}");
+    assert!(progress.is_stuck(), "and the conversation is stopped");
+    // Armed: every later step says so before the call, on the number-free
+    // wording so `already_said` dedupes a wake's repeats.
+    let CompactionStep::Stuck(armed) = step(&mut progress, TRIGGER) else { panic!("still stopped") };
+    assert!(armed.contains("compacting after every step"), "{armed}");
+    assert!(!armed.chars().any(|c| c.is_ascii_digit()), "number-free: {armed}");
+}
+
+#[test]
+fn test_the_users_send_clears_the_loop_fully() {
+    let mut progress = CompactionProgress::default();
+    thrash(&mut progress, END_AT);
+    assert!(matches!(step(&mut progress, TRIGGER), CompactionStep::Stuck(_)));
+    progress.user_wrote();
+    assert!(!progress.is_stuck());
+    assert_eq!(step(&mut progress, TRIGGER - 1), CompactionStep::Go, "fresh runway");
+    // And the notice can fire again: the send got a whole new count.
+    thrash(&mut progress, NOTICE_AT);
+    assert!(progress.take_thrash_notice().is_some());
+}
+
+#[test]
+fn test_a_queued_message_lifts_the_stop_and_only_the_stop() {
+    let mut progress = CompactionProgress::default();
+    thrash(&mut progress, END_AT);
+    assert!(matches!(step(&mut progress, TRIGGER), CompactionStep::Stuck(_)));
+    progress.clear_thrash();
+    assert!(!progress.is_stuck(), "the armed stop lifts");
+    assert_eq!(step(&mut progress, TRIGGER), CompactionStep::Compact, "the next compaction goes, and it reads the message");
+    // `stuck` is another matter: sizes are not what a message changes.
+    let mut progress = CompactionProgress::default();
+    progress.too_small(99_000, WINDOW);
+    progress.clear_thrash();
+    assert!(progress.is_stuck(), "still out of room");
+}
+
+#[test]
+fn test_nothing_is_counted_or_fired_against_a_guess() {
+    let mut progress = CompactionProgress::default();
+    let guess = 50_000;
+    progress.guessed(WINDOW, guess);
+    for _ in 0..END_AT + 1 {
+        progress.step_taken();
+        progress.compacted(guess);
+    }
+    assert_eq!(progress.thrash, 0, "nothing is counted against a guess");
+    assert_eq!(progress.take_thrash_notice(), None);
+    assert!(!progress.is_stuck());
+}
+
+#[test]
+fn test_a_new_window_clears_the_armed_stop() {
+    let mut progress = CompactionProgress::default();
+    thrash(&mut progress, END_AT);
+    assert!(matches!(step(&mut progress, TRIGGER), CompactionStep::Stuck(_)));
+    // The provider page's bigger window: what was counted was of the old one.
+    assert_eq!(progress.step("m", 200_000, Some(TRIGGER)), CompactionStep::Go);
+    assert!(!progress.is_stuck());
+}

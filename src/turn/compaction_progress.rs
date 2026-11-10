@@ -46,6 +46,10 @@
 //! - the server refuses a request whose budget that measured size gave
 //!   (`refused`, final review M-1): the size is out of date, and the larger
 //!   of it and the refusal's count is what's believed from then on;
+//! - compaction after every step — one step between each summary — is the
+//!   loop SME-386 F10 survived: counted (`thrash`), the model is told at
+//!   `NOTICE_AT`, and at `END_AT` the turn ends and wakes stop until the
+//!   user writes, the window changes, or a message queues (SME-414);
 //! - a restart or a delete: all of it goes, and the next compaction learns it.
 
 use super::*;
@@ -75,6 +79,19 @@ const MAX_AT_LIMIT: u32 = 3;
 /// How many compactions answering a refusal may come in a row, with no step
 /// the server took between them.
 const MAX_REFUSAL_COMPACTIONS: u32 = 3;
+
+/// How many single-step compactions in a row — one step between each — tell
+/// the model what it's in for: every step bigger than the room a compaction
+/// leaves. 9, under F11's real 11 compactions over 9 steps, so the loop is
+/// named while it can still bend, and above the 8-compaction guard test
+/// (Decided (Driver) D1, 2026-11-10: under the user's answer — end the turn,
+/// no clamp — a notice fired only at the end would never reach the model).
+pub(super) const NOTICE_AT: u32 = 9;
+
+/// How many single-step compactions in a row end the turn rather than keep
+/// paying for summaries (the user's answer: end with a clear notice;
+/// Decided (Driver) D1).
+pub(super) const END_AT: u32 = 12;
 
 /// What a turn does about compacting before a model call.
 #[derive(Debug, PartialEq)]
@@ -130,6 +147,16 @@ pub(super) struct CompactionProgress {
     /// `stuck` because the system prompt and tools take about this much,
     /// which leaves this window no room for a reply.
     too_small: Option<u64>,
+    /// Accepted model steps since the last compaction.
+    steps_since_compaction: u32,
+    /// Compactions in a row with exactly one step between them: each step
+    /// is spent before the model can use the room the last left (SME-414).
+    thrash: u32,
+    /// The model was told at `NOTICE_AT` (`take_thrash_notice` reads it).
+    thrash_noticed: bool,
+    /// `thrash` reached `END_AT`: turns end and wakes stop, until the user
+    /// writes, the window changes, or a message queues (`clear_thrash`).
+    thrashing: bool,
 }
 
 /// How near the window a request may come once compacting can't help.
@@ -152,6 +179,9 @@ impl CompactionProgress {
 
     fn forget_measures(&mut self) {
         (self.after, self.awaiting, self.tight, self.tight_results, self.at_limit) = (None, false, false, 0, 0);
+        // Against a guess the loop can't be measured; its armed stop
+        // survives, like `refused_out` (SME-414).
+        (self.thrash, self.thrash_noticed) = (0, false);
     }
 
     /// A refusal naming no window has the turn believe `guess` instead of
@@ -173,6 +203,7 @@ impl CompactionProgress {
         self.refusal_compactions = 0;
         self.try_anyway = false;
         self.believing = false;
+        self.steps_since_compaction += 1;
     }
 
     /// The server took the retry after a refusal: the try and what was
@@ -222,6 +253,17 @@ impl CompactionProgress {
         if self.stuck {
             return CompactionStep::Stuck(self.why_stuck(model, context_window));
         }
+        // The loop counted out (SME-414): an armed wake stops before the
+        // call, on wording that names no numbers so `already_said` dedupes
+        // its repeats; the count reaching `END_AT` arms it and ends the
+        // turn. Skipped under a guess, as `tight` is.
+        if self.thrashing {
+            return CompactionStep::Stuck(Self::why_armed(model));
+        }
+        if self.guess.is_none() && self.thrash >= END_AT {
+            self.thrashing = true;
+            return CompactionStep::Stuck(Self::why_thrashed(model));
+        }
         if std::mem::take(&mut self.compact_for_room) {
             return CompactionStep::Compact;
         }
@@ -242,6 +284,22 @@ impl CompactionProgress {
     pub(super) fn compacted(&mut self, context_window: u32) {
         self.sync(context_window);
         self.awaiting = true;
+        // The loop's count (SME-414): exactly one step between two
+        // compactions is the shape. Two worked steps mean the room was
+        // used, and the run starts over; none — refusal-answering and
+        // recovery chains — is `MAX_REFUSAL_COMPACTIONS`' job, not this
+        // one. Nothing is counted against a guess.
+        if self.guess.is_none() {
+            match self.steps_since_compaction {
+                1 => {
+                    self.thrash += 1;
+                    self.thrash_noticed |= self.thrash == NOTICE_AT;
+                }
+                0 => {}
+                _ => self.thrash = 0,
+            }
+        }
+        self.steps_since_compaction = 0;
     }
 
     /// A reply's `usage`. Its input alone: what it wrote is new work, not
@@ -319,12 +377,42 @@ impl CompactionProgress {
     /// The reason, if the conversation doesn't fit: for a reply cut off on
     /// the result that shows it, whose turn never gets to `step`.
     pub(super) fn why_if_stuck(&self, model: &str, context_window: u32) -> Option<String> {
-        self.stuck.then(|| self.why_stuck(model, context_window))
+        (self.stuck || self.thrashing).then(|| self.why_stuck(model, context_window))
     }
 
     /// Whether the conversation doesn't fit.
     pub(super) fn is_stuck(&self) -> bool {
-        self.stuck
+        self.stuck || self.thrashing
+    }
+
+    /// Whether the loop's stop is armed, for tests that watch it lift.
+    #[cfg(test)]
+    pub(super) fn is_thrashing(&self) -> bool {
+        self.thrashing
+    }
+
+    /// The loop's notice to the model, once (SME-414): fired by the
+    /// compaction that counted `NOTICE_AT`, drained by the turn right after
+    /// it, which saves it grey-marked (SME-357) so a later compaction
+    /// quotes it as the model's typed words.
+    pub(super) fn take_thrash_notice(&mut self) -> Option<String> {
+        std::mem::take(&mut self.thrash_noticed).then(|| {
+            format!(
+                "smelt notice: this turn has compacted {} times in a row — each step is bigger than the room a \
+                 compaction leaves. Keep the next steps small: read files with offset/limit, one at a time, and \
+                 don't re-read whole files. Smelt stops the turn if the loop keeps up.",
+                self.thrash
+            )
+        })
+    }
+
+    /// A message queued for this conversation lifts the loop's stop
+    /// (SME-414 D2): an agent's operator is its parent, and an armed child
+    /// must still read it. `stuck` stays — the message changes no sizes.
+    pub(super) fn clear_thrash(&mut self) {
+        self.thrash = 0;
+        self.thrash_noticed = false;
+        self.thrashing = false;
     }
 
     /// The user wrote: they may try again. One result short of `stuck`, so a
@@ -339,6 +427,9 @@ impl CompactionProgress {
         self.compact_for_room = false;
         self.at_limit = self.at_limit.min(MAX_AT_LIMIT - 1);
         self.refusal_compactions = self.refusal_compactions.min(MAX_REFUSAL_COMPACTIONS - 1);
+        // The loop, fully: thrash isn't "doesn't fit", and the user's send
+        // gets fresh runway (SME-414; the escape property needs it).
+        self.clear_thrash();
     }
 
     /// `room_only`, for a window that may have just changed.
@@ -353,6 +444,27 @@ impl CompactionProgress {
         self.tight && self.guess.is_none()
     }
 
+    /// Why the loop ended the turn: the steps, not the fit. Names `END_AT`,
+    /// which only ever changes with the code.
+    fn why_thrashed(model: &str) -> String {
+        format!(
+            "`{model}` was asked for work whose every step was bigger than the room a compaction left: {END_AT} \
+             compactions in a row, one step between each. The turn ends rather than keep paying for summaries — the \
+             conversation still fits; it is the steps that don't. Ask for the work in smaller pieces (read with \
+             offset/limit, one file at a time), give the model a larger context window, or start a fresh conversation."
+        )
+    }
+
+    /// Why an armed wake stops before the call. Number-free on purpose:
+    /// `already_said` dedupes on the identical text, and any number here
+    /// would change and re-tell it.
+    fn why_armed(model: &str) -> String {
+        format!(
+            "`{model}`'s turn was stopped for compacting after every step and will not try again until someone \
+             writes to this conversation. Break the work into smaller steps or pick a larger window."
+        )
+    }
+
     fn why_stuck(&self, model: &str, context_window: u32) -> String {
         if let Some(alone) = self.too_small {
             return super::overflow::too_small(model, context_window, alone);
@@ -362,6 +474,11 @@ impl CompactionProgress {
                 "`{model}`'s server kept refusing this conversation as too big for its context window, however much \
                  smelt compacted it. Give the model a larger context on its server, or pick another model."
             );
+        }
+        if self.thrashing {
+            // The conversation fits: it is the steps that don't. Named as
+            // such, and number-free like the armed wake's wording.
+            return Self::why_armed(model);
         }
         let size = self.after.map_or_else(String::new, |after| format!(" about {} tokens,", super::overflow::grouped(after)));
         format!(

@@ -37,6 +37,8 @@ use self::compaction::*;
 #[cfg(feature = "server")]
 pub(crate) use self::compaction::pinned_todos_text;
 use self::compaction_progress::{CompactionProgress, CompactionStep, FloorAnswer, MIN_USEFUL_REPLY};
+#[cfg(test)]
+use self::compaction_progress::{END_AT, NOTICE_AT};
 use self::compaction_transcript::*;
 pub(crate) use self::failure::*;
 pub(crate) use self::history::*;
