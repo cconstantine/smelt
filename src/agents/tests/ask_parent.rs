@@ -140,20 +140,29 @@ async fn test_the_parents_reply_answers_and_wakes_the_child(pool: PgPool) {
         message(&pool, root, serde_json::json!(child), "hello.txt").await,
         Ok(format!("Agent #{child} was waiting for your answer: it has it now."))
     );
-    eventually("the child took the answer", || async {
-        requests_for(&requests, Some(child)).len() == 2 && !crate::turn::turn_running(child)
+    eventually("the child took the answer, and its SME-455 nudge ran", || async {
+        // Turn 2 takes the answer; its plain stuck end is answered by the
+        // nudge, whose woken turn is the third (SME-455: the first such
+        // end speaks to the seat, not the parent).
+        requests_for(&requests, Some(child)).len() == 3 && !crate::turn::turn_running(child)
     })
     .await;
     assert_eq!(
         since_last_reply(&requests_for(&requests, Some(child))[1]),
         vec!["tool_result: Your parent answered:\n\nhello.txt".to_string()]
     );
-    let queued = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1")
+    let queued = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1 AND kind = 'message'")
         .bind(child)
         .fetch_one(&pool)
         .await
         .expect("count");
     assert_eq!(queued, 0, "the answer isn't also queued as a message");
+    let nudges = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1 AND kind = 'server_notice'")
+        .bind(child)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(nudges, 1, "the one SME-455 nudge");
     assert_eq!(status_of(&pool, root, child).await, "idle");
     eventually("every turn is over", || async { !crate::turn::turn_running(root) }).await;
 }
@@ -166,7 +175,9 @@ async fn test_the_user_writing_in_the_child_takes_the_question(pool: PgPool) {
 
     crate::turn::start_turn(pool.clone(), child, "Use a.txt.".to_string()).await.expect("the send");
     eventually("the child's turn is over", || async {
-        requests_for(&requests, Some(child)).len() == 2 && !crate::turn::turn_running(child)
+        // Two turns now: the send's (which takes the question), and the
+        // SME-455 nudge's woken turn for its plain stuck end.
+        requests_for(&requests, Some(child)).len() == 3 && !crate::turn::turn_running(child)
     })
     .await;
     assert_eq!(
@@ -329,7 +340,9 @@ async fn test_a_paused_child_waiting_for_its_parent(pool: PgPool) {
     assert_eq!(requests_for(&requests, Some(child)).len(), 1, "a paused child ran a turn");
     crate::turn::start_turn(pool.clone(), child, "Go on.".to_string()).await.expect("the send");
     eventually("the child's turn is over", || async {
-        requests_for(&requests, Some(child)).len() == 2 && !crate::turn::turn_running(child)
+        // The send's turn takes the recorded answer; its plain stuck end
+        // is answered by the SME-455 nudge, whose woken turn is the third.
+        requests_for(&requests, Some(child)).len() == 3 && !crate::turn::turn_running(child)
     })
     .await;
     assert_eq!(
