@@ -695,4 +695,32 @@ async fn test_the_running_command_reads_use_an_index(pool: PgPool) {
         !plan.contains("Seq Scan on pending_questions"),
         "the idle read's question clauses scan the table:\n{plan}"
     );
+    // SME-455 fix round 1 (seam B's Info 2): the tree host, as written —
+    // the CASE over `conversations c LEFT JOIN agents a`. It shares the
+    // macro's clauses, but prices them from an unanchored outer (no
+    // `WHERE c.id = $1`), so its plan is its own to check, as the macro
+    // doc promises for both hosts.
+    let plan: Vec<String> = sqlx::query_scalar(&format!(
+        "EXPLAIN SELECT c.id, {REPORT_OWED_CASE} AS report_owed_at \
+         FROM conversations c LEFT JOIN agents a ON a.conversation_id = c.id"
+    ))
+    .fetch_all(&mut *conn)
+    .await
+    .expect("explain the tree gate");
+    let plan = plan.join("\n");
+    assert!(!plan.contains("Seq Scan on terminal_commands"), "the tree gate's command clauses scan the table:\n{plan}");
+    assert!(!plan.contains("Seq Scan on agent_messages"), "the tree gate's wake clause scans agent_messages:\n{plan}");
+    assert!(!plan.contains("Seq Scan on pending_questions"), "the tree gate's question clauses scan the table:\n{plan}");
+    assert!(
+        plan.contains("idx_terminal_commands_conversation_running"),
+        "the tree gate's running-command clause is not served by the index:\n{plan}"
+    );
+    assert!(
+        plan.contains("agent_messages_undelivered"),
+        "the tree gate's undelivered-row clause is not served by the undelivered index:\n{plan}"
+    );
+    assert!(
+        plan.contains("idx_terminal_commands_unnotified_end"),
+        "the tree gate's undrained-command-end clause is not served by its index:\n{plan}"
+    );
 }
