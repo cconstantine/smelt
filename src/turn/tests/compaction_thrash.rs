@@ -64,9 +64,10 @@ async fn test_wakes_after_an_armed_thrash_turn_call_nothing(pool: PgPool) {
 async fn test_the_users_send_after_a_thrash_stop_gets_fresh_runway(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
-    // Thirteen big steps thrash the turn to its end; after the user writes,
+    // One more big step than the end threshold thrashes the turn to its
+    // end (the size derives from END_AT, per D1); after the user writes,
     // small ones finish it.
-    let mut steps = vec![step(60_000, 25_000); 13];
+    let mut steps = vec![step(60_000, 25_000); END_AT as usize + 1];
     steps.extend(std::iter::repeat_with(|| step(30_000, 1_000)).take(3));
     stepping_mock(&pool, steps).await;
     set_context_window(&pool, 100_000, None).await;
@@ -88,7 +89,7 @@ async fn test_the_users_send_after_a_thrash_stop_gets_fresh_runway(pool: PgPool)
 async fn test_a_queued_message_lifts_the_armed_stop(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
-    let seen = stepping_mock(&pool, vec![step(60_000, 25_000); 13]).await;
+    let seen = stepping_mock(&pool, vec![step(60_000, 25_000); END_AT as usize + 1]).await;
     set_context_window(&pool, 100_000, None).await;
     let parent = db::create_conversation(&pool).await.expect("create parent");
     let child = active_child(&pool, parent.id).await;

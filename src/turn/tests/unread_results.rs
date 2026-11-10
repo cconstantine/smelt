@@ -33,7 +33,7 @@ async fn test_a_continuation_names_results_compacted_before_they_were_read(pool:
     let recorded = requests.lock().expect("the request log");
     let post_summary = recorded[2].to_string();
     assert!(post_summary.contains(UNREAD_MARKER), "the continuation says what was covered unread: {post_summary}");
-    assert!(post_summary.contains("todoread"), "naming the call: {post_summary}");
+    assert!(post_summary.contains("before you read them: todoread"), "naming inside the section: {post_summary}");
 }
 
 fn tool_use(id: &str, name: &str) -> anthropic::ContentBlock {
@@ -81,7 +81,7 @@ fn test_the_unread_section_is_capped_and_sits_before_the_tail() {
         prompt.contains("summarized above before you read them: tool1, tool2, tool3, tool4, tool5, tool6, tool7, tool8 (and 1 more)"),
         "{prompt}"
     );
-    assert!(!prompt.contains("tool9,"), "capped at eight named: {prompt}");
+    assert!(!prompt.contains("tool9"), "capped at eight named: {prompt}");
     let section = prompt.find(UNREAD_MARKER).expect("the section");
     let tail = prompt.find("haven't answered yet").expect("the tail");
     assert!(section < tail, "the tail stays last: {prompt}");
