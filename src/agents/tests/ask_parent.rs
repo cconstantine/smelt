@@ -339,12 +339,22 @@ async fn test_a_paused_child_waiting_for_its_parent(pool: PgPool) {
     crate::turn::notify(&pool, child, vec![crate::turn::Notice::Wake]).await.expect("the wake");
     assert_eq!(requests_for(&requests, Some(child)).len(), 1, "a paused child ran a turn");
     crate::turn::start_turn(pool.clone(), child, "Go on.".to_string()).await.expect("the send");
-    eventually("the child's turn is over", || async {
-        // The send's turn takes the recorded answer; its plain stuck end
-        // is answered by the SME-455 nudge, whose woken turn is the third.
-        requests_for(&requests, Some(child)).len() == 3 && !crate::turn::turn_running(child)
+    // Self-diagnosis (SME-455 fix round 1, CI red at the head): split the
+    // chain's hops so a red names the one that failed — the nudge ROW
+    // (queued at the send's plain stuck end), then the third model call
+    // (its woken turn), then that turn ending. The row never arriving
+    // means the end-of-turn check itself was lost, not late.
+    eventually("the nudge row queued for the seat", || async {
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1 AND kind = 'server_notice'")
+            .bind(child)
+            .fetch_one(&pool)
+            .await
+            .expect("count the nudge rows");
+        rows >= 1
     })
     .await;
+    eventually("the nudge's turn is the child's third call", || async { requests_for(&requests, Some(child)).len() == 3 }).await;
+    eventually("the child's turn is over", || async { !crate::turn::turn_running(child) }).await;
     assert_eq!(
         since_last_reply(&requests_for(&requests, Some(child))[1]),
         vec!["tool_result: Your parent answered:\n\nhello.txt".to_string(), "Go on.".to_string()]
