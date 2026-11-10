@@ -288,7 +288,10 @@ async fn compact(
     // (SME-462). Best-effort in `describe_live_state`'s policy: a read
     // failure means no section, never a failed compaction.
     let todos = db::get_conversation_todos(pool, conversation_id).await.unwrap_or_default();
-    for (role, content) in compaction_messages(summary, covers_through_message_id, &typed, &unanswered, &todos, refused) {
+    // Results of the last reply the summary is covering unread (SME-414):
+    // the continuation names them, so the model doesn't re-run the big call.
+    let unread = unread_tool_results(&messages);
+    for (role, content) in compaction_messages(summary, covers_through_message_id, &typed, &unanswered, &todos, &unread, refused) {
         let saved = db::create_message(pool, conversation_id, role, &content)
             .await
             .map_err(ServerFnError::new)?;

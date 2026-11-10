@@ -70,6 +70,23 @@ pub(super) async fn clear_answer_owed(pool: &PgPool, conversation_id: i64) {
     }
 }
 
+/// The compaction loop's notice for the model, if the compaction just run
+/// counted `NOTICE_AT` of them (SME-414): saved grey (SME-357) by
+/// `save_notice`, which puts it on the next request too, so the model reads
+/// it while the loop can still bend (and before the turn ends at `END_AT`).
+#[cfg(feature = "server")]
+async fn note_thrash(
+    pool: &PgPool,
+    conversation_id: i64,
+    persisted: &mut Vec<Message>,
+    pending_new_content: &mut Vec<anthropic::ContentBlock>,
+) -> ServerFnResult<()> {
+    if let Some(notice) = with_compaction_progress(conversation_id, CompactionProgress::take_thrash_notice) {
+        save_notice(pool, conversation_id, crate::api::chat::mark_notice(&notice), persisted, pending_new_content).await?;
+    }
+    Ok(())
+}
+
 /// Records how many model calls a turn made on its span once the turn ends,
 /// whichever way it does (a return, an error, a stop dropping it).
 struct TurnSteps {
@@ -335,6 +352,7 @@ fn run_turn_loop<'c>(
                     // divider (SME-73).
                     compact_conversation(pool, conversation_id, turn_model, slot.held(), None).await?;
                     with_compaction_progress(conversation_id, |p| p.compacted(turn_model.context_window));
+                    note_thrash(pool, conversation_id, &mut persisted, &mut pending_new_content).await?;
                     compacted = true;
                     // The last usage measured the history just summarized: the
                     // reply budget below estimates the new one instead.
@@ -355,6 +373,9 @@ fn run_turn_loop<'c>(
                 0,
             )
             .await?;
+            // A floor compaction can run inside the build (SME-414): its
+            // notice is saved before the call, riding the next request.
+            note_thrash(pool, conversation_id, &mut persisted, &mut pending_new_content).await?;
             // What a compaction would have to free, for a cut-off reply below.
             let mut sized = projected_input(last_known_usage.as_ref(), estimate_tokens(&pending_new_content));
             let offered: Vec<String> = request.tools.iter().map(|tool| tool.name.clone()).collect();
@@ -400,6 +421,9 @@ fn run_turn_loop<'c>(
                 }
                 Err(CallError::Failed(e)) => return Err(e),
             };
+            // A refusal-answering compaction may have run in the recovery
+            // (SME-414): its notice rides the next request as the others' do.
+            note_thrash(pool, conversation_id, &mut persisted, &mut pending_new_content).await?;
             // A reply the window stopped, rather than one that ran out of
             // budget, measured the room the server really has — but only
             // against what the server reports, or a repeat of itself,

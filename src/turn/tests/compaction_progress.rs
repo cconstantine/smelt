@@ -11,23 +11,23 @@ use super::*;
 
 /// A step that calls `todoread` (cheap, database only), measuring `input`
 /// tokens in and `output` out.
-fn step(input: i64, output: i64) -> String {
+pub(super) fn step(input: i64, output: i64) -> String {
     with_usage(&tool_calls_body(&[("toolu_01", "todoread", serde_json::json!({}))]), input, 0, output)
 }
 
 /// What the stepping mock saw.
 #[derive(Default)]
-struct Seen {
+pub(super) struct Seen {
     /// Requests that weren't summaries, in order.
     steps: std::sync::Mutex<Vec<serde_json::Value>>,
 }
 
 impl Seen {
-    fn count(&self) -> usize {
+    pub(super) fn count(&self) -> usize {
         self.steps.lock().expect("the request log").len()
     }
 
-    fn max_tokens(&self, i: usize) -> u64 {
+    pub(super) fn max_tokens(&self, i: usize) -> u64 {
         self.steps.lock().expect("the request log")[i]["max_tokens"].as_u64().expect("max_tokens")
     }
 }
@@ -35,7 +35,7 @@ impl Seen {
 /// A mock answering each model step with the next of `steps`, then "Done.",
 /// and each summary request with a summary, in whatever order the turn asks:
 /// whether a compaction runs between two steps is what's under test.
-async fn stepping_mock(pool: &PgPool, steps: Vec<String>) -> Arc<Seen> {
+pub(super) async fn stepping_mock(pool: &PgPool, steps: Vec<String>) -> Arc<Seen> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
     let seen = Arc::new(Seen::default());
@@ -65,7 +65,7 @@ async fn stepping_mock(pool: &PgPool, steps: Vec<String>) -> Arc<Seen> {
     seen
 }
 
-async fn summaries(pool: &PgPool, id: i64) -> usize {
+pub(super) async fn summaries(pool: &PgPool, id: i64) -> usize {
     compaction_summaries(pool, id).await.len()
 }
 

@@ -90,7 +90,7 @@ async fn test_compaction_prompt_separates_done_from_planned(pool: PgPool) {
 /// the Claude CLI kinds alike.
 #[test]
 fn test_continuation_says_verify_before_acting() {
-    let bare = continuation_prompt(&Typed::default(), &[], &[]);
+    let bare = continuation_prompt(&Typed::default(), &[], &[], &[]);
     assert!(bare.starts_with("Continue based on the summary above."), "the nudge stays: {bare}");
     assert!(bare.contains("narration"), "the summary is named a narration: {bare}");
     assert!(bare.contains("verify"), "…and verified, not believed: {bare}");
@@ -99,7 +99,7 @@ fn test_continuation_says_verify_before_acting() {
         "…always before anything that would overwrite, discard or reset work: {bare}"
     );
     let typed = Typed { quotes: vec!["use the compose stack".to_string()], omitted: 1 };
-    let with_quotes = continuation_prompt(&typed, &[], &[]);
+    let with_quotes = continuation_prompt(&typed, &[], &[], &[]);
     assert!(
         !with_quotes.contains("the summary says which requests are already done"),
         "the trust-the-summary clause is gone (SME-393): {with_quotes}"

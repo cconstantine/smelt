@@ -39,6 +39,9 @@ pub(crate) async fn message_agent(pool: &PgPool, caller: i64, input: &serde_json
         .map_err(|e| format!("couldn't send the message: {e}"))?;
     match outcome {
         db::MessageOutcome::Queued(recipient) => {
+            // A parent steering an armed child (SME-414 D2): the loop's stop
+            // lifts, so it reads this; `stuck` stays, being about sizes.
+            crate::turn::clear_compaction_thrash(recipient);
             // A finished recipient is `active` again; a paused one runs no
             // turn whose start would say so to other tabs (SME-246).
             crate::events::publish_app(crate::events::AppEvent::ConversationsChanged);
@@ -49,6 +52,9 @@ pub(crate) async fn message_agent(pool: &PgPool, caller: i64, input: &serde_json
             })
         }
         db::MessageOutcome::Answered(child) => {
+            // Waiting on its parent is over, so the loop's stop lifts too
+            // (SME-414 D2): the answer is exactly the steering it needs.
+            crate::turn::clear_compaction_thrash(child);
             // No longer waiting for its parent, turn or not (SME-246).
             crate::events::publish_app(crate::events::AppEvent::ConversationsChanged);
             crate::turn::notify(pool, child, vec![crate::turn::Notice::Wake]);

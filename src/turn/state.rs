@@ -203,6 +203,13 @@ pub(super) fn with_compaction_progress<R>(conversation_id: i64, f: impl FnOnce(&
     with_runtime(conversation_id, |runtime| f(&mut runtime.compaction))
 }
 
+/// A message queued for `conversation_id` by `message_agent` lifts the
+/// compaction loop's stop (SME-414 D2): an armed agent must still read its
+/// parent. Ordinary wakes stay cheap-stopped.
+pub(crate) fn clear_compaction_thrash(conversation_id: i64) {
+    with_runtime(conversation_id, |runtime| runtime.compaction.clear_thrash());
+}
+
 /// `conversation_id`'s reply so far, if a model call is streaming one.
 pub(crate) fn reply_in_progress(conversation_id: i64) -> Option<String> {
     read_runtime(conversation_id, |runtime| runtime.reply.clone())
