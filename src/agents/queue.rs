@@ -154,6 +154,13 @@ async fn user_stopped(pool: &PgPool, child: i64) {
     }
 }
 
+/// The first nudge's words (SME-455) — the user's own, verbatim from the
+/// ticket comment of 2026-11-10, **no trailing period**. Pinned as a
+/// literal by `agents::tests::stuck::NUDGE`; if the wording ever changes,
+/// settle it with the user on SME-455 and move both together.
+pub(crate) const REPORT_OWE_NUDGE: &str =
+    "you ended your turn owing your parent a report, and nothing is running that will wake you; check your state";
+
 /// After a child's last turn ends (`why`: what ended it, when something
 /// other than the model did): if it's
 /// `active` with nothing to wait on and not paused by the user, its parent
@@ -162,6 +169,14 @@ async fn user_stopped(pool: &PgPool, child: i64) {
 /// won't come. A conversation that isn't an agent does nothing. Something
 /// arriving just after the check wakes the child again, which is fine: the
 /// notice says the turn ended, not the work.
+///
+/// SME-455: a **plain model-ended** end speaks to the seat first — the
+/// first such stuck end of a spell nudges it (its own wake, nothing to
+/// the parent), and the second one brings the parent notice below. The
+/// CAS in `db::queue_report_owed_nudge` is the only first/second decider.
+/// A turn ended by anything else — a failure, a cut-off, a refusal
+/// (SME-386 F6) — keeps reaching the parent at once: an SME-386 N6
+/// guarantee this delays nothing.
 pub(crate) async fn after_last_turn(pool: &PgPool, conversation_id: i64, why: Option<String>) {
     // A finished agent's turn ended with its report: its pod stops at once,
     // unless a command still runs (SME-78). It didn't end "without a report".
@@ -187,6 +202,28 @@ pub(crate) async fn after_last_turn(pool: &PgPool, conversation_id: i64, why: Op
         }
     };
     let (parent, last) = parent;
+    // SME-455: the first plain stuck end of a spell is the seat's own to
+    // answer, not the parent's to read. The CAS queues nudge and owed
+    // mark in one transaction; `false` means a later end (or the seat
+    // stopped mid-check) and today's notice goes on below — and a failed
+    // queue costs only the nudge: the parent still hears, now.
+    if why.is_none() {
+        let nudge = crate::api::chat::mark_notice(REPORT_OWE_NUDGE);
+        match db::queue_report_owed_nudge(pool, conversation_id, &nudge).await {
+            Ok(true) => {
+                crate::turn::notify(pool, conversation_id, vec![crate::turn::Notice::Wake]);
+                // The owed mark just appeared, and every turn-end event
+                // has already fired before this spawned check: without
+                // this a fresh mark can wait for an unrelated event.
+                // (Clears need no publish — every clear sits next to an
+                // event that refetches the tree.)
+                crate::events::publish_app(crate::events::AppEvent::ConversationsChanged);
+                return;
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't queue a report-owed nudge; telling the parent instead"),
+        }
+    }
     let label = label_of(pool, conversation_id).await;
     let why = why.map(|why| format!(" ({why})")).unwrap_or_default();
     let body = format!("{label}'s turn ended without a report{why}; its last message: {last}");

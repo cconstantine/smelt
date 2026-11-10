@@ -184,6 +184,9 @@ pub(crate) async fn answer_question(
     crate::agents::confirm_user_turn(&pool, conversation_id)
         .await
         .map_err(|why| ServerFnError::new(format!("{why} Your answer is kept for its next turn.")))?;
+    // SME-455: an answered card counts as the user engaging the seat —
+    // the same clearing as its send in `start_turn`.
+    clear_report_owed(&pool, conversation_id).await;
     tokio::spawn(async move {
         if let Err(e) = run_turn_bounded(&pool, in_flight, None, MAX_TURNS, Some(generation), false).await {
             let message = e.message();

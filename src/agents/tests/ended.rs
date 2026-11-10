@@ -24,6 +24,10 @@ async fn mock_child(pool: &PgPool, child: impl Fn() -> String + Send + Sync + 's
     .await;
 }
 
+/// SME-455 nudge-first shape: the seat's first plain stuck end nudges the
+/// seat and tells no one; the second one tells the parent, with the whole
+/// old notice — the 500-character quote rule asserted here on the
+/// escalation, as it was on the first end before SME-455.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_childs_turn_ending_with_text_tells_its_parent(pool: PgPool) {
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -33,6 +37,13 @@ async fn test_a_childs_turn_ending_with_text_tells_its_parent(pool: PgPool) {
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let child = start_child(&pool, root, "Work.").await;
 
+    // SME-455: the first end leaves the seat nudged once, and it is the
+    // second that carries the notice to the root.
+    eventually("the seat was nudged", || async {
+        let marked = super::stuck::marked_nudge();
+        transcript(&pool, child).await.iter().filter(|(_, t)| *t == marked).count() == 1
+    })
+    .await;
     // SME-390: wait for the notice row first, then for the parent's reply —
     // one wait racing the whole wake chain lost under full-gate load.
     eventually("the notice is queued", || async { queued_to(&pool, root).await.len() == 1 }).await;
@@ -116,6 +127,12 @@ async fn test_no_notice_when_the_child_waits_on_something_or_finished(pool: PgPo
         .await;
     }
     checked_after(commands, before).await;
+    // SME-455: the waiting seats keep no nudge row either — the predicate
+    // excludes them before any nudge is queued.
+    let marked = super::stuck::marked_nudge();
+    for child in [asks, commands] {
+        assert!(queued_to(&pool, child).await.iter().all(|b| b != &marked), "#{child}: no nudge row for a waiting seat");
+    }
     // SME-390: the report row first, then the root's turn over it — one
     // wait racing the wake chain and the turn together lost under load.
     eventually("the report is queued", || async { queued_to(&pool, root).await == vec!["Done.".to_string()] }).await;

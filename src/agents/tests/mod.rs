@@ -25,6 +25,7 @@ pub(super) mod repo;
 mod rules;
 mod start;
 mod stop;
+mod stuck;
 mod sweep;
 mod tools;
 mod volumes;

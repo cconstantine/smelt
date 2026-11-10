@@ -433,6 +433,9 @@ pub(crate) async fn start_turn(pool: PgPool, id: i64, content: String) -> Server
     spawn_store_pause(&pool, id);
     // A parent's stop between the admission and the count (SME-236).
     crate::agents::confirm_user_turn(&pool, id).await.map_err(ServerFnError::new)?;
+    // SME-455: the user is here — whatever this seat owed its parent a
+    // report stops being owed, and a later stuck end is a fresh spell.
+    clear_report_owed(&pool, id).await;
     let new_message = anthropic::AnthropicMessage {
         role: "user".to_string(),
         // Never taken for one of smelt's notices (SME-354 B19).

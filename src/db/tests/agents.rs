@@ -155,6 +155,44 @@ async fn test_the_tree_gates_the_report_owed_mark_on_the_predicate(pool: PgPool)
         .expect("end the command");
     shown_again(&pool, seat, first, "the command").await;
 
+    // A wake pending hides it (SME-455): an undelivered row ...
+    sqlx::query("INSERT INTO agent_messages (to_conversation_id, from_label, kind, body) VALUES ($1, 'smelt', 'server_notice', 'a wake coming')")
+        .bind(seat)
+        .execute(&pool)
+        .await
+        .expect("queue a wake");
+    assert!(owed().await.is_none(), "an undelivered row hides the mark");
+    sqlx::query("DELETE FROM agent_messages WHERE to_conversation_id = $1")
+        .bind(seat)
+        .execute(&pool)
+        .await
+        .expect("drain the wake");
+    shown_again(&pool, seat, first, "the undelivered row").await;
+    // ... a command end recorded but never drained ...
+    create_terminal_command(&pool, seat, terminal.id, "gate-end", "echo hi", 300)
+        .await
+        .expect("a command row");
+    mark_terminal_command_finished(&pool, "gate-end", 0).await.expect("record its end");
+    assert!(owed().await.is_none(), "an undrained command end hides the mark");
+    sqlx::query("DELETE FROM terminal_commands WHERE command_id = 'gate-end'")
+        .execute(&pool)
+        .await
+        .expect("drain the end");
+    shown_again(&pool, seat, first, "the undrained end").await;
+    // ... and an answer to its own question not yet taken.
+    sqlx::query("INSERT INTO pending_questions (conversation_id, tool_use_id, questions, answer, asked_of) VALUES ($1, 'toolu_gate', '[]', '[]', 'user')")
+        .bind(seat)
+        .execute(&pool)
+        .await
+        .expect("an answer waiting to be taken");
+    assert!(owed().await.is_none(), "an untaken answer hides the mark");
+    sqlx::query("DELETE FROM pending_questions WHERE conversation_id = $1")
+        .bind(seat)
+        .execute(&pool)
+        .await
+        .expect("take the answer");
+    shown_again(&pool, seat, first, "the untaken answer").await;
+
     // A `starting` or `active` agent of its own hides it.
     let child = agent(&pool, seat, AGENT_STARTING, None).await;
     assert!(owed().await.is_none(), "a starting child hides the mark");
@@ -218,6 +256,13 @@ fn test_the_stuck_predicate_quotes_its_state_literals() {
     assert!(
         IDLE_AGENT_WITHOUT_REPORT_SQL.contains(&format!("g.state IN ('{AGENT_STARTING}', '{AGENT_ACTIVE}')")),
         "the child-state literals drifted from the consts: {IDLE_AGENT_WITHOUT_REPORT_SQL}"
+    );
+    // The command-end wake clause mirrors `sandbox::UNNOTIFIED_END`
+    // (SME-455), inline like the state words so both host queries can
+    // share it — this pin is what keeps the mirror true.
+    assert!(
+        IDLE_AGENT_WITHOUT_REPORT_SQL.contains(crate::db::sandbox::UNNOTIFIED_END),
+        "the wake clause drifted from UNNOTIFIED_END: {IDLE_AGENT_WITHOUT_REPORT_SQL}"
     );
 }
 
@@ -629,5 +674,25 @@ async fn test_the_running_command_reads_use_an_index(pool: PgPool) {
     assert!(
         plan.contains("idx_terminal_commands_conversation_running"),
         "the idle read's running-command clause is not served by the index:\n{plan}"
+    );
+    // SME-455's wake clauses, priced the same way. The undelivered-row
+    // probe rides its partial index; the undrained-command-end probe
+    // falls under the "no Seq Scan on terminal_commands" above, and the
+    // question clauses under the one below.
+    assert!(
+        !plan.contains("Seq Scan on agent_messages"),
+        "the idle read's wake clause scans agent_messages:\n{plan}"
+    );
+    assert!(
+        plan.contains("agent_messages_undelivered"),
+        "the idle read's wake clause is not served by the undelivered index:\n{plan}"
+    );
+    assert!(
+        plan.contains("idx_terminal_commands_unnotified_end"),
+        "the idle read's undrained-command-end clause is not served by its index:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Seq Scan on pending_questions"),
+        "the idle read's question clauses scan the table:\n{plan}"
     );
 }
