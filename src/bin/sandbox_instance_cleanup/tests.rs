@@ -275,16 +275,21 @@ async fn test_a_missing_database_reads_as_absent(pool: PgPool) {
     );
 }
 
-/// A fresh empty database to count in, swept of any earlier one first: a
-/// run that died between creating and sweeping leaks one, and the next run
-/// takes it back. A green run deliberately leaves its own: dropping a
-/// database can wait on closing backends of it — the same asynchronous
-/// backend teardown this fixture exists to keep out of a count.
-async fn fresh_counting_database(conn: &mut PgConnection) -> String {
+/// A fresh empty database to count in, swept of any earlier one of
+/// `caller_tag`'s first: a run that died between creating and sweeping
+/// leaks one, and the next run takes it back. A green run deliberately
+/// leaves its own: dropping a database can wait on closing backends of
+/// it — the same asynchronous backend teardown this fixture exists to
+/// keep out of a count. The sweep is scoped to `caller_tag` (SME-462
+/// round 2): the counting tests run concurrently on default threads,
+/// and an unscoped sweep of the shared prefix could drop another
+/// caller's fresh database in the millisecond before its first
+/// connect — the very flake shape this file exists to end.
+async fn fresh_counting_database(conn: &mut PgConnection, caller_tag: &str) -> String {
     let leaked: Vec<(String,)> = sqlx::query_as(
         "SELECT datname FROM pg_database WHERE starts_with(datname, $1)",
     )
-    .bind(COUNT_DB_PREFIX)
+    .bind(format!("{COUNT_DB_PREFIX}{caller_tag}_"))
     .fetch_all(&mut *conn)
     .await
     .expect("list leaked counting databases");
@@ -300,7 +305,7 @@ async fn fresh_counting_database(conn: &mut PgConnection) -> String {
             .await
             .ok();
     }
-    let name = format!("{COUNT_DB_PREFIX}{}", unique());
+    let name = format!("{COUNT_DB_PREFIX}{caller_tag}_{}", unique());
     sqlx::query(&format!("CREATE DATABASE {name}"))
         .execute(&mut *conn)
         .await
@@ -319,7 +324,7 @@ async fn fresh_counting_database(conn: &mut PgConnection) -> String {
 async fn test_the_sweep_passes_by_a_database_still_connected(pool: PgPool) {
     let options: PgConnectOptions = pool.connect_options().as_ref().clone();
     let mut conn = connection(&pool).await;
-    let leaked = format!("{COUNT_DB_PREFIX}leak_{}", unique());
+    let leaked = format!("{COUNT_DB_PREFIX}sweep_leak_{}", unique());
     sqlx::query(&format!("CREATE DATABASE {leaked}"))
         .execute(&mut conn)
         .await
@@ -327,7 +332,7 @@ async fn test_the_sweep_passes_by_a_database_still_connected(pool: PgPool) {
     let hold = PgConnection::connect_with(&options.clone().database(&leaked))
         .await
         .expect("a backend still on the leak");
-    let fresh = fresh_counting_database(&mut conn).await;
+    let fresh = fresh_counting_database(&mut conn, "sweep").await;
     assert!(fresh.starts_with(COUNT_DB_PREFIX) && fresh != leaked, "the fresh one is this run's own: {fresh}");
     sqlx::query("SELECT 1")
         .execute(&mut PgConnection::connect_with(&options.clone().database(&fresh)).await.expect("the fresh database is usable"))
@@ -340,6 +345,35 @@ async fn test_the_sweep_passes_by_a_database_still_connected(pool: PgPool) {
     for name in [leaked.as_str(), fresh.as_str()] {
         sqlx::query(&format!("DROP DATABASE IF EXISTS {name}")).execute(&mut conn).await.ok();
     }
+}
+
+/// A sweep reclaims only its own caller's names (SME-462 round 2):
+/// the counting tests run concurrently on default threads, and one
+/// caller's sweep must never drop another's fresh database in the
+/// millisecond before its first connect — the flake this fixture was
+/// built to end, arriving from a new direction. Deterministic
+/// single-process shape: a database carrying the other caller's tag
+/// under the shared prefix, no backend on it yet, this caller's
+/// fixture, then connect to it. Before the caller tag the sweep
+/// matched every prefixed name, dropped it, and the connect answers
+/// 3D700; after it, the other caller's database survives, and the
+/// cross-run reclaim keeps working per tag.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_sweep_only_reclaims_its_own_callers_names(pool: PgPool) {
+    let options: PgConnectOptions = pool.connect_options().as_ref().clone();
+    let mut conn = connection(&pool).await;
+    let other = format!("{COUNT_DB_PREFIX}counts_{}", unique());
+    sqlx::query(&format!("CREATE DATABASE {other}"))
+        .execute(&mut conn)
+        .await
+        .expect("create the other caller's fresh-named database");
+    let fresh = fresh_counting_database(&mut conn, "own").await;
+    let survivor = PgConnection::connect_with(&options.clone().database(&other)).await;
+    // Leave nothing behind whatever the connect says.
+    for name in [other.as_str(), fresh.as_str()] {
+        sqlx::query(&format!("DROP DATABASE IF EXISTS {name}")).execute(&mut conn).await.ok();
+    }
+    survivor.expect("the other caller's database survives this caller's sweep");
 }
 
 /// Guard 5 counts every other connection to the database, and never this
@@ -368,7 +402,7 @@ async fn test_other_connections_counts_every_other_connection(pool: PgPool) {
     let mut stray: PgConnection = pool.acquire().await.expect("stray").detach();
     pool.close().await;
 
-    let fresh = fresh_counting_database(&mut stray).await;
+    let fresh = fresh_counting_database(&mut stray, "counts").await;
     let fresh_options = options.database(&fresh);
     let mut ours = PgConnection::connect_with(&fresh_options)
         .await
