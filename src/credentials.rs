@@ -348,7 +348,7 @@ pub async fn reconcile_pod(pool: &PgPool, child: i64, snapshot: Option<&db::Pers
 /// an abandoned or errored attempt the install also waits out that
 /// attempt's deadline plus `pod_writes::CLOCK_SKEW_MARGIN`, so it can return
 /// up to about 65 s after it started, plus the wait for its lock.
-const INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A new pod's files: nothing to write when this conversation gets no
 /// key, no granted secret and has no identity — so a pod on an image
