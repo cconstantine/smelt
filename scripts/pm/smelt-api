@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""The Project Manager's client for smelt's API (SME-460).
+
+Its only way to write to smelt when it runs as a smelt conversation (see
+docs/personas/pm-in-smelt.md). The subcommands below are the whole
+allowlist: each maps to fixed routes in smelt_api.ROUTES, ids are integers,
+and there is no raw or pass-through mode. Nothing deletes, stops, or
+touches providers, settings, secrets or trust decisions.
+
+  create                                   a new top-level conversation; prints its id first
+  attach CONV URL [--branch B] [--dir D]   attach a repo
+  model-set CONV PROVIDER_ID MODEL         set its model, then read it back (exit 1 unless Chosen)
+  send CONV FILE|- [--expect-model P:M]    send a message; with --expect-model, only on that model
+  answer CONV TOOL_USE_ID ANSWER...        answer the pending ask_user, one ANSWER per question:
+                                           a label, label1|label2 (multi-select), or other:<text>
+  tree ROOT [--json]                       ROOT and its descendants
+  messages CONV [--last K] [--json]        the last K messages (default 5), blocks cut to 500 chars
+  question CONV                            the pending question's JSON, or `none`
+  model CONV                               the conversation's model
+  pods                                     live pods and their running commands
+  providers                                provider id, kind and name
+  where                                    the address, the Host sent and the build id
+  archive|unarchive|compact CONV           not on the server yet (exit 3)
+
+Address: SMELT_API_URL (default http://smelt.smelt-park.svc.cluster.local:8080)
+and SMELT_API_HOST (default smelt.constantlee.us while SMELT_API_URL is unset;
+empty sends the URL's own host).
+
+Exit status: 0 on success; 1 on a non-2xx answer or a refused pre-check
+(nothing was sent); 2 for usage or a network error; 3 for a subcommand
+whose route isn't on the server yet.
+"""
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import smelt_api  # noqa: E402
+
+BODY_CUT = 2000
+BLOCK_CUT = 500
+
+
+def die(message, code):
+    print(message, file=sys.stderr)
+    sys.exit(code)
+
+
+def request(route, conv=None, body=None):
+    try:
+        status, out = smelt_api.call(route, conv, body)
+    except smelt_api.NetworkError as err:
+        die(f"can't reach smelt: {err}", 2)
+    if not smelt_api.ok(status):
+        text = out if isinstance(out, str) else json.dumps(out)
+        die(f"HTTP {status}: {text[:BODY_CUT]}", 1)
+    return out
+
+
+def conv_arg(value):
+    try:
+        return smelt_api.conv_id(value)
+    except ValueError as err:
+        raise argparse.ArgumentTypeError(str(err))
+
+
+def expect_arg(value):
+    provider, sep, model = value.partition(":")
+    if not sep or not provider.isdigit() or not model:
+        raise argparse.ArgumentTypeError(f"expected PROVIDER_ID:MODEL, got {value!r}")
+    return int(provider), model
+
+
+def show(value):
+    print(json.dumps(value, indent=2, ensure_ascii=False))
+
+
+def is_chosen(model, provider_id, name):
+    choice = model.get("choice") or {} if isinstance(model, dict) else {}
+    return (isinstance(model, dict) and model.get("state") == "Chosen"
+            and choice.get("provider_id") == provider_id and choice.get("model") == name)
+
+
+def cmd_create(args):
+    out = request("create")
+    print(out["id"])
+    show(out)
+
+
+def cmd_attach(args):
+    show(request("attach", args.conv, {"url": args.url, "branch": args.branch, "dir": args.dir}))
+
+
+def cmd_model_set(args):
+    request("model-set", args.conv, {"provider_id": args.provider_id, "model": args.model})
+    model = request("model", args.conv)
+    show(model)
+    if not is_chosen(model, args.provider_id, args.model):
+        die(f"conversation {args.conv}'s model reads back as above, not Chosen {args.provider_id}:{args.model}", 1)
+
+
+def read_brief(path):
+    try:
+        raw = sys.stdin.buffer.read() if path == "-" else open(path, "rb").read()
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as err:
+        die(f"can't read {path} as UTF-8: {err}", 2)
+    if not text.strip():
+        die(f"{path} is empty; nothing sent", 2)
+    return text
+
+
+def cmd_send(args):
+    text = read_brief(args.file)
+    if args.expect_model:
+        provider_id, name = args.expect_model
+        model = request("model", args.conv)
+        if not is_chosen(model, provider_id, name):
+            show(model)
+            die(f"conversation {args.conv}'s model isn't Chosen {provider_id}:{name}; nothing sent", 1)
+    request("send", args.conv, {"content": text})
+    print(f"sent to conversation {args.conv}")
+
+
+def parse_answer(text, question):
+    header = question.get("header", "")
+    if text.startswith("other:"):
+        own = text[len("other:"):]
+        if not own.strip():
+            return None, f"other: needs text, for {header!r}"
+        return {"selected": [], "other": own}, None
+    labels = text.split("|")
+    offered = [o["label"] for o in question.get("options") or []]
+    if not offered:
+        return None, f"{header!r} takes free text only: answer other:<text>"
+    for label in labels:
+        if label not in offered:
+            return None, f"{label!r} isn't one of {header!r}'s options {offered}"
+    if len(labels) > 1 and not question.get("multi_select"):
+        return None, f"{header!r} takes one option"
+    return {"selected": labels}, None
+
+
+def cmd_answer(args):
+    pending = request("question", args.conv)
+    if not pending:
+        die(f"no question is pending on conversation {args.conv}; nothing sent", 1)
+    if pending.get("tool_use_id") != args.tool_use_id:
+        die(f"the pending question is {pending.get('tool_use_id')}, not {args.tool_use_id}; nothing sent", 1)
+    questions = pending.get("questions") or []
+    if len(args.answers) != len(questions):
+        die(f"{len(questions)} questions, {len(args.answers)} answers; nothing sent", 1)
+    answers = []
+    for text, question in zip(args.answers, questions):
+        answer, error = parse_answer(text, question)
+        if error:
+            die(f"{error}; nothing sent", 1)
+        answers.append(answer)
+    request("answer", args.conv, {"tool_use_id": args.tool_use_id, "answers": answers})
+    print(f"answered {args.tool_use_id} on conversation {args.conv}")
+
+
+def flag(value, word):
+    return word if value else "-"
+
+
+def cmd_tree(args):
+    rows = smelt_api.subtree(request("tree"), args.root)
+    if not rows:
+        die(f"conversation {args.root} isn't in the tree", 1)
+    if args.json:
+        show([n for _, n in rows])
+        return
+    for depth, n in rows:
+        print("  " * depth + " ".join([
+            str(n["id"]), n.get("persona") or "-", n.get("status") or "-", flag(n.get("busy"), "busy"),
+            flag(n.get("waiting_for_user"), "waiting"), n.get("report_owed_at") or "-", n.get("title") or "",
+        ]))
+
+
+def cut(text):
+    text = text.replace("\n", "\\n")
+    return text if len(text) <= BLOCK_CUT else text[:BLOCK_CUT] + "\u2026"
+
+
+def describe(block):
+    kind = block.get("type", "?")
+    if kind == "text":
+        return "text: " + cut(block.get("text", ""))
+    if kind == "tool_use":
+        return f"tool_use {block.get('name')} " + cut(json.dumps(block.get("input"), ensure_ascii=False))
+    if kind == "tool_result":
+        content = block.get("content")
+        if isinstance(content, list):
+            content = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+        return "tool_result: " + cut(str(content or ""))
+    if kind == "thinking":
+        return "thinking: " + cut(block.get("thinking", ""))
+    return kind
+
+
+def cmd_messages(args):
+    messages = request("messages", args.conv)
+    messages = messages[-args.last:] if args.last > 0 else []
+    if args.json:
+        show(messages)
+        return
+    for m in messages:
+        for block in smelt_api.message_blocks(m):
+            print(f"{m.get('role')} {m.get('created_at')} {describe(block)}")
+
+
+def cmd_question(args):
+    pending = request("question", args.conv)
+    print("none") if not pending else show(pending)
+
+
+def cmd_model(args):
+    show(request("model", args.conv))
+
+
+def cmd_pods(args):
+    pods = request("pods")
+    counts = {c["conversation_id"]: c["running_commands"] for c in request("pod-commands")}
+    if not pods:
+        print("no live pods")
+    for p in pods:
+        cid = p["conversation_id"]
+        print(f"{cid} {p.get('status') or '-'} {counts.get(cid, 0)} pod={p.get('pod_id')} {p.get('conversation_title', '')}")
+
+
+def cmd_providers(args):
+    for p in request("providers"):
+        print(f"{p['id']} {p['kind']} {p['name']}")
+
+
+def cmd_where(args):
+    base, host = smelt_api.address()
+    print(f"url      {base}")
+    print(f"host     {smelt_api.sent_host(base, host)}")
+    print(f"build-id {request('build-id')}")
+
+
+def cmd_not_yet(args):
+    print(smelt_api.NOT_YET[args.command])
+    sys.exit(3)
+
+
+def parser():
+    p = argparse.ArgumentParser(prog="smelt-api", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="command", required=True)
+
+    def add(name, fn, *convs):
+        s = sub.add_parser(name)
+        for c in convs:
+            s.add_argument(c, type=conv_arg)
+        s.set_defaults(fn=fn)
+        return s
+
+    add("create", cmd_create)
+    s = add("attach", cmd_attach, "conv")
+    s.add_argument("url")
+    s.add_argument("--branch", default="")
+    s.add_argument("--dir", default="")
+    s = add("model-set", cmd_model_set, "conv", "provider_id")
+    s.add_argument("model")
+    s = add("send", cmd_send, "conv")
+    s.add_argument("file")
+    s.add_argument("--expect-model", type=expect_arg)
+    s = add("answer", cmd_answer, "conv")
+    s.add_argument("tool_use_id")
+    s.add_argument("answers", nargs="+")
+    add("tree", cmd_tree, "root").add_argument("--json", action="store_true")
+    s = add("messages", cmd_messages, "conv")
+    s.add_argument("--last", type=int, default=5)
+    s.add_argument("--json", action="store_true")
+    add("question", cmd_question, "conv")
+    add("model", cmd_model, "conv")
+    add("pods", cmd_pods)
+    add("providers", cmd_providers)
+    add("where", cmd_where)
+    for name in smelt_api.NOT_YET:
+        add(name, cmd_not_yet, "conv")
+    return p
+
+
+def main():
+    args = parser().parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
