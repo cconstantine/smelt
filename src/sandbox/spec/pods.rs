@@ -95,8 +95,9 @@ pub(in crate::sandbox) fn build_pod_spec(
     build_sized_pod_spec(name, memory, docker, &PodRequests::default(), volumes, agent_volumes, instance)
 }
 
-/// `build_pod_spec` with each container's `requests` (SME-484): none is
-/// the spec as it was before them, byte for byte.
+/// `build_pod_spec` with each container's `requests` (SME-484): none
+/// gives each container byte-for-byte its old `resources`; the pod also
+/// carries the spread rule.
 pub(in crate::sandbox) fn build_sized_pod_spec(
     name: &str,
     memory: &str,
