@@ -52,3 +52,7 @@ Too much planned at once goes stale: once one plan merges, every other plan that
 - **When it resumes.** The Project Manager starts no Planner for an Up Next ticket with an open blocker. Once every blocker is Done, the next pass starts a Planner, which begins from those notes.
 
 This rule is new (2026-10-09). The user asked to watch how it works and revise it if it doesn't.
+
+## Compacting your context
+
+A long-running Project Manager keeps its context small by compacting (`compact_context`, SME-482) at these points, and only after recording the board first (open slots, the Drivers running and their conversations, pins, retro counts) on the "Next retrospective" ticket or in its todo list, so the summary is never the only copy: after a ticket reaches Done and its retro count is taken; after a retrospective closes; and before starting a new Driver when its context is past about half the window. Never mid-dispatch (a Driver started, its "started" comment not yet written). After a compaction, rebuild state from Linear, git and GitHub before acting ([rules.md](rules.md)). To compact a Driver it supervises, it can call `POST /api/conversations/{id}/compact` while that Driver is idle.
