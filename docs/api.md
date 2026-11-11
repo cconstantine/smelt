@@ -110,8 +110,10 @@ In [api/events.md](api/events.md#the-browsing-panels-own-live-channel).
 
 | Function | Method + path | Notes |
 |---|---|---|
-| `get_conversations` | `GET /api/conversations` | ordered by `updated_at DESC` |
+| `get_conversations` | `GET /api/conversations` | ordered by `updated_at DESC`; each row's own `archived_at` (null on an agent, SME-480) |
 | `create_conversation` | `POST /api/conversations` | default title |
+| `archive_conversation` (`api::archive`) | `POST /api/conversations/{id}/archive` | archives a top-level conversation and its agents; idempotent; 404 missing, 409 for an agent (names its root). See [api/agents.md](api/agents.md#archiving) |
+| `unarchive_conversation` | `POST /api/conversations/{id}/unarchive` | clears it; same answers. A user's send unarchives too |
 | `get_messages` | `GET /api/conversations/{id}/messages` | ordered by `created_at ASC` |
 | `send_message` | `POST /api/conversations/{id}/messages` | starts the user's turn and returns; the reply arrives on the conversation's event stream, see above |
 | `get_todos` | `GET /api/conversations/{id}/todos` | one-shot snapshot of the current todo list, see above |
@@ -129,7 +131,7 @@ In [api/events.md](api/events.md#the-browsing-panels-own-live-channel).
 | `get_turn_error` | `GET /api/conversations/{id}/turn-error` | the last failed turn's error, until the user writes again, for a tab that connects after `TurnError` |
 | `get_attention` (`api::notifications`) | `GET /api/conversations/{id}/attention?generation&attention` | the notifier's check right before it acts (SME-71): `AttentionDetails` — the title, the first question's header for a question (`Trust a repo?` for a trust card alone), and the model's message for a `Notified` (SME-377) — or `None` when the `NeedsUser` stopped being true: a turn running again, a moved generation, an answered/dismissed/parent-row question with no trust card left, a `Notified` whose message the runtime no longer holds for that generation, no such conversation |
 | `get_busy_conversations` | `GET /api/conversations/busy` | conversations with a turn running or queued (the sidebar reads `get_conversation_tree` since SME-246) |
-| `get_conversation_tree` (`api::agents`) | `GET /api/conversations/tree` | the sidebar's list (SME-246): every conversation, most recently active first, with its `parent_id`, its busy and waiting marks, its `report_owed_at` (SME-455: when it was nudged for owing a report, shown only while the stuck predicate still holds), and for an agent its persona (`<dir>:<name>`, from the stored persona path) and status, derived at each call by `agents::status` as `list_agents` gives it, never stored. Refetched on `ConversationsChanged`, `TurnsChanged` and `QuestionsChanged`; the client lays it out as a tree |
+| `get_conversation_tree` (`api::agents`) | `GET /api/conversations/tree` | the sidebar's list (SME-246): every conversation, most recently active first, with its `parent_id`, its busy and waiting marks, its `report_owed_at` (SME-455: when it was nudged for owing a report, shown only while the stuck predicate still holds), its root's `archived_at` (SME-480), and for an agent its persona (`<dir>:<name>`, from the stored persona path) and status, derived at each call by `agents::status` as `list_agents` gives it, never stored. Refetched on `ConversationsChanged`, `TurnsChanged` and `QuestionsChanged`; the client lays it out as a tree |
 | `get_agents_waiting` (`api::agents`) | `GET /api/conversations/{id}/agents-waiting` | the agents under a conversation, at any depth, waiting for the user (an `ask_user` question or a trust card, never a question to their parent), for the banner over its chat (SME-246) |
 | `get_conversation_model` / `set_conversation_model` | `GET`, `POST /api/conversations/{id}/model` | the picker: which model the next turn uses (`ConversationModel`: `Chosen`, `Default`, `NoDefault`, `NoProviders`), and choosing one (SME-72) |
 | `list_providers` / `get_provider` | `GET /api/providers`, `GET /api/providers/{id}` | the `/providers` pages; never the secret, only `secret_hint` |
