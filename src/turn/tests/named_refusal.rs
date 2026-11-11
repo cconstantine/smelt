@@ -13,6 +13,9 @@ use super::*;
 /// output it writes: only a step it takes moves to the next plan. The last
 /// plan's step answers "Done."; the others call a tool, and one planned at
 /// `FAILS` fails. A summary is refused once naming `refuse_summary`, if set.
+/// With `retry_fresh_count` set, a refusal moves to the next plan too — a
+/// retry of a request that shrunk (SME-421's scenario: compaction
+/// summarized away the part the count named) is counted at its fresh size.
 #[derive(Default)]
 struct Counting {
     window: std::sync::Mutex<Option<u32>>,
@@ -21,6 +24,7 @@ struct Counting {
     taken: AtomicUsize,
     summaries: AtomicUsize,
     refuse_summary: std::sync::Mutex<Option<u32>>,
+    retry_fresh_count: std::sync::atomic::AtomicBool,
 }
 
 impl Counting {
@@ -67,10 +71,13 @@ async fn counting_mock(pool: &PgPool, window: Option<u32>, plans: Vec<(i64, i64)
                 let refused = window.filter(|window| input + max_tokens > i64::from(*window));
                 parsed["taken"] = serde_json::json!(refused.is_none());
                 state.requests.lock().expect("the request log").push(parsed);
-                if let Some(window) = refused
-                    && let Err((status, body)) = too_long(u32::try_from(input).expect("a plan's input"), window)
-                {
-                    return (status, body).into_response();
+                if let Some(window) = refused {
+                    if state.retry_fresh_count.load(Ordering::SeqCst) {
+                        state.taken.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if let Err((status, body)) = too_long(u32::try_from(input).expect("a plan's input"), window) {
+                        return (status, body).into_response();
+                    }
                 }
                 state.taken.fetch_add(1, Ordering::SeqCst);
                 if (input, output) == FAILS {
@@ -260,4 +267,64 @@ async fn test_a_window_the_floors_compaction_learns_is_read_again(pool: PgPool) 
     assert_eq!(last_reply(&saved).as_deref(), Some("Done."));
     let budget = *mock.taken_budgets().last().expect("a step taken");
     assert!(budget >= u64::from(smaller / 2), "built for the {smaller} window: {budget}");
+}
+
+/// SME-421, the ticket's scenario: a tool output the estimate saw at a
+/// third of its server count; a refusal names the count; the compaction
+/// that answers it summarizes that output away. The retry must be charged
+/// only `alone`'s share of the shortfall — the whole shortfall belongs to
+/// the history the summary replaced. Charged whole (the bug), the floor
+/// believes a phantom size: the turn ends "too small for this conversation"
+/// with a request of about `a` refused against a window of `a` plus tens of
+/// thousands, `stuck` is set, and every later wake pays for a summary only
+/// to re-refuse.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_compacted_retry_isnt_refused_for_a_shortfall_the_summary_replaced(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    // The mock first (its provider row is what a turn model resolves to),
+    // with a placeholder window and plan; the real ones go in below.
+    let mock = counting_mock(&pool, None, vec![(0, 10)]).await;
+    // `a`: what no compaction shrinks, measured the way `window_leaving`
+    // measures it — this binary's `build_request` estimate on an empty
+    // conversation.
+    let model = crate::providers::resolve_turn_model(&pool, conversation.id).await.expect("a model");
+    let (empty, _) = build_request(&pool, conversation.id, &model, None, &[], false, 0).await.expect("a request");
+    let a = estimate_request_tokens(&empty);
+    // One user message of 120,000 characters: exactly `m` tokens to the
+    // estimate, and 3× that to the server (a base64 blob's chars/4). An
+    // assistant ack follows: a replied-to message, so `cap_unanswered`
+    // (a summary-prompt-only thing, `continuation.rs`) is no factor.
+    let m: u64 = 30_000;
+    db::create_message(&pool, conversation.id, "user", &[anthropic::ContentBlock::Text { text: "a".repeat(120_000) }])
+        .await
+        .expect("seed the blob");
+    db::create_message(&pool, conversation.id, "assistant", &[anthropic::ContentBlock::Text { text: "Noted.".to_string() }])
+        .await
+        .expect("seed the ack");
+    // The server's count of the refused request and the shortfall it names.
+    // The one-token messages the turn adds move `e` by 2; the window lands
+    // ~20k inside the interval below either way.
+    let e = a + m;
+    let r = a + 3 * m;
+    let scaled = (r - e).saturating_mul(a) / e;
+    // The floor fires once the projected size passes the line
+    // `window − COMPACTION_SAFETY_BUFFER − MIN_USEFUL_REPLY`. Put the
+    // window where today's projection (the whole shortfall on a request of
+    // about `a`) is above it and the fixed one (`alone`'s share, the
+    // compacted request's own estimate is `a` plus a handful) is below.
+    let line = u64::from(COMPACTION_SAFETY_BUFFER) + u64::from(MIN_USEFUL_REPLY);
+    let window = u32::try_from((a + 3 + scaled + line + a + 2 * m + line) / 2).expect("a window");
+    *mock.window.lock().expect("the window") = Some(window);
+    *mock.plans.lock().expect("the plans") = vec![(i64::try_from(r).expect("r"), 10), (i64::try_from(a + 3).expect("compacted"), 10)];
+    mock.retry_fresh_count.store(true, Ordering::SeqCst);
+    set_context_window(&pool, window as i32, None).await;
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("the compacted retry fits");
+
+    assert_eq!(last_reply(&saved).as_deref(), Some("Done."));
+    assert_eq!(mock.calls(), 2, "one refusal, one retry");
+    assert_eq!(mock.summaries.load(Ordering::SeqCst), 1, "one summary answered the refusal");
+    assert_eq!(last_failure_reason(&pool, conversation.id).await, None, "nothing was stuck");
 }

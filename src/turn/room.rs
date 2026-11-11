@@ -92,3 +92,48 @@ pub(super) fn guessed_window(input: u64, believed: u32) -> Option<u32> {
     let assumed = u32::try_from(input.saturating_mul(3) / 4).unwrap_or(u32::MAX);
     (assumed < believed).then_some(assumed)
 }
+
+/// A refused request's estimate shortfall, and what may still be true of a
+/// request built after a compaction of it (SME-421): the part the estimate
+/// missed sat in the history the summary replaced, so a compacted request
+/// is charged only `alone`'s share of it — what no compaction shrinks.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Undercount {
+    /// What the refusal counted more than the estimate of the request it
+    /// refused.
+    full: u64,
+    /// That refused request's own estimate.
+    refused_estimate: u64,
+    /// The estimate of what survives every compaction: the refused request
+    /// with its messages emptied.
+    alone: u64,
+}
+
+impl Undercount {
+    /// Nothing was refused: a turn's normal steps.
+    pub(super) const fn none() -> Self {
+        Self { full: 0, refused_estimate: 0, alone: 0 }
+    }
+
+    /// The refusal counted `input` tokens if it said so (`None`: no
+    /// shortfall is known); `refused_estimate` is the refused request's
+    /// estimate and `alone` the part of it no compaction shrinks.
+    pub(super) fn from_refusal(input: Option<u64>, refused_estimate: u64, alone: u64) -> Self {
+        Self { full: input.map_or(0, |input| input.saturating_sub(refused_estimate)), refused_estimate, alone }
+    }
+
+    /// What a request of this kind is charged on top of its own estimate:
+    /// the whole shortfall until something is summarized away — and then
+    /// only `alone`'s share of it, since the summary replaced the part the
+    /// estimate missed. Exact when the estimate's error is uniform across
+    /// the request (the SME-386 regime that earned the correction), and
+    /// never more than the whole: a `refused_estimate` of 0 (a request
+    /// with no system prompt — unreachable today) falls back to the full
+    /// correction, so the SME-386 protection is the default.
+    pub(super) fn for_request(self, compacted: bool) -> u64 {
+        if !compacted || self.refused_estimate == 0 {
+            return self.full;
+        }
+        self.full.saturating_mul(self.alone) / self.refused_estimate
+    }
+}

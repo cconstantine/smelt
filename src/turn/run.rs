@@ -381,7 +381,7 @@ fn run_turn_loop<'c>(
                 &mut compacted,
                 false,
                 None,
-                0,
+                Undercount::none(),
             )
             .await?;
             // A floor compaction can run inside the build (SME-414): its

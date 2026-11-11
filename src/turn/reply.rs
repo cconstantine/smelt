@@ -65,8 +65,10 @@ fn apply_budget(request: &mut anthropic::CreateMessageRequest, turn_model: &crat
 /// compacting can't help, or `hold_to_room` says so, and the request gets
 /// only the room left. `refused` is the refusal a retry answers, which a
 /// compaction here names and counts; `undercount` is how far short of the
-/// server's count the estimate of the refused request fell, added to this
-/// one's.
+/// server's count the estimate of the refused request fell, and each pass
+/// adds its due to this one's: the whole of it until a compaction
+/// summarized away the part the estimate missed, `alone`'s share after
+/// (SME-421).
 #[cfg(feature = "server")]
 pub(super) async fn build_request_with_room(
     pool: &PgPool,
@@ -78,12 +80,17 @@ pub(super) async fn build_request_with_room(
     compacted: &mut bool,
     hold_to_room: bool,
     refused: Option<&str>,
-    undercount: u64,
+    undercount: Undercount,
 ) -> ServerFnResult<(anthropic::CreateMessageRequest, ReplyBudget)> {
     loop {
         let room_only = with_compaction_progress(conversation_id, |p| p.room_only_at(turn_model.context_window)) || hold_to_room;
-        let (mut request, budget) = build_request(pool, conversation_id, turn_model, last_known_usage.as_ref(), pending_new_content, room_only, undercount).await?;
-        let size = estimate_request_tokens(&request) + undercount;
+        // What this pass is charged for the shortfall: the whole of it
+        // until a compaction replaced the part the estimate missed
+        // (SME-421). A `BeforeSending::Compact` re-loops, so the scaled
+        // number is picked up on the very next pass.
+        let correction = undercount.for_request(*compacted);
+        let (mut request, budget) = build_request(pool, conversation_id, turn_model, last_known_usage.as_ref(), pending_new_content, room_only, correction).await?;
+        let size = estimate_request_tokens(&request) + correction;
         let (window, cap) = (turn_model.context_window, turn_model.output_cap);
         let decided = with_compaction_progress(conversation_id, |p| before_sending(p, &turn_model.model, window, cap, room_only, budget, size, *compacted));
         match decided {

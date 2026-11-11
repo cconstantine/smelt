@@ -42,23 +42,25 @@ pub(super) async fn recover(
     let named = learn(pool, conversation_id, turn_model, overflow.window).await;
     let input = overflow.input_tokens.unwrap_or_else(|| estimate_request_tokens(refused));
     let believed = turn_model.context_window;
+    // The size no compaction can take away. The named branch answers
+    // `too_small` from it, and the undercount below scales by its share;
+    // a refusal can name a count without a window, so the guess branch
+    // needs it too (SME-421).
+    let alone = estimate_request_tokens(&without_messages(refused));
 
     let (mut compacted, hold_to_room) = match named {
-        Some(_) => {
-            let alone = estimate_request_tokens(&without_messages(refused));
-            match after_named_refusal(&turn_model.model, turn_model.context_window, alone, input) {
-                NamedRefusal::TooSmall(why) => {
-                    // Wakes say so after this without calling.
-                    with_compaction_progress(conversation_id, |p| p.too_small(alone, turn_model.context_window));
-                    return Err(ServerFnError::new(why));
-                }
-                // A window named is a window to keep to: the retry gets no
-                // more than the room it leaves, whatever's been learned, or
-                // the usual reply would be refused again on every send
-                // (final review L-1).
-                NamedRefusal::Retry { compact } => (compact, true),
+        Some(_) => match after_named_refusal(&turn_model.model, turn_model.context_window, alone, input) {
+            NamedRefusal::TooSmall(why) => {
+                // Wakes say so after this without calling.
+                with_compaction_progress(conversation_id, |p| p.too_small(alone, turn_model.context_window));
+                return Err(ServerFnError::new(why));
             }
-        }
+            // A window named is a window to keep to: the retry gets no
+            // more than the room it leaves, whatever's been learned, or
+            // the usual reply would be refused again on every send
+            // (final review L-1).
+            NamedRefusal::Retry { compact } => (compact, true),
+        },
         None => {
             // The assumption for this turn's compaction and retry. A guess,
             // so it never leaves the turn; and with no window named, the
@@ -101,10 +103,12 @@ pub(super) async fn recover(
     // says; and to the floor (review L-2), which compacts a retry that didn't,
     // counting it as answering this refusal (final review L-3).
     let reason = refused_reason(named);
-    // The estimate fell short of what the server counted by this much: the
-    // retry's is taken to, or its budget would be refused again on every
-    // send (SME-386 final review, the property test).
-    let undercount = overflow.input_tokens.map_or(0, |input| input.saturating_sub(estimate_request_tokens(refused)));
+    // The estimate fell short of what the server counted by this much: a
+    // retry takes it as its own (SME-386 final review, the property test),
+    // and a compacted one only `alone`'s share of it — what the estimate
+    // missed sat in the history the summary replaced, and charging the
+    // whole shortfall refused compacted retries that fit (SME-421).
+    let undercount = Undercount::from_refusal(overflow.input_tokens, estimate_request_tokens(refused), alone);
     let (mut request, budget) = build_request_with_room(
         pool,
         conversation_id,
