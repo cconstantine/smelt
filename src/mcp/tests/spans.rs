@@ -289,8 +289,8 @@ async fn test_the_tool_lists_warning_exports_no_key_from_the_urls_path(pool: sql
     .await;
     evict(config.id).await;
     lock_failures().remove(&config.id);
-    // smelt's own warning; rmcp's own log lines quote the URL too, which
-    // is filed apart (it's older than this ticket).
+    // smelt's own warning; rmcp's own log lines quote the URL too, scrubbed
+    // out of the console by SME-392's writer (see `mcp/tests/rmcp_log_lines.rs`).
     let logged = String::from_utf8_lossy(&console.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
     let warnings: Vec<&str> = logged.lines().filter(|line| line.contains("MCP server unreachable this turn")).collect();
     assert!(!warnings.is_empty(), "the warning was logged: {logged}");
