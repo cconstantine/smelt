@@ -214,6 +214,14 @@ impl CompactionProgress {
         self.believing = false;
     }
 
+    /// The request out died in something other than a refusal: the size
+    /// believed for it is spent, and must not go on to make some later
+    /// refusal read as that size's disproof (SME-423). Nothing else is
+    /// proved — `after`, `awaiting` and `tight` stand.
+    pub(super) fn request_failed(&mut self) {
+        self.believing = false;
+    }
+
     /// The server refused a request, saying it held `input` tokens if it
     /// said. One whose budget came from a measured `after` shows that size is
     /// out of date (the system prompt or tools grew since), so it's believed
@@ -472,7 +480,7 @@ impl CompactionProgress {
         if self.refused_out {
             return format!(
                 "`{model}`'s server kept refusing this conversation as too big for its context window, however much \
-                 smelt compacted it. Give the model a larger context on its server, or pick another model."
+                 smelt compacted it. Give the model a larger context window on its server and on its provider's page, or pick another model."
             );
         }
         if self.thrashing {
