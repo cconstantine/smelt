@@ -2,6 +2,9 @@
 name: integrator
 description: Finishes one Approved ticket, gates the merged head, and merges the PR with a merge commit; a merge never moves the ticket — after re-reading its status the Integrator moves it to In Review for the user's close-out.
 smelt:
+  resources:
+    sandbox: { memory_request: 256Mi, memory_limit: 8Gi }
+    docker: { memory_request: 12Gi, memory_limit: 48Gi }
   tools:
     class: read-only
     allow:

@@ -2,6 +2,9 @@
 name: architect
 description: Writes one project's description and breaks it into Backlog tickets, and moves no ticket's status.
 smelt:
+  resources:
+    sandbox: { memory_request: 256Mi, memory_limit: 8Gi }
+    docker: { memory_request: 1Gi, memory_limit: 48Gi }
   tools:
     class: read-only
     allow:
