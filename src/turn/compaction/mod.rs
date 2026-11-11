@@ -116,6 +116,42 @@ pub(super) async fn describe_live_state(pool: &PgPool, conversation_id: i64) -> 
     }
 }
 
+/// What `compact` did (SME-482): compacted, or nothing, and why.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Compacted {
+    Done,
+    Skipped(Skip),
+}
+
+/// Why `compact` had nothing to do.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Skip {
+    /// The conversation has no messages.
+    Empty,
+    /// The last message holds calls with no results yet.
+    UnsafeBoundary,
+}
+
+/// Who asked for a compaction on demand (SME-482): its reason on the
+/// divider, after "Conversation compacted: ".
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Asker {
+    /// The model's `compact_context`.
+    Model,
+}
+
+#[cfg(feature = "server")]
+impl Asker {
+    fn reason(self) -> &'static str {
+        match self {
+            Asker::Model => "the model asked for it",
+        }
+    }
+}
+
 /// The most a summary may write (floor of the derived budget since
 /// SME-443 — `summary_max_tokens` sends HTTP kinds more when their window
 /// leaves room; Claude Code keeps this constant, `claude_cli::once` adding
@@ -199,8 +235,35 @@ pub(super) async fn compact_conversation(
     slot: anthropic::stream::SlotPolicy<'_>,
     refused: Option<String>,
 ) -> ServerFnResult<()> {
+    in_compaction_span(pool, conversation_id, turn_model, slot, refused, None).await.map(|_| ())
+}
+
+/// A compaction someone asked for (SME-482): `by` names the asker on the
+/// divider, and `note` is what they asked the summary to keep. The same
+/// `compact`, so every safeguard of the automatic one holds.
+#[cfg(feature = "server")]
+pub(super) async fn compact_on_request(
+    pool: &PgPool,
+    conversation_id: i64,
+    turn_model: &mut crate::providers::TurnModel,
+    slot: anthropic::stream::SlotPolicy<'_>,
+    by: Asker,
+    note: Option<String>,
+) -> ServerFnResult<Compacted> {
+    in_compaction_span(pool, conversation_id, turn_model, slot, Some(by.reason().to_string()), note.as_deref()).await
+}
+
+/// `compact` in its `compaction` span; its model call is its child (SME-137).
+#[cfg(feature = "server")]
+async fn in_compaction_span(
+    pool: &PgPool,
+    conversation_id: i64,
+    turn_model: &mut crate::providers::TurnModel,
+    slot: anthropic::stream::SlotPolicy<'_>,
+    refused: Option<String>,
+    note: Option<&str>,
+) -> ServerFnResult<Compacted> {
     use tracing::field::Empty;
-    // Its model call is its child (SME-137).
     let span = tracing::info_span!(
         "compaction",
         conversation_id,
@@ -208,7 +271,7 @@ pub(super) async fn compact_conversation(
         otel.status_description = Empty,
     );
     crate::telemetry::in_span(span.clone(), async move {
-        let result = compact(pool, conversation_id, turn_model, slot, refused).await;
+        let result = compact(pool, conversation_id, turn_model, slot, refused, note).await;
         if let Err(e) = &result {
             crate::telemetry::mark_error(&span, &e.to_string());
         }
@@ -224,16 +287,17 @@ async fn compact(
     turn_model: &mut crate::providers::TurnModel,
     slot: anthropic::stream::SlotPolicy<'_>,
     refused: Option<String>,
-) -> ServerFnResult<()> {
+    note: Option<&str>,
+) -> ServerFnResult<Compacted> {
     let messages = db::list_messages(pool, conversation_id)
         .await
         .map_err(ServerFnError::new)?;
     let Some(last) = messages.last() else {
-        return Ok(());
+        return Ok(Compacted::Skipped(Skip::Empty));
     };
     let last_blocks = last.blocks().map_err(ServerFnError::new)?;
     if !is_safe_compaction_boundary(&last_blocks) {
-        return Ok(());
+        return Ok(Compacted::Skipped(Skip::UnsafeBoundary));
     }
     let covers_through_message_id = last.id;
 
@@ -248,13 +312,13 @@ async fn compact(
     // the refused one when no window was named. A second refusal ends
     // the turn with the reason.
     let mut refused = refused;
-    let summary = match summarize(pool, conversation_id, turn_model, slot, &transcript).await {
+    let summary = match summarize(pool, conversation_id, turn_model, slot, &transcript, note).await {
         Ok(summary) => summary,
         Err(anthropic::stream::ModelError::Overflow(overflow)) => {
             let named = super::overflow::learn(pool, conversation_id, turn_model, overflow.window).await;
             let budget = named.map_or(transcript.chars().count() / 2, |w| compaction_transcript_budget(w, turn_model.kind));
             let transcript = compaction_transcript(&messages, budget);
-            match summarize(pool, conversation_id, turn_model, slot, &transcript).await {
+            match summarize(pool, conversation_id, turn_model, slot, &transcript, note).await {
                 Ok(summary) => {
                     // The refusal this compaction answered, when its
                     // caller didn't name one: the divider reads the
@@ -305,7 +369,7 @@ async fn compact(
         .await
         .map_err(ServerFnError::new)?;
     crate::claude_cli::session::reset(pool, conversation_id, turn_model.kind).await;
-    Ok(())
+    Ok(Compacted::Done)
 }
 
 /// The summarization call itself: a plain, tools-less request over the
@@ -313,19 +377,24 @@ async fn compact(
 /// its drop, SME-178). Answers with the summary's text — for an HTTP
 /// kind, after the one continuation its budget cut-off gets (SME-443),
 /// marked where it honestly stopped — or with the typed error so the
-/// caller can answer an overflow (SME-73).
+/// caller can answer an overflow (SME-73). `note` is what whoever asked
+/// for this compaction wants kept (SME-482), after the live state.
 async fn summarize(
     pool: &PgPool,
     conversation_id: i64,
     turn_model: &crate::providers::TurnModel,
     slot: anthropic::stream::SlotPolicy<'_>,
     transcript: &str,
+    note: Option<&str>,
 ) -> Result<String, anthropic::stream::ModelError> {
     let live_state = describe_live_state(pool, conversation_id).await;
-    let prompt = format!(
+    let mut prompt = format!(
         "Conversation so far:\n{transcript}\n\nCurrently live (preserve these \
          exact ids in your summary):\n{live_state}"
     );
+    if let Some(note) = note {
+        prompt.push_str(&format!("\n\nWhoever asked for this compaction asks the summary to keep: {note}"));
+    }
     let request_chars = prompt.chars().count();
 
     let summarization_request = summary_request(
