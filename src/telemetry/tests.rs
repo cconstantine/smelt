@@ -312,3 +312,68 @@ fn test_looks_like_a_key_needs_length_letters_and_digits() {
     assert!(!looks_like_a_key("01234567890123456")); // digits only
     assert!(!looks_like_a_key("web_search_exa_tool_name")); // letters only
 }
+
+/// The two rmcp lines of SME-392 (their exact texts, string-built with the
+/// markers), a split-write URL, a plain line that must come out
+/// byte-identical, and a final partial line: through the console writer as
+/// the `fmt` layer drives it.
+#[test]
+fn test_the_console_writer_scrubs_urls_from_every_line() {
+    use std::io::Write;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Buffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let url = "http://127.0.0.1:9/mcp/s/TEST-KEY-392-PATH-0001/mcp?apiKey=TEST-KEY-392";
+    let line_740 = format!(
+        "2026-11-11T00:00:00.000000Z ERROR rmcp::transport::streamable_http_client: \
+         fail to get common stream: Client error: HTTP status client error (404 Not Found) for url ({url})"
+    );
+    let line_135 = format!(
+        "2026-11-11T00:00:00.000000Z ERROR rmcp::transport::worker: worker quit with fatal: \
+         Transport channel closed, when Client(reqwest::Error {{ kind: Request, url: \"{url}\", \
+         source: Connection refused }})"
+    );
+    let plain = "2026-11-11T00:00:00.000000Z  INFO smelt: MCP server unreachable this turn\n";
+
+    let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    {
+        let buffer = Buffer(out.clone());
+        let make = Scrubbed::new(move || buffer.clone());
+        let mut w = make.make_writer();
+        w.write_all(line_740.as_bytes()).expect("write 740");
+        w.write_all(b"\n").expect("newline");
+        w.write_all(line_135.as_bytes()).expect("write 135");
+        w.write_all(b"\n").expect("newline");
+        w.write_all(plain.as_bytes()).expect("write plain");
+        // A line split across writes is still one line.
+        w.write_all(b"split url http://h/").expect("write part one");
+        w.write_all(b"mcp/s/TEST-KEY-392-PATH-0001/mcp?apiKey=TEST-KEY-392 end\n").expect("write part two");
+        // And a tail that never sees its newline is flushed on drop.
+        w.write_all(b"cut off for url (https://h/x?apiKey=TEST-KEY-392-PATH-0001)").expect("write tail");
+    }
+    let logged = String::from_utf8(out.lock().unwrap_or_else(|e| e.into_inner()).clone()).expect("utf-8");
+    assert!(!logged.contains("TEST-KEY-392"), "{logged}");
+    assert!(
+        logged.contains("fail to get common stream") && logged.contains("worker quit with fatal"),
+        "the words survive: {logged}"
+    );
+    assert!(
+        logged.contains("127.0.0.1:9") && logged.contains("404 Not Found") && logged.contains("Connection refused"),
+        "the host and the reason survive: {logged}"
+    );
+    assert!(logged.contains("for url (http://127.0.0.1:9/mcp/s/<redacted>/mcp?…"), "the shape survives: {logged}");
+    assert!(logged.contains(plain), "the plain line is byte-identical: {logged}");
+    assert!(logged.contains("split url http://h/mcp/s/<redacted>/mcp?… end"), "the split line: {logged}");
+    assert!(logged.ends_with("cut off for url (https://h/x?…)"), "the tail flushed, newline-free: {logged}");
+}

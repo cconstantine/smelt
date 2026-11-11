@@ -720,4 +720,5 @@ mod connection;
 mod hanging;
 mod oauth;
 mod redaction;
+mod rmcp_log_lines;
 mod offer;

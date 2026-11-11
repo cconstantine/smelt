@@ -129,6 +129,84 @@ pub(crate) fn looks_like_a_key(value: &str) -> bool {
     value.chars().count() >= 16 && value.chars().any(|c| c.is_ascii_digit()) && value.chars().any(|c| c.is_ascii_alphabetic())
 }
 
+/// Wraps a `fmt` layer's `MakeWriter` so every line it writes passes
+/// through [`scrub_urls`] (SME-392): rmcp's own WARN/ERROR lines carry
+/// reqwest's error text, which quotes the full request URL — query and
+/// key-shaped path segment included — and a dependency's lines are not
+/// scrubbed at their source as smelt's are. The `fmt` layer escapes
+/// newlines inside field values, so one line is one event; the EnvFilter
+/// still runs first, this only rewrites the text.
+#[derive(Clone)]
+pub(crate) struct Scrubbed<M>(M);
+
+impl<M> Scrubbed<M> {
+    pub(crate) fn new(inner: M) -> Self {
+        Scrubbed(inner)
+    }
+}
+
+impl<'a, M> tracing_subscriber::fmt::MakeWriter<'a> for Scrubbed<M>
+where
+    M: tracing_subscriber::fmt::MakeWriter<'a>,
+{
+    type Writer = ScrubbingWriter<M::Writer>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        ScrubbingWriter { inner: self.0.make_writer(), line: Vec::new() }
+    }
+}
+
+/// The line-buffering writer behind [`Scrubbed`].
+pub(crate) struct ScrubbingWriter<W: std::io::Write> {
+    inner: W,
+    line: Vec<u8>,
+}
+
+impl<W: std::io::Write> std::io::Write for ScrubbingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        for byte in buf {
+            if *byte == b'\n' {
+                self.write_line(b"\n")?;
+            } else {
+                self.line.push(*byte);
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // Keep any line in progress: every event ends at a newline, so a
+        // partial line here is fmt mid-write, not a line to release. Drop
+        // writes what is left.
+        self.inner.flush()
+    }
+}
+
+impl<W: std::io::Write> Drop for ScrubbingWriter<W> {
+    fn drop(&mut self) {
+        // A tail that never saw its newline is still scrubbed, and stays
+        // newline-free: what arrived is what goes, with URLs cut.
+        if !self.line.is_empty() {
+            let line = std::mem::take(&mut self.line);
+            let _ = self.write_scrubbed(&line, b"");
+        }
+    }
+}
+
+impl<W: std::io::Write> ScrubbingWriter<W> {
+    fn write_line(&mut self, terminator: &[u8]) -> std::io::Result<()> {
+        let line = std::mem::take(&mut self.line);
+        self.write_scrubbed(&line, terminator)
+    }
+
+    fn write_scrubbed(&mut self, line: &[u8], terminator: &[u8]) -> std::io::Result<()> {
+        // fmt writes UTF-8; lossy keeps a line a dependency garbled whole.
+        let text = String::from_utf8_lossy(line);
+        self.inner.write_all(scrub_urls(&text).as_bytes())?;
+        self.inner.write_all(terminator)
+    }
+}
+
 /// Runs `future` in `span` and ends the span's export when the future
 /// finishes or is dropped, whoever still holds the span. Use it instead of
 /// `Instrument::instrument` for every exported span: hyper-util spawns each
@@ -257,9 +335,14 @@ impl Drop for TelemetryGuard {
 /// layer. A failure to build the exporter is logged and leaves tracing off.
 pub(crate) fn init() -> Option<TelemetryGuard> {
     let env = |key: &str| std::env::var(key).ok();
-    let console = tracing_subscriber::fmt::layer().with_filter(tracing_subscriber::EnvFilter::new(
-        crate::log_filter_directives(&env("RUST_LOG").unwrap_or_default()),
-    ));
+    // SME-392: every console line passes `scrub_urls` on its way out, so a
+    // dependency's own log line (rmcp's transport failures quote the whole
+    // request URL) shows its diagnosis without its key.
+    let console = tracing_subscriber::fmt::layer()
+        .with_writer(Scrubbed::new(std::io::stdout))
+        .with_filter(tracing_subscriber::EnvFilter::new(
+            crate::log_filter_directives(&env("RUST_LOG").unwrap_or_default()),
+        ));
     let registry = tracing_subscriber::registry().with(console);
     if otel_endpoint(env).is_none() {
         registry.init();
@@ -368,8 +451,10 @@ async fn capture<F: std::future::Future>(
     let provider = SdkTracerProvider::builder().with_simple_exporter(exporter.clone()).build();
     let console = console.map(|buffer| {
         let writer = Console(buffer);
+        // The same scrubbing writer as production (SME-392): what the
+        // console tests see is what the console gets.
         tracing_subscriber::fmt::layer()
-            .with_writer(move || writer.clone())
+            .with_writer(Scrubbed::new(move || writer.clone()))
             .with_ansi(false)
             .with_filter(LevelFilter::TRACE)
     });
