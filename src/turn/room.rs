@@ -103,9 +103,13 @@ pub(super) fn after_named_refusal(model: &str, context_window: u32, alone: u64, 
 /// Hold a budget to the short reply (SME-422): the smallest the codebase
 /// promises is worth sending, the one the floor's `TryAnyway` arm sends —
 /// so a retry answering a refusal that named no input takes only room the
-/// request is guaranteed to leave whenever it leaves room for anything.
+/// request is guaranteed to leave whenever it leaves room for anything. A
+/// budget the cap doesn't cut keeps the label of what really bounded it
+/// (round 1 F1): relabelling a model-capped budget RoomLeft would make its
+/// cut-off notice blame the conversation's room for the model's own maximum.
 pub(super) fn short_reply_budget(budget: ReplyBudget) -> ReplyBudget {
-    ReplyBudget { tokens: budget.tokens.min(MIN_USEFUL_REPLY), limit: crate::api::chat::ReplyLimit::RoomLeft }
+    let tokens = budget.tokens.min(MIN_USEFUL_REPLY);
+    ReplyBudget { tokens, limit: if tokens < budget.tokens { crate::api::chat::ReplyLimit::RoomLeft } else { budget.limit } }
 }
 
 /// The window a refusal naming none has the turn assume, for this turn

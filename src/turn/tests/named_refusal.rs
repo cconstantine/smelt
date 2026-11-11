@@ -18,6 +18,9 @@ use super::*;
 /// summarized away the part the count named) is counted at its fresh size.
 /// With `window_only` set, a refusal names only its window, never the input
 /// it counted — vLLM's shape, and LiteLLM's when it relays it (SME-422).
+/// With `cut_off_reply` set, the last plan's answer stops at `max_tokens`
+/// rather than finishing — the shape that makes smelt save a cut-off notice
+/// naming the budget it stopped at (SME-422 F1).
 #[derive(Default)]
 struct Counting {
     window: std::sync::Mutex<Option<u32>>,
@@ -28,6 +31,7 @@ struct Counting {
     refuse_summary: std::sync::Mutex<Option<u32>>,
     retry_fresh_count: std::sync::atomic::AtomicBool,
     window_only: std::sync::atomic::AtomicBool,
+    cut_off_reply: std::sync::atomic::AtomicBool,
 }
 
 impl Counting {
@@ -99,7 +103,12 @@ async fn counting_mock(pool: &PgPool, window: Option<u32>, plans: Vec<(i64, i64)
                     return ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], OVERLOADED.to_string()).into_response();
                 }
                 let body = if index + 1 >= plans.len() {
-                    text_reply_body("Done.")
+                    let body = text_reply_body("Done.");
+                    if state.cut_off_reply.load(Ordering::SeqCst) {
+                        body.replace(r#""stop_reason":"end_turn""#, r#""stop_reason":"max_tokens""#)
+                    } else {
+                        body
+                    }
                 } else {
                     tool_calls_body(&[("toolu_01", "todoread", serde_json::json!({}))])
                 };
@@ -411,4 +420,68 @@ async fn test_a_refusal_that_names_only_its_window_gets_a_reply(pool: PgPool) {
     assert_eq!(mock.summaries.load(Ordering::SeqCst), 1, "one summary answered the refusal");
     assert_eq!(mock.taken_budgets().last(), Some(&u64::from(MIN_USEFUL_REPLY)), "the retry took a short reply: {:?}", mock.taken_budgets());
     assert_eq!(last_failure_reason(&pool, conversation.id).await, None, "nothing was stuck");
+}
+
+/// F1 (PR #327 round 1): with a model-own output cap below `MIN_USEFUL_REPLY`
+/// the retry answering a no-count refusal is already clamped to the cap —
+/// the short-reply cap must then touch neither its number nor its label: a
+/// reply cut off at 768 tokens is "the most this model can write", not
+/// "the room left in the conversation".
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_short_reply_at_a_model_own_cap_is_noticed_at_the_cap_not_the_room(pool: PgPool) {
+    use crate::api::chat::{ReplyLimit, parse_cut_off_notice};
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let mock = counting_mock(&pool, None, vec![(0, 10)]).await;
+    let model = crate::providers::resolve_turn_model(&pool, conversation.id).await.expect("a model");
+    let (empty, _) = build_request(&pool, conversation.id, &model, None, &[], false, 0).await.expect("a request");
+    let a = estimate_request_tokens(&empty);
+    let m: u64 = 30_000;
+    db::create_message(&pool, conversation.id, "user", &[anthropic::ContentBlock::Text { text: "a".repeat(120_000) }])
+        .await
+        .expect("seed the blob");
+    db::create_message(&pool, conversation.id, "assistant", &[anthropic::ContentBlock::Text { text: "Noted.".to_string() }])
+        .await
+        .expect("seed the ack");
+    // Sized as the wedge test: the refusal is window-only, the retry's fresh
+    // count leaves room for a short reply — here, for less than one: the
+    // model's own maximum, as its listing reports it, is 768.
+    let window = u32::try_from(a + m + 20_992).expect("a window");
+    const CAP: u32 = 768;
+    sqlx::query(
+        "INSERT INTO provider_models (provider_id, model, context_window, max_output, reported_max_output) SELECT id, $1, $2, $3, $3 FROM inference_providers",
+    )
+    .bind(crate::providers::test_support::MOCK_MODEL)
+    .bind(i32::try_from(window).expect("a window"))
+    .bind(i32::try_from(CAP).expect("a cap"))
+    .execute(&pool)
+    .await
+    .expect("seed the model's own cap");
+    *mock.window.lock().expect("the window") = Some(window);
+    *mock.plans.lock().expect("the plans") = vec![
+        (i64::try_from(a + 3 * m).expect("first count"), 10),
+        (i64::try_from(a + m + 9_992).expect("fresh count"), 10),
+    ];
+    mock.window_only.store(true, Ordering::SeqCst);
+    mock.retry_fresh_count.store(true, Ordering::SeqCst);
+    mock.cut_off_reply.store(true, Ordering::SeqCst);
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("the capped retry fits");
+    let taken = mock.taken_budgets();
+    assert_eq!(taken.last(), Some(&u64::from(CAP)), "the retry took its own cap, not a short reply: {taken:?}");
+    // The cut-off notice: what bound the reply was the model's own maximum,
+    // not the conversation's room. (Red today: the short-reply cap relabels
+    // the surviving budget RoomLeft, and the notice blames the room.)
+    let (limit, notice) = saved
+        .iter()
+        .rev()
+        .find_map(|m| {
+            m.blocks().ok()?.iter().find_map(|b| match b {
+                anthropic::ContentBlock::Text { text } => parse_cut_off_notice(text).map(|(_, limit, _)| (limit, text.clone())),
+                _ => None,
+            })
+        })
+        .expect("a cut-off notice was saved");
+    assert_eq!(limit, ReplyLimit::ModelMaximum, "{notice}");
 }
