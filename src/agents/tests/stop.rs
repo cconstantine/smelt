@@ -23,13 +23,22 @@ async fn set_state(pool: &PgPool, id: i64, state: &str) {
         .expect("set the state");
 }
 
-/// A child whose first turn is over.
+/// A child whose first turn is over — and whose SME-455 first-spell is
+/// over too: that turn ended plain and stuck, so the seat was nudged and
+/// its nudge-woken turn ran, ending with the notice to the root. Settling
+/// it here keeps callers' turn and transcript counts honest.
 async fn settled_child(pool: &PgPool, root: i64, brief: &str) -> i64 {
     let child = start_child(pool, root, brief).await;
     eventually("the child's first turn is over", || async {
         state(pool, child).await.as_deref() == Some(db::AGENT_ACTIVE)
             && transcript(pool, child).await.iter().any(|(role, _)| role == "assistant")
             && !crate::turn::turn_running(child)
+    })
+    .await;
+    eventually("the nudge spell is over", || async {
+        !crate::turn::turn_running(child)
+            && transcript(pool, child).await.iter().filter(|(role, _)| role == "assistant").count() == 2
+            && queued_to(pool, root).await.iter().any(|body| body.contains("turn ended without a report"))
     })
     .await;
     child
@@ -128,7 +137,10 @@ async fn test_the_users_send_makes_a_finished_or_stopped_child_active_and_a_fail
         crate::turn::start_turn(pool.clone(), child, "Carry on.".to_string()).await.expect("the send goes through");
         assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_ACTIVE));
         eventually("its turn is over", || async {
-            transcript(&pool, child).await.iter().filter(|(role, _)| role == "assistant").count() == 2
+            // settled_child's spell left two assistant turns (its own, the
+            // SME-455 nudge's). The send itself clears the owed spell (a
+            // fresh spell), so its turn is nudged too: send + nudge = four.
+            transcript(&pool, child).await.iter().filter(|(role, _)| role == "assistant").count() == 4
                 && !crate::turn::turn_running(child)
         })
         .await;

@@ -140,20 +140,29 @@ async fn test_the_parents_reply_answers_and_wakes_the_child(pool: PgPool) {
         message(&pool, root, serde_json::json!(child), "hello.txt").await,
         Ok(format!("Agent #{child} was waiting for your answer: it has it now."))
     );
-    eventually("the child took the answer", || async {
-        requests_for(&requests, Some(child)).len() == 2 && !crate::turn::turn_running(child)
+    eventually("the child took the answer, and its SME-455 nudge ran", || async {
+        // Turn 2 takes the answer; its plain stuck end is answered by the
+        // nudge, whose woken turn is the third (SME-455: the first such
+        // end speaks to the seat, not the parent).
+        requests_for(&requests, Some(child)).len() == 3 && !crate::turn::turn_running(child)
     })
     .await;
     assert_eq!(
         since_last_reply(&requests_for(&requests, Some(child))[1]),
         vec!["tool_result: Your parent answered:\n\nhello.txt".to_string()]
     );
-    let queued = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1")
+    let queued = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1 AND kind = 'message'")
         .bind(child)
         .fetch_one(&pool)
         .await
         .expect("count");
     assert_eq!(queued, 0, "the answer isn't also queued as a message");
+    let nudges = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1 AND kind = 'server_notice'")
+        .bind(child)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(nudges, 1, "the one SME-455 nudge");
     assert_eq!(status_of(&pool, root, child).await, "idle");
     eventually("every turn is over", || async { !crate::turn::turn_running(root) }).await;
 }
@@ -166,7 +175,9 @@ async fn test_the_user_writing_in_the_child_takes_the_question(pool: PgPool) {
 
     crate::turn::start_turn(pool.clone(), child, "Use a.txt.".to_string()).await.expect("the send");
     eventually("the child's turn is over", || async {
-        requests_for(&requests, Some(child)).len() == 2 && !crate::turn::turn_running(child)
+        // Two turns now: the send's (which takes the question), and the
+        // SME-455 nudge's woken turn for its plain stuck end.
+        requests_for(&requests, Some(child)).len() == 3 && !crate::turn::turn_running(child)
     })
     .await;
     assert_eq!(
@@ -328,15 +339,159 @@ async fn test_a_paused_child_waiting_for_its_parent(pool: PgPool) {
     crate::turn::notify(&pool, child, vec![crate::turn::Notice::Wake]).await.expect("the wake");
     assert_eq!(requests_for(&requests, Some(child)).len(), 1, "a paused child ran a turn");
     crate::turn::start_turn(pool.clone(), child, "Go on.".to_string()).await.expect("the send");
-    eventually("the child's turn is over", || async {
-        requests_for(&requests, Some(child)).len() == 2 && !crate::turn::turn_running(child)
+    // Self-diagnosis (SME-455 fix round 1, CI red at the head): split the
+    // chain's hops so a red names the one that failed — the nudge ROW
+    // (queued at the send's plain stuck end), then the third model call
+    // (its woken turn), then that turn ending. The row never arriving
+    // means the end-of-turn check itself was lost, not late.
+    eventually("the nudge row queued for the seat", || async {
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1 AND kind = 'server_notice'")
+            .bind(child)
+            .fetch_one(&pool)
+            .await
+            .expect("count the nudge rows");
+        rows >= 1
     })
     .await;
+    eventually("the nudge's turn is the child's third call", || async { requests_for(&requests, Some(child)).len() == 3 }).await;
+    eventually("the child's turn is over", || async { !crate::turn::turn_running(child) }).await;
     assert_eq!(
         since_last_reply(&requests_for(&requests, Some(child))[1]),
         vec!["tool_result: Your parent answered:\n\nhello.txt".to_string(), "Go on.".to_string()]
     );
     eventually("every turn is over", || async { !crate::turn::turn_running(root) }).await;
+}
+
+/// SME-478: the `Answered` wake a paused child's answer spawns admits
+/// *after* the user's send has ended the pause — its pause check rides
+/// behind two DB awaits in `wake_conversation` — so it counts a turn
+/// while the send runs, and ends finding nothing (the send took the
+/// answer) after the send's plain stuck end skipped the end-of-turn
+/// check for the counted wake. This test forces that interleaving step
+/// by step with the turn hooks, and asserts the check survives the two
+/// counted turns: the send's end leaves it owed, the late wake's empty
+/// end takes it, and the SME-455 nudge arrives — once, and the parent is
+/// told only at the nudge turn's second stuck end. Red without SME-478's
+/// fix at the CI red's own label (`the nudge row queued for the seat`);
+/// CI run 42937003336 is the race's second sighting after the loop.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_late_admitted_answered_wake_takes_the_check_the_send_skipped(pool: PgPool) {
+    let requests = agent_mock(&pool, vec![ask_reply(), text_reply("Noted.")]).await;
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    let child = asking_child(&pool, root, &requests).await;
+    user_stop(&pool, child).await.expect("the user's Stop");
+    // The parent's answer, recorded exactly as message_agent records it
+    // for a paused child — but not the wake that answering spawns. That
+    // wake is the thing that races, so the test spawns it itself at the
+    // moment the race puts it in flight: an explicit `Notice::Wake` runs
+    // the same `wake_conversation`, finds the same untaken answer, and
+    // admits the same way (the SME-450 sweep test above shows it does).
+    sqlx::query("UPDATE pending_questions SET answer = $2 WHERE conversation_id = $1 AND answer IS NULL")
+        .bind(child)
+        .bind(sqlx::types::Json(
+            &[crate::questions::QuestionAnswer { selected: Vec::new(), other: Some("hello.txt".to_string()) }][..],
+        ))
+        .execute(&pool)
+        .await
+        .expect("record the answer");
+
+    // (1) The user's send is counted — ending the pause — and held before
+    // it takes the turn lock, so it cannot take the answer out from under
+    // the wake's pending-work check.
+    let (counted, send_runs) = crate::turn::test_hooks::pause_after_turn_counted(child);
+    crate::turn::start_turn(pool.clone(), child, "Go on.".to_string()).await.expect("the send");
+    tokio::time::timeout(Duration::from_secs(10), counted)
+        .await
+        .expect("the send counted (and the pause ended) within 10 s")
+        .expect("the hook");
+
+    // (2) The wake admits — the pause is gone — and is held right after
+    // its admission: counted, not yet queued for the turn lock. This is
+    // the interleaving, the wake in flight while the send's turn runs.
+    let (admitted, wake_runs) = crate::turn::test_hooks::pause_after_notice_admitted(child);
+    let wake = crate::turn::notify(&pool, child, vec![crate::turn::Notice::Wake]);
+    tokio::time::timeout(Duration::from_secs(10), admitted)
+        .await
+        .expect("the wake admitted after the pause ended, within 10 s")
+        .expect("the hook");
+
+    // (3) The send runs and ends plain and stuck while the wake is still
+    // counted. It's held at the in-flight change that closes its turn, so
+    // the skip — which must leave the check owed, not run it — is
+    // observed before the wake's turn is released.
+    let (send_closed, send_finishes) = crate::turn::test_hooks::pause_after_in_flight_changed(child);
+    send_runs.send(()).expect("release the send");
+    let closed_by = std::time::Instant::now() + Duration::from_secs(15);
+    while send_closed.try_recv().is_err() {
+        assert!(std::time::Instant::now() < closed_by, "the send's turn ended: not within 15 s");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1 AND kind = 'server_notice'",
+        )
+        .bind(child)
+        .fetch_one(&pool)
+        .await
+        .expect("count the nudge rows"),
+        0,
+        "while the wake is counted, the send's end skips the check — it must not run it there"
+    );
+    // Let the send finish its end — best effort: this hook is synchronous
+    // and gives up after 5 s (which, on this test's single-worker runtime,
+    // it has usually done before the wait above can notice), and after it
+    // gives up the end goes on by itself. Leaving the check owed is a
+    // synchronous step of the turn state taken right there, before the
+    // wake's turn can reach its own end (which first waits the turn lock
+    // and its drains), so releasing the wake now reads what the send left.
+    let _ = send_finishes.send(());
+    wake_runs.send(()).expect("release the wake");
+
+    // (4) The wake's turn drains nothing and ends last. Without SME-478's
+    // fix this is where the check dies — neither counted turn owns it and
+    // the nudge row never arrives — so the waits below are the red.
+    eventually("the nudge row queued for the seat", || async {
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1 AND kind = 'server_notice'",
+        )
+        .bind(child)
+        .fetch_one(&pool)
+        .await
+        .expect("count the nudge rows");
+        rows >= 1
+    })
+    .await;
+    eventually("the nudge's turn is the child's third call", || async { requests_for(&requests, Some(child)).len() == 3 }).await;
+    // The nudge turn's own plain stuck end is the spell's second, and
+    // tells the parent (nudge-first) — the owed check ran exactly once
+    // across the two counted turns, so exactly one nudge and one notice.
+    eventually("the parent is told at the second end", || async {
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1 AND body LIKE '%turn ended without a report%'",
+        )
+        .bind(root)
+        .fetch_one(&pool)
+        .await
+        .expect("count the turn-ended notices");
+        rows == 1
+    })
+    .await;
+    eventually("every turn is over", || async { !crate::turn::turn_running(child) && !crate::turn::turn_running(root) }).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1 AND kind = 'server_notice'",
+        )
+        .bind(child)
+        .fetch_one(&pool)
+        .await
+        .expect("count the nudge rows"),
+        1,
+        "nudged once, once only"
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(30), wake).await;
+    for id in [root, child] {
+        crate::turn::forget_conversation_lock(id);
+    }
 }
 
 /// Review 1, finding 1. Interleaving: the parent's model call is held;

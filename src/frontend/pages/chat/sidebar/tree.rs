@@ -150,11 +150,13 @@ pub(super) fn settled_parents(nodes: &[ConversationNode]) -> Vec<i64> {
 }
 
 /// Whether an agent keeps its tree open: working, waiting for the user,
-/// still starting, or waiting on its parent's answer (`agents::status`'s
-/// words, as the node carries them).
+/// still starting, waiting on its parent's answer (`agents::status`'s
+/// words, as the node carries them), or owing its parent a report
+/// (SME-455: the fold used to hide exactly the tree that needs attention).
 fn unsettled(node: &ConversationNode) -> bool {
     node.busy
         || node.waiting_for_user
+        || node.report_owed_at.is_some()
         || matches!(node.status.as_deref(), Some("starting" | "waiting for its parent"))
 }
 
@@ -190,6 +192,7 @@ mod tests {
             status: None,
             busy: false,
             waiting_for_user: false,
+            report_owed_at: None,
         }
     }
 
@@ -332,6 +335,25 @@ mod tests {
             with_status(node(8, Some(7)), "finished"),
         ];
         assert_eq!(settled_parents(&list), vec![7], "only the tree with nothing left to do folds");
+    }
+
+    fn owed(mut n: ConversationNode) -> ConversationNode {
+        n.report_owed_at = Some(chrono::NaiveDate::from_ymd_opt(2026, 11, 10).unwrap().and_hms_opt(9, 0, 0).unwrap());
+        n
+    }
+
+    /// SME-455: a live seat that owes its parent a report is the case the
+    /// fold used to hide — a finished-looking tree with nothing working,
+    /// waiting on the user or starting, so it keeps its tree open.
+    #[test]
+    fn test_a_seat_that_owes_a_report_keeps_its_tree_open() {
+        let list = vec![
+            node(1, None),
+            owed(node(2, Some(1))),
+            node(3, None),
+            node(4, Some(3)),
+        ];
+        assert_eq!(settled_parents(&list), vec![3], "the tree with an owed report stays open");
     }
 
     #[test]

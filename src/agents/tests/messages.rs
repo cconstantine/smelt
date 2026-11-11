@@ -208,8 +208,14 @@ async fn test_a_busy_recipient_takes_a_message_at_its_next_iteration(pool: PgPoo
 
     message(&pool, root, serde_json::json!(child), "Mid-call.").await.expect("sent");
     gate.add_permits(1);
-    eventually("the child's turn is over", || async {
-        requests_for(&requests, Some(child)).len() == 2 && !crate::turn::turn_running(child)
+    // SME-478: this turn's plain stuck end leaves the end-of-turn check
+    // owed (the message's wake admits behind it, so the turn ends with a
+    // turn counted), and the spell's last end runs it: one nudge turn for
+    // the seat, and that seat's second plain end tells the parent. The
+    // claim below — the message arriving in the running turn's next
+    // iteration — is unchanged: calls[1]; the nudge turn is calls[2].
+    eventually("the nudged spell is over", || async {
+        requests_for(&requests, Some(child)).len() == 3 && !crate::turn::turn_running(child)
     })
     .await;
     let calls = requests_for(&requests, Some(child));
@@ -218,6 +224,16 @@ async fn test_a_busy_recipient_takes_a_message_at_its_next_iteration(pool: PgPoo
     assert_eq!(last.len(), 2, "{last:?}");
     assert!(last[0].starts_with("tool_result: "), "{last:?}");
     assert_eq!(last[1], "Message from your parent:\n\nMid-call.");
+    assert!(calls[2].to_string().contains("owing your parent a report"), "the third call is the nudge turn");
+    assert_eq!(
+        queued_to(&pool, child).await.iter().filter(|(_, body, _)| body.contains("owing your parent a report")).count(),
+        1,
+        "nudged once, once only"
+    );
+    eventually("the parent is told the nudge's turn was stuck too", || async {
+        queued_to(&pool, root).await.iter().any(|(_, body, _)| body.contains("turn ended without a report"))
+    })
+    .await;
     eventually("every turn is over", || async { !crate::turn::turn_running(root) }).await;
 }
 
@@ -233,15 +249,31 @@ async fn test_several_messages_to_a_paused_child_wait_and_arrive_in_one_turn_in_
         message(&pool, root, serde_json::json!(child), text).await.expect("sent");
     }
     crate::turn::start_turn(pool.clone(), child, "I'm back.".to_string()).await.expect("the send");
-    eventually("the child's turn is over", || async {
-        !requests_for(&requests, Some(child)).is_empty() && !crate::turn::turn_running(child)
+    // SME-478: the user's send was the spell's first plain stuck end, and
+    // the check it skipped (a wake admitted behind it) is owed to the
+    // spell's last end: the seat is nudged — one nudge turn — and that
+    // turn's own stuck end tells the parent. Settle the whole chain
+    // before the snapshot; the wake turns still drain nothing, and the
+    // messages still arrive in the user's own turn, in order, below.
+    eventually("the nudged spell is over", || async {
+        requests_for(&requests, Some(child)).len() == 2 && !crate::turn::turn_running(child)
+    })
+    .await;
+    eventually("the parent is told the nudge's turn was stuck too", || async {
+        queued_to(&pool, root).await.iter().any(|(_, body, _)| body.contains("turn ended without a report"))
     })
     .await;
     let calls = requests_for(&requests, Some(child));
-    assert_eq!(calls.len(), 1, "a wake ran a turn before the user wrote");
+    assert_eq!(calls.len(), 2, "the user's turn, then the nudge's — a wake ran no turn of its own");
     let request = calls[0].to_string();
     let at = |text: &str| request.find(&format!("Message from your parent:\\n\\n{text}")).unwrap_or_else(|| panic!("{text} missing: {request}"));
     assert!(at("One.") < at("Two.") && at("Two.") < at("Three."), "{request}");
+    assert!(calls[1].to_string().contains("owing your parent a report"), "the second call is the nudge turn");
+    assert_eq!(
+        queued_to(&pool, child).await.iter().filter(|(_, body, _)| body.contains("owing your parent a report")).count(),
+        1,
+        "nudged once, once only"
+    );
     eventually("every turn is over", || async { !crate::turn::turn_running(root) }).await;
 }
 
@@ -296,14 +328,29 @@ async fn test_finish_is_refused_while_a_message_is_queued(pool: PgPool) {
 
     message(&pool, root, serde_json::json!(child), "Wait, also this.").await.expect("sent");
     gate.add_permits(1);
-    eventually("the child's turn is over", || async {
-        requests_for(&requests, Some(child)).len() == 2 && !crate::turn::turn_running(child)
+    // SME-478: as in `test_a_busy_recipient…` above — the turn's plain
+    // stuck end leaves the check owed to the spell's last end, which
+    // nudges the seat once, and the nudge's own stuck end tells the
+    // parent. The refusal and the message arriving at its next step are
+    // unchanged: calls[1].
+    eventually("the nudged spell is over", || async {
+        requests_for(&requests, Some(child)).len() == 3 && !crate::turn::turn_running(child)
     })
     .await;
     assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_ACTIVE), "finish was refused");
     let last = last_message(&requests_for(&requests, Some(child))[1]);
     assert!(last[0].contains("a message arrived since your last step; read it, then finish"), "{last:?}");
     assert_eq!(last[1], "Message from your parent:\n\nWait, also this.");
+    assert!(requests_for(&requests, Some(child))[2].to_string().contains("owing your parent a report"), "the third call is the nudge turn");
+    assert_eq!(
+        queued_to(&pool, child).await.iter().filter(|(_, body, _)| body.contains("owing your parent a report")).count(),
+        1,
+        "nudged once, once only"
+    );
+    eventually("the parent is told the nudge's turn was stuck too", || async {
+        queued_to(&pool, root).await.iter().any(|(_, body, _)| body.contains("turn ended without a report"))
+    })
+    .await;
     assert!(
         !queued_to(&pool, root).await.iter().any(|(kind, _, _)| kind == db::KIND_REPORT),
         "no report was sent"

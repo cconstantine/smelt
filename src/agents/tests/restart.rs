@@ -169,13 +169,18 @@ async fn test_the_restart_notice_is_only_for_an_active_child_cut_off_mid_turn(po
     for id in ids {
         assert_eq!(restart_notices(&pool, id).await, 0, "#{id} was told");
     }
-    // The answered child is woken for its answer, and its turn ending
-    // without a report tells its root and wakes it (SME-236): the root IS
-    // woken, exactly once, and none of the other six is (SME-287). Both hops
-    // run unawaited — the end-of-turn check after the child's turn, the
-    // root's wake after that — so wait each out before counting.
+    // The answered child is woken for its answer (SME-287), and SME-455:
+    // its first plain stuck end is the seat's own — the nudge lands first,
+    // and it is that nudge-woken turn's (second) end that tells the root
+    // and wakes it: the root IS woken, exactly once, and none of the other
+    // six is. Both hops run unawaited — the end-of-turn check after the
+    // child's turn, the root's wake after that — so wait each out.
     eventually("the answered child's end-of-turn check ran", || async { test_hooks::last_turns_checked(answered) > before }).await;
-    assert_eq!(notices_to(&pool, root, answered).await, 1, "the child's end-of-turn notice to the root");
+    eventually("the seat was nudged first", || async {
+        transcript(&pool, answered).await.iter().any(|(_, t)| t.contains(crate::agents::queue::REPORT_OWE_NUDGE))
+    })
+    .await;
+    eventually("the second end told the root, once", || async { notices_to(&pool, root, answered).await == 1 }).await;
     eventually("the root's turn for the notice is over", || async { requests_for(&requests, None).len() == 1 && !crate::turn::turn_running(root) }).await;
     assert_eq!(requests_for(&requests, None).len(), 1, "None wasn't woken for the notice");
     // The six others were never woken — settled, these see nothing.

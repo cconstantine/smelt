@@ -70,6 +70,17 @@ pub(super) async fn clear_answer_owed(pool: &PgPool, conversation_id: i64) {
     }
 }
 
+/// Clears the report-owed mark (SME-455) where the user engages a seat:
+/// its send (`start_turn`) and its card answer. Warn-only like the
+/// clear above: losing it costs one redundant escalation at the seat's
+/// next stuck end, never a lost notice.
+#[cfg(feature = "server")]
+pub(super) async fn clear_report_owed(pool: &PgPool, conversation_id: i64) {
+    if let Err(e) = db::clear_report_owed(pool, conversation_id).await {
+        tracing::warn!(conversation_id, error = %e, "couldn't clear a report owed to the parent");
+    }
+}
+
 /// The compaction loop's notice for the model, if the compaction just run
 /// counted `NOTICE_AT` of them (SME-414): saved grey (SME-357) by
 /// `save_notice`, which puts it on the next request too, so the model reads

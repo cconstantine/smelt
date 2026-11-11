@@ -94,6 +94,7 @@ mod tests {
             status: status.map(str::to_string),
             busy: false,
             waiting_for_user: false,
+            report_owed_at: None,
         }
     }
 

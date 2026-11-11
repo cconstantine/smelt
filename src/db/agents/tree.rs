@@ -20,6 +20,12 @@ pub struct TreeRow {
     pub waiting_for_user: bool,
     /// Its `ask_parent` question is unanswered (SME-238).
     pub waiting_for_parent: bool,
+    /// When it last ended its turn owing its parent a report with nothing
+    /// running, `Some` only while that is still true — the tree gates
+    /// `agents.report_owed_at` on the stuck predicate, so the mark
+    /// self-hides while the seat runs something and returns with its
+    /// original age (SME-455).
+    pub report_owed_at: Option<NaiveDateTime>,
 }
 
 /// Every conversation, most recently active first.
@@ -29,10 +35,12 @@ pub async fn conversation_tree(pool: &PgPool) -> Result<Vec<TreeRow>, sqlx::Erro
                 a.state, a.persona_name, a.persona_path,
                 {} AS waiting_for_user,
                 EXISTS (SELECT 1 FROM pending_questions q
-                        WHERE q.conversation_id = c.id AND q.answer IS NULL AND q.asked_of = $1) AS waiting_for_parent
+                        WHERE q.conversation_id = c.id AND q.answer IS NULL AND q.asked_of = $1) AS waiting_for_parent,
+                {} AS report_owed_at
          FROM conversations c LEFT JOIN agents a ON a.conversation_id = c.id
          ORDER BY c.updated_at DESC, c.id DESC",
-        super::WAITS_FOR_USER
+        super::WAITS_FOR_USER,
+        super::REPORT_OWED_CASE
     ))
     .bind(super::ASKED_OF_PARENT)
     .fetch_all(pool)

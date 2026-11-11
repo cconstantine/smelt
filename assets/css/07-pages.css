@@ -88,6 +88,20 @@
     }
 }
 
+/* A live seat that ended its turn owing its parent a report with nothing
+   running (SME-455): the warning amber, but its own shape — an inline
+   glyph like the waiting `?`, not a dot, so it can't be confused with the
+   command dot or the pod dot beside it. */
+.conversation-report-owed {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    font-size: 12px;
+    line-height: 1;
+    color: var(--warn);
+    font-weight: 700;
+}
+
 /* The width every settings page has (SME-123 DR15); its tables' cells
    wrap to fit. */
 .pods-page {

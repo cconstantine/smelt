@@ -134,9 +134,9 @@ async fn test_a_wake_waiting_for_a_held_slot_is_answered_after_a_restart(pool: P
     restart(&pool, &[parent, child, root]).await;
 
     let child_calls = requests_for(&requests, Some(child));
-    assert_eq!(child_calls.len(), 1, "#{child} wasn't woken");
+    assert!(!child_calls.is_empty(), "#{child} wasn't woken");
     let root_calls = requests_for(&requests, None);
-    assert_eq!(root_calls.len(), 1, "#{root} wasn't woken");
+    assert!(!root_calls.is_empty(), "#{root} wasn't woken");
     for (id, command_id, calls) in [(child, "t1-child", &child_calls), (root, "t1-root", &root_calls)] {
         let notice = command_notice(command_id);
         let last = calls[0]["messages"].as_array().expect("messages").last().expect("a message").to_string();
@@ -148,8 +148,27 @@ async fn test_a_wake_waiting_for_a_held_slot_is_answered_after_a_restart(pool: P
     }
     eventually("the child's end-of-turn check ran", || async { test_hooks::last_turns_checked(child) > checked }).await;
 
+    // SME-455: the child's answered turn ended plain and stuck, so it was
+    // nudged — wait its spell out (its nudge-woken turn, then the notice
+    // its parent reads) before the second restart proves nothing is owed.
+    eventually("the child's nudge spell is over (the stopped parent only queues the notice)", || async {
+        !crate::turn::turn_running(child)
+            && requests_for(&requests, Some(child)).len() == 2
+            && sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1 AND kind = 'notice'",
+            )
+            .bind(parent)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or(0)
+                == 1
+    })
+    .await;
+    // The chain is three turns: the two answers and the child's nudge-woken
+    // turn. Its parent is the user-stopped one, so the second-end notice
+    // only queues. After the spell, the second restart must wake no one.
     restart(&pool, &[parent, child, root]).await;
-    assert_eq!(requests.lock().expect("the request log").len(), 2, "a second restart answered again");
+    assert_eq!(requests.lock().expect("the request log").len(), 3, "a second restart answered again");
     crate::providers::limiter::forget(provider);
     for id in [parent, child, root] {
         crate::turn::forget_conversation_lock(id);
@@ -307,12 +326,35 @@ async fn test_an_answer_owed_is_answered_once(pool: PgPool) {
     let checked = test_hooks::last_turns_checked(child);
     restart(&pool, &[parent, child]).await;
     let calls = requests_for(&requests, Some(child));
-    assert_eq!(calls.len(), 1, "#{child}'s requests");
+    assert!(!calls.is_empty(), "#{child} wasn't woken");
     let sent = calls[0]["messages"].to_string();
     assert!(sent.contains("Terminal command t5 finished") && sent.contains(RESTARTED_MID_TURN), "{sent}");
     eventually("the child's end-of-turn check ran", || async { test_hooks::last_turns_checked(child) > checked }).await;
+    // SME-455: that answered turn ended plain and stuck, so the seat was
+    // nudged — wait its spell out (nudge-woken turn, notice to the parent)
+    // before the second restart proves nothing else is owed.
+    eventually("the child's nudge spell is over (the stopped parent only queues the notice)", || async {
+        !crate::turn::turn_running(child)
+            && requests_for(&requests, Some(child)).len() == 2
+            && sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1 AND kind = 'notice'",
+            )
+            .bind(parent)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or(0)
+                == 1
+    })
+    .await;
     restart(&pool, &[parent, child]).await;
-    assert_eq!(requests_for(&requests, Some(child)).len(), 1, "a second restart answered again");
+    assert_eq!(requests_for(&requests, Some(child)).len(), 2, "a second restart answered again");
+    let said = transcript(&pool, child).await;
+    assert_eq!(
+        said.iter().filter(|(_, t)| t.contains(crate::agents::queue::REPORT_OWE_NUDGE)).count(),
+        1,
+        "the nudge, once: {said:?}"
+    );
+    assert_eq!(said.iter().filter(|(_, t)| t.contains(RESTARTED_MID_TURN)).count(), 1, "the cut-off notice wasn't answered again");
     for id in [parent, child] {
         crate::turn::forget_conversation_lock(id);
     }

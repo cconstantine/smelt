@@ -136,6 +136,17 @@ pub async fn message_agent(
             return Ok(MessageOutcome::Answered(recipient));
         }
     }
+    // SME-455: a report to the parent settles the debt — in this same
+    // transaction, so a crash keeps the pair (report and clearing) whole.
+    // Only the Parent recipient: a message to a child leaves the seat
+    // out of touch with its parent, and an `Answered` above is the
+    // parent answering — its child still owes its report.
+    if matches!(to, Recipient::Parent) {
+        sqlx::query("UPDATE agents SET report_owed_at = NULL WHERE conversation_id = $1")
+            .bind(caller)
+            .execute(&mut *tx)
+            .await?;
+    }
     queue_agent_message(&mut tx, recipient, Some(caller), label, KIND_MESSAGE, text).await?;
     tx.commit().await?;
     Ok(MessageOutcome::Queued(recipient))
@@ -206,6 +217,13 @@ pub async fn ask_parent(
     }];
     super::super::upsert_pending_question(&mut tx, child, tool_use_id, &asked, super::super::ASKED_OF_PARENT).await?;
     queue_agent_message(&mut tx, parent, Some(child), label, KIND_QUESTION, question).await?;
+    // SME-455: a question to the parent is contact — the owed spell ends
+    // (and while the question waits, the stuck predicate excludes the
+    // seat anyway, so no nudge can follow this).
+    sqlx::query("UPDATE agents SET report_owed_at = NULL WHERE conversation_id = $1")
+        .bind(child)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(AskParent::Asked { parent })
 }

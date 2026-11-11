@@ -28,6 +28,12 @@ pub struct ConversationNode {
     /// An `ask_user` question or an AGENTS.md trust card waits for the
     /// user (the "?" mark).
     pub waiting_for_user: bool,
+    /// When it last ended its turn owing its parent a report with nothing
+    /// running (the "!" mark, SME-455); `Some` only while that is still
+    /// true — the tree query gates it. `#[serde(default)]` so a node from
+    /// an older server parses.
+    #[serde(default)]
+    pub report_owed_at: Option<NaiveDateTime>,
 }
 
 /// One agent under a conversation that waits for the user, for its banner.
@@ -51,6 +57,7 @@ impl From<crate::models::Conversation> for ConversationNode {
             status: None,
             busy: false,
             waiting_for_user: false,
+            report_owed_at: None,
         }
     }
 }
@@ -102,6 +109,7 @@ fn node(row: crate::db::TreeRow, running: &std::collections::HashSet<i64>) -> Co
         status,
         busy,
         waiting_for_user: row.waiting_for_user,
+        report_owed_at: row.report_owed_at,
     }
 }
 

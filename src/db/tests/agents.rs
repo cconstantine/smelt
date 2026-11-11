@@ -104,6 +104,168 @@ async fn test_the_conversation_tree_has_each_agents_state_persona_and_waits(pool
     assert_eq!((carded.parent_id, carded.waiting_for_user, carded.waiting_for_parent), (Some(asks_user), true, false));
 }
 
+/// SME-455: the tree carries `agents.report_owed_at` only while the seat
+/// still owes a report with nothing running — the gate shows it plain and
+/// hides it while a command, a running child, an unanswered question or a
+/// trust card intervenes, or once the seat isn't `active` any more. A
+/// seat never stamped has no mark, and the gate never invents one. The
+/// hiding is live: clear the blocker and the mark returns with its
+/// original timestamp, because that is when the seat started owing.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_tree_gates_the_report_owed_mark_on_the_predicate(pool: PgPool) {
+    let root = test_conversation(&pool).await.id;
+    let seat = agent(&pool, root, AGENT_ACTIVE, None).await;
+    let owed = || async {
+        conversation_tree(&pool)
+            .await
+            .expect("the tree")
+            .into_iter()
+            .find(|r| r.id == seat)
+            .expect("the seat is listed")
+            .report_owed_at
+    };
+    assert!(owed().await.is_none(), "a seat never stamped has no mark");
+    sqlx::query("UPDATE agents SET report_owed_at = now() - interval '2 hours' WHERE conversation_id = $1")
+        .bind(seat)
+        .execute(&pool)
+        .await
+        .expect("stamp the mark");
+    let first = owed().await.expect("shown while plain");
+    async fn shown_again(pool: &PgPool, seat: i64, first: chrono::NaiveDateTime, what: &str) {
+        let now = conversation_tree(pool)
+            .await
+            .expect("the tree")
+            .into_iter()
+            .find(|r| r.id == seat)
+            .expect("the seat is listed")
+            .report_owed_at;
+        assert_eq!(now, Some(first), "the mark returned after {what}, with its original age");
+    }
+
+    // A terminal command running in the seat hides the mark while it runs.
+    let pod = create_sandbox_pod(&pool, seat).await.expect("a pod row");
+    let terminal = create_sandbox_terminal(&pool, pod.id).await.expect("a terminal row");
+    create_terminal_command(&pool, seat, terminal.id, "gate-cmd", "sleep 100", 300)
+        .await
+        .expect("a running command");
+    assert!(owed().await.is_none(), "a running command hides the mark");
+    sqlx::query("DELETE FROM terminal_commands WHERE command_id = 'gate-cmd'")
+        .execute(&pool)
+        .await
+        .expect("end the command");
+    shown_again(&pool, seat, first, "the command").await;
+
+    // A wake pending hides it (SME-455): an undelivered row ...
+    sqlx::query("INSERT INTO agent_messages (to_conversation_id, from_label, kind, body) VALUES ($1, 'smelt', 'server_notice', 'a wake coming')")
+        .bind(seat)
+        .execute(&pool)
+        .await
+        .expect("queue a wake");
+    assert!(owed().await.is_none(), "an undelivered row hides the mark");
+    sqlx::query("DELETE FROM agent_messages WHERE to_conversation_id = $1")
+        .bind(seat)
+        .execute(&pool)
+        .await
+        .expect("drain the wake");
+    shown_again(&pool, seat, first, "the undelivered row").await;
+    // ... a command end recorded but never drained ...
+    create_terminal_command(&pool, seat, terminal.id, "gate-end", "echo hi", 300)
+        .await
+        .expect("a command row");
+    mark_terminal_command_finished(&pool, "gate-end", 0).await.expect("record its end");
+    assert!(owed().await.is_none(), "an undrained command end hides the mark");
+    sqlx::query("DELETE FROM terminal_commands WHERE command_id = 'gate-end'")
+        .execute(&pool)
+        .await
+        .expect("drain the end");
+    shown_again(&pool, seat, first, "the undrained end").await;
+    // ... and an answer to its own question not yet taken.
+    sqlx::query("INSERT INTO pending_questions (conversation_id, tool_use_id, questions, answer, asked_of) VALUES ($1, 'toolu_gate', '[]', '[]', 'user')")
+        .bind(seat)
+        .execute(&pool)
+        .await
+        .expect("an answer waiting to be taken");
+    assert!(owed().await.is_none(), "an untaken answer hides the mark");
+    sqlx::query("DELETE FROM pending_questions WHERE conversation_id = $1")
+        .bind(seat)
+        .execute(&pool)
+        .await
+        .expect("take the answer");
+    shown_again(&pool, seat, first, "the untaken answer").await;
+
+    // A `starting` or `active` agent of its own hides it.
+    let child = agent(&pool, seat, AGENT_STARTING, None).await;
+    assert!(owed().await.is_none(), "a starting child hides the mark");
+    sqlx::query("UPDATE agents SET state = $2 WHERE conversation_id = $1")
+        .bind(child)
+        .bind(AGENT_ACTIVE)
+        .execute(&pool)
+        .await
+        .expect("the child starts");
+    assert!(owed().await.is_none(), "an active child hides it too");
+    sqlx::query("UPDATE agents SET state = $2 WHERE conversation_id = $1")
+        .bind(child)
+        .bind(AGENT_FINISHED)
+        .execute(&pool)
+        .await
+        .expect("the child finishes");
+    shown_again(&pool, seat, first, "the child").await;
+
+    // A question with no answer, of the user or of its parent, hides it.
+    question(&pool, seat, ASKED_OF_USER).await;
+    assert!(owed().await.is_none(), "a question to the user hides the mark");
+    sqlx::query("DELETE FROM pending_questions WHERE conversation_id = $1")
+        .bind(seat)
+        .execute(&pool)
+        .await
+        .expect("answer it away");
+    shown_again(&pool, seat, first, "the question").await;
+
+    // An AGENTS.md trust card waits like a question.
+    trust_card(&pool, seat).await;
+    assert!(owed().await.is_none(), "a trust card hides the mark");
+    sqlx::query("DELETE FROM instruction_requests WHERE conversation_id = $1")
+        .bind(seat)
+        .execute(&pool)
+        .await
+        .expect("decide the card");
+    shown_again(&pool, seat, first, "the card").await;
+
+    // A seat that isn't `active` carries no mark, however set the column.
+    sqlx::query("UPDATE agents SET state = $2 WHERE conversation_id = $1")
+        .bind(seat)
+        .bind(AGENT_FINISHED)
+        .execute(&pool)
+        .await
+        .expect("finish the seat");
+    assert!(owed().await.is_none(), "a finished seat shows no mark");
+
+    // And the rows of everyone else stay plain: the user's own
+    // conversation (no agents row at all) has no mark.
+    let rows = conversation_tree(&pool).await.expect("the tree");
+    assert!(rows.iter().find(|r| r.id == root).expect("the root is listed").report_owed_at.is_none(), "the user's own conversation has no mark");
+}
+
+/// The idle read and the tree's mark share the stuck predicate through
+/// inline state literals (the two hosts bind different parameters); these
+/// pins keep the literals in step with the consts, the way the
+/// `WAITS_FOR_USER` test pins that fragment's inline `asked_of`.
+#[test]
+fn test_the_stuck_predicate_quotes_its_state_literals() {
+    assert!(IDLE_AGENT_WITHOUT_REPORT_SQL.contains(&format!("a.state = '{AGENT_ACTIVE}'")), "{IDLE_AGENT_WITHOUT_REPORT_SQL}");
+    assert!(
+        IDLE_AGENT_WITHOUT_REPORT_SQL.contains(&format!("g.state IN ('{AGENT_STARTING}', '{AGENT_ACTIVE}')")),
+        "the child-state literals drifted from the consts: {IDLE_AGENT_WITHOUT_REPORT_SQL}"
+    );
+    // The command-end wake clause mirrors `sandbox::UNNOTIFIED_END`
+    // (SME-455), inline like the state words so both host queries can
+    // share it — this pin is what keeps the mirror true.
+    assert!(
+        IDLE_AGENT_WITHOUT_REPORT_SQL.contains(crate::db::sandbox::UNNOTIFIED_END),
+        "the wake clause drifted from UNNOTIFIED_END: {IDLE_AGENT_WITHOUT_REPORT_SQL}"
+    );
+}
+
 /// SME-246: the banner's list is every agent under a conversation, at any
 /// depth, waiting for the user (a question or a card), and never one that
 /// only asked its parent, nor one under another conversation.
@@ -501,8 +663,6 @@ async fn test_the_running_command_reads_use_an_index(pool: PgPool) {
     assert!(plan.contains("idx_terminal_commands_conversation_running"), "B's read is not served by the running-commands index:\n{plan}");
     let plan: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN {IDLE_AGENT_WITHOUT_REPORT_SQL}"))
         .bind(2_i64)
-        .bind(AGENT_ACTIVE)
-        .bind(AGENT_STARTING)
         .fetch_all(&mut *conn)
         .await
         .expect("explain the idle read");
@@ -514,5 +674,53 @@ async fn test_the_running_command_reads_use_an_index(pool: PgPool) {
     assert!(
         plan.contains("idx_terminal_commands_conversation_running"),
         "the idle read's running-command clause is not served by the index:\n{plan}"
+    );
+    // SME-455's wake clauses, priced the same way. The undelivered-row
+    // probe rides its partial index; the undrained-command-end probe
+    // falls under the "no Seq Scan on terminal_commands" above, and the
+    // question clauses under the one below.
+    assert!(
+        !plan.contains("Seq Scan on agent_messages"),
+        "the idle read's wake clause scans agent_messages:\n{plan}"
+    );
+    assert!(
+        plan.contains("agent_messages_undelivered"),
+        "the idle read's wake clause is not served by the undelivered index:\n{plan}"
+    );
+    assert!(
+        plan.contains("idx_terminal_commands_unnotified_end"),
+        "the idle read's undrained-command-end clause is not served by its index:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Seq Scan on pending_questions"),
+        "the idle read's question clauses scan the table:\n{plan}"
+    );
+    // SME-455 fix round 1 (seam B's Info 2): the tree host, as written —
+    // the CASE over `conversations c LEFT JOIN agents a`. It shares the
+    // macro's clauses, but prices them from an unanchored outer (no
+    // `WHERE c.id = $1`), so its plan is its own to check, as the macro
+    // doc promises for both hosts.
+    let plan: Vec<String> = sqlx::query_scalar(&format!(
+        "EXPLAIN SELECT c.id, {REPORT_OWED_CASE} AS report_owed_at \
+         FROM conversations c LEFT JOIN agents a ON a.conversation_id = c.id"
+    ))
+    .fetch_all(&mut *conn)
+    .await
+    .expect("explain the tree gate");
+    let plan = plan.join("\n");
+    assert!(!plan.contains("Seq Scan on terminal_commands"), "the tree gate's command clauses scan the table:\n{plan}");
+    assert!(!plan.contains("Seq Scan on agent_messages"), "the tree gate's wake clause scans agent_messages:\n{plan}");
+    assert!(!plan.contains("Seq Scan on pending_questions"), "the tree gate's question clauses scan the table:\n{plan}");
+    assert!(
+        plan.contains("idx_terminal_commands_conversation_running"),
+        "the tree gate's running-command clause is not served by the index:\n{plan}"
+    );
+    assert!(
+        plan.contains("agent_messages_undelivered"),
+        "the tree gate's undelivered-row clause is not served by the undelivered index:\n{plan}"
+    );
+    assert!(
+        plan.contains("idx_terminal_commands_unnotified_end"),
+        "the tree gate's undrained-command-end clause is not served by its index:\n{plan}"
     );
 }

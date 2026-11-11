@@ -19,6 +19,21 @@ async fn set_state(pool: &PgPool, id: i64, state: &str) {
         .expect("set the state");
 }
 
+/// Whether the parent's rows name `child`'s ended turn: the notice the
+/// stuck spell's last end owes (SME-478), present whichever end ran the
+/// check and whether it came as a nudge first or straight through.
+async fn told_parent(pool: &PgPool, parent: i64, child: i64) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1 AND body LIKE $2",
+    )
+    .bind(parent)
+    .bind(format!("%agent #{child}'s turn ended without a report%"))
+    .fetch_one(pool)
+    .await
+    .expect("the parent's rows")
+        > 0
+}
+
 /// Each status, from a child put in it; and only the caller's children.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_list_agents_shows_only_the_callers_children_with_their_status(pool: PgPool) {
@@ -73,6 +88,18 @@ async fn test_list_agents_shows_only_the_callers_children_with_their_status(pool
         eventually("the child's first turn is over", || async {
             state(&pool, child).await.as_deref() == Some(db::AGENT_ACTIVE) && !crate::turn::turn_running(child)
                 && transcript(&pool, child).await.iter().any(|(role, _)| role == "assistant")
+        })
+        .await;
+    }
+    // SME-478: every child's plain stuck end now runs its owed check even
+    // when a wake admitted late skipped it at the turn's own end: the
+    // chain — nudge, the seat's turn, the parent notice — must be over
+    // before the snapshot below, or a nudge turn still in flight reads as
+    // `running` and outranks the states pinned next (fix 6's settle; the
+    // statuses themselves are untouched).
+    for (child, parent) in [(others, other_root), (idle, root), (finished, root), (stopped, root), (failed, root), (waiting, root)] {
+        eventually("the child's spell is settled", || async {
+            told_parent(&pool, parent, child).await && !crate::turn::turn_running(child)
         })
         .await;
     }

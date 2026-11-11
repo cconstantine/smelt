@@ -285,7 +285,10 @@ pub async fn finish_agent(pool: &PgPool, child: i64, label: &str, report: &str) 
         return Ok(Finish::NotActive(None));
     }
     let finished = sqlx::query(
-        "UPDATE agents SET state = $2, state_changed_at = now() WHERE conversation_id = $1 AND state = $3",
+        // SME-455: a finished seat never holds the report-owed mark — the
+        // report itself settles it. Any refusal below rolls this back
+        // with the transaction, so they touch nothing.
+        "UPDATE agents SET state = $2, state_changed_at = now(), report_owed_at = NULL WHERE conversation_id = $1 AND state = $3",
     )
     .bind(child)
     .bind(AGENT_FINISHED)
@@ -561,33 +564,139 @@ pub async fn queue_server_notice(pool: &PgPool, to: i64, text: &str) -> Result<(
     queue_agent_message(&mut conn, to, None, "smelt", KIND_SERVER_NOTICE, text).await
 }
 
-/// The idle check's own query (`$1` the conversation id, `$2` active,
-/// `$3` starting), a constant so the running-command clause is
-/// EXPLAIN-tested as written, not paraphrased (SME-389 R1-1).
-pub(crate) const IDLE_AGENT_WITHOUT_REPORT_SQL: &str =
-    "SELECT c.parent_id,
-            (SELECT m.content FROM messages m WHERE m.conversation_id = c.id AND m.role = 'assistant'
-             ORDER BY m.id DESC LIMIT 1)
-     FROM conversations c JOIN agents a ON a.conversation_id = c.id
-     WHERE c.id = $1 AND c.parent_id IS NOT NULL AND a.state = $2
-       AND NOT EXISTS (SELECT 1 FROM pending_questions q WHERE q.conversation_id = c.id AND q.answer IS NULL)
-       AND NOT EXISTS (SELECT 1 FROM instruction_requests r WHERE r.conversation_id = c.id)
-       AND NOT EXISTS (SELECT 1 FROM terminal_commands t WHERE t.conversation_id = c.id AND t.status = 'running')
-       AND NOT EXISTS (SELECT 1 FROM agents g JOIN conversations gc ON gc.id = g.conversation_id
-                       WHERE gc.parent_id = c.id AND g.state IN ($3, $2))";
+/// The "owes a report with nothing running" predicate (SME-455), in two
+/// halves. `stuck_base` is today's SME-236 idle check: an `active` agent
+/// with a parent and none of a question waiting, a trust card waiting, a
+/// terminal command running, an agent of its own still starting or
+/// active. `stuck_wake` is the user's "no wake pending" (SME-455): an
+/// undelivered `agent_messages` row, a command end recorded but never
+/// drained (the `sandbox::UNNOTIFIED_END` clause, mirrored here and
+/// pinned to it by `test_the_stuck_predicate_quotes_its_state_literals`),
+/// or an answer to its own question not yet taken. Who reads which half:
+/// the idle check gates an end that carries a **reason** on the base
+/// alone (the wake clauses must not hide an SME-386 F6 reason from the
+/// parent — seam A's Medium, fix round 1), gates the plain end's nudge
+/// decision on both, and the tree's `REPORT_OWED_CASE` shows the mark
+/// only while both hold. Both hosts alias `conversations` as `c` and
+/// have its `agents` row as `a`. The state words are inline literals
+/// mirroring `AGENT_ACTIVE` and `AGENT_STARTING` (the two hosts bind
+/// different parameter lists); `test_the_stuck_predicate_quotes_its_state_literals`
+/// keeps them in step. SME-389 R1-1: EXPLAIN-test each host query as it
+/// is written — `test_the_running_command_reads_use_an_index` explains
+/// both hosts.
+macro_rules! stuck_base {
+    () => {
+        "c.parent_id IS NOT NULL AND a.state = 'active' \
+         AND NOT EXISTS (SELECT 1 FROM pending_questions q WHERE q.conversation_id = c.id AND q.answer IS NULL) \
+         AND NOT EXISTS (SELECT 1 FROM instruction_requests r WHERE r.conversation_id = c.id) \
+         AND NOT EXISTS (SELECT 1 FROM terminal_commands t WHERE t.conversation_id = c.id AND t.status = 'running') \
+         AND NOT EXISTS (SELECT 1 FROM agents g JOIN conversations gc ON gc.id = g.conversation_id \
+                         WHERE gc.parent_id = c.id AND g.state IN ('starting', 'active'))"
+    };
+}
+
+/// The pending-wake half of `stuck_base` — whose clauses and why, there.
+macro_rules! stuck_wake {
+    () => {
+        "NOT EXISTS (SELECT 1 FROM agent_messages m WHERE m.to_conversation_id = c.id AND m.delivered_at IS NULL) \
+         AND NOT EXISTS (SELECT 1 FROM terminal_commands tc WHERE tc.conversation_id = c.id \
+                         AND tc.status IN ('finished', 'lost') AND tc.notified_at IS NULL) \
+         AND NOT EXISTS (SELECT 1 FROM pending_questions q2 WHERE q2.conversation_id = c.id AND q2.answer IS NOT NULL)"
+    };
+}
+
+/// The whole predicate, base AND wake: the tree gate's shape.
+macro_rules! stuck_without_report {
+    () => {
+        concat!(stuck_base!(), " AND ", stuck_wake!())
+    };
+}
+
+/// The idle check's own query (`$1` the conversation id): the WHERE on
+/// `stuck_base` alone, and `stuck_wake` as a third column, so
+/// `after_last_turn` makes its one read either way — a reason-bearing
+/// end reads the WHERE (the SME-386 N6 guarantee), the nudge decision
+/// also the flag (SME-455, fix round 1). A constant so the clauses are
+/// EXPLAIN-tested as written, not paraphrased (SME-389 R1-1), and built
+/// from the shared macros so the tree's mark and this check cannot drift.
+pub(crate) const IDLE_AGENT_WITHOUT_REPORT_SQL: &str = concat!(
+    "SELECT c.parent_id,\n            (SELECT m.content FROM messages m WHERE m.conversation_id = c.id AND m.role = 'assistant'\n             ORDER BY m.id DESC LIMIT 1),\n            (",
+    stuck_wake!(),
+    ")\n     FROM conversations c JOIN agents a ON a.conversation_id = c.id\n     WHERE c.id = $1 AND (",
+    stuck_base!(),
+    ")"
+);
+
+/// The tree query's gated mark (SME-455): `agents.report_owed_at` shows
+/// only while `stuck_without_report` still holds, so the mark self-hides
+/// while the seat runs something or waits on someone and returns with its
+/// original age when those go — it never stopped owing. `state = 'active'`
+/// inside the predicate keeps it off stopped, failed and finished seats.
+/// Aliases as in the tree query: `conversations c LEFT JOIN agents a`.
+pub(crate) const REPORT_OWED_CASE: &str = concat!("CASE WHEN (", stuck_without_report!(), ") THEN a.report_owed_at END");
+
+/// SME-455: the first plain stuck end's nudge, queued and owed in **one**
+/// transaction: the CAS on `report_owed_at` is the only first/second
+/// decider, so *nudge queued* and *owed recorded* cannot split across a
+/// restart. `text` is the caller's already-marked words. `true` when this
+/// was the first (the column was NULL and the seat is `active`) — the row
+/// is committed with it; `false` for every later end and for a seat that
+/// isn't owed or isn't an active agent — nothing was queued, and the
+/// caller tells the parent. The wake is the caller's, after commit: a
+/// crash between commit and wake loses nothing, the undelivered row is on
+/// the startup sweep's list (`conversations_with_queued_messages`).
+pub async fn queue_report_owed_nudge(pool: &PgPool, seat: i64, text: &str) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    // The seat's conversations row, `KEY SHARE`, first — the order every
+    // transaction here takes (conversations rows, then the rest): a bare
+    // `UPDATE agents` then INSERT could cross a subtree stop's
+    // `FOR NO KEY UPDATE` into a deadlock.
+    lock_conversations(&mut tx, &[(seat, RowLock::KeyShare)]).await?;
+    let first = sqlx::query_scalar::<_, i64>(
+        "UPDATE agents SET report_owed_at = now() WHERE conversation_id = $1 AND report_owed_at IS NULL AND state = $2 RETURNING conversation_id",
+    )
+    .bind(seat)
+    .bind(AGENT_ACTIVE)
+    .fetch_optional(&mut *tx)
+    .await?
+    .is_some();
+    if !first {
+        // Dropping the transaction takes the UPDATE with it: already
+        // owed, or not an active agent any more.
+        return Ok(false);
+    }
+    queue_agent_message(&mut tx, seat, None, "smelt", KIND_SERVER_NOTICE, text).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Clears the report-owed mark (SME-455): the seat reported to its parent,
+/// asked one, or the user engaged it. Warn-only at the call sites, like
+/// `clear_answer_owed`: losing it costs one redundant escalation at the
+/// seat's next stuck end, never a lost notice.
+pub async fn clear_report_owed(pool: &PgPool, conversation_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE agents SET report_owed_at = NULL WHERE conversation_id = $1 AND report_owed_at IS NOT NULL")
+        .bind(conversation_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
 
 /// Whether `id` is an `active` agent with nothing to wait on: no question
 /// to the user unanswered, no AGENTS.md card, no terminal command running
-/// and no agent of its own still starting or active. Its parent then, and
-/// the first 500 characters of its last reply's text. `None` otherwise.
-pub async fn idle_agent_without_report(pool: &PgPool, id: i64) -> Result<Option<(i64, String)>, sqlx::Error> {
-    let row = sqlx::query_as::<_, (i64, Option<String>)>(IDLE_AGENT_WITHOUT_REPORT_SQL)
+/// and no agent of its own still starting or active — and, as the third
+/// field, none of its own wakes pending: no undelivered `agent_messages`
+/// row, no command end recorded but never drained, no answer to its own
+/// question not yet taken (SME-455). `agents::after_last_turn` gates an
+/// end that carries a reason on the first four and the state, and its
+/// nudge decision on all seven. Its parent then, and the first 500
+/// characters of its last reply's text; `None` otherwise.
+pub async fn idle_agent_without_report(pool: &PgPool, id: i64) -> Result<Option<(i64, String, bool)>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (i64, Option<String>, bool)>(IDLE_AGENT_WITHOUT_REPORT_SQL)
     .bind(id)
-    .bind(AGENT_ACTIVE)
-    .bind(AGENT_STARTING)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(parent, content)| {
+    Ok(row.map(|(parent, content, wake_clear)| {
         let text = content
             .and_then(|content| serde_json::from_str::<Vec<ContentBlock>>(&content).ok())
             .map(|blocks| {
@@ -601,7 +710,7 @@ pub async fn idle_agent_without_report(pool: &PgPool, id: i64) -> Result<Option<
                     .join("")
             })
             .unwrap_or_default();
-        (parent, text.chars().take(500).collect())
+        (parent, text.chars().take(500).collect(), wake_clear)
     }))
 }
 

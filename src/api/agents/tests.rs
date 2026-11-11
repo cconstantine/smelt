@@ -18,6 +18,7 @@ fn row(id: i64, state: Option<&str>) -> crate::db::TreeRow {
         persona_path: None,
         waiting_for_user: false,
         waiting_for_parent: false,
+        report_owed_at: None,
     }
 }
 
@@ -95,4 +96,22 @@ fn test_only_its_own_turn_makes_a_row_busy() {
     let shown = node(row(2, Some("active")), &HashSet::from([7]));
     assert!(!shown.busy);
     assert_eq!(shown.status.as_deref(), Some("idle"));
+}
+
+/// SME-455: the tree API carries the gated report-owed mark — `node`
+/// passes the gated timestamp the query produced straight through, a row
+/// the gate left NULL has none, and a node JSON from an old bundle (no
+/// key at all, as an older server's would be) still parses.
+#[test]
+fn test_the_tree_api_carries_the_report_owed_mark() {
+    let mut stamped = row(2, Some("active"));
+    stamped.report_owed_at =
+        Some(chrono::NaiveDate::from_ymd_opt(2026, 11, 10).expect("a date").and_hms_opt(8, 0, 0).expect("an hour"));
+    let shown = node(stamped.clone(), &HashSet::new());
+    assert_eq!(shown.report_owed_at, stamped.report_owed_at, "the gated timestamp passes through");
+    assert_eq!(node(row(2, Some("active")), &HashSet::new()).report_owed_at, None, "a plain row carries none");
+    let mut json = serde_json::to_value(&shown).expect("node JSON");
+    json.as_object_mut().expect("an object").remove("report_owed_at");
+    let old: ConversationNode = serde_json::from_value(json).expect("an old bundle's node JSON parses");
+    assert_eq!(old.report_owed_at, None, "the field defaults when it's absent");
 }

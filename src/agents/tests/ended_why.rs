@@ -107,22 +107,34 @@ async fn test_a_childs_failed_wake_is_saved_on_its_own_page(pool: PgPool) {
     .await;
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let child = start_child(&pool, root, "Work.").await;
-    eventually("the first turn tells the parent", || async { !queued_to(&pool, root).await.is_empty() }).await;
+    // SME-455: the first plain end nudges the seat first, and it's the
+    // nudge's wake that first meets the failing provider. The first
+    // turn's own reply went fine; the parent hears about the failed
+    // wake at once (why-Some, unchanged wording), and its failure is
+    // the child's only one so far.
+    eventually("the nudge's failed wake tells the parent", || async { !queued_to(&pool, root).await.is_empty() }).await;
     eventually("every turn is over", || async { !crate::turn::turn_running(root) && !crate::turn::turn_running(child) }).await;
-    assert!(failures_in(&pool, child).await.is_empty(), "its first turn went fine");
+    assert_eq!(failures_in(&pool, child).await.len(), 1, "its first turn went fine; the one failure is the nudge's wake");
+    let queued = queued_to(&pool, root).await;
+    assert!(queued[0].contains("(it failed: ") && queued[0].contains("Overloaded"), "the parent still hears why: {queued:?}");
 
+    // Each wake below: queue, notify, and wait for that wake's notice —
+    // its turn ending, let alone a failure already saved, says nothing
+    // about the notice still being spawned, and an owed seat holds it
+    // while a wake reads as pending (SME-455's clause). Waiting on the
+    // parent's row keeps every wake wholly over before the next arrives.
+    let mut told = queued_to(&pool, root).await.len();
     db::queue_notice(&pool, child, root, "agent", "Anything else?").await.expect("a notice");
     crate::turn::notify(&pool, child, vec![crate::turn::Notice::Wake]);
-
-    eventually("the wake's failure is saved", || async { !failures_in(&pool, child).await.is_empty() }).await;
+    eventually("the wake's failure tells the parent", || async { queued_to(&pool, root).await.len() > told }).await;
+    told = queued_to(&pool, root).await.len();
     eventually("every turn is over", || async { !crate::turn::turn_running(root) && !crate::turn::turn_running(child) }).await;
-    assert_eq!(failures_in(&pool, child).await.len(), 1);
+    assert_eq!(failures_in(&pool, child).await.len(), 1, "the same failure saved once");
 
     // Review L6: another wake failing the same way says nothing new.
-    let before = queued_to(&pool, root).await.len();
     db::queue_notice(&pool, child, root, "agent", "And now?").await.expect("a notice");
     crate::turn::notify(&pool, child, vec![crate::turn::Notice::Wake]);
-    eventually("the wake's failure tells the parent", || async { queued_to(&pool, root).await.len() > before }).await;
+    eventually("and again, once, says the parent", || async { queued_to(&pool, root).await.len() > told }).await;
     eventually("every turn is over", || async { !crate::turn::turn_running(root) && !crate::turn::turn_running(child) }).await;
     assert_eq!(failures_in(&pool, child).await.len(), 1);
 }
