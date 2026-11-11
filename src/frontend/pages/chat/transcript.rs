@@ -379,6 +379,7 @@ pub(super) fn Transcript(
     scroll: StickyBottom,
     mut pointer_over_transcript: Signal<bool>,
     mut media_loaded: Signal<u64>,
+    conversations_changed: Signal<u64>,
 ) -> Element {
     let messages = state.messages();
     let load_error = state.load_error();
@@ -501,6 +502,10 @@ pub(super) fn Transcript(
                         state,
                         attaches,
                         on_attach,
+                    }
+                    // SME-481: start as one of a trusted checkout's personas.
+                    if let Some(id) = selected() {
+                        super::persona_picker::PersonaPicker { key: "{id}", conversation_id: id, state, refresh: conversations_changed }
                     }
                     div { class: "example-asks",
                         for example in EXAMPLE_ASKS {

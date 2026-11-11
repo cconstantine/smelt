@@ -64,6 +64,7 @@ mod context;
 mod follow;
 mod model_setup;
 mod panels;
+mod persona_picker;
 mod live;
 mod question_card;
 mod repo_attach;
@@ -358,6 +359,7 @@ fn ChatPanel(
                             scroll: transcript_scroll,
                             pointer_over_transcript,
                             media_loaded,
+                            conversations_changed,
                         }
                         if !conversation_missing() {
                         if let Some(id) = selected() {

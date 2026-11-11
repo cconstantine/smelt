@@ -67,6 +67,7 @@ async fn apply(pool: &PgPool, id: i64, dir: &str, name: &str) -> Result<SetPerso
     let git_ssh = crate::credentials::snapshot_credential_names(&snapshot)
         .iter()
         .any(|n| n == crate::credentials::CREDENTIAL_GIT_SSH);
+    let pins_model = model.is_some();
     let new = db::NewTopLevelPersona { conversation: id, remote_key: &repo.remote_key, snapshot: &snapshot, git_ssh, model };
     if let db::InsertTopLevel::Refused(why) = db::insert_top_level_persona(pool, &new).await.map_err(e)? {
         return Err(why);
@@ -78,6 +79,10 @@ async fn apply(pool: &PgPool, id: i64, dir: &str, name: &str) -> Result<SetPerso
         return Err(error);
     }
     crate::events::publish_app(crate::events::AppEvent::ConversationsChanged);
+    // The persona's model is pinned: open tabs' model pickers refetch.
+    if pins_model {
+        crate::events::publish(id, crate::events::ConversationEvent::ModelChanged {});
+    }
     set_of(pool, id).await?.ok_or_else(|| "the persona was set, but its row is gone".to_string())
 }
 

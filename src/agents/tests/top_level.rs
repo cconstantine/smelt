@@ -236,9 +236,16 @@ async fn test_a_persona_model_resolves_on_the_conversations_own_provider(pool: P
     let (_, claude_code) = providers(&pool, &["default-model", "claude-opus-5-5"], &["claude-opus-4-x", "claude-opus-5-5"]).await;
     let id = conversation_with(&pool, Some(true), &[("driver", persona_md("driver", OPUS))]).await;
     db::set_conversation_model(&pool, id, claude_code, "claude-opus-4-x").await.expect("on ClaudeCode");
+    let mut events = crate::events::subscribe(id);
     let set_to = set(&pool, id, "app:driver").await.expect("the set");
     assert_eq!(stored_model(&pool, id).await, (Some(claude_code), Some("claude-opus-5-5".to_string())));
     assert_eq!((set_to.model.as_deref(), set_to.provider.as_deref()), (Some("claude-opus-5-5"), Some("ClaudeCode")));
+    // Open tabs' model pickers are told the model moved.
+    let mut told = false;
+    while let Ok(event) = events.try_recv() {
+        told |= event == crate::events::ConversationEvent::ModelChanged {};
+    }
+    assert!(told, "the set's model pin publishes ModelChanged");
 }
 
 /// M2: the conversation's provider lacks it and the default's has it:

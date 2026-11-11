@@ -6,7 +6,6 @@ use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// What the picker shows for a conversation.
-#[cfg_attr(not(feature = "server"), expect(dead_code, reason = "the start screen's picker builds it on the web side; SME-481's UI commit removes this"))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TopLevelPersona {
     /// The persona it's set to, once set.
