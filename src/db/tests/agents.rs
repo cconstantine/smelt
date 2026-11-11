@@ -104,6 +104,27 @@ async fn test_the_conversation_tree_has_each_agents_state_persona_and_waits(pool
     assert_eq!((carded.parent_id, carded.waiting_for_user, carded.waiting_for_parent), (Some(asks_user), true, false));
 }
 
+/// SME-481 P2: a top-level conversation set to a persona carries its
+/// persona in the tree, and no agent state.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_tree_row_of_a_top_level_persona_carries_its_label(pool: PgPool) {
+    let top = test_conversation(&pool).await.id;
+    let path = "/workspace/smelt/.agents/personas/ticket-driver.md";
+    sqlx::query(
+        "INSERT INTO top_level_personas (conversation_id, persona_name, persona_path, persona_body, persona_settings, credentials, applied_at)
+         VALUES ($1, 'ticket-driver', $2, 'Drive.', '{}', '{}', now())",
+    )
+    .bind(top)
+    .bind(path)
+    .execute(&pool)
+    .await
+    .expect("a top-level persona");
+    let rows = conversation_tree(&pool).await.expect("the tree");
+    let row = rows.iter().find(|r| r.id == top).expect("listed");
+    assert_eq!((row.state.as_deref(), row.parent_id), (None, None));
+    assert_eq!((row.persona_name.as_deref(), row.persona_path.as_deref()), (Some("ticket-driver"), Some(path)));
+}
+
 /// SME-455: the tree carries `agents.report_owed_at` only while the seat
 /// still owes a report with nothing running — the gate shows it plain and
 /// hides it while a command, a running child, an unanswered question or a
