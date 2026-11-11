@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use crate::api::agents::{ConversationNode, get_conversation_tree};
 use crate::frontend::notifications::NotificationsToggle;
 
+mod archive;
 mod tree;
 
 use tree::{TreeRow, build_tree, settled_parents, unfold_to};
@@ -31,6 +32,31 @@ static FOLDED: GlobalSignal<HashSet<i64>> = Signal::global(HashSet::new);
 /// unfolded: each folds on its own once at most, so a tree the user opened
 /// stays open (SME-123 DR1).
 static FOLD_DECIDED: GlobalSignal<HashSet<i64>> = Signal::global(HashSet::new);
+/// Whether archived trees are listed (SME-480 D8): per tab, like `FOLDED`,
+/// and off on every load.
+static SHOW_ARCHIVED: GlobalSignal<bool> = Signal::global(|| false);
+
+/// "Show archived (N)" / "Hide archived" over the list, when `count`
+/// top-level conversations are archived; nothing at zero.
+#[component]
+fn ShowArchivedToggle(count: usize) -> Element {
+    if count == 0 {
+        return rsx! {};
+    }
+    let shown = SHOW_ARCHIVED();
+    rsx! {
+        button {
+            class: "show-archived",
+            r#type: "button",
+            aria_pressed: "{shown}",
+            onclick: move |_| {
+                let now = *SHOW_ARCHIVED.peek();
+                *SHOW_ARCHIVED.write() = !now;
+            },
+            if shown { "Hide archived" } else { "Show archived ({count})" }
+        }
+    }
+}
 
 #[component]
 pub(super) fn ConversationSidebar(
@@ -249,13 +275,18 @@ pub(super) fn ConversationSidebar(
             }
             super::ErrorText { message: list_error() }
             super::ErrorText { message: action_error() }
+            // SME-480 D8: shown only when there is something archived.
+            ShowArchivedToggle { count: archive::archived_roots(&conversations()) }
             if !loaded() {
                 p { class: "muted", "Loading..." }
             } else if conversations().is_empty() {
                 p { class: "muted", "No conversations yet" }
             } else {
                 div { class: "conversation-list",
-                    for row in build_tree(&conversations(), &collapsed()) {
+                    // Archived trees drop out here, unless shown, owed
+                    // something (D1) or open (D7); the phone's count above
+                    // reads the whole list.
+                    for row in build_tree(&archive::visible(&conversations(), selected(), SHOW_ARCHIVED()), &collapsed()) {
                         ConversationRow {
                             key: "{row.node.id}",
                             active: selected() == Some(row.node.id),
@@ -411,6 +442,11 @@ fn ConversationRow(
             // (the SME-441 quoting rule); it reads the gated tree column.
             if let Some(title) = report_owed {
                 span { class: "conversation-report-owed", role: "img", title: "{title}", aria_label: "{title}", "!" }
+            }
+            // SME-480: an archived tree shown (by the toggle, D1 or D7)
+            // says so on its root's row only.
+            if row.depth == 0 && row.node.archived_at.is_some() {
+                span { class: "conversation-archived", "archived" }
             }
             if let Some(age) = age {
                 span { class: "conversation-age", "{age}" }

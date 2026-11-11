@@ -276,6 +276,33 @@
     visibility: hidden;
 }
 
+/* An archived tree's root row, when it's listed anyway (SME-480). */
+.conversation-archived {
+    flex-shrink: 0;
+    font-size: 11px;
+    color: var(--muted);
+}
+
+/* "Show archived (N)" over the list (SME-480 D8), like a settings link. */
+.show-archived {
+    display: block;
+    width: 100%;
+    margin: 4px 0;
+    padding: 4px 6px;
+    border: 0;
+    border-radius: 6px;
+    background: none;
+    color: var(--text-2);
+    font-size: 13px;
+    text-align: left;
+    cursor: pointer;
+}
+
+.show-archived:hover {
+    background: var(--subtle);
+    color: var(--ink);
+}
+
 /* A conversation whose model turn is running (SME-41 D9): the same pulse
    as the "Working..." line in the chat. */
 .conversation-busy {
