@@ -288,9 +288,29 @@ async fn test_the_nudge_survives_a_restart_once(pool: PgPool) {
     eventually("the parent is told", || async { queued_to(&pool, parent).await.iter().any(|b| b.contains("without a report")) }).await;
     eventually("every turn is over", || async { !crate::turn::turn_running(seat) && !crate::turn::turn_running(parent) }).await;
 
+    // Settle the parent's own turn for the notice before the second
+    // restart — test 2's fix-6 settle, and the answer to the CI red at
+    // run 42928936329 (`left: 2, right: 1`): the second end wakes the
+    // parent in a detached task, and `turn_running` says nothing about a
+    // wake still in flight — on a loaded runner the notice's own model
+    // call lands after the snapshot below, inside the second restart's
+    // sweep, which lists the parent's still-undelivered row and answers
+    // it (the loop reproduced it 1 of 12 under CPU pressure; the dump
+    // named the parent's call as the new one). The parent's one call plus
+    // its turn ending settles the first restart's chain in full.
+    eventually("the parent's turn for the notice is over", || async {
+        requests_for(&requests, None).len() == 1 && !crate::turn::turn_running(parent)
+    })
+    .await;
     let before = requests.lock().expect("the request log").len();
     restart(&pool, &[parent, seat]).await;
-    assert_eq!(requests.lock().expect("the request log").len(), before, "a second restart answered something new");
+    let after = requests.lock().expect("the request log").len();
+    assert_eq!(
+        after, before,
+        "a second restart answered something new (seat calls {}, parent calls {})",
+        requests_for(&requests, Some(seat)).len(),
+        requests_for(&requests, None).len(),
+    );
     assert_eq!(nudges_in(&pool, seat).await, 1, "the nudge, once — neither lost nor doubled");
     let rows = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1 AND kind = 'server_notice'")
         .bind(seat)
