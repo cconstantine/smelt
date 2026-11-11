@@ -67,15 +67,46 @@ pub struct PodLimitOverrides {
     pub docker_memory: Option<String>,
 }
 
+
 impl PodLimitOverrides {
-    /// The sandbox container's memory limit, and the Docker sidecar on the
-    /// conversation's own claim.
-    pub(in crate::sandbox) fn resolve(self, conversation_id: i64) -> (String, DockerSidecar) {
-        let docker = DockerSidecar {
-            memory: self.docker_memory.unwrap_or_else(default_docker_memory_limit),
-            storage: PodStorage::Conversation(conversation_id),
-        };
-        (self.memory.unwrap_or_else(default_memory_limit), docker)
+    /// The sandbox container's memory limit, the Docker sidecar on the
+    /// conversation's own claim, and both containers' requests. Each limit
+    /// is this override's, else `persona`'s (its conversation's
+    /// `pod_resources`, SME-484), else the deployment's. A request above
+    /// the limit it ends up under is refused here, saying which, rather
+    /// than by Kubernetes.
+    pub(in crate::sandbox) fn resolve(
+        self,
+        conversation_id: i64,
+        persona: Option<&PodResources>,
+    ) -> Result<(String, DockerSidecar, PodRequests), SandboxError> {
+        let none = ContainerResources::default();
+        let asked_sandbox = persona.and_then(|p| p.sandbox.as_ref()).unwrap_or(&none);
+        let asked_docker = persona.and_then(|p| p.docker.as_ref()).unwrap_or(&none);
+        let memory = self.memory.unwrap_or_else(|| asked_sandbox.limit_or(&default_memory_limit()));
+        let docker_memory = self.docker_memory.unwrap_or_else(|| asked_docker.limit_or(&default_docker_memory_limit()));
+        let requests = PodRequests { sandbox: asked_sandbox.requests(), docker: asked_docker.requests() };
+        request_fits("sandbox", &requests.sandbox, &memory)?;
+        request_fits("docker", &requests.docker, &docker_memory)?;
+        let docker = DockerSidecar { memory: docker_memory, storage: PodStorage::Conversation(conversation_id) };
+        Ok((memory, docker, requests))
+    }
+}
+
+/// Refuses a `container`'s memory request above the `limit` it got: the
+/// persona asked for room that a smaller limit (the tool's, or a
+/// deployment's default lowered since the persona was read) can't hold.
+/// A quantity this can't read is left to Kubernetes.
+fn request_fits(container: &str, requests: &Requests, limit: &str) -> Result<(), SandboxError> {
+    let Some(request) = requests.memory.as_deref() else {
+        return Ok(());
+    };
+    match (memory_bytes(request), memory_bytes(limit)) {
+        (Some(asked), Some(cap)) if asked > cap => Err(SandboxError::StartFailed(format!(
+            "the persona asks for a {container} memory request of {request}, above this pod's {container} memory limit of {limit}: \
+             give the {container} container a limit of at least {request}"
+        ))),
+        _ => Ok(()),
     }
 }
 

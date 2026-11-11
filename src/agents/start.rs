@@ -93,6 +93,9 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
         return Err("ref needs repo: the checkout whose remote it's on".to_string());
     }
     let volumes = optional_volumes(input)?;
+    // What the child's pods ask of their node, from the persona in the
+    // parent's checkout (SME-484).
+    let mut pod_resources = None;
     let repo = match repo_path {
         None => None,
         Some(path) => {
@@ -100,12 +103,28 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
             let target = match git_ref {
                 Some(git_ref) => {
                     crate::git::validate_ref(git_ref)?;
+                    // Best-effort (M1): the parent's tree, not the ref, so
+                    // anything it can't give is no refusal; the persona only
+                    // has to be at the ref, and the start re-clones when the
+                    // ref's file asks for other room.
+                    if let Some(name) = persona {
+                        let checkout = checkout_for(caller);
+                        pod_resources = persona::parent_resources(pool, checkout.as_ref(), caller, &parent_repo.dir, name)
+                            .await
+                            .unwrap_or_else(|e| {
+                                tracing::debug!(error = %e, "couldn't read the persona in the parent's tree for a ref start");
+                                None
+                            });
+                    }
                     crate::git::CloneTarget::Ref(git_ref.to_string())
                 }
                 // The parent's exact commit, which must be on its upstream.
                 None => {
                     if let Some(name) = persona {
                         persona::check_in_parent(pool, caller, &parent_repo.dir, name).await?;
+                        let checkout = checkout_for(caller);
+                        pod_resources =
+                            persona::parent_resources(pool, checkout.as_ref(), caller, &parent_repo.dir, name).await?;
                     }
                     let (sha, branch) = checkout_for(caller).parent_commit(pool, caller, &parent_repo.dir).await?;
                     // Read in the parent's pod, which its model controls, and
@@ -132,6 +151,7 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
         model,
         volumes: volumes.iter().map(|name| name.to_string()).collect(),
         repo: repo.clone(),
+        pod_resources,
     };
     // The child's transaction and the spawn of its start run in a task of
     // their own (SME-354 B7): a turn dropped while the commit is in
@@ -180,6 +200,8 @@ struct OwnedNewChild {
     volumes: Vec<String>,
     /// The parent's checkout the child works on, and its target.
     repo: Option<(db::ConversationRepo, crate::git::CloneTarget)>,
+    /// The persona's resources as the parent's checkout has them (SME-484).
+    pod_resources: Option<serde_json::Value>,
 }
 
 /// `create_child`, then what follows its commit (the sidebar told, the
@@ -219,6 +241,14 @@ async fn create_and_start(pool: PgPool, new: OwnedNewChild) -> Result<db::Create
         }
     };
     crate::events::publish_app(crate::events::AppEvent::ConversationsChanged);
+    // Before the start's clone makes the child's first pod (SME-484). A
+    // failed write leaves the defaults, which the start puts right from
+    // the snapshot.
+    if let Some(resources) = &new.pod_resources {
+        if let Err(e) = db::set_conversation_pod_resources(&pool, child, Some(resources)).await {
+            tracing::warn!(conversation_id = child, error = %e, "couldn't record the agent's pod resources before its clone");
+        }
+    }
     #[cfg(test)]
     test_hooks::reach(test_hooks::AFTER_CREATE_CHILD, new.caller).await;
     let request = StartRequest {
@@ -245,13 +275,24 @@ fn start_notice() -> String {
 async fn run_start(pool: &PgPool, child: i64, parent: i64, request: StartRequest) {
     let mut exit = StartExit { pool: pool.clone(), child, done: false };
     let checkout = checkout_for(parent);
-    let prepared = match prepare(pool, checkout.as_ref(), child, parent, request).await {
+    let mut prepared = match prepare(pool, checkout.as_ref(), child, parent, request).await {
         Ok(prepared) => prepared,
         Err(error) => {
             let _ = fail_start(pool, child, parent, &error).await;
             return;
         }
     };
+    // Its pod as big as its persona says (SME-484), before anything runs
+    // in it. `prepare`'s `size_first_pod` has already made its storage
+    // again for a persona that differed; this backstop restarts in place
+    // only when the ref moved between the two clones, persona and all.
+    match persona::match_pod_resources(pool, checkout.as_ref(), child, prepared.persona.as_ref()).await {
+        Ok(note) => prepared.parent_notice = one_notice([prepared.parent_notice.take(), note]),
+        Err(error) => {
+            let _ = fail_start(pool, child, parent, &error).await;
+            return;
+        }
+    }
     // The pod gets the decision before the child is `active` and its
     // first turn woken (SME-242, D4): the key a persona excluded goes,
     // the secrets it named come. A failure fails the start rather than
@@ -307,6 +348,12 @@ async fn prepare(
     if remote_trust(pool, &repo.remote_key).await? != Some(true) {
         return Err(format!("the user no longer trusts {}", repo.url));
     }
+    // Its storage sized for the persona at its ref (SME-484, M1), before
+    // anything is read or loaded from the checkout it may replace.
+    let sized = match &request.persona {
+        Some(name) => persona::size_first_pod(pool, checkout, child, &repo, &target, name).await?,
+        None => None,
+    };
     let repo = db::get_conversation_repo(pool, repo.id)
         .await
         .map_err(|e| format!("couldn't read the agent's checkout: {e}"))?
@@ -333,7 +380,7 @@ async fn prepare(
     db::narrow_agent_credentials(pool, child, wants_git_ssh)
         .await
         .map_err(|e| format!("couldn't narrow the agent's credentials: {e}"))?;
-    let mut notes = vec![model_notice, rules_notice];
+    let mut notes = vec![sized, model_notice, rules_notice];
     notes.extend(credentials_notes.into_iter().map(Some));
     Ok(Prepared { persona: Some(snapshot), model, parent_notice: one_notice(notes) })
 }

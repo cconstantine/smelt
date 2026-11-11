@@ -32,6 +32,27 @@ impl crate::agents::ChildCheckout for FakePersonas {
     ) -> Boxed<'a, Result<(), String>> {
         Box::pin(async { Err("this fake doesn't clone".to_string()) })
     }
+    fn parent_file<'a>(
+        &'a self,
+        _: &'a sqlx::PgPool,
+        _: i64,
+        _: &'a str,
+        rel: &'a str,
+    ) -> Boxed<'a, Result<Option<db::InstructionsFile>, String>> {
+        Box::pin(async move { Ok(self.file(rel)) })
+    }
+    fn restart_pod<'a>(&'a self, _: &'a sqlx::PgPool, _: i64) -> Boxed<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn reprovision<'a>(
+        &'a self,
+        _: &'a sqlx::PgPool,
+        _: i64,
+        _: &'a db::ConversationRepo,
+        _: &'a crate::git::CloneTarget,
+    ) -> Boxed<'a, Result<(), String>> {
+        Box::pin(async { Err("this fake doesn't clone".to_string()) })
+    }
     fn read_file<'a>(
         &'a self,
         _: &'a sqlx::PgPool,
@@ -39,13 +60,17 @@ impl crate::agents::ChildCheckout for FakePersonas {
         _: &'a str,
         rel: &'a str,
     ) -> Boxed<'a, Result<Option<db::InstructionsFile>, String>> {
-        Box::pin(async move {
-            Ok(self.0.iter().find(|(path, _)| path == rel).map(|(_, content)| db::InstructionsFile {
-                file_bytes: content.len() as i64,
-                content: content.clone(),
-                hash: "h".to_string(),
-                commit: None,
-            }))
+        Box::pin(async move { Ok(self.file(rel)) })
+    }
+}
+
+impl FakePersonas {
+    fn file(&self, rel: &str) -> Option<db::InstructionsFile> {
+        self.0.iter().find(|(path, _)| path == rel).map(|(_, content)| db::InstructionsFile {
+            file_bytes: content.len() as i64,
+            content: content.clone(),
+            hash: "h".to_string(),
+            commit: None,
         })
     }
 }

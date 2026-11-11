@@ -2,6 +2,9 @@
 name: planner
 description: Plans one Up Next ticket, writes its plan, and moves it to Planned, or to Todo when it has no questions.
 smelt:
+  resources:
+    sandbox: { memory_request: 256Mi, memory_limit: 8Gi }
+    docker: { memory_request: 12Gi, memory_limit: 48Gi }
   tools:
     class: read-only
     allow:

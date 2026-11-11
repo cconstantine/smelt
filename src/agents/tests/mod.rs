@@ -17,6 +17,7 @@ mod list;
 mod messages;
 mod pause;
 mod persona;
+mod pod_resources;
 mod reports;
 mod restart;
 mod restart_owed;
