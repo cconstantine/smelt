@@ -58,13 +58,67 @@ pub async fn remove_conversation_storage(
     .unwrap_or_else(|e| Err(SandboxError::StartFailed(format!("removing the sandbox storage failed: {e}"))))
 }
 
+/// Drops a starting child's fresh storage (SME-484, M1): its pod and its
+/// two claims, by name, so its next pod is placed afresh with the
+/// requests its persona asks for, rather than pinned by `local-path` to
+/// the node its first pod chose. Under the conversation's pod-start
+/// lock, like a user's removal; the model is told nothing, since it
+/// hasn't run. `Err` unless the workspace claim is gone and no claim
+/// was left behind: the start can't clone again over a claim that
+/// stands. Its repos are failed, as after any removal, for the caller's
+/// retry of the clone.
+// The start's reprovision (`PodCheckout::reprovision`) calls it from the
+// next commit on.
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn drop_starting_storage(pool: &PgPool, conversation_id: i64) -> Result<(), SandboxError> {
+    let pool = pool.clone();
+    tokio::spawn(tracing::Instrument::in_current_span(async move {
+        let start_lock = pod_start_lock(conversation_id);
+        let _starting = start_lock.lock().await;
+        let removal = Box::pin(drop_conversation_storage_locked(&pool, conversation_id)).await?;
+        if removal.workspace_gone && removal.claims_failed == 0 {
+            Ok(())
+        } else {
+            Err(SandboxError::StartFailed(format!(
+                "couldn't drop the agent's first storage to make it again: {removal:?}"
+            )))
+        }
+    }))
+    .await
+    .unwrap_or_else(|e| Err(SandboxError::StartFailed(format!("dropping the agent's first storage failed: {e}"))))
+}
+
 /// The whole body of `remove_conversation_storage`, for a caller that
 /// already holds the conversation's pod-start lock: SME-345's
 /// storage-grace pass, which takes the conversation's turn lock and then
 /// this start lock itself, in the order a turn takes them. Nothing here
 /// takes any lock of its own (the doc comment above), so running it
-/// under those cannot deadlock. Behaviour unchanged by the split.
+/// under those cannot deadlock. The user's removal and the grace pass
+/// tell the model; `drop_starting_storage` doesn't (SME-484).
 pub(in crate::sandbox) async fn remove_conversation_storage_locked(
+    pool: &PgPool,
+    conversation_id: i64,
+) -> Result<StorageRemoval, SandboxError> {
+    let removal = Box::pin(drop_conversation_storage_locked(pool, conversation_id)).await?;
+    // The model learns on its next turn, like a user Stop — and only
+    // when something was running to experience it, and it really lost
+    // its storage (review 1, finding 2: a claim left standing keeps its
+    // files; the model must not be told to re-clone over live ones).
+    if removal.pod_stopped && removal.workspace_gone {
+        crate::turn::notify(
+            pool,
+            conversation_id,
+            // SME-357: marked like every saved notice.
+            vec![crate::turn::Notice::Save(crate::api::chat::mark_notice(
+                "The user removed this conversation's sandbox storage: /workspace and the Docker images, build cache and volumes are gone. Repos there need cloning again; the next sandbox starts with fresh empty volumes.",
+            ))],
+        );
+    }
+    Ok(removal)
+}
+
+/// `remove_conversation_storage_locked` without its notice to the model.
+async fn drop_conversation_storage_locked(
     pool: &PgPool,
     conversation_id: i64,
 ) -> Result<StorageRemoval, SandboxError> {
@@ -239,20 +293,6 @@ pub(in crate::sandbox) async fn remove_conversation_storage_locked(
         }
     }
 
-    // The model learns on its next turn, like a user Stop — and only
-    // when something was running to experience it, and it really lost
-    // its storage (review 1, finding 2: a claim left standing keeps its
-    // files; the model must not be told to re-clone over live ones).
-    if removal.pod_stopped && workspace_gone {
-        crate::turn::notify(
-            pool,
-            conversation_id,
-            // SME-357: marked like every saved notice.
-            vec![crate::turn::Notice::Save(crate::api::chat::mark_notice(
-                "The user removed this conversation's sandbox storage: /workspace and the Docker images, build cache and volumes are gone. Repos there need cloning again; the next sandbox starts with fresh empty volumes.",
-            ))],
-        );
-    }
     // Reuse the pods event rather than add an `AppEvent` variant: an
     // unknown variant would trip an older tab's stream loop
     // (`frontend/pages/pods.rs`). Every non-empty case says so.
