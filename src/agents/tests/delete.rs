@@ -57,9 +57,16 @@ async fn test_deleting_a_child_tells_its_parent_and_a_failed_delete_tells_nothin
         transcript(&pool, child).await.iter().any(|(role, _)| role == "assistant") && !crate::turn::turn_running(child)
     })
     .await;
-    // The parent is told the child's turn ended without a report, after the
-    // turn: wait for that check, so it can't land inside the count below.
-    eventually("the end-of-turn check ran", || async { test_hooks::last_turns_checked(child) > 0 }).await;
+    // The parent is told the child's turn ended without a report. SME-478:
+    // the check can be owed to a later end of the spell, so wait for the
+    // notice itself — waiting only that "a check ran" returns mid-chain
+    // when a plain stuck end first nudges, and the notice would then land
+    // inside the count below (fix 6's settle shape; the count's own claim,
+    // that the failed delete tells no one, is unchanged).
+    eventually("the parent was told of the ended turn", || async {
+        queued_to(&pool, root).await.iter().any(|body| body.contains("turn ended without a report"))
+    })
+    .await;
     eventually("the parent's turns are over", || async { !crate::turn::turn_running(root) }).await;
     let before = queued_to(&pool, root).await.len();
 

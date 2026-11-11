@@ -191,13 +191,36 @@ pub(super) fn run_turn_bounded<'a>(
                 Err(TurnFailure::Failed(_) | TurnFailure::Noted { .. }) => Some(failed_with),
                 Err(TurnFailure::Stopped) => None,
             };
-            if let Some(why) = ended
-                && !turn_running(conversation_id)
-            {
-                let pool = pool.clone();
-                tokio::spawn(tracing::Instrument::in_current_span(async move {
-                    crate::agents::after_last_turn(&pool, conversation_id, why).await;
-                }));
+            // SME-478: a turn admitted after this one — a paused child's
+            // `Answered` wake, whose pause check rides behind two DB
+            // awaits, admitting once the user's send has ended the pause —
+            // can still be counted as this turn ends. Then the rule above
+            // would lose the check twice over: this end skips it (a turn
+            // is counted), and the late wake ends finding nothing and owns
+            // none. So a skipped check is left owed rather than lost, and
+            // an end with nothing of its own to say — the empty wake,
+            // above all — takes it. An end with its own `why` replaces an
+            // owed one as the fresher word, so a busy spell ends with the
+            // check it skipped run exactly once, at its end.
+            // A Stop is the user being here: as the spell's attention
+            // debt clears and the send clears `report_owed`, a check
+            // still owed stops being owed — dropped, never run at a
+            // stopped end ("not after a stop") nor carried across one.
+            let owed = if matches!(result, Err(TurnFailure::Stopped)) {
+                take_owed_end_check(conversation_id);
+                None
+            } else {
+                ended.or(take_owed_end_check(conversation_id))
+            };
+            if let Some(why) = owed {
+                if turn_running(conversation_id) {
+                    leave_owed_end_check(conversation_id, why);
+                } else {
+                    let pool = pool.clone();
+                    tokio::spawn(tracing::Instrument::in_current_span(async move {
+                        crate::agents::after_last_turn(&pool, conversation_id, why).await;
+                    }));
+                }
             }
             result
         })

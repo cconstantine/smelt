@@ -87,6 +87,10 @@ pub(super) struct ConversationRuntime {
     /// `ByUser`), by a trust decision for a published Question
     /// (`note_trust_decided`), and on delete.
     published: Option<(u64, crate::events::Attention)>,
+    /// The end-of-turn check (SME-236/455) a skipped end owed, with that
+    /// end's `why` (SME-478): the end clearing the turn count takes it;
+    /// a later skip overwrites. Cleared on delete.
+    owed_end_check: Option<Option<String>>,
     /// The conversation was deleted (`forget_conversation_lock`) while a
     /// turn of it was still in flight: that spell's end keeps no
     /// `published_notice`, which would hold the entry for good (SME-377
@@ -134,6 +138,7 @@ impl ConversationRuntime {
             && self.notified.is_none()
             && self.published_notice.is_none()
             && self.published.is_none()
+            && self.owed_end_check.is_none()
             && self.kept.generation == 0
             && self.kept.error.is_none()
     }
@@ -193,6 +198,7 @@ pub(crate) fn forget_conversation_lock(conversation_id: i64) {
         runtime.published_notice = None;
         runtime.published = None;
         runtime.forgotten = true;
+        runtime.owed_end_check = None;
         runtime.compaction = CompactionProgress::default();
         runtime.kept = KeptTurnError::default();
     });
@@ -713,6 +719,24 @@ pub(crate) fn publish_a_test_spell(conversation_id: i64, attention: crate::event
 /// Whether `conversation_id` has a turn running or queued.
 pub(crate) fn turn_running(conversation_id: i64) -> bool {
     read_runtime(conversation_id, |runtime| runtime.turns_in_flight > 0).unwrap_or(false)
+}
+
+/// Leaves `conversation_id`'s end-of-turn check owed to the turns still
+/// counted (SME-478); the end clearing that count runs it, a later skip's
+/// `why` overwriting it. Never on a forgotten entry, which it would hold
+/// for good (as `attention` review 1 L3).
+pub(super) fn leave_owed_end_check(conversation_id: i64, why: Option<String>) {
+    update_existing(conversation_id, |runtime| {
+        if !runtime.forgotten {
+            runtime.owed_end_check = Some(why);
+        }
+    });
+}
+
+/// Takes the conversation's owed end-of-turn check, if one stands
+/// (SME-478): the taker runs it, so a skip runs exactly once.
+pub(super) fn take_owed_end_check(conversation_id: i64) -> Option<Option<String>> {
+    update_existing_with(conversation_id, |runtime| runtime.owed_end_check.take()).flatten()
 }
 
 /// `conversation_id`'s turn generation (SME-71): what `TurnInFlight::drop`
