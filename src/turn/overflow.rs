@@ -48,8 +48,8 @@ pub(super) async fn recover(
     // needs it too (SME-421).
     let alone = estimate_request_tokens(&without_messages(refused));
 
-    let (mut compacted, hold_to_room) = match named {
-        Some(_) => match after_named_refusal(&turn_model.model, turn_model.context_window, alone, input) {
+    let (mut compacted, hold_to_room, short_reply) = match named {
+        Some(_) => match after_named_refusal(&turn_model.model, turn_model.context_window, alone, overflow.input_tokens) {
             NamedRefusal::TooSmall(why) => {
                 // Wakes say so after this without calling.
                 with_compaction_progress(conversation_id, |p| p.too_small(alone, turn_model.context_window));
@@ -59,7 +59,7 @@ pub(super) async fn recover(
             // more than the room it leaves, whatever's been learned, or
             // the usual reply would be refused again on every send
             // (final review L-1).
-            NamedRefusal::Retry { compact } => (compact, true),
+            NamedRefusal::Retry { compact, short_reply } => (compact, true, short_reply),
         },
         None => {
             // The assumption for this turn's compaction and retry. A guess,
@@ -69,7 +69,7 @@ pub(super) async fn recover(
                 turn_model.context_window = assumed;
                 with_compaction_progress(conversation_id, |p| p.guessed(believed, assumed));
             }
-            (true, false)
+            (true, false, false)
         }
     };
     if compacted {
@@ -122,6 +122,18 @@ pub(super) async fn recover(
         undercount,
     )
     .await?;
+    // A refusal that named no input vouches for none of the room this
+    // budget takes — it was sized from the same estimate the refused
+    // request was, and that is how the wedge sent one `max_tokens` twice
+    // (SME-422). Such a retry answers with only the short reply; the
+    // capped budget is the one really sent, so `save_stop_notice` reads it.
+    let budget = if short_reply {
+        let capped = short_reply_budget(budget);
+        reply::apply_budget(&mut request, turn_model, capped);
+        capped
+    } else {
+        budget
+    };
     // On a Claude Code provider (SME-431) the compaction above reset the
     // conversation's session, so this retry starts a new one, from the
     // summary, in a run of its own; the turn's run ends at its next call.

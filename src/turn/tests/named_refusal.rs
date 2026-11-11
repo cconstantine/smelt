@@ -4,7 +4,7 @@
 //! `escape.rs` found or the review named, against a server.
 
 use super::ask_user::tool_calls_body;
-use super::overflow::too_long;
+use super::overflow::{max_context_only, too_long};
 use super::window_stop::set_context_window;
 use super::*;
 
@@ -16,6 +16,8 @@ use super::*;
 /// With `retry_fresh_count` set, a refusal moves to the next plan too — a
 /// retry of a request that shrunk (SME-421's scenario: compaction
 /// summarized away the part the count named) is counted at its fresh size.
+/// With `window_only` set, a refusal names only its window, never the input
+/// it counted — vLLM's shape, and LiteLLM's when it relays it (SME-422).
 #[derive(Default)]
 struct Counting {
     window: std::sync::Mutex<Option<u32>>,
@@ -25,6 +27,7 @@ struct Counting {
     summaries: AtomicUsize,
     refuse_summary: std::sync::Mutex<Option<u32>>,
     retry_fresh_count: std::sync::atomic::AtomicBool,
+    window_only: std::sync::atomic::AtomicBool,
 }
 
 impl Counting {
@@ -32,6 +35,13 @@ impl Counting {
     fn taken_budgets(&self) -> Vec<u64> {
         let log = self.requests.lock().expect("the request log");
         log.iter().filter(|r| r["taken"].as_bool() == Some(true)).filter_map(|r| r["max_tokens"].as_u64()).collect()
+    }
+
+    /// The `max_tokens` of every model send, taken or refused: two sends
+    /// sharing one is the wedge's signature (SME-422).
+    fn sent_budgets(&self) -> Vec<u64> {
+        let log = self.requests.lock().expect("the request log");
+        log.iter().filter_map(|r| r["max_tokens"].as_u64()).collect()
     }
 
     fn calls(&self) -> usize {
@@ -75,7 +85,12 @@ async fn counting_mock(pool: &PgPool, window: Option<u32>, plans: Vec<(i64, i64)
                     if state.retry_fresh_count.load(Ordering::SeqCst) {
                         state.taken.fetch_add(1, Ordering::SeqCst);
                     }
-                    if let Err((status, body)) = too_long(u32::try_from(input).expect("a plan's input"), window) {
+                    let refusal = if state.window_only.load(Ordering::SeqCst) {
+                        max_context_only(window)
+                    } else {
+                        too_long(u32::try_from(input).expect("a plan's input"), window)
+                    };
+                    if let Err((status, body)) = refusal {
                         return (status, body).into_response();
                     }
                 }
@@ -326,5 +341,74 @@ async fn test_a_compacted_retry_isnt_refused_for_a_shortfall_the_summary_replace
     assert_eq!(last_reply(&saved).as_deref(), Some("Done."));
     assert_eq!(mock.calls(), 2, "one refusal, one retry");
     assert_eq!(mock.summaries.load(Ordering::SeqCst), 1, "one summary answered the refusal");
+    assert_eq!(last_failure_reason(&pool, conversation.id).await, None, "nothing was stuck");
+}
+
+/// SME-422, the ticket's server: it counts `max_tokens` against its window
+/// and refuses when the two don't fit, but names only the window (vLLM, and
+/// LiteLLM relaying it). The budget-only retry then repeated the same
+/// `max_tokens` on every send — nothing about the request had changed, so
+/// every send died and the conversation could never get a reply. Now: with
+/// no count named, nothing vouches for the room an estimate-sized budget
+/// takes, so the recovery compacts, and the retry answering the refusal
+/// takes only a short reply. Sized so the red is the wedge — `W` is 512
+/// past the budget-only gate on the estimate — and so the cap bites: the
+/// retry's fresh count leaves room for `MIN_USEFUL_REPLY`, not for the
+/// ~16,900-token budget the estimate sizes.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_refusal_that_names_only_its_window_gets_a_reply(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    // The mock first (its provider row is what a turn model resolves to),
+    // with a placeholder window and plan; the real ones go in below.
+    let mock = counting_mock(&pool, None, vec![(0, 10)]).await;
+    // `a`: what no compaction shrinks, measured the way `window_leaving`
+    // measures it — this binary's `build_request` estimate on an empty
+    // conversation.
+    let model = crate::providers::resolve_turn_model(&pool, conversation.id).await.expect("a model");
+    let (empty, _) = build_request(&pool, conversation.id, &model, None, &[], false, 0).await.expect("a request");
+    let a = estimate_request_tokens(&empty);
+    // One user message of 120,000 characters: `m` tokens to the estimate;
+    // an assistant ack follows so `cap_unanswered` is no factor (SME-421).
+    let m: u64 = 30_000;
+    db::create_message(&pool, conversation.id, "user", &[anthropic::ContentBlock::Text { text: "a".repeat(120_000) }])
+        .await
+        .expect("seed the blob");
+    db::create_message(&pool, conversation.id, "assistant", &[anthropic::ContentBlock::Text { text: "Noted.".to_string() }])
+        .await
+        .expect("seed the ack");
+    // W: 512 past today's budget-only gate on the estimate, so the red is
+    // the wedge. Plan 2 counts the retry's request 11,000 tokens short of
+    // the window: room for a 1,024-token reply, not for the estimate-sized
+    // budget (~16,900) the wedge sent twice.
+    let window = u32::try_from(a + m + 20_992).expect("a window");
+    *mock.window.lock().expect("the window") = Some(window);
+    *mock.plans.lock().expect("the plans") = vec![
+        (i64::try_from(a + 3 * m).expect("first count"), 10),
+        (i64::try_from(a + m + 9_992).expect("fresh count"), 10),
+    ];
+    mock.window_only.store(true, Ordering::SeqCst);
+    mock.retry_fresh_count.store(true, Ordering::SeqCst);
+    set_context_window(&pool, window as i32, None).await;
+
+    let result = run_turn(&pool, conversation.id, hello()).await;
+    // The wedge's count: two sends sharing one `max_tokens` means the retry
+    // changed nothing the server could see. (Red today: they are identical,
+    // and no summary was ever asked for.)
+    let sent = mock.sent_budgets();
+    let mut distinct = sent.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        sent.len(),
+        "two sends shared a max_tokens — the wedge: {sent:?}, summaries: {}",
+        mock.summaries.load(Ordering::SeqCst)
+    );
+    let saved = result.expect("with no count named the recovery compacts, and the short retry fits");
+    assert_eq!(last_reply(&saved).as_deref(), Some("Done."));
+    assert_eq!(mock.summaries.load(Ordering::SeqCst), 1, "one summary answered the refusal");
+    assert_eq!(mock.taken_budgets().last(), Some(&u64::from(MIN_USEFUL_REPLY)), "the retry took a short reply: {:?}", mock.taken_budgets());
     assert_eq!(last_failure_reason(&pool, conversation.id).await, None, "nothing was stuck");
 }

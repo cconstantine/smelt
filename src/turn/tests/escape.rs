@@ -64,9 +64,11 @@ const WINDOWS: [u32; 9] = [8_192, 12_000, 16_384, 20_000, 24_000, 32_768, 40_000
 /// How the simulated server treats a request too big for its window.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Server {
-    /// Refuses input and `max_tokens` over the window, naming both sizes
-    /// (Anthropic, a gateway).
-    Counts,
+    /// Refuses input and `max_tokens` over the window. `names_input` says
+    /// whether the refusal names the input too: a gateway names both
+    /// (Anthropic); a vLLM counts `max_tokens` and names only the window
+    /// (SME-422's wedge server).
+    Counts { names_input: bool },
     /// Refuses only input over the window, naming it or not (llama.cpp,
     /// Ollama), and stops a reply at the window.
     Lenient { names: bool },
@@ -139,7 +141,7 @@ impl World {
             usage: None,
             estimate_percent: rng.range(85, 115),
             blob_percent: rng.range(20, 60),
-            server: if rng.chance(50) { Server::Counts } else { Server::Lenient { names: rng.chance(70) } },
+            server: if rng.chance(50) { Server::Counts { names_input: rng.chance(50) } } else { Server::Lenient { names: rng.chance(70) } },
             output_cap: None,
             fail_percent: 5,
             calls: 0,
@@ -188,11 +190,18 @@ impl World {
             return Called::Failed;
         }
         let window = u64::from(self.server_window);
-        let over = input > window || (self.server == Server::Counts && input + u64::from(max_tokens) > window);
+        let counts_budget = matches!(self.server, Server::Counts { .. });
+        let over = input > window || (counts_budget && input + u64::from(max_tokens) > window);
         if over {
-            let names = matches!(self.server, Server::Counts | Server::Lenient { names: true });
-            self.log.push(format!("  call {input}+{max_tokens}: refused (names: {names})"));
-            return Called::Refused(Refusal { window: names.then_some(self.server_window), input: names.then_some(input) });
+            // The window is named by any naming shape; the input only by
+            // a server that counted it in its message (SME-422).
+            let names_window = matches!(self.server, Server::Counts { .. } | Server::Lenient { names: true });
+            let names_input = match self.server {
+                Server::Counts { names_input } => names_input,
+                Server::Lenient { names } => names,
+            };
+            self.log.push(format!("  call {input}+{max_tokens}: refused (window: {names_window}, input: {names_input})"));
+            return Called::Refused(Refusal { window: names_window.then_some(self.server_window), input: names_input.then_some(input) });
         }
         let wants = self.rng.range(100, 12_000);
         let written = wants.min(u64::from(max_tokens)).min(window - input);
@@ -267,20 +276,20 @@ impl World {
         // same number `undercount` is built from.
         let refused_estimate = self.estimate_request();
         let undercount = Undercount::from_refusal(refusal.input, refused_estimate, alone);
-        let (mut compacted, hold_to_room) = match refusal.window {
-            Some(_) => match after_named_refusal("m", *window, alone, input) {
+        let (mut compacted, hold_to_room, short_reply) = match refusal.window {
+            Some(_) => match after_named_refusal("m", *window, alone, refusal.input) {
                 NamedRefusal::TooSmall(why) => {
                     self.progress.too_small(alone, *window);
                     return Err(why);
                 }
-                NamedRefusal::Retry { compact } => (compact, true),
+                NamedRefusal::Retry { compact, short_reply } => (compact, true, short_reply),
             },
             None => {
                 if let Some(assumed) = guessed_window(input, believed) {
                     *window = assumed;
                     self.progress.guessed(believed, assumed);
                 }
-                (true, false)
+                (true, false, false)
             }
         };
         if compacted {
@@ -305,6 +314,10 @@ impl World {
         let budget = self.build(*window, 0, &mut compacted, hold_to_room, true, undercount);
         self.expect_send = None;
         let budget = budget?;
+        // A refusal that named no input vouches for none of the room this
+        // budget takes: the retry answering it takes only the short reply,
+        // exactly as `overflow::recover` does (SME-422).
+        let budget = if short_reply { short_reply_budget(budget) } else { budget };
         match self.call(budget.tokens) {
             Called::Took { input, written, cut } => {
                 self.progress.retry_taken();
@@ -445,7 +458,7 @@ impl World {
                 self.blob_percent = self.rng.range(20, 60);
             }
             85..=89 => self.output_cap = self.rng.chance(50).then(|| self.rng.range(512, 32_000) as u32),
-            90..=94 => self.server = if self.rng.chance(50) { Server::Counts } else { Server::Lenient { names: self.rng.chance(70) } },
+            90..=94 => self.server = if self.rng.chance(50) { Server::Counts { names_input: self.rng.chance(50) } } else { Server::Lenient { names: self.rng.chance(70) } },
             _ => self.fail_percent = if self.rng.chance(50) { 0 } else { 20 },
         }
     }

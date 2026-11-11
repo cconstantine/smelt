@@ -98,6 +98,19 @@ fn too_long_big(input: &str, window: &str) -> Answer {
     ))
 }
 
+/// vLLM's refusal, and LiteLLM's when it relays one: the server counts
+/// `max_tokens` against its window and refuses when the two don't fit,
+/// but names only the window — no input count anywhere the shipped
+/// classifier reads (SME-422). Flat 400, vLLM's sentence.
+pub(super) fn max_context_only(window: u32) -> Answer {
+    Err((
+        axum::http::StatusCode::BAD_REQUEST,
+        format!(
+            r#"{{"error":{{"message":"This model's maximum context length is {window} tokens. Please reduce the length of the input messages or the number of output tokens."}}}}"#
+        ),
+    ))
+}
+
 /// llama.cpp's structured 400, naming its `n_ctx` beside the wording.
 fn llama_refused(input: u32, window: u32) -> Answer {
     Err((
@@ -312,18 +325,21 @@ async fn test_absurd_refusal_counts_are_answered_with_the_estimate(pool: PgPool)
 }
 
 /// The same gateway with an honest window and the absurd input alone.
-/// The lying count is refused, the turn's own estimate takes its
-/// place, and that fits the window with room — so the history goes
-/// again on the shrunken budget, and the lie never forces a
-/// compaction it only dreamed up (SME-73 review).
+/// The lying count is refused, and a dropped count is a missing one
+/// (SME-422): with none named, nothing vouches for the room an
+/// estimate-sized budget takes, so the recovery compacts and the retry
+/// answering the refusal takes only a short reply. The lie still learns
+/// nothing: the model's row keeps the honest window, never the
+/// nine-quintillion-token input.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_an_absurd_input_count_never_forces_a_compaction(pool: PgPool) {
+async fn test_an_absurd_input_count_is_answered_like_a_missing_one(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
     let upstream = start_refusal_mock(
         &pool,
         vec![
             too_long_big("18446744073709551500", "131072"),
+            Ok(text_reply_body("Summary: the lie stands.")),
             Ok(text_reply_body("Answered.")),
         ],
     )
@@ -332,11 +348,11 @@ async fn test_an_absurd_input_count_never_forces_a_compaction(pool: PgPool) {
 
     run_turn(&pool, conversation.id, hello()).await.expect("the refusal recovers");
 
-    assert_eq!(upstream.count(), 2, "one refusal, one retry — the lying input was never trusted to demand a summary");
-    assert!(compaction_summaries(&pool, conversation.id).await.is_empty(), "the estimate fits 131,072 with room: only the lie said otherwise");
+    assert_eq!(upstream.count(), 3, "refusal, summary, retry — a dropped count is answered as a missing one");
+    assert_eq!(compaction_summaries(&pool, conversation.id).await, ["Summary: the lie stands."], "compaction is what can shrink the request");
     let saved = db::list_messages(&pool, conversation.id).await.expect("messages");
     assert_eq!(last_reply(&saved).as_deref(), Some("Answered."));
-    assert_eq!(saved_learned_context_window(&pool).await, Some(131_072), "the honest window is learned all the same");
+    assert_eq!(saved_learned_context_window(&pool).await, Some(131_072), "the honest window is learned; the nine-quintillion input count is not");
 }
 
 /// R4 "Can't help": a window that can't hold even the system prompt and
