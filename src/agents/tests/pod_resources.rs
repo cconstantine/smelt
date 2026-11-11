@@ -12,8 +12,8 @@ fn persona_with(resources: Option<&str>) -> String {
     format!("---\nname: developer\ndescription: Works one ticket.\n{smelt}---\nWork.\n")
 }
 
-const GATE: &str = "    docker: { memory_request: 1Gi }\n";
-const OTHER: &str = "    sandbox: { memory_request: 256Mi }\n";
+const GATE: &str = "    docker: { memory_request: 1Gi, memory_limit: 2Gi }\n";
+const OTHER: &str = "    sandbox: { memory_request: 256Mi, memory_limit: 1Gi }\n";
 
 fn fake_checkout(child_file: String, parent_file: Option<String>) -> FakeCheckout {
     FakeCheckout {
@@ -51,7 +51,7 @@ async fn test_a_no_ref_childs_resources_are_set_before_its_clone_from_the_parent
     let root = root_with_checkout(&pool, Some(true), fake.clone()).await;
     let result = start_on(&pool, root, serde_json::json!({"brief": "x", "persona": "app:developer"})).await.expect("started");
     let child = child_of(&pool, root, &result).await;
-    let expected = serde_json::json!({"docker": {"memory_request": "1Gi"}});
+    let expected = serde_json::json!({"docker": {"memory_request": "1Gi", "memory_limit": "2Gi"}});
     eventually("the clone is under way", || async { !fake.targets.lock().expect("targets").is_empty() }).await;
     assert_eq!(pod_resources(&pool, child).await, Some(expected.clone()), "set before the clone's pod");
     hold.notify_one();
@@ -72,7 +72,7 @@ async fn test_a_childs_snapshot_that_differs_rewrites_its_resources_and_restarts
     let input = serde_json::json!({"brief": "x", "persona": "app:developer", "ref": "v2"});
     let child = child_of(&pool, root, &start_on(&pool, root, input).await.expect("started")).await;
     eventually("the child goes active", || async { state(&pool, child).await.as_deref() == Some(db::AGENT_ACTIVE) }).await;
-    assert_eq!(pod_resources(&pool, child).await, Some(serde_json::json!({"docker": {"memory_request": "1Gi"}})));
+    assert_eq!(pod_resources(&pool, child).await, Some(serde_json::json!({"docker": {"memory_request": "1Gi", "memory_limit": "2Gi"}})));
     assert_eq!(*fake.restarts.lock().expect("restarts"), vec![child]);
     let told = notices(&pool, root).await;
     assert!(told.iter().any(|n| n.contains(&format!("agent #{child}")) && n.contains("restarted")), "{told:?}");

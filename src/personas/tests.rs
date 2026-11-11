@@ -404,10 +404,10 @@ fn test_own_rules_bind_their_entry_and_not_a_child() {
 
 #[test]
 fn test_smelt_resources_parses_each_containers_asks() {
-    let text = "---\nname: developer\ndescription: d\nsmelt:\n  resources:\n    sandbox: { memory_request: 256Mi, cpu_request: 500m }\n    docker:\n      memory_request: 12Gi\n      memory_limit: 24Gi\n---\n";
+    let text = "---\nname: developer\ndescription: d\nsmelt:\n  resources:\n    sandbox: { memory_request: 64Mi, cpu_request: 500m }\n    docker:\n      memory_request: 12Gi\n      memory_limit: 24Gi\n---\n";
     let resources = parse_ok(DEV, text).resources.expect("resources");
     let sandbox = resources.sandbox.expect("sandbox");
-    assert_eq!((sandbox.memory_request.as_deref(), sandbox.memory_limit, sandbox.cpu_request.as_deref()), (Some("256Mi"), None, Some("500m")));
+    assert_eq!((sandbox.memory_request.as_deref(), sandbox.memory_limit, sandbox.cpu_request.as_deref()), (Some("64Mi"), None, Some("500m")));
     let docker = resources.docker.expect("docker");
     assert_eq!((docker.memory_request.as_deref(), docker.memory_limit.as_deref()), (Some("12Gi"), Some("24Gi")));
 }
