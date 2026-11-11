@@ -363,7 +363,7 @@ async fn test_a_compacted_retry_isnt_refused_for_a_shortfall_the_summary_replace
 /// takes only a short reply. Sized so the red is the wedge — `W` is 512
 /// past the budget-only gate on the estimate — and so the cap bites: the
 /// retry's fresh count leaves room for `MIN_USEFUL_REPLY`, not for the
-/// ~16,900-token budget the estimate sizes.
+/// ≥ 16,384 estimate-sized budget (floor-clamped, as the recorded red shows).
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_refusal_that_names_only_its_window_gets_a_reply(pool: PgPool) {
     let _guard = lock_turn_tests();
@@ -390,7 +390,8 @@ async fn test_a_refusal_that_names_only_its_window_gets_a_reply(pool: PgPool) {
     // W: 512 past today's budget-only gate on the estimate, so the red is
     // the wedge. Plan 2 counts the retry's request 11,000 tokens short of
     // the window: room for a 1,024-token reply, not for the estimate-sized
-    // budget (~16,900) the wedge sent twice.
+    // budget the wedge sent twice — 16,384, the floor its raw ~16,900 clamps
+    // to (reply_budget never emits below MIN_REPLY_TOKENS), as the red shows.
     let window = u32::try_from(a + m + 20_992).expect("a window");
     *mock.window.lock().expect("the window") = Some(window);
     *mock.plans.lock().expect("the plans") = vec![
@@ -417,6 +418,7 @@ async fn test_a_refusal_that_names_only_its_window_gets_a_reply(pool: PgPool) {
     );
     let saved = result.expect("with no count named the recovery compacts, and the short retry fits");
     assert_eq!(last_reply(&saved).as_deref(), Some("Done."));
+    assert_eq!(mock.calls(), 2, "one refusal, one capped retry — a third send would be a new wedge");
     assert_eq!(mock.summaries.load(Ordering::SeqCst), 1, "one summary answered the refusal");
     assert_eq!(mock.taken_budgets().last(), Some(&u64::from(MIN_USEFUL_REPLY)), "the retry took a short reply: {:?}", mock.taken_budgets());
     assert_eq!(last_failure_reason(&pool, conversation.id).await, None, "nothing was stuck");
