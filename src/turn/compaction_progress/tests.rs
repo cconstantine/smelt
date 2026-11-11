@@ -4,6 +4,11 @@
 
 use super::*;
 
+/// The sentence every stuck wording must end with (SME-423): a raise
+/// lives on the server *and* on the provider's page, and the notice has
+/// to send the user to both.
+const PROVIDERS_PAGE_TAIL: &str = "Give the model a larger context window on its server and on its provider's page, or pick another model.";
+
 const WINDOW: u32 = 100_000;
 const TRIGGER: u64 = 83_616;
 const LIMIT: u64 = 93_856;
@@ -430,4 +435,27 @@ fn test_a_new_window_clears_the_armed_stop() {
     // The provider page's bigger window: what was counted was of the old one.
     assert_eq!(progress.step("m", 200_000, Some(TRIGGER)), CompactionStep::Go);
     assert!(!progress.is_stuck());
+}
+
+/// SME-423: all three stuck wordings — the measured floor, the window
+/// too small for the prompt alone, and the server that keeps refusing —
+/// send the user to both places a window can be raised.
+#[test]
+fn test_every_stuck_wording_names_the_providers_page() {
+    let mut progress = tight();
+    after_compaction(&mut progress, 96_000);
+    let FloorAnswer::NoRoom(why) = progress.floor_fired(99_000, "m", WINDOW) else {
+        panic!("no room by either number");
+    };
+    assert!(why.ends_with(PROVIDERS_PAGE_TAIL), "the floor wording: {why}");
+    let mut progress = CompactionProgress::default();
+    progress.too_small(99_000, WINDOW);
+    let why = progress.why_if_stuck("m", WINDOW).expect("stuck");
+    assert!(why.ends_with(PROVIDERS_PAGE_TAIL), "the too-small wording: {why}");
+    let mut progress = CompactionProgress::default();
+    for _ in 0..3 {
+        progress.refusal_compacted(WINDOW);
+    }
+    let why = progress.why_refused_out("m", WINDOW).expect("refused out");
+    assert!(why.ends_with(PROVIDERS_PAGE_TAIL), "the refused-out wording: {why}");
 }

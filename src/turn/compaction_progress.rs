@@ -472,7 +472,7 @@ impl CompactionProgress {
         if self.refused_out {
             return format!(
                 "`{model}`'s server kept refusing this conversation as too big for its context window, however much \
-                 smelt compacted it. Give the model a larger context on its server, or pick another model."
+                 smelt compacted it. Give the model a larger context window on its server and on its provider's page, or pick another model."
             );
         }
         if self.thrashing {

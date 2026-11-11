@@ -369,7 +369,7 @@ async fn test_a_window_too_small_for_the_system_prompt_fails_at_once(pool: PgPoo
     let error = run_turn(&pool, conversation.id, hello()).await.expect_err("no compaction can fit this");
     let error = error.to_string();
     assert!(error.contains("(1,024 tokens) is too small for smelt's system prompt and tools"), "{error}");
-    assert!(error.contains("Give the model a larger context on its server, or pick another model."), "{error}");
+    assert!(error.contains("Give the model a larger context window on its server and on its provider's page, or pick another model."), "{error}");
     assert_eq!(upstream.count(), 1, "it fails at once: no compaction, no retry");
     assert!(compaction_summaries(&pool, conversation.id).await.is_empty());
     assert_eq!(saved_learned_context_window(&pool).await, Some(1_024), "even a hopeless window is learned");

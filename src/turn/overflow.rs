@@ -590,7 +590,7 @@ fn still_did_not_fit(model: &str, window: Option<u32>, compacted: bool, said: &s
 pub(super) fn too_small(model: &str, window: u32, alone: u64) -> String {
     format!(
         "`{model}`'s context window ({} tokens) is too small for smelt's system prompt and tools (about {} tokens). \
-         Give the model a larger context on its server, or pick another model.",
+         Give the model a larger context window on its server and on its provider's page, or pick another model.",
         grouped(u64::from(window)),
         grouped(alone)
     )
