@@ -48,6 +48,18 @@ pub(crate) trait ChildCheckout: Send + Sync {
     /// and Docker data are its claims', and outlive the pod.
     fn restart_pod<'a>(&'a self, pool: &'a PgPool, child: i64) -> Boxed<'a, Result<(), String>>;
 
+    /// Drops the starting child's pod and claims and clones `repo` at
+    /// `target` again (SME-484, M1): its next pod reads `pod_resources`
+    /// and is placed afresh, rather than pinned to the node its first pod
+    /// bound the claims on.
+    fn reprovision<'a>(
+        &'a self,
+        pool: &'a PgPool,
+        child: i64,
+        repo: &'a db::ConversationRepo,
+        target: &'a crate::git::CloneTarget,
+    ) -> Boxed<'a, Result<(), String>>;
+
     /// Reads `rel` in the child's checkout `dir`, symlink-safe as an
     /// AGENTS.md is read; `None` when there's no such file.
     fn read_file<'a>(
@@ -111,6 +123,27 @@ impl ChildCheckout for PodCheckout {
                 .await
                 .map(|_| ())
                 .map_err(|e| format!("couldn't restart the agent's pod with its persona's resources: {e}"))
+        })
+    }
+
+    fn reprovision<'a>(
+        &'a self,
+        pool: &'a PgPool,
+        child: i64,
+        repo: &'a db::ConversationRepo,
+        target: &'a crate::git::CloneTarget,
+    ) -> Boxed<'a, Result<(), String>> {
+        Box::pin(async move {
+            crate::sandbox::drop_starting_storage(pool, child)
+                .await
+                .map_err(|e| format!("couldn't drop the agent's first storage to size it for its persona: {e}"))?;
+            // The drop failed the row (`fail_repos_after_storage_removal`):
+            // this is its retry, at the next attempt.
+            let retried = db::retry_repo_clone(pool, repo.id, &repo.url, &repo.remote_key, repo.branch.as_deref())
+                .await
+                .map_err(|e| format!("couldn't record the agent's clone again: {e}"))?
+                .ok_or("the agent's checkout wasn't failed after its storage was dropped")?;
+            crate::git::clone_child_repo(pool, child, &retried, target).await.map(|_| ())
         })
     }
 

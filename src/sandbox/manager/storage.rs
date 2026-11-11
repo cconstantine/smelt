@@ -67,9 +67,6 @@ pub async fn remove_conversation_storage(
 /// was left behind: the start can't clone again over a claim that
 /// stands. Its repos are failed, as after any removal, for the caller's
 /// retry of the clone.
-// The start's reprovision (`PodCheckout::reprovision`) calls it from the
-// next commit on.
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn drop_starting_storage(pool: &PgPool, conversation_id: i64) -> Result<(), SandboxError> {
     let pool = pool.clone();
     tokio::spawn(tracing::Instrument::in_current_span(async move {
