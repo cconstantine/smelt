@@ -79,6 +79,10 @@ async fn test_a_send_racing_a_set_runs_under_the_persona(pool: PgPool) {
         Box::pin(async move {
             let applied: Vec<bool> =
                 sqlx::query_scalar("SELECT applied_at IS NOT NULL FROM top_level_personas").fetch_all(&probe).await.expect("probe");
+            // The gate's flake (2026-11-11): the request is logged before
+            // this records, so a test reading both at once can see the
+            // request and not its probe. The delay makes that every time.
+            tokio::time::sleep(Duration::from_millis(300)).await;
             seen.lock().expect("seen").push(applied);
             text_reply("ok")
         })
@@ -103,6 +107,8 @@ async fn test_a_send_racing_a_set_runs_under_the_persona(pool: PgPool) {
     let tools: Vec<String> = first["tools"].as_array().expect("tools").iter().map(|t| t["name"].as_str().unwrap_or("").to_string()).collect();
     assert!(!tools.iter().any(|t| t == "write_file"), "the persona's deny is in force: {tools:?}");
     assert!(first["system"].to_string().contains("# Persona"), "its persona is in the prompt");
+    // The mock records each request before its probe: wait for the probe.
+    eventually("the first request's probe", || async { !applied_at_request.lock().expect("seen").is_empty() }).await;
     let seen = applied_at_request.lock().expect("seen").clone();
     assert!(!seen.is_empty() && seen.iter().all(|rows| *rows == [true]), "applied before every call: {seen:?}");
     eventually("the turn ends", || async { !crate::turn::turn_running(id) }).await;
