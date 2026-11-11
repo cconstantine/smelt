@@ -32,6 +32,22 @@ pub(crate) trait ChildCheckout: Send + Sync {
         target: &'a crate::git::CloneTarget,
     ) -> Boxed<'a, Result<(), String>>;
 
+    /// Reads `rel` in the parent's checkout `dir`, as `read_file` reads
+    /// the child's (SME-484: its persona's resources, before the child's
+    /// first pod is made).
+    fn parent_file<'a>(
+        &'a self,
+        pool: &'a PgPool,
+        parent: i64,
+        dir: &'a str,
+        rel: &'a str,
+    ) -> Boxed<'a, Result<Option<db::InstructionsFile>, String>>;
+
+    /// Stops the child's pod and starts another, which reads the
+    /// conversation's `pod_resources` again (SME-484). Its `/workspace`
+    /// and Docker data are its claims', and outlive the pod.
+    fn restart_pod<'a>(&'a self, pool: &'a PgPool, child: i64) -> Boxed<'a, Result<(), String>>;
+
     /// Reads `rel` in the child's checkout `dir`, symlink-safe as an
     /// AGENTS.md is read; `None` when there's no such file.
     fn read_file<'a>(
@@ -73,6 +89,29 @@ impl ChildCheckout for PodCheckout {
         target: &'a crate::git::CloneTarget,
     ) -> Boxed<'a, Result<(), String>> {
         Box::pin(async move { crate::git::clone_child_repo(pool, child, repo, target).await.map(|_| ()) })
+    }
+
+    fn parent_file<'a>(
+        &'a self,
+        pool: &'a PgPool,
+        parent: i64,
+        dir: &'a str,
+        rel: &'a str,
+    ) -> Boxed<'a, Result<Option<db::InstructionsFile>, String>> {
+        // The same read, in the parent's pod.
+        self.read_file(pool, parent, dir, rel)
+    }
+
+    fn restart_pod<'a>(&'a self, pool: &'a PgPool, child: i64) -> Boxed<'a, Result<(), String>> {
+        Box::pin(async move {
+            crate::sandbox::terminate_pod(pool, child)
+                .await
+                .map_err(|e| format!("couldn't stop the agent's pod to restart it with its persona's resources: {e}"))?;
+            crate::sandbox::start_or_get_pod(pool, child)
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("couldn't restart the agent's pod with its persona's resources: {e}"))
+        })
     }
 
     fn read_file<'a>(

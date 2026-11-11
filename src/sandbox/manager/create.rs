@@ -232,7 +232,10 @@ pub(in crate::sandbox) async fn create_pod_attempt_unspanned(
         .map_err(SandboxError::Db)?;
     check_pod_guard(&existing)?;
 
-    let (memory, docker) = limits.resolve(conversation_id);
+    // What the conversation's persona asks of its pod (SME-484), read at
+    // every start: an idle-stopped pod comes back the same size.
+    let persona = conversation_pod_resources(pool, conversation_id).await?;
+    let (memory, docker, requests) = limits.resolve(conversation_id, persona.as_ref())?;
 
     let manager = get()?;
     let instance = db::smelt_instance(pool).await.map_err(SandboxError::Db)?;
@@ -285,7 +288,7 @@ pub(in crate::sandbox) async fn create_pod_attempt_unspanned(
         return Err(e);
     }
     match manager
-        .create_with_docker(&row.id.to_string(), &memory, &docker, &volumes, &agent_volumes, &instance)
+        .create_with_requests(&row.id.to_string(), &memory, &docker, &requests, &volumes, &agent_volumes, &instance)
         .await
     {
         Ok(sandbox) => {
@@ -334,6 +337,23 @@ pub(in crate::sandbox) async fn create_pod_attempt_unspanned(
             let e = start_error(pool, row.id, e).await;
             let _ = db::terminate_sandbox_pod(pool, row.id).await;
             Err(e)
+        }
+    }
+}
+
+/// The conversation's `pod_resources` (SME-484). A stored value that no
+/// longer reads as `PodResources` (written by a newer smelt, say) starts
+/// the pod at the deployment's defaults rather than not at all, with a
+/// warning.
+async fn conversation_pod_resources(pool: &PgPool, conversation_id: i64) -> Result<Option<PodResources>, SandboxError> {
+    let Some(stored) = db::conversation_pod_resources(pool, conversation_id).await.map_err(SandboxError::Db)? else {
+        return Ok(None);
+    };
+    match serde_json::from_value(stored) {
+        Ok(resources) => Ok(Some(resources)),
+        Err(e) => {
+            tracing::warn!(conversation_id, error = %e, "the conversation's pod_resources don't read; its pod gets the defaults");
+            Ok(None)
         }
     }
 }

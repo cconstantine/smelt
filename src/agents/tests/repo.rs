@@ -27,6 +27,10 @@ pub(super) struct FakeCheckout {
     /// Other files in the child's checkout, by path relative to it; a
     /// `<dir>/<path>` key is that checkout's alone, and wins.
     pub files: Mutex<std::collections::HashMap<String, String>>,
+    /// Files in the parent's checkout, over `files` (SME-484).
+    pub parent_files: Mutex<std::collections::HashMap<String, String>>,
+    /// Each child whose pod `restart_pod` restarted, in order.
+    pub restarts: Mutex<Vec<i64>>,
 }
 
 impl ChildCheckout for FakeCheckout {
@@ -72,6 +76,38 @@ impl ChildCheckout for FakeCheckout {
             db::set_repo_ready(pool, repo.id, repo.attempt, branch, Some(COMMIT), &agents_files, &[], None)
                 .await
                 .expect("make the repo ready");
+            Ok(())
+        })
+    }
+
+    fn parent_file<'a>(
+        &'a self,
+        pool: &'a PgPool,
+        parent: i64,
+        dir: &'a str,
+        rel: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<db::InstructionsFile>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let own = self.parent_files.lock().expect("parent files").get(rel).cloned();
+            match own {
+                Some(content) => Ok(Some(db::InstructionsFile {
+                    file_bytes: content.len() as i64,
+                    content,
+                    hash: "h".to_string(),
+                    commit: None,
+                })),
+                None => self.read_file(pool, parent, dir, rel).await,
+            }
+        })
+    }
+
+    fn restart_pod<'a>(
+        &'a self,
+        _pool: &'a PgPool,
+        child: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.restarts.lock().expect("restarts").push(child);
             Ok(())
         })
     }

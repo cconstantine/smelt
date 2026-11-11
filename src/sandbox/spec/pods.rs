@@ -1,6 +1,8 @@
 //! The pod spec itself: its containers, volumes and delete options.
 
 use super::*;
+use k8s_openapi::api::core::v1::TopologySpreadConstraint;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, LabelSelectorRequirement};
 
 /// The Kubernetes pod name of smelt's pod `pod_id`.
 pub fn pod_name(pod_id: i64) -> String {
@@ -81,10 +83,25 @@ pub(in crate::sandbox) const START_DOCKERD_SCRIPT: &str = include_str!("../../..
 /// created, surfacing back through `SandboxError::Kube` as an ordinary
 /// error. Bounded from above by the `smelt-park` namespace's own
 /// `LimitRange` (`k8s/smelt-park-rbac.yaml`), not by anything here.
+#[cfg(test)]
 pub(in crate::sandbox) fn build_pod_spec(
     name: &str,
     memory: &str,
     docker: &DockerSidecar,
+    volumes: &[db::SandboxVolume],
+    agent_volumes: &[db::AgentVolume],
+    instance: &str,
+) -> Pod {
+    build_sized_pod_spec(name, memory, docker, &PodRequests::default(), volumes, agent_volumes, instance)
+}
+
+/// `build_pod_spec` with each container's `requests` (SME-484): none is
+/// the spec as it was before them, byte for byte.
+pub(in crate::sandbox) fn build_sized_pod_spec(
+    name: &str,
+    memory: &str,
+    docker: &DockerSidecar,
+    requests: &PodRequests,
     volumes: &[db::SandboxVolume],
     agent_volumes: &[db::AgentVolume],
     instance: &str,
@@ -171,7 +188,7 @@ pub(in crate::sandbox) fn build_pod_spec(
                     failure_threshold: Some(DOCKER_STARTUP_PROBE_CHECKS),
                     ..Default::default()
                 }),
-                resources: Some(memory_only(&docker.memory)),
+                resources: Some(container_resources(&docker.memory, &requests.docker)),
                 volume_mounts: Some(docker_mounts),
                 ..Default::default()
             }]),
@@ -192,7 +209,7 @@ pub(in crate::sandbox) fn build_pod_spec(
                 // the sandbox agent, so it's already running (and keeping
                 // the pod alive) the moment the container starts. See
                 // SME-17.
-                resources: Some(memory_only(memory)),
+                resources: Some(container_resources(memory, &requests.sandbox)),
                 volume_mounts: Some(shared_mounts),
                 env: Some(vec![node_name_env()]),
                 ..Default::default()
@@ -206,6 +223,11 @@ pub(in crate::sandbox) fn build_pod_spec(
             image_pull_secrets: default_image_pull_secrets(),
             // The deployment's own pin, if any (SME-379): SANDBOX_NODE_SELECTOR.
             node_selector: default_node_selector(),
+            // Spread over nodes (SME-484): without it every new pod went to
+            // the node already holding the sandbox image. Soft, so it
+            // never keeps a pod from starting; a conversation whose claims
+            // are already bound to a node (`local-path`) goes there anyway.
+            topology_spread_constraints: Some(vec![spread_over_nodes(instance)]),
             // No architecture pin (SME-360): every image a sandbox pod runs
             // is published for both linux/amd64 and linux/arm64 — the
             // sandbox image (`publish-images.yml`, from the same commit as
@@ -223,6 +245,32 @@ pub(in crate::sandbox) fn build_pod_spec(
             ..Default::default()
         }),
         status: None,
+    }
+}
+
+/// The spread rule (SME-484): at most one more of this instance's sandbox
+/// pods on a node than on the emptiest, preferred rather than required
+/// (`ScheduleAnyway`). It counts sandbox pods only — they carry the
+/// conversation label, which language-server pods don't (those follow
+/// their sandbox's node by `nodeName`) — and only this instance's.
+/// `nodeTaintsPolicy: Honor` leaves a node the pod doesn't tolerate out of
+/// the count, so a tainted node (one kept for other work) is never a place
+/// to spread to; the pod has no tolerations.
+pub(in crate::sandbox) fn spread_over_nodes(instance: &str) -> TopologySpreadConstraint {
+    TopologySpreadConstraint {
+        max_skew: 1,
+        topology_key: "kubernetes.io/hostname".to_string(),
+        when_unsatisfiable: "ScheduleAnyway".to_string(),
+        node_taints_policy: Some("Honor".to_string()),
+        label_selector: Some(LabelSelector {
+            match_labels: Some(instance_labels(instance)),
+            match_expressions: Some(vec![LabelSelectorRequirement {
+                key: CONVERSATION_LABEL.to_string(),
+                operator: "Exists".to_string(),
+                values: None,
+            }]),
+        }),
+        ..Default::default()
     }
 }
 

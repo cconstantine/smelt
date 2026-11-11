@@ -140,8 +140,69 @@ pub(crate) async fn snapshot(
             "model": persona.model,
             "tools": persona.tools,
             "credentials": persona.credentials,
+            // What its pod asks of its node (SME-484): `run_start`
+            // makes the conversation's `pod_resources` match it.
+            "resources": persona.resources,
         }),
     })
+}
+
+/// The resources (SME-484) the persona `name` in the parent's checkout
+/// `dir` asks for, as `pod_resources` JSON, read before the child exists:
+/// the child's clone starts its first pod, which binds its claims to a
+/// node, so that pod must already ask for the room the persona needs. The
+/// child's own snapshot is still the authority (`match_pod_resources`).
+/// A persona file that doesn't parse refuses the start: the child would
+/// read the same file at the same commit.
+pub(crate) async fn parent_resources(
+    pool: &PgPool,
+    checkout: &dyn ChildCheckout,
+    parent: i64,
+    dir: &str,
+    name: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let rel = persona_file(name);
+    let Some(file) = checkout.parent_file(pool, parent, dir, &rel).await? else {
+        return Ok(None);
+    };
+    let persona = crate::personas::parse(&rel, &file.content, file.file_bytes.max(0) as u64)?;
+    persona
+        .resources
+        .map(|resources| serde_json::to_value(resources).map_err(|e| format!("couldn't record the persona's resources: {e}")))
+        .transpose()
+}
+
+/// Makes the child's `pod_resources` its persona snapshot's (SME-484):
+/// when they differ — a `ref` start, which reads nothing in the parent, or
+/// a parent whose file differs — the row is rewritten and the child's pod,
+/// started by its clone with the old ones, restarted, before the child is
+/// woken. The note, for its parent, says so. A child with no persona keeps
+/// what it was created with: none.
+pub(crate) async fn match_pod_resources(
+    pool: &PgPool,
+    checkout: &dyn ChildCheckout,
+    child: i64,
+    persona: Option<&db::PersonaSnapshot>,
+) -> Result<Option<String>, String> {
+    let Some(persona) = persona else {
+        return Ok(None);
+    };
+    let wanted = persona.settings.get("resources").filter(|r| !r.is_null()).cloned();
+    let stored = db::conversation_pod_resources(pool, child)
+        .await
+        .map_err(|e| format!("couldn't read the agent's pod resources: {e}"))?;
+    if wanted == stored {
+        return Ok(None);
+    }
+    db::set_conversation_pod_resources(pool, child, wanted.as_ref())
+        .await
+        .map_err(|e| format!("couldn't record the agent's pod resources: {e}"))?;
+    checkout.restart_pod(pool, child).await?;
+    let at = persona.commit.as_deref().map(|c| format!(" at {}", c.get(..7).unwrap_or(c))).unwrap_or_default();
+    Ok(Some(format!(
+        "{}'s persona{at} asks its pod for other resources than its first pod had, so its pod was restarted with them",
+        label(child, crate::agents::persona_label(&persona.path).as_deref())
+    )))
 }
 
 /// The rules note for a child's persona snapshot: which of its

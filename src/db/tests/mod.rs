@@ -59,6 +59,7 @@ fn usage(input: i64, output: i64, write: i64, read: i64) -> crate::anthropic::To
 mod language_servers;
 mod questions;
 mod conversations;
+mod pod_resources;
 mod pods;
 mod commands;
 mod mcp;

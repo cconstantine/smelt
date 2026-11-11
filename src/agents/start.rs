@@ -93,6 +93,9 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
         return Err("ref needs repo: the checkout whose remote it's on".to_string());
     }
     let volumes = optional_volumes(input)?;
+    // What the child's pods ask of their node, from the persona in the
+    // parent's checkout (SME-484); a `ref` start reads none here.
+    let mut pod_resources = None;
     let repo = match repo_path {
         None => None,
         Some(path) => {
@@ -106,6 +109,9 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
                 None => {
                     if let Some(name) = persona {
                         persona::check_in_parent(pool, caller, &parent_repo.dir, name).await?;
+                        let checkout = checkout_for(caller);
+                        pod_resources =
+                            persona::parent_resources(pool, checkout.as_ref(), caller, &parent_repo.dir, name).await?;
                     }
                     let (sha, branch) = checkout_for(caller).parent_commit(pool, caller, &parent_repo.dir).await?;
                     // Read in the parent's pod, which its model controls, and
@@ -132,6 +138,7 @@ pub(crate) async fn start_agent(pool: &PgPool, caller: i64, input: &serde_json::
         model,
         volumes: volumes.iter().map(|name| name.to_string()).collect(),
         repo: repo.clone(),
+        pod_resources,
     };
     // The child's transaction and the spawn of its start run in a task of
     // their own (SME-354 B7): a turn dropped while the commit is in
@@ -180,6 +187,8 @@ struct OwnedNewChild {
     volumes: Vec<String>,
     /// The parent's checkout the child works on, and its target.
     repo: Option<(db::ConversationRepo, crate::git::CloneTarget)>,
+    /// The persona's resources as the parent's checkout has them (SME-484).
+    pod_resources: Option<serde_json::Value>,
 }
 
 /// `create_child`, then what follows its commit (the sidebar told, the
@@ -219,6 +228,14 @@ async fn create_and_start(pool: PgPool, new: OwnedNewChild) -> Result<db::Create
         }
     };
     crate::events::publish_app(crate::events::AppEvent::ConversationsChanged);
+    // Before the start's clone makes the child's first pod (SME-484). A
+    // failed write leaves the defaults, which the start puts right from
+    // the snapshot.
+    if let Some(resources) = &new.pod_resources {
+        if let Err(e) = db::set_conversation_pod_resources(&pool, child, Some(resources)).await {
+            tracing::warn!(conversation_id = child, error = %e, "couldn't record the agent's pod resources before its clone");
+        }
+    }
     #[cfg(test)]
     test_hooks::reach(test_hooks::AFTER_CREATE_CHILD, new.caller).await;
     let request = StartRequest {
@@ -245,13 +262,22 @@ fn start_notice() -> String {
 async fn run_start(pool: &PgPool, child: i64, parent: i64, request: StartRequest) {
     let mut exit = StartExit { pool: pool.clone(), child, done: false };
     let checkout = checkout_for(parent);
-    let prepared = match prepare(pool, checkout.as_ref(), child, parent, request).await {
+    let mut prepared = match prepare(pool, checkout.as_ref(), child, parent, request).await {
         Ok(prepared) => prepared,
         Err(error) => {
             let _ = fail_start(pool, child, parent, &error).await;
             return;
         }
     };
+    // Its pod as big as its persona says (SME-484), before anything runs
+    // in it.
+    match persona::match_pod_resources(pool, checkout.as_ref(), child, prepared.persona.as_ref()).await {
+        Ok(note) => prepared.parent_notice = one_notice([prepared.parent_notice.take(), note]),
+        Err(error) => {
+            let _ = fail_start(pool, child, parent, &error).await;
+            return;
+        }
+    }
     // The pod gets the decision before the child is `active` and its
     // first turn woken (SME-242, D4): the key a persona excluded goes,
     // the secrets it named come. A failure fails the start rather than
