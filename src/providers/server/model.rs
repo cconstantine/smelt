@@ -291,6 +291,10 @@ pub async fn set_model_settings(
     )
     .await
     .map_err(provider_gone)?;
+    // Every save forgets what smelt learned about this model's window
+    // (SME-423): a raise on the server itself moves no listing and no
+    // learner, and this row's Save is the user saying they just looked.
+    super::window::forget_learned_on_model_save(pool, provider_id, model).await;
     providers_changed();
     Ok(())
 }

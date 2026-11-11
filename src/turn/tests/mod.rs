@@ -494,6 +494,7 @@ mod turn_slot;
 mod overflow;
 mod window_stop;
 mod window_learning;
+mod window_raised;
 mod compaction_progress;
 mod compaction_thrash;
 mod compaction_honesty;
