@@ -269,3 +269,46 @@ async fn test_mark_error_sets_the_status_cut_to_the_limit_and_logs_nothing() {
     let logged = String::from_utf8(logged.lock().expect("lock").clone()).expect("utf-8");
     assert!(!logged.contains("ERROR") && !logged.contains("xxx"), "nothing logged: {logged}");
 }
+
+/// SME-392: rmcp prints reqwest's error text into its own WARN/ERROR
+/// lines, and that text quotes the URL with its path, so a key sitting in a
+/// path segment (`…/mcp/s/<key>/mcp`) must be scrubbed along with the query.
+/// Key-shaped means what `mcp::call::redact_secrets` has treated as key-
+/// shaped since SME-386 M1 — 16 characters or more with letters and digits —
+/// and that heuristic now lives here, one rule for both sinks and the
+/// config URL.
+#[test]
+fn test_scrub_urls_cuts_key_shaped_path_segments_too() {
+    // The one URL of this ticket's tests, both key positions in it.
+    let scrubbed = scrub_urls(
+        "error sending request for url \
+         (http://127.0.0.1:9/mcp/s/TEST-KEY-392-PATH-0001/mcp?apiKey=TEST-KEY-392)",
+    );
+    assert!(!scrubbed.contains("TEST-KEY-392"), "{scrubbed}");
+    assert!(scrubbed.contains("http://127.0.0.1:9/mcp/s/<redacted>/mcp?…"), "{scrubbed}");
+    // Ordinary path words stay (the query goes whole, as today), and a
+    // digits-only segment stays: the heuristic needs letters too.
+    assert_eq!(scrub_urls("https://mcp.exa.ai/mcp?tools=web_search_exa"), "https://mcp.exa.ai/mcp?…");
+    assert_eq!(
+        scrub_urls("failed for https://example.com/mcp/s/01234567890123456/v2/mcp"),
+        "failed for https://example.com/mcp/s/01234567890123456/v2/mcp"
+    );
+    // Idempotent: the exporter scrubs text `mark_error` and
+    // `redact_secrets` already scrubbed — scrubbing it again changes nothing.
+    let once = scrub_urls(
+        "for url (http://me:pw@h.example:8443/mcp/s/TEST-KEY-392-PATH-0001/mcp?apiKey=TEST-KEY-392#frag) done",
+    );
+    assert!(!once.contains("TEST-KEY-392") && !once.contains("me:pw"), "{once}");
+    assert_eq!(scrub_urls(&once), once);
+}
+
+/// The heuristic `redact_secrets` (query values) and `scrub_urls` (path
+/// segments) share from SME-392: 16 characters or more, letters and digits.
+#[test]
+fn test_looks_like_a_key_needs_length_letters_and_digits() {
+    assert!(looks_like_a_key("TEST-KEY-392-PATH-0001"));
+    assert!(looks_like_a_key("abcdefghij123456")); // exactly 16
+    assert!(!looks_like_a_key("abcdefghi12345")); // 15
+    assert!(!looks_like_a_key("01234567890123456")); // digits only
+    assert!(!looks_like_a_key("web_search_exa_tool_name")); // letters only
+}

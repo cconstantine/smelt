@@ -69,7 +69,8 @@ pub(crate) fn resource_attributes(env: impl Fn(&str) -> Option<String>) -> Vec<K
 }
 
 /// `text` with every URL in it cut to its scheme, host and path: userinfo,
-/// query and fragment can hold a key or a token. A cut query shows as `?…`.
+/// query and fragment can hold a key or a token. A cut query shows as `?…`,
+/// and a key-shaped path segment (SME-392) as `<redacted>`.
 pub(crate) fn scrub_urls(text: &str) -> String {
     static URL: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r#"[A-Za-z][A-Za-z0-9+.-]*://[^\s()<>"'`]+"#).ok()
@@ -87,6 +88,16 @@ pub(crate) fn scrub_urls(text: &str) -> String {
         let address = match address.find('/') {
             Some(slash) => {
                 let (authority, path) = address.split_at(slash);
+                // The path keeps its words (`mcp`, `s`, a version) and loses
+                // its key: `…/mcp/s/<key>/mcp` is a configured URL shape
+                // (SME-386 M1), and reqwest's error text quotes the whole
+                // path — rmcp prints that text into its own lines
+                // (SME-392). `<redacted>` re-scrubs to itself.
+                let path = path
+                    .split('/')
+                    .map(|segment| if looks_like_a_key(segment) { "<redacted>" } else { segment })
+                    .collect::<Vec<&str>>()
+                    .join("/");
                 format!("{}{path}", authority.rsplit('@').next().unwrap_or(authority))
             }
             None => address.rsplit('@').next().unwrap_or(address).to_string(),
@@ -107,6 +118,15 @@ pub(crate) fn mark_error(span: &Span, message: &str) {
     span.record("otel.status_code", "ERROR");
     // After the code: the description is what sets the status's text.
     span.record("otel.status_description", description.as_str());
+}
+
+/// Whether a URL query value or path segment, seen on its own, could be a
+/// credential: 16 characters or more, with both letters and digits, as
+/// API keys are and tool names, path words and flags aren't. SME-386 M1's
+/// rule for a configured server's URL, moved here for SME-392 so
+/// `scrub_urls` and `mcp::call::redact_secrets` share one rule.
+pub(crate) fn looks_like_a_key(value: &str) -> bool {
+    value.chars().count() >= 16 && value.chars().any(|c| c.is_ascii_digit()) && value.chars().any(|c| c.is_ascii_alphabetic())
 }
 
 /// Runs `future` in `span` and ends the span's export when the future
