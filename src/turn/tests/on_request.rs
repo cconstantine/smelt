@@ -7,7 +7,7 @@ use super::*;
 const COMPACT: &str = "compact_context";
 
 /// Every `CompactionSummary` saved in the conversation, as (summary, reason).
-async fn dividers(pool: &PgPool, conversation_id: i64) -> Vec<(String, Option<String>)> {
+pub(super) async fn dividers(pool: &PgPool, conversation_id: i64) -> Vec<(String, Option<String>)> {
     db::list_messages(pool, conversation_id)
         .await
         .expect("messages")

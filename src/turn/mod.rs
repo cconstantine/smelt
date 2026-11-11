@@ -45,7 +45,7 @@ pub(crate) use self::failure::*;
 pub(crate) use self::history::*;
 pub(crate) use self::lifecycle::*;
 pub(crate) use self::notify::*;
-pub(crate) use self::on_request::request_compaction;
+pub(crate) use self::on_request::{compact_now, request_compaction};
 use self::on_request::*;
 use self::overflow::recover as overflow_recovery;
 pub(crate) use self::overflow::reported_per_request;

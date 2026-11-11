@@ -141,6 +141,9 @@ pub(super) enum Skip {
 pub(super) enum Asker {
     /// The model's `compact_context`.
     Model,
+    /// `POST /api/conversations/{id}/compact`, from the chat's Compact
+    /// button or a script: one route, so one reason.
+    Request,
 }
 
 #[cfg(feature = "server")]
@@ -148,6 +151,7 @@ impl Asker {
     fn reason(self) -> &'static str {
         match self {
             Asker::Model => "the model asked for it",
+            Asker::Request => "on request",
         }
     }
 }

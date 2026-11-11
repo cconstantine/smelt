@@ -126,7 +126,7 @@ mod browser;
 #[cfg(feature = "server")]
 mod compact;
 #[cfg(feature = "server")]
-pub(crate) use compact::COMPACT_CONTEXT;
+pub(crate) use compact::{COMPACT_CONTEXT, parse_note};
 #[cfg(feature = "server")]
 mod files;
 #[cfg(feature = "server")]
