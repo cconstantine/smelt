@@ -2,14 +2,21 @@
 //! conversation, model and server drive the real `CompactionProgress` and
 //! the real room decisions (`turn::room`) through long random sequences,
 //! following the steps `run_turn_steps` and `overflow::recover` take
-//! around them, with no database. Two invariants:
+//! around them, with no database. Three invariants:
 //!
 //! - after any sequence, a user's send whose request fits with a short
 //!   reply reaches the server within a few sends;
-//! - wakes alone never keep spending on a conversation that doesn't fit.
+//! - wakes alone never keep spending on a conversation that doesn't fit;
+//! - the floor never refuses a compacted retry answering a count-naming
+//!   refusal when that retry fits — by the server's truth as well as the
+//!   estimate, with the undercount share the fix keeps (SME-421) and the
+//!   buffer and a short reply added on top.
 //!
 //! Three wedges were found by hand in this path (review M-A, M-B, and the
-//! final review's M-1); this is so the next one is found by the test.
+//! final review's M-1); this is so the next one is found by the test. The
+//! world models a per-part estimate error (SME-421): a base64/CJK-style
+//! blob in the history with its own, much lower, estimate ratio — the
+//! part a chars/4 estimate misses by 2–5× and a summary then replaces.
 
 use super::*;
 
@@ -87,18 +94,33 @@ struct World {
     fixed: u64,
     /// What a compaction summarizes.
     history: u64,
+    /// Real tokens of a base64/CJK-style tool output sitting in the
+    /// history (SME-421): the part `estimate_percent`'s ratio misses,
+    /// estimated at `blob_percent` instead, and zeroed by `compact()`.
+    blob: u64,
     /// The user's words not yet answered, which a compaction quotes.
     unanswered: u64,
     /// The usage row: the last reply's input and output.
     usage: Option<u64>,
-    /// The estimate, as a percentage of the real size.
+    /// The estimate, as a percentage of the real size, of everything but
+    /// the blob: prose the chars/4 estimate tracks.
     estimate_percent: u64,
+    /// The blob's estimate, as a percentage of its real size: a base64 or
+    /// CJK run tokenizes at 2–5× what chars/4 guesses (SME-421).
+    blob_percent: u64,
     server: Server,
     output_cap: Option<u32>,
     fail_percent: u64,
     calls: u32,
     summaries: u32,
     took: u32,
+    /// What the compacted retry built to answer the current count-naming
+    /// refusal will be charged for the shortfall: the third invariant's
+    /// bound (SME-421), set across one `recover` and cleared with it.
+    expect_send: Option<u64>,
+    /// A broken invariant the run does not end at: the third one's fault,
+    /// which `check` reports first (SME-421).
+    faults: Vec<String>,
     log: Vec<String>,
 }
 
@@ -112,15 +134,19 @@ impl World {
             believed: if rng.chance(70) { server_window } else { rng.pick(&WINDOWS) },
             fixed,
             history: 0,
+            blob: 0,
             unanswered: 0,
             usage: None,
             estimate_percent: rng.range(85, 115),
+            blob_percent: rng.range(20, 60),
             server: if rng.chance(50) { Server::Counts } else { Server::Lenient { names: rng.chance(70) } },
             output_cap: None,
             fail_percent: 5,
             calls: 0,
             summaries: 0,
             took: 0,
+            expect_send: None,
+            faults: Vec::new(),
             log: Vec::new(),
             progress: CompactionProgress::default(),
             rng,
@@ -131,13 +157,25 @@ impl World {
         tokens * self.estimate_percent / 100
     }
 
+    /// The whole request's estimate as `estimate_request_tokens` makes it:
+    /// each history part at its own ratio (SME-421). New content — typed,
+    /// pending, a compacted hypothetical — has no blob in it, and stays
+    /// proportional at `estimate`.
+    fn estimate_request(&self) -> u64 {
+        self.estimate(self.fixed + self.history) + self.blob * self.blob_percent / 100
+    }
+
     fn real(&self) -> u64 {
-        self.fixed + self.history
+        self.fixed + self.history + self.blob
     }
 
     fn compact(&mut self) {
         self.summaries += 1;
         self.history = self.rng.range(300, SUMMARY_MAX) + self.unanswered.min(QUOTE_MAX);
+        // A summary keeps a base64 blob's gist in plain words, not its
+        // bytes: the under-counted part's estimate share collapses here
+        // while a refusal's count of the refused request still carries it.
+        self.blob = 0;
         self.usage = None;
         self.log.push(format!("  compact -> {}", self.real()));
     }
@@ -164,12 +202,13 @@ impl World {
     }
 
     /// `build_request_with_room`.
-    fn build(&mut self, window: u32, pending: u64, compacted: &mut bool, hold_to_room: bool, refused: bool, undercount: u64) -> Result<ReplyBudget, String> {
+    fn build(&mut self, window: u32, pending: u64, compacted: &mut bool, hold_to_room: bool, refused: bool, undercount: Undercount) -> Result<ReplyBudget, String> {
         loop {
             let room_only = self.progress.room_only_at(window) || hold_to_room;
-            let projected = self.usage.map_or_else(|| self.estimate(self.real()) + undercount, |usage| usage + self.estimate(pending));
+            let correction = undercount.for_request(*compacted);
+            let projected = self.usage.map_or_else(|| self.estimate_request() + correction, |usage| usage + self.estimate(pending));
             let budget = budget_for(window, projected, self.output_cap, room_only);
-            let size = self.estimate(self.real()) + undercount;
+            let size = self.estimate_request() + correction;
             match before_sending(&mut self.progress, "m", window, self.output_cap, room_only, budget, size, *compacted) {
                 BeforeSending::Send(sent) => return Ok(sent),
                 BeforeSending::Compact => {
@@ -181,7 +220,31 @@ impl World {
                     }
                     *compacted = true;
                 }
-                BeforeSending::Refuse(why) => return Err(why),
+                BeforeSending::Refuse(why) => {
+                    // SME-421's invariant: this request answers a refusal
+                    // that named its count, and it fits — the server's own
+                    // count and the estimate both, with the surviving
+                    // share the correction adds, the estimate's buffer and
+                    // a short reply to spare. A mid-loop compaction only
+                    // shrank the sizes below, so this holds after one too.
+                    if let Some(bound) = self.expect_send
+                        && self
+                            .real()
+                            .max(self.estimate_request())
+                            .saturating_add(bound)
+                            .saturating_add(u64::from(COMPACTION_SAFETY_BUFFER) + u64::from(MIN_USEFUL_REPLY))
+                            <= u64::from(window)
+                    {
+                        let fault = format!(
+                            "the floor refused a compacted retry that fits: real {}, est {}, bound {bound}, window {window}",
+                            self.real(),
+                            self.estimate_request(),
+                        );
+                        self.log.push(format!("  FAULT: {fault}"));
+                        self.faults.push(fault);
+                    }
+                    return Err(why);
+                }
             }
         }
     }
@@ -196,10 +259,14 @@ impl World {
     /// `overflow::recover`: the reply, its budget, and whether it compacted.
     fn recover(&mut self, window: &mut u32, pending: u64, refusal: &Refusal) -> Result<(u64, u64, bool, ReplyBudget, bool), String> {
         self.learn(window, refusal.window);
-        let input = refusal.input.unwrap_or_else(|| self.estimate(self.real()));
+        let input = refusal.input.unwrap_or_else(|| self.estimate_request());
         let believed = *window;
         let alone = self.estimate(self.fixed);
-        let undercount = refusal.input.map_or(0, |input| input.saturating_sub(self.estimate(self.real())));
+        // The estimate of the request this refusal refused, before any
+        // compaction: read before `compact()` zeroes the blob, and the
+        // same number `undercount` is built from.
+        let refused_estimate = self.estimate_request();
+        let undercount = Undercount::from_refusal(refusal.input, refused_estimate, alone);
         let (mut compacted, hold_to_room) = match refusal.window {
             Some(_) => match after_named_refusal("m", *window, alone, input) {
                 NamedRefusal::TooSmall(why) => {
@@ -224,7 +291,20 @@ impl World {
             let projected = self.usage.map_or(0, |usage| usage + self.estimate(pending));
             self.usage = Some(projected.max(input));
         }
-        let budget = self.build(*window, 0, &mut compacted, hold_to_room, true, undercount)?;
+        // This retry answers a refusal that named its count. The oracle's
+        // bound — what the corrected charge for a compacted retry may be,
+        // per the fix — is computed from the server's truth and `alone`,
+        // never from the code under test: `full`'s share of the surviving
+        // (fixed, unshrunk) part. A retry that fits even with it on must
+        // not be refused (SME-421); a mid-loop compaction keeps the bound,
+        // as it only shrinks the sizes below.
+        self.expect_send = refusal.input.map(|input| {
+            let full = input.saturating_sub(refused_estimate);
+            if refused_estimate == 0 { full } else { full.saturating_mul(alone) / refused_estimate }
+        });
+        let budget = self.build(*window, 0, &mut compacted, hold_to_room, true, undercount);
+        self.expect_send = None;
+        let budget = budget?;
         match self.call(budget.tokens) {
             Called::Took { input, written, cut } => {
                 self.progress.retry_taken();
@@ -246,6 +326,11 @@ impl World {
             Some(typed) => {
                 self.progress.user_wrote();
                 self.unanswered += typed;
+                // A big tool output lands with the ask some third of the
+                // time (SME-421's blob): bytes the estimate misses.
+                if self.rng.chance(30) {
+                    self.blob += self.rng.range(200, 30_000);
+                }
                 typed
             }
             None => NOTICE,
@@ -263,7 +348,7 @@ impl World {
                 }
                 CompactionStep::Go => {}
             }
-            let budget = self.build(window, pending, &mut compacted, false, false, 0)?;
+            let budget = self.build(window, pending, &mut compacted, false, false, Undercount::none())?;
             let mut sized = self.usage.map(|usage| usage + self.estimate(pending));
             let (input, written, cut, budget) = match self.call(budget.tokens) {
                 Called::Took { input, written, cut } => {
@@ -307,6 +392,9 @@ impl World {
             if self.rng.chance(50) {
                 pending = self.rng.range(50, 9_000);
                 self.history += pending;
+                if self.rng.chance(30) {
+                    self.blob += self.rng.range(200, 30_000);
+                }
                 continue;
             }
             return Ok(());
@@ -352,7 +440,10 @@ impl World {
                 self.server_window = self.rng.pick(&WINDOWS);
                 self.log.push(format!("server window -> {}", self.server_window));
             }
-            78..=84 => self.estimate_percent = self.rng.range(85, 115),
+            78..=84 => {
+                self.estimate_percent = self.rng.range(85, 115);
+                self.blob_percent = self.rng.range(20, 60);
+            }
             85..=89 => self.output_cap = self.rng.chance(50).then(|| self.rng.range(512, 32_000) as u32),
             90..=94 => self.server = if self.rng.chance(50) { Server::Counts } else { Server::Lenient { names: self.rng.chance(70) } },
             _ => self.fail_percent = if self.rng.chance(50) { 0 } else { 20 },
@@ -390,6 +481,10 @@ fn check(world: &mut World) -> Result<(), String> {
     for _ in 0..events {
         world.event();
     }
+    // The third invariant first: its fault is what this widening hunts.
+    if let Some(first) = world.faults.first() {
+        return Err(first.clone());
+    }
     world.fail_percent = 0;
 
     // Wakes alone stop spending on a conversation that doesn't fit.
@@ -416,6 +511,9 @@ fn check(world: &mut World) -> Result<(), String> {
         if world.took == took {
             return Err(format!("{SENDS} sends that fit never reached the server"));
         }
+    }
+    if let Some(first) = world.faults.first() {
+        return Err(first.clone());
     }
     Ok(())
 }
