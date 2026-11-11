@@ -140,3 +140,31 @@ async fn test_a_top_level_pm_doesnt_pass_its_secret_down(pool: PgPool) {
     assert_eq!(below, crate::credentials::PodCredentials { git_ssh: true, secrets: vec![] });
     eventually("every turn is over", || async { !crate::turn::turn_running(id) && !crate::turn::turn_running(child) }).await;
 }
+
+/// SME-484's `smelt.resources` at the top level: the set makes the
+/// conversation's `pod_resources` the persona's and restarts its pod (the
+/// attach's) with them before it's applied, as a child's start puts its own
+/// right; a persona naming none, on a pod with none, restarts nothing.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_top_level_personas_resources_reach_its_pod(pool: PgPool) {
+    setup(&pool, vec![text_reply("ok")]).await;
+    let builder = persona_md("builder", "smelt:\n  resources:\n    docker: { memory_request: 1Gi, memory_limit: 2Gi }\n");
+    let plain = persona_md("plain", "");
+    let fake = Arc::new(super::repo::FakeCheckout {
+        parent_personas: vec![".agents/personas/builder.md".to_string(), ".agents/personas/plain.md".to_string()],
+        files: Mutex::new(
+            [(".agents/personas/builder.md".to_string(), builder), (".agents/personas/plain.md".to_string(), plain)].into(),
+        ),
+        ..Default::default()
+    });
+    let id = super::repo::root_with_checkout(&pool, Some(true), fake.clone()).await;
+    set(&pool, id, "app:builder").await.expect("the set");
+    let wanted = serde_json::json!({"docker": {"memory_request": "1Gi", "memory_limit": "2Gi"}});
+    assert_eq!(db::conversation_pod_resources(&pool, id).await.expect("read"), Some(wanted));
+    assert_eq!(*fake.restarts.lock().expect("restarts"), vec![id], "its pod is restarted with them");
+
+    let other = super::repo::root_with_checkout(&pool, Some(true), fake.clone()).await;
+    set(&pool, other, "app:plain").await.expect("the set");
+    assert_eq!(db::conversation_pod_resources(&pool, other).await.expect("read"), None);
+    assert_eq!(*fake.restarts.lock().expect("restarts"), vec![id], "nothing to change, no restart");
+}

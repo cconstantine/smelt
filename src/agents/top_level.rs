@@ -86,9 +86,11 @@ async fn apply(pool: &PgPool, id: i64, dir: &str, name: &str) -> Result<SetPerso
     set_of(pool, id).await?.ok_or_else(|| "the persona was set, but its row is gone".to_string())
 }
 
-/// The apply after the insert: the pod to the persona's grant, the
-/// checkout's AGENTS.md loaded as a child's start loads it (unless the
-/// conversation already has it), then the row marked applied.
+/// The apply after the insert: the pod restarted with the persona's
+/// `smelt.resources` when they differ from what it has (SME-484, the
+/// child's own step), the pod to the persona's grant, the checkout's
+/// AGENTS.md loaded as a child's start loads it (unless the conversation
+/// already has it), then the row marked applied.
 async fn finish_apply(
     pool: &PgPool,
     id: i64,
@@ -96,6 +98,10 @@ async fn finish_apply(
     repo: &db::ConversationRepo,
     snapshot: &db::PersonaSnapshot,
 ) -> Result<(), String> {
+    // Its note is for a parent, and a top-level conversation has none.
+    if let Some(note) = persona::match_pod_resources(pool, checkout, id, Some(snapshot)).await? {
+        tracing::info!(conversation_id = id, note = %note, "a top-level persona's resources restarted its pod");
+    }
     crate::credentials::reconcile_pod(pool, id, Some(snapshot))
         .await
         .map_err(|e| format!("couldn't write the persona's credentials into the sandbox: {e}"))?;

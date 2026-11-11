@@ -42,7 +42,7 @@ One row per conversation set to a persona: the snapshot (`persona_name`, `person
 | `db::create_child` (a top-level caller's children) | the chain through `for_child`, and the bit as the child's seed |
 | `db::admission_state` (the gate) | whether it's still unapplied |
 
-Any later field of the persona snapshot (SME-484's `resources`, say) reaches a top-level persona through the same `persona_settings` a child's does.
+SME-484's `smelt.resources` rides the same snapshot: the set makes the conversation's `pod_resources` the persona's and restarts its pod with them (`persona::match_pod_resources`, a child's own step) before the credentials are reconciled. A later snapshot field reaches a top-level persona through the same `persona_settings` a child's does.
 
 ## Model
 
