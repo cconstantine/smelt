@@ -40,7 +40,8 @@ pub(in crate::sandbox) async fn wait_for_running_unspanned(
     timeout: Duration,
 ) -> Result<(), SandboxError> {
     let mut last_detail = None;
-    let mut told_unschedulable = false;
+    // The status last told the panel while the pod waits (SME-484 L1).
+    let mut told: Option<String> = None;
     let started = std::time::Instant::now();
     let waited = tokio::time::timeout(timeout, async {
         loop {
@@ -50,15 +51,14 @@ pub(in crate::sandbox) async fn wait_for_running_unspanned(
             }
             last_detail = pod_pending_detail(&pod);
             // Not a silent wait (SME-484): the sandbox panel shows why the
-            // scheduler can't place it, once.
-            if !told_unschedulable {
-                if let Some((conversation_id, pod_id, status)) = unschedulable_notice(&pod) {
-                    told_unschedulable = true;
-                    crate::events::publish(
-                        conversation_id,
-                        crate::events::ConversationEvent::SandboxPodUpdate { pod_id, status, node: None, terminated: false },
-                    );
-                }
+            // scheduler can't place it, and moves on to Pending once it's
+            // placed (L1), each change once.
+            if let Some((conversation_id, pod_id, status, node)) = pending_panel_update(&pod, told.as_deref()) {
+                told = Some(status.clone());
+                crate::events::publish(
+                    conversation_id,
+                    crate::events::ConversationEvent::SandboxPodUpdate { pod_id, status, node, terminated: false },
+                );
             }
             if pod_phase_is_running(&pod) {
                 let took = started.elapsed();

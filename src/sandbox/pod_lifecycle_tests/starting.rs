@@ -20,6 +20,37 @@ async fn pod_is_up(client: &kube::Client, pod_id: i64) -> bool {
         .is_some_and(|pod| pod.metadata.deletion_timestamp.is_none())
 }
 
+/// SME-484 L1: a start that fails after the pod was made — here its git
+/// setup — tells the sandbox panel the pod ended, rather than leaving it
+/// on whatever it last showed (an Unschedulable reason, say).
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_pod_whose_git_setup_fails_tells_the_panel_it_ended(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
+        let id = db::create_conversation(&pool).await.expect("create conversation").id;
+        let mut events = events::subscribe(id);
+        injected_git_setup_failure::fail_next(id, "no key for you");
+
+        let started = create_pod(&pool, id, PodLimitOverrides::default()).await;
+
+        assert!(matches!(started, Err(SandboxError::GitSetup(_))), "{started:?}");
+        let pod: i64 = sqlx::query_scalar("SELECT id FROM sandbox_pods WHERE conversation_id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("the pod's row");
+        let mut told_ended = false;
+        while let Ok(event) = events.try_recv() {
+            if let events::ConversationEvent::SandboxPodUpdate { pod_id, terminated: true, .. } = event {
+                told_ended |= pod_id == pod;
+            }
+        }
+        assert!(told_ended, "the panel is told pod {pod} ended");
+        teardown_conversation(&pool, id, &[]).await;
+    })
+    .await;
+}
+
 /// B1 (SME-122): opening the conversation while its pod starts (the
 /// page load's `try_reconnect`, from `get_sandbox_state`) leaves the start
 /// alone. Before the fix the reconnect found no agent, took the starting

@@ -296,10 +296,14 @@ pub(in crate::sandbox) async fn create_pod_attempt_unspanned(
             // command (SME-32). A pod without them would fail its first
             // push with a confusing ssh error, so a failure here is the
             // pod's failure.
-            if let Err(e) = crate::credentials::install_into_new_pod(pool, row.id).await {
+            let installed = crate::credentials::install_into_new_pod(pool, row.id).await;
+            #[cfg(test)]
+            let installed = injected_git_setup_failure::take(conversation_id).map_or(installed, Err);
+            if let Err(e) = installed {
                 let e = start_error(pool, row.id, SandboxError::GitSetup(e)).await;
                 let _ = manager.delete(sandbox).await;
                 let _ = db::terminate_sandbox_pod(pool, row.id).await;
+                publish_start_ended(conversation_id, row.id);
                 return Err(e);
             }
             // Its record may have been closed while it started (the
@@ -307,6 +311,7 @@ pub(in crate::sandbox) async fn create_pod_attempt_unspanned(
             // is one nothing deletes (B1, SME-122).
             if !db::sandbox_pod_is_live(pool, row.id).await.unwrap_or(true) {
                 let _ = manager.delete(sandbox).await;
+                publish_start_ended(conversation_id, row.id);
                 return Err(stopped_while_starting());
             }
             std::mem::forget(sandbox);
@@ -336,19 +341,26 @@ pub(in crate::sandbox) async fn create_pod_attempt_unspanned(
         Err(e) => {
             let e = start_error(pool, row.id, e).await;
             let _ = db::terminate_sandbox_pod(pool, row.id).await;
-            // The panel may be showing it waiting for a node (SME-484).
-            events::publish(
-                conversation_id,
-                events::ConversationEvent::SandboxPodUpdate {
-                    pod_id: row.id,
-                    status: "terminated".to_string(),
-                    node: None,
-                    terminated: true,
-                },
-            );
+            publish_start_ended(conversation_id, row.id);
             Err(e)
         }
     }
+}
+
+/// Tells the conversation's sandbox panel that a pod whose start failed
+/// has ended (SME-484 L1): it may be showing it waiting for a node, or
+/// Pending. Every failed exit after the pod was made calls it; a
+/// duplicate of a Stop's own `terminated` is harmless.
+fn publish_start_ended(conversation_id: i64, pod_id: i64) {
+    events::publish(
+        conversation_id,
+        events::ConversationEvent::SandboxPodUpdate {
+            pod_id,
+            status: "terminated".to_string(),
+            node: None,
+            terminated: true,
+        },
+    );
 }
 
 /// The conversation's `pod_resources` (SME-484). A stored value that no
@@ -365,6 +377,26 @@ async fn conversation_pod_resources(pool: &PgPool, conversation_id: i64) -> Resu
             tracing::warn!(conversation_id, error = %e, "the conversation's pod_resources don't read; its pod gets the defaults");
             Ok(None)
         }
+    }
+}
+
+/// A test's stand-in for a pod's git setup failing (SME-484 L1), per
+/// conversation, so no other test's starts change. Here rather than in
+/// `credentials`, which SME-481 changes.
+#[cfg(test)]
+pub(crate) mod injected_git_setup_failure {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    static FAILURES: LazyLock<Mutex<HashMap<i64, String>>> = LazyLock::new(Default::default);
+
+    /// `conversation_id`'s next pod start fails its git setup with `error`.
+    pub(crate) fn fail_next(conversation_id: i64, error: &str) {
+        FAILURES.lock().unwrap_or_else(|e| e.into_inner()).insert(conversation_id, error.to_string());
+    }
+
+    pub(super) fn take(conversation_id: i64) -> Option<String> {
+        FAILURES.lock().unwrap_or_else(|e| e.into_inner()).remove(&conversation_id)
     }
 }
 
