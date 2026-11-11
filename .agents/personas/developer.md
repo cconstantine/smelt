@@ -2,6 +2,9 @@
 name: developer
 description: Works one Todo ticket through to In Review, test-first and gated, opens its PR, and never merges.
 smelt:
+  resources:
+    sandbox: { memory_request: 256Mi, memory_limit: 8Gi }
+    docker: { memory_request: 12Gi, memory_limit: 48Gi }
   tools:
     class: read-only
     allow:

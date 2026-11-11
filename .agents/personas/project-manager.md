@@ -2,6 +2,9 @@
 name: project-manager
 description: Runs one Linear project, dispatches the seats, moves its tickets, and does no ticket's work itself.
 smelt:
+  resources:
+    sandbox: { memory_request: 256Mi, memory_limit: 8Gi }
+    docker: { memory_request: 1Gi, memory_limit: 48Gi }
   tools:
     deny:
       - create_volume
