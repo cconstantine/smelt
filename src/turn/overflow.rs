@@ -157,7 +157,12 @@ pub(super) async fn recover(
                 &again.message,
             )))
         }
-        Err(CallError::Failed(e)) => Err(e),
+        Err(CallError::Failed(e)) => {
+            // Died, not refused (SME-423): the believed size this retry
+            // went out on is spent either way.
+            with_compaction_progress(conversation_id, CompactionProgress::request_failed);
+            Err(e)
+        }
     }
 }
 
