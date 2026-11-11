@@ -95,6 +95,7 @@ mod tests {
             busy: false,
             waiting_for_user: false,
             report_owed_at: None,
+            archived_at: None,
         }
     }
 

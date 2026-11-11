@@ -2,7 +2,7 @@ use super::*;
 
 fn conversation(id: i64, parent_id: Option<i64>) -> ConversationNode {
     let at = chrono::NaiveDateTime::default();
-    ConversationNode::from(crate::models::Conversation { id, title: format!("c{id}"), created_at: at, updated_at: at, parent_id })
+    ConversationNode::from(crate::models::Conversation { id, title: format!("c{id}"), created_at: at, updated_at: at, parent_id, archived_at: None })
 }
 
 fn agent(id: i64, parent_id: i64, persona: Option<&str>, status: &str) -> ConversationNode {

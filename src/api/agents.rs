@@ -34,6 +34,10 @@ pub struct ConversationNode {
     /// an older server parses.
     #[serde(default)]
     pub report_owed_at: Option<NaiveDateTime>,
+    /// Its root's `archived_at` (SME-480 D4): an agent is archived with its
+    /// top-level conversation. `#[serde(default)]` as above.
+    #[serde(default)]
+    pub archived_at: Option<NaiveDateTime>,
 }
 
 /// One agent under a conversation that waits for the user, for its banner.
@@ -58,6 +62,7 @@ impl From<crate::models::Conversation> for ConversationNode {
             busy: false,
             waiting_for_user: false,
             report_owed_at: None,
+            archived_at: conversation.archived_at,
         }
     }
 }
@@ -110,6 +115,7 @@ fn node(row: crate::db::TreeRow, running: &std::collections::HashSet<i64>) -> Co
         busy,
         waiting_for_user: row.waiting_for_user,
         report_owed_at: row.report_owed_at,
+        archived_at: row.archived_at,
     }
 }
 

@@ -19,6 +19,7 @@ fn row(id: i64, state: Option<&str>) -> crate::db::TreeRow {
         waiting_for_user: false,
         waiting_for_parent: false,
         report_owed_at: None,
+        archived_at: None,
     }
 }
 
