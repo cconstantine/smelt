@@ -138,6 +138,25 @@ pub async fn clear_learned_context_window(pool: &PgPool, provider_id: i64, model
     Ok(())
 }
 
+/// A save of the model's row forgets what smelt learned about its window
+/// (SME-423): a raise made on the server itself moves no listing and no
+/// learner, and the row's Save is the user's word that they just looked.
+/// Clears through the Forget button's own statement — all four learned
+/// columns together, the user's override and the report nobody's to
+/// touch — and says so on `window_learn` (source `settings`, decision
+/// `user_save`, value the number that went) only when the UPDATE really
+/// cleared: fired on the answer, never on the attempt, like
+/// `bigger_report` and `window_beaten`. Called between the overrides
+/// write and `providers_changed()`, so the caller's notice covers the
+/// clear; a failed read or clear proves nothing and fails no save.
+pub async fn forget_learned_on_model_save(pool: &PgPool, provider_id: i64, model: &str) {
+    let Ok(Some(row)) = db::get_provider_model(pool, provider_id, model).await else { return };
+    let Some(learned) = positive(row.learned_context_window) else { return };
+    if db::clear_learned_context_window(pool, provider_id, model).await.unwrap_or(false) {
+        trace_window_learn(None, model, "settings", "user_save", i64::from(learned), None, None, None);
+    }
+}
+
 /// A whole reply that filled more than the learned window disproves it
 /// (SME-439 PR 2, Expected 3b): what just fit is bigger than what smelt
 /// learned, so the learned number goes — one statement, strictly bigger

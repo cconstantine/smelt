@@ -123,14 +123,6 @@ async fn counting_mock(pool: &PgPool, window: Option<u32>, plans: Vec<(i64, i64)
     mock
 }
 
-/// The window at which, with this conversation's fixed content, a compacted
-/// request leaves `room` tokens for a reply.
-async fn window_leaving(pool: &PgPool, id: i64, room: u64) -> u32 {
-    let model = crate::providers::resolve_turn_model(pool, id).await.expect("a model");
-    let (request, _) = build_request(pool, id, &model, None, &[], false, 0).await.expect("a request");
-    u32::try_from(estimate_request_tokens(&request) + u64::from(COMPACTION_SAFETY_BUFFER) + room).expect("a window")
-}
-
 async fn send(pool: &PgPool, id: i64, text: &str) {
     let mut rx = events::subscribe(id);
     start_turn(pool.clone(), id, text.to_string()).await.expect("send");

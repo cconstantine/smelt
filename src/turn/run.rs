@@ -430,7 +430,13 @@ fn run_turn_loop<'c>(
                     }
                     (recovered.turn, recovered.recorder, recovered.budget)
                 }
-                Err(CallError::Failed(e)) => return Err(e),
+                Err(CallError::Failed(e)) => {
+                    // Died, not refused (SME-423): the size believed for this
+                    // send is spent, and must not go on reading a later
+                    // refusal as that size's disproof.
+                    with_compaction_progress(conversation_id, CompactionProgress::request_failed);
+                    return Err(e);
+                }
             };
             // A refusal-answering compaction may have run in the recovery
             // (SME-414): its notice rides the next request as the others' do.
