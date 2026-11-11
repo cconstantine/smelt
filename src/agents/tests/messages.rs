@@ -165,19 +165,33 @@ async fn test_message_agent_refuses_anyone_but_the_parent_and_its_own_children(p
 /// child's; each reads who it's from.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_message_to_an_idle_child_wakes_it_and_back(pool: PgPool) {
-    setup(&pool, vec![text_reply("Noted.")]).await;
+    let requests = setup(&pool, vec![text_reply("Noted.")]).await;
     let root = db::create_conversation(&pool).await.expect("create conversation").id;
     let child = active_child(&pool, root).await;
 
     assert_eq!(message(&pool, root, serde_json::json!(child.to_string()), "Hello child.").await, Ok(format!("Sent to agent #{child}.")));
-    eventually("the child read it and answered", || async {
-        transcript(&pool, child).await
-            == vec![
-                ("user".to_string(), "Message from your parent:\n\nHello child.".to_string()),
-                ("assistant".to_string(), "Noted.".to_string()),
-            ]
+    // SME-490: settle SME-455's report-owed nudge chain before the read below.
+    // This wake turn is the spell's first plain stuck end (the seat owes its
+    // parent a report), so it nudges the seat — the nudge row, then the nudge
+    // turn's reply — and that second end tells the parent. Under full-gate
+    // load that lands before an exact-transcript equality can observe the
+    // two-message transcript: CI run 43114393432 failed this assert at
+    // `the child read it and answered: not within 10 s`, and the old
+    // equality fails there deterministically once the chain is settled
+    // (red recorded in the PR). Reading and answering
+    // are append-only facts: assert they head the transcript.
+    eventually("the nudged spell is over", || async {
+        requests_for(&requests, Some(child)).len() == 2 && !crate::turn::turn_running(child)
     })
     .await;
+    let messages = transcript(&pool, child).await;
+    assert!(
+        messages.starts_with(&[
+            ("user".to_string(), "Message from your parent:\n\nHello child.".to_string()),
+            ("assistant".to_string(), "Noted.".to_string()),
+        ]),
+        "the child read it and answered: {messages:?}"
+    );
     let linked = sqlx::query_scalar::<_, bool>(
         "SELECT delivered_message_id IS NOT NULL FROM agent_messages WHERE to_conversation_id = $1 AND kind = 'message'",
     )
