@@ -9,9 +9,17 @@ use super::*;
 /// so a descendant's set can never narrow by an ancestor's list.
 /// Outer `None` is no `agents` row (a Rule G root); inner `None` is the
 /// NULL a pre-ticket row carries, which every Rule G read takes as
-/// granted rather than stranding a conversation smelt wrote.
+/// granted rather than stranding a conversation smelt wrote. A top-level
+/// conversation set to a persona (SME-481) answers from its
+/// `top_level_personas` row the same way: only one with no persona is a
+/// Rule G root.
 pub async fn agent_credentials(pool: &PgPool, id: i64) -> Result<Option<Option<Vec<String>>>, sqlx::Error> {
-    sqlx::query_scalar::<_, Option<Vec<String>>>("SELECT credentials FROM agents WHERE conversation_id = $1")
+    sqlx::query_scalar::<_, Option<Vec<String>>>(
+        "SELECT credentials FROM agents WHERE conversation_id = $1
+         UNION ALL
+         SELECT credentials FROM top_level_personas WHERE conversation_id = $1
+         LIMIT 1",
+    )
         .bind(id)
         .fetch_optional(pool)
         .await
@@ -71,13 +79,19 @@ pub async fn clear_agent_credentials(pool: &PgPool, child: i64) -> Result<bool, 
 /// at `complete_start` — the names are fixed for the conversation's
 /// life, which of them the store backs is read fresh. No row, no
 /// snapshot or no key all mean none. Whether each name is a stored
-/// secret is Rule S's store resolution, not this read.
+/// secret is Rule S's store resolution, not this read. A top-level
+/// persona's names come from its own `top_level_personas` snapshot
+/// (SME-481), and from nowhere else.
 pub async fn persona_credential_names(pool: &PgPool, id: i64) -> Result<Vec<String>, sqlx::Error> {
-    let settings =
-        sqlx::query_scalar::<_, Option<serde_json::Value>>("SELECT persona_settings FROM agents WHERE conversation_id = $1")
-            .bind(id)
-            .fetch_optional(pool)
-            .await?;
+    let settings = sqlx::query_scalar::<_, Option<serde_json::Value>>(
+        "SELECT persona_settings FROM agents WHERE conversation_id = $1
+         UNION ALL
+         SELECT persona_settings FROM top_level_personas WHERE conversation_id = $1
+         LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
     Ok(settings
         .flatten()
         .as_ref()
@@ -89,10 +103,15 @@ pub async fn persona_credential_names(pool: &PgPool, id: i64) -> Result<Vec<Stri
 
 /// The agent's stored `rule_chain` (SME-241): the JSON array as written,
 /// `None` for no agent row or a NULL chain — both mean allow-all. One
-/// indexed read; the primary key is the conversation id.
+/// indexed read; the primary key is the conversation id. A top-level
+/// conversation set to a persona (SME-481) has its chain in
+/// `top_level_personas`: the persona's one entry, `own` included.
 pub async fn agent_rule_chain(pool: &PgPool, id: i64) -> Result<Option<serde_json::Value>, sqlx::Error> {
     Ok(sqlx::query_scalar::<_, Option<serde_json::Value>>(
-        "SELECT rule_chain FROM agents WHERE conversation_id = $1",
+        "SELECT rule_chain FROM agents WHERE conversation_id = $1
+         UNION ALL
+         SELECT rule_chain FROM top_level_personas WHERE conversation_id = $1
+         LIMIT 1",
     )
     .bind(id)
     .fetch_optional(pool)

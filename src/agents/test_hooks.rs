@@ -153,6 +153,14 @@ pub fn stores_done(id: i64) -> usize {
     STORES_DONE.lock().unwrap_or_else(|e| e.into_inner()).get(&id).copied().unwrap_or(0)
 }
 
+/// The top-level persona set of conversation `id` (SME-481), its turn
+/// lock held, after the persona file is read and before the transaction.
+pub const TOP_LEVEL_AFTER_READ: &str = "top_level_after_read";
+
+/// The top-level persona set of conversation `id`, its turn lock held,
+/// after the row is inserted unapplied and before the pod's reconcile.
+pub const TOP_LEVEL_AFTER_INSERT: &str = "top_level_after_insert";
+
 /// `start_agent` by caller `id`, after `create_child` committed and
 /// before the start is spawned.
 pub const AFTER_CREATE_CHILD: &str = "after_create_child";

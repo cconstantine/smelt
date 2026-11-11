@@ -424,8 +424,10 @@ fn one_notice(notes: impl IntoIterator<Item = Option<String>>) -> Option<String>
 
 /// Loads the child's top-level AGENTS.md, which needs no card: the remote
 /// is trusted. One forgotten since the last read gets a card instead,
-/// which fails the start (its exit deletes the card).
-async fn load_agents_md(
+/// which fails the start (its exit deletes the card). A top-level
+/// persona's set loads its own this way too (SME-481), `child` and
+/// `parent` both the conversation.
+pub(crate) async fn load_agents_md(
     pool: &PgPool,
     checkout: &dyn ChildCheckout,
     child: i64,
@@ -446,7 +448,7 @@ async fn load_agents_md(
 }
 
 /// Whether the user trusts `remote_key`, read under its trust lock.
-async fn remote_trust(pool: &PgPool, remote_key: &str) -> Result<Option<bool>, String> {
+pub(crate) async fn remote_trust(pool: &PgPool, remote_key: &str) -> Result<Option<bool>, String> {
     let e = |e: sqlx::Error| format!("couldn't read the remote's trust: {e}");
     let mut tx = pool.begin().await.map_err(e)?;
     db::lock_remote_trust(&mut *tx, remote_key).await.map_err(e)?;
