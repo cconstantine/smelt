@@ -35,6 +35,39 @@ async fn test_a_conversations_pod_resources_reach_its_pod_and_it_schedules(pool:
     .await;
 }
 
+/// SME-484 L2: the start's backstop, the real `PodCheckout::restart_pod`,
+/// brings the pod back with the conversation's new requests: a new live
+/// pod, the old one gone, Running, and its storage kept.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_restart_pod_brings_the_pod_back_with_the_conversations_new_requests(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT * 2, async {
+        let id = db::create_conversation(&pool).await.expect("create conversation").id;
+        let first = start_or_get_pod(&pool, id).await.expect("the first pod starts");
+        let claims = claim_uids(&client, id).await;
+        let asks = serde_json::json!({
+            "sandbox": {"memory_request": "64Mi"},
+            "docker": {"memory_request": "128Mi"},
+        });
+        db::set_conversation_pod_resources(&pool, id, Some(&asks)).await.expect("set");
+
+        crate::agents::ChildCheckout::restart_pod(&crate::agents::PodCheckout, &pool, id).await.expect("restart_pod");
+
+        let live: Vec<i64> = db::list_sandbox_pods(&pool, id).await.expect("live pods").into_iter().map(|p| p.id).collect();
+        assert_eq!(live.len(), 1, "one live pod: {live:?}");
+        let second = live[0];
+        assert_ne!(second, first, "a new pod");
+        assert!(pods_api(&client).get_opt(&pod_name(first)).await.expect("read").map_or(true, |p| p.metadata.deletion_timestamp.is_some()), "the old pod is gone or going");
+        let read = pods_api(&client).get(&pod_name(second)).await.expect("read the pod");
+        assert_eq!(read.status.as_ref().and_then(|s| s.phase.as_deref()), Some("Running"));
+        let quantity = |q: &str| Some(Quantity(q.to_string()));
+        assert_eq!(memory_requests(&client, second).await, (quantity("64Mi"), quantity("128Mi")));
+        assert_eq!(claim_uids(&client, id).await, claims, "the storage outlives the pod");
+        teardown_conversation(&pool, id, &[]).await;
+    })
+    .await;
+}
+
 /// The claims' uids, workspace's first.
 async fn claim_uids(client: &kube::Client, id: i64) -> Vec<Option<String>> {
     let mut uids = Vec::new();
