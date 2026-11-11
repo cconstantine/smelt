@@ -40,6 +40,7 @@ pub(in crate::sandbox) async fn wait_for_running_unspanned(
     timeout: Duration,
 ) -> Result<(), SandboxError> {
     let mut last_detail = None;
+    let mut told_unschedulable = false;
     let started = std::time::Instant::now();
     let waited = tokio::time::timeout(timeout, async {
         loop {
@@ -48,6 +49,17 @@ pub(in crate::sandbox) async fn wait_for_running_unspanned(
                 return Err(SandboxError::StartFailed(reason));
             }
             last_detail = pod_pending_detail(&pod);
+            // Not a silent wait (SME-484): the sandbox panel shows why the
+            // scheduler can't place it, once.
+            if !told_unschedulable {
+                if let Some((conversation_id, pod_id, status)) = unschedulable_notice(&pod) {
+                    told_unschedulable = true;
+                    crate::events::publish(
+                        conversation_id,
+                        crate::events::ConversationEvent::SandboxPodUpdate { pod_id, status, node: None, terminated: false },
+                    );
+                }
+            }
             if pod_phase_is_running(&pod) {
                 let took = started.elapsed();
                 if is_slow_start(took, timeout) {
@@ -121,7 +133,14 @@ pub(in crate::sandbox) fn timed_out_outcome(pod: &Pod, events: Result<&[Event], 
     if pod_phase_is_running(pod) {
         return Ok(());
     }
-    Err(SandboxError::Timeout(Some(pod_start_report(pod, events, now))))
+    let report = pod_start_report(pod, events, now);
+    // The scheduler's words first (SME-484): no node has room for the
+    // pod's requests, or none it may go to.
+    let report = match unschedulable_reason(pod) {
+        Some(reason) => format!("no node can take it now (the scheduler: {reason}); {report}"),
+        None => report,
+    };
+    Err(SandboxError::Timeout(Some(report)))
 }
 
 /// `pod`'s events, or why they couldn't be listed. The `park` Role may

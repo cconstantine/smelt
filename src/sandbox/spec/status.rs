@@ -88,3 +88,24 @@ pub(in crate::sandbox) fn pod_startup_failure(pod: &Pod) -> Option<String> {
         })
     })
 }
+
+/// The scheduler's reason a pod has no node (SME-484): its `PodScheduled`
+/// condition `False` with reason `Unschedulable` — no node has room for
+/// its requests, or none it may go to — as the scheduler words it.
+pub(in crate::sandbox) fn unschedulable_reason(pod: &Pod) -> Option<String> {
+    let conditions = pod.status.as_ref()?.conditions.as_ref()?;
+    let scheduled = conditions.iter().find(|c| c.type_ == "PodScheduled")?;
+    if scheduled.status != "False" || scheduled.reason.as_deref() != Some("Unschedulable") {
+        return None;
+    }
+    Some(scheduled.message.clone().filter(|m| !m.is_empty()).unwrap_or_else(|| "Unschedulable".to_string()))
+}
+
+/// For a sandbox pod the scheduler can't place: its conversation, its
+/// pod id and the status its sandbox panel shows while it waits.
+pub(in crate::sandbox) fn unschedulable_notice(pod: &Pod) -> Option<(i64, i64, String)> {
+    let reason = unschedulable_reason(pod)?;
+    let conversation = pod.metadata.labels.as_ref()?.get(CONVERSATION_LABEL)?.parse().ok()?;
+    let pod_id = pod.metadata.name.as_deref()?.strip_prefix("sandbox-")?.parse().ok()?;
+    Some((conversation, pod_id, format!("Unschedulable: {reason}")))
+}

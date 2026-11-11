@@ -444,3 +444,41 @@ fn test_pod_startup_failure_is_none_while_a_pod_is_still_starting() {
     assert_eq!(pod_startup_failure(&pod_with_phase("Pending")), None);
     assert_eq!(pod_startup_failure(&pod_with_phase("Running")), None);
 }
+
+// --- SME-484: a pod no node can take says so ---
+
+const NO_ROOM: &str = "0/3 nodes are available: 1 node(s) had untolerated taint {strata: }, 2 Insufficient memory.";
+
+/// The timeout the model gets leads with the scheduler's reason.
+#[test]
+fn test_an_unschedulable_pods_timeout_leads_with_the_schedulers_reason() {
+    match timed_out_outcome(&pod_unschedulable(NO_ROOM), Ok(&[]), report_now()) {
+        Err(SandboxError::Timeout(Some(detail))) => {
+            assert!(detail.starts_with(&format!("no node can take it now (the scheduler: {NO_ROOM});")), "got {detail}")
+        }
+        other => panic!("expected a timeout, got {other:?}"),
+    }
+    // A pod held up elsewhere says nothing of the scheduler.
+    let pending = report_pod(&[("PodReadyToStartContainers", "False", 2, "", "")], serde_json::json!([]), serde_json::json!([]));
+    match timed_out_outcome(&pending, Ok(&[]), report_now()) {
+        Err(SandboxError::Timeout(Some(detail))) => assert!(!detail.contains("no node can take it"), "got {detail}"),
+        other => panic!("expected a timeout, got {other:?}"),
+    }
+}
+
+/// While it waits, the conversation's sandbox panel is told why.
+#[test]
+fn test_an_unschedulable_sandbox_pod_names_its_conversation_pod_and_reason() {
+    let mut pod = pod_unschedulable(NO_ROOM);
+    pod.metadata.name = Some(pod_name(12));
+    pod.metadata.labels = Some([(CONVERSATION_LABEL.to_string(), "7".to_string())].into());
+    assert_eq!(unschedulable_notice(&pod), Some((7, 12, format!("Unschedulable: {NO_ROOM}"))));
+
+    let mut unlabelled = pod_unschedulable(NO_ROOM);
+    unlabelled.metadata.name = Some(pod_name(12));
+    assert_eq!(unschedulable_notice(&unlabelled), None, "a test's pod has no conversation");
+    let mut scheduled = report_pod(&[("PodScheduled", "True", 0, "", "")], serde_json::json!([]), serde_json::json!([]));
+    scheduled.metadata.name = Some(pod_name(12));
+    scheduled.metadata.labels = pod.metadata.labels.clone();
+    assert_eq!(unschedulable_notice(&scheduled), None);
+}

@@ -336,6 +336,16 @@ pub(in crate::sandbox) async fn create_pod_attempt_unspanned(
         Err(e) => {
             let e = start_error(pool, row.id, e).await;
             let _ = db::terminate_sandbox_pod(pool, row.id).await;
+            // The panel may be showing it waiting for a node (SME-484).
+            events::publish(
+                conversation_id,
+                events::ConversationEvent::SandboxPodUpdate {
+                    pod_id: row.id,
+                    status: "terminated".to_string(),
+                    node: None,
+                    terminated: true,
+                },
+            );
             Err(e)
         }
     }

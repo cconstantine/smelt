@@ -208,3 +208,32 @@ fn test_a_tools_limit_below_the_personas_request_is_refused_naming_both() {
     let error = overrides.resolve(7, Some(&asks)).expect_err("4Gi can't hold a 12Gi request").to_string();
     assert!(error.contains("12Gi") && error.contains("4Gi") && error.contains("docker"), "{error}");
 }
+
+/// A real scheduler's answer to a request no node has room for: a CPU
+/// request of 100,000 cores. The wait's error leads with the scheduler's
+/// reason, and the pod it made is deleted, as any that never starts is.
+#[tokio::test]
+async fn test_a_pod_no_node_has_room_for_times_out_with_the_schedulers_reason() {
+    let client = test_client().await;
+    let manager = SandboxManager::new(client.clone());
+    let session_id = unique_session_id("no-room");
+    let requests = PodRequests {
+        sandbox: Requests { memory: None, cpu: Some("100000".to_string()) },
+        docker: Requests::default(),
+    };
+    let docker = DockerSidecar { memory: "512Mi".to_string(), storage: PodStorage::Ephemeral };
+    let result = manager
+        .create_with_running_timeout(&session_id, "128Mi", &docker, &requests, &[], &[], Duration::from_secs(8), &test_instance())
+        .await;
+    match result {
+        Err(SandboxError::Timeout(Some(detail))) => {
+            assert!(detail.starts_with("no node can take it now (the scheduler: "), "{detail}");
+            assert!(detail.contains("Insufficient cpu"), "{detail}");
+        }
+        Err(e) => panic!("expected a timeout naming the scheduler, got {e}"),
+        Ok(sandbox) => {
+            std::mem::forget(sandbox);
+            panic!("a 100,000-core pod started");
+        }
+    }
+}
