@@ -1,10 +1,12 @@
 //! SME-73: what a turn does with a refusal meaning "this didn't fit" —
 //! learn the window, shrink, send once more. Each test is one row of the
 //! plan's state model: budget-only, compact-then-retry, no window named,
-//! can't-help, refused twice, and the two Stop races the pause hooks
-//! exist for. The recovery's own wordings, what it saves, what it
-//! publishes and how its spans read are all asserted here; the replies
-//! that run into the window live beside it, in `window_stop.rs`.
+//! can't-help, refused twice; the two Stop races the pause hooks exist
+//! for and the summary's own refusals live beside them, in
+//! `stop_and_summary_races.rs`. The recovery's own wordings, what it
+//! saves, what it publishes and how its spans read are all asserted
+//! here; the replies that run into the window live beside it, in
+//! `window_stop.rs`.
 
 use super::*;
 use std::sync::Arc;
@@ -92,6 +94,19 @@ fn too_long_big(input: &str, window: &str) -> Answer {
         axum::http::StatusCode::BAD_REQUEST,
         format!(
             r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"prompt is too long: {input} tokens > {window} maximum"}},"request_id":"req_test"}}"#
+        ),
+    ))
+}
+
+/// vLLM's refusal, and LiteLLM's when it relays one: the server counts
+/// `max_tokens` against its window and refuses when the two don't fit,
+/// but names only the window — no input count anywhere the shipped
+/// classifier reads (SME-422). Flat 400, vLLM's sentence.
+pub(super) fn max_context_only(window: u32) -> Answer {
+    Err((
+        axum::http::StatusCode::BAD_REQUEST,
+        format!(
+            r#"{{"error":{{"message":"This model's maximum context length is {window} tokens. Please reduce the length of the input messages or the number of output tokens."}}}}"#
         ),
     ))
 }
@@ -310,18 +325,21 @@ async fn test_absurd_refusal_counts_are_answered_with_the_estimate(pool: PgPool)
 }
 
 /// The same gateway with an honest window and the absurd input alone.
-/// The lying count is refused, the turn's own estimate takes its
-/// place, and that fits the window with room — so the history goes
-/// again on the shrunken budget, and the lie never forces a
-/// compaction it only dreamed up (SME-73 review).
+/// The lying count is refused, and a dropped count is a missing one
+/// (SME-422): with none named, nothing vouches for the room an
+/// estimate-sized budget takes, so the recovery compacts and the retry
+/// answering the refusal takes only a short reply. The lie still learns
+/// nothing: the model's row keeps the honest window, never the
+/// nine-quintillion-token input.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_an_absurd_input_count_never_forces_a_compaction(pool: PgPool) {
+async fn test_an_absurd_input_count_is_answered_like_a_missing_one(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
     let upstream = start_refusal_mock(
         &pool,
         vec![
             too_long_big("18446744073709551500", "131072"),
+            Ok(text_reply_body("Summary: the lie stands.")),
             Ok(text_reply_body("Answered.")),
         ],
     )
@@ -330,11 +348,11 @@ async fn test_an_absurd_input_count_never_forces_a_compaction(pool: PgPool) {
 
     run_turn(&pool, conversation.id, hello()).await.expect("the refusal recovers");
 
-    assert_eq!(upstream.count(), 2, "one refusal, one retry — the lying input was never trusted to demand a summary");
-    assert!(compaction_summaries(&pool, conversation.id).await.is_empty(), "the estimate fits 131,072 with room: only the lie said otherwise");
+    assert_eq!(upstream.count(), 3, "refusal, summary, retry — a dropped count is answered as a missing one");
+    assert_eq!(compaction_summaries(&pool, conversation.id).await, ["Summary: the lie stands."], "compaction is what can shrink the request");
     let saved = db::list_messages(&pool, conversation.id).await.expect("messages");
     assert_eq!(last_reply(&saved).as_deref(), Some("Answered."));
-    assert_eq!(saved_learned_context_window(&pool).await, Some(131_072), "the honest window is learned all the same");
+    assert_eq!(saved_learned_context_window(&pool).await, Some(131_072), "the honest window is learned; the nine-quintillion input count is not");
 }
 
 /// R4 "Can't help": a window that can't hold even the system prompt and
@@ -400,186 +418,5 @@ async fn test_a_retry_refused_again_ends_the_turn_and_learns_whats_smaller(pool:
     assert_eq!(model.context_window, 24_576, "so the next turn starts at 24,576");
 }
 
-/// Stop race one: a Stop that catches the recovery between the window
-/// write and the summary call ends the turn stopped with only the
-/// window saved — the summary is never asked for, nothing else lands.
-#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_a_stop_before_the_summary_saves_nothing_but_the_window(pool: PgPool) {
-    let _guard = lock_turn_tests();
-    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
-    let upstream = start_refusal_mock(&pool, vec![too_long(120_000, 131_072), Ok(text_reply_body("Summary: never sent."))]).await;
-    let conversation = db::create_conversation(&pool).await.expect("create conversation");
-    let id = conversation.id;
 
-    let (reached, resume) = test_hooks::pause_before_summary_call(id);
-    let turn = tokio::spawn({
-        let pool = pool.clone();
-        async move { run_turn(&pool, id, hello()).await }
-    });
-    tokio::time::timeout(std::time::Duration::from_secs(10), reached)
-        .await
-        .expect("the recovery reached the summary call")
-        .expect("hook");
-
-    stop_turn_now(id);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(10), turn)
-        .await
-        .expect("the stopped turn ends")
-        .expect("join");
-    assert!(matches!(result, Err(TurnFailure::Stopped)), "{result:?}");
-    drop(resume);
-
-    assert_eq!(upstream.count(), 1, "the summary was never asked for");
-    assert!(compaction_summaries(&pool, id).await.is_empty(), "nothing of a compaction landed");
-    let saved = db::list_messages(&pool, id).await.expect("messages");
-    assert_eq!(last_reply(&saved), None, "no reply");
-    assert_eq!(saved_learned_context_window(&pool).await, Some(131_072), "the window write happened before the pause and stays");
-}
-
-/// Stop race two: a Stop after the compaction, before the retry, keeps
-/// both (the compacted conversation and the learned window) and sends
-/// the retry never.
-#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_a_stop_before_the_retry_keeps_the_compaction_and_the_window(pool: PgPool) {
-    let _guard = lock_turn_tests();
-    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
-    let upstream = start_refusal_mock(
-        &pool,
-        vec![
-            too_long(120_000, 131_072),
-            Ok(text_reply_body("Summary: it was going.")),
-            Ok(text_reply_body("Never sent.")),
-        ],
-    )
-    .await;
-    let conversation = db::create_conversation(&pool).await.expect("create conversation");
-    db::create_message(&pool, conversation.id, "user", &[anthropic::ContentBlock::Text { text: "earlier".to_string() }])
-        .await
-        .expect("seed");
-    let id = conversation.id;
-
-    let (reached, resume) = test_hooks::pause_before_retry(id);
-    let turn = tokio::spawn({
-        let pool = pool.clone();
-        async move { run_turn(&pool, id, hello()).await }
-    });
-    tokio::time::timeout(std::time::Duration::from_secs(10), reached)
-        .await
-        .expect("the recovery reached the retry")
-        .expect("hook");
-
-    stop_turn_now(id);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(10), turn)
-        .await
-        .expect("the stopped turn ends")
-        .expect("join");
-    assert!(matches!(result, Err(TurnFailure::Stopped)), "{result:?}");
-    drop(resume);
-
-    assert_eq!(upstream.count(), 2, "the refusal and the summary went, the retry never did");
-    assert_eq!(compaction_summaries(&pool, id).await, ["Summary: it was going."], "a finished compaction stays");
-    let saved = db::list_messages(&pool, id).await.expect("messages");
-    assert_eq!(last_reply(&saved), None, "the retry's reply is never sent, so nothing to discard");
-    assert_eq!(saved_learned_context_window(&pool).await, Some(131_072));
-}
-
-/// C1: a compaction whose own summary call is refused gets the same
-/// treatment once, inside `compact_conversation`: learn the named
-/// window, summarise again with the transcript sized to it, and carry
-/// on — the compaction span stays green, the refused summary's chat
-/// span stays marked.
-#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_a_compaction_that_overflows_retries_its_summary_once(pool: PgPool) {
-    let _guard = lock_turn_tests();
-    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
-    let upstream = start_refusal_mock(
-        &pool,
-        vec![
-            too_long(150_000, 131_072),
-            Ok(text_reply_body("Summary: recovered on the second ask.")),
-            Ok(text_reply_body("Answered after the recovered compaction.")),
-        ],
-    )
-    .await;
-    let conversation = db::create_conversation(&pool).await.expect("create conversation");
-    db::create_message(&pool, conversation.id, "user", &[anthropic::ContentBlock::Text { text: "earlier".to_string() }])
-        .await
-        .expect("seed");
-    let near_limit = anthropic::TokenUsage {
-        input_tokens: 190_000,
-        output_tokens: 0,
-        cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
-    };
-    db::upsert_conversation_usage(&pool, conversation.id, &near_limit).await.expect("seed usage");
-    let id = conversation.id;
-
-    let (result, spans) = crate::telemetry::capture_spans(run_turn(&pool, id, hello())).await;
-    result.expect("the refused summary recovers and the turn carries on");
-
-    assert_eq!(upstream.count(), 3, "refused summary, summary, reply");
-    assert_eq!(
-        compaction_summaries(&pool, id).await,
-        ["Summary: recovered on the second ask."],
-        "the summary asked for once more is the divider"
-    );
-    assert_eq!(
-        compaction_blocks(&pool, id).await[0].1.as_deref(),
-        Some("the model's server refused a request that didn't fit its 131,072-token window"),
-        "a compaction answering its own refusal names that refusal on the divider (SME-73)"
-    );
-    let saved = db::list_messages(&pool, id).await.expect("messages");
-    assert_eq!(last_reply(&saved).as_deref(), Some("Answered after the recovered compaction."));
-    assert_eq!(saved_learned_context_window(&pool).await, Some(131_072), "the compaction's refusal learns too");
-
-    let compactions: Vec<_> = spans.iter().filter(|s| s.name == "compaction").collect();
-    let [compaction] = compactions.as_slice() else { panic!("one compaction span: {spans:?}") };
-    assert_eq!(compaction.status, opentelemetry::trace::Status::Unset, "a self-recovered compaction ends green");
-    assert_eq!(turn_span(&spans).status, opentelemetry::trace::Status::Unset);
-    let chats = chat_spans(&spans);
-    assert_eq!(chats.len(), 3, "two summary tries and the reply: {chats:?}");
-    let opentelemetry::trace::Status::Error { description } = &chats[0].status else {
-        panic!("the refused summary stays marked: {:?}", chats[0].status);
-    };
-    assert!(description.contains("prompt is too long"), "{description}");
-    assert!(matches!(chats[1].status, opentelemetry::trace::Status::Unset), "the second summary succeeded");
-}
-
-/// C2: a second refusal fails the turn with the "Couldn't compact…"
-/// wording — the window it names is still learned, and the compaction
-/// span ends red.
-#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_a_compaction_refused_twice_fails_the_turn_with_the_worded_reason(pool: PgPool) {
-    let _guard = lock_turn_tests();
-    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
-    let upstream = start_refusal_mock(&pool, vec![too_long(150_000, 131_072), llama_refused(24_000, 24_576)]).await;
-    let conversation = db::create_conversation(&pool).await.expect("create conversation");
-    db::create_message(&pool, conversation.id, "user", &[anthropic::ContentBlock::Text { text: "earlier".to_string() }])
-        .await
-        .expect("seed");
-    let near_limit = anthropic::TokenUsage {
-        input_tokens: 190_000,
-        output_tokens: 0,
-        cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
-    };
-    db::upsert_conversation_usage(&pool, conversation.id, &near_limit).await.expect("seed usage");
-    let id = conversation.id;
-
-    let (result, spans) = crate::telemetry::capture_spans(run_turn(&pool, id, hello())).await;
-    let error = result.expect_err("the summary refused twice fails the turn").to_string();
-    assert!(error.contains("Couldn't compact the conversation"), "{error}");
-    assert!(error.contains("even the summary request didn't fit"), "{error}");
-    assert!(error.contains("(24,576 tokens)"), "the second refusal's window: {error}");
-    assert!(error.contains("The server said:"), "{error}");
-    assert_eq!(upstream.count(), 2, "one summary, one more, no third ask");
-    assert!(compaction_summaries(&pool, id).await.is_empty(), "nothing half-done was saved");
-    assert_eq!(saved_learned_context_window(&pool).await, Some(24_576), "both refusals learn, the smaller lands");
-
-    let compactions: Vec<_> = spans.iter().filter(|s| s.name == "compaction").collect();
-    let [compaction] = compactions.as_slice() else { panic!("one compaction span: {spans:?}") };
-    let opentelemetry::trace::Status::Error { description } = &compaction.status else {
-        panic!("the failed compaction is marked: {:?}", compaction.status);
-    };
-    assert!(description.contains("Couldn't compact"), "{description}");
-}
+mod stop_and_summary_races;

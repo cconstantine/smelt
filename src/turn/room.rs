@@ -59,16 +59,22 @@ pub(super) fn before_sending(
 
 /// What a refusal naming the window (`context_window`, already learned)
 /// has the turn do, with `alone` the size no compaction can shrink and
-/// `input` the refused request's.
+/// `input` the refused request's, when the refusal counted it (SME-422:
+/// a server that counts `max_tokens` and names only its window names no
+/// count, and neither does a count too absurd to be believed).
 #[derive(Debug, PartialEq)]
 pub(super) enum NamedRefusal {
     /// Not even a short reply fits beside the system prompt and tools.
     TooSmall(String),
-    /// Send again: compacted first if `compact`.
-    Retry { compact: bool },
+    /// Send again: compacted first if `compact`. A refusal that named no
+    /// input vouches for no room — the estimate of the request it just
+    /// refused is all the budget could be sized from — so it never
+    /// retries budget-only, and its retry takes only a short reply
+    /// (`short_reply`; SME-422).
+    Retry { compact: bool, short_reply: bool },
 }
 
-pub(super) fn after_named_refusal(model: &str, context_window: u32, alone: u64, input: u64) -> NamedRefusal {
+pub(super) fn after_named_refusal(model: &str, context_window: u32, alone: u64, input: Option<u64>) -> NamedRefusal {
     let window = u64::from(context_window);
     // Can't help: what no compaction can take away already leaves this
     // window no room to answer in, even a short reply, which is all a
@@ -78,10 +84,32 @@ pub(super) fn after_named_refusal(model: &str, context_window: u32, alone: u64, 
     if alone + u64::from(MIN_USEFUL_REPLY) > window {
         return NamedRefusal::TooSmall(super::overflow::too_small(model, context_window, alone));
     }
+    // With no count named, nothing says the input leaves room for the
+    // budget's usual reply — a same-history retry takes the room that was
+    // just refused, and is refused again, every send (SME-422's wedge).
+    // Compaction is what can shrink the request; and `MIN_USEFUL_REPLY` is
+    // both the smallest reply worth sending (the floor's own `TryAnyway`
+    // arm sends exactly this) and the spare a compacted request is
+    // guaranteed beside it, so whenever any reply fits this one does.
+    let Some(input) = input else {
+        return NamedRefusal::Retry { compact: true, short_reply: true };
+    };
     // Budget only when the input fits with the budget's usual reply: then
     // the budget was the whole problem, and the same history goes again.
     let needs = u64::from(MIN_REPLY_TOKENS) + u64::from(COMPACTION_SAFETY_BUFFER);
-    NamedRefusal::Retry { compact: input.saturating_add(needs) > window }
+    NamedRefusal::Retry { compact: input.saturating_add(needs) > window, short_reply: false }
+}
+
+/// Hold a budget to the short reply (SME-422): the smallest the codebase
+/// promises is worth sending, the one the floor's `TryAnyway` arm sends —
+/// so a retry answering a refusal that named no input takes only room the
+/// request is guaranteed to leave whenever it leaves room for anything. A
+/// budget the cap doesn't cut keeps the label of what really bounded it
+/// (round 1 F1): relabelling a model-capped budget RoomLeft would make its
+/// cut-off notice blame the conversation's room for the model's own maximum.
+pub(super) fn short_reply_budget(budget: ReplyBudget) -> ReplyBudget {
+    let tokens = budget.tokens.min(MIN_USEFUL_REPLY);
+    ReplyBudget { tokens, limit: if tokens < budget.tokens { crate::api::chat::ReplyLimit::RoomLeft } else { budget.limit } }
 }
 
 /// The window a refusal naming none has the turn assume, for this turn

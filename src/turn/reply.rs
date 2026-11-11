@@ -53,7 +53,7 @@ pub(super) async fn build_request(
 
 /// Puts a reply `budget` on `request`, with the thinking it allows.
 #[cfg(feature = "server")]
-fn apply_budget(request: &mut anthropic::CreateMessageRequest, turn_model: &crate::providers::TurnModel, budget: ReplyBudget) {
+pub(super) fn apply_budget(request: &mut anthropic::CreateMessageRequest, turn_model: &crate::providers::TurnModel, budget: ReplyBudget) {
     request.max_tokens = budget.tokens;
     request.thinking = turn_model.thinking_config(request.max_tokens);
     // A budget with no room to think in turned thinking off: the
