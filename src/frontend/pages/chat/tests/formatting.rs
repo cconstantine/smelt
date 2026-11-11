@@ -6,6 +6,16 @@ fn test_format_tool_input_pretty_prints_json_object() {
     assert_eq!(format_tool_input(&input), "{\n  \"a\": 2,\n  \"b\": 3\n}");
 }
 
+/// T20 (SME-482): the divider names who asked for an on-demand compaction,
+/// and the proactive one stays plain.
+#[test]
+fn test_a_compaction_divider_names_why_it_happened() {
+    use super::super::transcript::compaction_divider_header;
+    assert_eq!(compaction_divider_header(Some("on request")), "Conversation compacted: on request");
+    assert_eq!(compaction_divider_header(Some("the model asked for it")), "Conversation compacted: the model asked for it");
+    assert_eq!(compaction_divider_header(None), "Conversation compacted");
+}
+
 #[test]
 fn test_tool_result_label_distinguishes_error_from_success() {
     assert_eq!(tool_result_label(false), "Tool result");
