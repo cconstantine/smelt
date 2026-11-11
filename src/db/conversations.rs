@@ -245,6 +245,25 @@ pub async fn set_archived(pool: &PgPool, id: i64, archived: bool) -> Result<Arch
     })
 }
 
+/// Unarchives the tree `id` belongs to (SME-480 D3: the user wrote to it,
+/// so it's in use again): clears its root's mark, the root being
+/// `agents.root_id` for an agent and `id` itself otherwise. Whether a row
+/// changed, so the caller announces only a real change.
+pub async fn unarchive_root_of(pool: &PgPool, id: i64) -> Result<bool, sqlx::Error> {
+    let changed = sqlx::query(
+        "UPDATE conversations SET archived_at = NULL
+         WHERE archived_at IS NOT NULL
+           AND id = (SELECT COALESCE(a.root_id, c.id)
+                     FROM conversations c LEFT JOIN agents a ON a.conversation_id = c.id
+                     WHERE c.id = $1)",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(changed > 0)
+}
+
 /// The conversation's parent, and whether it has children of its own: who
 /// may call `message_agent` (SME-238; it's offered to everyone). `(None, false)` for one that
 /// doesn't exist.

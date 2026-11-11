@@ -7,6 +7,7 @@ use crate::anthropic::ContentBlock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod archive;
 mod ask_parent;
 mod credentials;
 mod delete;

@@ -81,6 +81,18 @@ pub(super) async fn clear_report_owed(pool: &PgPool, conversation_id: i64) {
     }
 }
 
+/// Unarchives the tree a user's send lands in (SME-480 D3), announcing it
+/// only when the mark was there. Warn-only like the clears above: the
+/// turn runs either way, and the tree stays listed while it's open (D7).
+#[cfg(feature = "server")]
+pub(super) async fn clear_archived(pool: &PgPool, conversation_id: i64) {
+    match db::unarchive_root_of(pool, conversation_id).await {
+        Ok(true) => crate::events::publish_app(crate::events::AppEvent::ConversationsChanged),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't unarchive the tree a send landed in"),
+    }
+}
+
 /// The compaction loop's notice for the model, if the compaction just run
 /// counted `NOTICE_AT` of them (SME-414): saved grey (SME-357) by
 /// `save_notice`, which puts it on the next request too, so the model reads

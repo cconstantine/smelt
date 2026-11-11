@@ -91,6 +91,26 @@ async fn test_an_agent_is_not_archived_and_names_its_root(pool: PgPool) {
     assert_eq!(marks(&pool, root).await.0, None, "nor is its root archived by the refusal");
 }
 
+/// T4: `unarchive_root_of` on a grandchild clears its root and says so;
+/// on a tree that isn't archived, or another tree's node, it changes
+/// nothing and says so.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_unarchive_root_of_clears_the_root_from_any_depth(pool: PgPool) {
+    let root = test_conversation(&pool).await.id;
+    let kid = child(&pool, root).await;
+    let grandkid = child(&pool, kid).await;
+    let other = test_conversation(&pool).await.id;
+    archive_by_hand(&pool, root).await;
+    let other_at = archive_by_hand(&pool, other).await;
+
+    assert!(unarchive_root_of(&pool, grandkid).await.expect("unarchive"), "a row changed");
+    assert_eq!(marks(&pool, root).await.0, None, "the root is cleared from its grandchild");
+    assert_eq!(marks(&pool, other).await.0, Some(other_at), "another tree keeps its mark");
+    assert!(!unarchive_root_of(&pool, kid).await.expect("again"), "nothing to clear");
+    assert!(!unarchive_root_of(&pool, 987_654_321).await.expect("a missing id"), "nothing to clear");
+    assert!(unarchive_root_of(&pool, other).await.expect("a root itself"), "a root clears its own");
+}
+
 /// T3: the tree gives a root's `archived_at` to its child and grandchild
 /// (depth 2) and leaves another tree's nodes null.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
