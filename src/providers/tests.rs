@@ -323,4 +323,75 @@ fn test_another_service_is_matched_by_host_then_path() {
     assert_eq!(suggest("not a url"), None);
 }
 
+/// SME-423 B (P1): saving a model's row on the provider's page forgets
+/// what was learned about its window — the four learned columns go, the
+/// save's own override lands, the provider's report stays, and
+/// `window_learn` says so: source `settings`, decision `user_save`, value
+/// the number that went. Every save clears, one that touches no window
+/// field too (the ticket's Q3): the second save below writes defaults and
+/// clears again.
+#[cfg(feature = "server")]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_saving_a_models_row_forgets_what_was_learned(pool: PgPool) {
+    let provider = report_provider(&pool, "anthropic", "http://one").await;
+    crate::db::save_learned_context_window(&pool, provider.id, "http://one", "m", 32_768, "window_stop", 42, 200_000).await.expect("learn");
+    crate::db::set_provider_model_overrides(&pool, provider.id, "m", None, Some(400_000), None, None, None).await.expect("user window");
+    server::store_details(&pool, provider.id, "m", &details_with_window(16_384)).await.expect("report");
+
+    let (result, spans) = crate::telemetry::capture_spans(server::set_model_settings(
+        &pool,
+        provider.id,
+        "m",
+        ModelSettings { context_window: Some(262_144), ..Default::default() },
+    ))
+    .await;
+    result.expect("save");
+    let found = window_learn_spans(&spans);
+    let [span] = found.as_slice() else { panic!("one window_learn span for the save's clear: {found:?}") };
+    assert_eq!(span_attribute(span, "smelt.window.source"), Some(&"settings".into()));
+    assert_eq!(span_attribute(span, "smelt.window.decision"), Some(&"user_save".into()));
+    assert_eq!(span_attribute(span, "smelt.window.value"), Some(&32_768_i64.into()));
+    assert_eq!(span_attribute(span, "conversation_id"), None, "a page save has no conversation to name");
+    let row = crate::db::get_provider_model(&pool, provider.id, "m").await.expect("get").expect("row");
+    assert_eq!(
+        (row.learned_context_window, row.learned_context_window_at, row.learned_context_window_reason, row.learned_context_window_conversation),
+        (None, None, None, None),
+        "the whole learned telling went with the number"
+    );
+    assert_eq!(row.context_window, Some(262_144), "the save wrote its own override");
+    assert_eq!(row.reported_context_window, Some(16_384), "the report is nobody of this save's");
+
+    crate::db::save_learned_context_window(&pool, provider.id, "http://one", "m", 12_000, "refusal", 42, 200_000).await.expect("learn again");
+    let (result, spans) = crate::telemetry::capture_spans(server::set_model_settings(&pool, provider.id, "m", ModelSettings::default())).await;
+    result.expect("default save");
+    let found = window_learn_spans(&spans);
+    let [span] = found.as_slice() else { panic!("a save that touches nothing still clears and says so: {found:?}") };
+    assert_eq!(span_attribute(span, "smelt.window.decision"), Some(&"user_save".into()));
+    assert_eq!(span_attribute(span, "smelt.window.value"), Some(&12_000_i64.into()));
+    let row = crate::db::get_provider_model(&pool, provider.id, "m").await.expect("get").expect("row");
+    assert_eq!(row.learned_context_window, None, "every save clears, defaults included");
+}
+
+/// SME-423 B (P2): the `user_save` trace rides the clear, not the attempt
+/// — a save on a row with nothing learned writes its override and says
+/// nothing on `window_learn`.
+#[cfg(feature = "server")]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_saving_a_models_row_with_nothing_learned_traces_nothing(pool: PgPool) {
+    let provider = report_provider(&pool, "anthropic", "http://one").await;
+    crate::db::set_provider_model_overrides(&pool, provider.id, "m", None, Some(100_000), None, None, None).await.expect("row");
+
+    let (result, spans) = crate::telemetry::capture_spans(server::set_model_settings(
+        &pool,
+        provider.id,
+        "m",
+        ModelSettings { context_window: Some(262_144), ..Default::default() },
+    ))
+    .await;
+    result.expect("save");
+    assert!(window_learn_spans(&spans).is_empty(), "nothing cleared, nothing said: {:?}", window_learn_spans(&spans));
+    let row = crate::db::get_provider_model(&pool, provider.id, "m").await.expect("get").expect("row");
+    assert_eq!(row.context_window, Some(262_144), "the override was still written");
+}
+
 mod server_tests;

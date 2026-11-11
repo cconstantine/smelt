@@ -40,6 +40,8 @@ pub(in crate::sandbox) async fn wait_for_running_unspanned(
     timeout: Duration,
 ) -> Result<(), SandboxError> {
     let mut last_detail = None;
+    // The status last told the panel while the pod waits (SME-484 L1).
+    let mut told: Option<String> = None;
     let started = std::time::Instant::now();
     let waited = tokio::time::timeout(timeout, async {
         loop {
@@ -48,6 +50,16 @@ pub(in crate::sandbox) async fn wait_for_running_unspanned(
                 return Err(SandboxError::StartFailed(reason));
             }
             last_detail = pod_pending_detail(&pod);
+            // Not a silent wait (SME-484): the sandbox panel shows why the
+            // scheduler can't place it, and moves on to Pending once it's
+            // placed (L1), each change once.
+            if let Some((conversation_id, pod_id, status, node)) = pending_panel_update(&pod, told.as_deref()) {
+                told = Some(status.clone());
+                crate::events::publish(
+                    conversation_id,
+                    crate::events::ConversationEvent::SandboxPodUpdate { pod_id, status, node, terminated: false },
+                );
+            }
             if pod_phase_is_running(&pod) {
                 let took = started.elapsed();
                 if is_slow_start(took, timeout) {
@@ -121,7 +133,14 @@ pub(in crate::sandbox) fn timed_out_outcome(pod: &Pod, events: Result<&[Event], 
     if pod_phase_is_running(pod) {
         return Ok(());
     }
-    Err(SandboxError::Timeout(Some(pod_start_report(pod, events, now))))
+    let report = pod_start_report(pod, events, now);
+    // The scheduler's words first (SME-484): no node has room for the
+    // pod's requests, or none it may go to.
+    let report = match unschedulable_reason(pod) {
+        Some(reason) => format!("no node can take it now (the scheduler: {reason}); {report}"),
+        None => report,
+    };
+    Err(SandboxError::Timeout(Some(report)))
 }
 
 /// `pod`'s events, or why they couldn't be listed. The `park` Role may

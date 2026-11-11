@@ -8,6 +8,8 @@
 //! here; the replies that run into the window live beside it, in
 //! `window_stop.rs`.
 
+use super::ask_user::tool_calls_body;
+use super::window_stop::set_context_window;
 use super::*;
 use std::sync::Arc;
 
@@ -21,7 +23,7 @@ pub(super) type Answer = Result<String, (axum::http::StatusCode, String)>;
 /// `request(i)` what the (i+1)th carried. Same locking rule as
 /// `start_mock_upstream`.
 pub(super) struct RefusalMock {
-    answers: Vec<Answer>,
+    answers: std::sync::Mutex<Vec<Answer>>,
     requests: std::sync::Mutex<Vec<serde_json::Value>>,
 }
 
@@ -33,6 +35,13 @@ impl RefusalMock {
     pub(super) fn request(&self, i: usize) -> serde_json::Value {
         self.requests.lock().expect("the request log")[i].clone()
     }
+
+    /// Rewrites one arrival's answer — for the refusal a test can only
+    /// size once the provider exists (SME-423 S2 names the window it
+    /// computed, and `window_leaving` needs this mock's provider row).
+    pub(super) fn set_answer(&self, index: usize, answer: Answer) {
+        self.answers.lock().expect("the answers")[index] = answer;
+    }
 }
 
 pub(super) async fn start_refusal_mock(pool: &PgPool, answers: Vec<Answer>) -> Arc<RefusalMock> {
@@ -41,7 +50,7 @@ pub(super) async fn start_refusal_mock(pool: &PgPool, answers: Vec<Answer>) -> A
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
     let mock = Arc::new(RefusalMock {
-        answers,
+        answers: std::sync::Mutex::new(answers),
         requests: Default::default(),
     });
     let state = mock.clone();
@@ -57,13 +66,17 @@ pub(super) async fn start_refusal_mock(pool: &PgPool, answers: Vec<Answer>) -> A
                     log.push(parsed);
                     log.len() - 1
                 };
-                match &state.answers[index.min(state.answers.len() - 1)] {
+                let answer = {
+                    let answers = state.answers.lock().expect("the answers");
+                    answers[index.min(answers.len() - 1)].clone()
+                };
+                match answer {
                     Ok(body) => (
                         [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                        body.clone(),
+                        body,
                     )
                         .into_response(),
-                    Err((status, body)) => (*status, body.clone()).into_response(),
+                    Err((status, body)) => (status, body).into_response(),
                 }
             }
         }),
@@ -369,7 +382,7 @@ async fn test_a_window_too_small_for_the_system_prompt_fails_at_once(pool: PgPoo
     let error = run_turn(&pool, conversation.id, hello()).await.expect_err("no compaction can fit this");
     let error = error.to_string();
     assert!(error.contains("(1,024 tokens) is too small for smelt's system prompt and tools"), "{error}");
-    assert!(error.contains("Give the model a larger context on its server, or pick another model."), "{error}");
+    assert!(error.contains("Give the model a larger context window on its server and on its provider's page, or pick another model."), "{error}");
     assert_eq!(upstream.count(), 1, "it fails at once: no compaction, no retry");
     assert!(compaction_summaries(&pool, conversation.id).await.is_empty());
     assert_eq!(saved_learned_context_window(&pool).await, Some(1_024), "even a hopeless window is learned");
@@ -416,6 +429,79 @@ async fn test_a_retry_refused_again_ends_the_turn_and_learns_whats_smaller(pool:
     assert_eq!(saved_learned_context_window(&pool).await, Some(24_576), "the smaller window is learned from the retry's refusal");
     let model = crate::providers::resolve_turn_model(&pool, conversation.id).await.expect("resolve");
     assert_eq!(model.context_window, 24_576, "so the next turn starts at 24,576");
+}
+
+/// SME-423 C: what a failed send does to the size that was believed for
+/// it. Turn 1 measures 3,000 twice after compactions and learns tight;
+/// turn 2's 11,000-usage step triggers a compaction whose big summary
+/// keeps the rebuild under the floor, so the floor believes the measured
+/// 3,000 — and that believed send dies in a 500, proving nothing. Turn 3's
+/// first request is that floor's compaction (a small summary frees enough
+/// room to send without believing), and the send it leaves behind carries
+/// the belief forward: refused naming 12,000, that refusal disproves the
+/// 3,000 only if the size is still believed. With `believing` left set
+/// through the death, the recovery's floor (its own big summary holds the
+/// rebuild under it) reads the 12,000 as 3,000's disproof, believes nothing
+/// anymore, and the turn ends "about 12,000 tokens"; with it spent, the
+/// refusal answers itself with a believed retry and the reply arrives.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_send_that_failed_after_a_believed_size_stops_believing_it(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let step = |input: i64| Ok(with_usage(&tool_calls_body(&[("toolu_01", "todoread", serde_json::json!({}))]), input, 0, 10));
+    // Summaries big enough (≈ 1,500 chars) that a request built around
+    // them is back under the floor: turns 2 and 3 need their post-
+    // compaction rebuilds to rest on it.
+    let big = |name: &str| Ok(text_reply_body(&format!("{name}: {}", "a".repeat(1_500))));
+    let mock = start_refusal_mock(
+        &pool,
+        vec![
+            step(3_000),                                              // 1: turn 1's first step; the compaction it triggers follows
+            big("Summary one."),                                      // 2
+            step(3_000),                                              // 3: right after: 3,000 measured
+            big("Summary two."),                                      // 4: and another compaction
+            step(3_000),                                              // 5: right after: tight learned
+            Ok(with_usage(&text_reply_body("Paused."), 3_000, 0, 10)), // 6: a plain send closes turn 1
+            step(11_000),                                             // 7: turn 2: over the tight trigger, so it compacts
+            big("Summary three."),                                    // 8: the believed 3,000 dies under this
+            Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom".to_string())), // 9: the believed send died, proving nothing
+            Ok(text_reply_body("Summary four.")),                     // 10: turn 3: the floor's own compaction
+            too_long(12_000, 12_000),                                 // 11: the send it leaves behind, refused (names the window below)
+            big("Summary five."),                                     // 12: the recovery compaction
+            step(4_000),                                              // 13: the believed retry, only the fixed run gets here
+            Ok(with_usage(&text_reply_body("Done."), 4_020, 0, 10)),  // 14: the reply — 4,020 sits under the tight limit, so none follows
+        ],
+    )
+    .await;
+    // The window that makes the scenario's floors land: `window_leaving(R)`
+    // leaves R for a request of the empty conversation's size, so a rebuild
+    // leaves R minus its own messages. R=1,300 puts a big-summary rebuild
+    // (≈ 420 tokens) under the floor's 1,024 and a small-summary rebuild
+    // (≈ 85) over it; and with this `alone` the window stays under
+    // `MIN_REPLY_TOKENS`, where the trigger is 0 until turn 1's tight pair
+    // moves it to the limit (≈ 10,030): the 3,000- and 4,000-token steps
+    // that follow it send, the 11,000 one compacts. It must also stay
+    // under `after + buffer +
+    // floor + 12,000`'s sum against 12,000 believed: at about 16,100 the
+    // floor believes 3,000 and refuses to believe 12,000.
+    let window = window_leaving(&pool, conversation.id, 1_300).await;
+    set_context_window(&pool, window as i32, None).await;
+    mock.set_answer(10, too_long(12_000, window));
+
+    run_turn(&pool, conversation.id, hello()).await.expect("turn 1 fits");
+    let died = run_turn(&pool, conversation.id, hello())
+        .await
+        .expect_err("the believed send died");
+    assert!(died.to_string().contains("boom"), "the turn dies where the send did: {died}");
+
+    let third = run_turn(&pool, conversation.id, hello()).await;
+    assert!(
+        third.is_ok(),
+        "the refusal followed a death, not the believed send's own budget — it disproves nothing: {}",
+        third.err().map(|e| e.to_string()).unwrap_or_default()
+    );
+    assert_eq!(last_reply(&db::list_messages(&pool, conversation.id).await.expect("messages")).as_deref(), Some("Done."));
 }
 
 

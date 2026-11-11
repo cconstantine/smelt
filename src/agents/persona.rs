@@ -140,8 +140,120 @@ pub(crate) async fn snapshot(
             "model": persona.model,
             "tools": persona.tools,
             "credentials": persona.credentials,
+            // What its pod asks of its node (SME-484): `run_start`
+            // makes the conversation's `pod_resources` match it.
+            "resources": persona.resources,
         }),
     })
+}
+
+/// The resources (SME-484) the persona `name` in the parent's checkout
+/// `dir` asks for, as `pod_resources` JSON, read before the child exists:
+/// the child's clone starts its first pod, which binds its claims to a
+/// node, so that pod must already ask for the room the persona needs. The
+/// child's own snapshot is still the authority (`size_first_pod`). For a
+/// no-ref start a persona file that doesn't parse refuses the start: the
+/// child would read the same file at the same commit. A ref start reads
+/// it best-effort, and an error there only leaves the defaults.
+pub(crate) async fn parent_resources(
+    pool: &PgPool,
+    checkout: &dyn ChildCheckout,
+    parent: i64,
+    dir: &str,
+    name: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let rel = persona_file(name);
+    let Some(file) = checkout.parent_file(pool, parent, dir, &rel).await? else {
+        return Ok(None);
+    };
+    let persona = crate::personas::parse(&rel, &file.content, file.file_bytes.max(0) as u64)?;
+    persona
+        .resources
+        .map(|resources| serde_json::to_value(resources).map_err(|e| format!("couldn't record the persona's resources: {e}")))
+        .transpose()
+}
+
+/// Sizes the child's storage for the persona in its fresh checkout
+/// (SME-484, M1): the clone's first pod asked for `pod_resources` as the
+/// parent's tree had them, and bound its claims to that pod's node. When
+/// the file at the child's ref asks for other room, the row is rewritten
+/// and the storage dropped and cloned again, so the next pod is placed
+/// with its requests rather than restarted on a node that may have no
+/// room for them. A file that doesn't parse changes nothing here: the
+/// snapshot reports it. The note, for its parent, says what was made
+/// again; a failed reprovision fails the start.
+pub(crate) async fn size_first_pod(
+    pool: &PgPool,
+    checkout: &dyn ChildCheckout,
+    child: i64,
+    repo: &db::ConversationRepo,
+    target: &crate::git::CloneTarget,
+    name: &str,
+) -> Result<Option<String>, String> {
+    let rel = persona_file(name);
+    let Some(file) = checkout.read_file(pool, child, &repo.dir, &rel).await? else {
+        return Ok(None);
+    };
+    let Ok(persona) = crate::personas::parse(&rel, &file.content, file.file_bytes.max(0) as u64) else {
+        return Ok(None);
+    };
+    let wanted = persona
+        .resources
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|e| format!("couldn't record the persona's resources: {e}"))?;
+    let stored = db::conversation_pod_resources(pool, child)
+        .await
+        .map_err(|e| format!("couldn't read the agent's pod resources: {e}"))?;
+    if wanted == stored {
+        return Ok(None);
+    }
+    db::set_conversation_pod_resources(pool, child, wanted.as_ref())
+        .await
+        .map_err(|e| format!("couldn't record the agent's pod resources: {e}"))?;
+    checkout.reprovision(pool, child, repo, target).await?;
+    // The commit the first clone found: the row's, re-read.
+    let commit = db::get_conversation_repo(pool, repo.id).await.ok().flatten().and_then(|r| r.commit_sha);
+    let at = commit.as_deref().map(|c| format!(" at {}", c.get(..7).unwrap_or(c))).unwrap_or_default();
+    let path = format!("{}/{}/{rel}", crate::sandbox::WORKSPACE_DIR, repo.dir);
+    Ok(Some(format!(
+        "{}'s persona{at} asks for other resources than its first pod had, so its storage and clone were made \
+         again on a node with room for them",
+        label(child, crate::agents::persona_label(&path).as_deref())
+    )))
+}
+
+/// The backstop for `size_first_pod` (SME-484): makes the child's
+/// `pod_resources` its persona snapshot's when they still differ — the
+/// ref moved between the two clones, and its persona with it — by
+/// rewriting the row and restarting the child's pod in place, before the
+/// child is woken. The note, for its parent, says so. A child with no
+/// persona keeps what it was created with: none.
+pub(crate) async fn match_pod_resources(
+    pool: &PgPool,
+    checkout: &dyn ChildCheckout,
+    child: i64,
+    persona: Option<&db::PersonaSnapshot>,
+) -> Result<Option<String>, String> {
+    let Some(persona) = persona else {
+        return Ok(None);
+    };
+    let wanted = persona.settings.get("resources").filter(|r| !r.is_null()).cloned();
+    let stored = db::conversation_pod_resources(pool, child)
+        .await
+        .map_err(|e| format!("couldn't read the agent's pod resources: {e}"))?;
+    if wanted == stored {
+        return Ok(None);
+    }
+    db::set_conversation_pod_resources(pool, child, wanted.as_ref())
+        .await
+        .map_err(|e| format!("couldn't record the agent's pod resources: {e}"))?;
+    checkout.restart_pod(pool, child).await?;
+    let at = persona.commit.as_deref().map(|c| format!(" at {}", c.get(..7).unwrap_or(c))).unwrap_or_default();
+    Ok(Some(format!(
+        "{}'s persona{at} asks its pod for other resources than its first pod had, so its pod was restarted with them",
+        label(child, crate::agents::persona_label(&persona.path).as_deref())
+    )))
 }
 
 /// The rules note for a child's persona snapshot: which of its

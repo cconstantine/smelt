@@ -123,14 +123,8 @@ async fn counting_mock(pool: &PgPool, window: Option<u32>, plans: Vec<(i64, i64)
     mock
 }
 
-/// The window at which, with this conversation's fixed content, a compacted
-/// request leaves `room` tokens for a reply.
-async fn window_leaving(pool: &PgPool, id: i64, room: u64) -> u32 {
-    u32::try_from(alone(pool, id).await + u64::from(COMPACTION_SAFETY_BUFFER) + room).expect("a window")
-}
-
-/// The estimate of this conversation's fixed content: the system prompt
-/// and tools.
+/// The estimate of this conversation's fixed content, the system prompt
+/// and tools, as `window_leaving` counts it.
 async fn alone(pool: &PgPool, id: i64) -> u64 {
     let model = crate::providers::resolve_turn_model(pool, id).await.expect("a model");
     let (request, _) = build_request(pool, id, &model, None, &[], false, 0).await.expect("a request");

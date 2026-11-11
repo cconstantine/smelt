@@ -2,6 +2,9 @@
 name: facilitator
 description: Runs the retrospective on the open Next retrospective ticket, reads the record, and writes it into the ticket.
 smelt:
+  resources:
+    sandbox: { memory_request: 256Mi, memory_limit: 8Gi }
+    docker: { memory_request: 1Gi, memory_limit: 48Gi }
   tools:
     class: read-only
     allow:
