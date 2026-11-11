@@ -377,3 +377,104 @@ fn test_the_console_writer_scrubs_urls_from_every_line() {
     assert!(logged.contains("split url http://h/mcp/s/<redacted>/mcp?… end"), "the split line: {logged}");
     assert!(logged.ends_with("cut off for url (https://h/x?…)"), "the tail flushed, newline-free: {logged}");
 }
+
+/// Class-level end to end (SME-392): the mechanism `kube_client`'s warning
+/// demonstrates — a dependency's WARN under an smelt INFO span is exported
+/// as that span's event — must scrub what it exports, because `capture()`
+/// wraps its test exporter the way `init()` wraps the production one.
+#[tokio::test]
+async fn test_a_dependency_warning_under_a_smelt_span_exports_no_url_key() {
+    let ((), spans) = capture_spans(async {
+        in_span(tracing::info_span!("work"), async {
+            tracing::warn!(
+                target: "rmcp::transport::streamable_http_client",
+                "fail to get common stream: Client error: error sending request for url \
+                 (https://mcp.example.com/mcp/s/TEST-KEY-392-PATH-0001/mcp?apiKey=TEST-KEY-392): connection refused"
+            );
+        })
+        .await;
+    })
+    .await;
+    let exported = format!("{spans:?}");
+    assert!(
+        spans.iter().flat_map(|span| span.events.iter()).count() > 0,
+        "the warning is exported: {exported}"
+    );
+    assert!(!exported.contains("TEST-KEY-392"), "the export carries the key: {exported}");
+    assert!(
+        exported.contains("connection refused") && exported.contains("mcp.example.com"),
+        "the useful text survives: {exported}"
+    );
+}
+
+/// The export sink's decorator against a hand-built span: every string form
+/// a dependency's text rides — an event's name (its message), string
+/// attributes, a `Value::Array` of strings, and a failed status's
+/// description — leaves scrubbed; the span name and the non-string
+/// attributes don't move.
+#[tokio::test]
+async fn test_the_export_scrubs_event_names_attributes_and_status() {
+    use opentelemetry::trace::{
+        Event as OtelEvent, SpanContext, SpanId, SpanKind, Status, TraceFlags, TraceState, TraceId,
+    };
+    use opentelemetry::{Array, InstrumentationScope, KeyValue, Value};
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SpanData, SpanEvents, SpanExporter, SpanLinks};
+
+    let url = "http://127.0.0.1:9/mcp/s/TEST-KEY-392-PATH-0001/mcp?apiKey=TEST-KEY-392";
+    let line_740 = format!(
+        "fail to get common stream: Client error: HTTP status client error (404 Not Found) for url ({url})"
+    );
+    let line_135 = format!(
+        "worker quit with fatal: Transport channel closed, when Client(reqwest::Error {{ kind: Request, url: \"{url}\" }})"
+    );
+    let now = std::time::SystemTime::now();
+    let mut events = SpanEvents::default();
+    events.events.push(OtelEvent::new(line_740.clone(), now, vec![KeyValue::new("message", line_135.clone())], 0));
+    let span = SpanData {
+        span_context: SpanContext::new(
+            TraceId::INVALID,
+            SpanId::INVALID,
+            TraceFlags::default(),
+            true,
+            TraceState::default(),
+        ),
+        parent_span_id: SpanId::INVALID,
+        parent_span_is_remote: false,
+        span_kind: SpanKind::Client,
+        name: "mcp connect".into(),
+        start_time: now,
+        end_time: now,
+        attributes: vec![
+            KeyValue::new("message", line_135.clone()),
+            KeyValue::new("attempt", 2_i64),
+            KeyValue::new("urls", Value::Array(Array::String(vec![url.to_string().into()]))),
+        ],
+        dropped_attributes_count: 0,
+        events,
+        links: SpanLinks::default(),
+        status: Status::error(format!("failed for url ({url}): connection refused")),
+        instrumentation_scope: InstrumentationScope::builder("smelt-test").build(),
+    };
+
+    let sink = InMemorySpanExporter::default();
+    SpanExporter::export(&UrlScrubbed::new(sink.clone()), vec![span]).await.expect("export");
+    let spans = sink.get_finished_spans().expect("the sink's spans");
+    let exported = format!("{spans:?}");
+    assert!(!exported.contains("TEST-KEY-392"), "{exported}");
+    assert!(
+        exported.contains("fail to get common stream") && exported.contains("worker quit with fatal"),
+        "the words survive: {exported}"
+    );
+    assert!(
+        exported.contains("127.0.0.1:9") && exported.contains("connection refused"),
+        "the host and reason survive: {exported}"
+    );
+    let [span] = spans.as_slice() else { panic!("one span: {spans:?}") };
+    assert_eq!(span.name, "mcp connect", "the span name is smelt's own and stays");
+    assert!(
+        span.attributes.iter().any(|kv| kv.key.as_str() == "attempt" && kv.value == Value::from(2_i64)),
+        "non-strings untouched: {:?}",
+        span.attributes
+    );
+    assert!(matches!(span.status, Status::Error { .. }), "{:?}", span.status);
+}

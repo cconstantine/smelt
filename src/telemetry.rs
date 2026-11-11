@@ -207,6 +207,83 @@ impl<W: std::io::Write> ScrubbingWriter<W> {
     }
 }
 
+/// The export sink's URL scrubber (SME-392): wraps the OTLP exporter and
+/// rewrites every string that leaves — each span event's name and string
+/// attribute values (an event's message rides its name, a dependency's
+/// error text its attributes), the span's own string attribute values,
+/// and a failed status's description — through [`scrub_urls`] before
+/// delegating. Span *names* stay: they're smelt's own; a dependency's
+/// text rides events. smelt's own lines were scrubbed or redacted at the
+/// source long before this — `scrub_urls` is idempotent, so they come out
+/// unchanged — and whatever a dependency quotes (reqwest's `for url (…)`
+/// with a key in the query or path is what filed this) loses the secret
+/// and keeps the sentence.
+#[derive(Debug, Clone)]
+pub(crate) struct UrlScrubbed<E> {
+    inner: E,
+}
+
+impl<E> UrlScrubbed<E> {
+    pub(crate) fn new(inner: E) -> Self {
+        Self { inner }
+    }
+}
+
+impl<E> opentelemetry_sdk::trace::SpanExporter for UrlScrubbed<E>
+where
+    E: opentelemetry_sdk::trace::SpanExporter,
+{
+    fn export(
+        &self,
+        batch: Vec<opentelemetry_sdk::trace::SpanData>,
+    ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send {
+        self.inner.export(batch.into_iter().map(scrub_span_data).collect())
+    }
+
+    fn shutdown_with_timeout(&self, timeout: std::time::Duration) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.inner.shutdown_with_timeout(timeout)
+    }
+
+    fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.inner.force_flush()
+    }
+
+    fn set_resource(&mut self, resource: &opentelemetry_sdk::Resource) {
+        self.inner.set_resource(resource)
+    }
+}
+
+/// `span` with every string an OTLP reader would read scrubbed. Built by
+/// rewriting in place: the strings are `Cow`s and rewriting a borrowed one
+/// allocates, which is the point.
+fn scrub_span_data(mut span: opentelemetry_sdk::trace::SpanData) -> opentelemetry_sdk::trace::SpanData {
+    span.attributes = span.attributes.into_iter().map(scrub_key_value).collect();
+    for event in span.events.events.iter_mut() {
+        event.name = std::borrow::Cow::Owned(scrub_urls(&event.name));
+        event.attributes = std::mem::take(&mut event.attributes).into_iter().map(scrub_key_value).collect();
+    }
+    span.status = match span.status {
+        opentelemetry::trace::Status::Error { description } => {
+            opentelemetry::trace::Status::error(scrub_urls(&description))
+        }
+        status => status,
+    };
+    span
+}
+
+fn scrub_key_value(pair: opentelemetry::KeyValue) -> opentelemetry::KeyValue {
+    let value = match pair.value {
+        opentelemetry::Value::String(text) => opentelemetry::Value::String(scrub_urls(text.as_ref()).into()),
+        opentelemetry::Value::Array(opentelemetry::Array::String(texts)) => {
+            opentelemetry::Value::Array(opentelemetry::Array::String(
+                texts.into_iter().map(|text| scrub_urls(text.as_ref()).into()).collect(),
+            ))
+        }
+        value => value,
+    };
+    opentelemetry::KeyValue::new(pair.key, value)
+}
+
 /// Runs `future` in `span` and ends the span's export when the future
 /// finishes or is dropped, whoever still holds the span. Use it instead of
 /// `Instrument::instrument` for every exported span: hyper-util spawns each
@@ -363,7 +440,10 @@ pub(crate) fn init() -> Option<TelemetryGuard> {
                 .with_attributes(resource_attributes(env))
                 .build(),
         )
-        .with_batch_exporter(exporter)
+        // SME-392: what leaves for Tempo/Loki passes the same URL scrub as the
+    // console — a dependency's WARN event under an smelt span exports its
+    // raw text, and rmcp's transport failures quote the whole request URL.
+    .with_batch_exporter(UrlScrubbed::new(exporter))
         .build();
     registry.with(export_layer(provider.tracer("smelt"))).init();
     Some(TelemetryGuard { provider })
@@ -448,7 +528,11 @@ async fn capture<F: std::future::Future>(
     static KEEP_THE_DISPATCHER_LIST: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
     KEEP_THE_DISPATCHER_LIST.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
     let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
-    let provider = SdkTracerProvider::builder().with_simple_exporter(exporter.clone()).build();
+    // The same scrubbing decorator as production (SME-392): what the
+    // capture's spans hold is what Tempo would get.
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(UrlScrubbed::new(exporter.clone()))
+        .build();
     let console = console.map(|buffer| {
         let writer = Console(buffer);
         // The same scrubbing writer as production (SME-392): what the
