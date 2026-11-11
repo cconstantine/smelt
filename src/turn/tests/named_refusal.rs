@@ -360,10 +360,11 @@ async fn test_a_compacted_retry_isnt_refused_for_a_shortfall_the_summary_replace
 /// every send died and the conversation could never get a reply. Now: with
 /// no count named, nothing vouches for the room an estimate-sized budget
 /// takes, so the recovery compacts, and the retry answering the refusal
-/// takes only a short reply. Sized so the red is the wedge — `W` is 512
+/// takes only a short reply. Sized so the red is the wedge — `W` is 510
 /// past the budget-only gate on the estimate — and so the cap bites: the
 /// retry's fresh count leaves room for `MIN_USEFUL_REPLY`, not for the
-/// ≥ 16,384 estimate-sized budget (floor-clamped, as the recorded red shows).
+/// 16,384 estimate-sized budget of the recorded red — the mock model's own
+/// reply cap clamping it down (see the sizing note below).
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_refusal_that_names_only_its_window_gets_a_reply(pool: PgPool) {
     let _guard = lock_turn_tests();
@@ -387,11 +388,14 @@ async fn test_a_refusal_that_names_only_its_window_gets_a_reply(pool: PgPool) {
     db::create_message(&pool, conversation.id, "assistant", &[anthropic::ContentBlock::Text { text: "Noted.".to_string() }])
         .await
         .expect("seed the ack");
-    // W: 512 past today's budget-only gate on the estimate, so the red is
+    // W: 510 past today's budget-only gate on the estimate, so the red is
     // the wedge. Plan 2 counts the retry's request 11,000 tokens short of
     // the window: room for a 1,024-token reply, not for the estimate-sized
-    // budget the wedge sent twice — 16,384, the floor its raw ~16,900 clamps
-    // to (reply_budget never emits below MIN_REPLY_TOKENS), as the red shows.
+    // budget the wedge sent twice — 16,384: the raw room, 20,992 − 2 −
+    // 4,096 = 16,894, clamped by the mock model's own reply cap
+    // (`UNKNOWN_OUTPUT_CAP` — the fallback an anthropic-kind model with no
+    // reported max gets); the MIN_REPLY_TOKENS floor never fires: the raw
+    // room sits above it.
     let window = u32::try_from(a + m + 20_992).expect("a window");
     *mock.window.lock().expect("the window") = Some(window);
     *mock.plans.lock().expect("the plans") = vec![
