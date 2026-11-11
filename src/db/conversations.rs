@@ -198,6 +198,53 @@ pub async fn set_paused(pool: &PgPool, id: i64, paused: bool) -> Result<(), sqlx
     Ok(())
 }
 
+/// What `set_archived` did (SME-480).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ArchiveOutcome {
+    /// The top-level conversation, as it now is.
+    Done(Conversation),
+    NotFound,
+    /// `id` is an agent: only its root is archived (D4).
+    NotTopLevel { root_id: i64 },
+}
+
+/// Archives (`archived`) or unarchives a top-level conversation (SME-480).
+/// Idempotent: a second archive keeps the first time, and `updated_at`
+/// is never touched, so the list keeps its order (D5). A child is
+/// refused with its root's id, found by walking `parent_id` up.
+pub async fn set_archived(pool: &PgPool, id: i64, archived: bool) -> Result<ArchiveOutcome, sqlx::Error> {
+    let done = sqlx::query_as::<_, Conversation>(
+        "UPDATE conversations
+         SET archived_at = CASE WHEN $2 THEN COALESCE(archived_at, now()) ELSE NULL END
+         WHERE id = $1 AND parent_id IS NULL
+         RETURNING *",
+    )
+    .bind(id)
+    .bind(archived)
+    .fetch_optional(pool)
+    .await?;
+    if let Some(conversation) = done {
+        return Ok(ArchiveOutcome::Done(conversation));
+    }
+    // No top-level row: missing, or an agent, whose root is the top of its
+    // `parent_id` chain.
+    let root = sqlx::query_scalar::<_, i64>(
+        "WITH RECURSIVE up(id, parent_id) AS (
+             SELECT id, parent_id FROM conversations WHERE id = $1
+             UNION
+             SELECT c.id, c.parent_id FROM conversations c JOIN up ON c.id = up.parent_id
+         )
+         SELECT id FROM up WHERE parent_id IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(match root {
+        Some(root_id) if root_id != id => ArchiveOutcome::NotTopLevel { root_id },
+        _ => ArchiveOutcome::NotFound,
+    })
+}
+
 /// The conversation's parent, and whether it has children of its own: who
 /// may call `message_agent` (SME-238; it's offered to everyone). `(None, false)` for one that
 /// doesn't exist.
