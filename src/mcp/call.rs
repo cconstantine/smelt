@@ -1,6 +1,9 @@
 //! Calling an MCP tool.
 
 use super::*;
+// SME-386 M1's key-shape rule moved to `telemetry` in SME-392, where
+// `scrub_urls` and this share it.
+use crate::telemetry::looks_like_a_key;
 
 /// How long one tool call may take. A call holds the turn, and the
 /// conversation's lock, while it waits (SME-51 B8).
@@ -470,13 +473,6 @@ fn names_a_credential(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     ["key", "token", "secret", "auth", "password", "passwd", "pwd", "credential", "signature"].iter().any(|word| name.contains(word))
         || name.starts_with("api")
-}
-
-/// Whether a URL query value, seen on its own, could be a credential: 16
-/// characters or more, with both letters and digits, as API keys are and
-/// tool names and flags aren't.
-fn looks_like_a_key(value: &str) -> bool {
-    value.chars().count() >= 16 && value.chars().any(|c| c.is_ascii_digit()) && value.chars().any(|c| c.is_ascii_alphabetic())
 }
 
 /// Every string under a key that names a token or secret, anywhere in a

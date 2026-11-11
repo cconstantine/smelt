@@ -69,7 +69,8 @@ pub(crate) fn resource_attributes(env: impl Fn(&str) -> Option<String>) -> Vec<K
 }
 
 /// `text` with every URL in it cut to its scheme, host and path: userinfo,
-/// query and fragment can hold a key or a token. A cut query shows as `?…`.
+/// query and fragment can hold a key or a token. A cut query shows as `?…`,
+/// and a key-shaped path segment (SME-392) as `<redacted>`.
 pub(crate) fn scrub_urls(text: &str) -> String {
     static URL: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r#"[A-Za-z][A-Za-z0-9+.-]*://[^\s()<>"'`]+"#).ok()
@@ -87,6 +88,16 @@ pub(crate) fn scrub_urls(text: &str) -> String {
         let address = match address.find('/') {
             Some(slash) => {
                 let (authority, path) = address.split_at(slash);
+                // The path keeps its words (`mcp`, `s`, a version) and loses
+                // its key: `…/mcp/s/<key>/mcp` is a configured URL shape
+                // (SME-386 M1), and reqwest's error text quotes the whole
+                // path — rmcp prints that text into its own lines
+                // (SME-392). `<redacted>` re-scrubs to itself.
+                let path = path
+                    .split('/')
+                    .map(|segment| if looks_like_a_key(segment) { "<redacted>" } else { segment })
+                    .collect::<Vec<&str>>()
+                    .join("/");
                 format!("{}{path}", authority.rsplit('@').next().unwrap_or(authority))
             }
             None => address.rsplit('@').next().unwrap_or(address).to_string(),
@@ -107,6 +118,170 @@ pub(crate) fn mark_error(span: &Span, message: &str) {
     span.record("otel.status_code", "ERROR");
     // After the code: the description is what sets the status's text.
     span.record("otel.status_description", description.as_str());
+}
+
+/// Whether a URL query value or path segment, seen on its own, could be a
+/// credential: 16 characters or more, with both letters and digits, as
+/// API keys are and tool names, path words and flags aren't. SME-386 M1's
+/// rule for a configured server's URL, moved here for SME-392 so
+/// `scrub_urls` and `mcp::call::redact_secrets` share one rule.
+pub(crate) fn looks_like_a_key(value: &str) -> bool {
+    value.chars().count() >= 16 && value.chars().any(|c| c.is_ascii_digit()) && value.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// Wraps a `fmt` layer's `MakeWriter` so every line it writes passes
+/// through [`scrub_urls`] (SME-392): rmcp's own WARN/ERROR lines carry
+/// reqwest's error text, which quotes the full request URL — query and
+/// key-shaped path segment included — and a dependency's lines are not
+/// scrubbed at their source as smelt's are. The `fmt` layer escapes
+/// newlines inside field values, so one line is one event; the EnvFilter
+/// still runs first, this only rewrites the text.
+#[derive(Clone)]
+pub(crate) struct Scrubbed<M>(M);
+
+impl<M> Scrubbed<M> {
+    pub(crate) fn new(inner: M) -> Self {
+        Scrubbed(inner)
+    }
+}
+
+impl<'a, M> tracing_subscriber::fmt::MakeWriter<'a> for Scrubbed<M>
+where
+    M: tracing_subscriber::fmt::MakeWriter<'a>,
+{
+    type Writer = ScrubbingWriter<M::Writer>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        ScrubbingWriter { inner: self.0.make_writer(), line: Vec::new() }
+    }
+}
+
+/// The line-buffering writer behind [`Scrubbed`].
+pub(crate) struct ScrubbingWriter<W: std::io::Write> {
+    inner: W,
+    line: Vec<u8>,
+}
+
+impl<W: std::io::Write> std::io::Write for ScrubbingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        for byte in buf {
+            if *byte == b'\n' {
+                self.write_line(b"\n")?;
+            } else {
+                self.line.push(*byte);
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // Keep any line in progress: every event ends at a newline, so a
+        // partial line here is fmt mid-write, not a line to release. Drop
+        // writes what is left.
+        self.inner.flush()
+    }
+}
+
+impl<W: std::io::Write> Drop for ScrubbingWriter<W> {
+    fn drop(&mut self) {
+        // A tail that never saw its newline is still scrubbed, and stays
+        // newline-free: what arrived is what goes, with URLs cut.
+        if !self.line.is_empty() {
+            let line = std::mem::take(&mut self.line);
+            let _ = self.write_scrubbed(&line, b"");
+        }
+    }
+}
+
+impl<W: std::io::Write> ScrubbingWriter<W> {
+    fn write_line(&mut self, terminator: &[u8]) -> std::io::Result<()> {
+        let line = std::mem::take(&mut self.line);
+        self.write_scrubbed(&line, terminator)
+    }
+
+    fn write_scrubbed(&mut self, line: &[u8], terminator: &[u8]) -> std::io::Result<()> {
+        // fmt writes UTF-8; lossy keeps a line a dependency garbled whole.
+        let text = String::from_utf8_lossy(line);
+        self.inner.write_all(scrub_urls(&text).as_bytes())?;
+        self.inner.write_all(terminator)
+    }
+}
+
+/// The export sink's URL scrubber (SME-392): wraps the OTLP exporter and
+/// rewrites every string that leaves — each span event's name and string
+/// attribute values (an event's message rides its name, a dependency's
+/// error text its attributes), the span's own string attribute values,
+/// and a failed status's description — through [`scrub_urls`] before
+/// delegating. Span *names* stay: they're smelt's own; a dependency's
+/// text rides events. smelt's own lines were scrubbed or redacted at the
+/// source long before this — `scrub_urls` is idempotent, so they come out
+/// unchanged — and whatever a dependency quotes (reqwest's `for url (…)`
+/// with a key in the query or path is what filed this) loses the secret
+/// and keeps the sentence.
+#[derive(Debug, Clone)]
+pub(crate) struct UrlScrubbed<E> {
+    inner: E,
+}
+
+impl<E> UrlScrubbed<E> {
+    pub(crate) fn new(inner: E) -> Self {
+        Self { inner }
+    }
+}
+
+impl<E> opentelemetry_sdk::trace::SpanExporter for UrlScrubbed<E>
+where
+    E: opentelemetry_sdk::trace::SpanExporter,
+{
+    fn export(
+        &self,
+        batch: Vec<opentelemetry_sdk::trace::SpanData>,
+    ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send {
+        self.inner.export(batch.into_iter().map(scrub_span_data).collect())
+    }
+
+    fn shutdown_with_timeout(&self, timeout: std::time::Duration) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.inner.shutdown_with_timeout(timeout)
+    }
+
+    fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.inner.force_flush()
+    }
+
+    fn set_resource(&mut self, resource: &opentelemetry_sdk::Resource) {
+        self.inner.set_resource(resource)
+    }
+}
+
+/// `span` with every string an OTLP reader would read scrubbed. Built by
+/// rewriting in place: the strings are `Cow`s and rewriting a borrowed one
+/// allocates, which is the point.
+fn scrub_span_data(mut span: opentelemetry_sdk::trace::SpanData) -> opentelemetry_sdk::trace::SpanData {
+    span.attributes = span.attributes.into_iter().map(scrub_key_value).collect();
+    for event in span.events.events.iter_mut() {
+        event.name = std::borrow::Cow::Owned(scrub_urls(&event.name));
+        event.attributes = std::mem::take(&mut event.attributes).into_iter().map(scrub_key_value).collect();
+    }
+    span.status = match span.status {
+        opentelemetry::trace::Status::Error { description } => {
+            opentelemetry::trace::Status::error(scrub_urls(&description))
+        }
+        status => status,
+    };
+    span
+}
+
+fn scrub_key_value(pair: opentelemetry::KeyValue) -> opentelemetry::KeyValue {
+    let value = match pair.value {
+        opentelemetry::Value::String(text) => opentelemetry::Value::String(scrub_urls(text.as_ref()).into()),
+        opentelemetry::Value::Array(opentelemetry::Array::String(texts)) => {
+            opentelemetry::Value::Array(opentelemetry::Array::String(
+                texts.into_iter().map(|text| scrub_urls(text.as_ref()).into()).collect(),
+            ))
+        }
+        value => value,
+    };
+    opentelemetry::KeyValue::new(pair.key, value)
 }
 
 /// Runs `future` in `span` and ends the span's export when the future
@@ -237,9 +412,14 @@ impl Drop for TelemetryGuard {
 /// layer. A failure to build the exporter is logged and leaves tracing off.
 pub(crate) fn init() -> Option<TelemetryGuard> {
     let env = |key: &str| std::env::var(key).ok();
-    let console = tracing_subscriber::fmt::layer().with_filter(tracing_subscriber::EnvFilter::new(
-        crate::log_filter_directives(&env("RUST_LOG").unwrap_or_default()),
-    ));
+    // SME-392: every console line passes `scrub_urls` on its way out, so a
+    // dependency's own log line (rmcp's transport failures quote the whole
+    // request URL) shows its diagnosis without its key.
+    let console = tracing_subscriber::fmt::layer()
+        .with_writer(Scrubbed::new(std::io::stdout))
+        .with_filter(tracing_subscriber::EnvFilter::new(
+            crate::log_filter_directives(&env("RUST_LOG").unwrap_or_default()),
+        ));
     let registry = tracing_subscriber::registry().with(console);
     if otel_endpoint(env).is_none() {
         registry.init();
@@ -260,7 +440,10 @@ pub(crate) fn init() -> Option<TelemetryGuard> {
                 .with_attributes(resource_attributes(env))
                 .build(),
         )
-        .with_batch_exporter(exporter)
+        // SME-392: what leaves for Tempo/Loki passes the same URL scrub as the
+    // console — a dependency's WARN event under an smelt span exports its
+    // raw text, and rmcp's transport failures quote the whole request URL.
+    .with_batch_exporter(UrlScrubbed::new(exporter))
         .build();
     registry.with(export_layer(provider.tracer("smelt"))).init();
     Some(TelemetryGuard { provider })
@@ -345,11 +528,17 @@ async fn capture<F: std::future::Future>(
     static KEEP_THE_DISPATCHER_LIST: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
     KEEP_THE_DISPATCHER_LIST.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
     let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
-    let provider = SdkTracerProvider::builder().with_simple_exporter(exporter.clone()).build();
+    // The same scrubbing decorator as production (SME-392): what the
+    // capture's spans hold is what Tempo would get.
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(UrlScrubbed::new(exporter.clone()))
+        .build();
     let console = console.map(|buffer| {
         let writer = Console(buffer);
+        // The same scrubbing writer as production (SME-392): what the
+        // console tests see is what the console gets.
         tracing_subscriber::fmt::layer()
-            .with_writer(move || writer.clone())
+            .with_writer(Scrubbed::new(move || writer.clone()))
             .with_ansi(false)
             .with_filter(LevelFilter::TRACE)
     });
@@ -365,273 +554,4 @@ async fn capture<F: std::future::Future>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use opentelemetry::trace::{SpanKind, Status};
-    use std::collections::HashMap;
-
-    fn env_of(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let vars: HashMap<String, String> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        move |key| vars.get(key).cloned()
-    }
-
-    fn attribute<'a>(attributes: &'a [KeyValue], key: &str) -> Option<&'a opentelemetry::Value> {
-        attributes.iter().find(|kv| kv.key.as_str() == key).map(|kv| &kv.value)
-    }
-
-    #[test]
-    fn test_tracing_is_off_unless_the_endpoint_is_set() {
-        assert_eq!(otel_endpoint(env_of(&[])), None);
-        assert_eq!(otel_endpoint(env_of(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "")])), None);
-        // Review 2: as the exporter reads them, only an empty value is unset,
-        // so a blank traces variable doesn't hide the general one from smelt
-        // while the exporter still takes the blank one.
-        assert_eq!(
-            otel_endpoint(env_of(&[
-                ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "  "),
-                ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://tempo:4318"),
-            ])),
-            Some("  ".to_string())
-        );
-        assert_eq!(
-            otel_endpoint(env_of(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "http://tempo:4318")])),
-            Some("http://tempo:4318".to_string())
-        );
-        // The exporter takes the traces-only variable too (review 1).
-        assert_eq!(
-            otel_endpoint(env_of(&[("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://tempo:4318/v1/traces")])),
-            Some("http://tempo:4318/v1/traces".to_string())
-        );
-    }
-
-    #[test]
-    fn test_the_resource_names_the_service_database_and_port_without_credentials() {
-        let attributes = resource_attributes(env_of(&[
-            ("DATABASE_URL", "postgres://smelt:hunter2-secret@postgres:5432/smelt_check_42?sslmode=disable"),
-            ("PORT", "8081"),
-        ]));
-        assert_eq!(attribute(&attributes, "service.name"), Some(&"smelt".into()));
-        assert_eq!(attribute(&attributes, "smelt.database"), Some(&"smelt_check_42".into()));
-        assert_eq!(attribute(&attributes, "smelt.port"), Some(&8081_i64.into()));
-        assert!(attribute(&attributes, "service.version").is_some(), "{attributes:?}");
-        let all = format!("{attributes:?}");
-        assert!(!all.contains("hunter2"), "the password leaked: {all}");
-        assert!(!all.contains("postgres:5432"), "the host leaked: {all}");
-    }
-
-    #[test]
-    fn test_the_resource_takes_the_service_name_from_the_environment_and_defaults_the_port() {
-        let attributes = resource_attributes(env_of(&[("OTEL_SERVICE_NAME", "smelt-dev")]));
-        assert_eq!(attribute(&attributes, "service.name"), Some(&"smelt-dev".into()));
-        assert_eq!(attribute(&attributes, "smelt.port"), Some(&8080_i64.into()));
-        assert_eq!(attribute(&attributes, "smelt.database"), None);
-    }
-
-    #[test]
-    fn test_database_name_is_only_the_path() {
-        assert_eq!(database_name("postgres://u:p@h/smelt").as_deref(), Some("smelt"));
-        assert_eq!(database_name("postgres://h:5432/").as_deref(), None);
-        assert_eq!(database_name("not a url").as_deref(), None);
-    }
-
-    #[tokio::test]
-    async fn test_an_http_span_has_the_path_but_never_the_query() {
-        let ((), spans) = capture_spans(async {
-            let request = http::Request::get("/oauth/mcp-callback/3?code=SECRET&state=X")
-                .header("cookie", "session=SECRET")
-                .body(())
-                .expect("request");
-            let span = make_http_span(&request);
-            let response = http::Response::builder().status(404).body(()).expect("response");
-            on_http_response(&response, std::time::Duration::from_millis(1), &span);
-        })
-        .await;
-        let [span] = spans.as_slice() else { panic!("one span: {spans:?}") };
-        assert_eq!(span.name, "GET /oauth/mcp-callback/3");
-        assert_eq!(span.span_kind, SpanKind::Server);
-        assert_eq!(attribute(&span.attributes, "url.path"), Some(&"/oauth/mcp-callback/3".into()));
-        assert_eq!(attribute(&span.attributes, "http.request.method"), Some(&"GET".into()));
-        assert_eq!(attribute(&span.attributes, "http.response.status_code"), Some(&404_i64.into()));
-        assert_eq!(span.status, Status::Unset, "a 404 isn't the server failing");
-        assert!(!format!("{span:?}").contains("SECRET"), "{span:?}");
-    }
-
-    /// A turn the request started (`start_turn`) and a connection it opened
-    /// hold the request's span: it still exports at its response, and an
-    /// event stream's span doesn't wait for the tab to close.
-    #[tokio::test]
-    async fn test_an_http_span_still_held_elsewhere_exports_at_its_response() {
-        let mut held = None;
-        let ((), spans) = capture_spans(async {
-            let request = http::Request::get("/api/conversations/1/events").body(()).expect("request");
-            let span = make_http_span(&request);
-            held = Some(span.clone());
-            let response = http::Response::builder().status(200).body(()).expect("response");
-            on_http_response(&response, std::time::Duration::from_millis(1), &span);
-        })
-        .await;
-        assert!(held.is_some());
-        let names: Vec<_> = spans.iter().map(|span| span.name.to_string()).collect();
-        assert_eq!(names, ["GET /api/conversations/1/events"]);
-    }
-
-    #[tokio::test]
-    async fn test_a_5xx_response_marks_its_span_failed() {
-        let ((), spans) = capture_spans(async {
-            let request = http::Request::post("/api/x").body(()).expect("request");
-            let span = make_http_span(&request);
-            let response = http::Response::builder().status(500).body(()).expect("response");
-            on_http_response(&response, std::time::Duration::from_millis(1), &span);
-        })
-        .await;
-        let [span] = spans.as_slice() else { panic!("one span: {spans:?}") };
-        assert!(matches!(span.status, Status::Error { .. }), "{:?}", span.status);
-    }
-
-    /// A library task that outlives the work (hyper-util spawns each pooled
-    /// connection `in_current_span`, rmcp its service loop) holds the span
-    /// open: it must still export when the work ends.
-    #[tokio::test]
-    async fn test_a_span_held_by_a_lingering_task_still_exports_when_its_work_ends() {
-        let held = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let holder = held.clone();
-        let ((), spans) = capture_spans(async move {
-            in_span(tracing::info_span!("work"), async move {
-                *holder.lock().expect("lock") = Some(Span::current());
-            })
-            .await;
-        })
-        .await;
-        assert!(held.lock().expect("lock").is_some(), "the span is still held");
-        let names: Vec<_> = spans.iter().map(|span| span.name.to_string()).collect();
-        assert_eq!(names, ["work"]);
-    }
-
-    #[tokio::test]
-    async fn test_a_span_whose_work_is_dropped_still_exports() {
-        let ((), spans) = capture_spans(async {
-            let held = std::sync::Arc::new(std::sync::Mutex::new(None));
-            let holder = held.clone();
-            let work = in_span(tracing::info_span!("work"), async move {
-                *holder.lock().expect("lock") = Some(Span::current());
-                std::future::pending::<()>().await
-            });
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(10), work).await;
-            std::mem::forget(held);
-        })
-        .await;
-        let names: Vec<_> = spans.iter().map(|span| span.name.to_string()).collect();
-        assert_eq!(names, ["work"]);
-    }
-
-    /// tracing-core keeps one dispatcher list for the whole process, and
-    /// with only one registered it asks the *current thread's* dispatcher
-    /// instead. With a capture's subscriber the only one registered, a
-    /// callsite another test's thread hit first was cached as "never", and
-    /// a capture missed its span (the chat-span test, in a full run). A
-    /// span first made on another thread is still captured here.
-    #[tokio::test]
-    async fn test_a_callsite_first_hit_on_another_thread_is_still_captured() {
-        fn fresh() -> Span {
-            tracing::info_span!("first_hit_elsewhere")
-        }
-        let ((), spans) = capture_spans(async {
-            std::thread::spawn(|| drop(fresh())).join().expect("the other thread");
-            in_span(fresh(), async {}).await;
-        })
-        .await;
-        let names: Vec<_> = spans.iter().map(|span| span.name.to_string()).collect();
-        assert_eq!(names, ["first_hit_elsewhere"]);
-    }
-
-    /// What a library spawns from work run `outside_spans` (rmcp's service
-    /// loop, which captures `Span::current()`) holds none of the caller's
-    /// spans, and a span it makes is a root.
-    #[tokio::test]
-    async fn test_work_outside_spans_sees_no_current_span() {
-        let ((current_is_none, ()), spans) = capture_spans(async {
-            in_span(tracing::info_span!("caller"), async {
-                let current_is_none = outside_spans(async { Span::current().is_none() }).await;
-                outside_spans(async { tracing::info_span!("library").in_scope(|| {}) }).await;
-                (current_is_none, ())
-            })
-            .await
-        })
-        .await;
-        assert!(current_is_none, "the work saw the caller's span");
-        let library = spans.iter().find(|span| span.name == "library").expect("the library's span");
-        assert_eq!(library.parent_span_id, opentelemetry::trace::SpanId::INVALID, "a root");
-    }
-
-    /// A dependency's own INFO spans (dioxus-signals instruments every
-    /// signal it makes) aren't exported, but its warnings inside smelt's
-    /// spans are.
-    #[tokio::test]
-    async fn test_only_smelts_info_spans_and_everyones_warnings_are_exported() {
-        let ((), spans) = capture_spans(async {
-            tracing::info_span!(target: "dioxus_signals::signal", "new_maybe_sync").in_scope(|| {});
-            in_span(tracing::info_span!("work"), async {
-                tracing::info!(target: "kube_client", "a dependency's chatter");
-                tracing::warn!(target: "kube_client", "a dependency's warning");
-            })
-            .await;
-        })
-        .await;
-        let names: Vec<_> = spans.iter().map(|span| span.name.to_string()).collect();
-        assert_eq!(names, ["work"]);
-        let events: Vec<_> = spans[0].events.iter().map(|event| event.name.to_string()).collect();
-        assert_eq!(events, ["a dependency's warning"]);
-    }
-
-    /// Review 1: an error's text quotes URLs (reqwest's `for url (…)`, smelt's
-    /// own `failed to load {url}`), and a query or userinfo can hold a key.
-    #[test]
-    fn test_urls_in_text_lose_their_userinfo_query_and_fragment() {
-        let scrubbed = scrub_urls(
-            "error sending request for url (http://me:pw@127.0.0.1:1/mcp?apiKey=SECRET-KEY#frag); \
-             then https://example.com/a/b?token=SECRET2 and wss://h/x?y=SECRET3.",
-        );
-        assert!(!scrubbed.contains("SECRET"), "{scrubbed}");
-        assert!(!scrubbed.contains("me:pw"), "{scrubbed}");
-        assert!(scrubbed.contains("(http://127.0.0.1:1/mcp?…)"), "{scrubbed}");
-        assert!(scrubbed.contains("https://example.com/a/b?…"), "{scrubbed}");
-        assert!(scrubbed.ends_with("wss://h/x?…."), "{scrubbed}");
-        assert_eq!(scrub_urls("no url here: 404 at /a?b"), "no url here: 404 at /a?b");
-    }
-
-    #[tokio::test]
-    async fn test_mark_error_scrubs_urls() {
-        let ((), spans) = capture_spans(async {
-            let span = tracing::info_span!(
-                "work",
-                otel.status_code = tracing::field::Empty,
-                otel.status_description = tracing::field::Empty,
-            );
-            mark_error(&span, "failed for url (http://h/mcp?apiKey=SECRET-KEY)");
-        })
-        .await;
-        let [span] = spans.as_slice() else { panic!("one span: {spans:?}") };
-        assert!(!format!("{:?}", span.status).contains("SECRET"), "{:?}", span.status);
-    }
-
-    #[tokio::test]
-    async fn test_mark_error_sets_the_status_cut_to_the_limit_and_logs_nothing() {
-        let long = "x".repeat(STATUS_DESCRIPTION_LIMIT + 100);
-        let logged = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-        let ((), spans) = capture_spans_with_console(logged.clone(), async {
-            let span = tracing::info_span!(
-                "work",
-                otel.status_code = tracing::field::Empty,
-                otel.status_description = tracing::field::Empty,
-            );
-            mark_error(&span, &format!("{long}é"));
-        })
-        .await;
-        let [span] = spans.as_slice() else { panic!("one span: {spans:?}") };
-        let Status::Error { description } = &span.status else { panic!("{:?}", span.status) };
-        assert_eq!(description.chars().count(), STATUS_DESCRIPTION_LIMIT, "{description}");
-        assert!(span.events.is_empty(), "no event: {:?}", span.events);
-        let logged = String::from_utf8(logged.lock().expect("lock").clone()).expect("utf-8");
-        assert!(!logged.contains("ERROR") && !logged.contains("xxx"), "nothing logged: {logged}");
-    }
-}
+mod tests;
