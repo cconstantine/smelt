@@ -32,8 +32,9 @@ async fn drain_until(console: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>, marker
 }
 
 /// The line that fires on every "server can't be reached" — rmcp's
-/// `transport/worker.rs:135`, at ERROR, so smelt's default `RUST_LOG=error`
-/// prints it: rmcp formats reqwest's Debug into it, url field included. The
+/// `transport/worker.rs:135` (citation: external), at ERROR, so smelt's
+/// default `RUST_LOG=error` prints it: rmcp formats reqwest's Debug into
+/// it, url field included. The
 /// line and its host must survive the console scrubbing — the fix hides the
 /// key, not the diagnosis — and the key must reach neither sink.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
@@ -69,7 +70,8 @@ async fn test_an_unreachable_servers_key_never_reaches_the_console_or_the_export
 }
 
 /// The site the ticket names: rmcp's common-stream GET
-/// (`transport/streamable_http_client.rs:740`) prints reqwest's Display
+/// (`transport/streamable_http_client.rs:740`, citation: external) prints
+/// reqwest's Display
 /// (`for url (…)` and all) when the server answered `initialize` with an
 /// `Mcp-Session-Id` response header — without it rmcp never opens the
 /// common stream — and the GET then answers non-2xx. 404, not 405: 405
