@@ -144,14 +144,18 @@ pub(super) enum Asker {
     /// `POST /api/conversations/{id}/compact`, from the chat's Compact
     /// button or a script: one route, so one reason.
     Request,
+    /// The conversation passed its persona's `smelt.compact_at`, this many
+    /// tokens (SME-493).
+    Ceiling(u64),
 }
 
 #[cfg(feature = "server")]
 impl Asker {
-    fn reason(self) -> &'static str {
+    fn reason(self) -> String {
         match self {
-            Asker::Model => "the model asked for it",
-            Asker::Request => "on request",
+            Asker::Model => "the model asked for it".to_string(),
+            Asker::Request => "on request".to_string(),
+            Asker::Ceiling(at) => format!("it passed its persona's {}-token ceiling", super::overflow::grouped(at)),
         }
     }
 }
@@ -254,7 +258,7 @@ pub(super) async fn compact_on_request(
     by: Asker,
     note: Option<String>,
 ) -> ServerFnResult<Compacted> {
-    in_compaction_span(pool, conversation_id, turn_model, slot, Some(by.reason().to_string()), note.as_deref()).await
+    in_compaction_span(pool, conversation_id, turn_model, slot, Some(by.reason()), note.as_deref()).await
 }
 
 /// `compact` in its `compaction` span; its model call is its child (SME-137).

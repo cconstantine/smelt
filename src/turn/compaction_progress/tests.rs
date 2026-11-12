@@ -492,3 +492,153 @@ fn test_a_failed_send_stops_believing_the_measured_size() {
     progress.refused(Some(120_000));
     assert_eq!(progress.after, Some(120_000), "a refusal straight after a believed send still shows the size out of date");
 }
+
+// --- SME-493: a persona's ceiling ---
+
+/// The ceiling the U tests set, well under `TRIGGER`.
+const AT: u64 = 40_000;
+
+/// A record with `AT` set and `steps` model steps taken.
+fn with_ceiling(steps: u32) -> CompactionProgress {
+    let mut progress = CompactionProgress::default();
+    progress.sync(WINDOW);
+    progress.set_ceiling(Some(AT));
+    for _ in 0..steps {
+        progress.step_taken();
+    }
+    progress
+}
+
+/// U1: due only with a ceiling, at or over it, and two steps clear of
+/// the last compaction.
+#[test]
+fn test_the_ceiling_is_due_only_over_it_and_two_steps_after_a_compaction() {
+    let mut none = CompactionProgress::default();
+    none.sync(WINDOW);
+    for _ in 0..3 {
+        none.step_taken();
+    }
+    assert_eq!(none.ceiling_due(Some(AT * 2)), None, "no ceiling set");
+    let progress = with_ceiling(2);
+    assert_eq!(progress.ceiling_due(Some(AT - 1)), None, "under it");
+    assert_eq!(progress.ceiling_due(None), None, "nothing measured");
+    assert_eq!(progress.ceiling_due(Some(AT)), Some(AT), "at it");
+    assert_eq!(with_ceiling(1).ceiling_due(Some(AT * 2)), None, "one step since the last compaction");
+    let mut progress = with_ceiling(5);
+    progress.compacted(WINDOW);
+    progress.step_taken();
+    assert_eq!(progress.ceiling_due(Some(AT * 2)), None, "one step since this compaction");
+    progress.step_taken();
+    assert_eq!(progress.ceiling_due(Some(AT * 2)), Some(AT), "two");
+}
+
+/// U2: a compaction whose next reply measures within `MIN_ROOM_TO_WORK`
+/// of the ceiling spends it: compacting can't get under it.
+#[test]
+fn test_a_compaction_that_leaves_the_seat_near_its_ceiling_spends_it() {
+    let mut progress = with_ceiling(2);
+    progress.compacted(WINDOW);
+    progress.measured(&input(AT - MIN_ROOM_TO_WORK + 1), WINDOW);
+    for _ in 0..4 {
+        progress.step_taken();
+    }
+    for size in [AT, AT * 2, TRIGGER - 1] {
+        assert_eq!(progress.ceiling_due(Some(size)), None, "spent, at {size}");
+    }
+    assert_eq!(step(&mut progress, TRIGGER), CompactionStep::Compact, "the window's trigger still guards the window");
+}
+
+/// U3: a later compaction of any kind measured under the ceiling re-arms it.
+#[test]
+fn test_a_later_compaction_measured_under_the_ceiling_rearms_it() {
+    let mut progress = with_ceiling(2);
+    progress.compacted(WINDOW);
+    progress.measured(&input(AT), WINDOW);
+    progress.step_taken();
+    progress.step_taken();
+    assert_eq!(progress.ceiling_due(Some(AT)), None, "spent");
+    progress.compacted(WINDOW);
+    // Exactly the margin (an eighth of the ceiling, round 1 L1) under it.
+    progress.measured(&input(AT - AT / 8), WINDOW);
+    progress.step_taken();
+    progress.step_taken();
+    assert_eq!(progress.ceiling_due(Some(AT)), Some(AT), "re-armed");
+}
+
+/// U7 (round 1 L1): the no-loop margin scales with the ceiling, an eighth
+/// of it, never under `MIN_ROOM_TO_WORK`. A floor just under the ceiling
+/// (112,000 against 120,000) spends it, where the window's flat 4,096
+/// would have kept it armed and paid for a summary every few steps.
+#[test]
+fn test_a_floor_within_an_eighth_of_the_ceiling_spends_it() {
+    for (at, floor) in [(120_000, 112_000), (AT, AT - 4_500)] {
+        let mut progress = CompactionProgress::default();
+        progress.sync(WINDOW * 2);
+        progress.set_ceiling(Some(at));
+        progress.step_taken();
+        progress.step_taken();
+        progress.compacted(WINDOW * 2);
+        progress.measured(&input(floor), WINDOW * 2);
+        for _ in 0..3 {
+            progress.step_taken();
+        }
+        assert_eq!(progress.ceiling_due(Some(at + 3_000)), None, "a floor of {floor} spends a ceiling of {at}");
+    }
+    // A small ceiling keeps the window's margin: an eighth of 16,000 is
+    // under 4,096.
+    let mut progress = CompactionProgress::default();
+    progress.sync(WINDOW);
+    progress.set_ceiling(Some(16_000));
+    progress.compacted(WINDOW);
+    progress.measured(&input(16_000 - MIN_ROOM_TO_WORK + 1), WINDOW);
+    progress.step_taken();
+    progress.step_taken();
+    assert_eq!(progress.ceiling_due(Some(20_000)), None, "within 4,096 of a small ceiling");
+}
+
+/// U4: a failed ceiling compaction turns it off until the next turn's start.
+#[test]
+fn test_a_failed_ceiling_compaction_waits_for_the_next_turn() {
+    let mut progress = with_ceiling(2);
+    progress.ceiling_failed();
+    progress.step_taken();
+    assert_eq!(progress.ceiling_due(Some(AT * 2)), None, "off for this turn");
+    progress.turn_started();
+    progress.set_ceiling(Some(AT));
+    assert_eq!(progress.ceiling_due(Some(AT * 2)), Some(AT), "the next turn tries again");
+}
+
+/// U5: a window change keeps the ceiling and clears its spent mark.
+#[test]
+fn test_a_window_change_keeps_the_ceiling_and_rearms_it() {
+    let mut progress = with_ceiling(2);
+    progress.compacted(WINDOW);
+    progress.measured(&input(AT), WINDOW);
+    progress.sync(WINDOW * 2);
+    progress.step_taken();
+    progress.step_taken();
+    assert_eq!(progress.ceiling_due(Some(AT)), Some(AT), "kept, and armed again");
+}
+
+/// U6: a seat whose every step lands it over its ceiling, asked before
+/// each call as the turn loop asks: its ceiling compactions come two
+/// steps apart, so they never count as the loop, and past `END_AT` of
+/// them the turn isn't stopped.
+#[test]
+fn test_ceiling_compactions_never_count_as_the_loop() {
+    let mut progress = with_ceiling(0);
+    let mut compactions = 0;
+    for _ in 0..4 * END_AT {
+        assert_eq!(step(&mut progress, 1_000), CompactionStep::Go, "the window's trigger stays quiet");
+        if progress.ceiling_due(Some(AT * 2)).is_some() {
+            progress.compacted(WINDOW);
+            compactions += 1;
+        }
+        progress.step_taken();
+        // Each step's reply measures well under the ceiling.
+        progress.measured(&input(1_000), WINDOW);
+    }
+    assert!(compactions > END_AT, "{compactions} ceiling compactions");
+    assert_eq!(progress.thrash, 0);
+    assert!(!progress.is_thrashing());
+}

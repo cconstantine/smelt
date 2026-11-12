@@ -33,6 +33,7 @@ fn test_a_full_persona_file_parses_with_its_body_as_written() {
             tools: None,
             credentials: None,
             resources: None,
+            compact_at: None,
         }
     );
 }
@@ -431,6 +432,31 @@ fn test_a_bad_resources_quantity_is_a_persona_error() {
     let text = "---\nname: developer\ndescription: d\nsmelt:\n  resources:\n    docker: { memory_request: 12GB }\n---\n";
     let error = parse_err(DEV, text);
     assert!(error.contains("smelt.resources.docker.memory_request") && error.contains("12GB"), "{error}");
+}
+
+// --- SME-493: smelt.compact_at ---
+
+/// P1: a token count, as written; absent is no ceiling.
+#[test]
+fn test_smelt_compact_at_parses_a_token_count_and_absent_is_none() {
+    let text = "---\nname: developer\ndescription: d\nsmelt:\n  compact_at: 200000\n---\n";
+    assert_eq!(parse_ok(DEV, text).compact_at, Some(200_000));
+    assert_eq!(parse_ok(DEV, "---\nname: developer\ndescription: d\nsmelt:\n  model: m\n---\n").compact_at, None);
+    assert_eq!(parse_ok(DEV, "---\nname: developer\ndescription: d\n---\n").compact_at, None);
+}
+
+/// P2: zero, a string (YAML 1.2 reads `200_000` as one) and a negative
+/// number are each serde's type or value error at the key's line, not an
+/// unknown field.
+#[test]
+fn test_a_compact_at_that_isnt_a_positive_count_is_refused_at_its_line() {
+    for (value, wording) in [("0", "invalid value"), ("200_000", "invalid type"), ("-5", "invalid type")] {
+        let text = format!("---\nname: developer\ndescription: d\nsmelt:\n  compact_at: {value}\n---\n");
+        let error = parse_err(DEV, &text);
+        assert!(error.contains(wording) && error.contains(value), "{value}: {error}");
+        assert!(error.contains("compact_at") && error.contains("line 5"), "{value}: {error}");
+        assert!(!error.contains("unknown field"), "{value}: {error}");
+    }
 }
 
 /// A request is checked against the persona's own limit where it sets

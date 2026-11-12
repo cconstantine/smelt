@@ -1,6 +1,6 @@
 # Developer
 Part of the [development process](../development-process.md).
-smelt's machine persona file is `.agents/personas/developer.md`; its `smelt.tools` encode what this page says the persona may do — its deny says in writing that it never merges.
+smelt's machine persona file is `.agents/personas/developer.md`; its `smelt.tools` encode what this page says the persona may do — its deny says in writing that it never merges. Its `smelt.compact_at: 200000` compacts the seat before any call past 200,000 tokens (SME-493): Developers were about 80% of the estimated Claude Code tokens on 2026-11-11, every step re-reading contexts of up to 653k on a 1M window (the SME-477 retrospective).
 
 
 Works one **Todo** ticket through to **In Review**:
