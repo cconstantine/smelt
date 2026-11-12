@@ -7,7 +7,9 @@
 # so in the log and stops the running go processes (TERM). A go is
 # running at a check only if its `rchar` can be read and it isn't a
 # zombie (SME-511): one that has ended but isn't reaped yet is no go to
-# stop, and its reads can't be taken. What they read is
+# stop, and its reads can't be taken. A check that sees a running go for
+# the first time gives no verdict (idle stays as it was): it didn't
+# measure that go across the interval. What they read is
 # each one's own `rchar` (sockets and files alike), counted per process
 # from one check to the next: a process seen for the first time, or one
 # gone, adds nothing. Never the pod's network counters: on a busy node
@@ -57,23 +59,30 @@ scan() {
 }
 # What $tree read since the last check ($delta), per process, and the
 # gos running now ($live): a go whose `rchar` was read and whose State
-# isn't Z or X (or gone).
+# isn't Z or X (or gone). $fresh is set when one of $live had no reading
+# at the last check.
 reads() {
-  delta=0 now_reads= live=
+  delta=0 now_reads= live= fresh=
   for p in $tree; do
     field rchar: "/proc/$p/io"
     r=$value
     [ -n "$r" ] || continue
     now_reads="$now_reads $p:$r"
+    seen=
     for e in $last_reads; do
-      if [ "${e%%:*}" = "$p" ] && [ "$r" -gt "${e#*:}" ]; then delta=$((delta + r - ${e#*:})); fi
+      [ "${e%%:*}" = "$p" ] || continue
+      seen=1
+      if [ "$r" -gt "${e#*:}" ]; then delta=$((delta + r - ${e#*:})); fi
     done
     case " $gos " in
       *" $p "*)
         field State: "/proc/$p/status"
         case $value in
           '' | Z* | X*) ;;
-          *) live="$live $p" ;;
+          *)
+            live="$live $p"
+            [ -n "$seen" ] || fresh=1
+            ;;
         esac
         ;;
     esac
@@ -91,6 +100,8 @@ while kill -0 "$install" 2>/dev/null; do
   reads
   if [ -z "$live" ] || [ "$now_size" != "$last_size" ] || [ "$delta" -ge 5120 ]; then
     idle=0
+  elif [ -n "$fresh" ]; then
+    :
   else
     idle=$((idle + 5))
   fi

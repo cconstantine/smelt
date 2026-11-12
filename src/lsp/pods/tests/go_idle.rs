@@ -221,6 +221,20 @@ fn test_a_silent_go_that_keeps_reading_is_left_alone() {
     assert!(ran.watchdogs.is_empty(), "the watchdog outlived the install: {:?}", ran.watchdogs);
 }
 
+/// (f) A go first seen at a check gets no verdict there (SME-511): (e)'s
+/// go, started 2 s after the install, after the watchdog's first scan.
+/// The 5 s check is the first to see it, so it has no reading to compare
+/// with; that check must not count as quiet, or a go reading 4 KB a
+/// second is stopped 5 s in.
+#[test]
+fn test_a_go_that_starts_late_and_keeps_reading_is_left_alone() {
+    let go = "printf '%4096s\\n' x > \"$HOME/line\"; i=0; while [ $i -lt 10 ]; do read -r l < \"$HOME/line\"; sleep 1; i=$((i+1)); done";
+    let ran = run_pod_script("late", go, "sleep 2; go install x@v1", &[], Duration::from_secs(25));
+    assert_eq!(ran.rc.as_deref(), Some("0"), "{:?}", ran.log);
+    assert!(!ran.log.contains("smelt: go"), "{:?}", ran.log);
+    assert!(ran.watchdogs.is_empty(), "the watchdog outlived the install: {:?}", ran.watchdogs);
+}
+
 /// (g) A go that has ended is never stopped, nor said to be (SME-511, CI's
 /// red): its parent never reaps it (the install execs a `sleep`), so the
 /// ended go stays a zombie across two checks, its `io` unreadable or
