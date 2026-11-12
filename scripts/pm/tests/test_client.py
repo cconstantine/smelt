@@ -42,6 +42,8 @@ class Allowlist(FakeCase):
             (["messages", "7"], [("GET", c + "/messages")]),
             (["question", "7"], [("GET", c + "/question")]),
             (["model", "7"], [("GET", c + "/model")]),
+            (["persona", "7"], [("GET", c + "/persona")]),
+            (["persona-set", "7", "smelt:developer"], [("POST", c + "/persona"), ("GET", c + "/persona")]),
             (["pods"], [("GET", "/api/pods"), ("GET", "/api/pods/commands")]),
             (["providers"], [("GET", "/api/providers")]),
             (["where"], [("GET", "/api/build-id")]),
