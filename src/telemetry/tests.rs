@@ -478,3 +478,75 @@ async fn test_the_export_scrubs_event_names_attributes_and_status() {
     );
     assert!(matches!(span.status, Status::Error { .. }), "{:?}", span.status);
 }
+
+/// SME-483: a span *link*'s attribute values can carry the same text an
+/// event's can — a linked span's error text, a retry URL — and
+/// `scrub_span_data` must scrub them like everything else, leaving the
+/// non-string attributes, the link's span context and its dropped count
+/// alone. (No live producer emits links today — tracing-opentelemetry 0.34
+/// has no `follows_from` support — so this is future-proofing, per the
+/// ticket.)
+#[tokio::test]
+async fn test_the_export_scrubs_span_link_attributes() {
+    use opentelemetry::trace::{
+        Link, SpanContext, SpanId, SpanKind, Status, TraceFlags, TraceState, TraceId,
+    };
+    use opentelemetry::{Array, InstrumentationScope, KeyValue, Value};
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SpanData, SpanEvents, SpanExporter, SpanLinks};
+
+    let url = "http://127.0.0.1:9/mcp/s/TEST-KEY-392-PATH-0001/mcp?apiKey=TEST-KEY-392";
+    let now = std::time::SystemTime::now();
+    let context = SpanContext::new(
+        TraceId::INVALID,
+        SpanId::INVALID,
+        TraceFlags::default(),
+        true,
+        TraceState::default(),
+    );
+    // `SpanLinks` is `#[non_exhaustive]`, so build the default and push:
+    // what `add_link` does.
+    let mut links = SpanLinks::default();
+    links.links.push(Link::new(
+        context.clone(),
+        vec![
+            KeyValue::new("message", format!("retried after url ({url})")),
+            KeyValue::new("urls", Value::Array(Array::String(vec![url.to_string().into()]))),
+            KeyValue::new("attempt", 2_i64),
+        ],
+        0,
+    ));
+    let span = SpanData {
+        span_context: context,
+        parent_span_id: SpanId::INVALID,
+        parent_span_is_remote: false,
+        span_kind: SpanKind::Client,
+        name: "link carrier".into(),
+        start_time: now,
+        end_time: now,
+        attributes: vec![],
+        dropped_attributes_count: 0,
+        events: SpanEvents::default(),
+        links,
+        status: Status::Unset,
+        instrumentation_scope: InstrumentationScope::builder("smelt-test").build(),
+    };
+
+    let sink = InMemorySpanExporter::default();
+    SpanExporter::export(&UrlScrubbed::new(sink.clone()), vec![span]).await.expect("export");
+    let spans = sink.get_finished_spans().expect("the sink's spans");
+    let exported = format!("{spans:?}");
+    assert!(!exported.contains("TEST-KEY-392"), "the export carries the key: {exported}");
+    let [span] = spans.as_slice() else { panic!("one span: {spans:?}") };
+    let [link] = span.links.links.as_slice() else { panic!("one link: {:?}", span.links) };
+    let attributes = format!("{:?}", link.attributes);
+    assert!(
+        attributes.contains("http://127.0.0.1:9/mcp/s/<redacted>/mcp?…"),
+        "the shape survives: {attributes}"
+    );
+    assert!(
+        link.attributes.iter().any(|kv| kv.key.as_str() == "attempt" && kv.value == Value::from(2_i64)),
+        "non-strings untouched: {:?}",
+        link.attributes
+    );
+    assert_eq!(link.dropped_attributes_count, 0, "{link:?}");
+}

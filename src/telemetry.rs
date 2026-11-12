@@ -211,7 +211,8 @@ impl<W: std::io::Write> ScrubbingWriter<W> {
 /// rewrites every string that leaves — each span event's name and string
 /// attribute values (an event's message rides its name, a dependency's
 /// error text its attributes), the span's own string attribute values,
-/// and a failed status's description — through [`scrub_urls`] before
+/// its links' string attribute values (SME-483), and a failed status's
+/// description — through [`scrub_urls`] before
 /// delegating. Span *names* stay: they're smelt's own; a dependency's
 /// text rides events. smelt's own lines were scrubbed or redacted at the
 /// source long before this — `scrub_urls` is idempotent, so they come out
@@ -261,6 +262,13 @@ fn scrub_span_data(mut span: opentelemetry_sdk::trace::SpanData) -> opentelemetr
     for event in span.events.events.iter_mut() {
         event.name = std::borrow::Cow::Owned(scrub_urls(&event.name));
         event.attributes = std::mem::take(&mut event.attributes).into_iter().map(scrub_key_value).collect();
+    }
+    // SME-483: a link's attribute values can carry the same text an
+    // event's, so they scrub the same way. No live producer emits links
+    // today (tracing-opentelemetry 0.34 has no `follows_from` support),
+    // so this is the future-proofing the ticket asked for.
+    for link in span.links.links.iter_mut() {
+        link.attributes = std::mem::take(&mut link.attributes).into_iter().map(scrub_key_value).collect();
     }
     span.status = match span.status {
         opentelemetry::trace::Status::Error { description } => {
