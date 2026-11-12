@@ -535,7 +535,7 @@ fn run_turn_loop<'c>(
             // bound, settled after their results are saved (SME-307).
             streak.after_calls(ran.unknown.as_deref()).map_err(ServerFnError::new)?;
             // The model's `compact_context`, now the whole pass is saved (SME-482).
-            compact_if_asked(pool, conversation_id, turn_model, slot.held(), &mut last_known_usage, &mut persisted, &mut pending_new_content).await?;
+            compact_if_asked(pool, conversation_id, turn_model, slot, &mut last_known_usage, &mut persisted, &mut pending_new_content).await?;
             if ends {
                 return Ok(persisted);
             }

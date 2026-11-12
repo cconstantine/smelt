@@ -22,11 +22,14 @@ pub(crate) fn request_compaction(conversation_id: i64, note: Option<String>) -> 
 /// `compact_context` asked for it. The last saved message is the pass's
 /// results, so the boundary is always safe. A failed summary fails the
 /// turn as a proactive compaction's does, with the history as it was.
+/// The tool pass may have given the turn's slot to its own live agent
+/// (SME-354 B6), so it's taken back first: the summary call never goes
+/// out beside the child's on a limited provider (round 1 M1).
 pub(super) async fn compact_if_asked(
     pool: &PgPool,
     conversation_id: i64,
     turn_model: &mut crate::providers::TurnModel,
-    slot: anthropic::stream::SlotPolicy<'_>,
+    slot: &mut TurnSlot,
     last_known_usage: &mut Option<anthropic::TokenUsage>,
     persisted: &mut Vec<Message>,
     pending_new_content: &mut Vec<anthropic::ContentBlock>,
@@ -34,7 +37,8 @@ pub(super) async fn compact_if_asked(
     let Some(note) = with_compaction_progress(conversation_id, CompactionProgress::take_request) else {
         return Ok(());
     };
-    match compact_on_request(pool, conversation_id, turn_model, slot, Asker::Model, note).await? {
+    slot.refresh(turn_model).await;
+    match compact_on_request(pool, conversation_id, turn_model, slot.held(), Asker::Model, note).await? {
         Compacted::Done => {
             let window = turn_model.context_window;
             with_compaction_progress(conversation_id, |p| p.compacted(window));
