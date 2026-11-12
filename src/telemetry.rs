@@ -298,21 +298,28 @@ fn scrub_key_value(pair: opentelemetry::KeyValue) -> opentelemetry::KeyValue {
 /// the default hook writes a panic message quoting a configured MCP URL
 /// (an `expect` on an rmcp call, say) to stderr with its key intact.
 ///
-/// The hook keeps the default hook's message shape and stderr destination
-/// — [`write_scrubbed_panic_report`] is that shape — and only scrubs the
-/// text. It must never panic itself: while a hook runs a panic cannot
-/// unwind (std's panic-count guard aborts with "panic in a panic hook"
-/// before unwinding, so not even `catch_unwind` here could catch one), so
-/// the hook runs no user code and takes no lock beyond stderr's own. The
-/// backtrace it prints is always the full one when `RUST_BACKTRACE` asks
-/// for one; the default hook's short/full distinction is std-internal and
-/// not reproducible on stable. Two more departures from std, neither of
-/// which matters here (no deployment sets either variable):
-/// `Backtrace::capture` also honours `RUST_LIB_BACKTRACE`, which std's
-/// hook ignores; and the hook prints its note or backtrace where std
-/// prints none (a `force_no_backtrace` panic, such as one in a destructor
-/// during cleanup), and none on a double panic, where std forces a full
-/// backtrace.
+/// The hook keeps the default hook's stderr destination and, but for the
+/// departures below, its message shape — [`write_scrubbed_panic_report`]
+/// is that shape — and only scrubs the text. It must never panic itself:
+/// while a hook runs a panic cannot unwind (std's panic-count guard aborts
+/// with "panic in a panic hook" before unwinding, so not even
+/// `catch_unwind` here could catch one), so the hook runs no user code and
+/// takes no lock beyond stderr's own.
+///
+/// Where it departs from the default hook (rust 1.96, the toolchain smelt
+/// builds with):
+/// - std's header is `thread '<name>' (<tid>) panicked at …`; this hook
+///   leaves out the `(<tid>)`, the OS thread id, which needs a platform
+///   call, so a scrubbed report just lacks it.
+/// - The backtrace it prints is always the full one when `RUST_BACKTRACE`
+///   asks for one; std's short/full distinction is std-internal and not
+///   reproducible on stable.
+/// - `Backtrace::capture` also honours `RUST_LIB_BACKTRACE`, which std's
+///   hook ignores (no deployment sets it).
+/// - It prints its note or backtrace where std prints none (a
+///   `force_no_backtrace` panic, such as one in a destructor during
+///   cleanup), and none on a double panic, where std forces a full
+///   backtrace (release aborts on the first panic, so never reaches one).
 pub(crate) fn install_scrubbed_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         let name = std::thread::current();
@@ -346,8 +353,10 @@ pub(crate) fn install_scrubbed_panic_hook() {
 static FIRST_PANIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// `out` gets the default hook's report of a panic in `name` at `location`
-/// with `payload`: a lead newline (the default hook's, so the report
-/// starts a line), `thread '<name>' panicked at <file>:<line>:<col>:`,
+/// with `payload`, less the `(<tid>)` std's header carries (see
+/// [`install_scrubbed_panic_hook`]): a lead newline (the default hook's,
+/// so the report starts a line), `thread '<name>' panicked at
+/// <file>:<line>:<col>:`,
 /// the message, then `tail` — a captured backtrace's text, the note that
 /// points one out, or empty — and the whole of it passed through
 /// [`scrub_urls`], so a panic quoting a configured URL loses its key
