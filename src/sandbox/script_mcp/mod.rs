@@ -435,3 +435,5 @@ pub(crate) use limits::Limits as ScriptMcpLimits;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod top_level_tests;

@@ -153,6 +153,35 @@ pub fn stores_done(id: i64) -> usize {
     STORES_DONE.lock().unwrap_or_else(|e| e.into_inner()).get(&id).copied().unwrap_or(0)
 }
 
+/// The top-level persona set of conversation `id` (SME-481), its turn
+/// lock held, after the persona file is read and before the transaction.
+pub const TOP_LEVEL_AFTER_READ: &str = "top_level_after_read";
+
+/// The top-level persona set of conversation `id`, its turn lock held,
+/// after the row is inserted unapplied and before the pod's reconcile.
+pub const TOP_LEVEL_AFTER_INSERT: &str = "top_level_after_insert";
+
+static TOP_LEVEL_FAILURES: LazyLock<Mutex<std::collections::HashSet<(&'static str, i64)>>> = LazyLock::new(Default::default);
+
+/// The step `what` of conversation `id`'s next top-level persona set (or
+/// put-back) fails, once (SME-481 review 1).
+pub fn fail_next(what: &'static str, id: i64) {
+    TOP_LEVEL_FAILURES.lock().unwrap_or_else(|e| e.into_inner()).insert((what, id));
+}
+
+/// Whether a test asked step `what` of `id` to fail; it then fails once.
+pub fn fails(what: &'static str, id: i64) -> bool {
+    TOP_LEVEL_FAILURES.lock().unwrap_or_else(|e| e.into_inner()).remove(&(what, id))
+}
+
+/// `fail_next`'s step: a top-level set's apply, after the pod is sized and
+/// its credentials reconciled, before the row is marked applied.
+pub const TOP_LEVEL_APPLY: &str = "top_level_apply";
+
+/// `fail_next`'s step: putting a failed or cut-off top-level set's pod
+/// back to the persona-less grant.
+pub const TOP_LEVEL_PUT_BACK: &str = "top_level_put_back";
+
 /// `start_agent` by caller `id`, after `create_child` committed and
 /// before the start is spawned.
 pub const AFTER_CREATE_CHILD: &str = "after_create_child";

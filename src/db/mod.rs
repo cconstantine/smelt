@@ -78,8 +78,10 @@ mod storage_grace;
 mod script_mcp;
 mod claude_cli;
 mod owed;
+mod top_level_personas;
 
 pub use agents::*;
+pub use top_level_personas::*;
 pub use owed::*;
 pub use conversations::*;
 pub use usage::*;

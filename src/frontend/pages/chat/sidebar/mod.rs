@@ -448,10 +448,18 @@ fn waiting_count(count: usize, label: impl Fn(usize) -> String) -> Element {
 }
 
 /// An agent's second line: its status, then its persona, which gives way
-/// first on a narrow row. Nothing for the user's own conversations.
+/// first on a narrow row. Nothing for the user's own conversations, except
+/// one set to a persona (SME-481): the persona alone, with no status.
 fn agent_meta(node: &ConversationNode) -> Element {
     let Some(status) = node.status.as_deref() else {
-        return rsx! {};
+        return match node.persona.as_deref() {
+            Some(persona) => rsx! {
+                div { class: "conversation-agent-meta",
+                    span { class: "agent-persona", "{persona}" }
+                }
+            },
+            None => rsx! {},
+        };
     };
     let status_class = format!("agent-status status-{}", status.replace(' ', "-"));
     rsx! {
@@ -590,6 +598,17 @@ mod tests {
         let html = dioxus::ssr::render_element(agent_meta(&agent(2, 1, None, "idle")));
         assert!(html.contains(">idle<"), "{html}");
         assert!(!html.contains("agent-persona") && !html.contains("agent-meta-sep"), "{html}");
+    }
+
+    /// SME-481: a top-level conversation set to a persona shows the
+    /// persona alone on its second line: it has no status.
+    #[test]
+    fn test_a_top_level_persona_shows_its_persona_alone() {
+        let mut top = conversation(1, None);
+        top.persona = Some("smelt:ticket-driver".to_string());
+        let html = dioxus::ssr::render_element(agent_meta(&top));
+        assert!(html.contains(r#"class="conversation-agent-meta""#) && html.contains(">smelt:ticket-driver<"), "{html}");
+        assert!(!html.contains("agent-status") && !html.contains("agent-meta-sep"), "{html}");
     }
 
     #[test]
