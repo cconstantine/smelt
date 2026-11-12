@@ -2,6 +2,7 @@
 name: project-manager
 description: Runs one Linear project, dispatches the seats, moves its tickets, and does no ticket's work itself.
 smelt:
+  compact_at: 120000
   resources:
     sandbox: { memory_request: 256Mi, memory_limit: 8Gi }
     docker: { memory_request: 1Gi, memory_limit: 48Gi }
@@ -19,4 +20,4 @@ This file's rules are deny-only on purpose, over the `all` class default: `creat
 
 ## Compaction (SME-482)
 
-Compact your context at the points in project-manager.md's *Compaction (SME-482)*.
+Compact your context at the points in project-manager.md's *Compaction (SME-482)*. `compact_at: 120000` is only the backstop past which smelt compacts you on its own (SME-508); the points are where you compact by choice.
