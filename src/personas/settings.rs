@@ -27,25 +27,30 @@ pub(crate) enum Kind {
 pub(crate) struct Key {
     pub name: &'static str,
     pub kind: Kind,
+    /// Known to every smelt that knows `ignore_if_unknown`: a file may
+    /// use it unlisted. The repo lint holds every other skippable key a
+    /// tracked persona uses to being listed.
+    #[cfg_attr(not(test), allow(dead_code, reason = "read by the repo lint, a test"))]
+    pub baseline: bool,
 }
 
-const fn key(name: &'static str, kind: Kind) -> Key {
-    Key { name, kind }
+const fn key(name: &'static str, kind: Kind, baseline: bool) -> Key {
+    Key { name, kind, baseline }
 }
 
-/// Every `smelt` key, known or reserved. A new key's ticket adds its row:
-/// a skippable one is listed by the files that use it until every smelt
-/// knows it; a restricting one lands in two merges (the parser, then its
-/// use after the deploy).
+/// Every `smelt` key, known or reserved. A new key's ticket adds its row,
+/// not in the baseline: a skippable one is listed by the files that use
+/// it until every smelt knows it; a restricting one lands in two merges
+/// (the parser, then its use after the deploy).
 pub(crate) const KEYS: &[Key] = &[
-    key("model", Kind::Skippable),
-    key("tools", Kind::Restricting),
-    key("credentials", Kind::Restricting),
-    key("resources", Kind::Restricting),
-    key("compact_at", Kind::Skippable),
-    key("ignore_if_unknown", Kind::Skippable),
-    key("egress", Kind::Reserved),
-    key("limits", Kind::Reserved),
+    key("model", Kind::Skippable, true),
+    key("tools", Kind::Restricting, true),
+    key("credentials", Kind::Restricting, true),
+    key("resources", Kind::Restricting, true),
+    key("compact_at", Kind::Skippable, true),
+    key("ignore_if_unknown", Kind::Skippable, true),
+    key("egress", Kind::Reserved, false),
+    key("limits", Kind::Reserved, false),
 ];
 
 /// The names this smelt accepts, as a refusal lists them.
@@ -73,6 +78,20 @@ pub(crate) fn listed(yaml: &str) -> Vec<String> {
         .and_then(|smelt| smelt.get("ignore_if_unknown"))
         .and_then(serde_norway::Value::as_sequence)
         .map(|list| list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+/// The keys written directly under the frontmatter's `smelt`, in file
+/// order, for the repo lint; none when it doesn't read as YAML.
+#[cfg(test)]
+pub(crate) fn written_keys(yaml: &str) -> Vec<String> {
+    let Ok(value) = serde_norway::from_str::<serde_norway::Value>(yaml) else {
+        return Vec::new();
+    };
+    value
+        .get("smelt")
+        .and_then(serde_norway::Value::as_mapping)
+        .map(|map| map.keys().filter_map(|k| k.as_str().map(str::to_string)).collect())
         .unwrap_or_default()
 }
 

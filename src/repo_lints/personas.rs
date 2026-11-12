@@ -95,6 +95,35 @@ pub(crate) fn dead_patterns(rules: &ToolRules, registry: &[String]) -> Vec<Strin
     dead
 }
 
+/// What a tracked persona file says about its `smelt` keys (SME-506),
+/// against the key table `keys`: a key this tree skipped (it must know
+/// every key its own files use, so a listed one is a typo or a missing
+/// row), and a skippable key outside the baseline used unlisted (an older
+/// smelt would refuse the file, the SME-493 incident). A restricting key
+/// can't be listed at all; its two merges are a written rule.
+pub(crate) fn key_findings(text: &str, keys: &[personas::settings::Key]) -> Vec<String> {
+    let Ok((yaml, _)) = personas::frontmatter::split(text) else {
+        return Vec::new(); // the parse check reports it
+    };
+    let mut findings = Vec::new();
+    if let Ok(persona) = personas::parse(".agents/personas/x.md", text, text.len() as u64) {
+        for name in &persona.ignored {
+            findings.push(format!("has `smelt.{name}`, which this smelt doesn't know: a typo, or a key with no row"));
+        }
+    }
+    let listed = personas::settings::listed(yaml);
+    for name in personas::settings::written_keys(yaml) {
+        let new_skippable =
+            keys.iter().any(|k| k.name == name && k.kind == personas::settings::Kind::Skippable && !k.baseline);
+        if new_skippable && !listed.contains(&name) {
+            findings.push(format!(
+                "uses `smelt.{name}`, which a smelt deployed before it doesn't know: list it in `smelt.ignore_if_unknown`"
+            ));
+        }
+    }
+    findings
+}
+
 /// A persona table row's link to its page: `[<name>.md](<name>.md …)`.
 static TABLE_LINK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[([a-z0-9-]+)\.md\]\(").expect("a valid regex"));
@@ -221,6 +250,45 @@ mod tests {
         }
     }
 
+    /// T11 (SME-506): `compact_at` stands in for a new skippable key by a
+    /// table that leaves it out of the baseline.
+    fn new_key_table() -> Vec<personas::settings::Key> {
+        personas::settings::KEYS
+            .iter()
+            .map(|k| personas::settings::Key { baseline: k.baseline && k.name != "compact_at", ..*k })
+            .collect()
+    }
+
+    fn with_smelt(smelt: &str) -> String {
+        format!("---\nname: x\ndescription: A fixture persona.\nsmelt:\n{smelt}---\nTake the persona.\n")
+    }
+
+    #[test]
+    fn test_a_new_skippable_key_used_unlisted_is_a_finding() {
+        let keys = new_key_table();
+        assert_eq!(
+            key_findings(&with_smelt("  compact_at: 5\n"), &keys),
+            vec![
+                "uses `smelt.compact_at`, which a smelt deployed before it doesn't know: list it in \
+                 `smelt.ignore_if_unknown`"
+                    .to_string()
+            ]
+        );
+        let listed = with_smelt("  compact_at: 5\n  ignore_if_unknown: [compact_at]\n");
+        assert!(key_findings(&listed, &keys).is_empty());
+        // A baseline key needs no list.
+        assert!(key_findings(&with_smelt("  compact_at: 5\n"), personas::settings::KEYS).is_empty());
+    }
+
+    #[test]
+    fn test_a_key_this_tree_skips_is_a_finding() {
+        let text = with_smelt("  compact_later: 5\n  ignore_if_unknown: [compact_later]\n");
+        assert_eq!(
+            key_findings(&text, personas::settings::KEYS),
+            vec!["has `smelt.compact_later`, which this smelt doesn't know: a typo, or a key with no row".to_string()]
+        );
+    }
+
     #[test]
     fn test_only_files_directly_in_the_persona_dir_are_personas() {
         let tracked = [
@@ -299,6 +367,8 @@ mod tests {
                     if let Some(rules) = &persona.tools {
                         findings.extend(dead_patterns(rules, &registry).into_iter().map(|f| format!("{path}: {f}")));
                     }
+                    let keys = key_findings(&text, personas::settings::KEYS);
+                    findings.extend(keys.into_iter().map(|f| format!("{path}: {f}")));
                 }
             }
         }
