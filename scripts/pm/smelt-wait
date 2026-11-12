@@ -2,7 +2,7 @@
 """The Project Manager's watcher on one Ticket Driver's tree (SME-460).
 
   [SME=N] [SMELT_KEY=regex] smelt-wait ROOT [STALL_MIN=45] [CAP_MIN=240]
-      [--known-waiting ID,...] [--since ISO] [--no-github]
+      [--known-waiting ID,...] [--known-owed ID,...] [--since ISO] [--no-github]
 
 Run as a terminal command: it prints exactly one wake line and exits 0, and
 its exit wakes the PM. It polls ROOT's tree (ROOT and its descendants)
@@ -15,8 +15,9 @@ second, or a MERGED PR's merged_at; the wake's own time without GitHub).
   WAITING_FOR_USER ids    a node starts waiting for the user (not in --known-waiting)
   TOOL notify_user|ask_user ...   a new ROOT message holds that tool call
   KEY ...                 SMELT_KEY matches a new assistant text block of ROOT's
-  REPORT_OWED id since    a node's report_owed_at, new since the baseline, is older
-                          than SMELT_OWED_GRACE_MIN (default 10) minutes
+  REPORT_OWED id since    a node's report_owed_at is older than SMELT_OWED_GRACE_MIN
+                          (default 10) minutes, at start too, unless it's the stamp
+                          a --known-owed id had at start
   MERGED pr#N ...         with SME=N: a PR whose branch matches (^|/)sme-N- or whose
                           title matches ^SME-N\\b, merged after --since (default: start)
   MAIN_RED run#id ...     a main run of CI or Publish images goes red after the baseline
@@ -234,8 +235,11 @@ class Watch:
         waiting = self.new_waiting(nodes)
         if waiting:
             self.wake("ALREADY_WAITING", ",".join(map(str, waiting)))
+        # Only a --known-owed id's stamp is taken as seen (M3): any other
+        # stamp past the grace wakes now, and one inside it once it passes.
+        self.owed = {n["id"]: n.get("report_owed_at") for n in nodes if n["id"] in self.args.known_owed}
+        self.check_owed(nodes)
         self.seen_messages = len(messages)
-        self.owed = {n["id"]: n.get("report_owed_at") for n in nodes}
         self.reds = reds
         self.moved = self.updated(nodes)
         self.last_move = time.monotonic()
@@ -362,6 +366,7 @@ def parser():
     p.add_argument("stall_min", type=minutes, nargs="?", default=45.0)
     p.add_argument("cap_min", type=minutes, nargs="?", default=240.0)
     p.add_argument("--known-waiting", type=ids_arg, default=set())
+    p.add_argument("--known-owed", type=ids_arg, default=set())
     p.add_argument("--since", type=since_arg)
     p.add_argument("--no-github", action="store_true")
     return p

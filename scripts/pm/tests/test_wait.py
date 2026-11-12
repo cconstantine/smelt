@@ -179,9 +179,32 @@ class Wait(FakeCase):
 
     # A seat owing a report (SME-455).
 
+    def test_a_report_owed_past_the_grace_at_start_wakes_at_once(self):
+        # M3: the baseline doesn't swallow a stamp already past the grace.
+        owed = stamp(30)
+        self.node(2)["report_owed_at"] = owed
+        self.start("1", "45", "1")
+        self.assertEqual(self.woke(), f"REPORT_OWED 2 {owed}")
+
+    def test_a_report_owed_inside_the_grace_at_start_wakes_once_past_it(self):
+        owed = stamp(0)
+        self.node(3)["report_owed_at"] = owed
+        self.start("1", "45", "1", SMELT_OWED_GRACE_MIN="0.03")
+        self.assertEqual(self.woke(), f"REPORT_OWED 3 {owed}")
+
+    def test_a_known_owed_stamp_is_quiet_and_a_new_one_from_it_wakes(self):
+        self.node(2)["report_owed_at"] = stamp(30)
+        self.start("1", "45", "1", "--known-owed", "2")
+        self.baseline()
+        time.sleep(0.6)
+        self.assertIsNone(self.proc.poll(), "woke on a known owed stamp")
+        owed = stamp(20)
+        self.node(2)["report_owed_at"] = owed
+        self.assertEqual(self.woke(), f"REPORT_OWED 2 {owed}")
+
     def test_a_new_old_enough_owed_report_wakes(self):
         self.node(2)["report_owed_at"] = stamp(30)
-        self.start("1", "45", "1")
+        self.start("1", "45", "1", "--known-owed", "2")
         self.baseline()
         self.node(3)["report_owed_at"] = stamp(1)
         time.sleep(0.8)
