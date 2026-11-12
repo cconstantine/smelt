@@ -51,6 +51,8 @@ impl SandboxManager {
     /// conversation mounts, its own and passed (SME-239) — read at this
     /// moment, since Kubernetes mounts only at the pod's start. `instance` is
     /// the database's (SME-115): the pod is labelled with it.
+    /// Tests' pods ask for nothing; see `create_with_requests`.
+    #[cfg(test)]
     pub async fn create_with_docker(
         &self,
         session_id: &str,
@@ -60,10 +62,28 @@ impl SandboxManager {
         agent_volumes: &[db::AgentVolume],
         instance: &db::SmeltInstance,
     ) -> Result<Sandbox, SandboxError> {
+        let requests = PodRequests::default();
+        self.create_with_requests(session_id, memory, docker, &requests, volumes, agent_volumes, instance).await
+    }
+
+    /// `create_with_docker` with each container's `requests` (SME-484),
+    /// which, like the limits, apply only to a pod this call creates.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_with_requests(
+        &self,
+        session_id: &str,
+        memory: &str,
+        docker: &DockerSidecar,
+        requests: &PodRequests,
+        volumes: &[db::SandboxVolume],
+        agent_volumes: &[db::AgentVolume],
+        instance: &db::SmeltInstance,
+    ) -> Result<Sandbox, SandboxError> {
         self.create_with_running_timeout(
             session_id,
             memory,
             docker,
+            requests,
             volumes,
             agent_volumes,
             running_wait_timeout(),
@@ -79,11 +99,13 @@ impl SandboxManager {
     /// other tests read concurrently, so overriding it here would risk
     /// spuriously timing *them* out instead. `create` itself just forwards
     /// the real env-driven default.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn create_with_running_timeout(
         &self,
         session_id: &str,
         memory: &str,
         docker: &DockerSidecar,
+        requests: &PodRequests,
         volumes: &[db::SandboxVolume],
         agent_volumes: &[db::AgentVolume],
         running_timeout: Duration,
@@ -124,7 +146,7 @@ impl SandboxManager {
                 let made = pods
                     .create(
                         &PostParams::default(),
-                        &build_pod_spec(&name, memory, docker, volumes, agent_volumes, &instance.id),
+                        &build_sized_pod_spec(&name, memory, docker, requests, volumes, agent_volumes, &instance.id),
                     )
                     .await?;
                 (true, made.metadata.uid)

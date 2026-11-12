@@ -424,3 +424,4 @@ mod storage;
 mod volumes;
 mod quiet_stop;
 mod storage_grace;
+mod resources;

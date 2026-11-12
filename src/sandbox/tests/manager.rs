@@ -111,6 +111,7 @@ async fn test_create_deletes_the_pod_it_just_created_if_it_never_reaches_running
                 memory: "512Mi".to_string(),
                 storage: PodStorage::Ephemeral,
             },
+            &PodRequests::default(),
             &[],
             &[],
             Duration::from_millis(1),

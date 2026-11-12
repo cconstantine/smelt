@@ -29,6 +29,9 @@ pub struct Persona {
     /// (SME-242). `None` — and `Some(vec![])` — mean none: a field that
     /// is absent grants nothing, exactly as one that lists nothing.
     pub credentials: Option<Vec<String>>,
+    /// `smelt.resources`: what the persona's pod asks of its node (SME-484).
+    /// `None` leaves the deployment's defaults: no request, its limits.
+    pub resources: Option<crate::sandbox::PodResources>,
 }
 
 /// The frontmatter. Claude Code's own keys (`tools`, `model`, ...) are
@@ -43,8 +46,8 @@ struct Frontmatter {
     smelt: Option<SmeltSettings>,
 }
 
-/// smelt's own settings. `credentials` arrived with SME-242; later tickets
-/// add `egress` (SME-243) and `limits` (SME-245).
+/// smelt's own settings. `credentials` arrived with SME-242 and `resources`
+/// with SME-484; later tickets add `egress` (SME-243) and `limits` (SME-245).
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SmeltSettings {
@@ -54,6 +57,8 @@ struct SmeltSettings {
     tools: Option<rules::RawToolRules>,
     #[serde(default)]
     credentials: Option<RawCredentials>,
+    #[serde(default)]
+    resources: Option<crate::sandbox::PodResources>,
 }
 
 /// `smelt.credentials`: a list of credential names, each checked where
@@ -164,6 +169,12 @@ pub fn parse(path: &str, text: &str, file_bytes: u64) -> Result<Persona, String>
     }
     let tools = smelt.tools.map(|raw| rules::check(path, raw)).transpose()?;
     let credentials = smelt.credentials.map(|raw| raw.0);
+    // Checked against this deployment's limits as it's read, so a request
+    // no pod could carry is the file's error, not a pod that won't start.
+    let resources = smelt.resources;
+    if let Some(resources) = &resources {
+        resources.check_for_deployment().map_err(|e| format!("{path}: {e}"))?;
+    }
     Ok(Persona {
         name: front.name,
         description: front.description,
@@ -171,6 +182,7 @@ pub fn parse(path: &str, text: &str, file_bytes: u64) -> Result<Persona, String>
         model,
         tools,
         credentials,
+        resources,
     })
 }
 

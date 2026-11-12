@@ -88,3 +88,49 @@ pub(in crate::sandbox) fn pod_startup_failure(pod: &Pod) -> Option<String> {
         })
     })
 }
+
+/// The scheduler's reason a pod has no node (SME-484): its `PodScheduled`
+/// condition `False` with reason `Unschedulable` — no node has room for
+/// its requests, or none it may go to — as the scheduler words it.
+pub(in crate::sandbox) fn unschedulable_reason(pod: &Pod) -> Option<String> {
+    let conditions = pod.status.as_ref()?.conditions.as_ref()?;
+    let scheduled = conditions.iter().find(|c| c.type_ == "PodScheduled")?;
+    if scheduled.status != "False" || scheduled.reason.as_deref() != Some("Unschedulable") {
+        return None;
+    }
+    Some(scheduled.message.clone().filter(|m| !m.is_empty()).unwrap_or_else(|| "Unschedulable".to_string()))
+}
+
+/// For a sandbox pod the scheduler can't place: its conversation, its
+/// pod id and the status its sandbox panel shows while it waits.
+pub(in crate::sandbox) fn unschedulable_notice(pod: &Pod) -> Option<(i64, i64, String)> {
+    let reason = unschedulable_reason(pod)?;
+    let conversation = pod.metadata.labels.as_ref()?.get(CONVERSATION_LABEL)?.parse().ok()?;
+    let pod_id = pod.metadata.name.as_deref()?.strip_prefix("sandbox-")?.parse().ok()?;
+    Some((conversation, pod_id, format!("Unschedulable: {reason}")))
+}
+
+/// What the sandbox panel is told while a pod waits to run (SME-484 L1):
+/// its conversation, pod id, status and node.
+pub(in crate::sandbox) type PanelUpdate = (i64, i64, String, Option<String>);
+
+/// What the start's wait tells the panel about `pod` now, given the
+/// status it last told (`told`): an unschedulable pod's reason, once
+/// each time it becomes so; and `Pending` on its node once a pod told
+/// Unschedulable is placed, so the panel doesn't keep a stale reason
+/// until Running. `None` when there's nothing new.
+pub(in crate::sandbox) fn pending_panel_update(pod: &Pod, told: Option<&str>) -> Option<PanelUpdate> {
+    if let Some((conversation, pod_id, status)) = unschedulable_notice(pod) {
+        return (told != Some(status.as_str())).then_some((conversation, pod_id, status, None));
+    }
+    // Placed after the panel was told it couldn't be.
+    if !told.is_some_and(|t| t.starts_with("Unschedulable")) {
+        return None;
+    }
+    let conditions = pod.status.as_ref()?.conditions.as_ref()?;
+    conditions.iter().find(|c| c.type_ == "PodScheduled" && c.status == "True")?;
+    let conversation = pod.metadata.labels.as_ref()?.get(CONVERSATION_LABEL)?.parse().ok()?;
+    let pod_id = pod.metadata.name.as_deref()?.strip_prefix("sandbox-")?.parse().ok()?;
+    let node = pod.spec.as_ref().and_then(|s| s.node_name.clone());
+    Some((conversation, pod_id, "Pending".to_string(), node))
+}

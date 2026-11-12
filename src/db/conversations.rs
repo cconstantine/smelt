@@ -382,3 +382,24 @@ mod title_tests {
         assert_eq!(title_from_text("a **** b", true), "a b");
     }
 }
+
+/// The conversation's `pod_resources` (SME-484): what its pods ask of
+/// their node, as JSON; `None` for the deployment's defaults, and for no
+/// such conversation.
+pub async fn conversation_pod_resources(pool: &PgPool, id: i64) -> Result<Option<serde_json::Value>, sqlx::Error> {
+    sqlx::query_scalar::<_, Option<serde_json::Value>>("SELECT pod_resources FROM conversations WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map(Option::flatten)
+}
+
+/// Sets (or, with `None`, clears) the conversation's `pod_resources`.
+pub async fn set_conversation_pod_resources(pool: &PgPool, id: i64, resources: Option<&serde_json::Value>) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE conversations SET pod_resources = $2 WHERE id = $1")
+        .bind(id)
+        .bind(resources)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}

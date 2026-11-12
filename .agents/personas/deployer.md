@@ -2,6 +2,9 @@
 name: deployer
 description: Runs one deploy of one named CI-green SHA of main per the homelab DEPLOY.md, and nothing else.
 smelt:
+  resources:
+    sandbox: { memory_request: 1Gi, memory_limit: 16Gi }
+    docker: { memory_request: 12Gi, memory_limit: 48Gi }
   tools:
     class: read-only
     allow:
