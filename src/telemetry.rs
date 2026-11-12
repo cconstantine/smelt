@@ -300,11 +300,15 @@ fn scrub_key_value(pair: opentelemetry::KeyValue) -> opentelemetry::KeyValue {
 ///
 /// The hook keeps the default hook's stderr destination and, but for the
 /// departures below, its message shape — [`write_scrubbed_panic_report`]
-/// is that shape — and only scrubs the text. It must never panic itself:
+/// is that shape — and only scrubs the text. It is written not to panic:
 /// while a hook runs a panic cannot unwind (std's panic-count guard aborts
 /// with "panic in a panic hook" before unwinding, so not even
 /// `catch_unwind` here could catch one), so the hook runs no user code and
-/// takes no lock beyond stderr's own.
+/// takes no lock beyond stderr's own. One edge remains, and it fails
+/// closed: `std::thread::current()` panics once the thread's handle is
+/// destroyed (a panic in a TLS destructor at thread exit), and std then
+/// aborts printing only that inner message — the original report is lost,
+/// but nothing of it leaks.
 ///
 /// Where it departs from the default hook (rust 1.96, the toolchain smelt
 /// builds with):
@@ -322,6 +326,8 @@ fn scrub_key_value(pair: opentelemetry::KeyValue) -> opentelemetry::KeyValue {
 ///   backtrace (release aborts on the first panic, so never reaches one).
 pub(crate) fn install_scrubbed_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
+        // Panics after the thread's handle is destroyed: fails closed (see
+        // the doc above).
         let name = std::thread::current();
         let location = info
             .location()
