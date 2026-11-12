@@ -207,7 +207,7 @@ async fn test_a_trust_forgotten_between_the_read_and_the_insert_is_refused(pool:
 
 /// Two providers, `Anthropic` (the default, on `default-model`) and
 /// `ClaudeCode`, each listing `models`; returns their ids.
-async fn providers(pool: &PgPool, anthropic: &[&str], claude_code: &[&str]) -> (i64, i64) {
+pub(super) async fn providers(pool: &PgPool, anthropic: &[&str], claude_code: &[&str]) -> (i64, i64) {
     let mut ids = Vec::new();
     for (name, kind, models) in [("Anthropic", "anthropic", anthropic), ("ClaudeCode", "claude_cli", claude_code)] {
         let provider = db::create_inference_provider(pool, name, kind, "http://127.0.0.1:9", "api_key", "k", false, None, true, None)
@@ -228,11 +228,11 @@ async fn providers(pool: &PgPool, anthropic: &[&str], claude_code: &[&str]) -> (
 }
 
 /// The conversation's chosen provider and model, as stored.
-async fn stored_model(pool: &PgPool, id: i64) -> (Option<i64>, Option<String>) {
+pub(super) async fn stored_model(pool: &PgPool, id: i64) -> (Option<i64>, Option<String>) {
     sqlx::query_as("SELECT provider_id, model FROM conversations WHERE id = $1").bind(id).fetch_one(pool).await.expect("the row")
 }
 
-const OPUS: &str = "smelt:\n  model: claude-opus-5-5\n";
+pub(super) const OPUS: &str = "smelt:\n  model: claude-opus-5-5\n";
 
 /// M1: the conversation's own provider lists the persona's model: it runs
 /// there, though the default's provider lists it too and sorts first.

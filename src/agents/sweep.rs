@@ -21,19 +21,10 @@ pub(crate) const RESTARTED_MID_TURN: &str = "smelt restarted during your turn; c
 /// restored before this runs). Returns the wakes' tasks.
 pub(crate) async fn startup_sweep(pool: &PgPool) -> Vec<tokio::task::JoinHandle<()>> {
     let mut wakes = Vec::new();
-    // SME-481: no top-level persona's set survives a restart either. Its
-    // unapplied row goes first, before anything wakes, and the pod is put
-    // back to the persona-less grant (best effort; no turn ran under it).
-    match db::delete_unapplied_top_level_personas(pool).await {
-        Ok(ids) => {
-            for id in ids {
-                if let Err(e) = crate::credentials::reconcile_pod(pool, id, None).await {
-                    tracing::warn!(conversation_id = id, error = %e, "couldn't put a cut-off persona set's pod back");
-                }
-            }
-        }
-        Err(e) => tracing::warn!(error = %e, "couldn't delete the top-level personas a restart cut off"),
-    }
+    // SME-481: no top-level persona's set survives a restart either: each
+    // unapplied one is put back (model, resources, pod credentials) and its
+    // row deleted only once that worked; until then its turns are refused.
+    top_level::sweep_unapplied(pool).await;
     match db::starting_agents(pool).await {
         Ok(starting) => {
             for (child, parent) in starting {

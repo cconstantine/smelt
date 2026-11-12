@@ -13,6 +13,11 @@ CREATE TABLE top_level_personas (
     persona_settings JSONB NOT NULL,
     rule_chain JSONB,
     credentials TEXT[] NOT NULL,
+    -- What the set changed, as it was before (review 1, M1): a failed or
+    -- cut-off set puts them back.
+    prior_provider_id BIGINT,
+    prior_model TEXT,
+    prior_pod_resources JSONB,
     created_at TIMESTAMP NOT NULL DEFAULT now(),
     applied_at TIMESTAMP
 );

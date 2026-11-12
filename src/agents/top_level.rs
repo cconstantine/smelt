@@ -58,6 +58,9 @@ async fn apply(pool: &PgPool, id: i64, dir: &str, name: &str) -> Result<SetPerso
     if remote_trust(pool, &repo.remote_key).await? != Some(true) {
         return Err(untrusted(&repo));
     }
+    // What the persona's model resolves against, read before it does: the
+    // transaction refuses a pin over any change since (review 1, L1).
+    let seen = db::get_conversation_model(pool, id).await.map_err(e)?.map(|row| (row.provider_id, row.model)).unwrap_or_default();
     let checkout = checkout_for(id);
     let snapshot = persona::snapshot(pool, checkout.as_ref(), id, &repo, name).await?;
     #[cfg(test)]
@@ -68,14 +71,21 @@ async fn apply(pool: &PgPool, id: i64, dir: &str, name: &str) -> Result<SetPerso
         .iter()
         .any(|n| n == crate::credentials::CREDENTIAL_GIT_SSH);
     let pins_model = model.is_some();
-    let new = db::NewTopLevelPersona { conversation: id, remote_key: &repo.remote_key, snapshot: &snapshot, git_ssh, model };
+    let new = db::NewTopLevelPersona {
+        conversation: id,
+        remote_key: &repo.remote_key,
+        snapshot: &snapshot,
+        git_ssh,
+        model,
+        seen_model: seen,
+    };
     if let db::InsertTopLevel::Refused(why) = db::insert_top_level_persona(pool, &new).await.map_err(e)? {
         return Err(why);
     }
     #[cfg(test)]
     test_hooks::reach(test_hooks::TOP_LEVEL_AFTER_INSERT, id).await;
     if let Err(error) = finish_apply(pool, id, checkout.as_ref(), &repo, &snapshot).await {
-        undo_apply(pool, id).await;
+        undo_apply(pool, id, checkout.as_ref()).await;
         return Err(error);
     }
     crate::events::publish_app(crate::events::AppEvent::ConversationsChanged);
@@ -112,24 +122,89 @@ async fn finish_apply(
             load_agents_md(pool, checkout, id, id, repo).await?;
         }
     }
+    #[cfg(test)]
+    if test_hooks::fails(test_hooks::TOP_LEVEL_APPLY, id) {
+        return Err("a test failed the apply".to_string());
+    }
     if !db::mark_top_level_persona_applied(pool, id).await.map_err(e)? {
         return Err("the persona's row was gone before it was applied".to_string());
     }
     Ok(())
 }
 
-/// A failed apply, still under the turn lock: the unapplied row deleted,
-/// then the pod put back to the persona-less grant. A failed delete leaves
-/// the row unapplied: turns are refused, a retried set replaces it, and
-/// the startup sweep deletes it.
-async fn undo_apply(pool: &PgPool, id: i64) {
-    if let Err(e) = db::delete_unapplied_top_level_persona(pool, id).await {
-        tracing::warn!(conversation_id = id, error = %e, "couldn't delete a failed top-level persona's row");
-        return;
+/// A failed apply, still under the turn lock: everything the set changed
+/// put back, and only then the unapplied row deleted (review 1, M2). A
+/// put-back that fails leaves the row, so turns stay refused on a pod
+/// that may hold the persona's grant; a retried set replaces it, and the
+/// next startup sweep tries the put-back again.
+async fn undo_apply(pool: &PgPool, id: i64, checkout: &dyn ChildCheckout) {
+    if let Err(e) = put_back(pool, id, checkout).await {
+        tracing::warn!(conversation_id = id, error = %e, "couldn't put a failed top-level persona back; its turns stay refused");
     }
-    if let Err(e) = crate::credentials::reconcile_pod(pool, id, None).await {
-        tracing::warn!(conversation_id = id, error = %e, "couldn't put a failed top-level persona's pod back");
+}
+
+/// Puts an unapplied set back: the model and pod resources it changed
+/// (M1), any trust card its AGENTS.md load filed (L2), the pod's
+/// credentials to the persona-less grant, then the row deleted under the
+/// same install lock (M2). Any failure keeps the row.
+async fn put_back(pool: &PgPool, id: i64, checkout: &dyn ChildCheckout) -> Result<(), String> {
+    let e = |e: sqlx::Error| e.to_string();
+    let Some(prior) = db::top_level_prior(pool, id).await.map_err(e)? else {
+        return Ok(()); // applied, or gone: nothing to put back
+    };
+    restore_prior(pool, id, checkout, &prior).await?;
+    if db::delete_instruction_requests_of(pool, id).await.map_err(e)? > 0 {
+        crate::git::publish_repos(pool, id).await;
     }
+    #[cfg(test)]
+    if test_hooks::fails(test_hooks::TOP_LEVEL_PUT_BACK, id) {
+        return Err("a test failed the put-back".to_string());
+    }
+    crate::credentials::put_back_persona_less(pool, id, || async move {
+        db::delete_unapplied_top_level_persona(pool, id).await.map(|_| ()).map_err(e)
+    })
+    .await
+}
+
+/// The startup sweep's part (SME-481): every unapplied set — one a restart
+/// cut off — put back. It runs while smelt already serves (review 1, L3),
+/// so each waits for its conversation's turn lock: a set started since the
+/// restart finishes first, and is then applied, not swept.
+pub(crate) async fn sweep_unapplied(pool: &PgPool) {
+    let ids = match db::unapplied_top_level_personas(pool).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't list the top-level personas a restart cut off");
+            return;
+        }
+    };
+    for id in ids {
+        let checkout = checkout_for(id);
+        let put = crate::turn::between_turns(id, true, || put_back(pool, id, checkout.as_ref())).await;
+        if let Some(Err(e)) = put {
+            tracing::warn!(conversation_id = id, error = %e, "couldn't put a cut-off top-level persona back; its turns stay refused");
+        }
+    }
+}
+
+/// Puts back what an unapplied set changed (review 1, M1): the model its
+/// persona pinned, and the pod resources, the pod restarted with them when
+/// it has one, so the persona-less conversation asks for nothing the
+/// persona did.
+async fn restore_prior(pool: &PgPool, id: i64, checkout: &dyn ChildCheckout, prior: &db::TopLevelPrior) -> Result<(), String> {
+    let e = |e: sqlx::Error| e.to_string();
+    if let Some(pinned) = &prior.persona_model {
+        db::restore_conversation_model(pool, id, (prior.prior_provider_id, prior.prior_model.as_deref()), pinned)
+            .await
+            .map_err(e)?;
+    }
+    if db::conversation_pod_resources(pool, id).await.map_err(e)? != prior.prior_pod_resources {
+        db::set_conversation_pod_resources(pool, id, prior.prior_pod_resources.as_ref()).await.map_err(e)?;
+        if !db::list_sandbox_pods(pool, id).await.map_err(e)?.is_empty() {
+            checkout.restart_pod(pool, id).await?;
+        }
+    }
+    Ok(())
 }
 
 /// The conversation's `ready` checkout `dir`.

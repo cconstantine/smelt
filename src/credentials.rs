@@ -343,6 +343,30 @@ pub async fn reconcile_pod(pool: &PgPool, child: i64, snapshot: Option<&db::Pers
     .await
 }
 
+/// Puts a top-level conversation's pod back to the persona-less grant
+/// (SME-481 review 1, M2) while its unapplied persona row still refuses
+/// turns: the key when one is stored, no named secret. `then` runs under
+/// the same install lock, after the write succeeded, and is where the row
+/// goes, so no install can read the persona's grant after the put-back and
+/// write it over it. A failed write never runs `then`: the row stays.
+pub async fn put_back_persona_less<F, Fut>(pool: &PgPool, conversation: i64, then: F) -> Result<(), String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    with_install_lock(conversation, async {
+        let pod = db::list_sandbox_pods(pool, conversation).await.map_err(|e| e.to_string())?.into_iter().next_back();
+        if let Some(pod) = pod {
+            let git_ssh = db::ssh_key_stored(pool).await.map_err(|e| e.to_string())?;
+            let granted = PodCredentials { git_ssh, secrets: Vec::new() };
+            let files = files_for_granted(pool, &granted).await.map_err(|e| e.to_string())?;
+            write_pod_files(pool, pod.id, &files).await?;
+        }
+        then().await
+    })
+    .await
+}
+
 /// How long an install's tries at writing the credential files into one pod
 /// may take. Not the whole bound a caller sees (SME-440 review R2-L2): after
 /// an abandoned or errored attempt the install also waits out that
