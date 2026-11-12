@@ -41,6 +41,8 @@ pub(super) async fn click_when_present(page: &chromiumoxide::Page, selector: &st
 /// a step that fails after its click went through (SME-505).
 pub(super) async fn click_when_present_with(page: &chromiumoxide::Page, selector: &str, timeout: Duration, click: ClickStep) {
     let deadline = tokio::time::Instant::now() + timeout;
+    // Best effort: a page that can't take it still gets its click.
+    let _ = page.evaluate(RECORDER).await;
     let watch = format!(
         "(() => {{ const el = document.querySelector({selector:?}); if (!el) return false; \
          window.__smeltClickTarget = el; window.__smeltClick = 'no click seen'; window.__smeltClickBefore = el.className; \
@@ -91,11 +93,44 @@ pub(super) async fn click_when_present_with(page: &chromiumoxide::Page, selector
                 return;
             }
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "clicking {selector} didn't land on it: {last}"
-        );
+        if tokio::time::Instant::now() >= deadline {
+            let held = page_state(page).await;
+            panic!("clicking {selector} didn't land on it: {last}; the page: {held}");
+        }
         tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
+/// Records, once per page, the last 30 things a failed click or wait should
+/// be read against (SME-505): every mouse press, release and click with
+/// its target and row, every button's class change, every conversation row
+/// added or removed (a row moved is both), and every in-app navigation.
+const RECORDER: &str = "(() => { if (window.__smeltLog) return true; const log = window.__smeltLog = []; const t0 = performance.now(); \
+     const put = s => { log.push(Math.round(performance.now() - t0) + 'ms ' + s); if (log.length > 30) log.shift(); }; \
+     const row = el => { const r = el && el.closest && el.closest('[data-conversation-id]'); return r ? r.dataset.conversationId : 'no row'; }; \
+     const name = el => (typeof el.className === 'string' && el.className) || el.tagName; \
+     for (const type of ['mousedown', 'mouseup', 'click']) document.addEventListener(type, e => put(type + ' on ' + name(e.target) + ' in ' + row(e.target)), true); \
+     new MutationObserver(ms => { for (const m of ms) { \
+       if (m.type === 'attributes') { if (m.target.tagName === 'BUTTON') put('class ' + m.target.className + ' in ' + row(m.target)); continue; } \
+       for (const n of m.removedNodes) if (n.nodeType === 1 && n.dataset && n.dataset.conversationId) put('row ' + n.dataset.conversationId + ' removed'); \
+       for (const n of m.addedNodes) if (n.nodeType === 1 && n.dataset && n.dataset.conversationId) put('row ' + n.dataset.conversationId + ' added'); } }) \
+       .observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['class'] }); \
+     const push = history.pushState; history.pushState = function () { put('pushState ' + arguments[2]); return push.apply(this, arguments); }; \
+     return true; })()";
+
+/// What the page held when a click or wait gave up, as JSON: where the tab
+/// was, which rows had an armed two-step button, the sidebar's error, and
+/// `RECORDER`'s log. Each names a different cause of a missing button: a
+/// navigation, a confirm that already happened (no row armed, perhaps an
+/// error), a click that never reached the page (no click logged).
+pub(super) async fn page_state(page: &chromiumoxide::Page) -> String {
+    let read = "JSON.stringify({ url: location.href, \
+         armed: [...document.querySelectorAll('.confirm')].map(b => { const r = b.closest('[data-conversation-id]'); return r ? r.dataset.conversationId : b.className; }), \
+         sidebar_error: (document.querySelector('.sidebar-body > .error') || {}).innerText ?? null, \
+         log: window.__smeltLog || 'nothing recorded: no click_when_present on this page' })";
+    match page.evaluate(read).await {
+        Ok(value) => value.into_value().unwrap_or_else(|e| format!("unreadable: {e}")),
+        Err(e) => format!("couldn't read it: {e}"),
     }
 }
 
@@ -120,7 +155,8 @@ async fn target_changed(page: &chromiumoxide::Page, changed: &str) -> bool {
 /// hide movement and change the page: scrolling the transcript turns off
 /// its stick-to-bottom). When its centre is on screen, it must also be the
 /// element there (or contain it), so nothing covers it. Returns its box;
-/// panics at `deadline` naming what kept it from settling.
+/// panics at `deadline` naming what kept it from settling, and what the
+/// page held then (`page_state`).
 pub(super) async fn wait_for_stable(page: &chromiumoxide::Page, selector: &str, deadline: tokio::time::Instant) -> String {
     let probe = format!(
         "(() => {{ const el = document.querySelector({selector:?}); if (!el) return 'missing'; \
@@ -139,10 +175,10 @@ pub(super) async fn wait_for_stable(page: &chromiumoxide::Page, selector: &str, 
         if state.contains(',') && !state.starts_with("couldn't") && state == last {
             return state;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{selector} never settled to be clicked: {state}"
-        );
+        if tokio::time::Instant::now() >= deadline {
+            let held = page_state(page).await;
+            panic!("{selector} never settled to be clicked: {state}; the page: {held}");
+        }
         last = state;
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
@@ -183,6 +219,31 @@ pub(super) async fn scenario_click_not_repeated(t: &Scenario<'_>) {
         .into_value()
         .expect("bool");
     assert!(still_armed, "the arm was clicked again, and the retry confirmed the delete");
+    // A wait that never settles says what the page held, so the next red
+    // tells its causes apart (SME-505): where the tab was, which row was
+    // armed, the sidebar's error, and the clicks and changes before it.
+    let gone = format!(".conversation-item[data-conversation-id='{}'] .no-such-button", target.id);
+    let failed = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(wait_for_stable(
+        &page,
+        &gone,
+        tokio::time::Instant::now() + Duration::from_millis(300),
+    )))
+    .await
+    .expect_err("a selector matching nothing never settles");
+    let why = failed
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| failed.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default();
+    for told in [
+        format!("\"url\":\"{}\"", t.url(&format!("conversation/{}", open.id))),
+        format!("\"armed\":[\"{}\"]", target.id),
+        "\"sidebar_error\":null".to_string(),
+        format!("click on two-step-text in {}", target.id),
+        format!("class delete-conversation confirm in {}", target.id),
+    ] {
+        assert!(why.contains(&told), "the failure should say {told}: {why}");
+    }
     click_when_present(&page, &armed, Duration::from_secs(5)).await;
     assert!(
         wait_for_count(&page, &format!(".conversation-item[data-conversation-id='{}']", target.id), 0, Duration::from_secs(10)).await,
