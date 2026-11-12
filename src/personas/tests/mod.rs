@@ -1,5 +1,7 @@
 use super::*;
 
+mod unknown_keys;
+
 const DEV: &str = ".agents/personas/developer.md";
 
 fn bytes(text: &str) -> u64 {
@@ -34,6 +36,7 @@ fn test_a_full_persona_file_parses_with_its_body_as_written() {
             credentials: None,
             resources: None,
             compact_at: None,
+            ignored: Vec::new(),
         }
     );
 }
