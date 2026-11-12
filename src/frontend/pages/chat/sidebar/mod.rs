@@ -281,6 +281,8 @@ pub(super) fn ConversationSidebar(
                 p { class: "muted", "Loading..." }
             } else if conversations().is_empty() {
                 p { class: "muted", "No conversations yet" }
+            } else if !SHOW_ARCHIVED() && archive::all_hidden(&conversations(), selected()) {
+                p { class: "muted all-archived", "All conversations are archived" }
             } else {
                 div { class: "conversation-list",
                     // Archived trees drop out here, unless shown, owed

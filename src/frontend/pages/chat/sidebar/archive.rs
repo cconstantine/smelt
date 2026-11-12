@@ -67,6 +67,13 @@ pub(super) fn hidden_archived(nodes: &[ConversationNode], open: Option<i64>) -> 
     nodes.iter().filter(|n| roots[&n.id] == n.id && !keep[&n.id]).count()
 }
 
+/// Whether the list has conversations but the toggle-off filter hides
+/// every one, for the sidebar's "All conversations are archived" line
+/// (review 1, L3: the list was blank under the toggle).
+pub(super) fn all_hidden(nodes: &[ConversationNode], open: Option<i64>) -> bool {
+    !nodes.is_empty() && visible(nodes, open, false).is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,6 +138,17 @@ mod tests {
         let mut two = list();
         two.push(node(6, None, true));
         assert_eq!(hidden_archived(&two, None), 2);
+    }
+
+    /// Review 1, L3: every tree archived and hidden says so; one listed
+    /// (in use, owed or open) or an empty list doesn't.
+    #[test]
+    fn test_all_hidden_only_when_every_tree_is_hidden() {
+        let only_archived = vec![node(1, None, true), node(2, Some(1), true), node(6, None, true)];
+        assert!(all_hidden(&only_archived, None));
+        assert!(!all_hidden(&only_archived, Some(2)), "the open tree is listed");
+        assert!(!all_hidden(&list(), None), "a tree in use is listed");
+        assert!(!all_hidden(&[], None), "no conversations at all says that instead");
     }
 
     /// Review 1, L2: the toggle counts only the archived trees it would
