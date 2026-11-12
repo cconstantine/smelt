@@ -49,7 +49,7 @@ Deploys ride with a Driver, one at a time, at the current DEPLOY.md pin, and onl
 
 - **A Driver's `ask_user` that is the PM's to decide** is answered with `smelt-api answer ID TOOL_USE_ID ANSWER…`, one `ANSWER` per question: an option's label, `label1|label2` for a multi-select, or `other:<text>`. `smelt-api question ID` shows the question first. The client checks the answer against the pending question and sends nothing if it doesn't fit.
 - **Then a comment on the ticket:** `Decided (PM): <question> → <answer>, because …`. The API records the answer as the user's, so the ticket is the only record that the PM gave it.
-- **A real product decision goes to the user** through `notify_user`. The watcher then restarts with `--known-waiting ID` naming that conversation, so the waiting question doesn't wake it again.
+- **A real product decision goes to the user** through `notify_user`. The watcher then restarts with `--known-waiting ID` naming that conversation, so the waiting question doesn't wake it again. That covers only the question waiting now: once a poll sees the conversation not waiting, the id is dropped, and its next question or trust card wakes `WAITING_FOR_USER`.
 - **A trust card stays the user's.** The client has no trust decision: the PM escalates it with `notify_user`.
 
 ## Watching

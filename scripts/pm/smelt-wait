@@ -231,7 +231,7 @@ class Watch:
                 self.gh_failed(err)
                 time.sleep(self.poll_secs)
         self.gh_failures = 0
-        waiting = sorted(n["id"] for n in nodes if n.get("waiting_for_user") and n["id"] not in self.known)
+        waiting = self.new_waiting(nodes)
         if waiting:
             self.wake("ALREADY_WAITING", ",".join(map(str, waiting)))
         self.seen_messages = len(messages)
@@ -260,8 +260,14 @@ class Watch:
     def updated(nodes):
         return sorted((n["id"], n.get("updated_at")) for n in nodes)
 
+    def new_waiting(self, nodes):
+        """The waiting ids not in --known-waiting. A known id leaves it once a
+        poll shows it not waiting, so its next question wakes (M2)."""
+        self.known -= {n["id"] for n in nodes if not n.get("waiting_for_user")}
+        return sorted(n["id"] for n in nodes if n.get("waiting_for_user") and n["id"] not in self.known)
+
     def check_tree(self, nodes):
-        waiting = sorted(n["id"] for n in nodes if n.get("waiting_for_user") and n["id"] not in self.known)
+        waiting = self.new_waiting(nodes)
         if waiting:
             self.wake("WAITING_FOR_USER", ",".join(map(str, waiting)))
 

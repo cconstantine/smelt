@@ -118,6 +118,25 @@ class Wait(FakeCase):
         self.node(2)["waiting_for_user"] = True
         self.assertEqual(self.woke(), "WAITING_FOR_USER 2")
 
+    def test_a_known_waiting_node_that_asks_again_wakes(self):
+        # M2: --known-waiting covers the question waiting at start, not the
+        # next one: once a poll shows the node not waiting, it's dropped.
+        self.node(3)["waiting_for_user"] = True
+        self.start("1", "45", "1", "--known-waiting", "3")
+        self.baseline()
+        time.sleep(0.6)
+        self.node(3)["waiting_for_user"] = False
+        time.sleep(0.6)
+        self.node(3)["waiting_for_user"] = True
+        self.assertEqual(self.woke(), "WAITING_FOR_USER 3")
+
+    def test_a_known_waiting_node_not_waiting_at_start_wakes_when_it_asks(self):
+        self.start("1", "45", "1", "--known-waiting", "3")
+        self.baseline()
+        time.sleep(0.4)
+        self.node(3)["waiting_for_user"] = True
+        self.assertEqual(self.woke(), "WAITING_FOR_USER 3")
+
     def test_a_waiting_node_outside_the_tree_is_quiet(self):
         self.node(9)["waiting_for_user"] = True
         self.start("1", "45", CAP)
