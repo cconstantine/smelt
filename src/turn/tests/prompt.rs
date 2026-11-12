@@ -9,6 +9,29 @@ fn test_chat_error_text_drops_the_server_function_wrapper() {
     );
 }
 
+/// SME-481 P1: a top-level conversation set to a persona has its `# Persona`
+/// section, said as set rather than started; one without has none.
+#[test]
+fn test_a_top_level_persona_is_in_the_prompt_and_absent_without_one() {
+    assert!(!system_prompt(&prompt_env()).contains("# Persona"), "no persona, no section");
+    let persona = crate::db::AgentPersona {
+        persona_path: "/workspace/smelt/.agents/personas/ticket-driver.md".to_string(),
+        persona_commit: Some("b7744764abcdef".to_string()),
+        persona_body: "Drive one ticket.".to_string(),
+    };
+    let set = PromptEnvironment { top_level_persona: Some(persona), ..prompt_env() };
+    let prompt = system_prompt(&set);
+    assert!(
+        prompt.contains(
+            "# Persona\n\nYour persona, `smelt:ticket-driver` from /workspace/smelt/.agents/personas/ticket-driver.md \
+             at b774476, read when this conversation was set to it;"
+        ),
+        "{prompt}"
+    );
+    assert!(prompt.contains("Drive one ticket."), "{prompt}");
+    assert!(!prompt.contains("You are agent #"), "it's no agent: {prompt}");
+}
+
 pub(super) fn prompt_env() -> PromptEnvironment {
     PromptEnvironment {
         conversation_id: 42,
@@ -30,6 +53,7 @@ pub(super) fn prompt_env() -> PromptEnvironment {
         instructions: Vec::new(),
         persona_files: Default::default(),
         agent: None,
+        top_level_persona: None,
         credentials: None,
         idle_stop_minutes: Some(60),
         storage_removal_days: Some(7),

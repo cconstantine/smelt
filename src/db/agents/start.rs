@@ -180,7 +180,21 @@ pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChi
         // (SME-354 B11): the key if one is stored then. So its child
         // carries the bit with or without a key stored now, and a key
         // added later reaches it (`credentials::install_into_live_pods`).
-        None => (1, new.caller, None, vec![crate::credentials::CREDENTIAL_GIT_SSH.to_string()]),
+        None => match top_level_grants(&mut tx, new.caller).await? {
+            // SME-481: a top-level conversation set to a persona narrows
+            // its line as any agent does: its chain (`own` stripped) and
+            // its own Rule G bit, never the root's.
+            Some((chain, bit)) => {
+                let git_ssh = bit.iter().any(|name| name == crate::credentials::CREDENTIAL_GIT_SSH);
+                (
+                    1,
+                    new.caller,
+                    crate::personas::rules::for_child(chain),
+                    if git_ssh { vec![crate::credentials::CREDENTIAL_GIT_SSH.to_string()] } else { vec![] },
+                )
+            }
+            None => (1, new.caller, None, vec![crate::credentials::CREDENTIAL_GIT_SSH.to_string()]),
+        },
     };
     #[cfg(test)]
     crate::agents::test_hooks::reach(crate::agents::test_hooks::CREATE_CHILD_LOCKED, new.caller).await;
@@ -248,6 +262,21 @@ pub async fn create_child(pool: &PgPool, new: &NewChild<'_>) -> Result<CreateChi
     };
     tx.commit().await?;
     Ok(CreateChild::Created { child, repo })
+}
+
+/// A top-level caller's persona grants (SME-481), read in `create_child`'s
+/// transaction with the caller's row already locked: its stored chain and
+/// Rule G bit, `None` for a conversation with no persona.
+async fn top_level_grants(
+    conn: &mut sqlx::PgConnection,
+    caller: i64,
+) -> Result<Option<(Option<serde_json::Value>, Vec<String>)>, sqlx::Error> {
+    sqlx::query_as::<_, (Option<serde_json::Value>, Vec<String>)>(
+        "SELECT rule_chain, credentials FROM top_level_personas WHERE conversation_id = $1",
+    )
+    .bind(caller)
+    .fetch_optional(&mut *conn)
+    .await
 }
 
 /// A persona as read at the child's ref when it started: what it runs
@@ -367,11 +396,15 @@ pub struct AgentPersona {
     pub persona_body: String,
 }
 
-/// The persona child `id` runs under, `None` without one.
+/// The persona conversation `id` runs under, `None` without one: a
+/// child's snapshot, or a top-level conversation's (SME-481).
 pub async fn agent_persona(pool: &PgPool, id: i64) -> Result<Option<AgentPersona>, sqlx::Error> {
     sqlx::query_as::<_, AgentPersona>(
         "SELECT persona_path, persona_commit, persona_body FROM agents
-         WHERE conversation_id = $1 AND persona_path IS NOT NULL AND persona_body IS NOT NULL",
+         WHERE conversation_id = $1 AND persona_path IS NOT NULL AND persona_body IS NOT NULL
+         UNION ALL
+         SELECT persona_path, persona_commit, persona_body FROM top_level_personas WHERE conversation_id = $1
+         LIMIT 1",
     )
     .bind(id)
     .fetch_optional(pool)

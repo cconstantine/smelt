@@ -20,6 +20,7 @@ mod persona;
 mod queue;
 mod start;
 mod sweep;
+pub(crate) mod top_level;
 mod volumes;
 
 pub(crate) use checkout::*;
@@ -161,11 +162,14 @@ pub(crate) fn label(conversation_id: i64, persona: Option<&str>) -> String {
 /// again. The caller then counts the turn and calls `confirm_user_turn`,
 /// so a `stop_agent` landing between this and the count is seen.
 pub(crate) async fn admit_user_turn(pool: &PgPool, conversation_id: i64) -> Result<(), String> {
-    let state = db::agent_state(pool, conversation_id)
+    // SME-481: a top-level persona still being applied reads as
+    // `PERSONA_PENDING` here, in the same one read.
+    let state = db::admission_state(pool, conversation_id)
         .await
         .map_err(|e| format!("couldn't read the agent's state: {e}"))?;
     match state.as_deref() {
         None | Some(db::AGENT_ACTIVE) => Ok(()),
+        Some(db::PERSONA_PENDING) => Err(top_level::PERSONA_PENDING_TEXT.to_string()),
         Some(db::AGENT_STARTING) => Err("This agent is still starting.".to_string()),
         Some(db::AGENT_FAILED) => Err("This agent's start failed; start a new one.".to_string()),
         Some(_) => {
@@ -205,8 +209,9 @@ pub(crate) async fn resume_finished(pool: &PgPool, conversation_id: i64) {
 /// turn to end (review 1). One landing after this read stops the counted
 /// turn itself (SME-216's order). A failed read lets the turn go on.
 pub(crate) async fn confirm_user_turn(pool: &PgPool, conversation_id: i64) -> Result<(), String> {
-    match db::agent_state(pool, conversation_id).await {
+    match db::admission_state(pool, conversation_id).await {
         Ok(Some(state)) if state == db::AGENT_STOPPED => Err("This agent was stopped by its parent.".to_string()),
+        Ok(Some(state)) if state == db::PERSONA_PENDING => Err(top_level::PERSONA_PENDING_TEXT.to_string()),
         Ok(Some(state)) if state == db::AGENT_FAILED || state == db::AGENT_STARTING => {
             Err(format!("This agent can't take a message now (it's {state})."))
         }
@@ -225,8 +230,13 @@ pub(crate) async fn confirm_user_turn(pool: &PgPool, conversation_id: i64) -> Re
 /// user writing in a stopped one brings it back (`admit_user_turn`). A
 /// failed read lets it in, so a notice is never dropped.
 pub(crate) async fn admits_notices(pool: &PgPool, conversation_id: i64) -> bool {
-    match db::agent_state(pool, conversation_id).await {
-        Ok(state) => !matches!(state.as_deref(), Some(db::AGENT_STARTING | db::AGENT_STOPPED | db::AGENT_FAILED)),
+    // SME-481: nor a top-level conversation whose persona is still being
+    // applied; the notice is saved for the turn after.
+    match db::admission_state(pool, conversation_id).await {
+        Ok(state) => !matches!(
+            state.as_deref(),
+            Some(db::AGENT_STARTING | db::AGENT_STOPPED | db::AGENT_FAILED | db::PERSONA_PENDING)
+        ),
         Err(e) => {
             tracing::warn!(conversation_id, error = %e, "couldn't read an agent's state before a wake");
             true

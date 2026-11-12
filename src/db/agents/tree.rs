@@ -32,12 +32,16 @@ pub struct TreeRow {
 pub async fn conversation_tree(pool: &PgPool) -> Result<Vec<TreeRow>, sqlx::Error> {
     sqlx::query_as::<_, TreeRow>(&format!(
         "SELECT c.id, c.title, c.created_at, c.updated_at, c.parent_id,
-                a.state, a.persona_name, a.persona_path,
+                a.state,
+                -- SME-481: a top-level conversation's persona, when set.
+                COALESCE(a.persona_name, t.persona_name) AS persona_name,
+                COALESCE(a.persona_path, t.persona_path) AS persona_path,
                 {} AS waiting_for_user,
                 EXISTS (SELECT 1 FROM pending_questions q
                         WHERE q.conversation_id = c.id AND q.answer IS NULL AND q.asked_of = $1) AS waiting_for_parent,
                 {} AS report_owed_at
          FROM conversations c LEFT JOIN agents a ON a.conversation_id = c.id
+         LEFT JOIN top_level_personas t ON t.conversation_id = c.id
          ORDER BY c.updated_at DESC, c.id DESC",
         super::WAITS_FOR_USER,
         super::REPORT_OWED_CASE

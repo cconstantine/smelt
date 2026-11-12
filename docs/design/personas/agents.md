@@ -27,7 +27,7 @@ A child agent is a conversation (the project's scope item 1): its own transcript
 - **`conversations.deleting_at`** `TIMESTAMP NULL` (SME-236): set by a delete under the root's lock, so `start_agent` can't add an agent to a subtree being deleted ([Deleting](#deleting)).
 - **`conversations.budget_stopped_at`** `TIMESTAMP NULL` (SME-245): set on a group's root when the group reaches its budget, cleared when the user lifts it ([Limits](#limits-sme-245)).
 
-The `agents` row is separate from `conversations` so the user's own conversations carry none of it; `parent_id` is on `conversations` because the cascade has to be.
+The `agents` row is separate from `conversations` so the user's own conversations carry none of it; `parent_id` is on `conversations` because the cascade has to be. A top-level conversation set to a persona (SME-481) gets no `agents` row either: its snapshot, chain and Rule G bit are in `top_level_personas`, read beside `agents` by the grant readers ([top-level.md](top-level.md)).
 
 ## Tools
 
