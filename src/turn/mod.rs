@@ -46,6 +46,8 @@ pub(crate) use self::lifecycle::*;
 pub(crate) use self::notify::*;
 use self::overflow::recover as overflow_recovery;
 pub(crate) use self::overflow::reported_per_request;
+#[cfg(test)]
+pub(crate) use self::overflow::forget_window_stop_candidates;
 pub(crate) use self::outside_turn::*;
 pub(crate) use self::questions::*;
 use self::reply::*;

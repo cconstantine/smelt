@@ -455,7 +455,7 @@ pub(super) fn ollama_tell_says_truncated(estimate: u64, measured: u64) -> bool {
 /// test that reads or writes them starts by forgetting them;
 /// `lock_turn_tests` keeps the tests off each other's turns.
 #[cfg(test)]
-pub(super) fn forget_window_stop_candidates() {
+pub(crate) fn forget_window_stop_candidates() {
     WINDOW_STOP_CANDIDATES.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 

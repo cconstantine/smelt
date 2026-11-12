@@ -313,6 +313,7 @@ async fn test_finish_is_refused_while_the_callers_own_agents_run(pool: PgPool) {
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_child_slot_stopped_before_its_finish_still_reports_its_parent(pool: PgPool) {
     let _guard = crate::providers::test_support::lock_turn_tests();
+    crate::turn::forget_window_stop_candidates();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let child_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let requests = {
