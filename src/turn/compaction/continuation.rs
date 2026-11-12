@@ -156,6 +156,8 @@ fn unread_results_text(unread: &[String]) -> Option<String> {
 /// now would cover before it reads them: the `ToolResult` blocks of the
 /// user messages after the last assistant message, each named by the tool
 /// that made it (SME-414 scenario 2 — the loop of its title steps on this).
+/// Not `compact_context`'s own (SME-482): it asked for this compaction, and
+/// naming it unread would tell the model to call it again.
 #[cfg(feature = "server")]
 pub fn unread_tool_results(messages: &[Message]) -> Vec<String> {
     let Some(last) = messages.iter().rposition(|m| m.role == "assistant") else {
@@ -165,7 +167,9 @@ pub fn unread_tool_results(messages: &[Message]) -> Vec<String> {
     let names: std::collections::HashMap<&str, &str> = blocks
         .iter()
         .filter_map(|b| match b {
-            anthropic::ContentBlock::ToolUse { id, name, .. } => Some((id.as_str(), name.as_str())),
+            anthropic::ContentBlock::ToolUse { id, name, .. } if name != anthropic::tools::COMPACT_CONTEXT => {
+                Some((id.as_str(), name.as_str()))
+            }
             _ => None,
         })
         .collect();

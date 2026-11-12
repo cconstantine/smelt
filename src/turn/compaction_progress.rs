@@ -50,6 +50,11 @@
 //!   loop SME-386 F10 survived: counted (`thrash`), the model is told at
 //!   `NOTICE_AT`, and at `END_AT` the turn ends and wakes stop until the
 //!   user writes, the window changes, or a message queues (SME-414);
+//! - the model's `compact_context` (SME-482, `on_request`): `request` records
+//!   it, the end of the tool pass takes it (`take_request`) and spends the
+//!   turn's once, and the turn's start clears both (`turn_started`). A
+//!   window change keeps it: one learned mid-turn mustn't give the turn a
+//!   second compaction;
 //! - a restart or a delete: all of it goes, and the next compaction learns it.
 
 use super::*;
@@ -157,6 +162,17 @@ pub(super) struct CompactionProgress {
     /// `thrash` reached `END_AT`: turns end and wakes stop, until the user
     /// writes, the window changes, or a message queues (`clear_thrash`).
     thrashing: bool,
+    /// The compaction the model asked for this turn (SME-482).
+    on_request: OnRequest,
+}
+
+/// A compaction the model asked for this turn (SME-482): `pending` holds
+/// its note until the end of the tool pass takes it, and `spent` says the
+/// turn has had its one.
+#[derive(Clone, Debug, Default)]
+struct OnRequest {
+    pending: Option<Option<String>>,
+    spent: bool,
 }
 
 /// How near the window a request may come once compacting can't help.
@@ -170,7 +186,9 @@ impl CompactionProgress {
             return;
         }
         if self.window != Some(context_window) {
-            *self = Self { window: Some(context_window), ..Self::default() };
+            // The model's request is the turn's, not the window's (SME-482).
+            let on_request = std::mem::take(&mut self.on_request);
+            *self = Self { window: Some(context_window), on_request, ..Self::default() };
         } else if self.guess.take().is_some() {
             // The turn that guessed is over, and what it saw was against the guess.
             self.forget_measures();
@@ -190,6 +208,33 @@ impl CompactionProgress {
         self.sync(believed);
         self.guess = Some(guess);
         self.forget_measures();
+    }
+
+    /// The model's `compact_context`, with its note (SME-482): refused when
+    /// the turn has had its one compaction, or this reply already asked.
+    pub(super) fn request(&mut self, note: Option<String>) -> Result<(), &'static str> {
+        if self.on_request.spent {
+            return Err("this conversation was already compacted once this turn, and compact_context compacts at \
+                        most once per turn: carry on from the summary");
+        }
+        if self.on_request.pending.is_some() {
+            return Err("compact_context was already asked for in this reply: the conversation compacts once this \
+                        tool pass ends");
+        }
+        self.on_request.pending = Some(note);
+        Ok(())
+    }
+
+    /// The request this tool pass made, if any, which spends the turn's once.
+    pub(super) fn take_request(&mut self) -> Option<Option<String>> {
+        let taken = self.on_request.pending.take();
+        self.on_request.spent |= taken.is_some();
+        taken
+    }
+
+    /// A turn starts: it may compact once, and nothing is asked yet.
+    pub(super) fn turn_started(&mut self) {
+        self.on_request = OnRequest::default();
     }
 
     /// A compaction just answered a refusal.
