@@ -80,9 +80,19 @@ class Allowlist(FakeCase):
                 self.assertEqual(self.sent(), [])
 
     def test_the_sources_name_no_delete_and_no_path_outside_the_tables(self):
-        for path in (CLIENT, os.path.join(PM, "smelt_api.py")):
+        # Every script that talks to smelt (L2: smelt-wait too); only
+        # smelt_api.py may import urllib, so every request goes through call().
+        for path in (CLIENT, WAITER, os.path.join(PM, "smelt_api.py")):
             with open(path, encoding="utf-8") as f:
                 tree = ast.parse(f.read())
+            if not path.endswith("smelt_api.py"):
+                for n in ast.walk(tree):
+                    names = ([a.name for a in n.names] if isinstance(n, ast.Import)
+                             else [n.module or ""] if isinstance(n, ast.ImportFrom) else [])
+                    for name in names:
+                        with self.subTest(path=os.path.basename(path), imports=name):
+                            self.assertFalse(name.split(".")[0] in ("urllib", "http", "requests", "socket"),
+                                             "a request outside smelt_api.call")
             tables = set()
             for top in tree.body:
                 if isinstance(top, ast.Assign) and any(getattr(t, "id", "") in ("ROUTES", "NOT_YET") for t in top.targets):
