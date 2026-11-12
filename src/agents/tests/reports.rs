@@ -294,3 +294,161 @@ async fn test_finish_is_refused_while_the_callers_own_agents_run(pool: PgPool) {
     assert!(finished.as_deref().is_ok_and(|r| r.contains("Your report was sent")), "{finished:?}");
     eventually("the parent's turns are over", || async { !crate::turn::turn_running(root) }).await;
 }
+
+/// SME-420: the symptom the ticket names, end to end. The child's
+/// llama.cpp slot stop is cut in the middle of its `finish` call, and its
+/// turn is where the decision lives: the stop learns a tight window, and
+/// if that same step's room decision read the changed window, the
+/// progress record it needs is wiped as a window change — the child's
+/// turn would end and its report would never exist. Here the turn
+/// compacts, carries on, and the full `finish` runs: the report row
+/// lands in the root, the root's transcript carries it and its reply,
+/// the child reaches AGENT_FINISHED, and the retry carried the cut-off
+/// notice. A scripted LlamaCpp-kind provider drives the whole chain
+/// (mock → run → `finish` → `agent_messages` → parent). Nothing asserted
+/// here says which learner branch fired — the candidate cache is
+/// process-global, keyed by provider id and reused across test databases
+/// — so leftovers from other tests cannot move the outcome; like every
+/// writer of it, this test holds `lock_turn_tests`.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_child_slot_stopped_before_its_finish_still_reports_its_parent(pool: PgPool) {
+    let _guard = crate::providers::test_support::lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let child_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let requests = {
+        let child_calls = child_calls.clone();
+        mock_of_kind(&pool, "llama_cpp", move |request| {
+            let body = if request["system"].to_string().contains("You are compacting") {
+                text_reply("The summary.")
+            } else if agent_of(request).is_some() {
+                // The child's steps, by call count: the same numbers the
+                // turn-level test scripts — two compactions learn `tight`,
+                // a RoomLeft step, then the slot stop cut mid-`finish`;
+                // its retry calls `finish` whole.
+                match child_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => with_usage(&tool_call_reply("todoread", serde_json::json!({})), 16_500, 0, 100),
+                    1 => with_usage(&tool_call_reply("todoread", serde_json::json!({})), 13_600, 0, 3_000),
+                    2 => with_usage(&tool_call_reply("todoread", serde_json::json!({})), 13_600, 0, 100),
+                    3 => with_usage(&tool_call_reply("todoread", serde_json::json!({})), 24_000, 0, 100),
+                    4 => {
+                        let max_tokens = request["max_tokens"].as_i64().expect("the RoomLeft request carries its room as a budget");
+                        slot_stop_mid_finish(24_000, max_tokens / 8)
+                    }
+                    5 => tool_call_reply("finish", serde_json::json!({"report": "All done: 42."})),
+                    _ => text_reply("Should never be asked: the child ran past its finish."),
+                }
+            } else {
+                text_reply("Thanks.")
+            };
+            Box::pin(async move { body })
+        })
+        .await
+    };
+    set_context_window(&pool, 32_768).await;
+    let root = db::create_conversation(&pool).await.expect("create conversation").id;
+    let child = start_child(&pool, root, "Work.").await;
+
+    // SME-390's shape: one wait per link of the chain, none racing all of it.
+    eventually("the report is queued", || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM agent_messages WHERE to_conversation_id = $1 AND kind = 'report'")
+            .bind(root)
+            .fetch_one(&pool)
+            .await
+            .expect("count")
+            == 1
+    })
+    .await;
+    eventually("the root's request runs", || async { requests_for(&requests, None).len() == 1 }).await;
+    eventually("the parent answers the report", || async {
+        transcript(&pool, root).await.iter().any(|(role, text)| role == "assistant" && text == "Thanks.")
+    })
+    .await;
+    assert_eq!(
+        transcript(&pool, root).await,
+        vec![
+            ("user".to_string(), format!("Report from agent #{child}:\n\nAll done: 42.")),
+            ("assistant".to_string(), "Thanks.".to_string()),
+        ]
+    );
+    assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_FINISHED), "the child reached its end");
+    let child_requests = requests_for(&requests, Some(child));
+    assert_eq!(child_requests.len(), 6, "through the stop, the room compaction, and the full finish");
+    assert!(
+        child_requests[5]["messages"].to_string().contains(crate::api::chat::CUT_OFF_NOTICE_START),
+        "the retry after the stop carried the cut-off notice: {}",
+        child_requests[5]["messages"]
+    );
+}
+
+/// A mock upstream shaped like `mock_with`, saved as a provider of
+/// `kind` — the llama.cpp kind's stop tell is what SME-420 needs.
+async fn mock_of_kind(
+    pool: &PgPool,
+    kind: &str,
+    answer: impl Fn(&serde_json::Value) -> Reply + Send + Sync + 'static,
+) -> Arc<Mutex<Vec<serde_json::Value>>> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    let answer = Arc::new(answer);
+    let app = axum::Router::new().route(
+        "/v1/messages",
+        axum::routing::post(move |request: String| {
+            let recorded = recorded.clone();
+            let answer = answer.clone();
+            async move {
+                let parsed: serde_json::Value = serde_json::from_str(&request).expect("a JSON request body");
+                let reply = answer(&parsed);
+                recorded.lock().expect("the request log").push(parsed);
+                ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], reply.await)
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    crate::providers::test_support::add_mock_provider_kind(pool, addr, kind).await;
+    requests
+}
+
+/// Saves `mock-model`'s Context window, as the provider page's field
+/// would — a copy of the turn tests' `set_context_window`, which is
+/// `pub(super)` inside `turn::tests` and unreachable from here.
+async fn set_context_window(pool: &PgPool, window: i32) {
+    sqlx::query("INSERT INTO provider_models (provider_id, model, context_window, max_output) SELECT id, $1, $2, $3 FROM inference_providers")
+        .bind(crate::providers::test_support::MOCK_MODEL)
+        .bind(window)
+        .bind(None::<i32>)
+        .execute(pool)
+        .await
+        .expect("seed the window");
+}
+
+/// `body` reporting `input`/`cache_read` input tokens and `output` output
+/// tokens, as a real reply's `message_start` and `message_delta` do — a
+/// copy of the turn tests' `with_usage`, same reason.
+fn with_usage(body: &str, input: i64, cache_read: i64, output: i64) -> String {
+    body.replacen(
+        r#"{"type":"message_start"}"#,
+        &format!(
+            r#"{{"type":"message_start","message":{{"usage":{{"input_tokens":{input},"cache_creation_input_tokens":0,"cache_read_input_tokens":{cache_read},"output_tokens":1}}}}}}"#
+        ),
+        1,
+    )
+    .replacen(r#""delta":{"stop_reason""#, &format!(r#""usage":{{"output_tokens":{output}}},"delta":{{"stop_reason""#), 1)
+}
+
+/// A llama.cpp slot stop cut in the middle of a `finish` call: the stream
+/// ends `max_tokens` with only the start of the call written, so the
+/// call is dropped and never runs — the state SME-420 is about.
+fn slot_stop_mid_finish(input: i64, output: i64) -> String {
+    let body = sse_body(&[
+        ("message_start", r#"{"type":"message_start"}"#),
+        ("content_block_start", r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_f","name":"finish","input":{}}}"#),
+        ("content_block_delta", r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"report\": \"All done"}}"#),
+        ("message_delta", r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"}}"#),
+        ("message_stop", r#"{"type":"message_stop"}"#),
+    ]);
+    with_usage(&body, input, 0, output)
+}
