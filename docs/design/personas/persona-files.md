@@ -31,7 +31,6 @@ smelt:
     class: read-only
     allow: [github/create_pull_request_review, linear/save_comment]
   credentials: []
-  compact_at: 200000
   resources:
     sandbox: { memory_request: 256Mi, memory_limit: 8Gi }
     docker: { memory_request: 12Gi, memory_limit: 48Gi }
