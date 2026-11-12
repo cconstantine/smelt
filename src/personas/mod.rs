@@ -3,13 +3,17 @@
 //! frontmatter holding exactly `name`, `description` and an optional
 //! `smelt` map of smelt's own settings, then the instructions as Markdown.
 //! Any other key, at the top or under `smelt`, is refused: a field arrives
-//! with the ticket that uses it. See docs/design/personas/persona-files.md.
+//! with the ticket that uses it. The one way out is `smelt.ignore_if_unknown`
+//! (SME-506, `settings`): a key under `smelt` that this smelt doesn't know
+//! and the file lists is skipped, and never a restricting one. See
+//! docs/design/personas/persona-files.md.
 
 use serde::Deserialize;
 
 pub(crate) mod frontmatter;
 pub(crate) mod links;
 pub(crate) mod rules;
+pub(crate) mod settings;
 
 /// A parsed persona file.
 #[derive(Clone, Debug, PartialEq)]
@@ -36,38 +40,9 @@ pub struct Persona {
     /// compacts before its next model call (SME-493), below the window's
     /// own trigger. `None` leaves only the window's.
     pub compact_at: Option<u64>,
-}
-
-/// The frontmatter. Claude Code's own keys (`tools`, `model`, ...) are
-/// refused like any other: smelt's settings go under `smelt`.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Frontmatter {
-    name: String,
-    description: String,
-    /// `smelt:` with no value is the same as no `smelt` key.
-    #[serde(default)]
-    smelt: Option<SmeltSettings>,
-}
-
-/// smelt's own settings. `credentials` arrived with SME-242, `resources`
-/// with SME-484 and `compact_at` with SME-493; later tickets add `egress`
-/// (SME-243) and `limits` (SME-245).
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SmeltSettings {
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    tools: Option<rules::RawToolRules>,
-    #[serde(default)]
-    credentials: Option<RawCredentials>,
-    #[serde(default)]
-    resources: Option<crate::sandbox::PodResources>,
-    /// A positive count of tokens: `0`, a negative number or a string
-    /// (YAML 1.2 reads `200_000` as one) is serde's error at its line.
-    #[serde(default)]
-    compact_at: Option<std::num::NonZeroU64>,
+    /// The `smelt` keys this smelt doesn't know that the file lists in
+    /// `smelt.ignore_if_unknown`, skipped unread, in file order (SME-506).
+    pub ignored: Vec<String>,
 }
 
 /// `smelt.credentials`: a list of credential names, each checked where
@@ -154,7 +129,14 @@ pub fn parse(path: &str, text: &str, file_bytes: u64) -> Result<Persona, String>
         return Err(format!("{path} is {file_bytes} bytes: a persona file may be at most {MAX_FILE_BYTES}."));
     }
     let (yaml, body) = frontmatter::split(text).map_err(|e| format!("{path} {e}"))?;
-    let front: Frontmatter = serde_norway::from_str(yaml).map_err(|e| yaml_error(path, &e))?;
+    // Two passes (SME-506): a lenient read of `smelt.ignore_if_unknown`,
+    // then the strict parse it informs, keeping serde's own locations.
+    let listed = settings::listed(yaml);
+    let front = serde::de::DeserializeSeed::deserialize(
+        settings::FrontmatterSeed(&listed),
+        serde_norway::Deserializer::from_str(yaml),
+    )
+    .map_err(|e| yaml_error(path, &e))?;
     if !valid_name(&front.name) {
         return Err(format!(
             "{path}: `name` {:?} must be 1 to 64 lowercase letters, digits and -, not starting or ending with -.",
@@ -193,6 +175,7 @@ pub fn parse(path: &str, text: &str, file_bytes: u64) -> Result<Persona, String>
         credentials,
         resources,
         compact_at: smelt.compact_at.map(std::num::NonZeroU64::get),
+        ignored: smelt.ignored,
     })
 }
 

@@ -110,6 +110,7 @@ fn read_from(repo: db::ConversationRepo, marker: &str) -> RepoPersonas {
         credentials: None,
         resources: None,
         compact_at: None,
+        ignored: Vec::new(),
     };
     RepoPersonas {
         repo,
