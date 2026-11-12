@@ -507,6 +507,7 @@ mod escape;
 mod claude_cli;
 mod on_request;
 mod compact_now;
+mod compact_at;
 
 /// The reason in conversation `id`'s last failure notice (SME-123 DR3),
 /// where a user's failed turn now says why.

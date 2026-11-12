@@ -7,6 +7,9 @@
 //! the loop's start clears both (`turn_started`). All three run under the
 //! turn lock. A window change (`sync`) keeps it: a window learned mid-turn
 //! must not hand the turn a second compaction.
+//!
+//! A persona's token ceiling (SME-493, `compact_at_ceiling`) compacts the
+//! same way, before a model call, once the conversation passes it.
 
 use super::*;
 
@@ -67,6 +70,46 @@ pub(super) async fn compact_if_asked(
         Compacted::Skipped(why) => tracing::warn!(conversation_id, ?why, "the model's compaction found nothing to compact"),
     }
     Ok(())
+}
+
+/// Before a model call the window's trigger let go (SME-493): compacts
+/// when the request, about `projected` tokens, is at or over the persona's
+/// ceiling and `ceiling_due` says it's worth it, over the same
+/// `compact_on_request` path, so every safeguard of `compact` holds.
+/// Returns whether it compacted. A failed summary doesn't fail the turn:
+/// the request still fits the window, so the ceiling is a saving, not a
+/// need. Nothing is saved for the model (it didn't ask, and nothing
+/// changed for it); the ceiling is off for the rest of the turn.
+pub(super) async fn compact_at_ceiling(
+    pool: &PgPool,
+    conversation_id: i64,
+    turn_model: &mut crate::providers::TurnModel,
+    slot: &TurnSlot,
+    projected: Option<u64>,
+    persisted: &mut Vec<Message>,
+    pending_new_content: &mut Vec<anthropic::ContentBlock>,
+) -> ServerFnResult<bool> {
+    let Some(at) = with_compaction_progress(conversation_id, |p| p.ceiling_due(projected)) else {
+        return Ok(false);
+    };
+    match compact_on_request(pool, conversation_id, turn_model, slot.held(), Asker::Ceiling(at), None).await {
+        Ok(Compacted::Done) => {
+            let window = turn_model.context_window;
+            with_compaction_progress(conversation_id, |p| p.compacted(window));
+            note_thrash(pool, conversation_id, persisted, pending_new_content).await?;
+            Ok(true)
+        }
+        Ok(Compacted::Skipped(why)) => {
+            tracing::warn!(conversation_id, ?why, "the ceiling's compaction found nothing to compact");
+            Ok(false)
+        }
+        Err(e) => {
+            let why = crate::api::chat::chat_error_text(&e);
+            tracing::warn!(conversation_id, error = %why, ceiling = at, "the ceiling's compaction failed; the turn carries on");
+            with_compaction_progress(conversation_id, CompactionProgress::ceiling_failed);
+            Ok(false)
+        }
+    }
 }
 
 /// A request the endpoint refuses, in its own words: a 409, since the

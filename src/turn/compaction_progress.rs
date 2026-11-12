@@ -55,6 +55,13 @@
 //!   turn's once, and the turn's start clears both (`turn_started`). A
 //!   window change keeps it: one learned mid-turn mustn't give the turn a
 //!   second compaction;
+//! - a persona's ceiling (SME-493, `Ceiling`): the turn's start reads it
+//!   (`set_ceiling`), and a step at or over it, two steps clear of the last
+//!   compaction, compacts first (`ceiling_due`). A compaction whose reply
+//!   measures within `MIN_ROOM_TO_WORK` of it spends it (`measured`), so a
+//!   summary that can't get under it isn't paid for again; a later one
+//!   measured under it, or a window change, re-arms it. A failed one turns
+//!   it off for the turn (`ceiling_failed`);
 //! - a restart or a delete: all of it goes, and the next compaction learns it.
 
 use super::*;
@@ -164,6 +171,19 @@ pub(super) struct CompactionProgress {
     thrashing: bool,
     /// The compaction the model asked for this turn (SME-482).
     on_request: OnRequest,
+    /// The persona's token ceiling (SME-493).
+    ceiling: Ceiling,
+}
+
+/// The persona's token ceiling (SME-493) and whether it's worth compacting
+/// at: `spent` once a compaction left the seat within `MIN_ROOM_TO_WORK`
+/// of it, until one leaves room again; `failed` for the rest of a turn
+/// whose ceiling compaction failed.
+#[derive(Clone, Debug, Default)]
+struct Ceiling {
+    at: Option<u64>,
+    spent: bool,
+    failed: bool,
 }
 
 /// A compaction the model asked for this turn (SME-482): `pending` holds
@@ -186,9 +206,12 @@ impl CompactionProgress {
             return;
         }
         if self.window != Some(context_window) {
-            // The model's request is the turn's, not the window's (SME-482).
+            // The model's request is the turn's, not the window's (SME-482),
+            // and the ceiling the persona's; only its spent mark was
+            // learned against the old window (SME-493).
             let on_request = std::mem::take(&mut self.on_request);
-            *self = Self { window: Some(context_window), on_request, ..Self::default() };
+            let ceiling = Ceiling { spent: false, ..std::mem::take(&mut self.ceiling) };
+            *self = Self { window: Some(context_window), on_request, ceiling, ..Self::default() };
         } else if self.guess.take().is_some() {
             // The turn that guessed is over, and what it saw was against the guess.
             self.forget_measures();
@@ -235,6 +258,28 @@ impl CompactionProgress {
     /// A turn starts: it may compact once, and nothing is asked yet.
     pub(super) fn turn_started(&mut self) {
         self.on_request = OnRequest::default();
+    }
+
+    /// The turn's start read the persona's ceiling (SME-493), `None` for
+    /// none: a failure in an earlier turn may be tried again.
+    pub(super) fn set_ceiling(&mut self, at: Option<u64>) {
+        self.ceiling.at = at;
+        self.ceiling.failed = false;
+    }
+
+    /// The ceiling, when a request of about `projected` tokens should
+    /// compact at it first (SME-493): at or over it, not spent or failed,
+    /// and two steps clear of the last compaction, so a ceiling compaction
+    /// is never the one-step shape `thrash` counts.
+    pub(super) fn ceiling_due(&self, projected: Option<u64>) -> Option<u64> {
+        let Ceiling { at, spent, failed } = self.ceiling;
+        let at = at.filter(|_| !spent && !failed && self.steps_since_compaction >= 2)?;
+        projected.filter(|projected| *projected >= at).map(|_| at)
+    }
+
+    /// The ceiling's compaction failed: no more tries this turn.
+    pub(super) fn ceiling_failed(&mut self) {
+        self.ceiling.failed = true;
     }
 
     /// A compaction just answered a refusal.
@@ -370,6 +415,11 @@ impl CompactionProgress {
         }
         self.awaiting = false;
         self.after = Some(input);
+        // A compaction that leaves too little room under the ceiling spends
+        // it, and one that leaves room re-arms it (SME-493).
+        if let Some(at) = self.ceiling.at {
+            self.ceiling.spent = input + MIN_ROOM_TO_WORK > at;
+        }
         if self.guess.is_some() {
             return;
         }
