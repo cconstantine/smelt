@@ -29,10 +29,10 @@ fn real_click(element: &chromiumoxide::Element) -> BoxFuture<'_, Result<(), Stri
 /// meanwhile doesn't confuse it): a miss is tried again. A click that
 /// loaded another page takes the check with it, and counts as landed. A
 /// miss that hit something with its own action does that action too; in
-/// practice it has been the transcript's background. A click not seen to
-/// land whose target has changed its class anyway counts as landed, and
-/// isn't repeated: the selector of a two-step button matches it armed too,
-/// so a retry would confirm what the lost click armed (SME-505).
+/// practice it has been the transcript's background. A click step that
+/// fails is read against the watcher too, and counts as landed when the
+/// click reached its target: the selector of a two-step button matches it
+/// armed too, so a retry would confirm what that click armed (SME-505).
 pub(super) async fn click_when_present(page: &chromiumoxide::Page, selector: &str, timeout: Duration) {
     click_when_present_with(page, selector, timeout, real_click).await;
 }
@@ -45,17 +45,13 @@ pub(super) async fn click_when_present_with(page: &chromiumoxide::Page, selector
     let _ = page.evaluate(RECORDER).await;
     let watch = format!(
         "(() => {{ const el = document.querySelector({selector:?}); if (!el) return false; \
-         window.__smeltClickTarget = el; window.__smeltClick = 'no click seen'; window.__smeltClickBefore = el.className; \
+         window.__smeltClickTarget = el; window.__smeltClick = 'no click seen'; \
          if (!window.__smeltClickWatcher) {{ window.__smeltClickWatcher = true; \
          document.addEventListener('click', e => {{ const t = window.__smeltClickTarget; \
          window.__smeltClick = t && (t === e.target || t.contains(e.target)) ? 'hit' : 'clicked ' + (e.target.className || e.target.tagName); }}, true); }} \
          return true; }})()"
     );
     let outcome = "typeof window.__smeltClick === 'string' ? window.__smeltClick : 'navigated'";
-    // Whether the target, still in the page, has another class than when
-    // the click was aimed at it: the click did something to it.
-    let changed = "(() => { const t = window.__smeltClickTarget; \
-         return !!t && t.isConnected && t.className !== window.__smeltClickBefore; })()";
     let mut last = String::new();
     loop {
         wait_for_stable(page, selector, deadline).await;
@@ -69,9 +65,14 @@ pub(super) async fn click_when_present_with(page: &chromiumoxide::Page, selector
         if watching {
             match page.find_element(selector).await {
                 Err(e) => last = format!("gone before the click: {e}"),
-                Ok(element) => match click(&element).await {
-                    Err(e) => last = format!("the click failed: {e}"),
-                    Ok(()) => match page.evaluate(outcome).await {
+                Ok(element) => {
+                    // A click step that fails may have pressed and released
+                    // already, after the watcher saw the click: that click
+                    // landed, and a retry would repeat it, confirming a
+                    // two-step button it armed (SME-505). So its failure is
+                    // read against the watcher too.
+                    let failed = click(&element).await.err();
+                    match page.evaluate(outcome).await {
                         // The page went away mid-read: the click did something.
                         Err(_) => return,
                         Ok(value) => {
@@ -79,18 +80,13 @@ pub(super) async fn click_when_present_with(page: &chromiumoxide::Page, selector
                             if result == "hit" || result == "navigated" {
                                 return;
                             }
-                            last = result;
+                            last = match failed {
+                                Some(e) => format!("the click failed: {e} ({result})"),
+                                None => result,
+                            };
                         }
-                    },
-                },
-            }
-            // Not seen to land, yet its target changed: it did land, and a
-            // retry would do it again. A two-step button armed by a click
-            // whose report was lost would be confirmed by the retry
-            // (SME-505). The page renders a click's change a little after
-            // it, so this watches for one for a moment before retrying.
-            if target_changed(page, changed).await {
-                return;
+                    }
+                }
             }
         }
         if tokio::time::Instant::now() >= deadline {
@@ -134,21 +130,6 @@ pub(super) async fn page_state(page: &chromiumoxide::Page) -> String {
     }
 }
 
-/// Whether `changed` (`click_when_present_with`'s check) turns true within
-/// half a second: a click's effect is rendered a few milliseconds to
-/// about 90 ms after it on the tier's long sidebar.
-async fn target_changed(page: &chromiumoxide::Page, changed: &str) -> bool {
-    let until = tokio::time::Instant::now() + Duration::from_millis(500);
-    loop {
-        if page.evaluate(changed).await.ok().and_then(|v| v.into_value::<bool>().ok()) == Some(true) {
-            return true;
-        }
-        if tokio::time::Instant::now() >= until {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
 
 /// Waits until `selector`'s element exists and has the same box on two
 /// reads 150 ms apart, without scrolling anything itself (that would both
@@ -193,7 +174,24 @@ fn click_then_fail(element: &chromiumoxide::Element) -> BoxFuture<'_, Result<(),
     })
 }
 
-/// SME-505: a click that changed its target isn't clicked again. A sidebar
+/// A click step that misses once: the first time it changes its target's
+/// class for a reason of its own and clicks the page's body instead, so
+/// the click is seen to land elsewhere; after that it clicks for real.
+fn miss_once_then_click(element: &chromiumoxide::Element) -> BoxFuture<'_, Result<(), String>> {
+    Box::pin(async move {
+        let decoy = "function() { if (window.__smeltMissedOnce) return false; window.__smeltMissedOnce = true; \
+             this.classList.add('changed-for-another-reason'); document.body.click(); return true; }";
+        let missed = element.call_js_fn(decoy, false).await.map_err(|e| e.to_string())?;
+        if missed.result.value == Some(serde_json::Value::Bool(true)) {
+            return Ok(());
+        }
+        element.click().await.map(|_| ()).map_err(|e| e.to_string())
+    })
+}
+
+/// SME-505: a click that reached its target isn't clicked again, even when
+/// its click step reports an error; one seen to land elsewhere still is,
+/// whatever its target did meanwhile (review 1, M1). A sidebar
 /// Delete arms on its first click and deletes on its second, and the same
 /// selector matches it armed or not; so a click whose report is lost (here
 /// an error after the press and release) and is retried confirms the
@@ -202,10 +200,16 @@ fn click_then_fail(element: &chromiumoxide::Element) -> BoxFuture<'_, Result<(),
 /// 43219768271. That such a retry happened there is not shown: the run's
 /// log has only that line. This shows the path exists, and closes it.
 pub(super) async fn scenario_click_not_repeated(t: &Scenario<'_>) {
+    let missed = t.conversation().await;
     let target = t.conversation().await;
     let open = t.conversation().await;
     let page = t.tab(t.url(&format!("conversation/{}", open.id))).await;
     wait_for_live_client(&page, open.id).await;
+    // A click seen to land elsewhere is retried, even when its target's
+    // class changes meanwhile for another reason (SME-505 review 1, M1).
+    let missed_delete = format!(".conversation-item[data-conversation-id='{}'] .delete-conversation", missed.id);
+    click_when_present_with(&page, &missed_delete, Duration::from_secs(5), miss_once_then_click).await;
+    wait_for_element(&page, &format!("{missed_delete}.confirm"), Duration::from_secs(5)).await;
     let delete = format!(".conversation-item[data-conversation-id='{}'] .delete-conversation", target.id);
     click_when_present_with(&page, &delete, Duration::from_secs(5), click_then_fail).await;
     // Armed, and still armed: the arm wasn't repeated into a confirm.
