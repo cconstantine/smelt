@@ -101,6 +101,24 @@ pub async fn persona_credential_names(pool: &PgPool, id: i64) -> Result<Vec<Stri
         .unwrap_or_default())
 }
 
+/// The token ceiling this conversation's persona snapshot sets (SME-493):
+/// the `compact_at` key of `persona_settings`, frozen at the start like
+/// `credentials`. Each seat's own, from its `agents` row or its
+/// `top_level_personas` one: nothing is inherited. No row, no key or a
+/// null all mean none.
+pub async fn persona_compact_at(pool: &PgPool, id: i64) -> Result<Option<u64>, sqlx::Error> {
+    let settings = sqlx::query_scalar::<_, Option<serde_json::Value>>(
+        "SELECT persona_settings FROM agents WHERE conversation_id = $1
+         UNION ALL
+         SELECT persona_settings FROM top_level_personas WHERE conversation_id = $1
+         LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(settings.flatten().as_ref().and_then(|s| s.get("compact_at")).and_then(serde_json::Value::as_u64))
+}
+
 /// The agent's stored `rule_chain` (SME-241): the JSON array as written,
 /// `None` for no agent row or a NULL chain — both mean allow-all. One
 /// indexed read; the primary key is the conversation id. A top-level

@@ -32,6 +32,10 @@ pub struct Persona {
     /// `smelt.resources`: what the persona's pod asks of its node (SME-484).
     /// `None` leaves the deployment's defaults: no request, its limits.
     pub resources: Option<crate::sandbox::PodResources>,
+    /// `smelt.compact_at`: the token ceiling past which the persona's seat
+    /// compacts before its next model call (SME-493), below the window's
+    /// own trigger. `None` leaves only the window's.
+    pub compact_at: Option<u64>,
 }
 
 /// The frontmatter. Claude Code's own keys (`tools`, `model`, ...) are
@@ -46,8 +50,9 @@ struct Frontmatter {
     smelt: Option<SmeltSettings>,
 }
 
-/// smelt's own settings. `credentials` arrived with SME-242 and `resources`
-/// with SME-484; later tickets add `egress` (SME-243) and `limits` (SME-245).
+/// smelt's own settings. `credentials` arrived with SME-242, `resources`
+/// with SME-484 and `compact_at` with SME-493; later tickets add `egress`
+/// (SME-243) and `limits` (SME-245).
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SmeltSettings {
@@ -59,6 +64,10 @@ struct SmeltSettings {
     credentials: Option<RawCredentials>,
     #[serde(default)]
     resources: Option<crate::sandbox::PodResources>,
+    /// A positive count of tokens: `0`, a negative number or a string
+    /// (YAML 1.2 reads `200_000` as one) is serde's error at its line.
+    #[serde(default)]
+    compact_at: Option<std::num::NonZeroU64>,
 }
 
 /// `smelt.credentials`: a list of credential names, each checked where
@@ -183,6 +192,7 @@ pub fn parse(path: &str, text: &str, file_bytes: u64) -> Result<Persona, String>
         tools,
         credentials,
         resources,
+        compact_at: smelt.compact_at.map(std::num::NonZeroU64::get),
     })
 }
 

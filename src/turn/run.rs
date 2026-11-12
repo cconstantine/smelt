@@ -242,6 +242,9 @@ fn run_turn_loop<'c>(
         let mut last_known_usage = db::get_conversation_usage(pool, conversation_id)
             .await
             .map_err(ServerFnError::new)?;
+        // The persona's token ceiling, from its frozen snapshot (SME-493).
+        let ceiling = db::persona_compact_at(pool, conversation_id).await.map_err(ServerFnError::new)?;
+        with_compaction_progress(conversation_id, |p| p.set_ceiling(ceiling));
         let is_wake = new_content.is_none();
         pending_new_content.extend(new_content.into_iter().flatten());
 
@@ -366,7 +369,17 @@ fn run_turn_loop<'c>(
             let projected = projected_input(last_known_usage.as_ref(), estimate_tokens(&pending_new_content));
             let mut compacted = false;
             match with_compaction_progress(conversation_id, |p| p.step(&turn_model.model, turn_model.context_window, projected)) {
-                CompactionStep::Go => {}
+                // Under the window's trigger, a persona's ceiling may still
+                // compact first (SME-493).
+                CompactionStep::Go => {
+                    let at_ceiling = super::on_request::compact_at_ceiling(
+                        pool, conversation_id, turn_model, slot, projected, &mut persisted, &mut pending_new_content,
+                    );
+                    if at_ceiling.await? {
+                        compacted = true;
+                        last_known_usage = None;
+                    }
+                }
                 // Compacting again would only repeat what the last ones
                 // showed: the turn ends, saying why (SME-386 F10).
                 CompactionStep::Stuck(why) => return Err(ServerFnError::new(why)),

@@ -109,6 +109,7 @@ fn read_from(repo: db::ConversationRepo, marker: &str) -> RepoPersonas {
         tools: None,
         credentials: None,
         resources: None,
+        compact_at: None,
     };
     RepoPersonas {
         repo,

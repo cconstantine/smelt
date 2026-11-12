@@ -218,6 +218,22 @@ async fn test_a_persona_at_the_childs_ref_goes_in_its_prompt(pool: PgPool) {
     eventually("every turn is over", || async { !crate::turn::turn_running(child) && !crate::turn::turn_running(root) }).await;
 }
 
+/// P3 (SME-493): the snapshot carries the persona's `compact_at`, which
+/// the turn reads from it; a file without one carries a null.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_snapshot_carries_the_personas_compact_at(pool: PgPool) {
+    let with = "---\nname: developer\ndescription: d\nsmelt:\n  compact_at: 120000\n---\nbody\n".to_string();
+    for (file, expected) in [(with, serde_json::json!(120000)), (persona_file(None, "body\n"), serde_json::Value::Null)] {
+        let fake = Arc::new(fake_with(&[(DEVELOPER, file)]));
+        let root = root_with_checkout(&pool, Some(true), fake.clone()).await;
+        let repo = db::list_conversation_repos(&pool, root).await.expect("repos").into_iter().next().expect("a repo");
+        let snapshot = crate::agents::persona::snapshot(&pool, fake.as_ref(), root, &repo, "developer")
+            .await
+            .expect("a snapshot");
+        assert_eq!(snapshot.settings["compact_at"], expected, "{:?}", snapshot.settings);
+    }
+}
+
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_persona_missing_or_broken_at_the_childs_ref_fails_the_start(pool: PgPool) {
     setup(&pool, vec![text_reply("ok")]).await;
