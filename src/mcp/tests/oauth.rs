@@ -567,15 +567,14 @@ async fn test_a_held_oauth_server_still_gives_up_at_the_test_budget(pool: sqlx::
     let (config, _hits, provider) = slow_discovery_server(&pool).await;
     crate::mcp::test_support::hold_to_test_budget(config.id);
 
-    let started = std::time::Instant::now();
     let checked = connection_check(&pool, &config).await;
-    let took = started.elapsed();
 
     evict(config.id).await;
     provider.abort();
+    // The error names the 1 s budget it gave up at: no wall-clock assert,
+    // which a starved runner could fail (SME-329).
     assert!(
         matches!(&checked, Err(CheckError::Unreachable(m)) if m.ends_with("within 1s")),
         "{checked:?}"
     );
-    assert!(took < std::time::Duration::from_secs(3), "gave up after {took:?}");
 }

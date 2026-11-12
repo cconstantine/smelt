@@ -78,7 +78,8 @@ const PRODUCT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// give-up puts its server back on 1 s (`test_support::hold_to_test_budget`).
 /// A static server whose connects a test holds at the mock across a step
 /// that can outlast 1 s opts in (`test_support::give_product_budget`: the
-/// registry tests' `held_server`, SME-363). Every other server — static,
+/// registry tests' `held_server`, SME-363, and the tests' shared
+/// `mock_holding_server_for_tests`). Every other server — static,
 /// hanging — keeps the short one.
 pub(super) fn connect_timeout(config: &McpServerConfig) -> std::time::Duration {
     #[cfg(test)]
