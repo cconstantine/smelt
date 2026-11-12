@@ -140,7 +140,8 @@ When the PM compacts itself and its Drivers is SME-482's, in [project-manager.md
 | `pods` | Live pods: conversation, status and running commands. |
 | `providers` | `id kind name` only, never the URL or the key's hint. |
 | `where` | The address, the `Host` sent, and the build id. |
-| `archive`, `unarchive`, `compact` | Not on the server yet: exit 3, naming SME-480 or SME-482. Each becomes a route-table row when its ticket merges. |
+| `compact CONV [--note N]` | Compacts the conversation now, between turns (SME-482); refused, exit 1, while a turn runs or a question waits. |
+| `archive`, `unarchive` | Not on the server yet: exit 3, naming SME-480. Each becomes a route-table row when its ticket merges. |
 
 It has **no delete, stop, stop-pod or remove-storage, and nothing that touches providers, the default model, settings, secrets or trust decisions.** Pods stop on their own after 60 idle minutes, and storage goes 7 days later. Both are the user's actions on the Sandboxes page, and archiving (SME-480) replaces deleting a Driver's tree. Exit status: 0 on success, 1 on a non-2xx answer or a refused pre-check (nothing sent), 2 for usage or a network error, 3 for a subcommand not on the server yet.
 
