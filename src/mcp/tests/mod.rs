@@ -643,7 +643,8 @@ mod oauth_http {
         client: Option<(&str, &str)>,
     ) -> McpServerConfig {
         let id = next_server_id(pool).await;
-        let server = crate::db::create_mcp_server_config(
+        // An OAuth server: the product's budgets already (SME-501).
+        crate::db::create_mcp_server_config(
             pool,
             &format!("oauth-http-{id}"),
             &mock.mcp_url,
@@ -653,14 +654,7 @@ mod oauth_http {
             client.map(|c| c.1),
         )
         .await
-        .expect("create mcp server config");
-        // These tests' checks refresh at a local mock provider, and on a
-        // loaded runner a refresh alone outlasts the test build's 1 s
-        // (SME-193, SME-356: three tests met it). None of them is about the
-        // budget, so each gets the product's; the one test that is opts
-        // back in with `hold_to_test_budget`.
-        crate::mcp::test_support::give_product_budget(server.id);
-        server
+        .expect("create mcp server config")
     }
 
     /// Saves a grant `mock` just issued, as a completed Connect would,
