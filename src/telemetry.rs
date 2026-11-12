@@ -306,7 +306,11 @@ fn scrub_key_value(pair: opentelemetry::KeyValue) -> opentelemetry::KeyValue {
 /// the hook runs no user code and takes no lock beyond stderr's own. The
 /// backtrace it prints is always the full one when `RUST_BACKTRACE` asks
 /// for one; the default hook's short/full distinction is std-internal and
-/// not reproducible on stable.
+/// not reproducible on stable. Two more departures from std, neither of
+/// which matters here (no deployment sets either variable):
+/// `Backtrace::capture` also honours `RUST_LIB_BACKTRACE`, which std's
+/// hook ignores, and the hook prints its note or backtrace even where std
+/// prints none (backtrace style `None`, or a double panic).
 pub(crate) fn install_scrubbed_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         let name = std::thread::current();
