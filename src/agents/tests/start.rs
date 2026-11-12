@@ -28,22 +28,34 @@ async fn test_start_agent_returns_at_once_and_the_child_runs_its_brief(pool: PgP
     assert_eq!(requests.lock().expect("log").len(), 0, "no turn while starting");
 
     release.send(()).expect("release the start");
-    eventually("the child's first turn replies", || async {
-        transcript(&pool, child).await.iter().any(|(role, _)| role == "assistant")
+    // SME-487: settle SME-455's report-owed nudge chain before the snapshot
+    // below: the child's first turn is the spell's first plain stuck end (it
+    // owes its parent a report), so the nudge row and its reply extend the
+    // transcript by two, and the nudge turn is the second model call. Under
+    // full-gate load they landed before the old `messages.len() == 3` could
+    // observe the three-message transcript — the failure's own read shows
+    // `left: 4` with the nudge as the 4th message. The brief's turn's three
+    // messages are append-only facts: assert they head the transcript.
+    eventually("the nudged spell is over", || async {
+        requests_for(&requests, Some(child)).len() == 2 && !crate::turn::turn_running(child)
     })
     .await;
     assert_eq!(state(&pool, child).await.as_deref(), Some(db::AGENT_ACTIVE));
     let messages = transcript(&pool, child).await;
-    assert_eq!(messages.len(), 3, "{messages:?}");
     assert_eq!(messages[0], ("user".to_string(), "Say hi.".to_string()));
     // SME-357: the delivered start notice carries the mark before its words.
     assert!(messages[1].1.starts_with(&format!("{}Notice: Your start is done", crate::api::chat::NOTICE_MARK)), "{messages:?}");
     assert_eq!(messages[2], ("assistant".to_string(), "Brief done.".to_string()));
-    assert_eq!(requests_for(&requests, Some(child)).len(), 1, "the child's turn calls the model once");
+    // "the child's turn calls the model once" survives as: the settled spell
+    // is exactly two calls, the second the nudge's — so the brief's turn made one.
+    let calls = requests_for(&requests, Some(child));
+    assert_eq!(calls.len(), 2, "one call for the brief's turn, one for the nudge's");
+    assert!(calls[1].to_string().contains(crate::agents::queue::REPORT_OWE_NUDGE), "the second call is the nudge turn");
     // Its system prompt says what it is.
-    let system = requests_for(&requests, Some(child))[0]["system"].to_string();
+    let system = calls[0]["system"].to_string();
     assert!(system.contains(&format!("You are agent #{child}, started by conversation #{root}")), "{system}");
     assert!(system.contains("message_agent with to \\\"parent\\\" writes to your parent"), "{system}");
+    eventually("every turn is over", || async { !crate::turn::turn_running(root) && !crate::turn::turn_running(child) }).await;
 }
 
 /// The child runs on its parent's model, not on the default.
