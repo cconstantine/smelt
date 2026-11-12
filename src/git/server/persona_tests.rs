@@ -412,3 +412,31 @@ async fn test_a_failed_secret_read_accuses_no_name(pool: PgPool) {
     assert_eq!(developer["credentials"], serde_json::json!(["whatever"]), "the persona's own names show anyway");
     assert!(developer.get("credentials_note").is_none(), "an unknown store accuses no name: {developer}");
 }
+
+/// SME-506, T10: a persona whose file lists a key this smelt doesn't
+/// know is listed with an `ignored` note, so a model choosing it sees
+/// that before starting; one without such a key has no note.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_listing_notes_the_keys_this_smelt_would_ignore(pool: PgPool) {
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let a = ready_repo(&pool, conversation.id, "a", true).await;
+    db::set_repo_trust(&pool, "github.com/o/a", true).await.expect("trust a");
+    let text = "---\nname: developer\ndescription: Works one ticket.\nsmelt:\n  compact_later: 5\n  \
+                ignore_if_unknown: [compact_later]\n---\n";
+    let persona = crate::personas::parse(".agents/personas/developer.md", text, text.len() as u64).expect("a valid persona");
+    let read = RepoPersonas {
+        repo: a.clone(),
+        read: Some(Ok(CheckoutPersonas {
+            files: vec![PersonaFile { path: ".agents/personas/developer.md".to_string(), parsed: Ok(persona) }],
+            unread: 0,
+        })),
+    };
+    let told = gated_listing(&pool, vec![read]).await.expect("listing");
+    let listing: serde_json::Value = serde_json::from_str(&told).expect("json");
+    let note = developer_entry(&listing, "a")["ignored"].as_str().expect("the ignored note").to_string();
+    assert!(note.contains("`smelt.compact_later`, which this smelt doesn't know"), "{note}");
+
+    let told = gated_listing(&pool, vec![read_from_with_credentials(&a, None)]).await.expect("listing");
+    let listing: serde_json::Value = serde_json::from_str(&told).expect("json");
+    assert!(developer_entry(&listing, "a").get("ignored").is_none(), "nothing ignored, no note");
+}

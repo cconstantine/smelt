@@ -76,6 +76,15 @@ pub(crate) fn listed(yaml: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The skipped keys in one sentence's middle: "`smelt.a` and `smelt.b`,
+/// which this smelt doesn't know"; `None` for none.
+pub(crate) fn ignored_phrase(keys: &[String]) -> Option<String> {
+    let names: Vec<String> = keys.iter().map(|k| format!("`smelt.{k}`")).collect();
+    let (last, rest) = names.split_last()?;
+    let list = if rest.is_empty() { last.clone() } else { format!("{} and {last}", rest.join(", ")) };
+    Some(format!("{list}, which this smelt doesn't know"))
+}
+
 /// smelt's own settings, as the visitor read them.
 #[derive(Default)]
 pub(super) struct SmeltSettings {

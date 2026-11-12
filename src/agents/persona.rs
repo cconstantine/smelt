@@ -172,19 +172,10 @@ pub(crate) fn ignored_keys(settings: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// What `ignored_keys` means, in one sentence's middle: "`smelt.a` and
-/// `smelt.b`, which this smelt doesn't know".
-pub(crate) fn ignored_phrase(keys: &[String]) -> Option<String> {
-    let names: Vec<String> = keys.iter().map(|k| format!("`smelt.{k}`")).collect();
-    let (last, rest) = names.split_last()?;
-    let list = if rest.is_empty() { last.clone() } else { format!("{} and {last}", rest.join(", ")) };
-    Some(format!("{list}, which this smelt doesn't know"))
-}
-
 /// The ignored-keys note for a child's persona snapshot, for its parent
 /// on the notice channel (SME-506). From the snapshot alone, no I/O.
 pub(crate) fn ignored_notice(child: i64, persona: &db::PersonaSnapshot) -> Option<String> {
-    let phrase = ignored_phrase(&ignored_keys(&persona.settings))?;
+    let phrase = crate::personas::settings::ignored_phrase(&ignored_keys(&persona.settings))?;
     let at = persona.commit.as_deref().map(|c| format!(" at {}", c.get(..7).unwrap_or(c))).unwrap_or_default();
     Some(format!(
         "{}'s persona{at} has {phrase}, so it was ignored (its file lists it in smelt.ignore_if_unknown); this smelt \
