@@ -95,13 +95,17 @@ pub(crate) async fn compact_now(pool: &PgPool, conversation_id: i64, note: Optio
         }
         between_turns(conversation_id, false, || compact_between_turns(&pool, conversation_id, note))
             .await
-            .unwrap_or_else(|| Err(refused(TURN_RUNNING)))
+            // The lock is held, but by no turn (another compaction, an idle
+            // pass): not "a turn is running" (round 1 L4).
+            .unwrap_or_else(|| Err(refused(if turn_running(conversation_id) { TURN_RUNNING } else { BUSY })))
     }));
     work.await.map_err(ServerFnError::new)?
 }
 
 const TURN_RUNNING: &str =
     "A turn is running in this conversation: compact it once the turn ends, or ask the model to call compact_context.";
+
+const BUSY: &str = "This conversation is busy (another compaction, or smelt's own work between turns): try again in a moment.";
 
 /// `compact_now`'s work, holding the turn lock.
 async fn compact_between_turns(pool: &PgPool, conversation_id: i64, note: Option<String>) -> ServerFnResult<()> {

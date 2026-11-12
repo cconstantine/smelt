@@ -307,3 +307,22 @@ async fn test_a_send_during_the_endpoints_compaction_queues_behind_it(pool: PgPo
     let at = |needle: &str| messages.iter().position(|m| m.content.contains(needle)).unwrap_or_else(|| panic!("{needle} saved"));
     assert!(at("SUMMARY-13") < at("after-reply"), "the reply lands after the divider");
 }
+
+/// SME-482 round 1 L4: a lock held by something other than a turn (another
+/// compaction, an idle pass between turns) isn't called a running turn.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_endpoint_says_busy_when_no_turn_holds_the_lock(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let mock = gated_mock(&pool, vec![text_reply_body("noted")], text_reply_body("SUMMARY-L4"), false).await;
+    let id = seeded(&pool, "hi").await;
+    let held = conversation_lock(id).lock_owned().await;
+
+    let refused = compact_now(&pool, id, None).await.expect_err("refused while the lock is held");
+
+    let text = error_text(&refused);
+    assert!(!text.contains("A turn is running"), "no turn runs: {text}");
+    assert!(text.contains("busy"), "{text}");
+    drop(held);
+    assert_eq!(mock.count(), 0, "no summary request");
+}
