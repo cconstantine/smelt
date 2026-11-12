@@ -27,7 +27,9 @@ touches providers, settings, secrets or trust decisions.
   pods                                     live pods and their running commands
   providers                                provider id, kind and name
   where                                    the address, the Host sent and the build id
-  archive|unarchive CONV                   not on the server yet (exit 3)
+  archive|unarchive CONV                   archive a top-level conversation and its agents, or clear
+                                           it (SME-480), then read the tree back (exit 1 unless it
+                                           reads so); an agent's id is refused, naming its root
 
 Address: SMELT_API_URL (default http://smelt.smelt-park.svc.cluster.local:8080)
 and SMELT_API_HOST (default smelt.constantlee.us while SMELT_API_URL is unset;
@@ -298,6 +300,22 @@ def cmd_compact(args):
     print(f"compacted conversation {args.conv}")
 
 
+def cmd_archive(args):
+    """archive/unarchive CONV (SME-480): POST, then read the tree back,
+    whose nodes carry their root's `archived_at`; exit 1 unless it reads
+    as asked. The server refuses an agent (409, naming its root)."""
+    archived = args.command == "archive"
+    request(args.command, args.conv)
+    rows = smelt_api.subtree(request("tree"), args.conv)
+    if not rows:
+        die(f"conversation {args.conv} isn't in the tree; can't read back its archive mark", 1)
+    mark = rows[0][1].get("archived_at")
+    if bool(mark) != archived:
+        die(f"conversation {args.conv} reads back archived_at={mark}, not {args.command}d", 1)
+    print(f"conversation {args.conv} {args.command}d" + (f" at {mark}" if mark else "")
+          + f", with its {len(rows) - 1} agent(s)")
+
+
 def cmd_not_yet(args):
     print(smelt_api.NOT_YET[args.command])
     sys.exit(3)
@@ -340,6 +358,8 @@ def parser():
     add("pods", cmd_pods)
     add("providers", cmd_providers)
     add("where", cmd_where)
+    add("archive", cmd_archive, "conv")
+    add("unarchive", cmd_archive, "conv")
     for name in smelt_api.NOT_YET:
         add(name, cmd_not_yet, "conv")
     return p

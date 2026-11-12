@@ -29,6 +29,7 @@ def node(id, parent_id=None, **kw):
         "busy": False,
         "waiting_for_user": False,
         "report_owed_at": None,
+        "archived_at": None,
     }
     out.update(kw)
     return out
@@ -93,6 +94,8 @@ class State:
         self.persona_models = {}
         self.persona_refusals = {}
         self.persona_unapplied = False
+        # archive/unarchive (SME-480): answer 200 but change nothing.
+        self.ignore_archive = False
 
     def default_model(self):
         return {"state": "Default", "choice": choice(1, "claude-opus-5-5", "ClaudeCode")}
@@ -170,6 +173,8 @@ def route(st, method, path, body):
     if not conv:
         return 404, {"message": f"no route {method} {path}"}
     cid, rest = int(conv.group(1)), conv.group(2)
+    if method == "POST" and rest in ("archive", "unarchive"):
+        return set_archived(st, cid, rest == "archive")
     if not any(n["id"] == cid for n in st.nodes):
         return 500, {"message": "That conversation no longer exists."}
     if method == "GET" and rest == "messages":
@@ -214,6 +219,33 @@ def route(st, method, path, body):
             return 500, {"message": f"can't clone {body.get('url')!r}"}
         return 200, {"url": body["url"], "branch": body.get("branch", ""), "dir": body.get("dir") or "repo"}
     return 404, {"message": f"no route {method} {path}"}
+
+
+def set_archived(st, cid, archived):
+    """POST …/archive and …/unarchive, as src/api/archive.rs answers: 404
+    for a missing id, 409 naming the root for an agent, else the
+    Conversation with its mark. The tree reports each node's root's mark,
+    so the root's descendants take it too."""
+    by_id = {n["id"]: n for n in st.nodes}
+    target = by_id.get(cid)
+    if target is None:
+        return 404, {"message": "That conversation no longer exists."}
+    if target["parent_id"] is not None:
+        root = target
+        while root["parent_id"] in by_id:
+            root = by_id[root["parent_id"]]
+        return 409, {"message": f"only a top-level conversation is archived: archive its root, conversation {root['id']}"}
+    if not st.ignore_archive:
+        mark = STAMP if archived else None
+        tree = {cid}
+        for n in st.nodes:  # the tests add parents before their children
+            if n["parent_id"] in tree:
+                tree.add(n["id"])
+        for n in st.nodes:
+            if n["id"] in tree:
+                n["archived_at"] = mark
+    return 200, {"id": cid, "title": target["title"], "created_at": STAMP, "updated_at": STAMP,
+                 "parent_id": None, "archived_at": target["archived_at"]}
 
 
 def set_persona(st, cid, label):

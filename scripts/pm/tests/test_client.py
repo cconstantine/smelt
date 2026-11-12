@@ -47,6 +47,8 @@ class Allowlist(FakeCase):
             (["pods"], [("GET", "/api/pods"), ("GET", "/api/pods/commands")]),
             (["providers"], [("GET", "/api/providers")]),
             (["where"], [("GET", "/api/build-id")]),
+            (["archive", "7"], [("POST", c + "/archive"), ("GET", "/api/conversations/tree")]),
+            (["unarchive", "7"], [("POST", c + "/unarchive"), ("GET", "/api/conversations/tree")]),
         ]
         for args, want in table:
             with self.subTest(args=args[0]):
@@ -64,14 +66,12 @@ class Allowlist(FakeCase):
                 self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
                 self.assertEqual(self.sent(), [])
 
-    def test_not_yet_subcommands_exit_3_naming_their_ticket(self):
-        for args, ticket in ((["archive", "7"], "SME-480"), (["unarchive", "7"], "SME-480")):
-            with self.subTest(args=args):
-                r = self.api(*args)
-                self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
-                self.assertIn(ticket, r.stdout + r.stderr)
-                self.assertIn("not on this server yet", r.stdout + r.stderr)
-                self.assertEqual(self.sent(), [])
+    def test_archive_and_unarchive_are_route_table_rows_now(self):
+        # SME-480 merged (#337): no longer exit-3 stubs.
+        self.assertEqual(smelt_api.ROUTES["archive"], ("POST", "/api/conversations/{id}/archive"))
+        self.assertEqual(smelt_api.ROUTES["unarchive"], ("POST", "/api/conversations/{id}/unarchive"))
+        self.assertNotIn("archive", smelt_api.NOT_YET)
+        self.assertNotIn("unarchive", smelt_api.NOT_YET)
 
     def test_compact_posts_its_note_and_says_what_the_server_refused(self):
         # SME-482's route, the PM's way to compact a Driver (pm-in-smelt.md).
