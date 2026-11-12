@@ -27,7 +27,11 @@ touches providers, settings, secrets or trust decisions.
   pods                                     live pods and their running commands
   providers                                provider id, kind and name
   where                                    the address, the Host sent and the build id
-  archive|unarchive CONV                   not on the server yet (exit 3)
+  archive|unarchive CONV                   archive a top-level conversation and its agents, or clear
+                                           it (SME-480), then read the tree back (exit 1 unless it
+                                           reads so); an agent's id is refused, naming its root;
+                                           archive refuses a tree with anything busy, waiting,
+                                           owed or running a command, sending nothing
 
 Address: SMELT_API_URL (default http://smelt.smelt-park.svc.cluster.local:8080)
 and SMELT_API_HOST (default smelt.constantlee.us while SMELT_API_URL is unset;
@@ -298,6 +302,48 @@ def cmd_compact(args):
     print(f"compacted conversation {args.conv}")
 
 
+def live_in_tree(conv):
+    """What in CONV's tree is still live, one phrase each: a node busy,
+    waiting for the user or owing a report, or a pod running a command. An
+    archived tree leaves the sidebar unless something is owed, and a busy
+    seat doesn't count (sidebar/archive.rs), so archive refuses these."""
+    rows = smelt_api.subtree(request("tree"), conv)
+    running = {c["conversation_id"]: c["running_commands"] for c in request("pod-commands")}
+    live = []
+    for _, n in rows:
+        cid = n["id"]
+        if n.get("busy"):
+            live.append(f"{cid} is busy")
+        if n.get("waiting_for_user"):
+            live.append(f"{cid} is waiting for the user")
+        if n.get("report_owed_at"):
+            live.append(f"{cid} has a report owed since {n['report_owed_at']}")
+        if running.get(cid):
+            live.append(f"{cid}'s pod is running {running[cid]} command(s)")
+    return live
+
+
+def cmd_archive(args):
+    """archive/unarchive CONV (SME-480): POST, then read the tree back,
+    whose nodes carry their root's `archived_at`; exit 1 unless it reads
+    as asked. The server refuses an agent (409, naming its root). archive
+    first refuses a tree with anything live in it, sending nothing."""
+    archived = args.command == "archive"
+    if archived:
+        live = live_in_tree(args.conv)
+        if live:
+            die(f"conversation {args.conv}'s tree isn't idle: {'; '.join(live)}; nothing sent", 1)
+    request(args.command, args.conv)
+    rows = smelt_api.subtree(request("tree"), args.conv)
+    if not rows:
+        die(f"conversation {args.conv} isn't in the tree; can't read back its archive mark", 1)
+    mark = rows[0][1].get("archived_at")
+    if bool(mark) != archived:
+        die(f"conversation {args.conv} reads back archived_at={mark}, not {args.command}d", 1)
+    print(f"conversation {args.conv} {args.command}d" + (f" at {mark}" if mark else "")
+          + f", with its {len(rows) - 1} agent(s)")
+
+
 def cmd_not_yet(args):
     print(smelt_api.NOT_YET[args.command])
     sys.exit(3)
@@ -340,6 +386,8 @@ def parser():
     add("pods", cmd_pods)
     add("providers", cmd_providers)
     add("where", cmd_where)
+    add("archive", cmd_archive, "conv")
+    add("unarchive", cmd_archive, "conv")
     for name in smelt_api.NOT_YET:
         add(name, cmd_not_yet, "conv")
     return p

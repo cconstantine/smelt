@@ -16,7 +16,7 @@ Until SME-481 a persona was only ever a child's: `start_agent` read the persona 
 
 ## How it's set
 
-`POST /api/conversations/{id}/persona` with `{"persona": "<dir>:<name>"}`, scoped names only. `GET` on the same path lists the options or says what it's set to. The UI's picker on a new conversation's start screen, under "Work on a repo", uses the same two calls. `POST /api/conversations` is unchanged: the persona is read from the conversation's own checkout, which exists only once the attach's asynchronous clone finishes. A set on a `ready` checkout is synchronous. The PM's sequence is create, attach, set the model, set the persona, send.
+`POST /api/conversations/{id}/persona` with `{"persona": "<dir>:<name>"}`, scoped names only. `GET` on the same path lists the options or says what it's set to. The UI's picker on a new conversation's start screen, under "Work on a repo", uses the same two calls. `POST /api/conversations` is unchanged: the persona is read from the conversation's own checkout, which exists only once the attach's asynchronous clone finishes. A set on a `ready` checkout is synchronous. The PM's sequence is create, attach, wait until the persona is listed, set the persona, set the model, send ([pm-in-smelt.md, "Starting a Driver"](../../personas/pm-in-smelt.md#starting-a-driver), which gives the reasons). With the persona set first, its `smelt.model` resolves on the default model's provider ([below](#model)).
 
 ## "Started", and where it's enforced
 
