@@ -41,6 +41,9 @@ class Archive(FakeCase):
                 self.fake.clear()
                 r = self.api(*args)
                 self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                # src/api/chat.rs's conversation_not_found, the real 404's text.
+                self.assertIn("HTTP 404", r.stderr)
+                self.assertIn("conversation not found", r.stderr)
                 self.assertEqual(self.sent(), [("POST", f"/api/conversations/99/{args[0]}")])
         self.st.forced[("POST", "/api/conversations/7/unarchive")] = (500, {"message": "refused 500"})
         r = self.api("unarchive", "7")

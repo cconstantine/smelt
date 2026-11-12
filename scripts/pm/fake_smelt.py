@@ -229,7 +229,8 @@ def set_archived(st, cid, archived):
     by_id = {n["id"]: n for n in st.nodes}
     target = by_id.get(cid)
     if target is None:
-        return 404, {"message": "That conversation no longer exists."}
+        # src/api/chat.rs's conversation_not_found.
+        return 404, {"message": "conversation not found"}
     if target["parent_id"] is not None:
         root = target
         while root["parent_id"] in by_id:
