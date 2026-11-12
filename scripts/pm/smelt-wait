@@ -22,6 +22,7 @@ second, or a MERGED PR's merged_at; the wake's own time without GitHub).
   MAIN_RED run#id ...     a main run of CI or Publish images goes red after the baseline
   STALL min busy:[ids]    no node's updated_at moved for STALL_MIN minutes
   UNREACHABLE n           SMELT_WAIT_MAX_FAILURES (default 10) polls failed in a row
+  UNREACHABLE github n    as many smelt-mcp calls failed in a row, counted apart
   CAP                     CAP_MIN minutes passed
 
 GitHub is read through smelt-mcp (SMELT_MCP_BIN, default `smelt-mcp`) every
@@ -193,6 +194,7 @@ class Watch:
         # merge this run hasn't seen (N1). It moves only when GitHub answers.
         self.checkpoint = self.since
         self.failures = 0
+        self.gh_failures = 0
         self.polls = 0
 
     def wake(self, kind, rest=""):
@@ -215,12 +217,20 @@ class Watch:
             try:
                 nodes = self.nodes()
                 messages = get("messages", self.root)
-                reds = set(red_runs(self.github.main_runs())) if self.github else set()
                 break
             except PollFailed as err:
                 self.failed(err)
                 time.sleep(self.poll_secs)
         self.failures = 0
+        reds = set()
+        while self.github:
+            try:
+                reds = set(red_runs(self.github.main_runs()))
+                break
+            except PollFailed as err:
+                self.gh_failed(err)
+                time.sleep(self.poll_secs)
+        self.gh_failures = 0
         waiting = sorted(n["id"] for n in nodes if n.get("waiting_for_user") and n["id"] not in self.known)
         if waiting:
             self.wake("ALREADY_WAITING", ",".join(map(str, waiting)))
@@ -237,6 +247,14 @@ class Watch:
         print(f"smelt-wait: poll failed ({self.failures}): {err}", file=sys.stderr, flush=True)
         if self.failures >= self.max_failures:
             self.wake("UNREACHABLE", str(self.failures))
+
+    def gh_failed(self, err):
+        """A smelt-mcp call failed. Counted apart from smelt's polls (M1):
+        only a GitHub call that answers resets it, not a tree-only poll."""
+        self.gh_failures += 1
+        print(f"smelt-wait: github failed ({self.gh_failures}): {err}", file=sys.stderr, flush=True)
+        if self.gh_failures >= self.max_failures:
+            self.wake("UNREACHABLE", f"github {self.gh_failures}")
 
     @staticmethod
     def updated(nodes):
@@ -309,7 +327,11 @@ class Watch:
         self.check_owed(nodes)
         self.polls += 1
         if self.github and self.polls % self.gh_every == 0:
-            self.check_github()
+            try:
+                self.check_github()
+                self.gh_failures = 0
+            except PollFailed as err:
+                self.gh_failed(err)
         return nodes
 
     def run(self):

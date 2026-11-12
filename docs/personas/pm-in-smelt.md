@@ -66,7 +66,7 @@ Deploys ride with a Driver, one at a time, at the current DEPLOY.md pin, and onl
   | `MERGED pr#N` | Checks the ticket's close-out and frees the slot once it's Done. |
   | `MAIN_RED run#id` | Reads the run. Matches it to a flake ticket in Test reliability, or files one ([never re-run a red](#never-re-run-a-red)). |
   | `STALL` | Nothing moved for `STALL_MIN` minutes: reads the tree and the Driver's messages, and asks. |
-  | `UNREACHABLE n` | smelt or `smelt-mcp` failed `n` polls in a row (a deploy restart, an outage): `smelt-api where`, then restart. |
+  | `UNREACHABLE n`, `UNREACHABLE github n` | smelt failed `n` polls in a row (a deploy restart, an outage): `smelt-api where`, then restart. With `github`, `smelt-mcp` failed `n` GitHub calls in a row, counted apart, so `MERGED` and `MAIN_RED` were off: restart, and if it repeats, run with `--no-github` and say so. |
   | `CAP` | Restarts the watcher. |
 
 - **The retrospective trigger** is about ten Done, per [close-out.md](../process/close-out.md#retrospective).

@@ -271,7 +271,19 @@ class Wait(FakeCase):
     def test_failed_smelt_mcp_calls_count_toward_unreachable(self):
         self.mcp(prs=[None])
         self.start("1", "45", "1", SMELT_WAIT_MAX_FAILURES="3", SME="460")
-        self.assertEqual(self.woke(), "UNREACHABLE 3")
+        self.assertEqual(self.woke(), "UNREACHABLE github 3")
+
+    def test_smelt_mcp_failing_at_the_default_gh_every_still_wakes_unreachable(self):
+        # M1: at SMELT_WAIT_GH_EVERY=2 a tree-only poll falls between each
+        # GitHub call; its success mustn't reset GitHub's count.
+        self.mcp(prs=[None])
+        self.start("1", "45", "1", SMELT_WAIT_MAX_FAILURES="3", SMELT_WAIT_GH_EVERY="2", SME="460")
+        self.assertEqual(self.woke(), "UNREACHABLE github 3")
+
+    def test_smelt_mcp_failing_at_the_baseline_counts_as_github(self):
+        self.mcp(runs=[None])
+        self.start("1", "45", "1", SMELT_WAIT_MAX_FAILURES="3", SMELT_WAIT_GH_EVERY="2")
+        self.assertEqual(self.woke(), "UNREACHABLE github 3")
 
     def test_a_root_not_in_the_tree_exits_2(self):
         r = self.run_script(WAITER, "55", "45", CAP, "--no-github", env=self.env(SMELT_WAIT_POLL_SECS="0.2"))
