@@ -260,7 +260,8 @@ struct DeepCodeTimings {
     span_depth: serde_json::Value,
 }
 
-/// `deep_code_at`'s steps; `None` once one stopped at the depth's deadline.
+/// `deep_code_at`'s steps; `None` once one stopped at the depth's deadline,
+/// or the live check failed.
 /// The polls keep the harness helpers' bounds and intervals
 /// (`wait_for_live_client`: 15 s at 100 ms; `wait_for_text`: at 200 ms),
 /// and also count their evaluates.
@@ -291,16 +292,23 @@ async fn deep_code_steps(
         .step("tab", async { (t.tab(t.url(&format!("conversation/{}", conversation.id))).await, Outcome::Ok) })
         .await?;
     let live_js = format!("document.querySelector({:?}) !== null", format!("[data-live=\"{}\"]", conversation.id));
-    let live = steps
-        .step("live", steps.poll(Duration::from_secs(15), Duration::from_millis(100), || reads_true(&page, &live_js)))
-        .await?;
+    // A failed live evaluate ends the depth at once, as the helper's panic
+    // did: re-polling it would lengthen the step on that path.
+    let poll_live = steps.poll(Duration::from_secs(15), Duration::from_millis(100), depth_steps::OnError::Stop, || {
+        reads_true(&page, &live_js)
+    });
+    let live = steps.step("live", poll_live).await?;
     timings.live_after = Some(started.elapsed());
+    if let Some(e) = steps.error_in("live") {
+        problems.push(format!("1: the live check failed: {e}"));
+        return None;
+    }
     if !live {
         problems.push("1: the client never went live".to_string());
     }
     let text_js = format!("document.body.innerText.includes({:?})", "AFTER-DEEP-CODE");
     let text = steps
-        .step("text", steps.poll(Duration::from_secs(20), Duration::from_millis(200), || reads_true(&page, &text_js)))
+        .step("text", steps.poll(Duration::from_secs(20), Duration::from_millis(200), depth_steps::OnError::Retry, || reads_true(&page, &text_js)))
         .await?;
     if !text {
         problems.push("2: the text after the block never rendered".to_string());
@@ -350,7 +358,7 @@ async fn deep_code_steps(
         .step("still_live", async {
             publish(conversation.id, ConversationEvent::ReplyReset {});
             publish(conversation.id, ConversationEvent::ReplyDelta { text: still_live.clone(), offset: 0 });
-            steps.poll(Duration::from_secs(10), Duration::from_millis(200), || reads_true(&page, &still_live_js)).await
+            steps.poll(Duration::from_secs(10), Duration::from_millis(200), depth_steps::OnError::Retry, || reads_true(&page, &still_live_js)).await
         })
         .await?;
     if !shown {

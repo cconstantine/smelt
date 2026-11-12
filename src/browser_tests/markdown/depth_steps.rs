@@ -22,6 +22,16 @@ pub(super) enum Outcome {
     NotReached,
 }
 
+/// What a poll does when an evaluate fails.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum OnError {
+    /// Count it and poll again within the same bound, as `wait_for_text`.
+    Retry,
+    /// End the step at once with the error, as `wait_for_live_client`,
+    /// which panicked on the first one.
+    Stop,
+}
+
 /// A polling step's counts: how many evaluates, the slowest one, how many
 /// failed and the last failure's text, and when the one still in flight
 /// started (from the depth's start).
@@ -77,6 +87,14 @@ impl DepthSteps {
     /// The step that stopped at the depth's deadline, if one did.
     pub(super) fn stopped_at_deadline(&self) -> Option<Step> {
         self.steps.borrow().iter().find(|s| s.outcome == Outcome::AtDeadline).cloned()
+    }
+
+    /// The error step `name` ended with, if it ended with one.
+    pub(super) fn error_in(&self, name: &str) -> Option<String> {
+        self.steps.borrow().iter().find_map(|s| match &s.outcome {
+            Outcome::Error(e) if s.name == name => Some(e.clone()),
+            _ => None,
+        })
     }
 
     /// Records every step the depth never began as not reached.
@@ -137,8 +155,9 @@ impl DepthSteps {
     /// `own` has passed (checked between evaluates, as the harness's
     /// `wait_for_live_client` and `wait_for_text` do). Counts each evaluate
     /// into the current step, so a step that stalls mid-poll still shows
-    /// them, and the one in flight.
-    pub(super) async fn poll<F, Fut>(&self, own: Duration, interval: Duration, mut eval: F) -> (bool, Outcome)
+    /// them, and the one in flight. A failed evaluate ends the step at once
+    /// with `OnError::Stop`, and is polled again with `OnError::Retry`.
+    pub(super) async fn poll<F, Fut>(&self, own: Duration, interval: Duration, on_error: OnError, mut eval: F) -> (bool, Outcome)
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<bool, String>>,
@@ -158,8 +177,10 @@ impl DepthSteps {
                     s.last_error = Some(e.clone());
                 }
             });
-            if read == Ok(true) {
-                return (true, Outcome::Ok);
+            match read {
+                Ok(true) => return (true, Outcome::Ok),
+                Err(e) if on_error == OnError::Stop => return (false, Outcome::Error(e)),
+                _ => {}
             }
             if Instant::now() >= poll_deadline {
                 return (false, Outcome::GaveUp(own));
@@ -320,12 +341,12 @@ mod tests {
         let _ = async {
             steps.step("seed", takes(Duration::from_millis(100))).await?;
             steps.step("tab", takes(tab)).await?;
-            if !steps.step("live", steps.poll(live_own, Duration::from_millis(100), never)).await? {
+            if !steps.step("live", steps.poll(live_own, Duration::from_millis(100), OnError::Stop, never)).await? {
                 problems.push("1: the client never went live".to_string());
             }
-            steps.step("text", steps.poll(Duration::from_secs(20), Duration::from_millis(200), || async { Ok(true) })).await?;
+            steps.step("text", steps.poll(Duration::from_secs(20), Duration::from_millis(200), OnError::Retry, || async { Ok(true) })).await?;
             steps.step("facts", takes(Duration::ZERO)).await?;
-            steps.step("still_live", steps.poll(Duration::from_secs(10), Duration::from_millis(200), || async { Ok(true) })).await
+            steps.step("still_live", steps.poll(Duration::from_secs(10), Duration::from_millis(200), OnError::Retry, || async { Ok(true) })).await
         }
         .await;
         steps.finish();
@@ -370,7 +391,7 @@ mod tests {
                     sleep(Duration::from_secs(30)).await;
                     Ok(true)
                 };
-                steps.step("live", steps.poll(Duration::from_secs(15), Duration::from_millis(100), slow)).await
+                steps.step("live", steps.poll(Duration::from_secs(15), Duration::from_millis(100), OnError::Stop, slow)).await
             }
             .await;
             steps.finish();
@@ -397,9 +418,30 @@ mod tests {
             let n = reads.get();
             async move { if n == 1 { Err("Request timed out".to_string()) } else { Ok(true) } }
         };
-        steps.step("text", steps.poll(Duration::from_secs(20), Duration::from_millis(200), flaky)).await;
+        steps.step("text", steps.poll(Duration::from_secs(20), Duration::from_millis(200), OnError::Retry, flaky)).await;
         let report = steps.report();
         assert!(report.contains("text 0.2 s (polls 2, max_eval 0.0 s, eval_errors 1, last_error Request timed out)"), "{report}");
+    }
+
+    /// The live poll gives up on its first failed evaluate, as
+    /// `wait_for_live_client` did (it panicked): polling again would
+    /// lengthen the step on that path (SME-329). Round 1, finding 2.
+    #[tokio::test(start_paused = true)]
+    #[ignore]
+    async fn test_a_stop_poll_ends_at_its_first_failed_evaluate() {
+        let steps = DepthSteps::new(NAMES, LIMIT);
+        let reads = Cell::new(0);
+        let flaky = || {
+            reads.set(reads.get() + 1);
+            let n = reads.get();
+            async move { if n == 1 { Err("context destroyed".to_string()) } else { Ok(true) } }
+        };
+        let live = steps.step("live", steps.poll(Duration::from_secs(15), Duration::from_millis(100), OnError::Stop, flaky)).await;
+        assert_eq!(live, Some(false));
+        assert_eq!(reads.get(), 1, "{}", steps.report());
+        assert_eq!(steps.error_in("live").as_deref(), Some("context destroyed"));
+        let report = steps.report();
+        assert!(report.contains("live 0.0 s error context destroyed (polls 1, max_eval 0.0 s, eval_errors 1, last_error context destroyed)"), "{report}");
     }
 
     /// A poll that reaches its own bound gives up, and the depth carries on
