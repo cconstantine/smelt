@@ -264,9 +264,10 @@ fn scrub_span_data(mut span: opentelemetry_sdk::trace::SpanData) -> opentelemetr
         event.attributes = std::mem::take(&mut event.attributes).into_iter().map(scrub_key_value).collect();
     }
     // SME-483: a link's attribute values can carry the same text an
-    // event's, so they scrub the same way. No live producer emits links
-    // today (tracing-opentelemetry 0.34 has no `follows_from` support),
-    // so this is the future-proofing the ticket asked for.
+    // event's, so they scrub the same way. Nothing in smelt calls
+    // `follows_from`/`add_link` today — the tracing-opentelemetry bridge
+    // supports both, and its `add_link_with_attributes` path would carry
+    // caller attributes to the exporter, which is why this branch matters.
     for link in span.links.links.iter_mut() {
         link.attributes = std::mem::take(&mut link.attributes).into_iter().map(scrub_key_value).collect();
     }

@@ -483,9 +483,10 @@ async fn test_the_export_scrubs_event_names_attributes_and_status() {
 /// event's can — a linked span's error text, a retry URL — and
 /// `scrub_span_data` must scrub them like everything else, leaving the
 /// non-string attributes, the link's span context and its dropped count
-/// alone. (No live producer emits links today — tracing-opentelemetry 0.34
-/// has no `follows_from` support — so this is future-proofing, per the
-/// ticket.)
+/// alone. (Nothing in smelt calls `follows_from`/`add_link` today — the
+/// tracing-opentelemetry bridge supports both, and its
+/// `add_link_with_attributes` path would carry attributes to the exporter,
+/// which is why this branch matters.)
 #[tokio::test]
 async fn test_the_export_scrubs_span_link_attributes() {
     use opentelemetry::trace::{
