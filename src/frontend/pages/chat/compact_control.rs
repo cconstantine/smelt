@@ -13,13 +13,19 @@ pub(super) fn compact_note(text: &str) -> Option<String> {
     (!note.is_empty()).then(|| note.to_string())
 }
 
+/// Whether the open conversation's own compaction is in flight: `busy` is
+/// the conversation a compaction was asked for, if one is (round 1 L3).
+pub(super) fn compacting_here(busy: Option<i64>, selected: Option<i64>) -> bool {
+    busy.is_some() && busy == selected
+}
+
 #[component]
 pub(super) fn CompactControl(selected: Memo<Option<i64>>, state: Store<ConversationState>) -> Element {
     let turn_running = state.turn_running();
     let mut context_usage = state.context_usage();
     let mut open = use_signal(|| false);
     let mut note = use_signal(String::new);
-    let mut busy = use_signal(|| false);
+    let mut busy = use_signal(|| None::<i64>);
     let mut error = use_signal(|| None::<String>);
     // Another conversation opened: its own popover starts closed.
     use_effect(move || {
@@ -30,12 +36,15 @@ pub(super) fn CompactControl(selected: Memo<Option<i64>>, state: Store<Conversat
     });
     let mut compact = move || {
         let Some(id) = selected() else { return };
-        busy.set(true);
+        busy.set(Some(id));
         error.set(None);
         let sent = compact_note(&note.peek());
         spawn(async move {
             let result = compact_conversation_now(id, sent).await;
-            busy.set(false);
+            // Only this request's own mark: a later click elsewhere set its own.
+            if *busy.peek() == Some(id) {
+                busy.set(None);
+            }
             // Not onto another conversation's header (SME-51 B11).
             if selected() != Some(id) {
                 return;
@@ -55,13 +64,14 @@ pub(super) fn CompactControl(selected: Memo<Option<i64>>, state: Store<Conversat
         });
     };
     let running = turn_running();
-    let label = if busy() { "Compacting…" } else { "Compact" };
+    let busy_here = compacting_here(busy(), selected());
+    let label = if busy_here { "Compacting…" } else { "Compact" };
     rsx! {
         div { class: "compact-control",
             button {
                 class: "conversation-thinking-toggle conversation-compact-toggle",
                 r#type: "button",
-                disabled: running || busy(),
+                disabled: running || busy_here,
                 title: if running { "Compact once the turn ends" } else { "Summarise this conversation's history now, to save tokens" },
                 aria_expanded: "{open()}",
                 onclick: move |_| open.set(!open()),
@@ -90,9 +100,9 @@ pub(super) fn CompactControl(selected: Memo<Option<i64>>, state: Store<Conversat
                         button {
                             class: "compact-now",
                             r#type: "button",
-                            disabled: busy() || running,
+                            disabled: busy_here || running,
                             onclick: move |_| compact(),
-                            if busy() { "Compacting…" } else { "Compact now" }
+                            if busy_here { "Compacting…" } else { "Compact now" }
                         }
                         button { r#type: "button", onclick: move |_| open.set(false), "Cancel" }
                     }
@@ -112,6 +122,16 @@ mod tests {
         assert_eq!(compact_note("  keep the SHA \n"), Some("keep the SHA".to_string()));
         assert_eq!(compact_note("line one\nline two"), Some("line one\nline two".to_string()));
         assert_eq!(compact_note(" \n\t "), None);
+    }
+
+    /// Round 1 L3: a compaction in flight in one conversation leaves
+    /// another's button alone, after a switch.
+    #[test]
+    fn test_only_the_compacting_conversation_reads_compacting() {
+        assert!(compacting_here(Some(7), Some(7)));
+        assert!(!compacting_here(Some(7), Some(8)), "another conversation is open");
+        assert!(!compacting_here(None, Some(7)));
+        assert!(!compacting_here(Some(7), None));
     }
 
     fn rendered(turn_running: bool) -> String {
