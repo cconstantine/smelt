@@ -117,9 +117,9 @@ impl DepthSteps {
         let mut steps = self.steps.borrow_mut();
         let step = &mut steps[index];
         step.elapsed = begun.elapsed();
-        if let Some(stats) = &mut step.stats {
-            stats.in_flight = None;
-        }
+        // An evaluate still in flight at the deadline stays in the record
+        // (`describe` times it to the step's end): a single blocked
+        // evaluate must not read like many small ones.
         match ended {
             Ok((value, outcome)) => {
                 step.outcome = outcome;
@@ -220,7 +220,11 @@ fn describe(s: &Step, now: Duration) -> String {
             line += &format!(", eval_errors {}", stats.eval_errors);
         }
         if let Some(since) = stats.in_flight {
-            line += &format!(", eval in flight {}", secs(now.saturating_sub(since)));
+            if s.outcome == Outcome::Running {
+                line += &format!(", eval in flight {}", secs(now.saturating_sub(since)));
+            } else {
+                line += &format!(", eval in flight {} at the deadline", secs((s.start + s.elapsed).saturating_sub(since)));
+            }
         }
         line += ")";
     }
@@ -344,6 +348,35 @@ mod tests {
             "{failures:?}"
         );
         assert!(failures[0].ends_with("text not reached, facts not reached, still_live not reached"), "{failures:?}");
+    }
+
+    /// A step stopped at the depth deadline mid-evaluate keeps that
+    /// evaluate: a single blocked evaluate (M3, M5) must not read like
+    /// many small ones (M4). Round 1, finding 1.
+    #[tokio::test(start_paused = true)]
+    #[ignore]
+    async fn test_a_step_stopped_at_the_deadline_keeps_its_evaluate_in_flight() {
+        let steps = DepthSteps::new(NAMES, LIMIT);
+        let failures = run_depth(2_000, &steps, async {
+            let _ = async {
+                steps.step("seed", takes(Duration::from_millis(100))).await?;
+                steps.step("tab", takes(Duration::from_secs(40))).await?;
+                let slow = || async {
+                    sleep(Duration::from_secs(30)).await;
+                    Ok(true)
+                };
+                steps.step("live", steps.poll(Duration::from_secs(15), Duration::from_millis(100), slow)).await
+            }
+            .await;
+            steps.finish();
+            Vec::new()
+        })
+        .await;
+        assert!(!steps.backstop_fired(), "the backstop fired: {failures:?}");
+        assert!(
+            failures[0].contains("live 4.9 s stopped at the depth deadline (polls 0, max_eval 0.0 s, eval in flight 4.9 s at the deadline)"),
+            "{failures:?}"
+        );
     }
 
     /// A poll that reaches its own bound gives up, and the depth carries on
