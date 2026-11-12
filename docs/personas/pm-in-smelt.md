@@ -23,17 +23,18 @@ In this order, one step at a time. After a failure, re-read the tree and the boa
 4. `smelt-api attach ID git@github.com:cconstantine/smelt.git`.
 5. `smelt-api send ID brief.md --expect-model PROVIDER_ID:MODEL`. The flag is required for a Driver's first brief: it sends nothing unless the model is `Chosen` with exactly that provider and model, so the brief never runs on the default model.
 6. The `Ticket Driver started: conversation ID` comment on the ticket.
-7. `SME=<ticket number> scripts/pm/smelt-wait ID` as a terminal command.
+7. `SME=<ticket number> scripts/pm/smelt-wait ID` as a terminal command. Its `KEY` wake is on by default, on the Driver's `Driver gate: ` lines (brief part 4); `SMELT_KEY` sets another regex.
 
 **A failure after `create` is retried on the same id, never by creating again.** A conversation with no model or no brief is finished on its id: `model-set`, `attach` and `send` can each be run again.
 
 ## Briefing a Driver
 
-Each brief has three parts, rebuilt for each brief and never pasted from an older one:
+Each brief has four parts, rebuilt for each brief and never pasted from an older one:
 
 1. **Rules in force.** One line per [standing rule](#standing-rules), each linking its section here, plus any user decision that applies to the ticket, quoted with its author and date. The block is copied fresh from this page for each brief. That's the one exception to ["a brief points at the rules"](project-manager.md): this page stays the source, and a stale block lives at most one brief.
 2. **What the other in-flight tickets touch.** For each ticket in Todo or In Progress with a live Driver, its id and the files or areas its plan's file list names, one line each, so the Driver keeps off them.
 3. **The current DEPLOY.md pin.** The latest homelab `master` commit touching `smelt-deployer/DEPLOY.md`, read when the brief is written (`Github/list_commits` with `path`), given as 12 characters. The brief also says: "the pin names which version of DEPLOY.md to read; do the deploy on homelab master's tip, never on a checkout of the pin."
+4. **How a top-level Driver reports its gates.** It has no parent, so rules.md's `message_agent` to the parent reaches nobody. The brief says: "You are top-level. At each gate (PR opened, reviews closed, merged, deployed, blocked, done), write a line of its own in your reply starting `Driver gate: `, such as `Driver gate: PR opened #330, head 24d984f8`, and call `notify_user` with the same line. The ticket comment is still owed." The watcher's default `KEY` matches that line.
 
 Then the ticket facts: the ticket, the persona file, the user's answers.
 
@@ -61,7 +62,7 @@ Deploys ride with a Driver, one at a time, at the current DEPLOY.md pin, and onl
   |---|---|
   | `ALREADY_WAITING`, `WAITING_FOR_USER` | Reads the question. Answers it ([above](#answering-for-the-user)), or escalates it and restarts with `--known-waiting`. |
   | `TOOL notify_user` / `ask_user` | Reads the Driver's last messages: it finished, or needs someone. |
-  | `KEY …` | The Driver's text matched `SMELT_KEY` (PR opened, merged, deployed, blocked): reads the messages and the ticket. |
+  | `KEY …` | A line of the Driver's text matched the key, by default a `Driver gate: ` line (PR opened, merged, deployed, blocked; [brief part 4](#briefing-a-driver)): reads the messages and the ticket. |
   | `REPORT_OWED id since` | A seat ended its turn owing a report, with nothing running, longer ago than the grace (a stamp already that old when the watcher starts wakes at once): asks the Driver to chase it, then restarts with `--known-owed id`, which quiets that stamp but not a later one. |
   | `MERGED pr#N` | Checks the ticket's close-out and frees the slot once it's Done. |
   | `MAIN_RED run#id` | Reads the run. Matches it to a flake ticket in Test reliability, or files one ([never re-run a red](#never-re-run-a-red)). |

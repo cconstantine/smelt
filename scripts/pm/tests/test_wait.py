@@ -177,6 +177,23 @@ class Wait(FakeCase):
         self.assertTrue(line.startswith("KEY "), line)
         self.assertIn("PR opened #5", line)
 
+    def test_the_default_key_wakes_on_a_driver_gate_line(self):
+        # M4: with no SMELT_KEY, a line starting `Driver gate: ` wakes KEY;
+        # the phrase inside a line doesn't.
+        self.start("1", "45", "1")
+        self.baseline()
+        self.say(1, "assistant", [{"type": "text", "text": "I'll write `Driver gate: …` lines at each gate."}])
+        time.sleep(0.8)
+        self.assertIsNone(self.proc.poll(), "woke on the phrase inside a line")
+        self.say(1, "assistant", [{"type": "text", "text": "Opened it.\nDriver gate: PR opened #12, head abc\nNext."}])
+        self.assertEqual(self.woke(), "KEY Driver gate: PR opened #12, head abc")
+
+    def test_an_empty_smelt_key_turns_the_key_off(self):
+        self.start("1", "45", CAP, SMELT_KEY="")
+        self.baseline()
+        self.say(1, "assistant", [{"type": "text", "text": "Driver gate: merged"}])
+        self.assertEqual(self.woke(), "CAP")
+
     # A seat owing a report (SME-455).
 
     def test_a_report_owed_past_the_grace_at_start_wakes_at_once(self):

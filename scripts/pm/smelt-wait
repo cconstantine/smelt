@@ -14,7 +14,8 @@ second, or a MERGED PR's merged_at; the wake's own time without GitHub).
   ALREADY_WAITING ids     at start, a node waits for the user and isn't in --known-waiting
   WAITING_FOR_USER ids    a node starts waiting for the user (not in --known-waiting)
   TOOL notify_user|ask_user ...   a new ROOT message holds that tool call
-  KEY ...                 SMELT_KEY matches a new assistant text block of ROOT's
+  KEY line                SMELT_KEY (a multiline regex; unset: ^Driver gate: , empty:
+                          off) matches a line of a new assistant text block of ROOT's
   REPORT_OWED id since    a node's report_owed_at is older than SMELT_OWED_GRACE_MIN
                           (default 10) minutes, at start too, unless it's the stamp
                           a --known-owed id had at start
@@ -49,6 +50,8 @@ import smelt_api  # noqa: E402
 RED = ("failure", "timed_out", "startup_failure")
 WATCHED_WORKFLOWS = ("CI", "Publish images")
 WAKE_TOOLS = ("notify_user", "ask_user")
+# The gate lines a top-level Driver writes (docs/personas/pm-in-smelt.md).
+DEFAULT_KEY = r"^Driver gate: "
 LINE_CUT = 300
 
 
@@ -178,9 +181,11 @@ class Watch:
         self.sme = os.environ.get("SME", "")
         if self.sme and not self.sme.isdigit():
             die(f"SME must be a ticket number, got {self.sme!r}")
-        key = os.environ.get("SMELT_KEY", "")
+        # Unset: DEFAULT_KEY (M4). Set but empty: no KEY wake. `^` is a
+        # line's start, so a gate line wakes anywhere in a text block.
+        key = os.environ.get("SMELT_KEY", DEFAULT_KEY)
         try:
-            self.key = re.compile(key) if key else None
+            self.key = re.compile(key, re.MULTILINE) if key else None
         except re.error as err:
             die(f"SMELT_KEY isn't a regex: {err}")
         self.github = None
