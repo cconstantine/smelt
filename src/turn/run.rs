@@ -451,8 +451,19 @@ fn run_turn_loop<'c>(
             // end with no report. Decide this step from `window_at_send`;
             // the new window still moves the meter below (SME-439's
             // intent) and every later size, and the record re-syncs to it
-            // at the next step's `step`. (A refusal recovery's own
-            // mid-step change, above, stays in the frame as today.)
+            // at the next step's `step` — and there that re-sync also
+            // drops `compact_for_room`/`room_retried` before the next
+            // decision can read them (SME-420 round 1 F1), so on this
+            // path it is `carries_on` that keeps the turn alive and the
+            // room compaction that lands comes from the trigger
+            // re-arming under the learned window, not the flag. No
+            // runaway: a second cut with nothing compacted between finds
+            // `after == None` and ends the turn, and compounding
+            // compactions stop at SME-414's `END_AT`. (A refusal
+            // recovery's own mid-step change and Ollama's
+            // `learn_ollama_window`, both above the capture, stay in the
+            // frame as today — there the snapshot is post-learn, exactly
+            // what the pre-fix call sites read (F3).)
             let window_at_send = turn_model.context_window;
             // A reply the window stopped, rather than one that ran out of
             // budget, measured the room the server really has — but only
