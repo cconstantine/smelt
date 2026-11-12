@@ -444,3 +444,87 @@ fn test_pod_startup_failure_is_none_while_a_pod_is_still_starting() {
     assert_eq!(pod_startup_failure(&pod_with_phase("Pending")), None);
     assert_eq!(pod_startup_failure(&pod_with_phase("Running")), None);
 }
+
+// --- SME-484: a pod no node can take says so ---
+
+const NO_ROOM: &str = "0/3 nodes are available: 1 node(s) had untolerated taint {strata: }, 2 Insufficient memory.";
+
+/// The timeout the model gets leads with the scheduler's reason.
+#[test]
+fn test_an_unschedulable_pods_timeout_leads_with_the_schedulers_reason() {
+    match timed_out_outcome(&pod_unschedulable(NO_ROOM), Ok(&[]), report_now()) {
+        Err(SandboxError::Timeout(Some(detail))) => {
+            assert!(detail.starts_with(&format!("no node can take it now (the scheduler: {NO_ROOM});")), "got {detail}")
+        }
+        other => panic!("expected a timeout, got {other:?}"),
+    }
+    // A pod held up elsewhere says nothing of the scheduler.
+    let pending = report_pod(&[("PodReadyToStartContainers", "False", 2, "", "")], serde_json::json!([]), serde_json::json!([]));
+    match timed_out_outcome(&pending, Ok(&[]), report_now()) {
+        Err(SandboxError::Timeout(Some(detail))) => assert!(!detail.contains("no node can take it"), "got {detail}"),
+        other => panic!("expected a timeout, got {other:?}"),
+    }
+}
+
+/// While it waits, the conversation's sandbox panel is told why.
+#[test]
+fn test_an_unschedulable_sandbox_pod_names_its_conversation_pod_and_reason() {
+    let mut pod = pod_unschedulable(NO_ROOM);
+    pod.metadata.name = Some(pod_name(12));
+    pod.metadata.labels = Some([(CONVERSATION_LABEL.to_string(), "7".to_string())].into());
+    assert_eq!(unschedulable_notice(&pod), Some((7, 12, format!("Unschedulable: {NO_ROOM}"))));
+
+    let mut unlabelled = pod_unschedulable(NO_ROOM);
+    unlabelled.metadata.name = Some(pod_name(12));
+    assert_eq!(unschedulable_notice(&unlabelled), None, "a test's pod has no conversation");
+    let mut scheduled = report_pod(&[("PodScheduled", "True", 0, "", "")], serde_json::json!([]), serde_json::json!([]));
+    scheduled.metadata.name = Some(pod_name(12));
+    scheduled.metadata.labels = pod.metadata.labels.clone();
+    assert_eq!(unschedulable_notice(&scheduled), None);
+}
+
+/// Conversation 7's pod 12, unschedulable for want of room.
+fn waiting_pod() -> Pod {
+    let mut pod = pod_unschedulable(NO_ROOM);
+    pod.metadata.name = Some(pod_name(12));
+    pod.metadata.labels = Some([(CONVERSATION_LABEL.to_string(), "7".to_string())].into());
+    pod
+}
+
+/// Conversation 7's pod 12, placed on `node` but not yet Running.
+fn placed_pod(node: &str) -> Pod {
+    let mut pod = report_pod(&[("PodScheduled", "True", 0, "", "")], serde_json::json!([]), serde_json::json!([]));
+    pod.metadata = waiting_pod().metadata;
+    pod.spec.get_or_insert_with(Default::default).node_name = Some(node.to_string());
+    pod
+}
+
+/// SME-484 L1: the panel hears an unschedulable pod's reason once, not
+/// on every poll.
+#[test]
+fn test_the_panel_is_told_an_unschedulable_pod_once() {
+    let waiting = format!("Unschedulable: {NO_ROOM}");
+    assert_eq!(pending_panel_update(&waiting_pod(), None), Some((7, 12, waiting.clone(), None)));
+    assert_eq!(pending_panel_update(&waiting_pod(), Some(&waiting)), None, "told already");
+}
+
+/// L1: once the scheduler places a pod it was told was unschedulable,
+/// the panel moves on to Pending on its node, rather than keeping a
+/// stale Unschedulable until Running.
+#[test]
+fn test_the_panel_moves_on_to_pending_once_the_pod_is_placed() {
+    let waiting = format!("Unschedulable: {NO_ROOM}");
+    assert_eq!(
+        pending_panel_update(&placed_pod("homelab"), Some(&waiting)),
+        Some((7, 12, "Pending".to_string(), Some("homelab".to_string())))
+    );
+    assert_eq!(pending_panel_update(&placed_pod("homelab"), Some("Pending")), None, "told already");
+    assert_eq!(pending_panel_update(&placed_pod("homelab"), None), None, "a pod placed at once tells nothing new");
+}
+
+/// L1: a pod unschedulable again after Pending was told is told again.
+#[test]
+fn test_a_pod_unschedulable_again_is_told_again() {
+    let waiting = format!("Unschedulable: {NO_ROOM}");
+    assert_eq!(pending_panel_update(&waiting_pod(), Some("Pending")), Some((7, 12, waiting, None)));
+}

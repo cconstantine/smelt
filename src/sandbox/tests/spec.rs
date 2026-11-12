@@ -191,7 +191,7 @@ fn test_pod_limit_overrides_replace_only_the_limits_they_name() {
         memory: Some("3Gi".to_string()),
         ..Default::default()
     };
-    let (memory, docker) = overrides.resolve(7);
+    let (memory, docker, _) = overrides.resolve(7, None).expect("resolves");
     assert_eq!(memory, "3Gi");
     assert_eq!(docker.memory, default_docker_memory_limit());
     assert_eq!(docker.storage, PodStorage::Conversation(7));

@@ -32,6 +32,7 @@ fn test_a_full_persona_file_parses_with_its_body_as_written() {
             model: Some("claude-opus-4-5".to_string()),
             tools: None,
             credentials: None,
+            resources: None,
         }
     );
 }
@@ -397,4 +398,46 @@ fn test_own_rules_bind_their_entry_and_not_a_child() {
     let text = "---\nname: driver\ndescription: Drives.\nsmelt:\n  tools:\n    own:\n      deny: [gh/merge_*]\n---\nDrive.\n";
     let rules = parse_ok(path, text).tools.expect("tools");
     assert_eq!(rules.unmatched_servers(&[]), vec!["gh/merge_*".to_string()]);
+}
+
+// --- SME-484: smelt.resources ---
+
+#[test]
+fn test_smelt_resources_parses_each_containers_asks() {
+    let text = "---\nname: developer\ndescription: d\nsmelt:\n  resources:\n    sandbox: { memory_request: 64Mi, cpu_request: 500m }\n    docker:\n      memory_request: 12Gi\n      memory_limit: 24Gi\n---\n";
+    let resources = parse_ok(DEV, text).resources.expect("resources");
+    let sandbox = resources.sandbox.expect("sandbox");
+    assert_eq!((sandbox.memory_request.as_deref(), sandbox.memory_limit, sandbox.cpu_request.as_deref()), (Some("64Mi"), None, Some("500m")));
+    let docker = resources.docker.expect("docker");
+    assert_eq!((docker.memory_request.as_deref(), docker.memory_limit.as_deref()), (Some("12Gi"), Some("24Gi")));
+}
+
+#[test]
+fn test_a_persona_without_resources_has_none() {
+    assert_eq!(parse_ok(DEV, "---\nname: developer\ndescription: d\nsmelt:\n  model: m\n---\n").resources, None);
+}
+
+#[test]
+fn test_an_unknown_resources_key_is_refused_naming_it_and_its_line() {
+    let text = "---\nname: developer\ndescription: d\nsmelt:\n  resources:\n    docker:\n      memory_requests: 12Gi\n---\n";
+    let error = parse_err(DEV, text);
+    assert!(error.contains("unknown field `memory_requests`") && error.contains("line 7"), "{error}");
+    let text = "---\nname: developer\ndescription: d\nsmelt:\n  resources:\n    gpu: {}\n---\n";
+    assert!(parse_err(DEV, text).contains("unknown field `gpu`"));
+}
+
+#[test]
+fn test_a_bad_resources_quantity_is_a_persona_error() {
+    let text = "---\nname: developer\ndescription: d\nsmelt:\n  resources:\n    docker: { memory_request: 12GB }\n---\n";
+    let error = parse_err(DEV, text);
+    assert!(error.contains("smelt.resources.docker.memory_request") && error.contains("12GB"), "{error}");
+}
+
+/// A request is checked against the persona's own limit where it sets
+/// one: the deployment's default is irrelevant then.
+#[test]
+fn test_a_resources_request_above_its_own_limit_is_a_persona_error() {
+    let text = "---\nname: developer\ndescription: d\nsmelt:\n  resources:\n    sandbox: { memory_request: 2Gi, memory_limit: 1Gi }\n---\n";
+    let error = parse_err(DEV, text);
+    assert!(error.contains("smelt.resources.sandbox.memory_request") && error.contains("1Gi"), "{error}");
 }

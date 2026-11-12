@@ -278,6 +278,8 @@ smelt is one server binary plus a web bundle. Alongside it, it needs:
 
 A cluster of several nodes costs one thing worth knowing: `local-path` claims are node-local. A claim binds to the node its volume was made on, so a conversation's claims — its `/workspace` and Docker-data claims, and every shared volume it mounts, the model's volumes (SME-239) among them — pin every later pod of that conversation to that one node. Disk pressure is then a per-node question too: the kubelet deletes unused images past 85% disk, and `scripts/cluster-doctor`'s missing-image message names that as the cause, and it warns within 15 GiB of the line, before the images are gone (SME-229); and nothing yet says which node a pod and its claims landed on (SME-304).
 
+**Scheduling and capacity** — how sandbox pods spread over the nodes (a tainted node is left out of the spread), and what the memory personas reserve means for a node, an idle pod included — is its own page: [setup/scheduling.md](setup/scheduling.md) (SME-484).
+
 The steps below build all of that yourself and take the import route. [Deploying from published images](#deploying-from-published-images) covers the alternative: pull the server and sandbox images from GHCR instead, and skip the building.
 
 ### Steps
