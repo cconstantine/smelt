@@ -23,13 +23,14 @@ pub(super) enum Outcome {
 }
 
 /// A polling step's counts: how many evaluates, the slowest one, how many
-/// failed, and when the one still in flight started (from the depth's
-/// start).
+/// failed and the last failure's text, and when the one still in flight
+/// started (from the depth's start).
 #[derive(Clone, Debug, Default)]
 pub(super) struct PollStats {
     pub(super) polls: u32,
     pub(super) max_eval: Duration,
     pub(super) eval_errors: u32,
+    last_error: Option<String>,
     in_flight: Option<Duration>,
 }
 
@@ -152,8 +153,9 @@ impl DepthSteps {
                 s.in_flight = None;
                 s.polls += 1;
                 s.max_eval = s.max_eval.max(took);
-                if read.is_err() {
+                if let Err(e) = &read {
                     s.eval_errors += 1;
+                    s.last_error = Some(e.clone());
                 }
             });
             if read == Ok(true) {
@@ -218,6 +220,9 @@ fn describe(s: &Step, now: Duration) -> String {
         line += &format!(" (polls {}, max_eval {}", stats.polls, secs(stats.max_eval));
         if stats.eval_errors > 0 {
             line += &format!(", eval_errors {}", stats.eval_errors);
+        }
+        if let Some(e) = &stats.last_error {
+            line += &format!(", last_error {e}");
         }
         if let Some(since) = stats.in_flight {
             if s.outcome == Outcome::Running {
@@ -377,6 +382,24 @@ mod tests {
             failures[0].contains("live 4.9 s stopped at the depth deadline (polls 0, max_eval 0.0 s, eval in flight 4.9 s at the deadline)"),
             "{failures:?}"
         );
+    }
+
+    /// A failed evaluate's text stays in the report, not only the count:
+    /// M5 is told apart by it (`Request timed out` against `context
+    /// destroyed`). Round 1, finding 4.
+    #[tokio::test(start_paused = true)]
+    #[ignore]
+    async fn test_a_failed_evaluate_keeps_its_error_text() {
+        let steps = DepthSteps::new(NAMES, LIMIT);
+        let reads = Cell::new(0);
+        let flaky = || {
+            reads.set(reads.get() + 1);
+            let n = reads.get();
+            async move { if n == 1 { Err("Request timed out".to_string()) } else { Ok(true) } }
+        };
+        steps.step("text", steps.poll(Duration::from_secs(20), Duration::from_millis(200), flaky)).await;
+        let report = steps.report();
+        assert!(report.contains("text 0.2 s (polls 2, max_eval 0.0 s, eval_errors 1, last_error Request timed out)"), "{report}");
     }
 
     /// A poll that reaches its own bound gives up, and the depth carries on
