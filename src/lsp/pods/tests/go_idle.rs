@@ -221,6 +221,21 @@ fn test_a_silent_go_that_keeps_reading_is_left_alone() {
     assert!(ran.watchdogs.is_empty(), "the watchdog outlived the install: {:?}", ran.watchdogs);
 }
 
+/// (g) A go that has ended is never stopped, nor said to be (SME-511, CI's
+/// red): its parent never reaps it (the install execs a `sleep`), so the
+/// ended go stays a zombie across two checks, its `io` unreadable or
+/// frozen. That is SME-511's shape forced: on CI, (e)'s go ended right on
+/// a check and was caught before it was reaped, its reads dropped, and
+/// the watchdog logged a stop of a go that had exited 0.
+#[test]
+fn test_a_go_that_has_ended_is_never_stopped() {
+    let go = "printf '%4096s\\n' x > \"$HOME/line\"; i=0; while [ $i -lt 2 ]; do read -r l < \"$HOME/line\"; sleep 1; i=$((i+1)); done";
+    let ran = run_pod_script("ended", go, "go install x@v1 & exec sleep 14", &[], Duration::from_secs(25));
+    assert_eq!(ran.rc.as_deref(), Some("0"), "{:?}", ran.log);
+    assert!(!ran.log.contains("smelt: go"), "{:?}", ran.log);
+    assert!(ran.watchdogs.is_empty(), "the watchdog outlived the install: {:?}", ran.watchdogs);
+}
+
 /// (b) An install whose log keeps growing is never stopped, however long
 /// go takes past the bound. The log is written beside go, outside its
 /// process tree, and go itself only waits on one `sleep`: so go reads
