@@ -49,7 +49,9 @@ pub(super) fn ConversationHeader(
         Some(info) => (info.title, info.meta, info.parent, info.archive),
         None => (String::new(), None, None, None),
     };
-    let archive_error: Signal<Option<String>> = use_signal(|| None);
+    // Kept with the conversation it's about: the header isn't remounted
+    // on a switch (review 1, L1), so another's error mustn't show here.
+    let archive_error: Signal<Option<(i64, String)>> = use_signal(|| None);
     rsx! {
         div { class: "conversation-header",
             div { class: "conversation-header-top",
@@ -74,7 +76,7 @@ pub(super) fn ConversationHeader(
                 // phone's left edge (SME-482's compact_now at 375 px).
                 super::compact_control::CompactControl { selected, state }
             }
-            super::ErrorText { message: archive_error() }
+            super::ErrorText { message: archive_error_for(archive_error(), selected()) }
             if meta.is_some() || parent.is_some() {
                 div { class: "conversation-header-meta",
                     if let Some(meta) = meta {
@@ -96,7 +98,7 @@ pub(super) fn ConversationHeader(
 /// returned mark goes into the shared tree at once; the refetch on
 /// `ConversationsChanged` confirms it. A failure shows under the header.
 #[component]
-fn ArchiveButton(id: i64, archived: bool, nodes: Signal<Vec<ConversationNode>>, error: Signal<Option<String>>) -> Element {
+fn ArchiveButton(id: i64, archived: bool, nodes: Signal<Vec<ConversationNode>>, error: Signal<Option<(i64, String)>>) -> Element {
     let mut nodes = nodes;
     let mut error = error;
     rsx! {
@@ -117,13 +119,19 @@ fn ArchiveButton(id: i64, archived: bool, nodes: Signal<Vec<ConversationNode>>, 
                                 node.archived_at = conversation.archived_at;
                             }
                         }
-                        Err(e) => error.set(Some(server_error_message(&e))),
+                        Err(e) => error.set(Some((id, server_error_message(&e)))),
                     }
                 });
             },
             if archived { "Unarchive" } else { "Archive" }
         }
     }
+}
+
+/// The archive error to show under `selected`'s header: only one from
+/// that conversation's own Archive / Unarchive (review 1, L1).
+fn archive_error_for(error: Option<(i64, String)>, selected: Option<i64>) -> Option<String> {
+    error.filter(|(id, _)| selected == Some(*id)).map(|(_, message)| message)
 }
 
 #[cfg(test)]
@@ -186,6 +194,16 @@ mod tests {
             "the user's own: its title alone"
         );
         assert_eq!(header_info(&nodes, 3), None);
+    }
+
+    /// Review 1, L1: a failed Archive on one conversation isn't shown
+    /// under the next one's header, and shows again on going back.
+    #[test]
+    fn test_an_archive_error_shows_only_under_its_own_conversation() {
+        let error = Some((1, "conversation not found".to_string()));
+        assert_eq!(archive_error_for(error.clone(), Some(1)).as_deref(), Some("conversation not found"));
+        assert_eq!(archive_error_for(error.clone(), Some(2)), None, "another conversation's header");
+        assert_eq!(archive_error_for(error, None), None, "no conversation open");
     }
 
     /// SME-480 D6: a top-level conversation offers Archive or Unarchive by
