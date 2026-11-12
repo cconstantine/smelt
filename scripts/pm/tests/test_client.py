@@ -47,7 +47,8 @@ class Allowlist(FakeCase):
             (["pods"], [("GET", "/api/pods"), ("GET", "/api/pods/commands")]),
             (["providers"], [("GET", "/api/providers")]),
             (["where"], [("GET", "/api/build-id")]),
-            (["archive", "7"], [("POST", c + "/archive"), ("GET", "/api/conversations/tree")]),
+            (["archive", "7"], [("GET", "/api/conversations/tree"), ("GET", "/api/pods/commands"),
+                                ("POST", c + "/archive"), ("GET", "/api/conversations/tree")]),
             (["unarchive", "7"], [("POST", c + "/unarchive"), ("GET", "/api/conversations/tree")]),
         ]
         for args, want in table:

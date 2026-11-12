@@ -31,7 +31,7 @@ In this order, one step at a time. After a failure, re-read the tree and the boa
 
 **One owner per message to a Driver:** the PM writes to its Drivers, and any other starter (a Claude Code PM, another ticket's Driver) relays through the PM, never to the Driver itself. On 2026-11-12 two nudges reached SME-483's Driver for the same change.
 
-**Archiving a Driver's tree:** once its ticket is Done and its slot is freed, the PM runs `smelt-api archive ID` on the Driver, which archives its agents with it. Archiving only hides the tree from the sidebar, and a user's message unarchives it; it never replaces stopping pods or removing storage, which stay the user's.
+**Archiving a Driver's tree:** once its ticket is Done, its slot is freed, `smelt-api tree ID` shows no node `busy`, `waiting` or owing a report, and `smelt-api pods` shows no running command for any conversation in it, the PM runs `smelt-api archive ID` on the Driver, which archives its agents with it. A tree that isn't idle waits for a later pass: an archived tree stays in the sidebar only while something in it is owed, and a busy seat doesn't count, so a Deployer seat or the Driver's own close-out still running would vanish from the user's sidebar. `archive` checks the same itself and refuses, sending nothing, while anything in the tree is live. Archiving only hides the tree from the sidebar, and a user's message unarchives it; it never replaces stopping pods or removing storage, which stay the user's.
 
 ## Briefing a Driver
 
@@ -70,7 +70,7 @@ Deploys ride with a Driver, one at a time, at the current DEPLOY.md pin, and onl
   | `TOOL notify_user` / `ask_user` | Reads the Driver's last messages: it finished, or needs someone. |
   | `KEY …` | A line of the Driver's text matched the key, by default a `Driver gate: ` line (PR opened, merged, deployed, blocked; [brief part 4](#briefing-a-driver)): reads the messages and the ticket. |
   | `REPORT_OWED id since` | A seat ended its turn owing a report, with nothing running, longer ago than the grace (a stamp already that old when the watcher starts wakes at once): asks for it with `smelt-api send DRIVER -` (the Driver's report if `id` is the Driver, else a request that it chase its seat `id`), then restarts with `--known-owed id`, which quiets that stamp but not a later one. |
-  | `MERGED pr#N` | Checks the ticket's close-out and frees the slot once it's Done, then archives the Driver's tree ([above](#starting-a-driver)). |
+  | `MERGED pr#N` | Checks the ticket's close-out and frees the slot once it's Done, then archives the Driver's tree once nothing in it is busy, waiting, owed or running a command ([above](#starting-a-driver)). |
   | `MAIN_RED run#id` | Reads the run. Matches it to a flake ticket in Test reliability, or files one ([never re-run a red](#never-re-run-a-red)). |
   | `STALL` | Nothing moved for `STALL_MIN` minutes: reads the tree and the Driver's messages, and asks. |
   | `UNREACHABLE n`, `UNREACHABLE github n` | smelt failed `n` polls in a row (a deploy restart, an outage): `smelt-api where`, then restart. With `github`, `smelt-mcp` failed `n` GitHub calls in a row, counted apart, so `MERGED` and `MAIN_RED` were off: restart, and if it repeats, run with `--no-github` and say so. |
@@ -149,7 +149,7 @@ When the PM compacts itself and its Drivers is SME-482's, in [project-manager.md
 | `providers` | `id kind name` only, never the URL or the key's hint. |
 | `where` | The address, the `Host` sent, and the build id. |
 | `compact CONV [--note N]` | Compacts the conversation now, between turns (SME-482); refused, exit 1, while a turn runs or a question waits. |
-| `archive CONV`, `unarchive CONV` | Sets or clears a top-level conversation's archive mark (SME-480), which its agents follow, then reads `tree` back and exits 1 unless it reads archived (or not). An agent's id is refused (409, naming its root), exit 1. A view mark only: messages, pods and storage are untouched. |
+| `archive CONV`, `unarchive CONV` | Sets or clears a top-level conversation's archive mark (SME-480), which its agents follow, then reads `tree` back and exits 1 unless it reads archived (or not). `archive` first reads `tree` and the pods' running commands, and refuses, exit 1 with nothing sent, while any node in the tree is busy, waiting or owes a report, or a pod in it runs a command. An agent's id is refused (409, naming its root), exit 1. A view mark only: messages, pods and storage are untouched. |
 
 It has **no delete, stop, stop-pod or remove-storage, and nothing that touches providers, the default model, settings, secrets or trust decisions.** Pods stop on their own after 60 idle minutes, and storage goes 7 days later. Both are the user's actions on the Sandboxes page, and archiving (SME-480) replaces deleting a Driver's tree. Exit status: 0 on success, 1 on a non-2xx answer, a refused pre-check (nothing sent) or a read-back that disagrees, 2 for usage or a network error, 3 for a subcommand not on the server yet (none today).
 
