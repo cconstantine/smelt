@@ -14,6 +14,9 @@ pub(super) struct HeaderInfo {
     pub meta: Option<String>,
     /// The conversation that started it: its id and title.
     pub parent: Option<(i64, String)>,
+    /// `Some(archived)` for a top-level conversation, which can be
+    /// archived (SME-480 D6); `None` for an agent, which follows its root.
+    pub archive: Option<bool>,
 }
 
 /// The header for conversation `id`, from the conversation list; None
@@ -28,7 +31,8 @@ pub(super) fn header_info(nodes: &[ConversationNode], id: i64) -> Option<HeaderI
         .parent_id
         .and_then(|p| nodes.iter().find(|n| n.id == p))
         .map(|p| (p.id, p.title.clone()));
-    Some(HeaderInfo { title: node.title.clone(), meta, parent })
+    let archive = node.parent_id.is_none().then_some(node.archived_at.is_some());
+    Some(HeaderInfo { title: node.title.clone(), meta, parent, archive })
 }
 
 #[component]
@@ -41,10 +45,13 @@ pub(super) fn ConversationHeader(
     // header is the toggle alone: thinking can be shown from the start
     // (SME-354 B18).
     let info = selected().and_then(|id| header_info(&nodes.read(), id));
-    let (title, meta, parent) = match info {
-        Some(info) => (info.title, info.meta, info.parent),
-        None => (String::new(), None, None),
+    let (title, meta, parent, archive) = match info {
+        Some(info) => (info.title, info.meta, info.parent, info.archive),
+        None => (String::new(), None, None, None),
     };
+    // Kept with the conversation it's about: the header isn't remounted
+    // on a switch (review 1, L1), so another's error mustn't show here.
+    let archive_error: Signal<Option<(i64, String)>> = use_signal(|| None);
     rsx! {
         div { class: "conversation-header",
             div { class: "conversation-header-top",
@@ -61,8 +68,15 @@ pub(super) fn ConversationHeader(
                     },
                     if super::transcript::SHOW_THINKING() { "Hide thinking" } else { "Show thinking" }
                 }
+                if let (Some(archived), Some(id)) = (archive, selected()) {
+                    ArchiveButton { id, archived, nodes, error: archive_error }
+                }
+                // Last in the row: its popover is right-aligned under it and
+                // 320 px wide, so anything after it pushes the popover off a
+                // phone's left edge (SME-482's compact_now at 375 px).
                 super::compact_control::CompactControl { selected, state }
             }
+            super::ErrorText { message: archive_error_for(archive_error(), selected()) }
             if meta.is_some() || parent.is_some() {
                 div { class: "conversation-header-meta",
                     if let Some(meta) = meta {
@@ -78,6 +92,46 @@ pub(super) fn ConversationHeader(
             }
         }
     }
+}
+
+/// Archive / Unarchive for a top-level conversation (SME-480 D6). The
+/// returned mark goes into the shared tree at once; the refetch on
+/// `ConversationsChanged` confirms it. A failure shows under the header.
+#[component]
+fn ArchiveButton(id: i64, archived: bool, nodes: Signal<Vec<ConversationNode>>, error: Signal<Option<(i64, String)>>) -> Element {
+    let mut nodes = nodes;
+    let mut error = error;
+    rsx! {
+        button {
+            class: "conversation-archive",
+            r#type: "button",
+            onclick: move |_| {
+                spawn(async move {
+                    let result = if archived {
+                        crate::api::archive::unarchive_conversation(id).await
+                    } else {
+                        crate::api::archive::archive_conversation(id).await
+                    };
+                    match result {
+                        Ok(conversation) => {
+                            error.set(None);
+                            if let Some(node) = nodes.write().iter_mut().find(|n| n.id == id) {
+                                node.archived_at = conversation.archived_at;
+                            }
+                        }
+                        Err(e) => error.set(Some((id, server_error_message(&e)))),
+                    }
+                });
+            },
+            if archived { "Unarchive" } else { "Archive" }
+        }
+    }
+}
+
+/// The archive error to show under `selected`'s header: only one from
+/// that conversation's own Archive / Unarchive (review 1, L1).
+fn archive_error_for(error: Option<(i64, String)>, selected: Option<i64>) -> Option<String> {
+    error.filter(|(id, _)| selected == Some(*id)).map(|(_, message)| message)
 }
 
 #[cfg(test)]
@@ -97,6 +151,7 @@ mod tests {
             busy: false,
             waiting_for_user: false,
             report_owed_at: None,
+            archived_at: None,
         }
     }
 
@@ -130,13 +185,39 @@ mod tests {
                 title: "Developer seat on SME-345".to_string(),
                 meta: Some("finished \u{b7} smelt:developer".to_string()),
                 parent: Some((1, "Ticket Driver for SME-345".to_string())),
+                archive: None,
             })
         );
         assert_eq!(
             header_info(&nodes, 1),
-            Some(HeaderInfo { title: "Ticket Driver for SME-345".to_string(), meta: None, parent: None }),
+            Some(HeaderInfo { title: "Ticket Driver for SME-345".to_string(), meta: None, parent: None, archive: Some(false) }),
             "the user's own: its title alone"
         );
         assert_eq!(header_info(&nodes, 3), None);
+    }
+
+    /// Review 1, L1: a failed Archive on one conversation isn't shown
+    /// under the next one's header, and shows again on going back.
+    #[test]
+    fn test_an_archive_error_shows_only_under_its_own_conversation() {
+        let error = Some((1, "conversation not found".to_string()));
+        assert_eq!(archive_error_for(error.clone(), Some(1)).as_deref(), Some("conversation not found"));
+        assert_eq!(archive_error_for(error.clone(), Some(2)), None, "another conversation's header");
+        assert_eq!(archive_error_for(error, None), None, "no conversation open");
+    }
+
+    /// SME-480 D6: a top-level conversation offers Archive or Unarchive by
+    /// its own mark; an agent offers neither, even in an archived tree.
+    #[test]
+    fn test_only_a_top_level_conversation_offers_archive_by_its_mark() {
+        let mut archived = node(1, None, "archived root", None, None);
+        archived.archived_at = Some(chrono::NaiveDateTime::default());
+        let mut agent = node(2, Some(1), "its agent", Some("idle"), None);
+        agent.archived_at = archived.archived_at;
+        let nodes = [archived, agent, node(3, None, "in use", None, None)];
+        let archive = |id| header_info(&nodes, id).expect("listed").archive;
+        assert_eq!(archive(1), Some(true));
+        assert_eq!(archive(3), Some(false));
+        assert_eq!(archive(2), None);
     }
 }

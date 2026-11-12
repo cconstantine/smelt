@@ -13,6 +13,11 @@ pub struct Conversation {
     /// The conversation that started this one as its agent (SME-236);
     /// `None` for the user's own conversations.
     pub parent_id: Option<i64>,
+    /// When the user (or a PM) archived it (SME-480): set on a top-level
+    /// conversation only, `None` on a child and on one in use. The tree
+    /// (`ConversationNode::archived_at`) gives a child its root's.
+    #[serde(default)]
+    pub archived_at: Option<NaiveDateTime>,
 }
 
 /// What a conversation's model calls used and cost in all (SME-106,

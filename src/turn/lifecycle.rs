@@ -459,6 +459,8 @@ pub(crate) async fn start_turn(pool: PgPool, id: i64, content: String) -> Server
     // SME-455: the user is here — whatever this seat owed its parent a
     // report stops being owed, and a later stuck end is a fresh spell.
     clear_report_owed(&pool, id).await;
+    // SME-480 D3: someone writing to it means its tree is in use again.
+    clear_archived(&pool, id).await;
     let new_message = anthropic::AnthropicMessage {
         role: "user".to_string(),
         // Never taken for one of smelt's notices (SME-354 B19).
