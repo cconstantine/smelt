@@ -78,6 +78,8 @@ class Wait(FakeCase):
         self.fail("no baseline in 15 s")
 
     def woke(self, timeout=20):
+        """The wake line without its time (`KIND TIME rest`), which is kept
+        in self.at after checking `--since` takes it."""
         try:
             out, err = self.proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -86,7 +88,11 @@ class Wait(FakeCase):
         lines = out.splitlines()
         self.assertEqual(self.proc.returncode, 0, out + err)
         self.assertEqual(len(lines), 1, f"exactly one wake line: {out!r} {err!r}")
-        return lines[0]
+        kind, _, rest = lines[0].partition(" ")
+        at, _, rest = rest.partition(" ")
+        self.assertRegex(at, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$", f"no wake time: {lines[0]!r}")
+        self.at = at
+        return f"{kind} {rest}" if rest else kind
 
     def node(self, cid):
         return next(n for n in self.st.nodes if n["id"] == cid)
@@ -199,6 +205,36 @@ class Wait(FakeCase):
         self.start("1", "45", CAP)
         self.assertEqual(self.woke(), "CAP")
 
+    # The wake line's time, for the next run's --since (N1).
+
+    def test_a_wake_s_time_is_now_without_github(self):
+        before = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+        self.start("1", "45", CAP, "--no-github")
+        self.assertEqual(self.woke(), "CAP")
+        at = datetime.datetime.fromisoformat(self.at.replace("Z", "+00:00"))
+        self.assertTrue(before <= at <= datetime.datetime.now(datetime.timezone.utc), self.at)
+
+    def test_a_merge_s_time_is_its_merged_at_and_restarting_there_is_quiet(self):
+        merged = pr(7, "SME-460: x", "cconstan/sme-460-x", "2026-11-11T13:00:00Z")
+        self.mcp(prs=[[merged]])
+        self.start("1", "45", "1", "--since", SINCE, SME="460")
+        self.assertTrue(self.woke().startswith("MERGED pr#7"))
+        self.assertEqual(self.at, "2026-11-11T13:00:00Z")
+        self.start("1", "45", CAP, "--since", self.at, SME="460")
+        self.assertEqual(self.woke(), "CAP")
+
+    def test_a_wake_s_time_stays_at_since_until_github_answers(self):
+        self.mcp(prs=[None])
+        self.start("1", "45", CAP, "--since", SINCE, SME="460", SMELT_WAIT_MAX_FAILURES="1000")
+        self.assertEqual(self.woke(), "CAP")
+        self.assertEqual(self.at, SINCE, "a merge GitHub never showed would be skipped by the next run")
+
+    def test_a_wake_s_time_after_a_github_check_is_just_before_it(self):
+        self.start("1", "45", CAP, "--since", SINCE, SME="460")
+        self.assertEqual(self.woke(), "CAP")
+        at = datetime.datetime.fromisoformat(self.at.replace("Z", "+00:00"))
+        self.assertGreater(at, datetime.datetime.fromisoformat(SINCE.replace("Z", "+00:00")))
+
     def test_no_smelt_mcp_exits_2_unless_no_github(self):
         r = self.run_script(WAITER, "1", "45", CAP, env=self.env(SMELT_MCP_BIN="/nonexistent/smelt-mcp",
                                                                SMELT_WAIT_POLL_SECS="0.2"))
@@ -207,7 +243,7 @@ class Wait(FakeCase):
         self.assertEqual(r.stdout, "")
         r = self.run_script(WAITER, "1", "45", CAP, "--no-github",
                             env=self.env(SMELT_MCP_BIN="/nonexistent/smelt-mcp", SMELT_WAIT_POLL_SECS="0.2"))
-        self.assertEqual((r.returncode, r.stdout.strip()), (0, "CAP"), r.stderr)
+        self.assertEqual((r.returncode, r.stdout.split()[0]), (0, "CAP"), r.stderr)
 
     # Time and failures.
 

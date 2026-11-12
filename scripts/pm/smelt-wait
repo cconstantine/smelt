@@ -7,7 +7,9 @@
 Run as a terminal command: it prints exactly one wake line and exits 0, and
 its exit wakes the PM. It polls ROOT's tree (ROOT and its descendants)
 through smelt_api every SMELT_WAIT_POLL_SECS (default 60) and wakes on the
-first of:
+first of the kinds below. A wake line is `KIND TIME rest`: TIME is a UTC
+ISO time to pass as the next run's --since (the last GitHub check, less a
+second, or a MERGED PR's merged_at; the wake's own time without GitHub).
 
   ALREADY_WAITING ids     at start, a node waits for the user and isn't in --known-waiting
   WAITING_FOR_USER ids    a node starts waiting for the user (not in --known-waiting)
@@ -57,9 +59,8 @@ def die(message, code=2):
     sys.exit(code)
 
 
-def wake(line):
-    print(line[:LINE_CUT * 2], flush=True)
-    sys.exit(0)
+def iso(t):
+    return t.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def env_float(name, default):
@@ -188,8 +189,20 @@ class Watch:
             self.github = GitHub(binary, os.environ.get("SMELT_WAIT_REPO", "cconstantine/smelt"))
         self.started = time.monotonic()
         self.since = args.since or datetime.datetime.now(datetime.timezone.utc)
+        # The wake line's time: a --since for the next run that skips no
+        # merge this run hasn't seen (N1). It moves only when GitHub answers.
+        self.checkpoint = self.since
         self.failures = 0
         self.polls = 0
+
+    def wake(self, kind, rest=""):
+        """Print `KIND TIME [rest]` and exit 0. TIME is now without GitHub
+        wakes, else the checkpoint (or a MERGED wake's merged_at, set by
+        check_github)."""
+        at = self.checkpoint if self.github else datetime.datetime.now(datetime.timezone.utc)
+        line = f"{kind} {iso(at)}" + (f" {rest}" if rest else "")
+        print(line[:LINE_CUT * 2], flush=True)
+        sys.exit(0)
 
     def nodes(self):
         rows = smelt_api.subtree(get("tree"), self.root)
@@ -210,7 +223,7 @@ class Watch:
         self.failures = 0
         waiting = sorted(n["id"] for n in nodes if n.get("waiting_for_user") and n["id"] not in self.known)
         if waiting:
-            wake("ALREADY_WAITING " + ",".join(map(str, waiting)))
+            self.wake("ALREADY_WAITING", ",".join(map(str, waiting)))
         self.seen_messages = len(messages)
         self.owed = {n["id"]: n.get("report_owed_at") for n in nodes}
         self.reds = reds
@@ -223,7 +236,7 @@ class Watch:
         self.failures += 1
         print(f"smelt-wait: poll failed ({self.failures}): {err}", file=sys.stderr, flush=True)
         if self.failures >= self.max_failures:
-            wake(f"UNREACHABLE {self.failures}")
+            self.wake("UNREACHABLE", str(self.failures))
 
     @staticmethod
     def updated(nodes):
@@ -232,7 +245,7 @@ class Watch:
     def check_tree(self, nodes):
         waiting = sorted(n["id"] for n in nodes if n.get("waiting_for_user") and n["id"] not in self.known)
         if waiting:
-            wake("WAITING_FOR_USER " + ",".join(map(str, waiting)))
+            self.wake("WAITING_FOR_USER", ",".join(map(str, waiting)))
 
     def check_messages(self, messages):
         new = messages[self.seen_messages:]
@@ -240,11 +253,11 @@ class Watch:
         for m in new:
             for block in smelt_api.message_blocks(m):
                 if block.get("type") == "tool_use" and block.get("name") in WAKE_TOOLS:
-                    wake(f"TOOL {block['name']} {cut(json.dumps(block.get('input'), ensure_ascii=False))}")
+                    self.wake("TOOL", f"{block['name']} {cut(json.dumps(block.get('input'), ensure_ascii=False))}")
                 if (self.key and m.get("role") == "assistant" and block.get("type") == "text"
                         and self.key.search(block.get("text", ""))):
                     lines = [ln for ln in block["text"].splitlines() if self.key.search(ln)]
-                    wake(f"KEY {cut(lines[0] if lines else block['text'])}")
+                    self.wake("KEY", cut(lines[0] if lines else block["text"]))
 
     def check_owed(self, nodes):
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -257,18 +270,25 @@ class Watch:
             except ValueError:
                 continue
             if now - at >= self.grace:
-                wake(f"REPORT_OWED {n['id']} {owed}")
+                self.wake("REPORT_OWED", f"{n['id']} {owed}")
 
     def check_github(self):
+        asked = datetime.datetime.now(datetime.timezone.utc)
         if self.sme:
-            for pr in self.github.merged_prs():
-                if not pr.get("merged_at") or not ticket_pr(pr, self.sme):
-                    continue
-                if parse_time(pr["merged_at"]) > self.since:
-                    wake(f"MERGED pr#{pr['number']} {cut(pr.get('title', ''))}")
+            merged = [pr for pr in self.github.merged_prs() if pr.get("merged_at") and ticket_pr(pr, self.sme)
+                      and parse_time(pr["merged_at"]) > self.since]
+            if merged:
+                # The earliest: a --since of its merged_at still wakes on any later one.
+                first = min(merged, key=lambda pr: parse_time(pr["merged_at"]))
+                self.checkpoint = parse_time(first["merged_at"])
+                self.wake("MERGED", f"pr#{first['number']} {cut(first.get('title', ''))}")
+        # Every merge before `asked` has been seen. merged_at is in whole
+        # seconds, so a second back keeps one later in the same second.
+        self.checkpoint = max(self.checkpoint, asked - datetime.timedelta(seconds=1))
         for rid, r in red_runs(self.github.main_runs()).items():
             if rid not in self.reds:
-                wake(f"MAIN_RED run#{rid} {r.get('name')} {r.get('conclusion')} {str(r.get('head_sha', ''))[:12]}")
+                self.wake("MAIN_RED", f"run#{rid} {r.get('name')} {r.get('conclusion')} "
+                                      f"{str(r.get('head_sha', ''))[:12]}")
 
     def check_time(self, nodes):
         now = time.monotonic()
@@ -277,9 +297,9 @@ class Watch:
             self.moved, self.last_move = moved, now
         if now - self.last_move >= self.args.stall_min * 60:
             busy = ",".join(str(n["id"]) for n in nodes if n.get("busy"))
-            wake(f"STALL {self.args.stall_min:g} busy:[{busy}]")
+            self.wake("STALL", f"{self.args.stall_min:g} busy:[{busy}]")
         if now - self.started >= self.args.cap_min * 60:
-            wake("CAP")
+            self.wake("CAP")
 
     def poll(self):
         nodes = self.nodes()
@@ -301,7 +321,7 @@ class Watch:
             except PollFailed as err:
                 self.failed(err)
                 if time.monotonic() - self.started >= self.args.cap_min * 60:
-                    wake("CAP")
+                    self.wake("CAP")
                 continue
             self.failures = 0
             self.check_time(nodes)

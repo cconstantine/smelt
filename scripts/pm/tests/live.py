@@ -9,6 +9,7 @@ wait for a turn to end) are test setup, outside the PM's allowlist.
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -98,7 +99,11 @@ class Waiter:
             fail(f"smelt-wait {self.args} didn't wake in {timeout} s")
         print(f"  -> exit {self.proc.returncode}: {out.strip()}")
         check(self.proc.returncode == 0 and len(out.splitlines()) == 1, "smelt-wait: one wake line, exit 0")
-        return out.strip()
+        # `KIND TIME rest`: the time is checked and dropped.
+        kind, _, rest = out.strip().partition(" ")
+        at, _, rest = rest.partition(" ")
+        check(re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", at) is not None, f"no wake time in {out.strip()!r}")
+        return f"{kind} {rest}" if rest else kind
 
 
 def free_port():

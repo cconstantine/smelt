@@ -54,7 +54,7 @@ Deploys ride with a Driver, one at a time, at the current DEPLOY.md pin, and onl
 
 ## Watching
 
-- **One `smelt-wait` per live Driver.** After each wake, the PM reads `smelt-api messages ID` (a wake doesn't repeat what it saw) and acts, then restarts the watcher with `--since` set to the last wake's time, so a merge between two runs isn't missed.
+- **One `smelt-wait` per live Driver.** After each wake, the PM reads `smelt-api messages ID` (a wake doesn't repeat what it saw) and acts, then restarts the watcher with `--since` set to the last wake's time, so a merge between two runs isn't missed. A wake line is `KIND TIME rest`, and `TIME` (UTC, `2026-11-12T03:04:05Z`) is that value: the watcher's last GitHub check less a second, a `MERGED` PR's `merged_at`, or, with `--no-github`, the wake itself. While GitHub doesn't answer, it stays at the run's own `--since`.
 - **What each wake means:**
 
   | Wake | What the PM does |
