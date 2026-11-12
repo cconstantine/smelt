@@ -657,3 +657,74 @@ async fn test_a_parents_turn_lets_its_own_agent_call_between_its_calls(pool: PgP
     finished(turn_a).await;
     assert_eq!(gate.peak.load(Ordering::SeqCst), 1, "the slot never double-handed");
 }
+
+/// SME-482 round 1 M1: the model's compaction runs at the end of a tool
+/// pass, where the turn has given its slot to its own live agent (B6). The
+/// summary call must take the slot back first, not go out beside the
+/// child's call: on a one-slot provider, with the child's call held at the
+/// server, A's summary doesn't arrive until the child's is answered. `ends`:
+/// the same when the pass ends the turn (`compact_context` + `notify_user`).
+async fn the_models_compaction_waits_for_the_slot(pool: PgPool, provider_id: i64, ends: bool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let mut calls = vec![("toolu_c", "compact_context", serde_json::json!({}))];
+    if ends {
+        calls.push(("toolu_n", "notify_user", serde_json::json!({"message": "done"})));
+    }
+    let (addr, gate) = start_slot_gate(vec![
+        GateResponse::Sse(super::ask_user::tool_calls_body(&calls)),
+        GateResponse::Sse(text_reply_body("Child done.")),
+        GateResponse::Sse(text_reply_body(T2_SUMMARY_BODY)),
+        GateResponse::Sse(text_reply_body("Parent done.")),
+    ])
+    .await;
+    let (_provider, a, b) = slot_provider_and_conversations(&pool, addr, provider_id, Some(1)).await;
+    sqlx::query("UPDATE conversations SET parent_id = $1 WHERE id = $2").bind(a).bind(b).execute(&pool).await.expect("B under A");
+    sqlx::query("INSERT INTO agents (conversation_id, root_id, depth, brief, state, started_at) VALUES ($1, $2, 1, 'b', 'active', now())")
+        .bind(b)
+        .bind(a)
+        .execute(&pool)
+        .await
+        .expect("B's agent row");
+
+    let (reached, resume) = test_hooks::pause_after_reply_saved(a);
+    let turn_a = tokio::spawn({
+        let pool = pool.clone();
+        async move { run_turn(&pool, a, call_message("a")).await }
+    });
+    gate.wait_for_arrivals(1).await;
+    gate.release_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached).await.expect("A's reply is saved").expect("hook");
+    let turn_b = tokio::spawn({
+        let pool = pool.clone();
+        async move { run_turn(&pool, b, call_message("b")).await }
+    });
+    tokio::time::sleep(SETTLE).await;
+    drop(resume); // A's tool pass: its slot goes to the queued child
+    gate.wait_for_arrivals(2).await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(gate.arrivals(), ["a", "b"], "A's summary waits for the slot the child holds");
+    assert_eq!(gate.peak.load(Ordering::SeqCst), 1, "the slot never double-handed");
+
+    gate.release_one(); // the child's reply frees the slot
+    finished(turn_b).await;
+    gate.wait_for_arrivals(3).await;
+    assert_eq!(gate.arrivals()[2], "summary");
+    gate.release_one();
+    if !ends {
+        gate.wait_for_arrivals(4).await;
+        gate.release_one();
+    }
+    finished(turn_a).await;
+    assert_eq!(gate.peak.load(Ordering::SeqCst), 1, "the slot never double-handed");
+}
+
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_models_compaction_takes_the_slot_back_mid_turn(pool: PgPool) {
+    the_models_compaction_waits_for_the_slot(pool, 9_162_000_331, false).await;
+}
+
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_models_compaction_takes_the_slot_back_when_the_pass_ends_the_turn(pool: PgPool) {
+    the_models_compaction_waits_for_the_slot(pool, 9_162_000_332, true).await;
+}

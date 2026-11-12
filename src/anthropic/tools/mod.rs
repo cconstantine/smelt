@@ -124,6 +124,10 @@ pub(crate) use class::ToolClass;
 #[cfg(feature = "server")]
 mod browser;
 #[cfg(feature = "server")]
+mod compact;
+#[cfg(feature = "server")]
+pub(crate) use compact::{COMPACT_CONTEXT, parse_note};
+#[cfg(feature = "server")]
 mod files;
 #[cfg(feature = "server")]
 mod git;
@@ -147,8 +151,8 @@ mod volumes;
 /// Every native tool, in the order the model is offered them. The order is
 /// part of what the model sees, so it stays fixed: changing it changes the
 /// request like adding or removing a tool would. The agent tools go last,
-/// so every older tool keeps its place, and `notify_user` (SME-377) after
-/// them for the same reason.
+/// so every older tool keeps its place, and `notify_user` (SME-377) and
+/// `compact_context` (SME-482) after them for the same reason.
 #[cfg(feature = "server")]
 static REGISTRY: std::sync::LazyLock<Vec<Registered>> = std::sync::LazyLock::new(|| {
     [
@@ -167,6 +171,7 @@ static REGISTRY: std::sync::LazyLock<Vec<Registered>> = std::sync::LazyLock::new
         .map(|tool| Registered { tool, offer: Offer::All })
         .chain(agents::tools())
         .chain(notify::tools())
+        .chain(compact::tools())
         .collect()
 });
 

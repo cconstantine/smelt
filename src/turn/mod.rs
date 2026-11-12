@@ -20,6 +20,7 @@ mod failure;
 mod history;
 mod lifecycle;
 mod notify;
+mod on_request;
 mod overflow;
 mod outside_turn;
 mod questions;
@@ -44,6 +45,8 @@ pub(crate) use self::failure::*;
 pub(crate) use self::history::*;
 pub(crate) use self::lifecycle::*;
 pub(crate) use self::notify::*;
+pub(crate) use self::on_request::{compact_now, request_compaction};
+use self::on_request::*;
 use self::overflow::recover as overflow_recovery;
 pub(crate) use self::overflow::reported_per_request;
 #[cfg(test)]

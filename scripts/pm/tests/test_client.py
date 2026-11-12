@@ -63,14 +63,29 @@ class Allowlist(FakeCase):
                 self.assertEqual(self.sent(), [])
 
     def test_not_yet_subcommands_exit_3_naming_their_ticket(self):
-        for args, ticket in ((["archive", "7"], "SME-480"), (["unarchive", "7"], "SME-480"),
-                             (["compact", "7"], "SME-482")):
+        for args, ticket in ((["archive", "7"], "SME-480"), (["unarchive", "7"], "SME-480")):
             with self.subTest(args=args):
                 r = self.api(*args)
                 self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
                 self.assertIn(ticket, r.stdout + r.stderr)
                 self.assertIn("not on this server yet", r.stdout + r.stderr)
                 self.assertEqual(self.sent(), [])
+
+    def test_compact_posts_its_note_and_says_what_the_server_refused(self):
+        # SME-482's route, the PM's way to compact a Driver (pm-in-smelt.md).
+        self.add_conv(7)
+        r = self.api("compact", "7", "--note", "keep the PR number")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.sent(), [("POST", "/api/conversations/7/compact")])
+        self.assertEqual(self.st.compacted, [(7, "keep the PR number")])
+        self.fake.clear()
+        r = self.api("compact", "7")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.st.compacted[-1], (7, None), "no --note sends a null note")
+        self.st.compact_refusals[7] = "A turn is running in this conversation"
+        r = self.api("compact", "7")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("A turn is running", r.stdout + r.stderr)
 
     def test_a_non_integer_id_exits_2_and_sends_nothing(self):
         for args in (["messages", "1/../2"], ["attach", "../7", "https://x/y"], ["model", "-1"], ["tree", "7a"]):

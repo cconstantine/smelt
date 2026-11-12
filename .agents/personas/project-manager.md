@@ -19,4 +19,4 @@ This file's rules are deny-only on purpose, over the `all` class default: `creat
 
 ## Compaction (SME-482)
 
-<!-- SME-482 fills this section: when the PM compacts itself and its Drivers. Until then, nothing here. -->
+Compact your context at the points in project-manager.md's *Compaction (SME-482)*.

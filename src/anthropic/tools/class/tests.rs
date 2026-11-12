@@ -54,6 +54,8 @@ const DESIGN: &[(&str, &[ToolClass])] = &[
     // Asks the user, or tells them (SME-377).
     ("ask_user", &[ReadOnly]),
     ("notify_user", &[ReadOnly]),
+    // The conversation's own context (SME-482).
+    ("compact_context", &[ReadOnly]),
     // Agents.
     ("list_agents", &[ReadOnly]),
     ("message_agent", &[ReadOnly]),
@@ -89,7 +91,7 @@ fn test_every_native_tool_has_the_designs_class() {
         wrong.is_empty() && missing.is_empty(),
         "classes differ from the design's: {wrong:?}; in the design but not the registry: {missing:?}"
     );
-    assert_eq!(registry.len(), 46, "every tool that exists at SME-237, plus SME-239's two volume tools and SME-377's notify_user");
+    assert_eq!(registry.len(), 47, "every tool that exists at SME-237, plus SME-239's two volume tools, SME-377's notify_user and SME-482's compact_context");
 }
 
 fn http_request_class_of(input: serde_json::Value) -> ToolClass {

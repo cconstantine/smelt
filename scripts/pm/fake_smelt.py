@@ -79,6 +79,10 @@ class State:
         self.fail_next = 0
         self.requests = []
         self.build_id = "fakebuild0001"
+        # compact (SME-482): what was compacted, with its note, and
+        # conversations whose compaction the server refuses (a 409).
+        self.compacted = []
+        self.compact_refusals = {}
 
     def default_model(self):
         return {"state": "Default", "choice": choice(1, "claude-opus-5-5", "ClaudeCode")}
@@ -183,6 +187,11 @@ def route(st, method, path, body):
             return 500, {"message": "unknown provider or empty model"}
         if not st.ignore_model_set:
             st.models[cid] = {"state": "Chosen", "choice": choice(prov[0]["id"], body["model"], prov[0]["name"])}
+        return 200, None
+    if method == "POST" and rest == "compact":
+        if cid in st.compact_refusals:
+            return 409, {"message": st.compact_refusals[cid]}
+        st.compacted.append((cid, body.get("note")))
         return 200, None
     if method == "POST" and rest == "repos":
         if not str(body.get("url", "")).startswith(("https://", "git@")):

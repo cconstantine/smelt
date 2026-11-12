@@ -32,6 +32,7 @@ ROUTES = {
     "send": ("POST", "/api/conversations/{id}/messages"),
     "model-set": ("POST", "/api/conversations/{id}/model"),
     "answer": ("POST", "/api/conversations/{id}/question/answer"),
+    "compact": ("POST", "/api/conversations/{id}/compact"),
     "tree": ("GET", "/api/conversations/tree"),
     "messages": ("GET", "/api/conversations/{id}/messages"),
     "question": ("GET", "/api/conversations/{id}/question"),
@@ -49,7 +50,6 @@ ALLOWED_METHODS = ("GET", "POST")
 NOT_YET = {
     "archive": "archive arrives with SME-480 (POST /api/conversations/{id}/archive); not on this server yet",
     "unarchive": "unarchive arrives with SME-480 (POST /api/conversations/{id}/unarchive); not on this server yet",
-    "compact": "compact arrives with SME-482 (POST /api/conversations/{id}/compact); not on this server yet",
 }
 
 

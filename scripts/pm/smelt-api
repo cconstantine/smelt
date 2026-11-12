@@ -13,6 +13,7 @@ touches providers, settings, secrets or trust decisions.
   send CONV FILE|- [--expect-model P:M]    send a message; with --expect-model, only on that model
   answer CONV TOOL_USE_ID ANSWER...        answer the pending ask_user, one ANSWER per question:
                                            a label, label1|label2 (multi-select), or other:<text>
+  compact CONV [--note N]                  compact it now, between turns, N what the summary keeps (SME-482)
   tree ROOT [--json]                       ROOT and its descendants
   messages CONV [--last K] [--json]        the last K messages (default 5), blocks cut to 500 chars
   question CONV                            the pending question's JSON, or `none`
@@ -20,7 +21,7 @@ touches providers, settings, secrets or trust decisions.
   pods                                     live pods and their running commands
   providers                                provider id, kind and name
   where                                    the address, the Host sent and the build id
-  archive|unarchive|compact CONV           not on the server yet (exit 3)
+  archive|unarchive CONV                   not on the server yet (exit 3)
 
 Address: SMELT_API_URL (default http://smelt.smelt-park.svc.cluster.local:8080)
 and SMELT_API_HOST (default smelt.constantlee.us while SMELT_API_URL is unset;
@@ -243,6 +244,11 @@ def cmd_where(args):
     print(f"build-id {request('build-id')}")
 
 
+def cmd_compact(args):
+    request("compact", args.conv, {"note": args.note})
+    print(f"compacted conversation {args.conv}")
+
+
 def cmd_not_yet(args):
     print(smelt_api.NOT_YET[args.command])
     sys.exit(3)
@@ -273,6 +279,7 @@ def parser():
     s = add("answer", cmd_answer, "conv")
     s.add_argument("tool_use_id")
     s.add_argument("answers", nargs="+")
+    add("compact", cmd_compact, "conv").add_argument("--note", default=None)
     add("tree", cmd_tree, "root").add_argument("--json", action="store_true")
     s = add("messages", cmd_messages, "conv")
     s.add_argument("--last", type=int, default=5)
