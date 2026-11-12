@@ -66,10 +66,13 @@ pub(super) fn ConversationHeader(
                     },
                     if super::transcript::SHOW_THINKING() { "Hide thinking" } else { "Show thinking" }
                 }
-                super::compact_control::CompactControl { selected, state }
                 if let (Some(archived), Some(id)) = (archive, selected()) {
                     ArchiveButton { id, archived, nodes, error: archive_error }
                 }
+                // Last in the row: its popover is right-aligned under it and
+                // 320 px wide, so anything after it pushes the popover off a
+                // phone's left edge (SME-482's compact_now at 375 px).
+                super::compact_control::CompactControl { selected, state }
             }
             super::ErrorText { message: archive_error() }
             if meta.is_some() || parent.is_some() {
