@@ -83,6 +83,16 @@ class State:
         # conversations whose compaction the server refuses (a 409).
         self.compacted = []
         self.compact_refusals = {}
+        # A top-level persona (SME-481): what each conversation is set to
+        # (its TopLevelPersona), the labels a set accepts, the model a
+        # persona pins (label -> (provider_id, model)), conversations whose
+        # set the server refuses (a 500, as a ServerFnError), and a set
+        # that is kept but not applied.
+        self.personas = {}
+        self.persona_options = ["smelt:developer", "smelt:project-manager", "smelt:ticket-driver"]
+        self.persona_models = {}
+        self.persona_refusals = {}
+        self.persona_unapplied = False
 
     def default_model(self):
         return {"state": "Default", "choice": choice(1, "claude-opus-5-5", "ClaudeCode")}
@@ -193,11 +203,39 @@ def route(st, method, path, body):
             return 409, {"message": st.compact_refusals[cid]}
         st.compacted.append((cid, body.get("note")))
         return 200, None
+    if method == "GET" and rest == "persona":
+        return 200, st.personas.get(cid) or {
+            "set": None, "can_set": None, "notes": [],
+            "options": [{"label": o, "description": None, "error": None} for o in st.persona_options]}
+    if method == "POST" and rest == "persona":
+        return set_persona(st, cid, body.get("persona"))
     if method == "POST" and rest == "repos":
         if not str(body.get("url", "")).startswith(("https://", "git@")):
             return 500, {"message": f"can't clone {body.get('url')!r}"}
         return 200, {"url": body["url"], "branch": body.get("branch", ""), "dir": body.get("dir") or "repo"}
     return 404, {"message": f"no route {method} {path}"}
+
+
+def set_persona(st, cid, label):
+    """POST …/persona: refused as the real set_top_level_persona refuses
+    (a ServerFnError is a 500), else the SetPersona it answers."""
+    if cid in st.persona_refusals:
+        return 500, {"message": st.persona_refusals[cid]}
+    current = st.personas.get(cid)
+    if current and current["set"] and current["set"]["applied"]:
+        return 500, {"message": "this conversation's persona is already set"}
+    if label not in st.persona_options:
+        return 500, {"message": f"no persona {label!r} in this conversation's checkouts"}
+    if label in st.persona_models:
+        provider_id, name = st.persona_models[label]
+        prov = [p for p in st.providers if p["id"] == provider_id][0]
+        st.models[cid] = {"state": "Chosen", "choice": choice(provider_id, name, prov["name"])}
+    model = (st.models.get(cid) or st.default_model()).get("choice") or {}
+    repo, name = label.split(":")
+    out = {"label": label, "path": f"/workspace/{repo}/.agents/personas/{name}.md", "commit": "d687835b",
+           "applied": not st.persona_unapplied, "model": model.get("model"), "provider": model.get("provider_name")}
+    st.personas[cid] = {"set": out, "can_set": "this conversation's persona is set", "options": [], "notes": []}
+    return 200, out
 
 
 class FakeSmelt:

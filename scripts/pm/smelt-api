@@ -10,6 +10,10 @@ touches providers, settings, secrets or trust decisions.
   create                                   a new top-level conversation; prints its id first
   attach CONV URL [--branch B] [--dir D]   attach a repo
   model-set CONV PROVIDER_ID MODEL         set its model, then read it back (exit 1 unless Chosen)
+  persona-set CONV DIR:NAME                set its persona (SME-481; scoped names only), then read
+                                           it back (exit 1 unless that persona, applied); prints
+                                           the model and provider it ended on: the persona's
+                                           smelt.model may have moved it, so check `model` again
   send CONV FILE|- [--expect-model P:M]    send a message; with --expect-model, only on that model
   answer CONV TOOL_USE_ID ANSWER...        answer the pending ask_user, one ANSWER per question:
                                            a label, label1|label2 (multi-select), or other:<text>
@@ -18,6 +22,8 @@ touches providers, settings, secrets or trust decisions.
   messages CONV [--last K] [--json]        the last K messages (default 5), blocks cut to 500 chars
   question CONV                            the pending question's JSON, or `none`
   model CONV                               the conversation's model
+  persona CONV                             what its persona is set to (label, commit, applied, model,
+                                           provider), or can_set and the options' labels
   pods                                     live pods and their running commands
   providers                                provider id, kind and name
   where                                    the address, the Host sent and the build id
@@ -35,6 +41,7 @@ whose route isn't on the server yet.
 import argparse
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -100,6 +107,48 @@ def cmd_model_set(args):
     show(model)
     if not is_chosen(model, args.provider_id, args.model):
         die(f"conversation {args.conv}'s model reads back as above, not Chosen {args.provider_id}:{args.model}", 1)
+
+
+def persona_arg(value):
+    """A scoped persona label, `<dir>:<name>` (the name as the server's
+    check_name takes it); anything else is usage, exit 2, nothing sent."""
+    dir_, sep, name = value.partition(":")
+    if (not sep or not re.fullmatch(r"[A-Za-z0-9._-]+", dir_) or dir_ in (".", "..")
+            or not re.fullmatch(r"[a-z0-9-]{1,64}", name)):
+        raise argparse.ArgumentTypeError(f"expected a scoped persona DIR:NAME, as in smelt:developer, got {value!r}")
+    return value
+
+
+def print_persona(persona):
+    chosen = persona.get("set") if isinstance(persona, dict) else None
+    if chosen:
+        for key in ("label", "commit", "applied", "model", "provider"):
+            print(f"{key:<9}{chosen.get(key)}")
+        return
+    if not isinstance(persona, dict):
+        print(f"unexpected answer: {json.dumps(persona)[:BODY_CUT]}")
+        return
+    print(f"can_set  {persona.get('can_set') or 'yes'}")
+    for option in persona.get("options") or []:
+        error = option.get("error")
+        print(f"option   {option.get('label')}" + (f" (error: {error})" if error else ""))
+    for note in persona.get("notes") or []:
+        print(f"note     {note}")
+
+
+def cmd_persona(args):
+    print_persona(request("persona", args.conv))
+
+
+def cmd_persona_set(args):
+    request("persona-set", args.conv, {"persona": args.persona})
+    persona = request("persona", args.conv)
+    print_persona(persona)
+    chosen = persona.get("set") if isinstance(persona, dict) else None
+    if not chosen or chosen.get("label") != args.persona or chosen.get("applied") is not True:
+        die(f"conversation {args.conv}'s persona reads back as above, not {args.persona} applied", 1)
+    print(f"conversation {args.conv} is {args.persona} on model {chosen.get('model')}, "
+          f"provider {chosen.get('provider')}")
 
 
 def read_brief(path):
@@ -286,6 +335,8 @@ def parser():
     s.add_argument("--json", action="store_true")
     add("question", cmd_question, "conv")
     add("model", cmd_model, "conv")
+    add("persona-set", cmd_persona_set, "conv").add_argument("persona", type=persona_arg)
+    add("persona", cmd_persona, "conv")
     add("pods", cmd_pods)
     add("providers", cmd_providers)
     add("where", cmd_where)

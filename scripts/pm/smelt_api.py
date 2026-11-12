@@ -37,6 +37,8 @@ ROUTES = {
     "messages": ("GET", "/api/conversations/{id}/messages"),
     "question": ("GET", "/api/conversations/{id}/question"),
     "model": ("GET", "/api/conversations/{id}/model"),
+    "persona-set": ("POST", "/api/conversations/{id}/persona"),
+    "persona": ("GET", "/api/conversations/{id}/persona"),
     "pods": ("GET", "/api/pods"),
     "pod-commands": ("GET", "/api/pods/commands"),
     "providers": ("GET", "/api/providers"),

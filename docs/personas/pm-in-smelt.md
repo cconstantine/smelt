@@ -3,7 +3,7 @@ Part of the [development process](../development-process.md). The [Project Manag
 
 ## Where it runs
 
-- **A top-level smelt conversation** on ClaudeCode `claude-opus-5-5`, started with `smelt:project-manager`, with a clone of the repo at `main` for `scripts/pm/`. It doesn't run on strata, where its own turns would share the strata line's one slot.
+- **A top-level smelt conversation** on ClaudeCode `claude-opus-5-5`, started with `smelt:project-manager`, with a clone of the repo at `main` for `scripts/pm/`. It's started as a Driver is ([below](#starting-a-driver), steps 2–5 and 7), with `persona-set ID smelt:project-manager`. It doesn't run on strata, where its own turns would share the strata line's one slot.
 - **Its only way to write to smelt is `scripts/pm/smelt-api`.** Its only waits are `scripts/pm/smelt-wait` (a Driver's tree) and `scripts/pm-wait-for-board` (the project's board). It makes no other request to smelt's API: see [Security model](#security-model).
 - **Reach smelt first:** `scripts/pm/smelt-api where` prints the address, the `Host` it sends and the server's build id. Run it before anything else in a new seat. See [The scripts](#the-scripts) for the address settings.
 
@@ -19,13 +19,14 @@ In this order, one step at a time. After a failure, re-read the tree and the boa
 
 1. Re-read the tree (`smelt-api tree` for each live Driver) and the board. Start a Driver only for a freed slot ([runaway guard](#security-model)).
 2. `smelt-api create`. The first line of its output is the new conversation's id.
-3. `smelt-api model-set ID PROVIDER_ID MODEL`: ClaudeCode `claude-opus-5-5`, or strata's provider and model. `smelt-api providers` lists the provider ids. It reads the model back and exits 1 unless it reads `Chosen`.
-4. `smelt-api attach ID git@github.com:cconstantine/smelt.git`.
-5. The `Ticket Driver started: conversation ID` comment on the ticket, before the brief starts it ([rules.md](rules.md): comment first), so a PM that dies after `send` leaves no live Driver that no comment names.
-6. `smelt-api send ID brief.md --expect-model PROVIDER_ID:MODEL`. The flag is required for a Driver's first brief: it sends nothing unless the model is `Chosen` with exactly that provider and model, so the brief never runs on the default model.
-7. `SME=<ticket number> scripts/pm/smelt-wait ID` as a terminal command. Its `KEY` wake is on by default, on the Driver's `Driver gate: ` lines (brief part 4); `SMELT_KEY` sets another regex.
+3. `smelt-api attach ID git@github.com:cconstantine/smelt.git`.
+4. `smelt-api model-set ID PROVIDER_ID MODEL`: ClaudeCode `claude-opus-5-5`, or strata's provider and model. `smelt-api providers` lists the provider ids. It reads the model back and exits 1 unless it reads `Chosen`.
+5. `smelt-api persona-set ID smelt:ticket-driver` (SME-481's top-level persona, [top-level.md](../design/personas/top-level.md)). It takes only a scoped `<dir>:<name>`, reads the persona back, and exits 1 unless it reads that persona, applied. The set reads the persona from the attach's checkout, so it's refused until the clone is `ready`: `smelt-api persona ID` shows `can_set` and the options once it is. **The persona's `smelt.model` must be listed on the conversation's provider, or the set is refused**, naming the providers that do list it ([top-level.md, "Model"](../design/personas/top-level.md#model)): there is no fallback to another provider. A set that succeeds may move the model to the persona's, so `persona-set` prints the model and provider it ended on, and `smelt-api model ID` is read again before the brief.
+6. The `Ticket Driver started: conversation ID` comment on the ticket, before the brief starts it ([rules.md](rules.md): comment first), so a PM that dies after `send` leaves no live Driver that no comment names.
+7. `smelt-api send ID brief.md --expect-model PROVIDER_ID:MODEL`, with the model read in step 5. The flag is required for a Driver's first brief: it sends nothing unless the model is `Chosen` with exactly that provider and model, so the brief never runs on the default model.
+8. `SME=<ticket number> scripts/pm/smelt-wait ID` as a terminal command. Its `KEY` wake is on by default, on the Driver's `Driver gate: ` lines (brief part 4); `SMELT_KEY` sets another regex.
 
-**A failure after `create` is retried on the same id, never by creating again.** A conversation with no model or no brief is finished on its id: `model-set`, `attach` and `send` can each be run again.
+**A failure after `create` is retried on the same id, never by creating again.** A conversation with no model, no persona or no brief is finished on its id: `attach`, `model-set`, `persona-set` (until it reads applied) and `send` can each be run again. A persona can't be set once the conversation has a message ([top-level.md](../design/personas/top-level.md#started-and-where-its-enforced)), which is why `send` comes last.
 
 ## Briefing a Driver
 
@@ -132,6 +133,8 @@ When the PM compacts itself and its Drivers is SME-482's, in [project-manager.md
 | `create` | A new top-level conversation; prints its id alone on the first line. |
 | `attach CONV URL [--branch B] [--dir D]` | Attaches a repo. |
 | `model-set CONV PROVIDER_ID MODEL` | Sets the model, reads it back, and exits 1 unless it's `Chosen` with that provider and model. |
+| `persona-set CONV DIR:NAME` | Sets a top-level conversation's persona (SME-481), scoped labels only (anything else exits 2, sending nothing). Reads it back, exits 1 unless it's that persona and `applied`, and prints the model and provider it ended on. |
+| `persona CONV` | Read-only: the persona it's set to (`label`, `commit`, `applied`, `model`, `provider`), or `can_set` (`yes`, or why not) and the options' labels. |
 | `send CONV FILE\|- [--expect-model P:M]` | Sends a UTF-8 message (refuses an empty one). With `--expect-model`, sends nothing unless the model is `Chosen` P:M. |
 | `answer CONV TOOL_USE_ID ANSWER…` | Answers the pending `ask_user`, checked against it first. |
 | `tree ROOT [--json]` | ROOT and its descendants: `id persona status busy waiting report_owed title`. |
