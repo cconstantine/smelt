@@ -130,6 +130,14 @@ pub(super) async fn page_state(page: &chromiumoxide::Page) -> String {
     }
 }
 
+/// `wait_for_stable`'s failure: what kept `selector` from settling
+/// (`state`), then `page_state`. Its own function so a scenario can check
+/// it without a panic, whose text would sit in every tier log in a flake's
+/// signature form (SME-505 review 1, M2).
+pub(super) async fn settle_failure(page: &chromiumoxide::Page, selector: &str, state: &str) -> String {
+    let held = page_state(page).await;
+    format!("{selector} never settled to be clicked: {state}; the page: {held}")
+}
 
 /// Waits until `selector`'s element exists and has the same box on two
 /// reads 150 ms apart, without scrolling anything itself (that would both
@@ -157,8 +165,7 @@ pub(super) async fn wait_for_stable(page: &chromiumoxide::Page, selector: &str, 
             return state;
         }
         if tokio::time::Instant::now() >= deadline {
-            let held = page_state(page).await;
-            panic!("{selector} never settled to be clicked: {state}; the page: {held}");
+            panic!("{}", settle_failure(page, selector, &state).await);
         }
         last = state;
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -226,20 +233,12 @@ pub(super) async fn scenario_click_not_repeated(t: &Scenario<'_>) {
     // A wait that never settles says what the page held, so the next red
     // tells its causes apart (SME-505): where the tab was, which row was
     // armed, the sidebar's error, and the clicks and changes before it.
+    // Read without a panic: one would print its text, in SME-505's
+    // signature form, into every green tier log (review 1, M2).
     let gone = format!(".conversation-item[data-conversation-id='{}'] .no-such-button", target.id);
-    let failed = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(wait_for_stable(
-        &page,
-        &gone,
-        tokio::time::Instant::now() + Duration::from_millis(300),
-    )))
-    .await
-    .expect_err("a selector matching nothing never settles");
-    let why = failed
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| failed.downcast_ref::<&str>().map(|s| s.to_string()))
-        .unwrap_or_default();
+    let why = settle_failure(&page, &gone, "missing").await;
     for told in [
+        format!("{gone} never settled to be clicked: missing; the page: "),
         format!("\"url\":\"{}\"", t.url(&format!("conversation/{}", open.id))),
         format!("\"armed\":[\"{}\"]", target.id),
         "\"sidebar_error\":null".to_string(),
