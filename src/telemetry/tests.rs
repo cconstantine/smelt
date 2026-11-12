@@ -550,3 +550,101 @@ async fn test_the_export_scrubs_span_link_attributes() {
     );
     assert_eq!(link.dropped_attributes_count, 0, "{link:?}");
 }
+/// SME-483: a panic never enters the tracing pipeline, so neither SME-392
+/// sink can scrub it — the panic hook must produce the default hook's
+/// report itself, scrubbed. Same shape and destination as the default
+/// hook: a lead newline, `thread '<name>' panicked at <file>:<line>:<col>:`,
+/// the message, then the captured backtrace or the note that points one
+/// out; every string through [`scrub_urls`]. `tail` is that last part, as
+/// the hook renders it (a backtrace's text, the note, or empty).
+#[test]
+fn test_the_panic_report_scrubs_urls_and_keeps_the_default_shape() {
+    let url = "http://127.0.0.1:9/mcp/s/TEST-KEY-392-PATH-0001/mcp?apiKey=TEST-KEY-392";
+    let note = "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n";
+
+    // A `String` payload — what `panic!("…{url}…")` and every `expect`
+    // make — quoting a configured URL: the key goes, the sentence and the
+    // shape stay.
+    let mut out = Vec::new();
+    write_scrubbed_panic_report(
+        &mut out,
+        "main",
+        Some("src/mcp.rs:1:1"),
+        &format!("failed for url ({url})"),
+        note,
+    )
+    .expect("write to a Vec");
+    assert_eq!(
+        String::from_utf8(out).expect("utf-8"),
+        format!(
+            "\nthread 'main' panicked at src/mcp.rs:1:1:\n\
+             failed for url (http://127.0.0.1:9/mcp/s/<redacted>/mcp?…)\n{note}"
+        )
+    );
+
+    // A `&str` payload (a bare `panic!("literal")`) with a captured
+    // backtrace where the note would be.
+    let mut out = Vec::new();
+    write_scrubbed_panic_report(
+        &mut out,
+        "worker",
+        Some("src/main.rs:120:32"),
+        &"transport died",
+        "stack backtrace:\n   0: smelt::mcp::call\n",
+    )
+    .expect("write");
+    assert_eq!(
+        String::from_utf8(out).expect("utf-8"),
+        "\nthread 'worker' panicked at src/main.rs:120:32:\n\
+         transport died\nstack backtrace:\n   0: smelt::mcp::call\n"
+    );
+
+    // A payload that is neither renders as the default hook's
+    // `Box<dyn Any>`, and no location as its "unknown location" — and no
+    // user Display runs, so nothing here can panic (a panic inside the
+    // hook aborts the process: std calls that "panic in a panic hook").
+    let mut out = Vec::new();
+    write_scrubbed_panic_report(&mut out, "<unnamed>", None, &42_i64, "").expect("write");
+    assert_eq!(
+        String::from_utf8(out).expect("utf-8"),
+        "\nthread '<unnamed>' panicked at unknown location:\nBox<dyn Any>\n"
+    );
+}
+
+/// The installed hook end to end (SME-483): a real panic, real payload,
+/// real stderr — in a *child* copy of this test binary, so the panicking
+/// never touches the test process. The child's stderr must carry the
+/// default hook's shape with the key gone; on the unfixed hook the raw
+/// URL rides through and the second assert fails.
+#[test]
+fn test_the_installed_hook_writes_a_scrubbed_report_to_stderr() {
+    let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+        .args(["--exact", "telemetry::tests::the_panic_hook_child_panics", "--nocapture"])
+        .env("SMELT_PANIC_HOOK_CHILD", "1")
+        .output()
+        .expect("spawn the child test");
+    assert!(!output.status.success(), "the child must die of its panic: {output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("TEST-KEY-392"), "the stderr carries the key: {stderr}");
+    assert!(
+        stderr.contains("panicked at src/telemetry/tests.rs:")
+            && stderr.contains("child panic for url (http://127.0.0.1:9/mcp/s/<redacted>/mcp?…"),
+        "the default hook's shape with the URLs cut: {stderr}"
+    );
+}
+
+/// The child of [`test_the_installed_hook_writes_a_scrubbed_report_to_stderr`]:
+/// installs the hook and panics when the parent asked it to, so the hook's
+/// real output (stderr, an unwinding panic process) is what gets checked.
+/// Run directly it is inert — without the parent's env var this test just
+/// passes, and no filter but the parent's exact-name one selects it.
+#[test]
+fn the_panic_hook_child_panics() {
+    if std::env::var("SMELT_PANIC_HOOK_CHILD").is_err() {
+        return;
+    }
+    install_scrubbed_panic_hook();
+    panic!(
+        "child panic for url (http://127.0.0.1:9/mcp/s/TEST-KEY-392-PATH-0001/mcp?apiKey=TEST-KEY-392)"
+    );
+}
