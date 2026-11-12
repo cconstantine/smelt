@@ -575,7 +575,14 @@ async fn test_a_slot_stop_the_turn_just_learned_still_compacts_for_the_room(pool
 
     assert_eq!(last_reply(&saved).as_deref(), Some("Done."), "the turn got to its end");
     assert_eq!(seen.count(), 7, "every planned step ran, and the final reply");
-    assert_eq!(seen.summary_calls(), 3, "two to learn it, one for the room");
+    // The plan's one-extra-summary trade-off, realized: the room
+    // compaction lands at the next step, and once the slot stop's
+    // tighter window re-syncs the record there, the fixed content sits
+    // over that window's lower trigger — so the step after pays one
+    // more proactive compaction. That's the re-learn the window change
+    // always costs, and compacting when a request nears the (new)
+    // window is what F10 says a turn may do as often as it needs.
+    assert_eq!(seen.summary_calls(), 4, "two to learn it, one for the room, one as the learned window re-arms the trigger");
     assert_eq!(cut_off_notices(&pool, conversation.id).await, 1, "the model and the user are told it was cut");
     assert!(seen.request(5).contains(crate::api::chat::CUT_OFF_NOTICE_START), "the retry carries the notice: {}", seen.request(5));
     // The stop really learned, mid-step: `turn_only` (nothing reported,

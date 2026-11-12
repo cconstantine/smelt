@@ -358,7 +358,19 @@ async fn test_a_child_slot_stopped_before_its_finish_still_reports_its_parent(po
             == 1
     })
     .await;
-    eventually("the root's request runs", || async { requests_for(&requests, None).len() == 1 }).await;
+    // The root's one real call. Not `requests_for(None).len()`: the
+    // child's compaction summaries carry no "You are agent #" system
+    // line, so they land in the no-parent bucket too — all three are
+    // in by the time the report queues, and the count passes through
+    // 4, never 1. Filter to what isn't a summary.
+    eventually("the root's request runs", || async {
+        requests_for(&requests, None)
+            .iter()
+            .filter(|r| !r["system"].to_string().contains("You are compacting"))
+            .count()
+            == 1
+    })
+    .await;
     eventually("the parent answers the report", || async {
         transcript(&pool, root).await.iter().any(|(role, text)| role == "assistant" && text == "Thanks.")
     })
