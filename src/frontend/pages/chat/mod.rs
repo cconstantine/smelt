@@ -58,6 +58,7 @@ use crate::models::Message;
 mod actions;
 mod agents_waiting;
 mod composer;
+mod compact_control;
 mod conversation_header;
 mod empty_home;
 mod context;
@@ -339,7 +340,7 @@ fn ChatPanel(
                         // header nor its side panels (SME-354 B24: its sandbox
                         // panel's Remove volumes stayed up).
                         if !conversation_missing() {
-                            conversation_header::ConversationHeader { selected, nodes: conversation_nodes }
+                            conversation_header::ConversationHeader { selected, nodes: conversation_nodes, state }
                         }
                         AgentsWaitingBanner { selected, conversations_changed, questions_changed }
                         ContextUsage {

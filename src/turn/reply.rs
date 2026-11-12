@@ -357,8 +357,13 @@ pub(super) async fn run_tools(
         if let anthropic::ContentBlock::ToolUse { id, name, input } = block
             && !is_question(name)
         {
-            let result =
-                anthropic::tools::execute(pool, conversation_id, id, name, input).await;
+            // A summary covering the question's call would leave its
+            // answer's result orphaned, which the API refuses (SME-482).
+            let result = if name == anthropic::tools::COMPACT_CONTEXT && asked.is_some() {
+                Err(COMPACT_BESIDE_A_QUESTION.to_string())
+            } else {
+                anthropic::tools::execute(pool, conversation_id, id, name, input).await
+            };
             if (name == crate::agents::FINISH || name == anthropic::tools::NOTIFY_USER) && result.is_ok() {
                 finished = true;
             }
@@ -390,6 +395,11 @@ pub(super) async fn run_tools(
         asked: asked_id,
     })
 }
+
+/// `compact_context`'s result in a reply that asked a question (SME-482).
+#[cfg(feature = "server")]
+const COMPACT_BESIDE_A_QUESTION: &str =
+    "compact_context can't run in the same reply as a question (ask_user, ask_parent): call it after the answer";
 
 /// What running a reply's calls gave: their results, whether the turn ends
 /// (a question asked, `finish` or `notify_user`), and, when every call named a tool no

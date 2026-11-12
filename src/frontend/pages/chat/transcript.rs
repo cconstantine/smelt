@@ -268,10 +268,7 @@ pub(super) fn render_block_element(
         // When a refusal caused it, the header says why (SME-73); the
         // reason never reaches the model, only the summary replays.
         ContentBlock::CompactionSummary { summary, refused, .. } => {
-            let header = match refused {
-                Some(reason) => format!("Conversation compacted: {reason}"),
-                None => "Conversation compacted".to_string(),
-            };
+            let header = compaction_divider_header(refused.as_deref());
             rsx! {
                 details { key: "{key}", class: "compaction-summary-block",
                     summary { class: "compaction-summary-header",
@@ -287,6 +284,16 @@ pub(super) fn render_block_element(
         // typed or needs to see; the `CompactionSummary` divider above is
         // what actually marks "compaction happened" in the transcript.
         ContentBlock::CompactionPlaceholder { .. } => rsx! {},
+    }
+}
+
+/// A compaction divider's header: why it happened, when it wasn't the
+/// plain proactive one — a refusal (SME-73), or someone asking for it
+/// (SME-482: "on request", "the model asked for it").
+pub(super) fn compaction_divider_header(reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => format!("Conversation compacted: {reason}"),
+        None => "Conversation compacted".to_string(),
     }
 }
 

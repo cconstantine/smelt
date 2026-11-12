@@ -33,6 +33,7 @@ Each native tool's class sits beside its definition in the registry (`Tool { def
 | `lsp_servers`, `start_language_server`, `lsp` | read-only | A language server for its own checkout. |
 | `ask_user` | read-only | Asks the user. |
 | `notify_user` | read-only | Tells the user it's done (SME-377); offered only to a conversation the user started. |
+| `compact_context` | read-only | Compacts its own conversation's context at the end of the tool pass, once a turn (SME-482); offered to every conversation. |
 | `list_agents` | read-only | Its own children. |
 | `message_agent`, `ask_parent`, `finish` | read-only | They reach only the agent's own parent or children, which the parent chose to start; a read-only Code Reviewer must still be able to report. ([agents.md](agents.md#tools)) |
 | `start_agent`, `stop_agent` | writing | New conversations, pods and spend; ending another agent's work. |

@@ -437,6 +437,24 @@ fn test_a_new_window_clears_the_armed_stop() {
     assert!(!progress.is_stuck());
 }
 
+/// T6 (SME-482): the model's once a turn survives a window learned mid-turn,
+/// and so does a request not yet taken; the next turn's start clears both.
+#[test]
+fn test_the_models_compaction_stays_spent_across_a_window_change() {
+    let mut progress = CompactionProgress::default();
+    progress.sync(WINDOW);
+    assert_eq!(progress.request(Some("n".to_string())), Ok(()));
+    assert!(progress.request(None).expect_err("asked twice").contains("already asked for in this reply"));
+    assert_eq!(progress.take_request(), Some(Some("n".to_string())));
+    assert_eq!(progress.take_request(), None, "taken once");
+    progress.sync(WINDOW / 2);
+    assert!(progress.request(None).expect_err("still spent").contains("once this turn"));
+    progress.turn_started();
+    assert_eq!(progress.request(None), Ok(()));
+    progress.sync(WINDOW);
+    assert_eq!(progress.take_request(), Some(None), "pending survives a window change");
+}
+
 /// SME-423: all three stuck wordings — the measured floor, the window
 /// too small for the prompt alone, and the server that keeps refusing —
 /// send the user to both places a window can be raised.
