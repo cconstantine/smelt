@@ -57,12 +57,36 @@ class NetworkError(Exception):
     """smelt couldn't be reached at all (no HTTP status)."""
 
 
+class AddressError(ValueError):
+    """SMELT_API_URL isn't scheme://host[:port]. Its text never holds the
+    URL, which could carry a password."""
+
+
+URL_RULE = ("SMELT_API_URL must be http(s)://host[:port] and nothing more "
+            "(no user, path, query or fragment); nothing sent")
+
+
+def checked_url(url):
+    """`url` without a trailing slash, or AddressError. Anything after the
+    host and port would swallow the route table's path (L1)."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        parts.port  # raises ValueError for a port out of range
+    except ValueError:
+        raise AddressError(URL_RULE) from None
+    if (parts.scheme.lower() not in ("http", "https") or not parts.hostname or "@" in parts.netloc
+            or parts.path not in ("", "/") or "?" in url or "#" in url or any(c.isspace() for c in url)):
+        raise AddressError(URL_RULE)
+    return url.rstrip("/")
+
+
 def address(env=None):
-    """(base URL, Host header or None for the URL's own)."""
+    """(base URL, Host header or None for the URL's own); AddressError for
+    a SMELT_API_URL that isn't scheme://host[:port]."""
     env = os.environ if env is None else env
     url = env.get("SMELT_API_URL", "")
     if url:
-        base = url.rstrip("/")
+        base = checked_url(url)
         host = env.get("SMELT_API_HOST") or None
     else:
         base = DEFAULT_URL

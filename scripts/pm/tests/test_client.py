@@ -6,7 +6,7 @@ import json
 import os
 import socket
 
-from helpers import CLIENT, PM, FakeCase, base_env, fake_smelt
+from helpers import CLIENT, PM, WAITER, FakeCase, base_env, fake_smelt
 
 import smelt_api
 
@@ -104,6 +104,29 @@ class Address(FakeCase):
         self.assertEqual(smelt_api.address({"SMELT_API_URL": "https://smelt.example/"}), ("https://smelt.example", None))
         self.assertEqual(smelt_api.address({"SMELT_API_URL": "http://x:1", "SMELT_API_HOST": "h.example"}),
                          ("http://x:1", "h.example"))
+
+    def test_a_url_with_more_than_scheme_host_and_port_exits_2_unprinted(self):
+        # L1: a path, query or fragment would swallow the route table's
+        # path, and userinfo would be printed (or crash urllib).
+        base = self.fake.url
+        for url in (base + "/api/pods/7/stop?", base + "/api/conversations/7/stop#", base + "/x",
+                    base + "?q=1", base + "#f", f"http://user:hunter2@127.0.0.1:{self.fake.port}",
+                    "http://hunter2@127.0.0.1", "ftp://127.0.0.1", "http://", "http://h:99999", "127.0.0.1:8080"):
+            for script, args in ((CLIENT, ["where"]), (CLIENT, ["create"]), (WAITER, ["1", "45", "0.01", "--no-github"])):
+                with self.subTest(url=url, script=os.path.basename(script), args=args[0]):
+                    self.fake.clear()
+                    r = self.run_script(script, *args, env=base_env(SMELT_API_URL=url))
+                    self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                    self.assertNotIn("hunter2", r.stdout + r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
+                    self.assertIn("SMELT_API_URL", r.stderr)
+                    self.assertEqual(self.sent(), [])
+
+    def test_a_url_of_scheme_host_and_port_is_kept(self):
+        for url, want in (("https://smelt.example/", "https://smelt.example"), ("http://x:1", "http://x:1"),
+                          ("HTTP://Smelt.Example:8080", "HTTP://Smelt.Example:8080")):
+            with self.subTest(url=url):
+                self.assertEqual(smelt_api.address({"SMELT_API_URL": url})[0], want)
 
     def host_sent(self, **env):
         self.fake.clear()

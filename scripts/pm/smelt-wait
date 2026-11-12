@@ -172,6 +172,10 @@ def ticket_pr(pr, sme):
 class Watch:
     def __init__(self, args):
         self.args = args
+        try:
+            smelt_api.address()
+        except smelt_api.AddressError as err:
+            die(str(err))
         self.root = args.root
         self.known = args.known_waiting
         self.poll_secs = env_float("SMELT_WAIT_POLL_SECS", 60)

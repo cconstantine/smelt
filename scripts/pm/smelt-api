@@ -289,6 +289,10 @@ def parser():
 
 def main():
     args = parser().parse_args()
+    try:
+        smelt_api.address()
+    except smelt_api.AddressError as err:
+        die(str(err), 2)
     args.fn(args)
 
 
