@@ -211,7 +211,8 @@ impl<W: std::io::Write> ScrubbingWriter<W> {
 /// rewrites every string that leaves — each span event's name and string
 /// attribute values (an event's message rides its name, a dependency's
 /// error text its attributes), the span's own string attribute values,
-/// and a failed status's description — through [`scrub_urls`] before
+/// its links' string attribute values (SME-483), and a failed status's
+/// description — through [`scrub_urls`] before
 /// delegating. Span *names* stay: they're smelt's own; a dependency's
 /// text rides events. smelt's own lines were scrubbed or redacted at the
 /// source long before this — `scrub_urls` is idempotent, so they come out
@@ -262,6 +263,14 @@ fn scrub_span_data(mut span: opentelemetry_sdk::trace::SpanData) -> opentelemetr
         event.name = std::borrow::Cow::Owned(scrub_urls(&event.name));
         event.attributes = std::mem::take(&mut event.attributes).into_iter().map(scrub_key_value).collect();
     }
+    // SME-483: a link's attribute values can carry the same text an
+    // event's, so they scrub the same way. Nothing in smelt calls
+    // `follows_from`/`add_link` today — the tracing-opentelemetry bridge
+    // supports both, and its `add_link_with_attributes` path would carry
+    // caller attributes to the exporter, which is why this branch matters.
+    for link in span.links.links.iter_mut() {
+        link.attributes = std::mem::take(&mut link.attributes).into_iter().map(scrub_key_value).collect();
+    }
     span.status = match span.status {
         opentelemetry::trace::Status::Error { description } => {
             opentelemetry::trace::Status::error(scrub_urls(&description))
@@ -282,6 +291,102 @@ fn scrub_key_value(pair: opentelemetry::KeyValue) -> opentelemetry::KeyValue {
         value => value,
     };
     opentelemetry::KeyValue::new(pair.key, value)
+}
+
+/// The server process's panic hook (SME-483). Panics never enter the
+/// tracing pipeline, so neither SME-392 sink can scrub them: without this
+/// the default hook writes a panic message quoting a configured MCP URL
+/// (an `expect` on an rmcp call, say) to stderr with its key intact.
+///
+/// The hook keeps the default hook's stderr destination and, but for the
+/// departures below, its message shape — [`write_scrubbed_panic_report`]
+/// is that shape — and only scrubs the text. It is written not to panic:
+/// while a hook runs a panic cannot unwind (std's panic-count guard aborts
+/// with "panic in a panic hook" before unwinding, so not even
+/// `catch_unwind` here could catch one), so the hook runs no user code and
+/// takes no lock beyond stderr's own. One edge remains, and it fails
+/// closed: `std::thread::current()` panics once the thread's handle is
+/// destroyed (a panic in a TLS destructor at thread exit), and std then
+/// aborts printing only that inner message — the original report is lost,
+/// but nothing of it leaks.
+///
+/// Where it departs from the default hook (rust 1.96, the toolchain smelt
+/// builds with):
+/// - std's header is `thread '<name>' (<tid>) panicked at …`; this hook
+///   leaves out the `(<tid>)`, the OS thread id, which needs a platform
+///   call, so a scrubbed report just lacks it.
+/// - The backtrace it prints is always the full one when `RUST_BACKTRACE`
+///   asks for one; std's short/full distinction is std-internal and not
+///   reproducible on stable.
+/// - `Backtrace::capture` also honours `RUST_LIB_BACKTRACE`, which std's
+///   hook ignores (no deployment sets it).
+/// - It prints its note or backtrace where std prints none (a
+///   `force_no_backtrace` panic, such as one in a destructor during
+///   cleanup), and none on a double panic, where std forces a full
+///   backtrace (release aborts on the first panic, so never reaches one).
+pub(crate) fn install_scrubbed_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        // Panics after the thread's handle is destroyed: fails closed (see
+        // the doc above).
+        let name = std::thread::current();
+        let location = info
+            .location()
+            .map(|location| format!("{}:{}:{}", location.file(), location.line(), location.column()));
+        // The default hook's tail: the backtrace it captured, or — once
+        // per process, as std's own `FIRST_PANIC` — the note that points
+        // one out. `Backtrace::capture` never panics.
+        let backtrace = std::backtrace::Backtrace::capture();
+        let tail = match backtrace.status() {
+            std::backtrace::BacktraceStatus::Captured => backtrace.to_string(),
+            _ if FIRST_PANIC.swap(false, std::sync::atomic::Ordering::Relaxed) => {
+                "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n".to_string()
+            }
+            _ => String::new(),
+        };
+        let mut stderr = std::io::stderr().lock();
+        let _ = write_scrubbed_panic_report(
+            &mut stderr,
+            name.name().unwrap_or("<unnamed>"),
+            location.as_deref(),
+            info.payload(),
+            &tail,
+        );
+    }));
+}
+
+/// The first-panic marker behind the note line, mirroring the `FIRST_PANIC`
+/// in std's default hook.
+static FIRST_PANIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// `out` gets the default hook's report of a panic in `name` at `location`
+/// with `payload`, less the `(<tid>)` std's header carries (see
+/// [`install_scrubbed_panic_hook`]): a lead newline (the default hook's,
+/// so the report starts a line), `thread '<name>' panicked at
+/// <file>:<line>:<col>:`,
+/// the message, then `tail` — a captured backtrace's text, the note that
+/// points one out, or empty — and the whole of it passed through
+/// [`scrub_urls`], so a panic quoting a configured URL loses its key
+/// (SME-483). The payload is read the way the default hook's
+/// `payload_as_str` reads it — a string payload's text, anything else
+/// `Box<dyn Any>` — so no user code runs on this path: a panic inside the
+/// hook aborts the process.
+fn write_scrubbed_panic_report<W: std::io::Write>(
+    out: &mut W,
+    name: &str,
+    location: Option<&str>,
+    payload: &dyn std::any::Any,
+    tail: &str,
+) -> std::io::Result<()> {
+    let message = if let Some(text) = payload.downcast_ref::<&str>() {
+        *text
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.as_str()
+    } else {
+        "Box<dyn Any>"
+    };
+    let location = location.unwrap_or("unknown location");
+    let text = format!("\nthread '{name}' panicked at {location}:\n{message}\n{tail}");
+    out.write_all(scrub_urls(&text).as_bytes())
 }
 
 /// Runs `future` in `span` and ends the span's export when the future

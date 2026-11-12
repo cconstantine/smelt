@@ -94,6 +94,11 @@ fn build_router() -> axum::Router {
 #[cfg(feature = "server")]
 #[tokio::main]
 async fn main() {
+    // A panic never enters the tracing pipeline, so neither SME-392 sink
+    // sees its text: install the scrubbed panic hook (telemetry.rs) as
+    // the body's first statement (SME-483). The only code before it is
+    // `#[tokio::main]`'s runtime builder, which has seen no config.
+    telemetry::install_scrubbed_panic_hook();
     // Before `.env` is read: the capture's CLI gets none of smelt's
     // environment either way, and it never serves (SME-430).
     #[cfg(feature = "claude-cli-capture")]
