@@ -18,6 +18,7 @@ fn test_a_top_level_persona_is_in_the_prompt_and_absent_without_one() {
         persona_path: "/workspace/smelt/.agents/personas/ticket-driver.md".to_string(),
         persona_commit: Some("b7744764abcdef".to_string()),
         persona_body: "Drive one ticket.".to_string(),
+        ignored: Vec::new(),
     };
     let set = PromptEnvironment { top_level_persona: Some(persona), ..prompt_env() };
     let prompt = system_prompt(&set);

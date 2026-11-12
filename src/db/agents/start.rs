@@ -394,16 +394,24 @@ pub struct AgentPersona {
     pub persona_path: String,
     pub persona_commit: Option<String>,
     pub persona_body: String,
+    /// The `smelt` keys its file listed and this smelt skipped (SME-506).
+    pub ignored: Vec<String>,
 }
 
 /// The persona conversation `id` runs under, `None` without one: a
 /// child's snapshot, or a top-level conversation's (SME-481).
 pub async fn agent_persona(pool: &PgPool, id: i64) -> Result<Option<AgentPersona>, sqlx::Error> {
     sqlx::query_as::<_, AgentPersona>(
-        "SELECT persona_path, persona_commit, persona_body FROM agents
+        // `ignored` is absent from a snapshot written before SME-506,
+        // so anything but an array reads as none.
+        "SELECT persona_path, persona_commit, persona_body, ARRAY(SELECT jsonb_array_elements_text(
+                CASE WHEN jsonb_typeof(persona_settings->'ignored') = 'array' THEN persona_settings->'ignored' END)) AS ignored
+         FROM agents
          WHERE conversation_id = $1 AND persona_path IS NOT NULL AND persona_body IS NOT NULL
          UNION ALL
-         SELECT persona_path, persona_commit, persona_body FROM top_level_personas WHERE conversation_id = $1
+         SELECT persona_path, persona_commit, persona_body, ARRAY(SELECT jsonb_array_elements_text(
+                CASE WHEN jsonb_typeof(persona_settings->'ignored') = 'array' THEN persona_settings->'ignored' END))
+         FROM top_level_personas WHERE conversation_id = $1
          LIMIT 1",
     )
     .bind(id)
