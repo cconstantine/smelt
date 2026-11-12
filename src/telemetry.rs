@@ -293,8 +293,6 @@ fn scrub_key_value(pair: opentelemetry::KeyValue) -> opentelemetry::KeyValue {
     opentelemetry::KeyValue::new(pair.key, value)
 }
 
-// SME-483 implementation for src/telemetry.rs — replace the stubs block with this.
-
 /// The server process's panic hook (SME-483). Panics never enter the
 /// tracing pipeline, so neither SME-392 sink can scrub them: without this
 /// the default hook writes a panic message quoting a configured MCP URL
