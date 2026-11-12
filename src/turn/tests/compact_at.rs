@@ -235,7 +235,11 @@ async fn test_no_ceiling_means_no_ceiling_compaction(pool: PgPool) {
 async fn test_a_child_seats_ceiling_comes_from_its_own_snapshot(pool: PgPool) {
     let _guard = lock_turn_tests();
     let mut bodies = over_at_the_second_step();
-    // Whatever the parent's wake may ask for after the child's turn.
+    // The child's turn ends plainly with no report, so its after-turn work
+    // runs on (SME-455): its first such end nudges the child itself, whose
+    // wake turn takes the next body, and that turn's plain end tells the
+    // parent and wakes it, which takes the one after (round 1 L2).
+    bodies.push(text_reply_body("the nudge's reply"));
     bodies.push(text_reply_body("the parent's reply"));
     let (root, requests) = on_mock(&pool, bodies).await;
     set_persona_ceiling(&pool, root, 500_000).await;
@@ -256,11 +260,37 @@ async fn test_a_child_seats_ceiling_comes_from_its_own_snapshot(pool: PgPool) {
     .expect("its agent row");
 
     run_turn(&pool, child, hello()).await.expect("the child's turn ends Ok");
+    every_turn_is_over(&pool, &[child, root]).await;
 
     let recorded = requests.lock().expect("the request log").clone();
     assert_compacted_at_the_third_call(&recorded[..4.min(recorded.len())]);
     assert_eq!(dividers(&pool, child).await, vec![("SUMMARY-1".to_string(), Some(REASON.to_string()))]);
-    assert!(dividers(&pool, root).await.is_empty());
+    assert!(dividers(&pool, root).await.is_empty(), "the parent's 500,000 ceiling never fired");
+}
+
+/// Waits, up to 10 s, until the parent of `ids` (the last) has been told
+/// of the child's turn, every message queued between them is delivered,
+/// and none of their turns is running: the after-turn wakes are over, so
+/// the test leaves no turn on its pool (as `agents::tests::persona` does).
+async fn every_turn_is_over(pool: &PgPool, ids: &[i64]) {
+    let parent = *ids.last().expect("a parent");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (told, undelivered): (i64, i64) = sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE to_conversation_id = $2), count(*) FILTER (WHERE delivered_at IS NULL)
+             FROM agent_messages WHERE to_conversation_id = ANY($1)",
+        )
+        .bind(ids)
+        .bind(parent)
+        .fetch_one(pool)
+        .await
+        .expect("the agent messages");
+        if told > 0 && undelivered == 0 && ids.iter().all(|id| !crate::turn::turn_running(*id)) {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "every turn is over: not within 10 s (told {told}, undelivered {undelivered})");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// T7: the ceiling's compaction is `compact`, so every safeguard holds:
