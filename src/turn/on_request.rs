@@ -99,8 +99,12 @@ pub(super) async fn compact_at_ceiling(
             note_thrash(pool, conversation_id, persisted, pending_new_content).await?;
             Ok(true)
         }
+        // Not expected at this site, which the window's own compaction
+        // shares; off for the turn like a failure, so it's warned of once a
+        // turn rather than at every step (round 1 L4).
         Ok(Compacted::Skipped(why)) => {
             tracing::warn!(conversation_id, ?why, "the ceiling's compaction found nothing to compact");
+            with_compaction_progress(conversation_id, CompactionProgress::ceiling_failed);
             Ok(false)
         }
         Err(e) => {

@@ -369,3 +369,38 @@ async fn test_a_failed_ceiling_summary_lets_the_turn_go_on_and_retries_next_turn
     let saved: String = messages.iter().flat_map(|m| m.blocks().expect("blocks")).map(|b| format!("{b:?}")).collect();
     assert!(!saved.contains("smelt notice"), "no notice saved: {saved}");
 }
+
+/// T9 (round 1 L4): a ceiling compaction `compact` skips turns the ceiling
+/// off for the turn, as a failed one does, so it's tried (and warned of)
+/// once a turn, not at every later step. The turn loop never leaves an
+/// unsafe boundary at this site, so the skip is set up by hand: the
+/// history ends in a call with no result, and `compact_at_ceiling` is
+/// called directly.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_skipped_ceiling_compaction_turns_the_ceiling_off_for_the_turn(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let (id, requests) = on_mock(&pool, vec![text_reply_body("never sent")]).await;
+    db::create_message(&pool, id, "user", &[text_block("hello")]).await.expect("the ask");
+    let open = anthropic::ContentBlock::ToolUse { id: "toolu_open".to_string(), name: "todoread".to_string(), input: serde_json::json!({}) };
+    db::create_message(&pool, id, "assistant", &[open]).await.expect("a call with no result");
+    with_compaction_progress(id, |p| {
+        p.turn_started();
+        p.set_ceiling(Some(AT));
+        p.step_taken();
+        p.step_taken();
+    });
+    let mut turn_model = crate::providers::resolve_turn_model(&pool, id).await.expect("its model");
+    let slot = crate::turn::call::TurnSlot::acquire(&turn_model).await;
+    let (mut persisted, mut pending) = (Vec::new(), Vec::new());
+
+    let compacted = super::super::on_request::compact_at_ceiling(&pool, id, &mut turn_model, &slot, Some(AT * 2), &mut persisted, &mut pending)
+        .await
+        .expect("a skip is no error");
+
+    assert!(!compacted, "skipped: the last message holds a call with no result");
+    assert!(dividers(&pool, id).await.is_empty());
+    assert!(requests.lock().expect("the request log").is_empty(), "no summary call");
+    assert_eq!(with_compaction_progress(id, |p| p.ceiling_due(Some(AT * 2))), None, "off for the rest of the turn");
+    with_compaction_progress(id, |p| p.set_ceiling(Some(AT)));
+    assert_eq!(with_compaction_progress(id, |p| p.ceiling_due(Some(AT * 2))), Some(AT), "the next turn's start tries again");
+}
