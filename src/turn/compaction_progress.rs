@@ -58,8 +58,9 @@
 //! - a persona's ceiling (SME-493, `Ceiling`): the turn's start reads it
 //!   (`set_ceiling`), and a step at or over it, two steps clear of the last
 //!   compaction, compacts first (`ceiling_due`). A compaction whose reply
-//!   measures within `MIN_ROOM_TO_WORK` of it spends it (`measured`), so a
-//!   summary that can't get under it isn't paid for again; a later one
+//!   measures within `ceiling_margin` of it (an eighth of it, at least
+//!   `MIN_ROOM_TO_WORK`) spends it (`measured`), so a summary that can't
+//!   get well under it isn't paid for again and again; a later one
 //!   measured under it, or a window change, re-arms it. A failed one turns
 //!   it off for the turn (`ceiling_failed`);
 //! - a restart or a delete: all of it goes, and the next compaction learns it.
@@ -176,14 +177,22 @@ pub(super) struct CompactionProgress {
 }
 
 /// The persona's token ceiling (SME-493) and whether it's worth compacting
-/// at: `spent` once a compaction left the seat within `MIN_ROOM_TO_WORK`
-/// of it, until one leaves room again; `failed` for the rest of a turn
-/// whose ceiling compaction failed.
+/// at: `spent` once a compaction left the seat within `ceiling_margin` of
+/// it, until one leaves room again; `failed` for the rest of a turn whose
+/// ceiling compaction failed.
 #[derive(Clone, Debug, Default)]
 struct Ceiling {
     at: Option<u64>,
     spent: bool,
     failed: bool,
+}
+
+/// How much room under the ceiling `at` a compaction has to leave for the
+/// ceiling to stay worth compacting at (round 1 L1): an eighth of it, and
+/// never less than the window's own `MIN_ROOM_TO_WORK`. A floor closer
+/// than that would buy only a few steps per summary.
+fn ceiling_margin(at: u64) -> u64 {
+    MIN_ROOM_TO_WORK.max(at / 8)
 }
 
 /// A compaction the model asked for this turn (SME-482): `pending` holds
@@ -418,7 +427,7 @@ impl CompactionProgress {
         // A compaction that leaves too little room under the ceiling spends
         // it, and one that leaves room re-arms it (SME-493).
         if let Some(at) = self.ceiling.at {
-            self.ceiling.spent = input + MIN_ROOM_TO_WORK > at;
+            self.ceiling.spent = input + ceiling_margin(at) > at;
         }
         if self.guess.is_some() {
             return;

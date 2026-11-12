@@ -558,10 +558,42 @@ fn test_a_later_compaction_measured_under_the_ceiling_rearms_it() {
     progress.step_taken();
     assert_eq!(progress.ceiling_due(Some(AT)), None, "spent");
     progress.compacted(WINDOW);
-    progress.measured(&input(AT - MIN_ROOM_TO_WORK), WINDOW);
+    // Exactly the margin (an eighth of the ceiling, round 1 L1) under it.
+    progress.measured(&input(AT - AT / 8), WINDOW);
     progress.step_taken();
     progress.step_taken();
     assert_eq!(progress.ceiling_due(Some(AT)), Some(AT), "re-armed");
+}
+
+/// U7 (round 1 L1): the no-loop margin scales with the ceiling, an eighth
+/// of it, never under `MIN_ROOM_TO_WORK`. A floor just under the ceiling
+/// (112,000 against 120,000) spends it, where the window's flat 4,096
+/// would have kept it armed and paid for a summary every few steps.
+#[test]
+fn test_a_floor_within_an_eighth_of_the_ceiling_spends_it() {
+    for (at, floor) in [(120_000, 112_000), (AT, AT - 4_500)] {
+        let mut progress = CompactionProgress::default();
+        progress.sync(WINDOW * 2);
+        progress.set_ceiling(Some(at));
+        progress.step_taken();
+        progress.step_taken();
+        progress.compacted(WINDOW * 2);
+        progress.measured(&input(floor), WINDOW * 2);
+        for _ in 0..3 {
+            progress.step_taken();
+        }
+        assert_eq!(progress.ceiling_due(Some(at + 3_000)), None, "a floor of {floor} spends a ceiling of {at}");
+    }
+    // A small ceiling keeps the window's margin: an eighth of 16,000 is
+    // under 4,096.
+    let mut progress = CompactionProgress::default();
+    progress.sync(WINDOW);
+    progress.set_ceiling(Some(16_000));
+    progress.compacted(WINDOW);
+    progress.measured(&input(16_000 - MIN_ROOM_TO_WORK + 1), WINDOW);
+    progress.step_taken();
+    progress.step_taken();
+    assert_eq!(progress.ceiling_due(Some(20_000)), None, "within 4,096 of a small ceiling");
 }
 
 /// U4: a failed ceiling compaction turns it off until the next turn's start.
