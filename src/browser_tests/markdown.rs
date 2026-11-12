@@ -241,14 +241,8 @@ async fn deep_code_at(t: &Scenario<'_>, depth: usize, steps: &depth_steps::Depth
     let mut timings = DeepCodeTimings::default();
     let _ = deep_code_steps(t, depth, steps, &mut problems, &mut timings).await;
     steps.finish();
-    let ms = |d: Option<Duration>| d.map_or("-".to_string(), |d| d.as_millis().to_string());
-    eprintln!(
-        "browser tier: markdown_deep_code: depth {depth}: live in {} ms, rendered in {} ms, span depth {}; steps: {}",
-        ms(timings.live_after),
-        ms(timings.rendered_after),
-        timings.span_depth,
-        steps.report()
-    );
+    let line = depth_steps::timing_line(depth, timings.live_after, timings.rendered_after, &timings.span_depth, &steps.report());
+    eprintln!("{line}");
     problems
 }
 

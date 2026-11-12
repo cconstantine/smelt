@@ -257,6 +257,24 @@ fn describe(s: &Step, now: Duration) -> String {
     line
 }
 
+/// A depth's timing line, as far as it got: `-` for a value it never
+/// reached.
+pub(super) fn timing_line(
+    depth: usize,
+    live_after: Option<Duration>,
+    rendered_after: Option<Duration>,
+    span_depth: &serde_json::Value,
+    steps: &str,
+) -> String {
+    let ms = |d: Option<Duration>| d.map_or("-".to_string(), |d| d.as_millis().to_string());
+    let span = if span_depth.is_null() { "-".to_string() } else { span_depth.to_string() };
+    format!(
+        "browser tier: markdown_deep_code: depth {depth}: live in {} ms, rendered in {} ms, span depth {span}; steps: {steps}",
+        ms(live_after),
+        ms(rendered_after)
+    )
+}
+
 /// Runs one depth's `body` under the deadline `steps` was made with. A
 /// depth that hangs or panics ends alone, so the rest still run; its
 /// failures come back prefixed with the depth, and a hang or a panic names
@@ -460,6 +478,20 @@ mod tests {
         }
         assert_eq!(failures, vec!["depth 2000: 1: the client never went live".to_string()]);
         assert!(!steps.backstop_fired());
+    }
+
+    /// A depth that never reached `facts` prints `-` for its span depth,
+    /// as for its unreached times, not `null`. Round 1, finding 5.
+    #[test]
+    #[ignore]
+    fn test_the_timing_line_prints_a_dash_for_what_it_never_reached() {
+        let line = timing_line(2_000, Some(Duration::from_millis(1_200)), None, &serde_json::Value::Null, "seed 0.1 s");
+        assert_eq!(
+            line,
+            "browser tier: markdown_deep_code: depth 2000: live in 1200 ms, rendered in - ms, span depth -; steps: seed 0.1 s"
+        );
+        let line = timing_line(100, None, None, &serde_json::json!(64), "");
+        assert!(line.contains("span depth 64;"), "{line}");
     }
 
     /// The PM's condition (SME-329): no step gets more time than the old
