@@ -127,3 +127,42 @@ fn test_every_accepted_key_parses_and_the_refusal_lists_exactly_them() {
         assert!(parse_err(DEV, &file(&format!("  {reserved}: []\n"))).contains("unknown field"));
     }
 }
+
+// --- Review 1, L1: a repeated key is refused, never a later one replacing an earlier ---
+
+#[test]
+fn test_a_repeated_key_is_refused_under_smelt_and_at_the_top() {
+    for (smelt, key) in [
+        // A second `tools: ~` would otherwise drop the first one's deny.
+        ("  tools: {deny: [write_file]}\n  model: m\n  tools: ~\n", "tools"),
+        ("  ignore_if_unknown: [a]\n  ignore_if_unknown: [b]\n", "ignore_if_unknown"),
+    ] {
+        let error = parse_err(DEV, &file(smelt));
+        assert!(error.contains(&format!("duplicate field `{key}`")), "{smelt}: {error}");
+    }
+    // A repeated skipped key is refused too: pass 1 can't read the map, so
+    // its list is empty and the key is unlisted (the visitor's `seen`
+    // would refuse it as a duplicate otherwise).
+    let error = parse_err(DEV, &file("  zeta: 1\n  zeta: 2\n  ignore_if_unknown: [zeta]\n"));
+    assert!(error.contains("`zeta`"), "{error}");
+    // A second `smelt` would otherwise drop every restriction in the first.
+    let text = "---\nname: developer\ndescription: d\nsmelt:\n  tools: {deny: [write_file]}\nsmelt: ~\n---\nbody\n";
+    let error = parse_err(DEV, text);
+    assert!(error.contains("duplicate field `smelt`"), "{error}");
+}
+
+// --- Review 1, L2: the baseline is fixed ---
+
+/// The baseline is what every smelt that knows `ignore_if_unknown`
+/// already knows, so it never grows: a new key is never baseline, or the
+/// repo lint stops asking for it to be listed and an older smelt refuses
+/// the file (SME-493).
+#[test]
+fn test_the_baseline_is_the_six_keys_ignore_if_unknown_shipped_with() {
+    let baseline: Vec<&str> = settings::KEYS.iter().filter(|k| k.baseline).map(|k| k.name).collect();
+    assert_eq!(
+        baseline,
+        ["model", "tools", "credentials", "resources", "compact_at", "ignore_if_unknown"],
+        "a new smelt key is never in the baseline: give its row `baseline: false` (persona-files.md)"
+    );
+}
