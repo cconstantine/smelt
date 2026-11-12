@@ -124,9 +124,13 @@ pub(super) async fn page_state(page: &chromiumoxide::Page) -> String {
          armed: [...document.querySelectorAll('.confirm')].map(b => { const r = b.closest('[data-conversation-id]'); return r ? r.dataset.conversationId : b.className; }), \
          sidebar_error: (document.querySelector('.sidebar-body > .error') || {}).innerText ?? null, \
          log: window.__smeltLog || 'nothing recorded: no click_when_present on this page' })";
-    match page.evaluate(read).await {
-        Ok(value) => value.into_value().unwrap_or_else(|e| format!("unreadable: {e}")),
-        Err(e) => format!("couldn't read it: {e}"),
+    // Bounded: a hung renderer may be why the click or wait failed, and an
+    // unbounded read would hold its failure up to chromiumoxide's 30 s, past
+    // a scenario's limit, losing the message (review 1, L1).
+    match tokio::time::timeout(Duration::from_secs(2), page.evaluate(read)).await {
+        Ok(Ok(value)) => value.into_value().unwrap_or_else(|e| format!("unreadable: {e}")),
+        Ok(Err(e)) => format!("couldn't read it: {e}"),
+        Err(_) => "page state unavailable: the page didn't answer within 2 s".to_string(),
     }
 }
 
@@ -251,5 +255,18 @@ pub(super) async fn scenario_click_not_repeated(t: &Scenario<'_>) {
     assert!(
         wait_for_count(&page, &format!(".conversation-item[data-conversation-id='{}']", target.id), 0, Duration::from_secs(10)).await,
         "the confirm should delete the conversation"
+    );
+    // A page too busy to answer doesn't hold up the failure it would
+    // annotate (review 1, L1): its state is given up on after 2 s.
+    page.evaluate("setTimeout(() => { const end = Date.now() + 4000; while (Date.now() < end) {} }, 0)")
+        .await
+        .expect("keep the page busy");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let asked = tokio::time::Instant::now();
+    let held = page_state(&page).await;
+    let took = asked.elapsed();
+    assert!(
+        took < Duration::from_millis(3000) && held.starts_with("page state unavailable"),
+        "a busy page's state should be given up on after 2 s: {held:?} after {took:?}"
     );
 }
