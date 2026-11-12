@@ -42,11 +42,14 @@ pub enum ContentBlock {
         summary: String,
         covers_through_message_id: i64,
         /// Why this compaction happened instead of the usual proactive
-        /// one, when a request was refused as an overflow (SME-73): the
-        /// reason the transcript divider reads after "Conversation
-        /// compacted: " — "the model's server refused a request that
-        /// didn't fit its 32,768-token window", or with no window named,
-        /// "the model's server refused a request that didn't fit".
+        /// one — despite its name, the reason for any such compaction:
+        /// the reason the transcript divider reads after "Conversation
+        /// compacted: ". A request refused as an overflow (SME-73): "the
+        /// model's server refused a request that didn't fit its
+        /// 32,768-token window", or with no window named, "the model's
+        /// server refused a request that didn't fit". One asked for
+        /// (SME-482): "on request" (the endpoint, from the chat or a
+        /// script) or "the model asked for it" (`compact_context`).
         /// `None` on every proactive compaction and every row saved
         /// before SME-73 — `default` keeps those reading unchanged.
         /// Storage and frontend only: `history_for_request` replays the

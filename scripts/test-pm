@@ -1,0 +1,5 @@
+#!/bin/bash
+# scripts/pm/smelt-api's and scripts/pm/smelt-wait's own tests (SME-460):
+# a fake smelt and a fake smelt-mcp on 127.0.0.1, no cluster, no database.
+# Arguments go to unittest: scripts/test-pm -k Answer -v
+exec python3 -I -B "$(dirname "$0")/pm/tests/run.py" "$@"

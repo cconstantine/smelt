@@ -177,6 +177,7 @@ fn scenarios() -> Vec<Entry> {
         entry("terminals", 120, Runs::Beside, |t| Box::pin(scenario_terminals(t))),
         entry("context_usage", 60, Runs::Beside, |t| Box::pin(scenario_context_usage(t))),
         entry("compaction_divider", 60, Runs::Beside, |t| Box::pin(scenario_compaction_divider(t))),
+        entry("compact_now", 150, Runs::Beside, |t| Box::pin(scenario_compact_now(t))),
         entry("overflow_compacts", 60, Runs::Beside, |t| Box::pin(scenario_overflow_compacts(t))),
         entry("todo_panel", 60, Runs::Beside, |t| Box::pin(scenario_todo_panel(t))),
         entry("reply_stays_in_its_conversation", 60, Runs::Beside, |t| Box::pin(scenario_reply_stays_in_its_conversation(t))),
@@ -460,6 +461,7 @@ mod notifier_leader;
 mod live_commands;
 mod report_owed;
 mod archive;
+mod compact_now;
 
 use harness::*;
 use mock::*;
@@ -484,3 +486,4 @@ use notifier_leader::*;
 use live_commands::*;
 use report_owed::*;
 use archive::*;
+use compact_now::*;

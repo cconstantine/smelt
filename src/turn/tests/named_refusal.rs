@@ -123,12 +123,25 @@ async fn counting_mock(pool: &PgPool, window: Option<u32>, plans: Vec<(i64, i64)
     mock
 }
 
-/// The window at which, with this conversation's fixed content, a compacted
-/// request leaves `room` tokens for a reply.
-async fn window_leaving(pool: &PgPool, id: i64, room: u64) -> u32 {
+/// The estimate of this conversation's fixed content, the system prompt
+/// and tools, as `window_leaving` counts it.
+async fn alone(pool: &PgPool, id: i64) -> u64 {
     let model = crate::providers::resolve_turn_model(pool, id).await.expect("a model");
     let (request, _) = build_request(pool, id, &model, None, &[], false, 0).await.expect("a request");
-    u32::try_from(estimate_request_tokens(&request) + u64::from(COMPACTION_SAFETY_BUFFER) + room).expect("a window")
+    estimate_request_tokens(&request)
+}
+
+/// What the fixed content estimated at when the plans below were written
+/// (SME-482 measured it, before `compact_context` joined the tools).
+const ALONE_WHEN_PLANNED: i64 = 10_778;
+
+/// `plans` (server counts written against `ALONE_WHEN_PLANNED`) moved by
+/// how far the system prompt and tools have grown since, so a window from
+/// `window_leaving` keeps the same room against them as when written: a
+/// new tool shifts the window and every count alike (SME-482).
+async fn plans_for_today(pool: &PgPool, id: i64, plans: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    let grown = i64::try_from(alone(pool, id).await).expect("an estimate") - ALONE_WHEN_PLANNED;
+    plans.into_iter().map(|(input, output)| if (input, output) == FAILS { FAILS } else { (input + grown, output) }).collect()
 }
 
 async fn send(pool: &PgPool, id: i64, text: &str) {
@@ -151,7 +164,9 @@ async fn test_a_size_measured_before_the_tools_grew_isnt_believed_after_a_refusa
     // prompt and tools and the estimate's buffer. Replies measure 3,000 after
     // two compactions, which learns it's tight; the 10,000 has the next step
     // compact; and by then the tools have grown, and the server counts 10,900.
-    let mock = counting_mock(&pool, None, vec![(3_000, 10), (3_000, 10), (3_000, 10), (7_000, 3_000), (10_900, 10)]).await;
+    let mock = counting_mock(&pool, None, vec![]).await;
+    let plans = vec![(3_000, 10), (3_000, 10), (3_000, 10), (7_000, 3_000), (10_900, 10)];
+    *mock.plans.lock().expect("the plans") = plans_for_today(&pool, conversation.id, plans).await;
     let window = window_leaving(&pool, conversation.id, 1_030).await;
     *mock.window.lock().expect("the window") = Some(window);
     set_context_window(&pool, window as i32, None).await;
@@ -277,7 +292,9 @@ async fn test_a_window_the_floors_compaction_learns_is_read_again(pool: PgPool) 
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     // Learns it's tight, then a step compacts and its call fails, leaving no
     // usage row: the next request is under the floor, and compacts there.
-    let mock = counting_mock(&pool, None, vec![(3_000, 10), (3_000, 10), (3_000, 10), (7_000, 2_000), FAILS, (3_000, 10)]).await;
+    let mock = counting_mock(&pool, None, vec![]).await;
+    let plans = vec![(3_000, 10), (3_000, 10), (3_000, 10), (7_000, 2_000), FAILS, (3_000, 10)];
+    *mock.plans.lock().expect("the plans") = plans_for_today(&pool, conversation.id, plans).await;
     let window = window_leaving(&pool, conversation.id, 100).await;
     set_context_window(&pool, window as i32, None).await;
     run_turn(&pool, conversation.id, hello()).await.expect_err("the call fails");

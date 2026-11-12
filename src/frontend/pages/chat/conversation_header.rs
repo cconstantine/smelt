@@ -39,6 +39,7 @@ pub(super) fn header_info(nodes: &[ConversationNode], id: i64) -> Option<HeaderI
 pub(super) fn ConversationHeader(
     selected: Memo<Option<i64>>,
     nodes: Signal<Vec<ConversationNode>>,
+    state: Store<ConversationState>,
 ) -> Element {
     // Without the tree (not fetched yet, or a row it doesn't have yet) the
     // header is the toggle alone: thinking can be shown from the start
@@ -65,6 +66,7 @@ pub(super) fn ConversationHeader(
                     },
                     if super::transcript::SHOW_THINKING() { "Hide thinking" } else { "Show thinking" }
                 }
+                super::compact_control::CompactControl { selected, state }
                 if let (Some(archived), Some(id)) = (archive, selected()) {
                     ArchiveButton { id, archived, nodes, error: archive_error }
                 }
@@ -151,7 +153,8 @@ mod tests {
         fn app() -> Element {
             let selected = use_memo(|| Some(7));
             let nodes = use_signal(Vec::new);
-            rsx! { ConversationHeader { selected, nodes } }
+            let state = use_store(ConversationState::default);
+            rsx! { ConversationHeader { selected, nodes, state } }
         }
         let mut dom = VirtualDom::new(app);
         dom.rebuild_in_place();

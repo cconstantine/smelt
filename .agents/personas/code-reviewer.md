@@ -2,6 +2,9 @@
 name: code-reviewer
 description: Reviews one PR's diff for bugs and security gaps, changes nothing, and reports to its Developer.
 smelt:
+  resources:
+    sandbox: { memory_request: 256Mi, memory_limit: 8Gi }
+    docker: { memory_request: 12Gi, memory_limit: 48Gi }
   tools:
     class: read-only
     allow:

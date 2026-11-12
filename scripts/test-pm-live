@@ -1,0 +1,23 @@
+#!/bin/bash
+# scripts/pm/smelt-api and smelt-wait against a real smelt (SME-460): a check
+# server of this checkout's HEAD on a scratch database, with
+# scripts/pm/mock_upstream.py as the model (scripts/pm/tests/live.py has the
+# steps). It needs the full stack, so it isn't in check.sh; run it at push
+# points, after check.sh:
+#
+#   docker compose run --rm smelt scripts/test-pm-live
+#
+# Never against production: the address is the check server's
+# (SMELT_API_URL=http://localhost:$CHECK_PORT), and the scratch database is
+# dropped on stop. The start/check/stop shape is rules.md's.
+set -u
+cd "$(dirname "$0")/.."
+export CHECK_WORKTREE="${CHECK_WORKTREE:-$PWD/target/check-pm-live}"
+export CHECK_PORT="${CHECK_PORT:-8081}"
+export SMELT_API_URL="http://localhost:$CHECK_PORT"
+unset SMELT_API_HOST
+CHECK_SCRATCH_DB=1 scripts/check-server start && python3 -I -B scripts/pm/tests/live.py; rc=$?
+# A failed stop keeps the scratch database so it can be retried (SME-129).
+timeout 15m bash -c 'until scripts/check-server stop; do echo "check-server stop failed; retrying" >&2; sleep 10; done' ||
+    echo 'check-server stop still failing: the scratch database is kept; report it' >&2
+exit $rc

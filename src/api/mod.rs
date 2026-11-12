@@ -2,6 +2,7 @@ pub mod agents;
 pub mod archive;
 pub mod browsing;
 pub mod chat;
+pub mod compaction;
 pub mod git;
 pub mod language_servers;
 pub mod mcp;

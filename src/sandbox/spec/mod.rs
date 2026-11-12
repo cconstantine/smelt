@@ -16,6 +16,7 @@ mod mounts;
 mod ownership;
 mod pods;
 mod pvcs;
+mod resources;
 mod status;
 
 // What the submodules' own `use super::*` reaches: this module's re-exports
@@ -28,6 +29,10 @@ pub use limits::PodLimitOverrides;
 pub use mounts::WORKSPACE_DIR;
 pub use ownership::{counts_as_ours, ownership, Ownership};
 pub use pods::{pod_name, DockerSidecar, PodStorage};
+pub use resources::{memory_bytes, ContainerResources, PodRequests, PodResources, Requests};
+#[cfg(test)]
+pub(in crate::sandbox) use resources::cpu_millis;
+pub(in crate::sandbox) use resources::container_resources;
 
 pub(crate) use images::default_sandbox_image;
 #[cfg(test)]
@@ -53,10 +58,14 @@ pub(in crate::sandbox) use limits::{default_docker_memory_limit, default_memory_
 pub(in crate::sandbox) use mounts::{agent_volume_mounts_for, agent_volume_pvc_name, docker_data_volume, empty_dir_volume, mount, resolve_mount_path, sandbox_volume_pvc_name, validate_mount_path, volume_mounts_for, workspace_volume, DOCKER_DATA_VOLUME, DOCKER_GID, DOCKER_HOST, DOCKER_SOCK_DIR, DOCKER_SOCK_VOLUME, SANDBOX_OWNER, WORKSPACE_VOLUME};
 pub(in crate::sandbox) use ownership::{instance_labels, AGENT_VOLUME_LABEL};
 pub(crate) use ownership::CONVERSATION_LABEL;
-pub(in crate::sandbox) use pods::{build_pod_spec, sandbox_delete_params};
+pub(in crate::sandbox) use pods::{build_sized_pod_spec, sandbox_delete_params};
+#[cfg(test)]
+pub(in crate::sandbox) use pods::build_pod_spec;
 #[cfg(test)]
 pub(in crate::sandbox) use pods::{immediate_delete_params, START_DOCKERD_SCRIPT};
 pub(in crate::sandbox) use pvcs::{build_agent_volume_pvc_spec, build_volume_pvc_spec, conversation_pvc_specs};
 #[cfg(test)]
 pub(in crate::sandbox) use pvcs::{build_conversation_pvc_spec, default_docker_storage_size, default_volume_storage_size};
-pub(in crate::sandbox) use status::{pod_pending_detail, pod_startup_failure};
+#[cfg(test)]
+pub(in crate::sandbox) use status::unschedulable_notice;
+pub(in crate::sandbox) use status::{pending_panel_update, pod_pending_detail, pod_startup_failure, unschedulable_reason};

@@ -6,7 +6,7 @@ Every persona still follows the rest of the [development process](../development
 
 | Persona | Works on | Moves the ticket | File |
 | -- | -- | -- | -- |
-| Project Manager | the one project the user directs it to | Backlog to Up Next, within that project | [project-manager.md](project-manager.md) |
+| Project Manager | the one project the user directs it to; when it runs as a smelt conversation, see [the PM in smelt](pm-in-smelt.md) | Backlog to Up Next, within that project | [project-manager.md](project-manager.md) |
 | Architect | one project: its description and its breakdown into tickets | creates tickets in Backlog | [architect.md](architect.md) |
 | Planner | one Up Next ticket | to Planned, or Todo with no questions | [planner.md](planner.md) |
 | Ticket Driver | one Todo ticket, to merged | keeps it true to its trail; its seats make the moves, the driver only a move its seat died before making | [ticket-driver.md](ticket-driver.md) |

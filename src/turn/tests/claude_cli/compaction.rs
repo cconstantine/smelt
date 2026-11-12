@@ -5,7 +5,7 @@
 use super::*;
 
 /// How many compaction dividers `conversation_id` has.
-async fn dividers(pool: &PgPool, conversation_id: i64) -> usize {
+pub(super) async fn dividers(pool: &PgPool, conversation_id: i64) -> usize {
     saved(pool, conversation_id).await.iter().flat_map(|(_, blocks)| blocks).filter(|b| matches!(b, anthropic::ContentBlock::CompactionSummary { .. })).count()
 }
 
@@ -28,7 +28,7 @@ async fn call_kinds(pool: &PgPool, conversation_id: i64) -> Vec<String> {
 /// What the summary's one-shot process `n` was, as the plan has it: no
 /// session, no tools, no bridge, one turn, smelt's compaction prompt, and
 /// the live ids in its one message.
-fn assert_summary_call(fake: &FakeCli, n: usize, live: &str) {
+pub(super) fn assert_summary_call(fake: &FakeCli, n: usize, live: &str) {
     let args = fake.args(n);
     for flag in ["--no-session-persistence", "--strict-mcp-config", "--max-turns"] {
         assert!(args.iter().any(|a| a == flag), "{flag} in {args:?}");
@@ -48,7 +48,7 @@ fn assert_summary_call(fake: &FakeCli, n: usize, live: &str) {
 
 /// A pod and a terminal of `conversation_id`, as the summary must keep
 /// them: the line `describe_live_state` writes for the terminal.
-async fn live_ids(pool: &PgPool, conversation_id: i64) -> String {
+pub(super) async fn live_ids(pool: &PgPool, conversation_id: i64) -> String {
     let pod = db::create_sandbox_pod(pool, conversation_id).await.expect("a pod");
     let terminal = db::create_sandbox_terminal(pool, pod.id).await.expect("a terminal");
     format!("terminal_id {} in pod_id {}", terminal.id, pod.id)

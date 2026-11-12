@@ -27,6 +27,20 @@ pub(super) struct FakeCheckout {
     /// Other files in the child's checkout, by path relative to it; a
     /// `<dir>/<path>` key is that checkout's alone, and wins.
     pub files: Mutex<std::collections::HashMap<String, String>>,
+    /// Files in the parent's checkout, over `files` (SME-484).
+    pub parent_files: Mutex<std::collections::HashMap<String, String>>,
+    /// Each child whose pod `restart_pod` restarted, in order.
+    pub restarts: Mutex<Vec<i64>>,
+    /// Each child `reprovision` dropped and cloned again, in order.
+    pub reprovisions: Mutex<Vec<i64>>,
+    /// The child's `pod_resources` as each clone began (SME-484): what its
+    /// pod would ask for.
+    pub clone_resources: Mutex<Vec<Option<serde_json::Value>>>,
+    /// Files that replace `files`' entries once `reprovision` runs: the
+    /// ref moved between the two clones.
+    pub files_after_reprovision: Option<std::collections::HashMap<String, String>>,
+    /// What `reprovision` fails with, when set.
+    pub reprovision_error: Option<String>,
 }
 
 impl ChildCheckout for FakeCheckout {
@@ -51,11 +65,13 @@ impl ChildCheckout for FakeCheckout {
     fn clone_repo<'a>(
         &'a self,
         pool: &'a PgPool,
-        _child: i64,
+        child: i64,
         repo: &'a db::ConversationRepo,
         target: &'a CloneTarget,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
+            let resources = db::conversation_pod_resources(pool, child).await.expect("read the pod resources");
+            self.clone_resources.lock().expect("clone resources").push(resources);
             self.targets.lock().expect("targets").push(target.clone());
             if let Some(hold) = &self.hold_clone {
                 hold.notified().await;
@@ -73,6 +89,63 @@ impl ChildCheckout for FakeCheckout {
                 .await
                 .expect("make the repo ready");
             Ok(())
+        })
+    }
+
+    fn parent_file<'a>(
+        &'a self,
+        pool: &'a PgPool,
+        parent: i64,
+        dir: &'a str,
+        rel: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<db::InstructionsFile>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let own = self.parent_files.lock().expect("parent files").get(rel).cloned();
+            match own {
+                Some(content) => Ok(Some(db::InstructionsFile {
+                    file_bytes: content.len() as i64,
+                    content,
+                    hash: "h".to_string(),
+                    commit: None,
+                })),
+                None => self.read_file(pool, parent, dir, rel).await,
+            }
+        })
+    }
+
+    fn restart_pod<'a>(
+        &'a self,
+        _pool: &'a PgPool,
+        child: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.restarts.lock().expect("restarts").push(child);
+            Ok(())
+        })
+    }
+
+    fn reprovision<'a>(
+        &'a self,
+        pool: &'a PgPool,
+        child: i64,
+        repo: &'a db::ConversationRepo,
+        target: &'a CloneTarget,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.reprovisions.lock().expect("reprovisions").push(child);
+            if let Some(error) = &self.reprovision_error {
+                return Err(error.clone());
+            }
+            if let Some(after) = &self.files_after_reprovision {
+                self.files.lock().expect("files").extend(after.clone());
+            }
+            // As the real one: the drop fails the row, the retry re-records it.
+            db::fail_repos_after_storage_removal(pool, child, "dropped").await.expect("fail the repo");
+            let retried = db::retry_repo_clone(pool, repo.id, &repo.url, &repo.remote_key, repo.branch.as_deref())
+                .await
+                .expect("retry the clone")
+                .expect("the repo was failed");
+            self.clone_repo(pool, child, &retried, target).await
         })
     }
 

@@ -494,6 +494,7 @@ mod turn_slot;
 mod overflow;
 mod window_stop;
 mod window_learning;
+mod window_raised;
 mod compaction_progress;
 mod compaction_thrash;
 mod compaction_honesty;
@@ -504,6 +505,8 @@ mod unread_results;
 mod named_refusal;
 mod escape;
 mod claude_cli;
+mod on_request;
+mod compact_now;
 
 /// The reason in conversation `id`'s last failure notice (SME-123 DR3),
 /// where a user's failed turn now says why.
@@ -516,4 +519,12 @@ pub(super) async fn last_failure_reason(pool: &PgPool, id: i64) -> Option<String
             _ => None,
         })
     })
+}
+
+/// The window at which, with this conversation's fixed content, a compacted
+/// request leaves `room` tokens for a reply.
+pub(super) async fn window_leaving(pool: &PgPool, id: i64, room: u64) -> u32 {
+    let model = crate::providers::resolve_turn_model(pool, id).await.expect("a model");
+    let (request, _) = build_request(pool, id, &model, None, &[], false, 0).await.expect("a request");
+    u32::try_from(estimate_request_tokens(&request) + u64::from(COMPACTION_SAFETY_BUFFER) + room).expect("a window")
 }

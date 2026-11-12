@@ -2,6 +2,9 @@
 name: ticket-driver
 description: Drives one Todo ticket to merged, spawning the seats that do the work and keeping their Linear trail, and merging nothing itself.
 smelt:
+  resources:
+    sandbox: { memory_request: 256Mi, memory_limit: 8Gi }
+    docker: { memory_request: 1Gi, memory_limit: 48Gi }
   tools:
     deny:
       - create_volume

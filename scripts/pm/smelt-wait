@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""The Project Manager's watcher on one Ticket Driver's tree (SME-460).
+
+  [SME=N] [SMELT_KEY=regex] smelt-wait ROOT [STALL_MIN=45] [CAP_MIN=240]
+      [--known-waiting ID,...] [--known-owed ID,...] [--since ISO] [--no-github]
+
+Run as a terminal command: it prints exactly one wake line and exits 0, and
+its exit wakes the PM. It polls ROOT's tree (ROOT and its descendants)
+through smelt_api every SMELT_WAIT_POLL_SECS (default 60) and wakes on the
+first of the kinds below. A wake line is `KIND TIME rest`: TIME is a UTC
+ISO time to pass as the next run's --since (the last GitHub check, less a
+second, or a MERGED PR's merged_at; the wake's own time without GitHub).
+
+  ALREADY_WAITING ids     at start, a node waits for the user and isn't in --known-waiting
+  WAITING_FOR_USER ids    a node starts waiting for the user (not in --known-waiting)
+  TOOL notify_user|ask_user ...   a new ROOT message holds that tool call
+  KEY line                SMELT_KEY (a multiline regex; unset: ^Driver gate: , empty:
+                          off) matches a line of a new assistant text block of ROOT's
+  REPORT_OWED id since    a node's report_owed_at is older than SMELT_OWED_GRACE_MIN
+                          (default 10) minutes, at start too, unless it's the stamp
+                          a --known-owed id had at start
+  MERGED pr#N ...         with SME=N: a PR whose branch matches (^|/)sme-N- or whose
+                          title matches ^SME-N\\b, merged after --since (default: start)
+  MAIN_RED run#id ...     a main run of CI or Publish images goes red after the baseline
+  STALL min busy:[ids]    no node's updated_at moved for STALL_MIN minutes
+  UNREACHABLE n           SMELT_WAIT_MAX_FAILURES (default 10) polls failed in a row
+  UNREACHABLE github n    as many smelt-mcp calls failed in a row, counted apart
+  CAP                     CAP_MIN minutes passed
+
+GitHub is read through smelt-mcp (SMELT_MCP_BIN, default `smelt-mcp`) every
+SMELT_WAIT_GH_EVERY polls (default 2); without it the watcher exits 2,
+unless --no-github says GitHub wakes are off. Minutes may be fractional.
+Exit status: 0 with a wake line; 2 for usage, a ROOT not in the tree, or
+no smelt-mcp. See docs/personas/pm-in-smelt.md.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import smelt_api  # noqa: E402
+
+RED = ("failure", "timed_out", "startup_failure")
+WATCHED_WORKFLOWS = ("CI", "Publish images")
+WAKE_TOOLS = ("notify_user", "ask_user")
+# The gate lines a top-level Driver writes (docs/personas/pm-in-smelt.md).
+DEFAULT_KEY = r"^Driver gate: "
+LINE_CUT = 300
+
+
+class PollFailed(Exception):
+    pass
+
+
+def die(message, code=2):
+    print(f"smelt-wait: {message}", file=sys.stderr)
+    sys.exit(code)
+
+
+def iso(t):
+    return t.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        die(f"{name} must be a number")
+
+
+def minutes(value):
+    try:
+        out = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number of minutes: {value!r}")
+    if out < 0:
+        raise argparse.ArgumentTypeError("minutes can't be negative")
+    return out
+
+
+def parse_time(text):
+    """An ISO time, naive ones read as UTC, as an aware datetime."""
+    t = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    return t if t.tzinfo else t.replace(tzinfo=datetime.timezone.utc)
+
+
+def since_arg(value):
+    try:
+        return parse_time(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an ISO time: {value!r}")
+
+
+def root_arg(value):
+    try:
+        return smelt_api.conv_id(value)
+    except ValueError as err:
+        raise argparse.ArgumentTypeError(str(err))
+
+
+def ids_arg(value):
+    try:
+        return {smelt_api.conv_id(v) for v in value.split(",") if v}
+    except ValueError as err:
+        raise argparse.ArgumentTypeError(str(err))
+
+
+def cut(text):
+    text = " ".join(str(text).split())
+    return text if len(text) <= LINE_CUT else text[:LINE_CUT] + "\u2026"
+
+
+def get(route, conv=None):
+    try:
+        status, out = smelt_api.call(route, conv)
+    except smelt_api.NetworkError as err:
+        raise PollFailed(str(err))
+    if not smelt_api.ok(status):
+        raise PollFailed(f"{route}: HTTP {status}")
+    return out
+
+
+class GitHub:
+    def __init__(self, binary, repo):
+        self.binary = binary
+        self.owner, _, self.repo = repo.partition("/")
+
+    def call(self, tool, args):
+        try:
+            done = subprocess.run([self.binary, "call", tool, json.dumps(args)], capture_output=True,
+                                  text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as err:
+            raise PollFailed(f"{tool}: {err}")
+        if done.returncode != 0:
+            raise PollFailed(f"{tool}: exit {done.returncode}: {cut(done.stderr)}")
+        try:
+            result = json.loads(done.stdout)
+            return json.loads(result["content"][0]["text"])
+        except (ValueError, KeyError, IndexError, TypeError) as err:
+            raise PollFailed(f"{tool}: unreadable result: {err}")
+
+    def merged_prs(self):
+        out = self.call("Github/list_pull_requests", {
+            "owner": self.owner, "repo": self.repo, "state": "closed", "sort": "updated",
+            "direction": "desc", "perPage": 30, "fields": ["number", "title", "merged", "merged_at", "head"]})
+        return out if isinstance(out, list) else out.get("pull_requests", [])
+
+    def main_runs(self):
+        out = self.call("Github/actions_list", {
+            "method": "list_workflow_runs", "owner": self.owner, "repo": self.repo, "perPage": 10,
+            "workflow_runs_filter": {"branch": "main"}})
+        return out.get("workflow_runs", []) if isinstance(out, dict) else out
+
+
+def red_runs(runs):
+    return {r["id"]: r for r in runs if r.get("name") in WATCHED_WORKFLOWS and r.get("conclusion") in RED}
+
+
+def ticket_pr(pr, sme):
+    ref = (pr.get("head") or {}).get("ref") or ""
+    title = pr.get("title") or ""
+    return bool(re.search(rf"(^|/)sme-{sme}-", ref, re.IGNORECASE) or re.match(rf"SME-{sme}\b", title))
+
+
+class Watch:
+    def __init__(self, args):
+        self.args = args
+        try:
+            smelt_api.address()
+        except smelt_api.AddressError as err:
+            die(str(err))
+        self.root = args.root
+        self.known = args.known_waiting
+        self.poll_secs = env_float("SMELT_WAIT_POLL_SECS", 60)
+        self.grace = datetime.timedelta(minutes=env_float("SMELT_OWED_GRACE_MIN", 10))
+        self.max_failures = int(env_float("SMELT_WAIT_MAX_FAILURES", 10))
+        self.gh_every = max(1, int(env_float("SMELT_WAIT_GH_EVERY", 2)))
+        self.sme = os.environ.get("SME", "")
+        if self.sme and not self.sme.isdigit():
+            die(f"SME must be a ticket number, got {self.sme!r}")
+        # Unset: DEFAULT_KEY (M4). Set but empty: no KEY wake. `^` is a
+        # line's start, so a gate line wakes anywhere in a text block.
+        key = os.environ.get("SMELT_KEY", DEFAULT_KEY)
+        try:
+            self.key = re.compile(key, re.MULTILINE) if key else None
+        except re.error as err:
+            die(f"SMELT_KEY isn't a regex: {err}")
+        self.github = None
+        if not args.no_github:
+            binary = shutil.which(os.environ.get("SMELT_MCP_BIN") or "smelt-mcp")
+            if not binary:
+                die("no smelt-mcp: GitHub wakes would be silently off (pass --no-github to run without them)")
+            self.github = GitHub(binary, os.environ.get("SMELT_WAIT_REPO", "cconstantine/smelt"))
+        self.started = time.monotonic()
+        self.since = args.since or datetime.datetime.now(datetime.timezone.utc)
+        # The wake line's time: a --since for the next run that skips no
+        # merge this run hasn't seen (N1). It moves only when GitHub answers.
+        self.checkpoint = self.since
+        self.failures = 0
+        self.gh_failures = 0
+        self.polls = 0
+
+    def wake(self, kind, rest=""):
+        """Print `KIND TIME [rest]` and exit 0. TIME is now without GitHub
+        wakes, else the checkpoint (or a MERGED wake's merged_at, set by
+        check_github)."""
+        at = self.checkpoint if self.github else datetime.datetime.now(datetime.timezone.utc)
+        line = f"{kind} {iso(at)}" + (f" {rest}" if rest else "")
+        print(line[:LINE_CUT * 2], flush=True)
+        sys.exit(0)
+
+    def nodes(self):
+        rows = smelt_api.subtree(get("tree"), self.root)
+        if not rows:
+            die(f"conversation {self.root} isn't in the tree")
+        return [n for _, n in rows]
+
+    def take_baseline(self):
+        while True:
+            try:
+                nodes = self.nodes()
+                messages = get("messages", self.root)
+                break
+            except PollFailed as err:
+                self.failed(err)
+                time.sleep(self.poll_secs)
+        self.failures = 0
+        reds = set()
+        while self.github:
+            try:
+                reds = set(red_runs(self.github.main_runs()))
+                break
+            except PollFailed as err:
+                self.gh_failed(err)
+                time.sleep(self.poll_secs)
+        self.gh_failures = 0
+        waiting = self.new_waiting(nodes)
+        if waiting:
+            self.wake("ALREADY_WAITING", ",".join(map(str, waiting)))
+        # Only a --known-owed id's stamp is taken as seen (M3): any other
+        # stamp past the grace wakes now, and one inside it once it passes.
+        self.owed = {n["id"]: n.get("report_owed_at") for n in nodes if n["id"] in self.args.known_owed}
+        self.check_owed(nodes)
+        self.seen_messages = len(messages)
+        self.reds = reds
+        self.moved = self.updated(nodes)
+        self.last_move = time.monotonic()
+        print(f"smelt-wait: baseline taken: {len(nodes)} nodes, {len(messages)} messages, "
+              f"{len(reds)} red runs; github {'on' if self.github else 'off'}", file=sys.stderr, flush=True)
+
+    def failed(self, err):
+        self.failures += 1
+        print(f"smelt-wait: poll failed ({self.failures}): {err}", file=sys.stderr, flush=True)
+        if self.failures >= self.max_failures:
+            self.wake("UNREACHABLE", str(self.failures))
+
+    def gh_failed(self, err):
+        """A smelt-mcp call failed. Counted apart from smelt's polls (M1):
+        only a GitHub call that answers resets it, not a tree-only poll."""
+        self.gh_failures += 1
+        print(f"smelt-wait: github failed ({self.gh_failures}): {err}", file=sys.stderr, flush=True)
+        if self.gh_failures >= self.max_failures:
+            self.wake("UNREACHABLE", f"github {self.gh_failures}")
+
+    @staticmethod
+    def updated(nodes):
+        return sorted((n["id"], n.get("updated_at")) for n in nodes)
+
+    def new_waiting(self, nodes):
+        """The waiting ids not in --known-waiting. A known id leaves it once a
+        poll shows it not waiting, so its next question wakes (M2)."""
+        self.known -= {n["id"] for n in nodes if not n.get("waiting_for_user")}
+        return sorted(n["id"] for n in nodes if n.get("waiting_for_user") and n["id"] not in self.known)
+
+    def check_tree(self, nodes):
+        waiting = self.new_waiting(nodes)
+        if waiting:
+            self.wake("WAITING_FOR_USER", ",".join(map(str, waiting)))
+
+    def check_messages(self, messages):
+        new = messages[self.seen_messages:]
+        self.seen_messages = len(messages)
+        for m in new:
+            for block in smelt_api.message_blocks(m):
+                if block.get("type") == "tool_use" and block.get("name") in WAKE_TOOLS:
+                    self.wake("TOOL", f"{block['name']} {cut(json.dumps(block.get('input'), ensure_ascii=False))}")
+                if (self.key and m.get("role") == "assistant" and block.get("type") == "text"
+                        and self.key.search(block.get("text", ""))):
+                    lines = [ln for ln in block["text"].splitlines() if self.key.search(ln)]
+                    self.wake("KEY", cut(lines[0] if lines else block["text"]))
+
+    def check_owed(self, nodes):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        for n in nodes:
+            owed = n.get("report_owed_at")
+            if not owed or self.owed.get(n["id"]) == owed:
+                continue
+            try:
+                at = parse_time(owed)
+            except ValueError:
+                continue
+            if now - at >= self.grace:
+                self.wake("REPORT_OWED", f"{n['id']} {owed}")
+
+    def check_github(self):
+        asked = datetime.datetime.now(datetime.timezone.utc)
+        if self.sme:
+            merged = [pr for pr in self.github.merged_prs() if pr.get("merged_at") and ticket_pr(pr, self.sme)
+                      and parse_time(pr["merged_at"]) > self.since]
+            if merged:
+                # The earliest: a --since of its merged_at still wakes on any later one.
+                first = min(merged, key=lambda pr: parse_time(pr["merged_at"]))
+                self.checkpoint = parse_time(first["merged_at"])
+                self.wake("MERGED", f"pr#{first['number']} {cut(first.get('title', ''))}")
+        # Every merge before `asked` has been seen. merged_at is in whole
+        # seconds, so a second back keeps one later in the same second.
+        self.checkpoint = max(self.checkpoint, asked - datetime.timedelta(seconds=1))
+        for rid, r in red_runs(self.github.main_runs()).items():
+            if rid not in self.reds:
+                self.wake("MAIN_RED", f"run#{rid} {r.get('name')} {r.get('conclusion')} "
+                                      f"{str(r.get('head_sha', ''))[:12]}")
+
+    def check_time(self, nodes):
+        now = time.monotonic()
+        moved = self.updated(nodes)
+        if moved != self.moved:
+            self.moved, self.last_move = moved, now
+        if now - self.last_move >= self.args.stall_min * 60:
+            busy = ",".join(str(n["id"]) for n in nodes if n.get("busy"))
+            self.wake("STALL", f"{self.args.stall_min:g} busy:[{busy}]")
+        if now - self.started >= self.args.cap_min * 60:
+            self.wake("CAP")
+
+    def poll(self):
+        nodes = self.nodes()
+        messages = get("messages", self.root)
+        self.check_tree(nodes)
+        self.check_messages(messages)
+        self.check_owed(nodes)
+        self.polls += 1
+        if self.github and self.polls % self.gh_every == 0:
+            try:
+                self.check_github()
+                self.gh_failures = 0
+            except PollFailed as err:
+                self.gh_failed(err)
+        return nodes
+
+    def run(self):
+        self.take_baseline()
+        while True:
+            time.sleep(self.poll_secs)
+            try:
+                nodes = self.poll()
+            except PollFailed as err:
+                self.failed(err)
+                if time.monotonic() - self.started >= self.args.cap_min * 60:
+                    self.wake("CAP")
+                continue
+            self.failures = 0
+            self.check_time(nodes)
+
+
+def parser():
+    p = argparse.ArgumentParser(prog="smelt-wait", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("root", type=root_arg)
+    p.add_argument("stall_min", type=minutes, nargs="?", default=45.0)
+    p.add_argument("cap_min", type=minutes, nargs="?", default=240.0)
+    p.add_argument("--known-waiting", type=ids_arg, default=set())
+    p.add_argument("--known-owed", type=ids_arg, default=set())
+    p.add_argument("--since", type=since_arg)
+    p.add_argument("--no-github", action="store_true")
+    return p
+
+
+if __name__ == "__main__":
+    Watch(parser().parse_args()).run()

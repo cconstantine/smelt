@@ -98,7 +98,7 @@ pub(super) async fn clear_archived(pool: &PgPool, conversation_id: i64) {
 /// `save_notice`, which puts it on the next request too, so the model reads
 /// it while the loop can still bend (and before the turn ends at `END_AT`).
 #[cfg(feature = "server")]
-async fn note_thrash(
+pub(super) async fn note_thrash(
     pool: &PgPool,
     conversation_id: i64,
     persisted: &mut Vec<Message>,
@@ -229,6 +229,8 @@ fn run_turn_loop<'c>(
         // The turn's own span, `run_turn_bounded`'s: its model and the
         // number of model calls it made, recorded however it ends.
         let mut steps = TurnSteps { span: tracing::Span::current(), count: 0 };
+        // The turn may compact once on the model's request (SME-482).
+        with_compaction_progress(conversation_id, CompactionProgress::turn_started);
         // Tracks what's been persisted since the last *real* Anthropic
         // response — the compaction trigger's cheap size estimate (see
         // `CompactionProgress::step`) is computed over exactly this, added to that
@@ -442,7 +444,13 @@ fn run_turn_loop<'c>(
                     }
                     (recovered.turn, recovered.recorder, recovered.budget)
                 }
-                Err(CallError::Failed(e)) => return Err(e),
+                Err(CallError::Failed(e)) => {
+                    // Died, not refused (SME-423): the size believed for this
+                    // send is spent, and must not go on reading a later
+                    // refusal as that size's disproof.
+                    with_compaction_progress(conversation_id, CompactionProgress::request_failed);
+                    return Err(e);
+                }
             };
             // A refusal-answering compaction may have run in the recovery
             // (SME-414): its notice rides the next request as the others' do.
@@ -538,6 +546,8 @@ fn run_turn_loop<'c>(
             // Calls that all named no tool count toward the correction
             // bound, settled after their results are saved (SME-307).
             streak.after_calls(ran.unknown.as_deref()).map_err(ServerFnError::new)?;
+            // The model's `compact_context`, now the whole pass is saved (SME-482).
+            compact_if_asked(pool, conversation_id, turn_model, slot, &mut last_known_usage, &mut persisted, &mut pending_new_content).await?;
             if ends {
                 return Ok(persisted);
             }

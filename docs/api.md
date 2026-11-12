@@ -126,6 +126,7 @@ In [api/events.md](api/events.md#the-browsing-panels-own-live-channel).
 | `navigate_browser` | `POST /api/conversations/{id}/browsing/navigate` | the live panel's address bar, see above |
 | `subscribe_conversation_events` | `GET /api/conversations/{id}/events` | always-open live stream, see above |
 | `stop_turn` | `POST /api/conversations/{id}/stop` | the Stop button: end the running turn and pause, see above; refused on a child agent still starting, and stopping a working one tells its parent (SME-236) |
+| `compact_conversation_now` | `POST /api/conversations/{id}/compact` | compact now, between turns, with an optional `note` for the summary; refused while a turn runs or is queued, see [api/model.md](api/model.md) (SME-482) |
 | `get_turn_state` | `GET /api/conversations/{id}/turn` | whether a turn is running, with how many whole seconds its busy spell has run, for the Stop button and the "Working…" timer on (re)connect (SME-160) |
 | `get_reply_in_progress` | `GET /api/conversations/{id}/reply` | the reply streamed so far, for a tab that (re)connects mid-reply |
 | `get_turn_error` | `GET /api/conversations/{id}/turn-error` | the last failed turn's error, until the user writes again, for a tab that connects after `TurnError` |
