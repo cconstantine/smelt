@@ -35,7 +35,23 @@ pub(super) async fn scenario_archived_conversations(t: &Scenario<'_>) {
     assert!(wait_for_count(&home, &a_row, 0, Duration::from_secs(10)).await, "hidden again");
 
     // 3. D1: the agent waits for the user, so A's tree is listed, tagged,
-    // with its marks, and the phone's folded list counts it.
+    // with its marks, and the phone's folded list counts it. The count is
+    // read before the question goes in: earlier scenarios' conversations
+    // waiting for the user are still listed in a full run, so the phone
+    // adds one to what it already showed (alone in its run, see
+    // `scenarios`, so nothing else changes it meanwhile).
+    let phone = t.tab("about:blank").await;
+    phone
+        .execute(chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::new(390, 844, 2.0, true))
+        .await
+        .expect("emulate a phone");
+    phone.goto(t.url("")).await.expect("open Home on the phone");
+    wait_for_element(&phone, "[data-app-live]", Duration::from_secs(15)).await;
+    // The list is in (B's row, in the folded drawer's DOM) before the
+    // count is read, or a list not yet fetched would read as 0.
+    assert!(wait_for_count(&phone, &b_row, 1, Duration::from_secs(10)).await, "the phone's list loaded");
+    let waiting_count = ".sidebar-toggle .agents-waiting-count";
+    let before: usize = text_of(&phone, waiting_count).await.trim().trim_start_matches('?').parse().unwrap_or(0);
     sqlx::query(
         "INSERT INTO pending_questions (conversation_id, tool_use_id, questions, asked_of)
          VALUES ($1, 'toolu_archived', '[]', 'user')",
@@ -51,18 +67,11 @@ pub(super) async fn scenario_archived_conversations(t: &Scenario<'_>) {
         wait_for_count(&home, &format!("{agent_row} .conversation-waiting"), 1, Duration::from_secs(10)).await,
         "the agent's row shows its ?"
     );
-    let phone = t.tab("about:blank").await;
-    phone
-        .execute(chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::new(390, 844, 2.0, true))
-        .await
-        .expect("emulate a phone");
-    phone.goto(t.url("")).await.expect("open Home on the phone");
+    phone.reload().await.expect("reload the phone");
     wait_for_element(&phone, "[data-app-live]", Duration::from_secs(15)).await;
-    // Alone in its run (see `scenarios`), so this lane's question is the
-    // only one waiting.
     assert!(
-        wait_for_text(&phone, ".sidebar-toggle .agents-waiting-count", "?1", Duration::from_secs(10)).await,
-        "the phone's folded list counts the archived tree's question"
+        wait_for_text(&phone, waiting_count, &format!("?{}", before + 1), Duration::from_secs(10)).await,
+        "the phone's folded list counts the archived tree's question (it showed {before} before)"
     );
     sqlx::query("DELETE FROM pending_questions WHERE conversation_id = $1")
         .bind(agent)
