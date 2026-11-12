@@ -51,6 +51,17 @@ fn test_an_agent_without_a_persona_shows_its_status_alone() {
     assert!(!html.contains("agent-persona") && !html.contains("agent-meta-sep"), "{html}");
 }
 
+/// SME-481: a top-level conversation set to a persona shows the
+/// persona alone on its second line: it has no status.
+#[test]
+fn test_a_top_level_persona_shows_its_persona_alone() {
+    let mut top = conversation(1, None);
+    top.persona = Some("smelt:ticket-driver".to_string());
+    let html = dioxus::ssr::render_element(agent_meta(&top));
+    assert!(html.contains(r#"class="conversation-agent-meta""#) && html.contains(">smelt:ticket-driver<"), "{html}");
+    assert!(!html.contains("agent-status") && !html.contains("agent-meta-sep"), "{html}");
+}
+
 #[test]
 fn test_the_users_own_conversation_has_no_meta_line() {
     assert_eq!(dioxus::ssr::render_element(agent_meta(&conversation(1, None))), "");

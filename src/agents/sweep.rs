@@ -21,6 +21,10 @@ pub(crate) const RESTARTED_MID_TURN: &str = "smelt restarted during your turn; c
 /// restored before this runs). Returns the wakes' tasks.
 pub(crate) async fn startup_sweep(pool: &PgPool) -> Vec<tokio::task::JoinHandle<()>> {
     let mut wakes = Vec::new();
+    // SME-481: no top-level persona's set survives a restart either: each
+    // unapplied one is put back (model, resources, pod credentials) and its
+    // row deleted only once that worked; until then its turns are refused.
+    top_level::sweep_unapplied(pool).await;
     match db::starting_agents(pool).await {
         Ok(starting) => {
             for (child, parent) in starting {

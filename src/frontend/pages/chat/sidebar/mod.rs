@@ -484,10 +484,18 @@ fn waiting_count(count: usize, label: impl Fn(usize) -> String) -> Element {
 }
 
 /// An agent's second line: its status, then its persona, which gives way
-/// first on a narrow row. Nothing for the user's own conversations.
+/// first on a narrow row. Nothing for the user's own conversations, except
+/// one set to a persona (SME-481): the persona alone, with no status.
 fn agent_meta(node: &ConversationNode) -> Element {
     let Some(status) = node.status.as_deref() else {
-        return rsx! {};
+        return match node.persona.as_deref() {
+            Some(persona) => rsx! {
+                div { class: "conversation-agent-meta",
+                    span { class: "agent-persona", "{persona}" }
+                }
+            },
+            None => rsx! {},
+        };
     };
     let status_class = format!("agent-status status-{}", status.replace(' ', "-"));
     rsx! {

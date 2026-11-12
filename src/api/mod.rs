@@ -8,6 +8,7 @@ pub mod language_servers;
 pub mod mcp;
 pub mod mcp_calls;
 pub mod notifications;
+pub mod personas;
 pub mod pods;
 pub mod providers;
 pub mod questions;

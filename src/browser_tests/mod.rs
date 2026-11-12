@@ -274,6 +274,10 @@ fn scenarios() -> Vec<Entry> {
         entry("notifier_event_queued_at_demotion", 60, Runs::Alone, |t| Box::pin(scenario_notifier_event_queued_at_demotion(t))),
         entry("agent_reference_links", 90, Runs::Beside, |t| Box::pin(scenario_agent_reference_links(t))),
         entry("report_owed_marker", 60, Runs::Beside, |t| Box::pin(scenario_report_owed_marker(t))),
+        // SME-481: the start screen's persona picker.
+        entry("persona_picker_starts_a_conversation_as_a_persona", 90, Runs::Beside, |t| Box::pin(scenario_persona_picker_starts_a_conversation_as_a_persona(t))),
+        entry("persona_picker_fits_narrow_layouts", 60, Runs::Beside, |t| Box::pin(scenario_persona_picker_fits_narrow_layouts(t))),
+        entry("persona_picker_shows_a_refusal", 60, Runs::Beside, |t| Box::pin(scenario_persona_picker_shows_a_refusal(t))),
         // Alone (SME-480): it reads the phone's folded count, which other
         // lanes' waiting conversations would add to.
         entry("archived_conversations", 90, Runs::Alone, |t| Box::pin(scenario_archived_conversations(t))),
@@ -460,6 +464,7 @@ mod notifications;
 mod notifier_leader;
 mod live_commands;
 mod report_owed;
+mod top_level_persona;
 mod archive;
 mod compact_now;
 
@@ -485,5 +490,6 @@ use notifications::*;
 use notifier_leader::*;
 use live_commands::*;
 use report_owed::*;
+use top_level_persona::*;
 use archive::*;
 use compact_now::*;

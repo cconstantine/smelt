@@ -25,6 +25,7 @@ The design the "Personas and sub-agents" project's tickets follow (SME-234, the 
 12. **A child's clone** is at a `ref` argument, by default the parent's exact commit, which must be on its upstream with a clean tree; unpushed work goes on a volume. Trust is per remote, so the parent's carries over with no card.
 13. **Volumes** the model creates are owned by its conversation, passed only down the tree, mounted from a pod's next start, and deleted with their owner's subtree; `ReadWriteOnce` on the single-node cluster is enough (spike S2).
 14. **Limits** (agents at once, depth, budget) are counted over the group under a lock on the root; a parent never waits holding a provider slot, so SME-162's limit can't deadlock it.
+15. **A top-level conversation can be set to a persona** once, after its repo is attached and before its first message (SME-481): it then runs as a child of the user's root with that persona would, and its model resolves only on its own provider ([top-level.md](top-level.md)).
 
 ## Glossary
 

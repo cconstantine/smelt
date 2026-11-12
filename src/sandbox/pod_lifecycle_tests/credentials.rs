@@ -452,3 +452,33 @@ async fn test_a_stored_secret_reaches_a_grandchild_no_ancestor_held(pool: PgPool
     })
     .await;
 }
+
+/// SME-481 C5: a top-level conversation's pod held the key for its attach's
+/// clone; set to `keeper` (it lists `linear-key`, not `git-ssh`), the key
+/// and its IdentityFile line are gone and the secret is there at 600 by
+/// the time the set returns, before any turn could run.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_setting_a_keyless_persona_removes_the_attach_key_from_the_pod(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
+        db::create_ssh_key(&pool, "id_ed25519", "pub", "PRIVATE-MARKER").await.expect("a key");
+        sqlx::query("INSERT INTO named_secrets (name, value) VALUES ('linear-key', 'SECRET-MARKER')")
+            .execute(&pool)
+            .await
+            .expect("a secret");
+        let root = root_with_checkout(&pool, &client).await;
+        let pod = wait_pod_id(&pool, root).await;
+        sh_ok(&client, pod, "test -e /etc/smelt/keys/id_ed25519").await;
+        let set = crate::agents::top_level::set_persona(&pool, root, "origin:keeper").await.expect("the set");
+        assert!(set.applied, "{set:?}");
+        assert_eq!(sh_ok(&client, pod, "ls -A /etc/smelt/keys").await, "", "the attach's key is gone");
+        let offered = sh_ok(&client, pod, "grep -c IdentityFile /etc/smelt/ssh_config || true").await;
+        assert_eq!(offered, "0", "the SSH config offers nothing");
+        assert_eq!(
+            sh_ok(&client, pod, "stat -c '%a %U' /etc/smelt/secrets/linear-key").await,
+            "600 sandbox",
+            "the persona's secret is there"
+        );
+    })
+    .await;
+}
