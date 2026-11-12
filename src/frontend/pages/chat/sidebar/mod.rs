@@ -276,7 +276,7 @@ pub(super) fn ConversationSidebar(
             super::ErrorText { message: list_error() }
             super::ErrorText { message: action_error() }
             // SME-480 D8: shown only when there is something archived.
-            ShowArchivedToggle { count: archive::archived_roots(&conversations()) }
+            ShowArchivedToggle { count: archive::hidden_archived(&conversations(), selected()) }
             if !loaded() {
                 p { class: "muted", "Loading..." }
             } else if conversations().is_empty() {

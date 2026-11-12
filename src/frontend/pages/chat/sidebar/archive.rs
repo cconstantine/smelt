@@ -33,11 +33,9 @@ fn owed(node: &ConversationNode) -> bool {
     node.waiting_for_user || node.report_owed_at.is_some()
 }
 
-/// The nodes the sidebar lays out: every tree kept whole or dropped whole.
-pub(super) fn visible(nodes: &[ConversationNode], open: Option<i64>, show_archived: bool) -> Vec<ConversationNode> {
-    if show_archived {
-        return nodes.to_vec();
-    }
+/// Each node's root, and whether each root's tree is listed with the
+/// toggle off: in use, owed something (D1), or holding `open` (D7).
+fn kept(nodes: &[ConversationNode], open: Option<i64>) -> (HashMap<i64, i64>, HashMap<i64, bool>) {
     let roots = roots(nodes);
     let by_id: HashMap<i64, &ConversationNode> = nodes.iter().map(|n| (n.id, n)).collect();
     let mut keep: HashMap<i64, bool> = HashMap::new();
@@ -48,14 +46,25 @@ pub(super) fn visible(nodes: &[ConversationNode], open: Option<i64>, show_archiv
             *entry = true;
         }
     }
+    (roots, keep)
+}
+
+/// The nodes the sidebar lays out: every tree kept whole or dropped whole.
+pub(super) fn visible(nodes: &[ConversationNode], open: Option<i64>, show_archived: bool) -> Vec<ConversationNode> {
+    if show_archived {
+        return nodes.to_vec();
+    }
+    let (roots, keep) = kept(nodes, open);
     nodes.iter().filter(|n| keep[&roots[&n.id]]).cloned().collect()
 }
 
-/// How many archived top-level conversations the list has, for the
-/// toggle's label.
-pub(super) fn archived_roots(nodes: &[ConversationNode]) -> usize {
-    let roots = roots(nodes);
-    nodes.iter().filter(|n| roots[&n.id] == n.id && n.archived_at.is_some()).count()
+/// How many archived trees the toggle would add, for its label: the
+/// archived roots the filter hides with the toggle off, not those already
+/// listed for something owed (D1) or the open conversation (D7) (review 1,
+/// L2: "Show archived (1)" over a tree already shown added nothing).
+pub(super) fn hidden_archived(nodes: &[ConversationNode], open: Option<i64>) -> usize {
+    let (roots, keep) = kept(nodes, open);
+    nodes.iter().filter(|n| roots[&n.id] == n.id && !keep[&n.id]).count()
 }
 
 #[cfg(test)]
@@ -118,10 +127,24 @@ mod tests {
     fn test_the_open_tree_stays_listed_and_the_count_is_of_roots() {
         assert_eq!(ids(&visible(&list(), Some(3), false)), vec![1, 2, 3, 4, 5]);
         assert_eq!(ids(&visible(&list(), Some(5), false)), vec![4, 5]);
-        assert_eq!(archived_roots(&list()), 1);
+        assert_eq!(hidden_archived(&list(), None), 1);
         let mut two = list();
         two.push(node(6, None, true));
-        assert_eq!(archived_roots(&two), 2);
-        assert_eq!(archived_roots(&visible(&two, None, false)), 0);
+        assert_eq!(hidden_archived(&two, None), 2);
+    }
+
+    /// Review 1, L2: the toggle counts only the archived trees it would
+    /// add. One kept for an owed question (D1) and one for the open
+    /// conversation (D7) aren't counted; the one hidden is.
+    #[test]
+    fn test_the_toggle_counts_only_the_archived_trees_it_would_add() {
+        let mut nodes = list();
+        nodes[2].waiting_for_user = true;
+        nodes.push(node(6, None, true));
+        assert_eq!(hidden_archived(&nodes, None), 1, "the owed tree is already listed");
+        nodes.push(node(7, None, true));
+        assert_eq!(hidden_archived(&nodes, Some(7)), 1, "the open tree is already listed");
+        nodes[2].waiting_for_user = false;
+        assert_eq!(hidden_archived(&nodes, Some(7)), 2, "once nothing is owed, tree 1 is hidden again");
     }
 }
