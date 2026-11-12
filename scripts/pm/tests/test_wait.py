@@ -4,11 +4,12 @@ smelt-mcp."""
 
 import datetime
 import json
+import os
 import subprocess
 import sys
 import time
 
-from helpers import WAITER, FakeCase, fake_smelt
+from helpers import PM, WAITER, FakeCase, fake_smelt
 
 SINCE = "2026-11-11T12:00:00Z"
 # Fractional minutes: 0.03 min is 1.8 s at a 0.2 s poll.
@@ -350,7 +351,20 @@ class Wait(FakeCase):
         self.assertEqual(r.stdout, "")
 
     def test_usage_errors_exit_2(self):
-        for args in (["x1"], ["1", "soon"], []):
+        for args in (["x1"], ["1", "soon"], [], ["1", "STALL_MIN=120"]):
             with self.subTest(args=args):
                 r = self.run_script(WAITER, *args, "--no-github")
                 self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+
+    def test_the_usage_shows_the_minutes_as_bare_numbers(self):
+        # The SME-460 trial (PM note, 2026-11-12 13:43 UTC): `STALL_MIN=45`
+        # in the usage read as KEY=value, which the watcher refuses (exit 2).
+        doc = os.path.join(os.path.dirname(os.path.dirname(PM)), "docs", "personas", "pm-in-smelt.md")
+        r = self.run_script(WAITER, "--help")
+        with open(doc, encoding="utf-8") as f:
+            texts = {"--help": r.stdout, "pm-in-smelt.md": f.read()}
+        for where, text in texts.items():
+            with self.subTest(where=where):
+                self.assertNotIn("STALL_MIN=", text)
+                self.assertNotIn("CAP_MIN=", text)
+                self.assertIn("smelt-wait ROOT [STALL_MIN] [CAP_MIN]", text)

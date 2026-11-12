@@ -208,6 +208,12 @@ def run(port, tmp):
     check(api("question", conv).stdout.strip() == "none", "no question waits now")
     api("tree", conv)
 
+    step("archive, unarchive: SME-480's routes, read back through the tree")
+    check(f"conversation {conv} archived" in api("archive", conv).stdout, "archive reads back archived")
+    check(json.loads(api("tree", conv, "--json").stdout)[0]["archived_at"], "the tree shows the mark")
+    check(f"conversation {conv} unarchived" in api("unarchive", conv).stdout, "unarchive reads back unarchived")
+    check(json.loads(api("tree", conv, "--json").stdout)[0]["archived_at"] is None, "the mark is cleared")
+
 
 if __name__ == "__main__":
     main()

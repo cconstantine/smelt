@@ -43,16 +43,17 @@ ROUTES = {
     "pod-commands": ("GET", "/api/pods/commands"),
     "providers": ("GET", "/api/providers"),
     "build-id": ("GET", "/api/build-id"),
+    # SME-480: a view mark on a top-level conversation and its agents.
+    "archive": ("POST", "/api/conversations/{id}/archive"),
+    "unarchive": ("POST", "/api/conversations/{id}/unarchive"),
 }
 
 ALLOWED_METHODS = ("GET", "POST")
 
 # Subcommands whose route isn't on the server yet: each prints its line and
-# exits 3. When its ticket merges, it becomes a ROUTES row instead.
-NOT_YET = {
-    "archive": "archive arrives with SME-480 (POST /api/conversations/{id}/archive); not on this server yet",
-    "unarchive": "unarchive arrives with SME-480 (POST /api/conversations/{id}/unarchive); not on this server yet",
-}
+# exits 3. When its ticket merges, it becomes a ROUTES row instead (as
+# archive and unarchive did when SME-480 merged). Empty today.
+NOT_YET = {}
 
 
 class NetworkError(Exception):
