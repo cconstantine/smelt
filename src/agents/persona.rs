@@ -143,6 +143,9 @@ pub(crate) async fn snapshot(
             // What its pod asks of its node (SME-484): `run_start`
             // makes the conversation's `pod_resources` match it.
             "resources": persona.resources,
+            // The seat's token ceiling (SME-493), read at each turn's
+            // start by `db::persona_compact_at`.
+            "compact_at": persona.compact_at,
         }),
     })
 }
