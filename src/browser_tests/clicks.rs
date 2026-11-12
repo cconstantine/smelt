@@ -100,7 +100,10 @@ pub(super) async fn click_when_present_with(page: &chromiumoxide::Page, selector
 /// Records, once per page, the last 30 things a failed click or wait should
 /// be read against (SME-505): every mouse press, release and click with
 /// its target and row, every button's class change, every conversation row
-/// added or removed (a row moved is both), and every in-app navigation.
+/// added or removed (a row moved is both), every in-app navigation, and
+/// every uncaught error and unhandled rejection: a trapped wasm client
+/// still reports a click `hit` (the watcher is plain JS), and shows only
+/// here (review 1, L2).
 const RECORDER: &str = "(() => { if (window.__smeltLog) return true; const log = window.__smeltLog = []; const t0 = performance.now(); \
      const put = s => { log.push(Math.round(performance.now() - t0) + 'ms ' + s); if (log.length > 30) log.shift(); }; \
      const row = el => { const r = el && el.closest && el.closest('[data-conversation-id]'); return r ? r.dataset.conversationId : 'no row'; }; \
@@ -111,6 +114,8 @@ const RECORDER: &str = "(() => { if (window.__smeltLog) return true; const log =
        for (const n of m.removedNodes) if (n.nodeType === 1 && n.dataset && n.dataset.conversationId) put('row ' + n.dataset.conversationId + ' removed'); \
        for (const n of m.addedNodes) if (n.nodeType === 1 && n.dataset && n.dataset.conversationId) put('row ' + n.dataset.conversationId + ' added'); } }) \
        .observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['class'] }); \
+     window.addEventListener('error', e => put('error ' + ((e.error && e.error.message) || e.message || e.type))); \
+     window.addEventListener('unhandledrejection', e => put('unhandledrejection ' + ((e.reason && e.reason.message) || String(e.reason)))); \
      const push = history.pushState; history.pushState = function () { put('pushState ' + arguments[2]); return push.apply(this, arguments); }; \
      return true; })()";
 
@@ -239,9 +244,17 @@ pub(super) async fn scenario_click_not_repeated(t: &Scenario<'_>) {
     // armed, the sidebar's error, and the clicks and changes before it.
     // Read without a panic: one would print its text, in SME-505's
     // signature form, into every green tier log (review 1, M2).
+    // A dead client shows as its error (review 1, L2): a wasm trap reaches
+    // the page as an uncaught error, a failed future as a rejection.
+    page.evaluate("setTimeout(() => { throw new Error('probe error (SME-505)'); }, 0); Promise.reject(new Error('probe rejection (SME-505)')); true")
+        .await
+        .expect("raise the probes");
+    tokio::time::sleep(Duration::from_millis(200)).await;
     let gone = format!(".conversation-item[data-conversation-id='{}'] .no-such-button", target.id);
     let why = settle_failure(&page, &gone, "missing").await;
     for told in [
+        "error probe error (SME-505)".to_string(),
+        "unhandledrejection probe rejection (SME-505)".to_string(),
         format!("{gone} never settled to be clicked: missing; the page: "),
         format!("\"url\":\"{}\"", t.url(&format!("conversation/{}", open.id))),
         format!("\"armed\":[\"{}\"]", target.id),
