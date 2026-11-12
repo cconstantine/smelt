@@ -8,10 +8,21 @@ pub(super) async fn scenario_oauth_sign_in_expired(t: &Scenario<'_>) {
     let pool = t.pool;
     // The provider: nothing to discover (rmcp falls back to its default
     // endpoints), and no refresh is ever attempted without a refresh token.
+    // Its `/mcp`, the first request of each manager build's discovery,
+    // takes 1.2 s: past the test build's 1 s connect budget, which an
+    // OAuth server made inline ran on, so the list read Unreachable on a
+    // loaded runner (SME-501). The delay makes that crossing every run's.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind the provider");
     let addr = listener.local_addr().expect("provider address");
+    let slow_probe = axum::Router::new().route(
+        "/mcp",
+        axum::routing::any(|| async {
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            axum::http::StatusCode::NOT_FOUND
+        }),
+    );
     let provider = tokio::spawn(async move {
-        let _ = axum::serve(listener, axum::Router::new()).await;
+        let _ = axum::serve(listener, slow_probe).await;
     });
     let server = db::create_mcp_server_config(
         pool,
@@ -39,8 +50,9 @@ pub(super) async fn scenario_oauth_sign_in_expired(t: &Scenario<'_>) {
 
     let list = t.tab(t.url("mcp-servers")).await;
     let badge_selector = format!("a[href='/mcp-servers/{}'] .mcp-status", server.id);
+    // With the title, the check's own error text, so a red names its branch.
     let badge_text = format!(
-        "(() => {{ const b = document.querySelector({badge_selector:?}); return b ? b.className + '|' + b.innerText : ''; }})()"
+        "(() => {{ const b = document.querySelector({badge_selector:?}); return b ? b.className + '|' + b.innerText + '|' + (b.title || '') : ''; }})()"
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let badge = loop {
@@ -70,7 +82,7 @@ pub(super) async fn scenario_oauth_sign_in_expired(t: &Scenario<'_>) {
     crate::mcp::evict(server.id).await;
     provider.abort();
     assert!(
-        badge.contains("mcp-status-needs-reconnect") && badge.ends_with("|Sign-in expired"),
+        badge.contains("mcp-status-needs-reconnect") && badge.contains("|Sign-in expired|"),
         "the list's badge: {badge:?}"
     );
     assert!(status_shown, "the edit page should say the sign-in expired");
