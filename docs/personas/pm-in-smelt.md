@@ -63,13 +63,14 @@ Deploys ride with a Driver, one at a time, at the current DEPLOY.md pin, and onl
   | `ALREADY_WAITING`, `WAITING_FOR_USER` | Reads the question. Answers it ([above](#answering-for-the-user)), or escalates it and restarts with `--known-waiting`. |
   | `TOOL notify_user` / `ask_user` | Reads the Driver's last messages: it finished, or needs someone. |
   | `KEY …` | A line of the Driver's text matched the key, by default a `Driver gate: ` line (PR opened, merged, deployed, blocked; [brief part 4](#briefing-a-driver)): reads the messages and the ticket. |
-  | `REPORT_OWED id since` | A seat ended its turn owing a report, with nothing running, longer ago than the grace (a stamp already that old when the watcher starts wakes at once): asks the Driver to chase it, then restarts with `--known-owed id`, which quiets that stamp but not a later one. |
+  | `REPORT_OWED id since` | A seat ended its turn owing a report, with nothing running, longer ago than the grace (a stamp already that old when the watcher starts wakes at once): asks for it with `smelt-api send DRIVER -` (the Driver's report if `id` is the Driver, else a request that it chase its seat `id`), then restarts with `--known-owed id`, which quiets that stamp but not a later one. |
   | `MERGED pr#N` | Checks the ticket's close-out and frees the slot once it's Done. |
   | `MAIN_RED run#id` | Reads the run. Matches it to a flake ticket in Test reliability, or files one ([never re-run a red](#never-re-run-a-red)). |
   | `STALL` | Nothing moved for `STALL_MIN` minutes: reads the tree and the Driver's messages, and asks. |
   | `UNREACHABLE n`, `UNREACHABLE github n` | smelt failed `n` polls in a row (a deploy restart, an outage): `smelt-api where`, then restart. With `github`, `smelt-mcp` failed `n` GitHub calls in a row, counted apart, so `MERGED` and `MAIN_RED` were off: restart, and if it repeats, run with `--no-github` and say so. |
   | `CAP` | Restarts the watcher. |
 
+- **A report owed is asked for with `smelt-api send`.** project-manager.md's SME-339 rule reads `list_agents` and asks with `message_agent`, which reach only agents the PM started, never its top-level Drivers. For those, a `REPORT_OWED`, a `STALL` or a gate the PM hasn't heard about is asked about with `smelt-api send DRIVER -`, the message on stdin. That replaces the `list_agents`/`message_agent` rule for them.
 - **The retrospective trigger** is about ten Done, per [close-out.md](../process/close-out.md#retrospective).
 - **A stall is an owed answer with nothing running:** `REPORT_OWED` names it exactly (SME-455), and `STALL` catches the rest.
 

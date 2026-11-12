@@ -45,7 +45,7 @@ It comments on the ticket, `Project Manager: moved to Up Next because …`, nami
 
 ## Running in smelt
 
-When the Project Manager runs as a smelt conversation rather than a Claude Code session, [pm-in-smelt.md](pm-in-smelt.md) applies too (SME-460). It covers its slots (four ClaudeCode/Opus ticket slots and one strata slot), starting each Ticket Driver as a top-level conversation through `scripts/pm/smelt-api`, the three parts of a Driver's brief, watching each Driver with `scripts/pm/smelt-wait`, the PM's standing rules, and the security model they rest on. The two scripts are its only way to write to smelt.
+When the Project Manager runs as a smelt conversation rather than a Claude Code session, [pm-in-smelt.md](pm-in-smelt.md) applies too (SME-460). It covers its slots (four ClaudeCode/Opus ticket slots and one strata slot), starting each Ticket Driver as a top-level conversation through `scripts/pm/smelt-api`, the four parts of a Driver's brief, watching each Driver with `scripts/pm/smelt-wait`, the PM's standing rules, and the security model they rest on. The two scripts are its only way to write to smelt. Its Drivers aren't agents it started, so `list_agents` and `message_agent` don't reach them: there, a report owed is asked for with `smelt-api send ID -` ([pm-in-smelt.md](pm-in-smelt.md#watching)).
 
 ## Compaction (SME-482)
 
