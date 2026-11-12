@@ -193,31 +193,36 @@ async fn test_a_pass_that_ends_the_turn_still_compacts(pool: PgPool) {
 /// T5: SME-443 holds on the model path: an empty summary, or one cut off
 /// twice, fails the turn and leaves the history as it was.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_an_empty_summary_fails_the_models_compaction(pool: PgPool) {
-    a_refused_summary_fails_the_turn(&pool, vec![text_reply_body("")], "its summary came back empty").await;
+async fn test_an_empty_summary_leaves_the_history_and_the_turn_carries_on(pool: PgPool) {
+    a_refused_summary_is_a_notice(&pool, vec![text_reply_body("")], "its summary came back empty").await;
 }
 
 /// T5, cut off: the summary and its one continuation both stop at the budget.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_a_summary_cut_off_twice_fails_the_models_compaction(pool: PgPool) {
+async fn test_a_summary_cut_off_twice_leaves_the_history_and_the_turn_carries_on(pool: PgPool) {
     let cut = text_reply_body("part").replace("end_turn", "max_tokens");
-    a_refused_summary_fails_the_turn(&pool, vec![cut.clone(), cut], "cut off again").await;
+    a_refused_summary_is_a_notice(&pool, vec![cut.clone(), cut], "cut off again").await;
 }
 
-/// T5's body: the model asks, the summary is refused for `why`, and the
-/// turn fails with the ask, the call and its result still the history.
-async fn a_refused_summary_fails_the_turn(pool: &PgPool, summaries: Vec<String>, why: &str) {
+/// T5's body (SME-482 round 1 L1): the model asks, the summary is refused
+/// for `why`. A compaction the model chose is optional: the turn doesn't
+/// fail. A notice names the failure, the history is never replaced (no
+/// divider), and the model is called again and answers.
+async fn a_refused_summary_is_a_notice(pool: &PgPool, summaries: Vec<String>, why: &str) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(pool).await.expect("clear ids");
     let mut bodies = vec![tool_calls_body(&[("toolu_c", COMPACT, serde_json::json!({}))])];
     bodies.extend(summaries);
-    start_recording_mock_upstream(pool, bodies).await;
+    bodies.push(text_reply_body("carried on"));
+    let requests = start_recording_mock_upstream(pool, bodies).await;
     let conversation = db::create_conversation(pool).await.expect("create conversation");
 
-    let failed = run_turn(pool, conversation.id, hello()).await.expect_err("the turn fails");
+    run_turn(pool, conversation.id, hello()).await.expect("the turn carries on");
 
-    assert!(format!("{failed:?}").contains(why), "{failed:?}");
-    assert!(dividers(pool, conversation.id).await.is_empty(), "no divider");
-    let roles: Vec<String> = db::list_messages(pool, conversation.id).await.expect("messages").into_iter().map(|m| m.role).collect();
-    assert_eq!(roles, ["user", "assistant", "user"], "the ask, the call, its result");
+    assert!(dividers(pool, conversation.id).await.is_empty(), "no divider: the history stays");
+    let messages = db::list_messages(pool, conversation.id).await.expect("messages");
+    assert_eq!(last_reply(&messages).as_deref(), Some("carried on"));
+    let last = requests.lock().expect("the request log").last().cloned().expect("a request").to_string();
+    assert!(last.contains("compact_context") && last.contains(why), "the model is told why: {last}");
+    assert!(last.contains("toolu_c"), "the history it carries on from is the uncompacted one: {last}");
 }

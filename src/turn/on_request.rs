@@ -20,8 +20,10 @@ pub(crate) fn request_compaction(conversation_id: i64, note: Option<String>) -> 
 /// At the end of a tool pass, after every result is saved and before the
 /// next model call (or the turn's return): compacts when the pass's
 /// `compact_context` asked for it. The last saved message is the pass's
-/// results, so the boundary is always safe. A failed summary fails the
-/// turn as a proactive compaction's does, with the history as it was.
+/// results, so the boundary is always safe. A failed summary doesn't fail
+/// the turn (round 1 L1): this compaction is the model's choice, not one the
+/// next request needs, so the model is told it failed, the history stays as
+/// it was (SME-443), and the turn carries on.
 /// The tool pass may have given the turn's slot to its own live agent
 /// (SME-354 B6), so it's taken back first: the summary call never goes
 /// out beside the child's on a limited provider (round 1 M1).
@@ -38,7 +40,20 @@ pub(super) async fn compact_if_asked(
         return Ok(());
     };
     slot.refresh(turn_model).await;
-    match compact_on_request(pool, conversation_id, turn_model, slot.held(), Asker::Model, note).await? {
+    let compacted = match compact_on_request(pool, conversation_id, turn_model, slot.held(), Asker::Model, note).await {
+        Ok(compacted) => compacted,
+        Err(e) => {
+            let why = crate::api::chat::chat_error_text(&e);
+            tracing::warn!(conversation_id, error = %why, "the model's compaction failed; the turn carries on");
+            let notice = format!(
+                "smelt notice: the compaction compact_context asked for failed, so the history is unchanged: {why} \
+                 Carry on from here."
+            );
+            save_notice(pool, conversation_id, crate::api::chat::mark_notice(&notice), persisted, pending_new_content).await?;
+            return Ok(());
+        }
+    };
+    match compacted {
         Compacted::Done => {
             let window = turn_model.context_window;
             with_compaction_progress(conversation_id, |p| p.compacted(window));
