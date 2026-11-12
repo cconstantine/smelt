@@ -44,7 +44,13 @@ pub(super) fn PersonaPicker(conversation_id: i64, state: Store<ConversationState
     };
     let shown: TopLevelPersona = match listing() {
         Some(Ok(listed)) => listed,
-        _ => return rsx! {},
+        // A listing that failed (the sandbox unreachable, say) says so
+        // rather than showing nothing (review 1, L4).
+        Some(Err(e)) => {
+            let message = format!("Couldn't list this conversation's personas: {}", server_error_message(&e));
+            return rsx! { ErrorText { message: Some(message) } };
+        }
+        None => return rsx! {},
     };
     if let Some(set) = &shown.set {
         let on = match (&set.model, &set.provider) {
