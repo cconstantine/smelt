@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """The Project Manager's watcher on one Ticket Driver's tree (SME-460).
 
-  [SME=N] [SMELT_KEY=regex] smelt-wait ROOT [STALL_MIN=45] [CAP_MIN=240]
+  [SME=N] [SMELT_KEY=regex] smelt-wait ROOT [STALL_MIN] [CAP_MIN]
       [--known-waiting ID,...] [--known-owed ID,...] [--since ISO] [--no-github]
+
+STALL_MIN (default 45) and CAP_MIN (default 240) are bare numbers, in that
+order, as in `smelt-wait 2294639921 120 240`; a KEY=value form exits 2.
 
 Run as a terminal command: it prints exactly one wake line and exits 0, and
 its exit wakes the PM. It polls ROOT's tree (ROOT and its descendants)
