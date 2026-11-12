@@ -46,7 +46,7 @@ fn span_attribute<'a>(span: &'a opentelemetry_sdk::trace::SpanData, key: &str) -
     values.first().copied()
 }
 
-fn decisions(spans: &[opentelemetry_sdk::trace::SpanData]) -> Vec<String> {
+pub(super) fn decisions(spans: &[opentelemetry_sdk::trace::SpanData]) -> Vec<String> {
     window_learn_spans(spans)
         .into_iter()
         .map(|span| match span_attribute(span, "smelt.window.decision") {

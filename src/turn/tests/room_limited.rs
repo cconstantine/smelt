@@ -48,6 +48,10 @@ impl Honest {
 const FAILS: i64 = -1;
 /// A step cut off in the middle of a call to `write_file`.
 const CUT_IN_WRITE_FILE: i64 = -2;
+/// A llama.cpp slot stop: `max_tokens`, but with only 1/8 of the request's
+/// own budget written — the stop that reads as the window's edge, not the
+/// budget (SME-420).
+const SLOT_STOP: i64 = -3;
 const OVERLOADED: &str = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
 
 fn cut_in_write_file(input: i64, output: i64) -> String {
@@ -62,8 +66,15 @@ fn cut_in_write_file(input: i64, output: i64) -> String {
 }
 
 /// Answers each model step from `plans`, in order, then "Done.", and each
-/// summary request with a summary.
+/// summary request with a summary, on an Anthropic-kind provider.
 pub(super) async fn honest_mock(pool: &PgPool, plans: Vec<Plan>) -> Arc<Honest> {
+    honest_mock_as_kind(pool, plans, "anthropic").await
+}
+
+/// As `honest_mock`, with the provider saved under `kind` — a llama.cpp
+/// kind server reads its short `max_tokens` stops as the room the server
+/// has, not the budget it was sent with (SME-73, SME-420).
+pub(super) async fn honest_mock_as_kind(pool: &PgPool, plans: Vec<Plan>, kind: &str) -> Arc<Honest> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
     let seen = Arc::new(Honest::default());
@@ -85,6 +96,12 @@ pub(super) async fn honest_mock(pool: &PgPool, plans: Vec<Plan>) -> Arc<Honest> 
                     match plans.get(steps.len() - 1) {
                         Some(Plan { wants: FAILS, .. }) => OVERLOADED.to_string(),
                         Some(Plan { input, wants: CUT_IN_WRITE_FILE }) => cut_in_write_file(*input, max_tokens),
+                        Some(Plan { input, wants: SLOT_STOP }) => with_usage(
+                            &text_reply_body("Half a thought").replace("end_turn", "max_tokens"),
+                            *input,
+                            0,
+                            max_tokens / 8,
+                        ),
                         Some(Plan { input, wants }) if *wants > max_tokens => with_usage(
                             &text_reply_body("Half a thought").replace("end_turn", "max_tokens"),
                             *input,
@@ -104,7 +121,7 @@ pub(super) async fn honest_mock(pool: &PgPool, plans: Vec<Plan>) -> Arc<Honest> 
     tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
     });
-    crate::providers::test_support::add_mock_provider(pool, addr).await;
+    crate::providers::test_support::add_mock_provider_kind(pool, addr, kind).await;
     seen
 }
 
@@ -528,4 +545,50 @@ async fn test_a_later_wake_doesnt_retry_until_a_reply_finishes(pool: PgPool) {
     assert_eq!(seen.count(), calls + 1, "one call, cut off");
     assert_eq!(seen.summary_calls(), summarized, "and no compaction for it");
     assert_eq!(cut_off_notices(&pool, conversation.id).await, 3);
+}
+
+/// SME-420: the llama.cpp slot stop learns a tight window mid-step, and
+/// that must not unmake the step's own room decision. The stop arrived on
+/// a RoomLeft request, where a compaction would free the room, so the
+/// turn compacts and carries on — a child that ended here would end with
+/// no report. The last two asserts pin the learning itself (the
+/// `turn_only` decision and the meter reading the new, tight window):
+/// a "fix" that stopped reading the stop as a window stop could not pass
+/// them.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_slot_stop_the_turn_just_learned_still_compacts_for_the_room(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    crate::turn::overflow::forget_window_stop_candidates();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let mut plans = learn_its_tight();
+    // The RoomLeft step goes out fine (budget ≈ 4,6xx); the slot stop
+    // writes 1/8 of it, so the call measures ≈ 24,5xx — the window it
+    // then learns, under the 32,768 the step was sent at.
+    plans.extend([plan(24_000, 100), plan(24_000, SLOT_STOP), plan(13_600, 100)]);
+    let seen = honest_mock_as_kind(&pool, plans, "llama_cpp").await;
+    set_context_window(&pool, 32_768, None).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let mut rx = events::subscribe(conversation.id);
+
+    let (result, spans) = crate::telemetry::capture_spans(run_turn(&pool, conversation.id, hello())).await;
+    let saved = result.expect("the turn compacts and carries on");
+
+    assert_eq!(last_reply(&saved).as_deref(), Some("Done."), "the turn got to its end");
+    assert_eq!(seen.count(), 7, "every planned step ran, and the final reply");
+    // The plan's one-extra-summary trade-off, realized: the room
+    // compaction lands at the next step, and once the slot stop's
+    // tighter window re-syncs the record there, the fixed content sits
+    // over that window's lower trigger — so the step after pays one
+    // more proactive compaction. That's the re-learn the window change
+    // always costs, and compacting when a request nears the (new)
+    // window is what F10 says a turn may do as often as it needs.
+    assert_eq!(seen.summary_calls(), 4, "two to learn it, one for the room, one as the learned window re-arms the trigger");
+    assert_eq!(cut_off_notices(&pool, conversation.id).await, 1, "the model and the user are told it was cut");
+    assert!(seen.request(5).contains(crate::api::chat::CUT_OFF_NOTICE_START), "the retry carries the notice: {}", seen.request(5));
+    // The stop really learned, mid-step: `turn_only` (nothing reported,
+    // SME-439's shape) and the meter published beside the learned window.
+    assert_eq!(super::window_learning::decisions(&spans), ["turn_only"], "the slot stop was learned as this turn's window");
+    let learned = (24_000 + seen.max_tokens(4) / 8) as u32;
+    assert!(learned < 32_768, "the slot measured tighter than the believed window: {learned}");
+    assert!(published_windows(drain_events(&mut rx).await).contains(&learned), "the meter reads the learned window");
 }
