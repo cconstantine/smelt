@@ -21,8 +21,8 @@ In this order, one step at a time. After a failure, re-read the tree and the boa
 2. `smelt-api create`. The first line of its output is the new conversation's id.
 3. `smelt-api model-set ID PROVIDER_ID MODEL`: ClaudeCode `claude-opus-5-5`, or strata's provider and model. `smelt-api providers` lists the provider ids. It reads the model back and exits 1 unless it reads `Chosen`.
 4. `smelt-api attach ID git@github.com:cconstantine/smelt.git`.
-5. `smelt-api send ID brief.md --expect-model PROVIDER_ID:MODEL`. The flag is required for a Driver's first brief: it sends nothing unless the model is `Chosen` with exactly that provider and model, so the brief never runs on the default model.
-6. The `Ticket Driver started: conversation ID` comment on the ticket.
+5. The `Ticket Driver started: conversation ID` comment on the ticket, before the brief starts it ([rules.md](rules.md): comment first), so a PM that dies after `send` leaves no live Driver that no comment names.
+6. `smelt-api send ID brief.md --expect-model PROVIDER_ID:MODEL`. The flag is required for a Driver's first brief: it sends nothing unless the model is `Chosen` with exactly that provider and model, so the brief never runs on the default model.
 7. `SME=<ticket number> scripts/pm/smelt-wait ID` as a terminal command. Its `KEY` wake is on by default, on the Driver's `Driver gate: ` lines (brief part 4); `SMELT_KEY` sets another regex.
 
 **A failure after `create` is retried on the same id, never by creating again.** A conversation with no model or no brief is finished on its id: `model-set`, `attach` and `send` can each be run again.
