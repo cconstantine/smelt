@@ -100,13 +100,15 @@ pub(crate) fn dead_patterns(rules: &ToolRules, registry: &[String]) -> Vec<Strin
 /// every key its own files use, so a listed one is a typo or a missing
 /// row), and a skippable key outside the baseline used unlisted (an older
 /// smelt would refuse the file, the SME-493 incident). A restricting key
-/// can't be listed at all; its two merges are a written rule.
-pub(crate) fn key_findings(text: &str, keys: &[personas::settings::Key]) -> Vec<String> {
+/// can't be listed at all; its two merges are a written rule. `path` is
+/// the file's own: `parse` refuses a `name` that isn't its file's, so any
+/// other path would drop the first finding (review 1, M1).
+pub(crate) fn key_findings(path: &str, text: &str, keys: &[personas::settings::Key]) -> Vec<String> {
     let Ok((yaml, _)) = personas::frontmatter::split(text) else {
         return Vec::new(); // the parse check reports it
     };
     let mut findings = Vec::new();
-    if let Ok(persona) = personas::parse(".agents/personas/x.md", text, text.len() as u64) {
+    if let Ok(persona) = personas::parse(path, text, text.len() as u64) {
         for name in &persona.ignored {
             findings.push(format!("has `smelt.{name}`, which this smelt doesn't know: a typo, or a key with no row"));
         }
@@ -267,7 +269,7 @@ mod tests {
     fn test_a_new_skippable_key_used_unlisted_is_a_finding() {
         let keys = new_key_table();
         assert_eq!(
-            key_findings(&with_smelt("  compact_at: 5\n"), &keys),
+            key_findings(".agents/personas/x.md", &with_smelt("  compact_at: 5\n"), &keys),
             vec![
                 "uses `smelt.compact_at`, which a smelt deployed before it doesn't know: list it in \
                  `smelt.ignore_if_unknown`"
@@ -275,17 +277,29 @@ mod tests {
             ]
         );
         let listed = with_smelt("  compact_at: 5\n  ignore_if_unknown: [compact_at]\n");
-        assert!(key_findings(&listed, &keys).is_empty());
+        assert!(key_findings(".agents/personas/x.md", &listed, &keys).is_empty());
         // A baseline key needs no list.
-        assert!(key_findings(&with_smelt("  compact_at: 5\n"), personas::settings::KEYS).is_empty());
+        assert!(key_findings(".agents/personas/x.md", &with_smelt("  compact_at: 5\n"), personas::settings::KEYS).is_empty());
     }
 
     #[test]
     fn test_a_key_this_tree_skips_is_a_finding() {
         let text = with_smelt("  compact_later: 5\n  ignore_if_unknown: [compact_later]\n");
         assert_eq!(
-            key_findings(&text, personas::settings::KEYS),
+            key_findings(".agents/personas/x.md", &text, personas::settings::KEYS),
             vec!["has `smelt.compact_later`, which this smelt doesn't know: a typo, or a key with no row".to_string()]
+        );
+    }
+
+    /// Review 1, M1: a real file's name isn't `x`, and the finding held
+    /// only for a fixture named so.
+    #[test]
+    fn test_a_key_a_tracked_file_skips_is_a_finding_whatever_its_name() {
+        let text = "---\nname: developer\ndescription: A fixture persona.\nsmelt:\n  compact_latr: 5\n  \
+                    ignore_if_unknown: [compact_latr]\n---\nTake the persona.\n";
+        assert_eq!(
+            key_findings(".agents/personas/developer.md", text, personas::settings::KEYS),
+            vec!["has `smelt.compact_latr`, which this smelt doesn't know: a typo, or a key with no row".to_string()]
         );
     }
 
@@ -367,7 +381,7 @@ mod tests {
                     if let Some(rules) = &persona.tools {
                         findings.extend(dead_patterns(rules, &registry).into_iter().map(|f| format!("{path}: {f}")));
                     }
-                    let keys = key_findings(&text, personas::settings::KEYS);
+                    let keys = key_findings(path, &text, personas::settings::KEYS);
                     findings.extend(keys.into_iter().map(|f| format!("{path}: {f}")));
                 }
             }
