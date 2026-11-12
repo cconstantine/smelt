@@ -449,9 +449,16 @@ fn persona_section(persona: &crate::db::AgentPersona, when: &str) -> String {
         Some(commit) => format!(" at {}", commit.get(..7).unwrap_or(commit)),
         None => String::new(),
     };
+    // The keys this smelt skipped (SME-506), already shape-checked.
+    let ignored: String = persona
+        .ignored
+        .iter()
+        .map(|k| format!("- This smelt doesn't know `smelt.{k}` from your persona file, so it was ignored.\n"))
+        .collect();
+    let ignored = if ignored.is_empty() { ignored } else { format!("{ignored}\n") };
     format!(
         "\n# Persona\n\nYour persona, `{named}` from {}{at}, {when}; a later change to \
-         the file doesn't change it.\n\n{}\n",
+         the file doesn't change it.\n\n{ignored}{}\n",
         persona.persona_path,
         persona.persona_body.trim_end()
     )

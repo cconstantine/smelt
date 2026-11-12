@@ -234,6 +234,46 @@ async fn test_a_snapshot_carries_the_personas_compact_at(pool: PgPool) {
     }
 }
 
+/// T8 (SME-506): a key the file lists in `smelt.ignore_if_unknown` and
+/// this smelt doesn't know is skipped: the child starts, its parent is
+/// told, the snapshot keeps the name, and a known restriction beside it
+/// still reaches the rule chain.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_listed_unknown_key_is_ignored_and_its_parent_is_told(pool: PgPool) {
+    setup(&pool, vec![text_reply("ok")]).await;
+    let file = "---\nname: developer\ndescription: d\nsmelt:\n  tools:\n    deny: [write_file]\n  compact_later: 5\n  \
+                ignore_if_unknown: [compact_later]\n---\nWork.\n"
+        .to_string();
+    let root = root_with_checkout(&pool, Some(true), Arc::new(fake_with(&[(DEVELOPER, file)]))).await;
+    let input = serde_json::json!({"brief": "x", "repo": "/workspace/app", "ref": "v2", "persona": "developer"});
+    let child = child_of(&pool, root, &start_on(&pool, root, input).await.expect("started")).await;
+    eventually("the child goes active", || async { state(&pool, child).await.as_deref() == Some(db::AGENT_ACTIVE) }).await;
+
+    let settings: serde_json::Value = sqlx::query_scalar("SELECT persona_settings FROM agents WHERE conversation_id = $1")
+        .bind(child)
+        .fetch_one(&pool)
+        .await
+        .expect("the snapshot's settings");
+    assert_eq!(settings["ignored"], serde_json::json!(["compact_later"]), "{settings}");
+    let chain: Option<serde_json::Value> = sqlx::query_scalar("SELECT rule_chain FROM agents WHERE conversation_id = $1")
+        .bind(child)
+        .fetch_one(&pool)
+        .await
+        .expect("the chain column");
+    assert!(chain.is_some_and(|c| c.to_string().contains("write_file")), "the deny beside the skipped key is kept");
+    let notices: Vec<String> = sqlx::query_scalar("SELECT body FROM agent_messages WHERE to_conversation_id = $1 AND kind = 'notice'")
+        .bind(root)
+        .fetch_all(&pool)
+        .await
+        .expect("notices");
+    assert!(
+        notices.iter().any(|n| n.contains(&format!("agent #{child} (app:developer)'s persona at {}", &COMMIT[..7]))
+            && n.contains("`smelt.compact_later`, which this smelt doesn't know")),
+        "{notices:?}"
+    );
+    eventually("every turn is over", || async { !crate::turn::turn_running(root) && !crate::turn::turn_running(child) }).await;
+}
+
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_persona_missing_or_broken_at_the_childs_ref_fails_the_start(pool: PgPool) {
     setup(&pool, vec![text_reply("ok")]).await;

@@ -127,6 +127,14 @@ pub(crate) async fn snapshot(
     let persona = crate::personas::parse(&rel, &file.content, file.file_bytes.max(0) as u64)?;
     let checkout_dir = format!("{}/{}", crate::sandbox::WORKSPACE_DIR, repo.dir);
     let body = crate::personas::links::absolute(&persona.instructions, &format!("{checkout_dir}/.agents/personas"));
+    if !persona.ignored.is_empty() {
+        tracing::warn!(
+            file = %format!("{checkout_dir}/{rel}"),
+            commit = at,
+            keys = ?persona.ignored,
+            "a persona's smelt keys aren't known to this smelt and were ignored"
+        );
+    }
     Ok(db::PersonaSnapshot {
         name: persona.name,
         path: format!("{checkout_dir}/{rel}"),
@@ -146,8 +154,34 @@ pub(crate) async fn snapshot(
             // The seat's token ceiling (SME-493), read at each turn's
             // start by `db::persona_compact_at`.
             "compact_at": persona.compact_at,
+            // The unknown keys its file lists in `ignore_if_unknown` and
+            // this smelt skipped (SME-506): the notice and the prompt line.
+            "ignored": persona.ignored,
         }),
     })
+}
+
+/// The `smelt` keys a snapshot's file had and this smelt skipped because
+/// the file lists them in `ignore_if_unknown` (SME-506), shape-checked by
+/// the parser. A snapshot from before the ticket has none.
+pub(crate) fn ignored_keys(settings: &serde_json::Value) -> Vec<String> {
+    settings
+        .get("ignored")
+        .and_then(serde_json::Value::as_array)
+        .map(|keys| keys.iter().filter_map(|k| k.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+/// The ignored-keys note for a child's persona snapshot, for its parent
+/// on the notice channel (SME-506). From the snapshot alone, no I/O.
+pub(crate) fn ignored_notice(child: i64, persona: &db::PersonaSnapshot) -> Option<String> {
+    let phrase = crate::personas::settings::ignored_phrase(&ignored_keys(&persona.settings))?;
+    let at = persona.commit.as_deref().map(|c| format!(" at {}", c.get(..7).unwrap_or(c))).unwrap_or_default();
+    Some(format!(
+        "{}'s persona{at} has {phrase}, so it was ignored (its file lists it in smelt.ignore_if_unknown); this smelt \
+         may be older than the file, and a seat started after the deploy will apply it",
+        label(child, crate::agents::persona_label(&persona.path).as_deref())
+    ))
 }
 
 /// The resources (SME-484) the persona `name` in the parent's checkout

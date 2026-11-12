@@ -380,7 +380,8 @@ async fn prepare(
     db::narrow_agent_credentials(pool, child, wants_git_ssh)
         .await
         .map_err(|e| format!("couldn't narrow the agent's credentials: {e}"))?;
-    let mut notes = vec![sized, model_notice, rules_notice];
+    let ignored_notice = persona::ignored_notice(child, &snapshot);
+    let mut notes = vec![sized, model_notice, rules_notice, ignored_notice];
     notes.extend(credentials_notes.into_iter().map(Some));
     Ok(Prepared { persona: Some(snapshot), model, parent_notice: one_notice(notes) })
 }

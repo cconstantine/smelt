@@ -210,6 +210,14 @@ fn persona_entry(dir: &str, file: PersonaFile, server_names: Option<&[String]>, 
             if let Some(model) = persona.model {
                 entry["model"] = Value::String(model);
             }
+            // Keys its file lists in `ignore_if_unknown` that this smelt
+            // doesn't know (SME-506): seen before the persona is chosen.
+            if let Some(phrase) = crate::personas::settings::ignored_phrase(&persona.ignored) {
+                entry["ignored"] = Value::String(format!(
+                    "Its file has {phrase}, so a seat started with it here runs without it (the file lists it in \
+                     smelt.ignore_if_unknown)."
+                ));
+            }
             entry
         }
         Err(error) => json!({"file": full, "error": error}),
