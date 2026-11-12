@@ -482,5 +482,30 @@ mod tests {
                 assert!(ran <= own && ran <= LIMIT - t, "{name} begun at {t:?} ran {ran:?}");
             }
         }
+        // The polls themselves, with the scenario's bounds, intervals and
+        // error modes, and a slow evaluate (2 s, never true): each gets
+        // min(own + one evaluate, 45 s − t), as the harness helpers did
+        // under the outer 45 s. Round 1, finding 3.
+        let eval = Duration::from_secs(2);
+        let polls = [
+            ("live", 15, 100, OnError::Stop),
+            ("text", 20, 200, OnError::Retry),
+            ("still_live", 10, 200, OnError::Retry),
+        ];
+        for t in [0, 10_000, 30_000, 40_000, 44_900].map(Duration::from_millis) {
+            for (name, own, every, on_error) in polls {
+                let (own, every) = (Duration::from_secs(own), Duration::from_millis(every));
+                let steps = DepthSteps::new(NAMES, LIMIT);
+                sleep(t).await;
+                let slow = || async move {
+                    sleep(eval).await;
+                    Ok(false)
+                };
+                steps.step(name, steps.poll(own, every, on_error, slow)).await;
+                let ran = named(&steps, name).elapsed;
+                assert!(ran <= (own + eval).min(LIMIT - t), "poll {name} begun at {t:?} ran {ran:?}");
+                assert!(ran >= own.min(LIMIT - t), "poll {name} begun at {t:?} gave up early, after {ran:?}");
+            }
+        }
     }
 }
