@@ -1,5 +1,7 @@
 use super::*;
 
+mod depth_steps;
+
 /// SME-30: the model's replies render as markdown, and the reply is
 /// untrusted. A heading, list, table, code block and link become those
 /// elements; raw HTML (an `<img onerror>`, a `<script>`) and a
@@ -210,19 +212,7 @@ pub(super) async fn scenario_markdown_deep_code(t: &Scenario<'_>) {
     let mut failures = Vec::new();
     for depth in [100, 500, 2_000, 8_000] {
         // A depth that hangs the tab ends alone, so the rest still run.
-        let outcome = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(tokio::time::timeout(
-            Duration::from_secs(45),
-            deep_code_at(t, depth),
-        )))
-        .await;
-        let problems = match outcome {
-            Ok(Ok(problems)) => problems,
-            Ok(Err(_)) => vec!["didn't finish within 45 s".to_string()],
-            Err(panic) => vec![
-                panic.downcast_ref::<String>().cloned().unwrap_or_else(|| "panicked".to_string()),
-            ],
-        };
-        failures.extend(problems.into_iter().map(|p| format!("depth {depth}: {p}")));
+        failures.extend(depth_steps::run_depth(depth, Duration::from_secs(45), deep_code_at(t, depth)).await);
         // Closed before the next depth, however this one ended: a tab still
         // busy in a hung render would take the CPU the next one needs.
         t.close_tabs().await;
