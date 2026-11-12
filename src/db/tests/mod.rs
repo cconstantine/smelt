@@ -70,6 +70,7 @@ mod usage;
 mod providers;
 mod instance;
 mod agents;
+mod archive;
 mod agent_races;
 mod agent_volumes;
 mod secrets;

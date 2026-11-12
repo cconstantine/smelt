@@ -26,6 +26,9 @@ pub struct TreeRow {
     /// self-hides while the seat runs something and returns with its
     /// original age (SME-455).
     pub report_owed_at: Option<NaiveDateTime>,
+    /// Its root's `archived_at` (SME-480 D4): an agent is archived with
+    /// the top-level conversation it belongs to.
+    pub archived_at: Option<NaiveDateTime>,
 }
 
 /// Every conversation, most recently active first.
@@ -39,8 +42,12 @@ pub async fn conversation_tree(pool: &PgPool) -> Result<Vec<TreeRow>, sqlx::Erro
                 {} AS waiting_for_user,
                 EXISTS (SELECT 1 FROM pending_questions q
                         WHERE q.conversation_id = c.id AND q.answer IS NULL AND q.asked_of = $1) AS waiting_for_parent,
-                {} AS report_owed_at
+                {} AS report_owed_at,
+                r.archived_at
          FROM conversations c LEFT JOIN agents a ON a.conversation_id = c.id
+         -- Its root's mark (SME-480 D4): an agent's `root_id` is the
+         -- top-level conversation, at any depth.
+         LEFT JOIN conversations r ON r.id = COALESCE(a.root_id, c.id)
          LEFT JOIN top_level_personas t ON t.conversation_id = c.id
          ORDER BY c.updated_at DESC, c.id DESC",
         super::WAITS_FOR_USER,

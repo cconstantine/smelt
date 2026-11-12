@@ -278,6 +278,9 @@ fn scenarios() -> Vec<Entry> {
         entry("persona_picker_starts_a_conversation_as_a_persona", 90, Runs::Beside, |t| Box::pin(scenario_persona_picker_starts_a_conversation_as_a_persona(t))),
         entry("persona_picker_fits_narrow_layouts", 60, Runs::Beside, |t| Box::pin(scenario_persona_picker_fits_narrow_layouts(t))),
         entry("persona_picker_shows_a_refusal", 60, Runs::Beside, |t| Box::pin(scenario_persona_picker_shows_a_refusal(t))),
+        // Alone (SME-480): it reads the phone's folded count, which other
+        // lanes' waiting conversations would add to.
+        entry("archived_conversations", 90, Runs::Alone, |t| Box::pin(scenario_archived_conversations(t))),
     ]
 }
 
@@ -462,6 +465,7 @@ mod notifier_leader;
 mod live_commands;
 mod report_owed;
 mod top_level_persona;
+mod archive;
 mod compact_now;
 
 use harness::*;
@@ -487,4 +491,5 @@ use notifier_leader::*;
 use live_commands::*;
 use report_owed::*;
 use top_level_persona::*;
+use archive::*;
 use compact_now::*;

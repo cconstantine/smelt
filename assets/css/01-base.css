@@ -512,7 +512,8 @@ body {
     min-width: 0;
 }
 
-.conversation-thinking-toggle {
+.conversation-thinking-toggle,
+.conversation-archive {
     flex-shrink: 0;
     padding: 2px 8px;
     border: 1px solid var(--border);
