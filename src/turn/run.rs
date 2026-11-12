@@ -455,6 +455,30 @@ fn run_turn_loop<'c>(
             // A refusal-answering compaction may have run in the recovery
             // (SME-414): its notice rides the next request as the others' do.
             note_thrash(pool, conversation_id, &mut persisted, &mut pending_new_content).await?;
+            // SME-420: this step's sizes were built against the window it
+            // was sent at. The window-stop learner below may move
+            // `context_window` mid-step (a llama.cpp slot stop measures
+            // the server's real room); `measured` and `cut_for_room`
+            // below would read that as a window change and wipe the very
+            // record this step's cut-off decision needs — the turn would
+            // end instead of compacting for the room, and a child could
+            // end with no report. Decide this step from `window_at_send`;
+            // the new window still moves the meter below (SME-439's
+            // intent) and every later size, and the record re-syncs to it
+            // at the next step's `step` — and there that re-sync also
+            // drops `compact_for_room`/`room_retried` before the next
+            // decision can read them (SME-420 round 1 F1), so on this
+            // path it is `carries_on` that keeps the turn alive and the
+            // room compaction that lands comes from the trigger
+            // re-arming under the learned window, not the flag. No
+            // runaway: a second cut with nothing compacted between finds
+            // `after == None` and ends the turn, and compounding
+            // compactions stop at SME-414's `END_AT`. (A refusal
+            // recovery's own mid-step change and Ollama's
+            // `learn_ollama_window`, both above the capture, stay in the
+            // frame as today — there the snapshot is post-learn, exactly
+            // what the pre-fix call sites read (F3).)
+            let window_at_send = turn_model.context_window;
             // A reply the window stopped, rather than one that ran out of
             // budget, measured the room the server really has — but only
             // against what the server reports, or a repeat of itself,
@@ -479,7 +503,7 @@ fn run_turn_loop<'c>(
             // everything up through this response is now accounted for, so
             // `pending_new_content` resets — only what's persisted after
             // this point is "new" again (SME-18).
-            with_compaction_progress(conversation_id, |p| p.measured(&turn.usage, turn_model.context_window));
+            with_compaction_progress(conversation_id, |p| p.measured(&turn.usage, window_at_send));
             last_known_usage = Some(turn.usage);
             pending_new_content.clear();
             // The room cut this reply off, where a compaction would free it:
@@ -490,7 +514,7 @@ fn run_turn_loop<'c>(
                 if !cut_off {
                     p.reply_finished();
                 }
-                cut_off && budget.limit == crate::api::chat::ReplyLimit::RoomLeft && p.cut_for_room(sized, turn_model.context_window)
+                cut_off && budget.limit == crate::api::chat::ReplyLimit::RoomLeft && p.cut_for_room(sized, window_at_send)
             });
             save_stop_notice(pool, conversation_id, turn_model, &turn, &budget, carries_on, &mut persisted).await?;
             if carries_on {
