@@ -233,13 +233,46 @@ async fn reads_true(page: &chromiumoxide::Page, js: &str) -> Result<bool, String
 
 /// One depth of `scenario_markdown_deep_code`: what went wrong, if anything.
 /// Each await runs as a step of `steps`, which the caller holds, so a depth
-/// that stalls still names its step. The polls keep the harness helpers'
-/// bounds and intervals (`wait_for_live_client`: 15 s at 100 ms;
-/// `wait_for_text`: at 200 ms), and also count their evaluates.
+/// that stalls still names its step. The steps share the depth's deadline:
+/// one that reaches it ends the depth here, and its timing line still
+/// prints.
 async fn deep_code_at(t: &Scenario<'_>, depth: usize, steps: &depth_steps::DepthSteps) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut timings = DeepCodeTimings::default();
+    let _ = deep_code_steps(t, depth, steps, &mut problems, &mut timings).await;
+    steps.finish();
+    let ms = |d: Option<Duration>| d.map_or("-".to_string(), |d| d.as_millis().to_string());
+    eprintln!(
+        "browser tier: markdown_deep_code: depth {depth}: live in {} ms, rendered in {} ms, span depth {}; steps: {}",
+        ms(timings.live_after),
+        ms(timings.rendered_after),
+        timings.span_depth,
+        steps.report()
+    );
+    problems
+}
+
+/// What `deep_code_at`'s timing line reports, as far as the depth got.
+#[derive(Default)]
+struct DeepCodeTimings {
+    live_after: Option<Duration>,
+    rendered_after: Option<Duration>,
+    span_depth: serde_json::Value,
+}
+
+/// `deep_code_at`'s steps; `None` once one stopped at the depth's deadline.
+/// The polls keep the harness helpers' bounds and intervals
+/// (`wait_for_live_client`: 15 s at 100 ms; `wait_for_text`: at 200 ms),
+/// and also count their evaluates.
+async fn deep_code_steps(
+    t: &Scenario<'_>,
+    depth: usize,
+    steps: &depth_steps::DepthSteps,
+    problems: &mut Vec<String>,
+    timings: &mut DeepCodeTimings,
+) -> Option<()> {
     use crate::events::{ConversationEvent, publish};
     use depth_steps::Outcome;
-    let mut problems = Vec::new();
     let conversation = steps
         .step("seed", async {
             let conversation = t.conversation().await;
@@ -252,27 +285,27 @@ async fn deep_code_at(t: &Scenario<'_>, depth: usize, steps: &depth_steps::Depth
                 .expect("seed the reply");
             (conversation, Outcome::Ok)
         })
-        .await;
+        .await?;
     let started = tokio::time::Instant::now();
     let page = steps
         .step("tab", async { (t.tab(t.url(&format!("conversation/{}", conversation.id))).await, Outcome::Ok) })
-        .await;
+        .await?;
     let live_js = format!("document.querySelector({:?}) !== null", format!("[data-live=\"{}\"]", conversation.id));
     let live = steps
         .step("live", steps.poll(Duration::from_secs(15), Duration::from_millis(100), || reads_true(&page, &live_js)))
-        .await;
-    let live_after = started.elapsed();
+        .await?;
+    timings.live_after = Some(started.elapsed());
     if !live {
         problems.push("1: the client never went live".to_string());
     }
     let text_js = format!("document.body.innerText.includes({:?})", "AFTER-DEEP-CODE");
     let text = steps
         .step("text", steps.poll(Duration::from_secs(20), Duration::from_millis(200), || reads_true(&page, &text_js)))
-        .await;
+        .await?;
     if !text {
         problems.push("2: the text after the block never rendered".to_string());
     }
-    let rendered_after = started.elapsed();
+    timings.rendered_after = Some(started.elapsed());
     // The deepest chain of scope spans (those with a class; a run of text
     // has a span of its own, with none) under the block, walked with an
     // explicit stack: a recursive walk would itself be the deep recursion.
@@ -298,7 +331,8 @@ async fn deep_code_at(t: &Scenario<'_>, depth: usize, steps: &depth_steps::Depth
                 Err(e) => (serde_json::json!({ "error": e }), Outcome::Error(e)),
             }
         })
-        .await;
+        .await?;
+    timings.span_depth = facts["deepest"].clone();
     if facts["highlighted"] != true {
         problems.push(format!("3: the block isn't highlighted: {facts}"));
     } else {
@@ -318,18 +352,11 @@ async fn deep_code_at(t: &Scenario<'_>, depth: usize, steps: &depth_steps::Depth
             publish(conversation.id, ConversationEvent::ReplyDelta { text: still_live.clone(), offset: 0 });
             steps.poll(Duration::from_secs(10), Duration::from_millis(200), || reads_true(&page, &still_live_js)).await
         })
-        .await;
+        .await?;
     if !shown {
         problems.push("6: a live event after the render never showed".to_string());
     }
-    eprintln!(
-        "browser tier: markdown_deep_code: depth {depth}: live in {} ms, rendered in {} ms, span depth {}; steps: {}",
-        live_after.as_millis(),
-        rendered_after.as_millis(),
-        facts["deepest"],
-        steps.report()
-    );
-    problems
+    Some(())
 }
 
 /// What the tab says `prefers-color-scheme` is; an empty value lifts it.

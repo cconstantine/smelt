@@ -15,7 +15,11 @@ pub(super) enum Outcome {
     Ok,
     /// A poll reached its own bound and gave up; the depth carries on.
     GaveUp(Duration),
+    /// The depth's shared deadline came first; the depth ends here.
+    AtDeadline,
     Error(String),
+    /// The depth ended before this step began.
+    NotReached,
 }
 
 /// A polling step's counts: how many evaluates, the slowest one, how many
@@ -64,9 +68,39 @@ impl DepthSteps {
         self.backstop_fired.get()
     }
 
+    /// Every step so far, in order.
+    pub(super) fn steps(&self) -> Vec<Step> {
+        self.steps.borrow().clone()
+    }
+
+    /// The step that stopped at the depth's deadline, if one did.
+    pub(super) fn stopped_at_deadline(&self) -> Option<Step> {
+        self.steps.borrow().iter().find(|s| s.outcome == Outcome::AtDeadline).cloned()
+    }
+
+    /// Records every step the depth never began as not reached.
+    pub(super) fn finish(&self) {
+        let mut steps = self.steps.borrow_mut();
+        for name in self.names {
+            if !steps.iter().any(|s| s.name == *name) {
+                steps.push(Step {
+                    name,
+                    start: Duration::ZERO,
+                    elapsed: Duration::ZERO,
+                    outcome: Outcome::NotReached,
+                    stats: None,
+                });
+            }
+        }
+    }
+
     /// Runs `fut` as step `name`, which gives back its value and how it
-    /// ended.
-    pub(super) async fn step<T>(&self, name: &'static str, fut: impl Future<Output = (T, Outcome)>) -> T {
+    /// ended. Every step shares the depth's one deadline: a step gets
+    /// min(its own bound, the time left), never more. When the deadline
+    /// comes first, the step is recorded as stopped there and this returns
+    /// `None`, and the depth should end: its body then returns normally, so
+    /// the stall names its step without the backstop.
+    pub(super) async fn step<T>(&self, name: &'static str, fut: impl Future<Output = (T, Outcome)>) -> Option<T> {
         let begun = Instant::now();
         let index = {
             let mut steps = self.steps.borrow_mut();
@@ -79,12 +113,23 @@ impl DepthSteps {
             });
             steps.len() - 1
         };
-        let (value, outcome) = fut.await;
+        let ended = tokio::time::timeout_at(self.deadline(), fut).await;
         let mut steps = self.steps.borrow_mut();
         let step = &mut steps[index];
         step.elapsed = begun.elapsed();
-        step.outcome = outcome;
-        value
+        if let Some(stats) = &mut step.stats {
+            stats.in_flight = None;
+        }
+        match ended {
+            Ok((value, outcome)) => {
+                step.outcome = outcome;
+                Some(value)
+            }
+            Err(_) => {
+                step.outcome = Outcome::AtDeadline;
+                None
+            }
+        }
     }
 
     /// Polls `eval` until it reads true, every `interval`, giving up once
@@ -165,7 +210,9 @@ fn describe(s: &Step, now: Duration) -> String {
         Outcome::Ok => format!("{} {}", s.name, secs(s.elapsed)),
         Outcome::Running => format!("{} {} running", s.name, secs(now - s.start)),
         Outcome::GaveUp(own) => format!("{} {} gave up after its own bound ({})", s.name, secs(s.elapsed), secs(*own)),
+        Outcome::AtDeadline => format!("{} {} stopped at the depth deadline", s.name, secs(s.elapsed)),
         Outcome::Error(e) => format!("{} {} error {e}", s.name, secs(s.elapsed)),
+        Outcome::NotReached => return format!("{} not reached", s.name),
     };
     if let Some(stats) = &s.stats {
         line += &format!(" (polls {}, max_eval {}", stats.polls, secs(stats.max_eval));
@@ -183,12 +230,14 @@ fn describe(s: &Step, now: Duration) -> String {
 /// Runs one depth's `body` under the deadline `steps` was made with. A
 /// depth that hangs or panics ends alone, so the rest still run; its
 /// failures come back prefixed with the depth, and a hang or a panic names
-/// its step.
+/// its step. A step stopped at the shared deadline ends the body normally
+/// and is named here; the outer timeout, at the same deadline, stays as the
+/// backstop for a stall outside every step.
 pub(super) async fn run_depth(depth: usize, steps: &DepthSteps, body: impl Future<Output = Vec<String>>) -> Vec<String> {
     let outcome =
         futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(tokio::time::timeout_at(steps.deadline(), body)))
             .await;
-    let problems = match outcome {
+    let mut problems = match outcome {
         Ok(Ok(problems)) => problems,
         Ok(Err(_)) => vec![steps.timeout_report()],
         Err(panic) => vec![format!(
@@ -197,6 +246,15 @@ pub(super) async fn run_depth(depth: usize, steps: &DepthSteps, body: impl Futur
             steps.report()
         )],
     };
+    if let Some(stopped) = steps.stopped_at_deadline() {
+        problems.push(format!(
+            "stopped at the depth deadline in step {} after {:.1} s (depth {:.1} s); steps: {}",
+            stopped.name,
+            stopped.elapsed.as_secs_f64(),
+            steps.limit.as_secs_f64(),
+            steps.report()
+        ));
+    }
     problems.into_iter().map(|p| format!("depth {depth}: {p}")).collect()
 }
 
@@ -236,5 +294,95 @@ mod tests {
         assert!(failure.starts_with("depth 2000: timed out after step tab finished (depth 45.0 s); steps: "), "{failure}");
         assert!(failure.contains("seed 0.1 s, tab 2.0 s, live not reached"), "{failure}");
         assert!(steps.backstop_fired());
+    }
+
+    async fn never() -> Result<bool, String> {
+        Ok(false)
+    }
+
+    fn named(steps: &DepthSteps, name: &str) -> Step {
+        steps.steps().into_iter().find(|s| s.name == name).unwrap_or_else(|| panic!("no step {name}: {:?}", steps.steps()))
+    }
+
+    /// A body shaped like `deep_code_at`'s: each step ends the depth when it
+    /// returns `None`, and the rest are recorded as not reached.
+    async fn body(steps: &DepthSteps, tab: Duration, live_own: Duration) -> Vec<String> {
+        let mut problems = Vec::new();
+        let _ = async {
+            steps.step("seed", takes(Duration::from_millis(100))).await?;
+            steps.step("tab", takes(tab)).await?;
+            if !steps.step("live", steps.poll(live_own, Duration::from_millis(100), never)).await? {
+                problems.push("1: the client never went live".to_string());
+            }
+            steps.step("text", steps.poll(Duration::from_secs(20), Duration::from_millis(200), || async { Ok(true) })).await?;
+            steps.step("facts", takes(Duration::ZERO)).await?;
+            steps.step("still_live", steps.poll(Duration::from_secs(10), Duration::from_millis(200), || async { Ok(true) })).await
+        }
+        .await;
+        steps.finish();
+        problems
+    }
+
+    /// A stall inside a step stops that step at the depth's shared deadline,
+    /// which names it, and the depth ends through its body, not the
+    /// backstop: `tab` takes 40 s, so `live` gets the 4.9 s left, not its 15.
+    #[tokio::test(start_paused = true)]
+    #[ignore]
+    async fn test_a_stall_inside_a_step_stops_at_the_depth_deadline_and_names_it() {
+        let steps = DepthSteps::new(NAMES, LIMIT);
+        let failures = run_depth(2_000, &steps, body(&steps, Duration::from_secs(40), Duration::from_secs(15))).await;
+        assert!(!steps.backstop_fired(), "the backstop fired: {failures:?}");
+        let live = named(&steps, "live");
+        assert_eq!(live.outcome, Outcome::AtDeadline, "{live:?}");
+        assert_eq!(live.elapsed, Duration::from_millis(4_900), "{live:?}");
+        for name in ["text", "facts", "still_live"] {
+            assert_eq!(named(&steps, name).outcome, Outcome::NotReached, "{name}");
+        }
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].starts_with("depth 2000: stopped at the depth deadline in step live after 4.9 s (depth 45.0 s); steps: seed 0.1 s, tab 40.0 s, live 4.9 s stopped at the depth deadline (polls "),
+            "{failures:?}"
+        );
+        assert!(failures[0].ends_with("text not reached, facts not reached, still_live not reached"), "{failures:?}");
+    }
+
+    /// A poll that reaches its own bound gives up, and the depth carries on
+    /// to its next steps, as it did before the shared deadline.
+    #[tokio::test(start_paused = true)]
+    #[ignore]
+    async fn test_a_step_at_its_own_bound_lets_the_next_steps_run() {
+        let steps = DepthSteps::new(NAMES, LIMIT);
+        let failures = run_depth(2_000, &steps, body(&steps, Duration::from_millis(900), Duration::from_secs(15))).await;
+        let live = named(&steps, "live");
+        assert_eq!(live.outcome, Outcome::GaveUp(Duration::from_secs(15)), "{live:?}");
+        assert_eq!(live.elapsed, Duration::from_secs(15), "{live:?}");
+        assert!(steps.report().contains("live 15.0 s gave up after its own bound (15.0 s) (polls 151, max_eval 0.0 s)"), "{}", steps.report());
+        for name in ["text", "facts", "still_live"] {
+            assert_eq!(named(&steps, name).outcome, Outcome::Ok, "{name}");
+        }
+        assert_eq!(failures, vec!["depth 2000: 1: the client never went live".to_string()]);
+        assert!(!steps.backstop_fired());
+    }
+
+    /// The PM's condition (SME-329): no step gets more time than the old
+    /// stacked waits under the outer 45 s gave it. A step that would use
+    /// its whole own bound, begun `t` into the depth, runs exactly
+    /// min(own, 45 s − t).
+    #[tokio::test(start_paused = true)]
+    #[ignore]
+    async fn test_no_step_gets_more_than_today() {
+        // Each step's own bound: sqlx's acquire and chromiumoxide's
+        // REQUEST_TIMEOUT for the calls, the helpers' bounds for the polls.
+        let own = [("seed", 30), ("tab", 30), ("live", 15), ("text", 20), ("facts", 30), ("still_live", 10)];
+        for t in [0, 10_000, 30_000, 40_000, 44_900].map(Duration::from_millis) {
+            for (name, own) in own.map(|(n, s)| (n, Duration::from_secs(s))) {
+                let steps = DepthSteps::new(NAMES, LIMIT);
+                sleep(t).await;
+                steps.step(name, async { sleep(own).await; ((), Outcome::GaveUp(own)) }).await;
+                let ran = named(&steps, name).elapsed;
+                assert_eq!(ran, own.min(LIMIT - t), "{name} begun at {t:?}");
+                assert!(ran <= own && ran <= LIMIT - t, "{name} begun at {t:?} ran {ran:?}");
+            }
+        }
     }
 }
