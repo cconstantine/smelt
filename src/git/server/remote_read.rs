@@ -35,6 +35,19 @@ fn transport_allowed(url: &str) -> bool {
     }
 }
 
+/// The string git is given for `url`: the one `remote_key` keyed (review 2
+/// M1). A `scheme://` URL is the `url` crate's own serialization of what it
+/// parsed, so git connects to the host and path the key names; an scp-like
+/// one is the trimmed text `parse_remote` split.
+pub(super) fn fetch_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.contains("://") {
+        url::Url::parse(url).ok().map(|parsed| parsed.as_str().to_string())
+    } else {
+        Some(url.to_string())
+    }
+}
+
 /// A refresh's `commit`: only a commit id, whole or abbreviated (review 1
 /// L1). A ref name would resolve against refs the read doesn't need.
 pub fn validate_refresh_commit(commit: &str) -> Result<(), String> {
@@ -65,6 +78,9 @@ pub async fn persona_at_remote(
     if !transport_allowed(url) {
         return Err(format!("a refresh reads a remote only over ssh or https, and {url} is neither"));
     }
+    // From here on git sees only the form that was keyed (review 2 M1).
+    let fetch = fetch_url(url).ok_or_else(|| format!("couldn't read {url} as a URL; nothing was read"))?;
+    let url = fetch.as_str();
     if let Some(c) = commit {
         validate_refresh_commit(c)?;
     }

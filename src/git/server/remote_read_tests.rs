@@ -113,6 +113,25 @@ async fn test_a_remote_read_reads_only_the_trusted_remote() {
     assert_eq!(refused, "a refresh reads a remote only over ssh or https, and git://h/o/r is neither");
 }
 
+/// Review 2 M1: git is given the string that was keyed, never the raw one,
+/// and a URL the two parsers read as different remotes is refused before
+/// anything is fetched.
+#[tokio::test]
+async fn test_a_remote_read_gives_git_the_url_it_keyed() {
+    assert_eq!(fetch_url("https://GitHub.com/o/r").as_deref(), Some("https://github.com/o/r"));
+    assert_eq!(fetch_url("ssh://git@GitHub.com/o/r").as_deref(), Some("ssh://git@GitHub.com/o/r"));
+    assert_eq!(fetch_url("  git@github.com:o/r.git ").as_deref(), Some("git@github.com:o/r.git"));
+    assert_eq!(fetch_url("http://[::1"), None);
+    for (url, key) in [
+        (r"https://github.com\@example.com/../cconstantine/smelt", "github.com/cconstantine/smelt"),
+        ("ssh://git@github.com/x/../o/r", "github.com/o/r"),
+        ("git@github.com:x/../o/r", "github.com/x/../o/r"),
+    ] {
+        let refused = persona_at_remote(url, key, DEV, None, &[]).await.expect_err(url);
+        assert_eq!(refused, format!("the checkout's remote {url} isn't {key}, the remote whose trust was read; nothing was read"));
+    }
+}
+
 /// Review 1 L1: `commit` is a commit id only; a ref name, even one on the
 /// default branch, is refused before anything is fetched.
 #[tokio::test]

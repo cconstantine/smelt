@@ -209,6 +209,33 @@ fn test_remote_key_refuses_what_isnt_a_url() {
     }
 }
 
+/// SME-516 review 2, M1: a backslash, or a `.` or `..` path segment (also
+/// percent-encoded), is refused in every URL form. The `url` crate reads
+/// `https://github.com\@example.com/../o/r` as `github.com/o/r` while git
+/// connects to example.com, and an scp-like `..` reaches past the path the
+/// key names.
+#[test]
+fn test_remote_key_refuses_a_backslash_or_a_dot_segment() {
+    for bad in [
+        r"https://github.com\@example.com/../cconstantine/smelt",
+        r"https://github.com\o\r",
+        r"git@github.com:o\r.git",
+        "https://github.com/x/../o/r",
+        "https://github.com/./o/r",
+        "https://github.com/x/%2e%2e/o/r",
+        "https://github.com/x/.%2E/o/r",
+        "ssh://git@github.com/x/../o/r",
+        "git@github.com:x/../o/r.git",
+        "git@github.com:../o/r",
+        "git@github.com:o/./r",
+    ] {
+        assert_eq!(remote_key(bad), None, "{bad:?}");
+    }
+    // A dot inside a name is no segment of its own.
+    assert_eq!(remote_key("git@github.com:o/r.js.git").as_deref(), Some("github.com/o/r.js"));
+    assert_eq!(remote_key("https://github.com/o/..r").as_deref(), Some("github.com/o/..r"));
+}
+
 /// SME-283: a remote that differs from another only in characters a reader
 /// can't see must never be recorded at all — the same key is what trust
 /// decisions are remembered by. Every `plain_text` predicate character
