@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""One-off: delete stale conversation sandbox claims in `smelt-park`.
+
+Every conversation gets two claims, `sandbox-workspace-<id>` and
+`sandbox-docker-<id>`. Only the storage-grace pass (SME-345) deletes
+them automatically, and only for a conversation whose last pod ended in
+a quiet stop (idle or finish) after that pass shipped. Every other end
+(`terminate_pod`, a lost pod, a failed create, a user's Stop, anything
+from before 2026-11-02) leaves them for ever, and they pile up.
+
+This deletes the claims of every conversation, of the database that
+owns them, that:
+
+  * has no live pod row (`sandbox_pods.terminated_at IS NULL`), and
+  * has no pod in the namespace mounting either claim, and
+  * ended its last pod at least --min-idle-days ago (default 2), or
+    never had a pod and its claim is that old, or no longer exists in
+    the database at all (its claim at least an hour old).
+
+It deletes only claims labelled `smelt/instance=<this database's
+instance>` (or unlabelled ones, when this database owns those, as
+smelt itself does). Claims of other instances (check servers' scratch
+databases) are listed, not touched: `sandbox_instance_cleanup` is for
+those. Generic and agent volume claims are never touched.
+
+After deleting, it does in the database what smelt's own "remove
+storage" does: the conversations' `ready` repos become `failed` ("clone
+the repo again"), and their quiet-stop marks are cleared so the grace
+pass doesn't later try again. No message is saved into the
+conversations.
+
+Needs `kubectl` with rights to list pods and claims and delete claims in
+the namespace, and to exec into the database pod (`smelt-db-0`, which
+the module in terraform/smelt deploys). Dry run by default:
+
+  scripts/oneoff/clean-stale-sandbox-storage                # list only
+  scripts/oneoff/clean-stale-sandbox-storage --apply        # delete
+  scripts/oneoff/clean-stale-sandbox-storage --min-idle-days 7 --keep 123 --apply
+
+Run it while smelt is quiet if you can: a conversation whose pod starts
+between the check and the delete is re-checked just before its delete,
+but not under smelt's own locks.
+"""
+
+import argparse
+import collections
+import datetime
+import json
+import re
+import subprocess
+import sys
+
+CLAIM = re.compile(r"^sandbox-(workspace|docker)-(\d+)$")
+INSTANCE_LABEL = "smelt/instance"
+STORAGE_REMOVED_ERROR = "the sandbox storage was deleted; clone the repo again"
+ORPHAN_MIN_AGE_SECS = 3600
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("--namespace", default="smelt-park")
+    p.add_argument("--context", help="kubectl context (default: current)")
+    p.add_argument("--db-pod", default="smelt-db-0")
+    p.add_argument("--db-container", default="postgres")
+    p.add_argument("--min-idle-days", type=float, default=2.0)
+    p.add_argument("--keep", type=int, action="append", default=[], metavar="CONVERSATION_ID",
+                   help="never delete this conversation's claims (repeatable)")
+    p.add_argument("--apply", action="store_true", help="delete; without it, only list")
+    return p.parse_args()
+
+
+class Kube:
+    def __init__(self, args):
+        self.base = ["kubectl"] + (["--context", args.context] if args.context else []) + ["-n", args.namespace]
+        self.args = args
+
+    def run(self, *argv, stdin=None):
+        result = subprocess.run(self.base + list(argv), input=stdin, capture_output=True, text=True)
+        if result.returncode != 0:
+            sys.exit(f"kubectl {' '.join(argv[:3])} failed: {result.stderr.strip()}")
+        return result.stdout
+
+    def items(self, kind):
+        return json.loads(self.run("get", kind, "-o", "json"))["items"]
+
+    def sql(self, statement):
+        """Rows of `statement` (tab-separated, unaligned), run in the database pod."""
+        out = self.run(
+            "exec", "-i", self.args.db_pod, "-c", self.args.db_container, "--",
+            "sh", "-c", 'exec psql -X -q -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At -F "\t"',
+            stdin=statement,
+        )
+        return [line.split("\t") for line in out.splitlines() if line]
+
+
+def instance(kube):
+    rows = kube.sql("SELECT instance_id::text, owns_unlabelled FROM smelt_instance;")
+    if len(rows) != 1:
+        sys.exit(f"expected one smelt_instance row, got {rows!r}")
+    return rows[0][0], rows[0][1] == "t"
+
+
+def conversations(kube):
+    """{id: (live pod rows, pod rows, seconds since the last pod ended or -1)}."""
+    rows = kube.sql(
+        "SELECT c.id,"
+        " count(p.id) FILTER (WHERE p.terminated_at IS NULL),"
+        " count(p.id),"
+        " COALESCE(extract(epoch FROM now()::timestamp - max(p.terminated_at))::bigint, -1)"
+        " FROM conversations c LEFT JOIN sandbox_pods p ON p.conversation_id = c.id"
+        " GROUP BY c.id;"
+    )
+    return {int(r[0]): (int(r[1]), int(r[2]), int(r[3])) for r in rows}
+
+
+def mounted_claims(kube):
+    """Every claim some pod in the namespace mounts, whatever its phase."""
+    mounted = set()
+    for pod in kube.items("pods"):
+        for volume in pod["spec"].get("volumes") or []:
+            claim = volume.get("persistentVolumeClaim")
+            if claim:
+                mounted.add(claim["claimName"])
+    return mounted
+
+
+def age_secs(claim, now):
+    created = datetime.datetime.fromisoformat(claim["metadata"]["creationTimestamp"].replace("Z", "+00:00"))
+    return (now - created).total_seconds()
+
+
+def days(secs):
+    return f"{secs / 86400:.1f}d"
+
+
+def plan(kube, args):
+    our_instance, owns_unlabelled = instance(kube)
+    convs = conversations(kube)
+    mounted = mounted_claims(kube)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    min_idle = args.min_idle_days * 86400
+
+    by_conv = collections.defaultdict(list)
+    foreign = collections.Counter()
+    for claim in kube.items("persistentvolumeclaims"):
+        name = claim["metadata"]["name"]
+        m = CLAIM.match(name)
+        if not m:
+            continue
+        label = (claim["metadata"].get("labels") or {}).get(INSTANCE_LABEL)
+        if label != our_instance and not (label is None and owns_unlabelled):
+            foreign[label or "(unlabelled)"] += 1
+            continue
+        by_conv[int(m.group(2))].append(claim)
+
+    delete, keep = {}, collections.Counter()
+    for conv_id, claims in sorted(by_conv.items()):
+        names = [c["metadata"]["name"] for c in claims]
+        oldest = max(age_secs(c, now) for c in claims)
+        if any(c["metadata"].get("deletionTimestamp") for c in claims):
+            keep["already deleting"] += 1
+        elif conv_id in args.keep:
+            keep["--keep"] += 1
+        elif any(n in mounted for n in names):
+            keep["mounted by a pod"] += 1
+        elif conv_id not in convs:
+            if oldest >= ORPHAN_MIN_AGE_SECS:
+                delete[conv_id] = (names, f"conversation gone, claim {days(oldest)} old")
+            else:
+                keep["conversation gone, claim under an hour old"] += 1
+        else:
+            live, rows, since_end = convs[conv_id]
+            if live:
+                keep["live pod row"] += 1
+            elif rows == 0:
+                if oldest >= min_idle:
+                    delete[conv_id] = (names, f"never had a pod, claim {days(oldest)} old")
+                else:
+                    keep["never had a pod, claim recent"] += 1
+            elif since_end >= min_idle:
+                delete[conv_id] = (names, f"last pod ended {days(since_end)} ago")
+            else:
+                keep["stopped recently"] += 1
+    return delete, keep, foreign, convs, our_instance
+
+
+def still_stale(kube, conv_id, names, existed):
+    """The re-check just before a delete: no live pod row, nothing mounting."""
+    if existed:
+        rows = kube.sql(f"SELECT count(*) FROM sandbox_pods WHERE conversation_id = {conv_id} AND terminated_at IS NULL;")
+        if rows[0][0] != "0":
+            return False
+    return not (set(names) & mounted_claims(kube))
+
+
+def apply(kube, delete, convs):
+    deleted, skipped = [], []
+    for conv_id, (names, _) in sorted(delete.items()):
+        if not still_stale(kube, conv_id, names, conv_id in convs):
+            skipped.append(conv_id)
+            print(f"  skipped {conv_id}: a pod started since the plan")
+            continue
+        kube.run("delete", "pvc", "--wait=false", "--ignore-not-found", *names)
+        deleted.append(conv_id)
+        print(f"  deleted {' '.join(names)}")
+    in_db = [c for c in deleted if c in convs]
+    if in_db:
+        ids = ",".join(str(c) for c in in_db)
+        kube.sql(
+            "BEGIN;"
+            f" UPDATE conversation_repos SET status = 'failed', error = '{STORAGE_REMOVED_ERROR}', updated_at = now()"
+            f"  WHERE conversation_id IN ({ids}) AND status = 'ready';"
+            " UPDATE sandbox_pods SET quietly_stopped_at = NULL, storage_removal_started_at = NULL"
+            f"  WHERE conversation_id IN ({ids}) AND (quietly_stopped_at IS NOT NULL OR storage_removal_started_at IS NOT NULL);"
+            " COMMIT;"
+        )
+        print(f"marked the repos of {len(in_db)} conversation(s) failed and cleared their quiet-stop marks")
+    print(f"deleted the claims of {len(deleted)} conversation(s); skipped {len(skipped)}")
+    print(f"they finish deleting in the background: kubectl -n {kube.args.namespace} get pvc | grep -c Terminating")
+
+
+def main():
+    args = parse_args()
+    kube = Kube(args)
+    delete, keep, foreign, convs, our_instance = plan(kube, args)
+
+    print(f"instance {our_instance}, namespace {args.namespace}, min idle {args.min_idle_days} days")
+    for conv_id, (names, reason) in sorted(delete.items()):
+        print(f"  delete  conversation {conv_id:<12} {reason:<40} {' '.join(names)}")
+    claims = sum(len(names) for names, _ in delete.values())
+    print(f"to delete: {claims} claim(s) of {len(delete)} conversation(s)")
+    for reason, n in keep.most_common():
+        print(f"kept: {n} conversation(s): {reason}")
+    for label, n in foreign.most_common():
+        print(f"not ours: {n} claim(s) of instance {label} (see sandbox_instance_cleanup --list)")
+
+    if not args.apply:
+        print("dry run: nothing deleted; run again with --apply to delete")
+        return
+    if delete:
+        apply(kube, delete, convs)
+
+
+if __name__ == "__main__":
+    main()
