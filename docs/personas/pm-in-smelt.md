@@ -67,7 +67,7 @@ Deploys ride with a Driver, one at a time, at the current DEPLOY.md pin, and onl
 A deploy restarts smelt under every seat, so it runs only when the trees are quiet (the SME-477 retrospective, proposal 4; the user agreed 2026-11-12). The check is the PM's, since only it has `smelt-api`:
 
 - **The Driver asks for a go.** When a deploy is due, it writes `Driver gate: deploy due <sha>` and starts its Deployer only once the PM sends the go.
-- **The PM gives the go only when every other tree is quiet.** A seat is busy if `smelt-api tree` shows it `busy` (a turn in flight) or `smelt-api pods` shows a running command for it (the count after its status). A seat idle on its own gate shows only in `pods`, so both are read. The asking Driver's own tree is left out: it's busy starting the Deployer.
+- **The PM gives the go only when every other tree is quiet.** A seat is busy if `smelt-api tree` shows it `busy` (a turn in flight) or `smelt-api pods` shows a running command for it (the count after its status). A seat idle on its own gate shows only in `pods`, so both are read. The PM's own tree (its turn and its `smelt-wait` commands) and the asking Driver's are left out: both are busy by design.
 - **After the restart, the PM tells each tree it saw busy or running a command** to check its seats (`smelt-api send`). The Deployer reports its apply time to its Driver ([deployer.md](deployer.md#quiet-deploys)), and the Driver passes it on.
 - **Merges that land close together share a deploy:** one deploy at `main`'s tip covers them.
 
