@@ -195,6 +195,44 @@ async fn test_a_turns_span_carries_its_claude_code_calls_tokens(pool: PgPool) {
     assert!(!shown.contains(&MARKER.to_lowercase()), "no session id on a span: {shown}");
 }
 
+/// Round 1 A-L2: the turn span's tokens count every Claude Code call of
+/// the turn, as `model_call_usage` does: the compaction's summary
+/// (`once`) too, not only the turn's own calls. Recorded once.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_turns_span_counts_its_compactions_summary_call(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let tool = crate::claude_cli::tests::fake::tool_block("toolu_al2", "todoread", &json!({}));
+    let first = call_with_usage(api_call(0, vec![tool], "tool_use", 5), 50_000, 1, 2);
+    let call = json!({"call": [{"id": "toolu_al2", "name": "mcp__smelt__todoread", "input": {}}]});
+    let reply = |text: &str, input, read, write| {
+        let mut lines = call_with_usage(api_call(0, vec![text_block(text)], "end_turn", 3), input, read, write);
+        lines.push(crate::claude_cli::tests::fake::result_ok());
+        json!({"emit": lines})
+    };
+    let fake = FakeCli::new("usage-span-compaction", vec![
+        vec![json!({"read": true}), json!({"emit": first}), call],
+        vec![json!({"read": true}), reply("SUMMARY-AL2", 7, 8, 9)],
+        vec![json!({"read": true}), reply("after", 10, 20, 30)],
+    ]);
+    let provider = fake.pick_for(&pool, conversation.id).await;
+    super::review1::set_cli_window(&pool, provider, 65_536).await;
+
+    let (result, spans) = crate::telemetry::capture_spans(run_turn(&pool, conversation.id, hello())).await;
+    result.expect("the turn compacts and carries on");
+
+    assert_eq!(super::compaction::dividers(&pool, conversation.id).await, 1, "it compacted");
+    let turns: Vec<_> = spans.iter().filter(|span| span.name == "turn").collect();
+    let [turn] = turns.as_slice() else { panic!("one turn span: {spans:?}") };
+    let attribute = |key: &str| -> Vec<opentelemetry::Value> {
+        turn.attributes.iter().filter(|kv| kv.key.as_str() == key).map(|kv| kv.value.clone()).collect()
+    };
+    assert_eq!(attribute("gen_ai.usage.input_tokens"), vec![50_017_i64.into()], "{turn:?}");
+    assert_eq!(attribute("gen_ai.usage.cache_read.input_tokens"), vec![29_i64.into()], "{turn:?}");
+    assert_eq!(attribute("gen_ai.usage.cache_creation.input_tokens"), vec![41_i64.into()], "{turn:?}");
+}
+
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_conversation_route_is_none_off_claude_code(pool: PgPool) {
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");

@@ -113,26 +113,26 @@ pub(super) async fn note_thrash(
 /// Records how many model calls a turn made on its span once the turn ends,
 /// whichever way it does (a return, an error, a stop dropping it).
 /// With its Claude Code calls' input, cache read and cache write tokens,
-/// summed (SME-486 T11): numbers only, never the CLI's session.
+/// summed (SME-486 T11) over every Claude Code call of the turn, its
+/// compaction's included (`call::open_turn_tokens`, round 1 A-L2):
+/// numbers only, never the CLI's session.
 struct TurnSteps {
     span: tracing::Span,
     count: i64,
-    claude_code: Option<[i64; 3]>,
+    conversation_id: i64,
 }
 
 impl TurnSteps {
-    fn add_claude_code(&mut self, usage: &anthropic::TokenUsage) {
-        let [input, read, write] = self.claude_code.get_or_insert([0; 3]);
-        *input += usage.input_tokens;
-        *read += usage.cache_read_input_tokens;
-        *write += usage.cache_creation_input_tokens;
+    fn new(conversation_id: i64) -> Self {
+        super::call::open_turn_tokens(conversation_id);
+        Self { span: tracing::Span::current(), count: 0, conversation_id }
     }
 }
 
 impl Drop for TurnSteps {
     fn drop(&mut self) {
         self.span.record("turn.steps", self.count);
-        if let Some([input, read, write]) = self.claude_code {
+        if let Some([input, read, write]) = super::call::close_turn_tokens(self.conversation_id) {
             self.span.record("gen_ai.usage.input_tokens", input);
             self.span.record("gen_ai.usage.cache_read.input_tokens", read);
             self.span.record("gen_ai.usage.cache_creation.input_tokens", write);
@@ -245,7 +245,7 @@ fn run_turn_loop<'c>(
     Box::pin(async move {
         // The turn's own span, `run_turn_bounded`'s: its model and the
         // number of model calls it made, recorded however it ends.
-        let mut steps = TurnSteps { span: tracing::Span::current(), count: 0, claude_code: None };
+        let mut steps = TurnSteps::new(conversation_id);
         // The turn may compact once on the model's request (SME-482).
         with_compaction_progress(conversation_id, CompactionProgress::turn_started);
         // Tracks what's been persisted since the last *real* Anthropic
@@ -482,9 +482,6 @@ fn run_turn_loop<'c>(
                     return Err(e);
                 }
             };
-            if turn_model.kind == crate::providers::ProviderKind::ClaudeCli {
-                steps.add_claude_code(&turn.usage);
-            }
             // A refusal-answering compaction may have run in the recovery
             // (SME-414): its notice rides the next request as the others' do.
             note_thrash(pool, conversation_id, &mut persisted, &mut pending_new_content).await?;

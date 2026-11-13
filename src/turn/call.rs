@@ -266,6 +266,43 @@ async fn call_claude_cli(
     })
 }
 
+/// Each running turn's Claude Code calls' input, cache read and cache
+/// write tokens, by conversation (SME-486 T11): `None` until a call adds
+/// some. Every Claude Code call's `CallRecorder` adds what it records (the
+/// turn's calls, the CLI's `extra` calls, a compaction's summary, a call
+/// refused or stopped), so the turn span counts what `model_call_usage`
+/// does (round 1 A-L2). `TurnSteps` opens its turn's entry and closes it.
+#[cfg(feature = "server")]
+fn turn_tokens() -> std::sync::MutexGuard<'static, std::collections::HashMap<i64, Option<[i64; 3]>>> {
+    static TOKENS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, Option<[i64; 3]>>>> =
+        std::sync::LazyLock::new(Default::default);
+    // Every change is one insert, remove or add: nothing is left half-done.
+    TOKENS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Starts counting `conversation_id`'s turn's Claude Code tokens.
+#[cfg(feature = "server")]
+pub(super) fn open_turn_tokens(conversation_id: i64) {
+    turn_tokens().insert(conversation_id, None);
+}
+
+/// Stops counting, with the turn's summed tokens if any call added some.
+#[cfg(feature = "server")]
+pub(super) fn close_turn_tokens(conversation_id: i64) -> Option<[i64; 3]> {
+    turn_tokens().remove(&conversation_id).flatten()
+}
+
+/// Adds one Claude Code call's `usage` to its turn's count, if one is open.
+#[cfg(feature = "server")]
+fn add_turn_tokens(conversation_id: i64, usage: &anthropic::TokenUsage) {
+    if let Some(sum) = turn_tokens().get_mut(&conversation_id) {
+        let [input, read, write] = sum.get_or_insert([0; 3]);
+        *input += usage.input_tokens;
+        *read += usage.cache_read_input_tokens;
+        *write += usage.cache_creation_input_tokens;
+    }
+}
+
 /// Records one model call attempt's usage and cost (SME-106), however the
 /// call ends (SME-178): made before the call, it's `finish`ed with the
 /// reply once that's saved, and a recorder dropped before then (a Stop
@@ -292,6 +329,8 @@ pub(super) struct CallRecorder {
     meter: anthropic::stream::UsageMeter,
     estimated_input: i64,
     armed: bool,
+    /// A Claude Code call: what it records counts on its turn's span too.
+    claude_code: bool,
 }
 
 #[cfg(feature = "server")]
@@ -313,6 +352,7 @@ impl CallRecorder {
             meter: anthropic::stream::UsageMeter::default(),
             estimated_input: i64::try_from(estimate_request_tokens(request)).unwrap_or(i64::MAX),
             armed: true,
+            claude_code: turn_model.kind == crate::providers::ProviderKind::ClaudeCli,
         }
     }
 
@@ -364,6 +404,9 @@ impl CallRecorder {
         context_window: Option<u32>,
     ) -> ServerFnResult<()> {
         self.armed = false;
+        if self.claude_code {
+            add_turn_tokens(self.conversation_id, &turn.usage);
+        }
         let current = Arc::new(AtomicBool::new(true));
         let _current_while_awaited = NotCurrentOnDrop(current.clone());
         let record = self.record(turn.usage, Some(current.clone()));
@@ -430,6 +473,9 @@ impl Drop for CallRecorder {
         };
         let usage = with_estimated_input(usage, self.estimated_input);
         let conversation_id = self.conversation_id;
+        if self.claude_code {
+            add_turn_tokens(conversation_id, &usage);
+        }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             tracing::warn!(conversation_id, "no runtime to record an unfinished model call on");
             return;
