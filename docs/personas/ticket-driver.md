@@ -20,6 +20,8 @@ It is the rung between the Project Manager and the work: the seats' parent, the 
 
 **The stack-slot protocol.** Before starting any seat that brings up the compose stack — its Developer, a re-gating fix seat, the Integrator — the driver asks the Project Manager for a slot on the ticket; the grant, with the numbers granted on and the conditions (one stack at a time for the ticket, no shared `volumes:`), is recorded on the ticket too, as SME-255's were. An OOM-killed or unschedulable stack is reported to the Project Manager, never retried into a pass. Round-2 reviewers restricted to read-only runs need no slot unless a re-gate is granted.
 
+**A usage hold** (SME-486, [project-manager.md](project-manager.md#usage-hold-sme-486)): when the Project Manager says the Claude subscription's usage is on hold, the driver lets its running seat finish, starts no next seat, reports where the ticket stands, and waits for the Project Manager's "Usage hold lifted" before starting another.
+
 **Status moves.** The seats move the ticket as their own pages already say — the Todo to In Progress move is the Developer's own first step, made by it, not the driver (developer.md, step 1). The driver's moves are recovery: if its seat died before making a status move its phase owed, the driver makes it, recording each such move in a comment.
 
 **After a merge**, it records the ticket's state on the ticket, then calls `compact_context` (SME-482).

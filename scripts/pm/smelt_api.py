@@ -26,7 +26,8 @@ DEFAULT_HOST = "smelt.constantlee.us"
 
 TIMEOUT_SECS = 30
 
-# name -> (method, path template). `{id}` is a conversation id, an integer.
+# name -> (method, path template). `{id}` is a conversation or (for
+# `usage`) a provider id, an integer either way.
 ROUTES = {
     "create": ("POST", "/api/conversations"),
     "attach": ("POST", "/api/conversations/{id}/repos"),

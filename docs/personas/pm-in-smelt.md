@@ -17,6 +17,7 @@ Part of the [development process](../development-process.md). The [Project Manag
 
 In this order, one step at a time. After a failure, re-read the tree and the board before going on.
 
+0. `smelt-api usage <id>` for the Claude Code provider. On `hold`, start no Driver ([Usage hold](project-manager.md#usage-hold-sme-486), SME-486).
 1. Re-read the tree (`smelt-api tree` for each live Driver) and the board. Start a Driver only for a freed slot ([runaway guard](#security-model)).
 2. `smelt-api create`. The first line of its output is the new conversation's id.
 3. `smelt-api attach ID git@github.com:cconstantine/smelt.git`.
@@ -147,6 +148,7 @@ When the PM compacts itself and its Drivers is SME-482's, in [project-manager.md
 | `question CONV`, `model CONV` | The pending question (or `none`) and the model, as JSON. |
 | `pods` | Live pods: conversation, status and running commands. |
 | `providers` | `id kind name` only, never the URL or the key's hint. |
+| `usage PROVIDER_ID [--json]` | A Claude Code provider's subscription usage windows (percent, status, reset, last seen, seven-day pace) and the verdict `ok`, `hold: <reasons>` or `unknown: no reading` ([Usage hold](project-manager.md#usage-hold-sme-486), SME-486). Whitelisted fields only, never the CLI's session id. |
 | `where` | The address, the `Host` sent, and the build id. |
 | `compact CONV [--note N]` | Compacts the conversation now, between turns (SME-482); refused, exit 1, while a turn runs or a question waits. |
 | `archive CONV`, `unarchive CONV` | Sets or clears a top-level conversation's archive mark (SME-480), which its agents follow, then reads `tree` back and exits 1 unless it reads archived (or not). `archive` first reads `tree` and the pods' running commands, and refuses, exit 1 with nothing sent, while any node in the tree is busy, waiting or owes a report, or a pod in it runs a command. An agent's id is refused (409, naming its root), exit 1. A view mark only: messages, pods and storage are untouched. |
