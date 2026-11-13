@@ -73,7 +73,7 @@ The trigger is close-out.md's ([Watching](#watching)). The retro runs from smelt
 
 1. **It takes a ClaudeCode slot at once** ([Slots](#slots)): the PM holds the ClaudeCode tree that's cheapest to pause and resumes it once the retro is done.
 2. **The PM starts a top-level `smelt:facilitator`** on the open "Next retrospective" ticket, as it starts a Driver ([Starting a Driver](#starting-a-driver), with `persona-set ID smelt:facilitator`), and briefs it as it would a Driver ([Briefing a Driver](#briefing-a-driver)), adding what [facilitator.md](facilitator.md) names. It watches it with `smelt-wait` like a Driver.
-3. **The PM puts the proposals to the user with `ask_user`.** They're a real product decision, so `ask_user` is right here, not an answer of the PM's.
+3. **The PM passes the Facilitator's report to the user unedited, then puts the proposals to the user with `ask_user`.** They're a real product decision, so `ask_user` is right here, not an answer of the PM's.
 4. **It files a ticket for each agreed proposal that needs code**, and owns the close-out PR: it starts the [Integrator](integrator.md) that makes it ([close-out.md](../process/close-out.md#retrospective)), top-level on the retro ticket and briefed like a Driver. The PM itself writes nothing to GitHub ([Hosted checks](#hosted-checks-are-a-small-spend)).
 
 **A bug bash** runs per [project-manager.md](project-manager.md) and [architect.md](architect.md), its seats started and watched the same way.
