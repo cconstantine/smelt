@@ -66,24 +66,27 @@ const CONNECT_TIMEOUT: std::time::Duration = if cfg!(test) {
 /// build, and which a test may give one of its servers (`connect_timeout`).
 const PRODUCT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// `CONNECT_TIMEOUT` for `server_id` (and `call::call_timeout`, the call's,
-/// on the same rule). A test build's 1 s keeps the tests of
-/// a server that never answers quick, but an OAuth server's connect
-/// includes a token refresh at the tests' mock provider, and under CI's
-/// load that alone ran past 1 s ("didn't answer within 1s", SME-341,
-/// SME-356). So every OAuth mock server (`oauth_http::create_server`) gets
-/// the product's own budget (`test_support::give_product_budget`), and a
-/// test whose subject is the give-up puts its server back on 1 s
-/// (`test_support::hold_to_test_budget`). So do the registry tests'
-/// servers (`tests/registry.rs`'s `held_server`), whose connects are held
-/// at the mock across a step that can outlast 1 s (SME-363). Every other
-/// server — static, hanging — keeps the short one.
-pub(super) fn connect_timeout(server_id: i64) -> std::time::Duration {
+/// `CONNECT_TIMEOUT` for `config`'s server (and `call::call_timeout`, the
+/// call's, on the same rule). A test build's 1 s keeps the tests of a
+/// server that never answers quick. But an OAuth server's connect and
+/// status check always include its provider's round trips (discovery,
+/// maybe a token refresh), and under CI's load those alone ran past 1 s
+/// ("didn't answer within 1s": SME-341, SME-356, and SME-501's browser
+/// scenario, whose server was made outside the opt-in helper). So in a
+/// test build every OAuth server gets the product's own budget, by its
+/// `auth_mode`, wherever its row was made; a test whose subject is the
+/// give-up puts its server back on 1 s (`test_support::hold_to_test_budget`).
+/// A static server whose connects a test holds at the mock across a step
+/// that can outlast 1 s opts in (`test_support::give_product_budget`: the
+/// registry tests' `held_server`, SME-363, and the tests' shared
+/// `mock_holding_server_for_tests`). Every other server — static,
+/// hanging — keeps the short one.
+pub(super) fn connect_timeout(config: &McpServerConfig) -> std::time::Duration {
     #[cfg(test)]
-    if test_support::has_product_budget(server_id) {
+    if test_support::has_product_budget(config) {
         return PRODUCT_CONNECT_TIMEOUT;
     }
-    let _ = server_id;
+    let _ = config;
     CONNECT_TIMEOUT
 }
 
@@ -92,22 +95,31 @@ pub(crate) mod test_support {
     use std::collections::HashSet;
     use std::sync::{LazyLock, Mutex};
 
+    use crate::db::McpServerConfig;
+
+    /// Servers opted in to the product's budget (static ones; every OAuth
+    /// server has it already), and servers held to the test build's 1 s.
     static PRODUCT_BUDGET: LazyLock<Mutex<HashSet<i64>>> = LazyLock::new(Default::default);
+    static HELD: LazyLock<Mutex<HashSet<i64>>> = LazyLock::new(Default::default);
 
     /// `server_id` connects under the product's budget, not the test build's
     /// 1 s (see `connect_timeout`).
     pub(crate) fn give_product_budget(server_id: i64) {
+        HELD.lock().unwrap_or_else(|e| e.into_inner()).remove(&server_id);
         PRODUCT_BUDGET.lock().unwrap_or_else(|e| e.into_inner()).insert(server_id);
     }
 
-    /// `server_id` is held to the test build's 1 s again: for a test whose
-    /// subject is the give-up itself.
+    /// `server_id` is held to the test build's 1 s, an OAuth one too: for a
+    /// test whose subject is the give-up itself.
     pub(crate) fn hold_to_test_budget(server_id: i64) {
         PRODUCT_BUDGET.lock().unwrap_or_else(|e| e.into_inner()).remove(&server_id);
+        HELD.lock().unwrap_or_else(|e| e.into_inner()).insert(server_id);
     }
 
-    pub(super) fn has_product_budget(server_id: i64) -> bool {
-        PRODUCT_BUDGET.lock().unwrap_or_else(|e| e.into_inner()).contains(&server_id)
+    pub(super) fn has_product_budget(config: &McpServerConfig) -> bool {
+        !HELD.lock().unwrap_or_else(|e| e.into_inner()).contains(&config.id)
+            && (config.auth_mode == "oauth"
+                || PRODUCT_BUDGET.lock().unwrap_or_else(|e| e.into_inner()).contains(&config.id))
     }
 }
 
@@ -494,7 +506,7 @@ async fn connect_unspanned(pool: &sqlx::PgPool, config: &McpServerConfig) -> Res
         stale: stale.clone(),
     };
     let name = config.name.clone();
-    let timeout = connect_timeout(config.id);
+    let timeout = connect_timeout(config);
     let (pool, config) = (pool.clone(), config.clone());
     let connecting = async move {
         // An OAuth server's requests go through rmcp's `AuthClient`, which

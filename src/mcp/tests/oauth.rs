@@ -298,8 +298,8 @@ async fn test_a_sign_in_that_cannot_be_refreshed_is_reported_as_expired(pool: sq
 async fn test_the_status_check_and_a_tool_call_share_one_refresh(pool: sqlx::PgPool) {
     let mock = oauth_http::spawn().await;
     // The provider is held back below until both callers are waiting: the
-    // test's own doing, not a slow provider, and `create_server` gives its
-    // server the product's budget (SME-341: CI run 41381589266).
+    // test's own doing, not a slow provider, and an OAuth server has the
+    // product's budget (SME-341: CI run 41381589266; SME-501).
     let server = oauth_http::create_server(&pool, &mock, None).await;
     oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
     oauth_http::age_token(&pool, server.id).await;
@@ -489,4 +489,92 @@ async fn test_a_check_whose_refresh_loses_to_a_reconnect_tries_the_new_grant(poo
 
     assert_eq!(checked, Ok(vec!["echo".to_string()]), "the Reconnect's grant connects");
     evict(server.id).await;
+}
+
+/// An OAuth server made inline (not by `oauth_http::create_server`), as
+/// the browser tier's `oauth_sign_in_expired` makes it, whose provider
+/// takes 1.2 s over `/mcp`, the first request of each manager build's
+/// discovery, and 404s everything. Its grant is that scenario's: expired,
+/// with no refresh token. Returns the server and the `/mcp` hit count.
+async fn slow_discovery_server(pool: &sqlx::PgPool) -> (McpServerConfig, Arc<AtomicU32>, tokio::task::JoinHandle<()>) {
+    let hits = Arc::new(AtomicU32::new(0));
+    let app = axum::Router::new().route(
+        "/mcp",
+        axum::routing::any({
+            let hits = hits.clone();
+            move || async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                axum::http::StatusCode::NOT_FOUND
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind the provider");
+    let addr = listener.local_addr().expect("provider address");
+    let provider = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let id = next_server_id(pool).await;
+    let server = crate::db::create_mcp_server_config(
+        pool,
+        &format!("inline-oauth-{id}"),
+        &format!("http://{addr}/mcp"),
+        &HashMap::new(),
+        "oauth",
+        None,
+        None,
+    )
+    .await
+    .expect("create an OAuth server");
+    crate::db::set_mcp_server_oauth_credentials(
+        pool,
+        server.id,
+        Some(serde_json::json!({
+            "client_id": "client",
+            "token_response": {"access_token": "expired", "token_type": "bearer", "expires_in": 60},
+            "granted_scopes": [],
+            "token_received_at": 1_000_000_000u64,
+        })),
+    )
+    .await
+    .expect("store an expired grant");
+    (oauth_http::config(pool, server.id).await, hits, provider)
+}
+
+/// SME-501: an OAuth server's check includes its provider's round trips
+/// (discovery, maybe a refresh), so in a test build every OAuth server
+/// gets the product's connect budget, wherever its row was made. Made
+/// inline it ran on the test build's 1 s, and on a loaded runner the
+/// browser tier's expired sign-in read Unreachable.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_oauth_server_made_anywhere_gets_the_product_connect_budget(pool: sqlx::PgPool) {
+    let (config, hits, provider) = slow_discovery_server(&pool).await;
+
+    let checked = connection_check(&pool, &config).await;
+
+    evict(config.id).await;
+    provider.abort();
+    assert!(matches!(&checked, Err(CheckError::SignInExpired(_))), "{checked:?}");
+    let hits = hits.load(Ordering::SeqCst);
+    assert!(hits >= 1, "the check went through discovery: {hits} /mcp hits");
+}
+
+/// SME-501: a test whose subject is the give-up still holds its OAuth
+/// server to the test build's 1 s (`hold_to_test_budget`), over the
+/// OAuth default above.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_held_oauth_server_still_gives_up_at_the_test_budget(pool: sqlx::PgPool) {
+    let (config, _hits, provider) = slow_discovery_server(&pool).await;
+    crate::mcp::test_support::hold_to_test_budget(config.id);
+
+    let checked = connection_check(&pool, &config).await;
+
+    evict(config.id).await;
+    provider.abort();
+    // The error names the 1 s budget it gave up at: no wall-clock assert,
+    // which a starved runner could fail (SME-329).
+    assert!(
+        matches!(&checked, Err(CheckError::Unreachable(m)) if m.ends_with("within 1s")),
+        "{checked:?}"
+    );
 }

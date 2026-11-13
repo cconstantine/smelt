@@ -87,7 +87,7 @@ async fn stored_grant(pool: &sqlx::PgPool, server_id: i64) -> Option<serde_json:
 }
 
 pub(super) async fn check_sign_in(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<(), CheckError> {
-    let timeout = connect_timeout(config.id);
+    let timeout = connect_timeout(config);
     let token = tokio::time::timeout(timeout, async {
         let client = oauth_client(pool, config)
             .await
