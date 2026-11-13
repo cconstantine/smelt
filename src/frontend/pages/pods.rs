@@ -6,6 +6,7 @@ use crate::api::pods::{
     get_pods, get_stored_storage, remove_stored_storage, stop_pod,
 };
 use crate::frontend::Route;
+use crate::frontend::pages::SettingsCrumbs;
 use crate::frontend::pages::STORAGE_REMOVE_WARNING;
 
 /// A counter that goes up every time a pod is created or goes away, in
@@ -76,7 +77,7 @@ pub fn PodsIndex() -> Element {
     rsx! {
         div { class: "pods-page",
             div { class: "pods-header",
-                Link { to: Route::Home {}, class: "pods-back-link", "\u{2190} Back to conversations" }
+                SettingsCrumbs {}
                 h1 { "Sandboxes" }
                 p { class: "muted",
                     "Every sandbox that's running, in any conversation. Stopping one loses its terminals and any files outside /workspace and mounted volumes; the model is told, and starts a new one when it needs to."

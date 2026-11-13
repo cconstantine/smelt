@@ -140,25 +140,31 @@ async fn spell_notifies(page: &chromiumoxide::Page, id: i64) -> bool {
     false
 }
 
-/// A sidebar link to the providers page, and that page having loaded.
+/// The sidebar's Settings link, then Settings' link to the providers
+/// page, and that page having loaded: two client-side route changes.
 async fn to_providers(page: &chromiumoxide::Page) {
-    click_when_present(page, ".providers-link", Duration::from_secs(10)).await;
-    assert!(wait_pathname(page, "/providers", Duration::from_secs(10)).await, "the sidebar link didn't open /providers");
-    wait_for_element(page, ".mcp-back-link", Duration::from_secs(10)).await;
+    click_when_present(page, ".sidebar-settings-link", Duration::from_secs(10)).await;
+    assert!(wait_pathname(page, "/settings", Duration::from_secs(10)).await, "the sidebar link didn't open /settings");
+    click_when_present(page, ".settings-index .providers-link", Duration::from_secs(10)).await;
+    assert!(wait_pathname(page, "/providers", Duration::from_secs(10)).await, "Settings' link didn't open /providers");
+    wait_for_element(page, ".settings-home-link", Duration::from_secs(10)).await;
     // Whatever the route change was going to do to the notifier, done.
     tokio::time::sleep(Duration::from_secs(1)).await;
 }
 
-/// The browser's Back, and whatever it did settled.
+/// The browser's Back from `to_providers`' page to `path`: twice, by way
+/// of Settings (SME-512), and whatever it did settled.
 async fn browser_back(page: &chromiumoxide::Page, path: &str) {
     page.evaluate("history.back()").await.expect("go back");
+    assert!(wait_pathname(page, "/settings", Duration::from_secs(10)).await, "Back didn't return to /settings");
+    page.evaluate("history.back()").await.expect("go back again");
     assert!(wait_pathname(page, path, Duration::from_secs(10)).await, "Back didn't return to {path}");
     tokio::time::sleep(Duration::from_secs(1)).await;
 }
 
 /// The settings page's own link back to Home, and it settled.
 async fn back_link_home(page: &chromiumoxide::Page) {
-    click_when_present(page, ".mcp-back-link", Duration::from_secs(10)).await;
+    click_when_present(page, ".settings-home-link", Duration::from_secs(10)).await;
     assert!(wait_pathname(page, "/", Duration::from_secs(10)).await, "the back link didn't open Home");
     tokio::time::sleep(Duration::from_secs(1)).await;
 }
@@ -298,10 +304,12 @@ async fn tracked(page: &chromiumoxide::Page) -> usize {
         .expect("a count")
 }
 
-/// F2 through a real route to not leading: a click on another tab's page
-/// fires `focus`, which takes the lock back, but the sidebar button lets
-/// go of it for good. On the conversation the tab keeps what it showed,
-/// which its stream revalidates; leaving it, nothing would, so they close.
+/// F2 through a real route to not leading: the setting turned off lets
+/// go of the lock for good. On the conversation the tab keeps what it
+/// showed, which its stream revalidates; leaving it, nothing would, so
+/// they close. The toggle is on Settings (SME-512), so it's turned off
+/// from a second tab there, and the conversation's tab hears it as a
+/// `storage` event.
 pub(super) async fn scenario_notifier_setting_off_then_leaving(t: &Scenario<'_>) {
     const HEADING: &str = "smelt: the reply was cut off";
     let shown = t.conversation().await;
@@ -311,10 +319,14 @@ pub(super) async fn scenario_notifier_setting_off_then_leaving(t: &Scenario<'_>)
     assert!(spell_notifies(&page, other.id).await, "the leader notifies");
     assert!(wait_title(&page, "(1) smelt", Duration::from_secs(5)).await, "the count shows");
 
-    wait_toggle_label(&page, "Notifications on", Duration::from_secs(10)).await;
-    click_when_present(&page, ".notifications-toggle", Duration::from_secs(5)).await;
-    wait_toggle_label(&page, "Turn on notifications", Duration::from_secs(10)).await;
+    // The setting is already on in this browser: B boots with it.
+    let settings = stubbed_tab(t, t.url("settings")).await;
+    set_focus(&settings, false, false).await;
+    wait_toggle_label(&settings, "Notifications on", Duration::from_secs(10)).await;
+    click_when_present(&settings, ".notifications-toggle", Duration::from_secs(5)).await;
+    wait_toggle_label(&settings, "Turn on notifications", Duration::from_secs(10)).await;
     assert!(wait_until(|| async { !leads(&page).await }, Duration::from_secs(5)).await, "the setting off let the lock go");
+    assert!(!leads(&settings).await, "and the Settings tab doesn't take it");
     tokio::time::sleep(Duration::from_millis(700)).await;
     assert_eq!(tracked(&page).await, 1, "on the conversation the tab keeps what it showed");
     assert!(wait_title(&page, "(1) smelt", Duration::from_secs(1)).await, "and its count");

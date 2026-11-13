@@ -22,13 +22,15 @@
         display: block;
     }
 
-    .sidebar:not(.sidebar-open) .sidebar-body {
+    .sidebar:not(.sidebar-open) .sidebar-body,
+    .sidebar:not(.sidebar-open) .sidebar-footer {
         display: none;
     }
 
+    /* The list scrolls inside the drawer's 60vh; the Settings link sits
+       below it, the drawer's last row (SME-512). */
     .sidebar-open .sidebar-body {
         max-height: 60vh;
-        overflow-y: auto;
     }
 
     /* The conversation first; the sandbox and task panels below it. */

@@ -1,48 +1,22 @@
 /* --- Pods (SME-26) --- */
 
-/* The sidebar's settings links: one compact block of two columns
-   (SME-123 DR4), not a full-width button each. */
-.settings-links {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 2px 8px;
-    padding: 6px 0;
-    border-top: 1px solid var(--border);
-    border-bottom: 1px solid var(--border);
-}
-
-.settings-link {
-    display: block;
-    padding: 4px 6px;
-    border-radius: 6px;
-    color: var(--text-2);
-    font-size: 13px;
-    text-decoration: none;
-}
-
-.settings-link:hover {
-    background: var(--subtle);
-    color: var(--ink);
-}
-
-/* The notifications button (SME-71) sits among the settings links and
-   reads like them — a button, not a link, since it changes state rather
-   than navigating. Full width across the two-column grid: its longest
-   label ("Notifications aren't supported in this browser", 45
-   characters) wraps to two lines in the 272 px sidebar. Colour tokens
-   carry both themes, as everywhere else; `:disabled` keeps a browser
-   from greying it its own way. */
+/* The notifications button (SME-71), on the Settings page under "This
+   browser" (SME-512): a bordered button, since it changes state rather
+   than navigating. Its longest label ("Notifications aren't supported
+   in this browser", 45 characters) wraps within a phone's width. Colour
+   tokens carry both themes, as everywhere else; `:disabled` keeps a
+   browser from greying it its own way. */
 .notifications-toggle {
-    grid-column: 1 / -1;
-    width: 100%;
-    padding: 4px 6px;
-    border: 0;
-    border-radius: 6px;
-    background: none;
+    max-width: 100%;
+    padding: 8px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--surface);
     color: var(--text-2);
     font-family: inherit;
-    font-size: 13px;
+    font-size: 14px;
     text-align: left;
+    cursor: pointer;
 }
 
 .notifications-toggle:hover:not(:disabled) {
@@ -114,16 +88,66 @@
     margin-bottom: 24px;
 }
 
-.pods-back-link {
-    display: inline-block;
+/* Every settings page's breadcrumb (SME-512): Conversations › Settings,
+   with the page's own h1 as the last crumb. */
+.settings-crumbs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 6px;
     margin-bottom: 12px;
-    color: var(--text-2);
     font-size: 13px;
+}
+
+.settings-crumbs a {
+    color: var(--text-2);
     text-decoration: none;
 }
 
-.pods-back-link:hover {
+.settings-crumbs a:hover {
     color: var(--ink);
+}
+
+.settings-crumb-separator {
+    color: var(--muted);
+}
+
+/* The Settings index (SME-512): one row per settings page. */
+.settings-entries {
+    list-style: none;
+    margin: 0 0 32px;
+    padding: 0;
+    border-top: 1px solid var(--border);
+}
+
+.settings-entry {
+    padding: 12px 0;
+    border-bottom: 1px solid var(--border);
+}
+
+.settings-entry p {
+    margin: 4px 0 0;
+    font-size: 13px;
+}
+
+.settings-entry-link {
+    color: var(--ink);
+    font-weight: 600;
+    text-decoration: none;
+}
+
+.settings-entry-link:hover {
+    color: var(--accent);
+}
+
+.settings-browser h2 {
+    font-size: 16px;
+    margin: 0 0 4px;
+}
+
+.settings-browser p {
+    margin: 0 0 12px;
+    font-size: 13px;
 }
 
 .pods-table {

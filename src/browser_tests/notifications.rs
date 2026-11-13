@@ -293,8 +293,12 @@ pub(super) async fn scenario_desktop_notifications(t: &Scenario<'_>) {
     wait_for_resource(&b, "/api/providers").await;
     set_focus(&b, false, false).await;
 
-    // 1. The sidebar button turns it on: permission asked in the click
-    //    (the stub grants), the setting stored, one confirmation shown.
+    // 1. The button on Settings turns it on: permission asked in the
+    //    click (the stub grants), the setting stored, one confirmation
+    //    shown. A reaches Settings by the sidebar's link, a client-side
+    //    route change that keeps its notifier (F2), and comes back.
+    click_when_present(&a, ".sidebar-settings-link", Duration::from_secs(10)).await;
+    assert!(wait_pathname(&a, "/settings", Duration::from_secs(10)).await, "the sidebar link didn't open /settings");
     wait_toggle_label(&a, "Turn on notifications", Duration::from_secs(10)).await;
     click_when_present(&a, ".notifications-toggle", Duration::from_secs(5)).await;
     let (disabled, pressed) = wait_toggle_label(&a, "Notifications on", Duration::from_secs(10)).await;
@@ -315,6 +319,12 @@ pub(super) async fn scenario_desktop_notifications(t: &Scenario<'_>) {
     for tab in [&a, &b] {
         tab.evaluate("window.__notifications.length = 0").await.expect("clear the records");
     }
+    a.evaluate("history.back()").await.expect("go back to the conversation");
+    assert!(
+        wait_pathname(&a, &format!("/conversation/{}", home.id), Duration::from_secs(10)).await,
+        "Back didn't return to the conversation"
+    );
+    wait_for_live_client(&a, home.id).await;
 
     // 2. A turn ending on a question notifies — exactly one browser, one
     //    tab, and it says what the card says.
@@ -480,6 +490,8 @@ pub(super) async fn scenario_desktop_notifications(t: &Scenario<'_>) {
     for tab in [&a, &b, &c] {
         tab.evaluate("window.__notifications.length = 0").await.expect("clear the records");
     }
+    click_when_present(&a, ".sidebar-settings-link", Duration::from_secs(10)).await;
+    assert!(wait_pathname(&a, "/settings", Duration::from_secs(10)).await, "the sidebar link didn't open /settings");
     click_when_present(&a, ".notifications-toggle", Duration::from_secs(5)).await;
     let (disabled, _) = wait_toggle_label(&a, "Turn on notifications", Duration::from_secs(10)).await;
     assert!(!disabled);
@@ -497,9 +509,9 @@ pub(super) async fn scenario_desktop_notifications(t: &Scenario<'_>) {
     //    127.0.0.1 tab (SME-146: writes from the plain-HTTP name can be
     //    refused).
     let port = t.harness.base_url.trim_end_matches('/').rsplit(':').next().unwrap_or_default().to_string();
-    let d = stubbed_tab(t, format!("http://{INSECURE_HOST}:{port}/conversation/{}", home.id)).await;
-    wait_for_live_client(&d, home.id).await;
-    set_focus(&d, false, true).await;
+    //    The button is read on Settings (SME-512), first.
+    let insecure = format!("http://{INSECURE_HOST}:{port}");
+    let d = stubbed_tab(t, format!("{insecure}/settings")).await;
     let (disabled, pressed) =
         wait_toggle_label(&d, "Desktop notifications need HTTPS", Duration::from_secs(10)).await;
     assert!(disabled && !pressed, "the plain-HTTP button is disabled and unpressed");
@@ -511,6 +523,40 @@ pub(super) async fn scenario_desktop_notifications(t: &Scenario<'_>) {
         .expect("a string");
     assert!(hint.contains("https://localhost:8443"), "the hint names the one origin that works: {hint}");
     assert!(recorded(&d).await.is_empty(), "no Notification is even constructed here");
+
+    // 8. The button on a phone, and the widest label wrapping inside its
+    //    section — on D, which always shows its widest one.
+    d.execute(SetDeviceMetricsOverrideParams::new(390, 844, 2.0, true)).await.expect("emulate a phone");
+    let phone: Vec<f64> = d
+        .evaluate(
+            "(() => { const r = document.querySelector('.settings-browser .notifications-toggle').getBoundingClientRect(); \
+             return [r.right, document.documentElement.scrollWidth - document.documentElement.clientWidth]; })()",
+        )
+        .await
+        .expect("measure on a phone")
+        .into_value()
+        .expect("numbers");
+    assert!(phone[0] <= 390.0, "the button is on screen at 390 px: {phone:?}");
+    assert!(phone[1] <= 0.0, "no sideways scroll with the button at 390 px: {phone:?}");
+    d.execute(SetDeviceMetricsOverrideParams::new(721, 900, 1.0, false)).await.expect("emulate a small laptop");
+    let laptop: Vec<f64> = d
+        .evaluate(
+            "(() => { const b = document.querySelector('.notifications-toggle').getBoundingClientRect(); \
+             const s = document.querySelector('.settings-browser').getBoundingClientRect(); \
+             return [b.right, s.right, document.documentElement.scrollWidth - document.documentElement.clientWidth]; })()",
+        )
+        .await
+        .expect("measure at 721 px")
+        .into_value()
+        .expect("numbers");
+    assert!(laptop[0] <= laptop[1] + 1.0, "the widest label wraps inside its section: {laptop:?}");
+    assert!(laptop[2] <= 0.0, "no sideways scroll at 721 px: {laptop:?}");
+
+    //    Then the title count, which a conversation's own stream keeps.
+    d.goto(format!("{insecure}/conversation/{}", home.id)).await.expect("open the conversation over plain HTTP");
+    wait_for_live_client(&d, home.id).await;
+    set_focus(&d, false, true).await;
+    assert!(recorded(&d).await.is_empty(), "no Notification is constructed on the conversation either");
 
     // A plain reply counts nothing (SME-377): only the model's
     // notify_user, below, owes the user anything.
@@ -528,47 +574,4 @@ pub(super) async fn scenario_desktop_notifications(t: &Scenario<'_>) {
     assert!(wait_title(&d, "smelt", Duration::from_secs(5)).await, "the focused tab has nothing to count");
     let back = favicon_href(&d).await;
     assert!(!back.contains("favicon-dot"), "the favicon swaps back: {back}");
-
-    // 8. The button in the phone drawer, and the widest label wrapping
-    //    inside the sidebar — on D, which always shows its widest one.
-    d.execute(SetDeviceMetricsOverrideParams::new(390, 844, 2.0, true)).await.expect("emulate a phone");
-    click_when_present(&d, ".sidebar-toggle", Duration::from_secs(5)).await;
-    assert!(
-        wait_until(
-            || async {
-                d.evaluate("document.querySelector('.notifications-toggle').offsetParent !== null")
-                    .await
-                    .ok()
-                    .and_then(|v| v.into_value::<bool>().ok())
-                    == Some(true)
-            },
-            Duration::from_secs(5)
-        )
-        .await,
-        "the button sits in the opened sidebar list on a phone"
-    );
-    let phone: Vec<f64> = d
-        .evaluate(
-            "(() => { const r = document.querySelector('.notifications-toggle').getBoundingClientRect(); \
-             return [r.right, document.documentElement.scrollWidth - document.documentElement.clientWidth]; })()",
-        )
-        .await
-        .expect("measure on a phone")
-        .into_value()
-        .expect("numbers");
-    assert!(phone[0] <= 390.0, "the button is on screen at 390 px: {phone:?}");
-    assert!(phone[1] <= 0.0, "no sideways scroll with the button at 390 px: {phone:?}");
-    d.execute(SetDeviceMetricsOverrideParams::new(721, 900, 1.0, false)).await.expect("emulate a small laptop");
-    let laptop: Vec<f64> = d
-        .evaluate(
-            "(() => { const b = document.querySelector('.notifications-toggle').getBoundingClientRect(); \
-             const s = document.querySelector('.sidebar').getBoundingClientRect(); \
-             return [b.right, s.right, document.documentElement.scrollWidth - document.documentElement.clientWidth]; })()",
-        )
-        .await
-        .expect("measure at 721 px")
-        .into_value()
-        .expect("numbers");
-    assert!(laptop[0] <= laptop[1] + 1.0, "the widest label wraps inside the sidebar: {laptop:?}");
-    assert!(laptop[2] <= 0.0, "no sideways scroll at 721 px: {laptop:?}");
 }
