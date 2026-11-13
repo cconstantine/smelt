@@ -89,6 +89,21 @@ class Usage(FakeCase):
             with self.subTest(name):
                 self.assertEqual(self.verdict(*windows), expected)
 
+    # Round 1 B-L4: only the seven-day pace counts (the verdict, the UI), so
+    # only it prints.
+    def test_only_the_seven_day_pace_prints(self):
+        self.st.usage[7] = usage(7, [
+            window("five_hour", 0.30, elapsed_fraction=0.15, projected=2.1),
+            window("seven_day", 0.32, elapsed_fraction=0.5, projected=0.64),
+        ])
+        r = self.api("usage", "7")
+        lines = r.stdout.splitlines()
+        self.assertNotIn("pace", lines[0])
+        self.assertIn("pace 64%", lines[1])
+        self.assertEqual(lines[2].split(), ["verdict", "ok"])
+        out = json.loads(self.api("usage", "7", "--json").stdout)
+        self.assertEqual([w["projected"] for w in out["windows"]], [None, 0.64])
+
     def test_a_reset_passed_window_prints_reset_since(self):
         self.st.usage[7] = usage(7, [window("five_hour", 0.95, reset_passed=True)])
         r = self.api("usage", "7")

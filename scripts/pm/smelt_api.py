@@ -224,20 +224,22 @@ def usage_windows(answer):
     """The whitelisted fields of each window in a ProviderUsage answer
     (SME-486): numbers, booleans, minute times, and a name or status
     that is a plain word (else `(unnamed)` / `(unknown)`). Nothing else
-    of the answer is kept."""
+    of the answer is kept. Only seven_day keeps its pace (`projected`):
+    it's the only pace the verdict and the UI use."""
     windows = answer.get("windows") if isinstance(answer, dict) else None
     out = []
     for w in windows if isinstance(windows, list) else []:
         if not isinstance(w, dict):
             continue
+        name = _word(w.get("name"), "(unnamed)")
         out.append({
-            "name": _word(w.get("name"), "(unnamed)"),
+            "name": name,
             "utilization": _number(w.get("utilization")) or 0.0,
             "status": _word(w.get("status"), "(unknown)"),
             "resets_at": _time(w.get("resets_at")),
             "seen_at": _time(w.get("seen_at")),
             "reset_passed": w.get("reset_passed") is True,
-            "projected": _number(w.get("projected")),
+            "projected": _number(w.get("projected")) if name == "seven_day" else None,
         })
     return out
 
