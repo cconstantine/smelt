@@ -3,9 +3,10 @@ usage windows and the PM's hold/ok verdict, against
 scripts/pm/fake_smelt.py."""
 
 import json
+import os
 
 from fake_smelt import usage, window
-from helpers import FakeCase
+from helpers import PM, FakeCase
 
 USAGE_7 = ("GET", "/api/providers/7/usage")
 
@@ -107,6 +108,18 @@ class Usage(FakeCase):
         lines = self.api("usage", "7").stdout.splitlines()
         self.assertEqual(lines[0].split()[1], "13%", "a half rounds up")
         self.assertEqual(lines[1].split()[1], "63%", "a half rounds up")
+
+    # Round 1 B-L2: the usage check is part of the PM's wake handling, and
+    # a held Driver's STALL is answered without messaging it.
+    def test_the_watching_section_checks_usage_and_answers_a_held_stall(self):
+        doc = os.path.join(os.path.dirname(os.path.dirname(PM)), "docs", "personas", "pm-in-smelt.md")
+        with open(doc, encoding="utf-8") as f:
+            watching = f.read().split("\n## Watching\n", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("smelt-api usage", watching)
+        stall = [line for line in watching.splitlines() if line.strip().startswith("| `STALL`")]
+        self.assertEqual(len(stall), 1, watching)
+        self.assertIn("usage hold", stall[0].lower())
+        self.assertIn("without messaging", stall[0])
 
     # Round 1 B-L4: only the seven-day pace counts (the verdict, the UI), so
     # only it prints.
