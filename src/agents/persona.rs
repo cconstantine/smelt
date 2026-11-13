@@ -6,7 +6,7 @@
 use super::*;
 
 /// A persona's path in a checkout.
-fn persona_file(name: &str) -> String {
+pub(crate) fn persona_file(name: &str) -> String {
     format!(".agents/personas/{name}.md")
 }
 
@@ -124,7 +124,21 @@ pub(crate) async fn snapshot(
         // Named as start_agent takes it, `<repo dir>:<name>`, like the other
         // refusals (SME-368; SME-386 A8).
         .ok_or_else(|| format!("no persona `{}:{name}` in {} at {at}", repo.dir, repo.url))?;
-    let persona = crate::personas::parse(&rel, &file.content, file.file_bytes.max(0) as u64)?;
+    snapshot_from(&rel, &file.content, file.file_bytes.max(0) as u64, repo, repo.commit_sha.clone())
+}
+
+/// The persona file `rel` of `repo`'s checkout, read as `content` at
+/// `commit`, parsed into a snapshot: `snapshot`'s step, and a refresh's
+/// (SME-516), so the two can't drift.
+pub(crate) fn snapshot_from(
+    rel: &str,
+    content: &str,
+    file_bytes: u64,
+    repo: &db::ConversationRepo,
+    commit: Option<String>,
+) -> Result<db::PersonaSnapshot, String> {
+    let at = commit.as_deref().unwrap_or("its ref");
+    let persona = crate::personas::parse(rel, content, file_bytes)?;
     let checkout_dir = format!("{}/{}", crate::sandbox::WORKSPACE_DIR, repo.dir);
     let body = crate::personas::links::absolute(&persona.instructions, &format!("{checkout_dir}/.agents/personas"));
     if !persona.ignored.is_empty() {
@@ -138,7 +152,7 @@ pub(crate) async fn snapshot(
     Ok(db::PersonaSnapshot {
         name: persona.name,
         path: format!("{checkout_dir}/{rel}"),
-        commit: repo.commit_sha.clone(),
+        commit,
         body,
         // `tools` rides along so the start can append it to the child's
         // rule chain without re-reading the file (SME-241);

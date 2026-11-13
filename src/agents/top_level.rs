@@ -21,18 +21,28 @@ pub(crate) const PERSONA_PENDING_TEXT: &str =
 /// The set, as `POST /api/conversations/{id}/persona` runs it: in a task
 /// the request awaits (SME-354 B7's pattern), so a hung-up client can't
 /// stop it between its steps.
-pub(crate) async fn set_persona(pool: &PgPool, id: i64, persona: &str) -> Result<SetPersona, String> {
-    let (pool, persona) = (pool.clone(), persona.to_string());
-    tokio::spawn(tracing::Instrument::in_current_span(async move { set_in_task(&pool, id, &persona).await }))
-        .await
-        .map_err(|e| format!("the persona's set didn't finish: {e}"))?
+pub(crate) async fn set_persona(pool: &PgPool, id: i64, persona: &str, commit: Option<&str>) -> Result<SetPersona, String> {
+    let (pool, persona, commit) = (pool.clone(), persona.to_string(), commit.map(str::to_string));
+    tokio::spawn(tracing::Instrument::in_current_span(async move {
+        set_in_task(&pool, id, &persona, commit.as_deref()).await
+    }))
+    .await
+    .map_err(|e| format!("the persona's set didn't finish: {e}"))?
 }
 
-async fn set_in_task(pool: &PgPool, id: i64, persona: &str) -> Result<SetPersona, String> {
+async fn set_in_task(pool: &PgPool, id: i64, persona: &str, commit: Option<&str>) -> Result<SetPersona, String> {
     persona::check_name(persona)?;
     let (Some(dir), name) = persona::split_name(persona) else {
         return Err(format!("name the persona with its repo, as `<repo dir>:{persona}` (the picker and list_personas name it so)"));
     };
+    // An applied persona is refreshed, not set (SME-516).
+    let row = db::get_top_level_persona(pool, id).await.map_err(|e| format!("couldn't read the conversation's persona: {e}"))?;
+    if let Some(row) = row.filter(|row| row.applied) {
+        return crate::agents::top_level_refresh::refresh(pool, id, &row, dir, name, commit).await;
+    }
+    if commit.is_some() {
+        return Err("a first set reads the checkout as it is; commit is for a refresh".to_string());
+    }
     match crate::turn::between_turns(id, false, || apply(pool, id, dir, name)).await {
         Some(result) => result,
         None => Err(db::PERSONA_STARTED.to_string()),
@@ -208,7 +218,7 @@ async fn restore_prior(pool: &PgPool, id: i64, checkout: &dyn ChildCheckout, pri
 }
 
 /// The conversation's `ready` checkout `dir`.
-async fn ready_checkout(pool: &PgPool, id: i64, dir: &str) -> Result<db::ConversationRepo, String> {
+pub(super) async fn ready_checkout(pool: &PgPool, id: i64, dir: &str) -> Result<db::ConversationRepo, String> {
     let repos = db::list_conversation_repos(pool, id)
         .await
         .map_err(|e| format!("couldn't read this conversation's repos: {e}"))?;
@@ -222,7 +232,7 @@ async fn ready_checkout(pool: &PgPool, id: i64, dir: &str) -> Result<db::Convers
     }
 }
 
-fn untrusted(repo: &db::ConversationRepo) -> String {
+pub(super) fn untrusted(repo: &db::ConversationRepo) -> String {
     format!("the user doesn't trust {}, so its personas can't be used", repo.url)
 }
 
@@ -266,7 +276,7 @@ async fn persona_model(
 }
 
 /// The persona the conversation is set to, with the model it's on now.
-async fn set_of(pool: &PgPool, id: i64) -> Result<Option<SetPersona>, String> {
+pub(super) async fn set_of(pool: &PgPool, id: i64) -> Result<Option<SetPersona>, String> {
     let e = |e: sqlx::Error| format!("couldn't read the conversation's persona: {e}");
     let Some(row) = db::get_top_level_persona(pool, id).await.map_err(e)? else {
         return Ok(None);
@@ -284,8 +294,14 @@ async fn set_of(pool: &PgPool, id: i64) -> Result<Option<SetPersona>, String> {
         applied: row.applied,
         model: choice.as_ref().map(|c| c.model.clone()),
         provider: choice.map(|c| c.provider_name),
+        settings: row.persona_settings,
+        refresh: crate::agents::top_level_refresh::refresh_of(id),
     }))
 }
+
+/// `can_set` for an applied persona (SME-516).
+pub(crate) const REFRESH_ONLY_TEXT: &str = "this conversation has started: its persona can only be refreshed — the same \
+     persona, at a commit on its remote's default branch";
 
 /// `GET /api/conversations/{id}/persona`: the persona it's set to, or why
 /// it can't take one, or the options — each ready checkout's persona
@@ -297,7 +313,7 @@ pub(crate) async fn get_persona(pool: &PgPool, id: i64) -> Result<TopLevelPerson
         return Err("this conversation no longer exists".to_string());
     }
     if let Some(set) = set_of(pool, id).await? {
-        let can_set = Some(if set.applied { db::PERSONA_STARTED.to_string() } else { PERSONA_PENDING_TEXT.to_string() });
+        let can_set = Some(if set.applied { REFRESH_ONLY_TEXT.to_string() } else { PERSONA_PENDING_TEXT.to_string() });
         return Ok(TopLevelPersona { set: Some(set), can_set, ..Default::default() });
     }
     let can_set = if db::conversation_parent(pool, id).await.map_err(e)?.is_some() {

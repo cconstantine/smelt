@@ -34,6 +34,25 @@ pub struct SetPersona {
     /// The model and provider the conversation is on now.
     pub model: Option<String>,
     pub provider: Option<String>,
+    /// The snapshot's `persona_settings` (SME-516): `compact_at`, `tools`,
+    /// `credentials` (names only, never a value), `resources`, `ignored`.
+    pub settings: serde_json::Value,
+    /// The last refresh asked for since smelt started, if any.
+    pub refresh: Option<RefreshState>,
+}
+
+/// A refresh of an applied persona (SME-516), as last asked for.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RefreshState {
+    /// `pending` (it applies when the conversation's current turn ends),
+    /// `applied` or `refused`.
+    pub state: String,
+    /// The commit it reads, once resolved.
+    pub commit: Option<String>,
+    /// Why it was refused.
+    pub why: Option<String>,
+    /// When it reached this state.
+    pub at: chrono::NaiveDateTime,
 }
 
 /// One persona the conversation can be set to.
@@ -53,8 +72,14 @@ pub async fn get_top_level_persona(id: i64) -> ServerFnResult<TopLevelPersona> {
 }
 
 /// Sets the conversation to `persona` (`<dir>:<name>`), once, after its
-/// repo is attached and before its first message.
+/// repo is attached and before its first message. On a conversation whose
+/// persona is applied, it refreshes it instead (SME-516): the same persona
+/// read at `commit`, which must be on its remote's default branch (that
+/// branch's tip when `None`); `refresh` in the answer says whether it
+/// applied or waits for the current turn to end.
 #[post("/api/conversations/{id}/persona")]
-pub async fn set_top_level_persona(id: i64, persona: String) -> ServerFnResult<SetPersona> {
-    crate::agents::top_level::set_persona(crate::db::get(), id, &persona).await.map_err(ServerFnError::new)
+pub async fn set_top_level_persona(id: i64, persona: String, commit: Option<String>) -> ServerFnResult<SetPersona> {
+    crate::agents::top_level::set_persona(crate::db::get(), id, &persona, commit.as_deref())
+        .await
+        .map_err(ServerFnError::new)
 }

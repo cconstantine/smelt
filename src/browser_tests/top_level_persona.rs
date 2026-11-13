@@ -62,6 +62,16 @@ impl crate::agents::ChildCheckout for FakePersonas {
     ) -> Boxed<'a, Result<Option<db::InstructionsFile>, String>> {
         Box::pin(async move { Ok(self.file(rel)) })
     }
+    fn persona_at<'a>(
+        &'a self,
+        _: &'a sqlx::PgPool,
+        _: i64,
+        _: &'a str,
+        _: &'a str,
+        _: Option<&'a str>,
+    ) -> Boxed<'a, Result<(String, String), String>> {
+        Box::pin(async { Err("this fake has no commits".to_string()) })
+    }
 }
 
 impl FakePersonas {

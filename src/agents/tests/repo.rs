@@ -41,6 +41,12 @@ pub(super) struct FakeCheckout {
     pub files_after_reprovision: Option<std::collections::HashMap<String, String>>,
     /// What `reprovision` fails with, when set.
     pub reprovision_error: Option<String>,
+    /// Files on the default branch by `(commit, path)` (SME-516): what
+    /// `persona_at` reads; `default_tip` is the commit `None` means.
+    pub commit_files: Mutex<std::collections::HashMap<(String, String), String>>,
+    pub default_tip: Mutex<Option<String>>,
+    /// Commits `persona_at` refuses as not on the default branch.
+    pub side_commits: Vec<String>,
 }
 
 impl ChildCheckout for FakeCheckout {
@@ -170,6 +176,27 @@ impl ChildCheckout for FakeCheckout {
                 hash: "h".to_string(),
                 commit: None,
             }))
+        })
+    }
+
+    fn persona_at<'a>(
+        &'a self,
+        _pool: &'a PgPool,
+        _conversation: i64,
+        _dir: &'a str,
+        rel: &'a str,
+        commit: Option<&'a str>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(String, String), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let sha = match commit {
+                Some(c) => c.to_string(),
+                None => self.default_tip.lock().expect("tip").clone().ok_or("this fake has no default branch")?,
+            };
+            if self.side_commits.contains(&sha) {
+                return Err(format!("{sha} isn't on origin/main: a refresh reads only commits on the remote's default branch"));
+            }
+            let file = self.commit_files.lock().expect("commit files").get(&(sha.clone(), rel.to_string())).cloned();
+            file.map(|content| (sha.clone(), content)).ok_or_else(|| format!("no file {rel} at {sha}"))
         })
     }
 }

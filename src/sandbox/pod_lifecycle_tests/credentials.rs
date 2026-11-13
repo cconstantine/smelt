@@ -469,7 +469,7 @@ async fn test_setting_a_keyless_persona_removes_the_attach_key_from_the_pod(pool
         let root = root_with_checkout(&pool, &client).await;
         let pod = wait_pod_id(&pool, root).await;
         sh_ok(&client, pod, "test -e /etc/smelt/keys/id_ed25519").await;
-        let set = crate::agents::top_level::set_persona(&pool, root, "origin:keeper").await.expect("the set");
+        let set = crate::agents::top_level::set_persona(&pool, root, "origin:keeper", None).await.expect("the set");
         assert!(set.applied, "{set:?}");
         assert_eq!(sh_ok(&client, pod, "ls -A /etc/smelt/keys").await, "", "the attach's key is gone");
         let offered = sh_ok(&client, pod, "grep -c IdentityFile /etc/smelt/ssh_config || true").await;

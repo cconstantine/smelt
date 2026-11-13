@@ -404,3 +404,28 @@ async fn test_a_skipped_ceiling_compaction_turns_the_ceiling_off_for_the_turn(po
     with_compaction_progress(id, |p| p.set_ceiling(Some(AT)));
     assert_eq!(with_compaction_progress(id, |p| p.ceiling_due(Some(AT * 2))), Some(AT), "the next turn's start tries again");
 }
+
+/// R10 (SME-516's done-when): a seat set at a snapshot with no ceiling
+/// runs past 120,000 without compacting; refreshed at a commit whose file
+/// says `compact_at: 120000`, its next turn compacts before its first call.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_seat_refreshed_to_a_ceiling_compacts_at_it_from_its_next_turn(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("clear ids");
+    let bodies = vec![todoread_at("toolu_1", 100_000), text_at("one", 130_000), text_reply_body("SUMMARY-R"), text_at("two", 9_000)];
+    let requests = start_recording_mock_upstream(&pool, bodies).await;
+    set_window(&pool).await;
+    let (id, newer) = crate::agents::tests::top_level_refresh::applied_without_a_ceiling(&pool).await;
+    run_turn(&pool, id, hello()).await.expect("turn 1");
+    assert!(dividers(&pool, id).await.is_empty(), "no ceiling yet: 130,000 compacts nothing");
+
+    let refreshed = crate::agents::top_level::set_persona(&pool, id, "app:driver", Some(newer)).await.expect("the refresh");
+    assert_eq!(refreshed.refresh.map(|r| r.state), Some("applied".to_string()));
+    run_turn(&pool, id, hello()).await.expect("turn 2");
+
+    let recorded = requests.lock().expect("the request log").clone();
+    assert_eq!(summary_calls(&recorded), vec![2], "turn 2's first request is the summary: {recorded:#?}");
+    let reason = "it passed its persona's 120,000-token ceiling".to_string();
+    assert_eq!(dividers(&pool, id).await, vec![("SUMMARY-R".to_string(), Some(reason))]);
+    assert_eq!(last_reply(&db::list_messages(&pool, id).await.expect("messages")).as_deref(), Some("two"));
+}

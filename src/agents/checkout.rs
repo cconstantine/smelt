@@ -69,6 +69,19 @@ pub(crate) trait ChildCheckout: Send + Sync {
         dir: &'a str,
         rel: &'a str,
     ) -> Boxed<'a, Result<Option<db::InstructionsFile>, String>>;
+
+    /// Reads `rel` in the conversation's checkout `dir` at `commit` (the
+    /// default branch's tip when `None`), which must be on the remote's
+    /// default branch after a fetch (SME-516: a refresh's input), with that
+    /// commit's full id.
+    fn persona_at<'a>(
+        &'a self,
+        pool: &'a PgPool,
+        conversation: i64,
+        dir: &'a str,
+        rel: &'a str,
+        commit: Option<&'a str>,
+    ) -> Boxed<'a, Result<(String, String), String>>;
 }
 
 /// The real checkout: the child's own pod.
@@ -160,6 +173,22 @@ impl ChildCheckout for PodCheckout {
                 .map_err(|e| format!("couldn't reach the agent's sandbox: {e}"))?;
             let checkout = format!("{}/{dir}", crate::sandbox::WORKSPACE_DIR);
             crate::git::read_instructions_file(&shell, &checkout, &format!("{checkout}/{rel}")).await
+        })
+    }
+
+    fn persona_at<'a>(
+        &'a self,
+        pool: &'a PgPool,
+        conversation: i64,
+        dir: &'a str,
+        rel: &'a str,
+        commit: Option<&'a str>,
+    ) -> Boxed<'a, Result<(String, String), String>> {
+        Box::pin(async move {
+            let shell = crate::sandbox::PodShell::for_conversation(pool, conversation)
+                .await
+                .map_err(|e| format!("couldn't reach the conversation's sandbox to read its persona: {e}"))?;
+            crate::git::persona_at_default_branch(&shell, dir, rel, commit).await
         })
     }
 }

@@ -130,6 +130,70 @@ pub async fn insert_top_level_persona(pool: &PgPool, new: &NewTopLevelPersona<'_
     Ok(InsertTopLevel::Inserted)
 }
 
+/// A refresh's transaction (SME-516): the remote's trust lock, the trust
+/// read again under it, and the row, still applied and at `snapshot`'s
+/// path, rewritten with the new snapshot, chain and Rule G bit. `prior_*`,
+/// `created_at` and `applied_at` stay. `Some(why)` is a refusal, which
+/// writes nothing.
+pub async fn refresh_top_level_persona(
+    pool: &PgPool,
+    id: i64,
+    remote_key: &str,
+    snapshot: &PersonaSnapshot,
+    git_ssh: bool,
+) -> Result<Option<String>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    lock_remote_trust(&mut *tx, remote_key).await?;
+    let deleting = sqlx::query_scalar::<_, Option<NaiveDateTime>>(
+        "SELECT deleting_at FROM conversations WHERE id = $1 FOR NO KEY UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    match deleting {
+        None => return Ok(Some("this conversation no longer exists".to_string())),
+        Some(Some(_)) => return Ok(Some("this conversation is being deleted".to_string())),
+        Some(None) => {}
+    }
+    if get_repo_trust(&mut *tx, remote_key).await? != Some(true) {
+        return Ok(Some("the user doesn't trust this repo's remote, so its personas can't be used".to_string()));
+    }
+    let path = sqlx::query_scalar::<_, String>(
+        "SELECT persona_path FROM top_level_personas WHERE conversation_id = $1 AND applied_at IS NOT NULL FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    match path {
+        None => return Ok(Some("this conversation's persona is no longer applied".to_string())),
+        Some(path) if path != snapshot.path => {
+            return Ok(Some(format!("this conversation's persona is now {path}, not {}", snapshot.path)))
+        }
+        Some(_) => {}
+    }
+    let chain = snapshot
+        .settings
+        .get("tools")
+        .filter(|tools| !tools.is_null())
+        .map(|tools| serde_json::Value::Array(vec![tools.clone()]));
+    let credentials: Vec<String> = if git_ssh { vec![crate::credentials::CREDENTIAL_GIT_SSH.to_string()] } else { Vec::new() };
+    sqlx::query(
+        "UPDATE top_level_personas SET persona_commit = $2, persona_body = $3, persona_settings = $4,
+             rule_chain = $5, credentials = $6
+         WHERE conversation_id = $1 AND applied_at IS NOT NULL",
+    )
+    .bind(id)
+    .bind(snapshot.commit.as_deref())
+    .bind(&snapshot.body)
+    .bind(&snapshot.settings)
+    .bind(chain)
+    .bind(&credentials)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(None)
+}
+
 /// The set's last step: the row applied, so turns are admitted. Says
 /// whether it wrote (an applied row, or none, gives `false`).
 pub async fn mark_top_level_persona_applied(pool: &PgPool, id: i64) -> Result<bool, sqlx::Error> {
@@ -215,12 +279,14 @@ pub struct TopLevelPersonaRow {
     pub persona_path: String,
     pub persona_commit: Option<String>,
     pub applied: bool,
+    /// The snapshot's settings: names only, never a secret's value.
+    pub persona_settings: serde_json::Value,
 }
 
 /// The conversation's top-level persona row, applied or not.
 pub async fn get_top_level_persona(pool: &PgPool, id: i64) -> Result<Option<TopLevelPersonaRow>, sqlx::Error> {
     sqlx::query_as::<_, TopLevelPersonaRow>(
-        "SELECT persona_name, persona_path, persona_commit, applied_at IS NOT NULL AS applied
+        "SELECT persona_name, persona_path, persona_commit, applied_at IS NOT NULL AS applied, persona_settings
          FROM top_level_personas WHERE conversation_id = $1",
     )
     .bind(id)

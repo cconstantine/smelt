@@ -31,7 +31,7 @@ pub(super) fn PersonaPicker(conversation_id: i64, state: Store<ConversationState
         }
         setting.set(true);
         spawn(async move {
-            let result = set_top_level_persona(conversation_id, persona).await;
+            let result = set_top_level_persona(conversation_id, persona, None).await;
             setting.set(false);
             match result {
                 Ok(_) => {
