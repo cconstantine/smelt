@@ -309,7 +309,8 @@ pub(super) async fn scenario_busy_session_layout(t: &Scenario<'_>) {
     assert!(panels[2] >= 240.0, "the sandbox panel should be visible without scrolling: {panels:?}");
 }
 
-/// Scenario 16: every settings page is reachable from the sidebar. Sandbox
+/// Scenario 16: every settings page is reachable from the sidebar, through
+/// its Settings link (SME-512). Sandbox
 /// volumes had no link anywhere; the only way in was typing the URL
 /// (SME-40 F7).
 pub(super) async fn scenario_sidebar(t: &Scenario<'_>) {
@@ -355,32 +356,31 @@ pub(super) async fn scenario_sidebar(t: &Scenario<'_>) {
     );
     page.close().await.expect("close the tab");
     let page = t.tab(t.url("")).await;
-    // Named the way a user thinks of them: "Sandboxes", not "Pods"
-    // (SME-41 D11).
-    let links: String = page
-        .evaluate("Array.from(document.querySelectorAll('.sidebar-body a')).map(a => a.innerText).join('|')")
+    // The settings pages moved to /settings, one link away at the
+    // sidebar's bottom left (SME-512); the scenario `settings_page`
+    // covers them, and the links' names (SME-41 D11).
+    wait_for_element(&page, ".sidebar .sidebar-settings-link", Duration::from_secs(10)).await;
+    let settings: (i64, String) = page
+        .evaluate(
+            "[document.querySelectorAll('.sidebar .settings-link, .sidebar .settings-links, .sidebar .notifications-toggle').length, \
+             document.querySelector('.sidebar .sidebar-settings-link').getAttribute('href')]",
+        )
         .await
-        .expect("read the sidebar links")
+        .expect("read the sidebar's settings")
         .into_value()
-        .expect("text");
-    assert!(links.contains("Sandboxes") && !links.contains("Pods"), "sidebar links: {links}");
-    // The settings links are one compact block: seven full-width buttons
-    // took about 400px above the conversations on every page (SME-123 DR4).
-    // The notifications toggle made it eight since SME-71, and the block
-    // measures 152px: one more wrapped line. The guard is against the
-    // 400px regression, not a tally.
-    let settings = element_box(&page, ".sidebar .settings-links").await;
-    assert!(settings.3 <= 160, "the settings links take {}px of the sidebar", settings.3);
+        .expect("a count and a path");
+    assert_eq!(settings, (0, "/settings".to_string()), "the sidebar holds one Settings link, and no settings");
     // With nothing open, the page offers a way on: a new conversation,
     // not just "Select or start a conversation" (SME-123 DR4).
     assert!(
         wait_for_count(&page, ".empty-state .empty-new-conversation", 1, Duration::from_secs(10)).await,
         "the empty page offers a new conversation"
     );
-    click_when_present(&page, ".sidebar a[href='/sandbox-volumes']", Duration::from_secs(10)).await;
+    click_when_present(&page, ".sidebar .sidebar-settings-link", Duration::from_secs(10)).await;
+    click_when_present(&page, ".settings-index a[href='/sandbox-volumes']", Duration::from_secs(10)).await;
     assert!(
         wait_for_text(&page, "Sandbox volumes", Duration::from_secs(10)).await,
-        "the sidebar's volumes link should open the volumes page"
+        "Settings' volumes link should open the volumes page"
     );
 }
 
@@ -480,7 +480,7 @@ pub(super) async fn scenario_phone_width(t: &Scenario<'_>) {
     assert!(list_shown, "the button should open the conversation list");
     // Every settings page and form fits a phone: Add an MCP server's header
     // row ran 148px past the screen (SME-123 DR8).
-    for path in ["mcp-servers/new", "providers/new", "language-servers/new", "sandbox-volumes/new", "git", "secrets", "pods"] {
+    for path in ["mcp-servers/new", "providers/new", "language-servers/new", "sandbox-volumes/new", "git", "secrets", "pods", "settings"] {
         page.goto(t.url(path)).await.expect("open a settings page");
         wait_for_element(&page, "h1", Duration::from_secs(10)).await;
         // Measured once its lists have loaded, not on the server-rendered

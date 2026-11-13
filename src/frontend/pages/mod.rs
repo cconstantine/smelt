@@ -6,6 +6,7 @@ mod pods;
 mod providers;
 mod secrets;
 mod sandbox_volumes;
+mod settings;
 
 pub use chat::Chat;
 pub use git::GitSettingsPage;
@@ -16,6 +17,8 @@ pub(crate) use providers::ModelPicker;
 pub use providers::{ProviderEdit, ProviderNew, ProvidersIndex};
 pub use secrets::SecretsPage;
 pub use sandbox_volumes::{SandboxVolumeNew, SandboxVolumesIndex};
+pub use settings::SettingsIndex;
+pub(crate) use settings::SettingsCrumbs;
 
 use dioxus::prelude::*;
 

@@ -127,7 +127,7 @@ const RECORDER: &str = "(() => { if (window.__smeltLog) return true; const log =
 pub(super) async fn page_state(page: &chromiumoxide::Page) -> String {
     let read = "JSON.stringify({ url: location.href, \
          armed: [...document.querySelectorAll('.confirm')].map(b => { const r = b.closest('[data-conversation-id]'); return r ? r.dataset.conversationId : b.className; }), \
-         sidebar_error: (document.querySelector('.sidebar-body > .error') || {}).innerText ?? null, \
+         sidebar_error: (document.querySelector('.sidebar-scroll > .error') || {}).innerText ?? null, \
          log: window.__smeltLog || 'nothing recorded: no click_when_present on this page' })";
     // Bounded: a hung renderer may be why the click or wait failed, and an
     // unbounded read would hold its failure up to chromiumoxide's 30 s, past

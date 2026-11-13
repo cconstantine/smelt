@@ -121,6 +121,7 @@ pub fn Chat() -> Element {
         // `Chat` is never actually rendered on these routes (see their own
         // components in `frontend/mod.rs`) — these arms only exist to
         // satisfy exhaustiveness.
+        Route::SettingsRoute {} => None,
         Route::McpServersRoute {} => None,
         Route::McpServerNewRoute {} => None,
         Route::McpServerEditRoute { .. } => None,

@@ -15,7 +15,7 @@ use crate::api::secrets::{
     delete_secret, list_secrets, save_secret, unpruned_sandboxes_notice, validate_secret_name, validate_secret_value,
     SecretSummary,
 };
-use crate::frontend::Route;
+use crate::frontend::pages::SettingsCrumbs;
 
 /// The page itself: list, add, delete. One load, then the signals mirror
 /// it — the pattern the other settings pages share (`pages/git.rs`).
@@ -40,7 +40,7 @@ pub fn SecretsPage() -> Element {
     rsx! {
         div { class: "sandbox-volumes-page secrets-page",
             div { class: "sandbox-volumes-header",
-                Link { to: Route::Home {}, class: "sandbox-volumes-back-link", "\u{2190} Back to conversations" }
+                SettingsCrumbs {}
                 h1 { "Secrets" }
                 p { class: "muted",
                     "Named secrets personas hand to the agents that run under them. A persona lists a name in \

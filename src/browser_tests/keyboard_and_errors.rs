@@ -329,7 +329,7 @@ pub(super) async fn scenario_error_text(t: &Scenario<'_>) {
     sidebar.evaluate(FAIL_NEXT_DELETE).await.expect("make the next DELETE fail");
     click_when_present(&sidebar, &delete_button(refused.id), Duration::from_secs(5)).await;
     click_when_present(&sidebar, &format!("{}.confirm", delete_button(refused.id)), Duration::from_secs(5)).await;
-    wait_for_element(&sidebar, ".sidebar-body > .error", Duration::from_secs(10)).await;
+    wait_for_element(&sidebar, ".sidebar-scroll > .error", Duration::from_secs(10)).await;
     // A message arriving in the open conversation reloads the list (as a
     // running turn's every reply does); that reload succeeding isn't the
     // failed Delete succeeding, so the error stays (SME-81 review).
@@ -355,7 +355,7 @@ pub(super) async fn scenario_error_text(t: &Scenario<'_>) {
     // The reload's result is applied by an effect after the request ends.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let kept: bool = sidebar
-        .evaluate("!!document.querySelector('.sidebar-body > .error')")
+        .evaluate("!!document.querySelector('.sidebar-scroll > .error')")
         .await
         .expect("look for the sidebar error")
         .into_value()
@@ -372,7 +372,7 @@ pub(super) async fn scenario_error_text(t: &Scenario<'_>) {
     // what clears the error. So wait for the error to go rather than read it
     // once (SME-341: CI run 41394052871).
     assert!(
-        wait_for_count(&sidebar, ".sidebar-body > .error", 0, Duration::from_secs(10)).await,
+        wait_for_count(&sidebar, ".sidebar-scroll > .error", 0, Duration::from_secs(10)).await,
         "a later success should clear the sidebar's error"
     );
 

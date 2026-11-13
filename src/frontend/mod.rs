@@ -7,7 +7,7 @@ use notifications::Shell;
 use pages::{
     Chat, GitSettingsPage, LanguageServerEdit, LanguageServerNew, LanguageServersIndex, McpServerEdit,
     McpServerNew, McpServersIndex, PodsIndex, ProviderEdit, ProviderNew, ProvidersIndex, SecretsPage,
-    SandboxVolumeNew, SandboxVolumesIndex,
+    SandboxVolumeNew, SandboxVolumesIndex, SettingsIndex,
 };
 
 // Every route sits inside the one `Shell` layout (SME-71): its `Notifier`
@@ -25,6 +25,9 @@ pub(crate) enum Route {
     Home {},
     #[route("/conversation/:id")]
     ConversationRoute { id: i64 },
+    // The index of every settings page (SME-512).
+    #[route("/settings")]
+    SettingsRoute {},
     #[route("/mcp-servers")]
     McpServersRoute {},
     #[route("/mcp-servers/new")]
@@ -61,6 +64,11 @@ pub(crate) enum Route {
 #[component]
 fn Home() -> Element {
     rsx! { Chat {} }
+}
+
+#[component]
+fn SettingsRoute() -> Element {
+    rsx! { SettingsIndex {} }
 }
 
 #[component]

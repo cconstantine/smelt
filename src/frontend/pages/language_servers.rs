@@ -7,6 +7,7 @@ use crate::api::language_servers::{
     lookup_language_server, update_language_server,
 };
 use crate::frontend::Route;
+use crate::frontend::pages::SettingsCrumbs;
 use crate::models::{LanguageServer, LanguageServerConfig};
 
 /// The non-empty, trimmed lines of a text field.
@@ -116,7 +117,7 @@ pub fn LanguageServersIndex() -> Element {
     rsx! {
         div { class: "mcp-servers-page",
             div { class: "mcp-servers-header",
-                Link { to: Route::Home {}, class: "mcp-back-link", "\u{2190} Back to conversations" }
+                SettingsCrumbs {}
                 h1 { "Language servers" }
                 p { class: "muted",
                     "Code intelligence for the model: diagnostics after its edits, and go to definition, references and more. Each server runs in a pod of its own next to a conversation's sandbox, when the model starts it, and sees /workspace."

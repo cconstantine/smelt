@@ -4,7 +4,7 @@
 //! (`AppEvent::NeedsUser`); this file is everything a browser does with
 //! that: the `Shell` layout that keeps the `Notifier` mounted on every
 //! page, the leader election (one tab per browser holds the Web Lock and
-//! does the notifying), the permission-on-click button in the sidebar,
+//! does the notifying), the permission-on-click button on Settings,
 //! and — where notifications can't work at all — the `(N) smelt` title
 //! count every chat tab keeps for itself.
 //!
@@ -51,7 +51,7 @@ impl Permission {
     }
 }
 
-/// What the sidebar button says and does, and whether the notifier runs
+/// What the notifications button says and does, and whether the notifier runs
 /// at all — the plan's mode table as data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NotifyMode {
@@ -226,7 +226,7 @@ struct NotifierStatus {
     toggle: Signal<Option<ToggleRequest>>,
 }
 
-/// What the sidebar button clicked for.
+/// What the notifications button clicked for.
 #[derive(Clone, Copy, PartialEq)]
 enum ToggleRequest {
     /// The click asked for permission: granted, or not (either way the
@@ -242,7 +242,7 @@ enum ToggleRequest {
 #[component]
 pub fn Shell() -> Element {
     // The feed and status live here, not in `Notifier`: a context reaches
-    // only an ancestor's subtree, and the sidebar's `NotificationsToggle`
+    // only an ancestor's subtree, and the Settings page's `NotificationsToggle`
     // sits under `Outlet`, a sibling of `Notifier`. Provided by `Shell`,
     // every route below — and `Notifier` itself — can find them.
     let feed = use_context_provider(|| NotifierFeed {
@@ -295,9 +295,9 @@ fn Notifier() -> Element {
     rsx! {}
 }
 
-/// The sidebar's notifications button, among the settings links: the
-/// one place the browser's permission prompt ever appears. Its label
-/// follows the mode; only Off and On answer a click.
+/// The notifications button, on the Settings page under "This browser"
+/// (SME-512): the one place the browser's permission prompt ever
+/// appears. Its label follows the mode; only Off and On answer a click.
 #[component]
 pub(crate) fn NotificationsToggle() -> Element {
     let status = use_context::<NotifierStatus>();
@@ -307,7 +307,7 @@ pub(crate) fn NotificationsToggle() -> Element {
     let hint = mode.hint();
     rsx! {
         button {
-            class: "settings-link sandbox-volumes-link notifications-toggle",
+            class: "notifications-toggle",
             r#type: "button",
             disabled: !mode.enabled(),
             aria_pressed: (mode == NotifyMode::On).then_some("true"),
@@ -739,7 +739,7 @@ async fn notify_leader(
     // and accumulate `open` entries for notifications that never existed
     // (review 1). Leadership itself is untouched — one connection, and
     // the permission can flip back in site settings, which the tick
-    // re-reads — and the sidebar button keeps the same disabled mode.
+    // re-reads — and the notifications button keeps the same disabled mode.
     if !matches!(page.mode(), NotifyMode::On) {
         return;
     }
