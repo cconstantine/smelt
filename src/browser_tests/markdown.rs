@@ -1,5 +1,7 @@
 use super::*;
 
+mod depth_steps;
+
 /// SME-30: the model's replies render as markdown, and the reply is
 /// untrusted. A heading, list, table, code block and link become those
 /// elements; raw HTML (an `<img onerror>`, a `<script>`) and a
@@ -209,20 +211,11 @@ pub(super) fn reply_copy_button(reply: i64) -> String {
 pub(super) async fn scenario_markdown_deep_code(t: &Scenario<'_>) {
     let mut failures = Vec::new();
     for depth in [100, 500, 2_000, 8_000] {
-        // A depth that hangs the tab ends alone, so the rest still run.
-        let outcome = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(tokio::time::timeout(
-            Duration::from_secs(45),
-            deep_code_at(t, depth),
-        )))
-        .await;
-        let problems = match outcome {
-            Ok(Ok(problems)) => problems,
-            Ok(Err(_)) => vec!["didn't finish within 45 s".to_string()],
-            Err(panic) => vec![
-                panic.downcast_ref::<String>().cloned().unwrap_or_else(|| "panicked".to_string()),
-            ],
-        };
-        failures.extend(problems.into_iter().map(|p| format!("depth {depth}: {p}")));
+        // A depth that hangs the tab ends alone, so the rest still run. Its
+        // steps are recorded outside its timed future, so a hang still
+        // names the step it hung in (SME-500).
+        let steps = depth_steps::DepthSteps::new(DEEP_CODE_STEPS, Duration::from_secs(45));
+        failures.extend(depth_steps::run_depth(depth, &steps, deep_code_at(t, depth, &steps)).await);
         // Closed before the next depth, however this one ended: a tab still
         // busy in a hung render would take the CPU the next one needs.
         t.close_tabs().await;
@@ -230,52 +223,113 @@ pub(super) async fn scenario_markdown_deep_code(t: &Scenario<'_>) {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// The steps of one depth of `scenario_markdown_deep_code`, in order.
+const DEEP_CODE_STEPS: &[&str] = &["seed", "tab", "live", "text", "facts", "still_live"];
+
+/// Whether `js` reads true on `page`, or why it couldn't be read.
+async fn reads_true(page: &chromiumoxide::Page, js: &str) -> Result<bool, String> {
+    page.evaluate(js).await.map_err(|e| e.to_string())?.into_value::<bool>().map_err(|e| e.to_string())
+}
+
 /// One depth of `scenario_markdown_deep_code`: what went wrong, if anything.
-async fn deep_code_at(t: &Scenario<'_>, depth: usize) -> Vec<String> {
-    use crate::events::{ConversationEvent, publish};
+/// Each await runs as a step of `steps`, which the caller holds, so a depth
+/// that stalls still names its step. The steps share the depth's deadline:
+/// one that reaches it ends the depth here, and its timing line still
+/// prints.
+async fn deep_code_at(t: &Scenario<'_>, depth: usize, steps: &depth_steps::DepthSteps) -> Vec<String> {
     let mut problems = Vec::new();
-    let conversation = t.conversation().await;
-    db::create_message(t.pool, conversation.id, "user", &[anthropic::ContentBlock::Text { text: "Deep code".into() }])
-        .await
-        .expect("seed the user's message");
-    let reply = format!("Deep:\n\n```d\n{}\n```\n\nAFTER-DEEP-CODE\n", "$(".repeat(depth));
-    db::create_message(t.pool, conversation.id, "assistant", &[anthropic::ContentBlock::Text { text: reply }])
-        .await
-        .expect("seed the reply");
+    let mut timings = DeepCodeTimings::default();
+    let _ = deep_code_steps(t, depth, steps, &mut problems, &mut timings).await;
+    steps.finish();
+    let line = depth_steps::timing_line(depth, timings.live_after, timings.rendered_after, &timings.span_depth, &steps.report());
+    eprintln!("{line}");
+    problems
+}
+
+/// What `deep_code_at`'s timing line reports, as far as the depth got.
+#[derive(Default)]
+struct DeepCodeTimings {
+    live_after: Option<Duration>,
+    rendered_after: Option<Duration>,
+    span_depth: serde_json::Value,
+}
+
+/// `deep_code_at`'s steps; `None` once one stopped at the depth's deadline,
+/// or the live check failed.
+/// The polls keep the harness helpers' bounds and intervals
+/// (`wait_for_live_client`: 15 s at 100 ms; `wait_for_text`: at 200 ms),
+/// and also count their evaluates.
+async fn deep_code_steps(
+    t: &Scenario<'_>,
+    depth: usize,
+    steps: &depth_steps::DepthSteps,
+    problems: &mut Vec<String>,
+    timings: &mut DeepCodeTimings,
+) -> Option<()> {
+    use crate::events::{ConversationEvent, publish};
+    use depth_steps::Outcome;
+    let conversation = steps
+        .step("seed", async {
+            let conversation = t.conversation().await;
+            db::create_message(t.pool, conversation.id, "user", &[anthropic::ContentBlock::Text { text: "Deep code".into() }])
+                .await
+                .expect("seed the user's message");
+            let reply = format!("Deep:\n\n```d\n{}\n```\n\nAFTER-DEEP-CODE\n", "$(".repeat(depth));
+            db::create_message(t.pool, conversation.id, "assistant", &[anthropic::ContentBlock::Text { text: reply }])
+                .await
+                .expect("seed the reply");
+            (conversation, Outcome::Ok)
+        })
+        .await?;
     let started = tokio::time::Instant::now();
-    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
-    let live = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(wait_for_live_client(
-        &page,
-        conversation.id,
-    )))
-    .await;
-    let live_after = started.elapsed();
-    if live.is_err() {
-        problems.push("1: the client never went live".to_string());
-    }
-    if !wait_for_text(&page, "AFTER-DEEP-CODE", Duration::from_secs(20)).await {
+    let page = steps
+        .step("tab", async { (t.tab(t.url(&format!("conversation/{}", conversation.id))).await, Outcome::Ok) })
+        .await?;
+    let live_js = format!("document.querySelector({:?}) !== null", format!("[data-live=\"{}\"]", conversation.id));
+    // A failed live evaluate ends the live poll at once, as the helper's
+    // panic did, and the depth carries on to its later steps, as the
+    // scenario's `catch_unwind` of that panic did (`DepthSteps::live`).
+    let poll_live = steps.poll(Duration::from_secs(15), Duration::from_millis(100), depth_steps::OnError::Stop, || {
+        reads_true(&page, &live_js)
+    });
+    let live_problem = steps.live(poll_live).await?;
+    timings.live_after = Some(started.elapsed());
+    problems.extend(live_problem);
+    let text_js = format!("document.body.innerText.includes({:?})", "AFTER-DEEP-CODE");
+    let text = steps
+        .step("text", steps.poll(Duration::from_secs(20), Duration::from_millis(200), depth_steps::OnError::Retry, || reads_true(&page, &text_js)))
+        .await?;
+    if !text {
         problems.push("2: the text after the block never rendered".to_string());
     }
-    let rendered_after = started.elapsed();
+    timings.rendered_after = Some(started.elapsed());
     // The deepest chain of scope spans (those with a class; a run of text
     // has a span of its own, with none) under the block, walked with an
     // explicit stack: a recursive walk would itself be the deep recursion.
-    let facts: serde_json::Value = page
-        .evaluate(
-            "(() => { const pre = document.querySelector('.message-assistant .markdown pre.hl-code'); \
-               if (!pre) return { highlighted: false }; \
-               let deepest = 0; const stack = [[pre, 0]]; \
-               while (stack.length) { const [el, d] = stack.pop(); \
-                 const here = el.tagName === 'SPAN' && el.className !== '' ? d + 1 : d; \
-                 if (here > deepest) deepest = here; \
-                 for (const child of el.children) stack.push([child, here]); } \
-               const text = pre.querySelector('code')?.textContent ?? pre.textContent; \
-               return { highlighted: true, dollars: text.split('$(').length - 1, deepest }; })()",
-        )
-        .await
-        .map_err(|e| e.to_string())
-        .and_then(|v| v.into_value().map_err(|e| e.to_string()))
-        .unwrap_or_else(|e| serde_json::json!({ "error": e }));
+    let facts: serde_json::Value = steps
+        .step("facts", async {
+            let read = page
+                .evaluate(
+                    "(() => { const pre = document.querySelector('.message-assistant .markdown pre.hl-code'); \
+                       if (!pre) return { highlighted: false }; \
+                       let deepest = 0; const stack = [[pre, 0]]; \
+                       while (stack.length) { const [el, d] = stack.pop(); \
+                         const here = el.tagName === 'SPAN' && el.className !== '' ? d + 1 : d; \
+                         if (here > deepest) deepest = here; \
+                         for (const child of el.children) stack.push([child, here]); } \
+                       const text = pre.querySelector('code')?.textContent ?? pre.textContent; \
+                       return { highlighted: true, dollars: text.split('$(').length - 1, deepest }; })()",
+                )
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|v| v.into_value().map_err(|e| e.to_string()));
+            match read {
+                Ok(facts) => (facts, Outcome::Ok),
+                Err(e) => (serde_json::json!({ "error": e }), Outcome::Error(e)),
+            }
+        })
+        .await?;
+    timings.span_depth = facts["deepest"].clone();
     if facts["highlighted"] != true {
         problems.push(format!("3: the block isn't highlighted: {facts}"));
     } else {
@@ -288,18 +342,18 @@ async fn deep_code_at(t: &Scenario<'_>, depth: usize) -> Vec<String> {
         }
     }
     let still_live = format!("STILL-LIVE-{depth}");
-    publish(conversation.id, ConversationEvent::ReplyReset {});
-    publish(conversation.id, ConversationEvent::ReplyDelta { text: still_live.clone(), offset: 0 });
-    if !wait_for_text(&page, &still_live, Duration::from_secs(10)).await {
+    let still_live_js = format!("document.body.innerText.includes({still_live:?})");
+    let shown = steps
+        .step("still_live", async {
+            publish(conversation.id, ConversationEvent::ReplyReset {});
+            publish(conversation.id, ConversationEvent::ReplyDelta { text: still_live.clone(), offset: 0 });
+            steps.poll(Duration::from_secs(10), Duration::from_millis(200), depth_steps::OnError::Retry, || reads_true(&page, &still_live_js)).await
+        })
+        .await?;
+    if !shown {
         problems.push("6: a live event after the render never showed".to_string());
     }
-    eprintln!(
-        "browser tier: markdown_deep_code: depth {depth}: live in {} ms, rendered in {} ms, span depth {}",
-        live_after.as_millis(),
-        rendered_after.as_millis(),
-        facts["deepest"]
-    );
-    problems
+    Some(())
 }
 
 /// What the tab says `prefers-color-scheme` is; an empty value lifts it.
