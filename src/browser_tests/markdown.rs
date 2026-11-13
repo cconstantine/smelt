@@ -286,20 +286,15 @@ async fn deep_code_steps(
         .step("tab", async { (t.tab(t.url(&format!("conversation/{}", conversation.id))).await, Outcome::Ok) })
         .await?;
     let live_js = format!("document.querySelector({:?}) !== null", format!("[data-live=\"{}\"]", conversation.id));
-    // A failed live evaluate ends the depth at once, as the helper's panic
-    // did: re-polling it would lengthen the step on that path.
+    // A failed live evaluate ends the live poll at once, as the helper's
+    // panic did, and the depth carries on to its later steps, as the
+    // scenario's `catch_unwind` of that panic did (`DepthSteps::live`).
     let poll_live = steps.poll(Duration::from_secs(15), Duration::from_millis(100), depth_steps::OnError::Stop, || {
         reads_true(&page, &live_js)
     });
-    let live = steps.step("live", poll_live).await?;
+    let live_problem = steps.live(poll_live).await?;
     timings.live_after = Some(started.elapsed());
-    if let Some(e) = steps.error_in("live") {
-        problems.push(format!("1: the live check failed: {e}"));
-        return None;
-    }
-    if !live {
-        problems.push("1: the client never went live".to_string());
-    }
+    problems.extend(live_problem);
     let text_js = format!("document.body.innerText.includes({:?})", "AFTER-DEEP-CODE");
     let text = steps
         .step("text", steps.poll(Duration::from_secs(20), Duration::from_millis(200), depth_steps::OnError::Retry, || reads_true(&page, &text_js)))

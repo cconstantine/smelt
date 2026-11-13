@@ -97,6 +97,18 @@ impl DepthSteps {
         })
     }
 
+    /// Runs `poll` as the `live` step: `None` once the depth's deadline
+    /// stopped it, and otherwise the problem it found, if any. A failed
+    /// evaluate is a problem and the depth carries on to its later steps,
+    /// as main's `catch_unwind` of `wait_for_live_client`'s panic did.
+    pub(super) async fn live(&self, poll: impl Future<Output = (bool, Outcome)>) -> Option<Option<String>> {
+        let live = self.step("live", poll).await?;
+        if let Some(e) = self.error_in("live") {
+            return Some(Some(format!("1: the live check failed: {e}")));
+        }
+        Some((!live).then(|| "1: the client never went live".to_string()))
+    }
+
     /// Records every step the depth never began as not reached.
     pub(super) fn finish(&self) {
         let mut steps = self.steps.borrow_mut();
@@ -460,6 +472,35 @@ mod tests {
         assert_eq!(steps.error_in("live").as_deref(), Some("context destroyed"));
         let report = steps.report();
         assert!(report.contains("live 0.0 s error context destroyed (polls 1, max_eval 0.0 s, eval_errors 1, last_error context destroyed)"), "{report}");
+    }
+
+    /// A failed live evaluate is a problem, and the depth still runs text,
+    /// facts and still_live, as main did when its `catch_unwind` caught
+    /// `wait_for_live_client`'s panic. Round 2, finding 1.
+    #[tokio::test(start_paused = true)]
+    #[ignore]
+    async fn test_a_failed_live_evaluate_lets_the_next_steps_run() {
+        let steps = DepthSteps::new(NAMES, LIMIT);
+        let failures = run_depth(2_000, &steps, async {
+            let mut problems = Vec::new();
+            let _ = async {
+                steps.step("seed", takes(Duration::from_millis(100))).await?;
+                steps.step("tab", takes(Duration::from_secs(1))).await?;
+                let failing = || async { Err::<bool, String>("context destroyed".to_string()) };
+                problems.extend(steps.live(steps.poll(Duration::from_secs(15), Duration::from_millis(100), OnError::Stop, failing)).await?);
+                steps.step("text", steps.poll(Duration::from_secs(20), Duration::from_millis(200), OnError::Retry, || async { Ok(true) })).await?;
+                steps.step("facts", takes(Duration::ZERO)).await?;
+                steps.step("still_live", steps.poll(Duration::from_secs(10), Duration::from_millis(200), OnError::Retry, || async { Ok(true) })).await
+            }
+            .await;
+            steps.finish();
+            problems
+        })
+        .await;
+        assert_eq!(failures, vec!["depth 2000: 1: the live check failed: context destroyed".to_string()], "{}", steps.report());
+        for name in ["text", "facts", "still_live"] {
+            assert_eq!(named(&steps, name).outcome, Outcome::Ok, "{name}: {}", steps.report());
+        }
     }
 
     /// A poll that reaches its own bound gives up, and the depth carries on
