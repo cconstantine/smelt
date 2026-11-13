@@ -73,7 +73,7 @@ A deploy restarts smelt under every seat, so it runs only when the trees are qui
 
 ## Retrospectives and bug bashes
 
-The trigger is close-out.md's ([Watching](#watching)). The retro runs from smelt, with no Claude Code session involved:
+The trigger is [close-out.md's](../process/close-out.md#retrospective). The retro runs from smelt, with no Claude Code session involved:
 
 1. **It takes a ClaudeCode slot at once** ([Slots](#slots)): the PM holds the ClaudeCode tree that's cheapest to pause and resumes it once the retro is done.
 2. **The PM starts a top-level `smelt:facilitator`** on the open "Next retrospective" ticket, as it starts a Driver ([Starting a Driver](#starting-a-driver), with `persona-set ID smelt:facilitator`), and briefs it as it would a Driver ([Briefing a Driver](#briefing-a-driver)), adding what [facilitator.md](facilitator.md) names. It watches it with `smelt-wait` like a Driver.
