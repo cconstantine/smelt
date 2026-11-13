@@ -206,7 +206,10 @@ impl Run {
     /// What smelt notes of a line that isn't the reply's.
     pub(super) fn note(&mut self, event: &Value) {
         match (event["type"].as_str(), event["subtype"].as_str()) {
-            (Some("rate_limit_event"), _) => self.rate = Some(RateLimit::from_event(event)),
+            (Some("rate_limit_event"), _) => {
+                crate::claude_cli::usage::seen(self.conversation_id, event);
+                self.rate = Some(RateLimit::from_event(event));
+            }
             (Some("system"), Some("init")) => {
                 // What this process's CLI says it can call (SME-447), the
                 // witness that echoes are checkable at all. A non-empty

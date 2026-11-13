@@ -115,7 +115,7 @@ pub async fn once(
     // One message, then no more: the CLI answers it and exits.
     drop(stdin);
     let mut lines = BufReader::new(stdout).lines();
-    let replied = read(&mut lines, &launching, on_delta, meter).await;
+    let replied = read(conversation_id, &mut lines, &launching, on_delta, meter).await;
     let kill = |child: &tokio::process::Child| {
         if let Some(group) = child.id().and_then(|id| i32::try_from(id).ok()) {
             let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(group), nix::sys::signal::Signal::SIGKILL);
@@ -146,6 +146,7 @@ pub async fn once(
 /// block assembler, then its `result`, within `WIND_DOWN`. An error that
 /// is the process going is `Other("")`, for `once` to quote its stderr.
 async fn read(
+    conversation_id: i64,
     lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     launching: &Launching,
     on_delta: &mut (dyn FnMut(&str) + Send),
@@ -177,7 +178,10 @@ async fn read(
                 }
                 apply(&mut blocks, &mut stop_reason, inner, on_delta, meter).map_err(ModelError::Other)?;
             }
-            Some("rate_limit_event") => rate = Some(super::errors::RateLimit::from_event(&event)),
+            Some("rate_limit_event") => {
+                super::usage::seen(conversation_id, &event);
+                rate = Some(super::errors::RateLimit::from_event(&event));
+            }
             Some("result") => {
                 return Err(result_failure(&event, rate.as_ref()).unwrap_or_else(|| ModelError::Other("Claude Code ended the reply before it finished.".to_string())));
             }

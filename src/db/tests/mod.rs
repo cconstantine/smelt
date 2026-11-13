@@ -76,3 +76,4 @@ mod agent_volumes;
 mod secrets;
 mod storage_grace;
 mod claude_cli;
+mod provider_usage;

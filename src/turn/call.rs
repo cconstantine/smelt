@@ -179,6 +179,7 @@ pub(super) async fn call_model(
         );
         let recorder = CallRecorder::new(pool, conversation_id, turn_model, db::ModelCallKind::Turn, request);
         match stream_for_kind(
+            pool,
             conversation_id,
             turn_model,
             request,
@@ -214,6 +215,7 @@ pub(super) async fn call_model(
 /// slot the turn already holds.
 #[cfg(feature = "server")]
 pub(super) async fn stream_for_kind(
+    pool: &PgPool,
     conversation_id: i64,
     turn_model: &crate::providers::TurnModel,
     request: &anthropic::CreateMessageRequest,
@@ -222,7 +224,10 @@ pub(super) async fn stream_for_kind(
     slot: anthropic::stream::SlotPolicy<'_>,
 ) -> Result<anthropic::stream::StreamedTurn, anthropic::stream::ModelError> {
     if turn_model.kind == crate::providers::ProviderKind::ClaudeCli {
-        return crate::claude_cli::once::once(conversation_id, turn_model, request, on_delta, meter).await;
+        // The summary's subscription reading (SME-486), Ok or Err.
+        let done = crate::claude_cli::once::once(conversation_id, turn_model, request, on_delta, meter).await;
+        crate::claude_cli::usage::record(pool, conversation_id, turn_model.provider_id).await;
+        return done;
     }
     anthropic::stream::stream_anthropic_message_metered(&turn_model.endpoint, request, on_delta, meter, slot).await
 }
@@ -248,6 +253,9 @@ async fn call_claude_cli(
     let extra = CallRecorder::new(pool, conversation_id, turn_model, db::ModelCallKind::Turn, request);
     let called = crate::claude_cli::run::call(pool, conversation_id, turn_model, request, relay, recorder.meter(), extra.meter(), cli).await;
     drop(extra);
+    // The call's subscription reading (SME-486), Ok or Err: a capped
+    // call's `rejected` is the one that matters most.
+    crate::claude_cli::usage::record(pool, conversation_id, turn_model.provider_id).await;
     called.map(|turn| (turn, recorder)).map_err(|e| match cli.take_overflow() {
         Some(overflow) => CallError::Overflow(overflow),
         None => CallError::Failed(ServerFnError::new(e)),

@@ -15,4 +15,5 @@ pub mod questions;
 pub mod secrets;
 pub mod sandbox;
 pub mod sandbox_volumes;
+pub mod usage_windows;
 pub mod version;

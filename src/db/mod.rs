@@ -79,8 +79,10 @@ mod script_mcp;
 mod claude_cli;
 mod owed;
 mod top_level_personas;
+mod provider_usage;
 
 pub use agents::*;
+pub use provider_usage::*;
 pub use top_level_personas::*;
 pub use owed::*;
 pub use conversations::*;
