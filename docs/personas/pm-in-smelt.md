@@ -13,7 +13,7 @@ Part of the [development process](../development-process.md). The [Project Manag
 - **Up to four ClaudeCode/Opus ticket slots and one strata slot,** one ticket each.
 - **Each ticket gets a fresh top-level Ticket Driver conversation,** never a child of the PM. A child would put every ticket line in one tree, so stopping or deleting the PM would take every line with it. Also, `start_agent` can't choose a provider, and `claude-opus-5-5` exists on both the paid API and ClaudeCode.
 - **Ticket slots aren't stack slots.** The [stack-slot rule](project-manager.md) (two full-stack seats at a time, granted on the ticket) stays as it is.
-- **A retrospective takes a ClaudeCode slot at once.** When one is due, the PM doesn't wait for a slot to free: it holds the ClaudeCode tree that's cheapest to pause, runs the retro in its slot, and resumes that tree after ([Retrospectives](#retrospectives-and-bug-bashes)). The hold is a message to that tree's Driver (`smelt-api send`): start no seat and send no new work until told. A seat already mid-turn finishes its turn; it isn't stopped.
+- **A retrospective takes a ClaudeCode slot at once,** unless a [usage-limit hold](#claudecode-usage-limit) is on; then the retro waits for the reset. When one is due, the PM doesn't wait for a slot to free: it holds the ClaudeCode tree that's cheapest to pause, runs the retro in its slot, and resumes that tree after ([Retrospectives](#retrospectives-and-bug-bashes)). The hold is a message to that tree's Driver (`smelt-api send`): start no seat and send no new work until told. A seat already mid-turn finishes its turn; it isn't stopped.
 
 ### ClaudeCode usage limit
 
