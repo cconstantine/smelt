@@ -254,7 +254,8 @@ fn describe(s: &Step, now: Duration) -> String {
         if stats.eval_errors > 0 {
             line += &format!(", eval_errors {}", stats.eval_errors);
         }
-        if let Some(e) = &stats.last_error {
+        // A step that ended with this very error already printed it.
+        if let Some(e) = stats.last_error.as_ref().filter(|e| s.outcome != Outcome::Error((*e).clone())) {
             line += &format!(", last_error {e}");
         }
         if let Some(since) = stats.in_flight {
@@ -471,7 +472,8 @@ mod tests {
         assert_eq!(reads.get(), 1, "{}", steps.report());
         assert_eq!(steps.error_in("live").as_deref(), Some("context destroyed"));
         let report = steps.report();
-        assert!(report.contains("live 0.0 s error context destroyed (polls 1, max_eval 0.0 s, eval_errors 1, last_error context destroyed)"), "{report}");
+        assert!(report.contains("live 0.0 s error context destroyed (polls 1, max_eval 0.0 s, eval_errors 1)"), "{report}");
+        assert_eq!(report.matches("context destroyed").count(), 1, "the error text prints once: {report}");
     }
 
     /// A failed live evaluate is a problem, and the depth still runs text,
