@@ -301,8 +301,11 @@ def provider_arg(value):
 
 
 def usage_line(w):
-    """One window, from smelt_api.usage_windows's whitelisted fields only."""
-    parts = [f"{w['name']:<10}", f"{smelt_api.percent(w['utilization']):>4}", f"{w['status']:<16}"]
+    """One window, from smelt_api.usage_windows's whitelisted fields only.
+    A window whose reset has passed shows a dash, not its ended
+    utilization (round 1 B-L5)."""
+    shown = "\u2014" if w["reset_passed"] else smelt_api.percent(w["utilization"])
+    parts = [f"{w['name']:<10}", f"{shown:>4}", f"{w['status']:<16}"]
     if w["reset_passed"]:
         parts.append("reset since " + (w["resets_at"] or "-"))
     else:

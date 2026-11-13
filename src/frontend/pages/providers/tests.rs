@@ -319,3 +319,17 @@ fn test_reset_and_seen_texts() {
     let usage = usage_of(vec![usage_window("seven_day", 0.32, "allowed", 84, now), usage_window("five_hour", 0.45, "allowed", 2, now)], now);
     assert_eq!(usage_title(&usage), "Claude subscription: 5-hour 45%, resets 14:00 UTC; 7-day 32%, resets Tue 00:00 UTC");
 }
+
+/// Round 1 B-L5: a window whose reset has passed shows no percent, on the
+/// provider page (no bar either) or in the indicator's hover text: its
+/// utilization is an ended window's.
+#[test]
+fn test_an_ended_window_shows_no_stale_percent() {
+    use super::usage::{shown_percent, usage_title};
+    let now = usage_now();
+    let ended = usage_window("five_hour", 0.95, "rejected", -1, now);
+    assert_eq!(shown_percent(&ended), None);
+    assert_eq!(shown_percent(&usage_window("five_hour", 0.454, "allowed", 2, now)), Some(45));
+    let usage = usage_of(vec![usage_window("seven_day", 0.32, "allowed", 84, now), ended], now);
+    assert_eq!(usage_title(&usage), "Claude subscription: 5-hour \u{2014}, reset since; 7-day 32%, resets Tue 00:00 UTC");
+}

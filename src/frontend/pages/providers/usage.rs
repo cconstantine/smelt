@@ -14,6 +14,17 @@ pub fn usage_percent(utilization: f64) -> u32 {
     (utilization * 100.0).round().clamp(0.0, 1000.0) as u32
 }
 
+/// The percent a window shows: none once its reset has passed, as its
+/// utilization is an ended window's (round 1 B-L5).
+pub fn shown_percent(window: &UsageWindow) -> Option<u32> {
+    (!window.reset_passed).then(|| usage_percent(window.utilization))
+}
+
+/// `45%`, or a dash once the reset has passed.
+fn shown_text(window: &UsageWindow) -> String {
+    shown_percent(window).map_or_else(|| "\u{2014}".to_string(), |p| format!("{p}%"))
+}
+
 /// `5h`, `7d`, or the window's own name.
 fn short_name(name: &str) -> &str {
     match name {
@@ -49,13 +60,7 @@ fn ordered(usage: &ProviderUsage) -> Vec<&UsageWindow> {
 pub fn usage_short_text(usage: &ProviderUsage) -> String {
     ordered(usage)
         .iter()
-        .map(|w| {
-            if w.reset_passed {
-                format!("{} \u{2014}", short_name(&w.name))
-            } else {
-                format!("{} {}%", short_name(&w.name), usage_percent(w.utilization))
-            }
-        })
+        .map(|w| format!("{} {}", short_name(&w.name), shown_text(w)))
         .collect::<Vec<_>>()
         .join(" \u{b7} ")
 }
@@ -83,11 +88,12 @@ pub fn seen_text(seen_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
 }
 
 /// The context bar indicator's hover text: `Claude subscription: 5-hour
-/// 45%, resets 14:20 UTC; 7-day 32%, resets Mon 09:00 UTC`.
+/// 45%, resets 14:20 UTC; 7-day 32%, resets Mon 09:00 UTC`; an ended
+/// window reads `5-hour —, reset since`.
 pub fn usage_title(usage: &ProviderUsage) -> String {
     let parts: Vec<String> = ordered(usage)
         .iter()
-        .map(|w| format!("{} {}%, {}", long_name(&w.name), usage_percent(w.utilization), reset_text(w, usage.observed_at)))
+        .map(|w| format!("{} {}, {}", long_name(&w.name), shown_text(w), reset_text(w, usage.observed_at)))
         .collect();
     format!("Claude subscription: {}", parts.join("; "))
 }
@@ -128,9 +134,11 @@ pub(super) fn SubscriptionUsage(id: i64, refresh: Signal<u64>) -> Element {
                 div { class: "subscription-window", key: "{w.name}",
                     span { class: "subscription-window-name", "{long_name(&w.name)}" }
                     div { class: "context-usage-track",
-                        div { class: "context-usage-fill", style: "width: {usage_percent(w.utilization).min(100)}%" }
+                        if let Some(percent) = shown_percent(w) {
+                            div { class: "context-usage-fill", style: "width: {percent.min(100)}%" }
+                        }
                     }
-                    span { class: "subscription-window-percent", "{usage_percent(w.utilization)}%" }
+                    span { class: "subscription-window-percent", "{shown_text(w)}" }
                     span { class: "muted subscription-window-when",
                         "{reset_text(w, usage.observed_at)} \u{b7} {seen_text(w.seen_at, usage.observed_at)}"
                         if let Some(projected) = w.projected.filter(|_| w.name == "seven_day") {

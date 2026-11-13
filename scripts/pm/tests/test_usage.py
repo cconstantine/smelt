@@ -140,6 +140,9 @@ class Usage(FakeCase):
         self.st.usage[7] = usage(7, [window("five_hour", 0.95, reset_passed=True)])
         r = self.api("usage", "7")
         self.assertIn("reset since", r.stdout.splitlines()[0])
+        # Round 1 B-L5: an ended window's utilization isn't shown as now's.
+        self.assertEqual(r.stdout.splitlines()[0].split()[1], "\u2014")
+        self.assertNotIn("95%", r.stdout)
 
     # P3
     def test_nothing_but_the_whitelisted_fields_prints(self):
