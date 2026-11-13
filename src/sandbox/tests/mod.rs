@@ -209,6 +209,7 @@ mod volumes;
 mod start_reports;
 mod death;
 mod manager;
+mod pod_gone;
 mod git;
 mod child_checkout;
 mod docker;

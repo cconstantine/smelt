@@ -128,16 +128,10 @@ async fn test_create_deletes_the_pod_it_just_created_if_it_never_reaches_running
     }
 
     let pods = pods_api(&client);
-    let gone = tokio::time::timeout(Duration::from_secs(15), async {
-        while pods.get_opt(&name).await.ok().flatten().is_some() {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    })
-    .await;
-    assert!(
-        gone.is_ok(),
-        "the pod create() gave up waiting on should have been cleaned up, not left orphaned"
-    );
+    // A red says what the pod was doing (SME-489).
+    if let Err(report) = pod_gone::wait_for_pod_gone(&pods, &name, Duration::from_secs(15)).await {
+        panic!("the pod create() gave up waiting on should have been cleaned up, not left orphaned: {report}");
+    }
 }
 
 /// Every configured volume is mounted into every pod, but its claim can
@@ -481,15 +475,12 @@ async fn test_manager_delete_removes_the_pod() {
         .expect("delete should succeed");
 
     // Pods are deleted with a grace period (SME-51 B6), and the agent
-    // exits on SIGTERM, so the pod goes well within it.
+    // exits on SIGTERM, so the pod goes well within it. A red says what
+    // the pod was doing (SME-489).
     let pods = pods_api(&client);
-    let gone = tokio::time::timeout(Duration::from_secs(10), async {
-        while pods.get_opt(&pod_name).await.expect("get_opt should not error").is_some() {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    })
-    .await;
-    assert!(gone.is_ok(), "the pod should stop within seconds of manager.delete, not wait out its grace");
+    if let Err(report) = pod_gone::wait_for_pod_gone(&pods, &pod_name, Duration::from_secs(10)).await {
+        panic!("the pod should stop within seconds of manager.delete, not wait out its grace: {report}");
+    }
 }
 
 #[tokio::test]
@@ -506,24 +497,10 @@ async fn test_dropping_without_delete_still_cleans_up_via_drain_task() {
     drop(sandbox); // no manager.delete call — this is the path under test
 
     let pods = pods_api(&client);
-    let gone = tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            if pods
-                .get_opt(&pod_name)
-                .await
-                .expect("get_opt should not error")
-                .is_none()
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    })
-    .await;
-    assert!(
-        gone.is_ok(),
-        "drain task should have deleted the pod within the timeout"
-    );
+    // A red says what the pod was doing (SME-489).
+    if let Err(report) = pod_gone::wait_for_pod_gone(&pods, &pod_name, Duration::from_secs(15)).await {
+        panic!("drain task should have deleted the pod within the timeout: {report}");
+    }
 }
 
 /// The futures of the sandbox calls that sit deepest in the dev server's
