@@ -52,6 +52,19 @@ class Usage(FakeCase):
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("That provider no longer exists.", r.stderr)
 
+    # Round 1 B-L1: before the deploy, smelt's catch-all NotFound page
+    # answers the route 200 with HTML; that, or any answer without a
+    # windows list, is no usage route, not "no reading".
+    def test_an_answer_that_isnt_a_usage_answer_is_no_usage_route(self):
+        for body in (b"<!DOCTYPE html><html><body>Not found</body></html>", b'"a string"', b'{"windows": "none"}', b"[]"):
+            for args in (["usage", "7"], ["usage", "7", "--json"]):
+                with self.subTest(body=body, args=args):
+                    self.st.forced[USAGE_7] = (200, body)
+                    r = self.api(*args)
+                    self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                    self.assertIn("unknown: no usage route", r.stdout)
+                    self.assertNotIn("html", (r.stdout + r.stderr).lower())
+
     # P2
     def test_the_verdicts(self):
         cases = [

@@ -59,7 +59,7 @@ The Claude subscription's usage windows (five hours and seven days) are shared b
   - it comments `Usage hold: <verdict line>` on each affected ticket, with the time;
   - it calls `notify_user` once.
 - **Resume.** On a later pass whose verdict is `ok` (typically after the window's reset), it messages each held Driver "Usage hold lifted", comments `Usage hold lifted` on the same tickets, and starts Drivers again.
-- **On `unknown`:** it proceeds, and says so in its pass note. A `smelt-api usage` that fails (a server without the route answers 404, exit 1) counts as `unknown`.
+- **On `unknown`:** it proceeds, and says so in its pass note. A server without the route (one before SME-486 answers it 200 with its NotFound page) gives `unknown: no usage route` and exit 1; any other failure of `smelt-api usage` (an HTTP error, exit 1; smelt unreachable, exit 2) counts as `unknown` too.
 - **Not a gate on the user.** The user can lift a hold by saying so.
 
 ## Compaction (SME-482)

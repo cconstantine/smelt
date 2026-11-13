@@ -211,6 +211,15 @@ def _word(value, otherwise):
     return value if isinstance(value, str) and WINDOW_WORD.fullmatch(value) else otherwise
 
 
+NO_USAGE_ROUTE = "unknown: no usage route"
+
+
+def is_usage_answer(answer):
+    """Whether `answer` is a ProviderUsage: a dict with a windows list. A
+    server before SME-486 answers the route 200 with its NotFound page."""
+    return isinstance(answer, dict) and isinstance(answer.get("windows"), list)
+
+
 def usage_windows(answer):
     """The whitelisted fields of each window in a ProviderUsage answer
     (SME-486): numbers, booleans, minute times, and a name or status

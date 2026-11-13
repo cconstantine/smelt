@@ -316,14 +316,20 @@ def usage_line(w):
 def cmd_usage(args):
     """usage PROVIDER_ID (SME-486): the Claude subscription's usage windows
     and the PM's usage-hold verdict (docs/personas/project-manager.md)."""
-    windows = smelt_api.usage_windows(request("usage", args.provider_id))
-    verdict = smelt_api.usage_verdict(windows)
+    answer = request("usage", args.provider_id)
+    # Not a usage answer (a server before SME-486 answers 200 with its
+    # NotFound page): no usage route, exit 1, as a 404 would.
+    usage_route = smelt_api.is_usage_answer(answer)
+    windows = smelt_api.usage_windows(answer) if usage_route else []
+    verdict = smelt_api.usage_verdict(windows) if usage_route else smelt_api.NO_USAGE_ROUTE
     if args.json:
         show({"provider_id": args.provider_id, "windows": windows, "verdict": verdict})
-        return
-    for w in windows:
-        print(usage_line(w))
-    print(f"{'verdict':<10}  {verdict}")
+    else:
+        for w in windows:
+            print(usage_line(w))
+        print(f"{'verdict':<10}  {verdict}")
+    if not usage_route:
+        sys.exit(1)
 
 
 def cmd_where(args):
