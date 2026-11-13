@@ -181,15 +181,42 @@ fn read_record(record: &std::path::Path, wait: Duration) -> Option<String> {
 
 const STOPPED: &str = "smelt: go wrote nothing and received under 1 KB/s for 3 s, so it was stopped";
 
+/// The watchdog's check period: `go_idle.sh` naps `sleep 5` between checks.
+const CHECK: Duration = Duration::from_secs(5);
+
+/// The design's bound on stopping a silent go, at the tests' 3 s idle
+/// bound: two checks. The first check that sees a go gives no verdict
+/// (SME-511's first-seen rule), so a go first seen at the 5 s check, its
+/// exec just after the watchdog's first scan, is judged at the 10 s check,
+/// where one quiet check (5 s idle) is past the 3 s bound. A go the first
+/// scan already sees is stopped at the 5 s check.
+const STOPPED_WITHIN: Duration = CHECK.saturating_mul(2);
+
+/// Scheduling on a loaded gate, on top of the design bound: two scans of
+/// `/proc` (each walks every process up to the install), the nap's own
+/// `sleep` starting late, and the install's exit and record write. Measured
+/// on SME-511's 40 runs of (a): the worst 10.76 s, 0.76 s past the bound.
+/// 5 s is that overrun about six times over, for the full gate's parallel
+/// load; it is one check period, not a widening for a flake (SME-329): the
+/// bound itself rose from 5 s to 10 s with the first-seen rule, on purpose.
+const SCHEDULING_MARGIN: Duration = Duration::from_secs(5);
+
+/// How long (a) and (d) wait for a silent go's record: the design bound
+/// plus the scheduling margin, 10 s + 5 s = 15 s.
+const SILENT_GO_WAIT: Duration = STOPPED_WITHIN.saturating_add(SCHEDULING_MARGIN);
+
 /// (a) A go that hangs silently, as on a module proxy that never answers,
 /// is stopped and says why, and the install fails with its own status.
 /// The install writes after it's stopped (here the fake go itself), and
 /// the watchdog's line survives that: the log is opened for append.
+/// The watchdog stops it within two checks (`STOPPED_WITHIN`: one check
+/// period to first see it, one more to judge it, 10 s, plus scan time), so
+/// the wait is `SILENT_GO_WAIT`, that bound plus `SCHEDULING_MARGIN`.
 #[test]
 fn test_a_silent_go_is_stopped_and_says_why() {
     let go = "trap 'kill $! 2>/dev/null; echo go: interrupted; exit 143' TERM; sleep 600 & wait";
-    let ran = run_pod_script("silent", go, "go install x@v1", &[], Duration::from_secs(15));
-    let rc = ran.rc.unwrap_or_else(|| panic!("no record within 15 s; the log: {:?}", ran.log));
+    let ran = run_pod_script("silent", go, "go install x@v1", &[], SILENT_GO_WAIT);
+    let rc = ran.rc.unwrap_or_else(|| panic!("no record within {SILENT_GO_WAIT:?}; the log: {:?}", ran.log));
     assert_ne!(rc, "0", "{}", ran.log);
     assert!(ran.log.ends_with(&format!("{STOPPED}\ngo: interrupted\n")), "{:?}", ran.log);
     assert!(ran.watchdogs.is_empty(), "the watchdog outlived the install: {:?}", ran.watchdogs);
@@ -199,15 +226,67 @@ fn test_a_silent_go_is_stopped_and_says_why() {
 /// (d) SME-456's full-gate red: a silent go is stopped even while the pod
 /// receives traffic that isn't the install's (on a busy node, the
 /// bridge's broadcasts reach every pod). Only what go itself reads
-/// counts.
+/// counts. As in (a), the watchdog stops it within two checks
+/// (`STOPPED_WITHIN`, 10 s, plus scan time), and the wait is
+/// `SILENT_GO_WAIT`, that bound plus `SCHEDULING_MARGIN`.
 #[test]
 fn test_a_silent_go_is_stopped_while_other_traffic_arrives() {
     let go = "trap 'kill $! 2>/dev/null; exit 143' TERM; sleep 600 & wait";
-    let ran = run(Run { name: "traffic", go_body: go, traffic: true, ..Default::default() });
-    let rc = ran.rc.unwrap_or_else(|| panic!("no record within 15 s; the log: {:?}", ran.log));
+    let ran = run(Run { name: "traffic", go_body: go, traffic: true, wait: SILENT_GO_WAIT, ..Default::default() });
+    let rc = ran.rc.unwrap_or_else(|| panic!("no record within {SILENT_GO_WAIT:?}; the log: {:?}", ran.log));
     assert_ne!(rc, "0", "{}", ran.log);
     assert!(ran.log.trim_end().ends_with(STOPPED), "{:?}", ran.log);
     assert!(ran.watchdogs.is_empty(), "the watchdog outlived the install: {:?}", ran.watchdogs);
+}
+
+/// Waits, in the install, until the watchdog's first nap is running: a
+/// `sleep 5` whose parent is this run's watchdog (`sh <dir>/smelt-go-idle.sh
+/// …`, `<dir>` being `$HOME`'s parent, so another test's watchdog never
+/// matches). `go_idle.sh` starts that nap only after its first `scan` and
+/// `reads`, so whatever the install runs next is exec'd after the first
+/// scan by construction, not by timing.
+const AFTER_FIRST_SCAN: &str = r#"w="sh ${HOME%/home}/smelt-go-idle.sh "
+while :; do
+  for d in /proc/[0-9]*; do
+    c=; read -r c 2>/dev/null < "$d/comm"
+    [ "$c" = sleep ] || continue
+    [ "$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)" = "sleep 5 " ] || continue
+    pp=; read -r _ _ _ pp _ 2>/dev/null < "$d/stat"
+    case "$(tr '\0' ' ' < "/proc/$pp/cmdline" 2>/dev/null)" in "$w"*) exit 0 ;; esac
+  done
+  sleep 0.1
+done
+"#;
+
+/// (h) The first-seen path, forced (SME-511 review 1): a silent go exec'd
+/// after the watchdog's first scan, ordered by `AFTER_FIRST_SCAN`. The 5 s
+/// check is the first to see it and gives no verdict; the 10 s check
+/// judges it and stops it: rc 143 (its TERM trap's own status, and TERM's
+/// were the trap not set), the watchdog's line, and a stop inside the
+/// design window. The window's floor is two naps, `STOPPED_WITHIN`, which
+/// no scheduling can shorten: a watchdog judging the go at the check that
+/// first sees it stops it at 5 s. Its ceiling is the wait, `SILENT_GO_WAIT`.
+#[test]
+fn test_a_silent_go_first_seen_late_is_stopped_at_the_second_check() {
+    let go = "trap 'kill $! 2>/dev/null; echo go: interrupted; exit 143' TERM; sleep 600 & wait";
+    let ran = run(Run {
+        name: "silent-late",
+        go_body: go,
+        install: "sh \"$HOME/after-first-scan.sh\"; go install x@v1",
+        home_files: &[("after-first-scan.sh", AFTER_FIRST_SCAN)],
+        wait: SILENT_GO_WAIT,
+        ..Default::default()
+    });
+    let rc = ran.rc.unwrap_or_else(|| panic!("no record within {SILENT_GO_WAIT:?}; the log: {:?}", ran.log));
+    assert_eq!(rc, "143", "{}", ran.log);
+    assert!(ran.log.ends_with(&format!("{STOPPED}\ngo: interrupted\n")), "{:?}", ran.log);
+    assert!(ran.watchdogs.is_empty(), "the watchdog outlived the install: {:?}", ran.watchdogs);
+    assert!(
+        ran.took >= STOPPED_WITHIN,
+        "stopped after {:?}, before the second check ({STOPPED_WITHIN:?}): the check that first saw it judged it",
+        ran.took
+    );
+    eprintln!("stopped after {:?}, rc {rc}", ran.took);
 }
 
 /// (e) A go that writes nothing but keeps reading (a download between
