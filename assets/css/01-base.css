@@ -76,11 +76,23 @@ body {
     cursor: pointer;
 }
 
+/* Only `.sidebar-scroll` (the list) scrolls: New conversation above it
+   and the Settings footer below stay on screen (SME-512). */
 .sidebar-body {
     display: flex;
     flex-direction: column;
     gap: 16px;
+    flex: 1 1 auto;
     min-height: 0;
+}
+
+.sidebar-scroll {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
 }
 
 .sidebar {
@@ -92,7 +104,29 @@ body {
     display: flex;
     flex-direction: column;
     gap: 16px;
-    overflow-y: auto;
+    overflow: hidden;
+}
+
+.sidebar-footer {
+    flex-shrink: 0;
+    border-top: 1px solid var(--border);
+    padding-top: 8px;
+}
+
+.sidebar-settings-link {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px;
+    border-radius: 6px;
+    color: var(--text-2);
+    font-size: 14px;
+    text-decoration: none;
+}
+
+.sidebar-settings-link:hover {
+    background: var(--subtle);
+    color: var(--ink);
 }
 
 .new-conversation {

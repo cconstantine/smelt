@@ -4,7 +4,6 @@ use super::*;
 use std::collections::HashSet;
 
 use crate::api::agents::{ConversationNode, get_conversation_tree};
-use crate::frontend::notifications::NotificationsToggle;
 
 mod archive;
 mod tree;
@@ -259,20 +258,10 @@ pub(super) fn ConversationSidebar(
             // server render (SME-269).
             "data-app-live": app_live().then_some("true"),
             button { class: "new-conversation", onclick: move |e| { open_on_phone.set(false); new_conversation(e) }, "New conversation" }
-            // Settings, as one compact block: seven full-width buttons took
-            // about 400px above the conversations (SME-123 DR4).
-            nav { class: "settings-links", aria_label: "Settings",
-                Link { to: Route::ProvidersRoute {}, class: "settings-link providers-link", "Model providers" }
-                Link { to: Route::McpServersRoute {}, class: "settings-link mcp-servers-link", "MCP servers" }
-                Link { to: Route::PodsRoute {}, class: "settings-link pods-link", "Sandboxes" }
-                Link { to: Route::SandboxVolumesRoute {}, class: "settings-link sandbox-volumes-link", "Sandbox volumes" }
-                Link { to: Route::GitRoute {}, class: "settings-link git-link", "Git" }
-                Link { to: Route::SecretsRoute {}, class: "settings-link secrets-link", "Secrets" }
-                Link { to: Route::LanguageServersRoute {}, class: "settings-link language-servers-link", "Language servers" }
-                // The one place the browser's notification permission
-                // prompt ever appears (SME-71).
-                NotificationsToggle {}
-            }
+            // Only the list scrolls: New conversation above it and the
+            // Settings link below stay put (SME-512). The settings pages
+            // are on /settings.
+            div { class: "sidebar-scroll",
             super::ErrorText { message: list_error() }
             super::ErrorText { message: action_error() }
             // SME-480 D8: shown only when there is something archived.
@@ -312,6 +301,15 @@ pub(super) fn ConversationSidebar(
                     }
                 }
             }
+            }
+            }
+            // Pinned at the sidebar's bottom left, however long the list
+            // (SME-512); on a phone, the opened drawer's last row.
+            div { class: "sidebar-footer",
+                Link { to: Route::SettingsRoute {}, class: "sidebar-settings-link",
+                    span { class: "sidebar-settings-icon", aria_hidden: "true", "\u{2699}" }
+                    "Settings"
+                }
             }
         }
     }
