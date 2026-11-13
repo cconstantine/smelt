@@ -4,6 +4,7 @@ use crate::api::sandbox_volumes::{
     SandboxVolumeSummary, create_sandbox_volume, delete_sandbox_volume, list_sandbox_volumes,
 };
 use crate::frontend::Route;
+use crate::frontend::pages::SettingsCrumbs;
 
 /// Lists every configured volume — every sandbox pod smelt creates gets
 /// every one of these mounted, unconditionally (see
@@ -47,7 +48,7 @@ pub fn SandboxVolumesIndex() -> Element {
     rsx! {
         div { class: "sandbox-volumes-page",
             div { class: "sandbox-volumes-header",
-                Link { to: Route::Home {}, class: "sandbox-volumes-back-link", "\u{2190} Back to conversations" }
+                SettingsCrumbs {}
                 h1 { "Sandbox volumes" }
                 p { class: "muted",
                     "A volume is mounted into every sandbox pod smelt creates \u{2014} smelt doesn't need to know what it's for."

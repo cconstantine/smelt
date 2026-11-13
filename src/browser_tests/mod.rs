@@ -287,6 +287,7 @@ fn scenarios() -> Vec<Entry> {
         // Alone (SME-486): its Claude Code provider shows in every lane's
         // providers list and model picker.
         entry("usage_windows", 90, Runs::Alone, |t| Box::pin(scenario_usage_windows(t))),
+        entry("settings_page", 60, Runs::Beside, |t| Box::pin(scenario_settings_page(t))),
     ]
 }
 
@@ -476,6 +477,7 @@ mod top_level_persona;
 mod archive;
 mod compact_now;
 mod usage_windows;
+mod settings_page;
 
 use harness::*;
 use clicks::*;
@@ -505,3 +507,4 @@ use top_level_persona::*;
 use archive::*;
 use compact_now::*;
 use usage_windows::*;
+use settings_page::*;

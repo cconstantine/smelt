@@ -1,4 +1,5 @@
 use super::*;
+use crate::frontend::pages::SettingsCrumbs;
 
 #[component]
 pub fn ProvidersIndex() -> Element {
@@ -40,7 +41,7 @@ pub fn ProvidersIndex() -> Element {
     rsx! {
         div { class: "mcp-servers-page providers-page",
             div { class: "mcp-servers-header",
-                Link { to: Route::Home {}, class: "mcp-back-link", "\u{2190} Back to conversations" }
+                SettingsCrumbs {}
                 h1 { "Model providers" }
                 p { class: "muted",
                     "Where the model runs: Anthropic, a llama.cpp or Ollama server, or any other server with an Anthropic-compatible /v1/messages. Each conversation can use a different one."

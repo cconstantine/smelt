@@ -4,6 +4,7 @@ use crate::api::mcp::{
     McpConnectionStatus, McpServerSummary, list_mcp_servers, mcp_server_status,
 };
 use crate::frontend::Route;
+use crate::frontend::pages::SettingsCrumbs;
 
 use super::status_summary;
 
@@ -31,7 +32,7 @@ pub fn McpServersIndex() -> Element {
     rsx! {
         div { class: "mcp-servers-page",
             div { class: "mcp-servers-header",
-                Link { to: Route::Home {}, class: "mcp-back-link", "\u{2190} Back to conversations" }
+                SettingsCrumbs {}
                 h1 { "MCP servers" }
                 p { class: "muted",
                     "Every tool a configured server exposes is available to the model in every conversation."

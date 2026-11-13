@@ -4,7 +4,7 @@ use crate::api::git::{
     delete_ssh_key, forget_repo_trust, generate_ssh_key, get_git_settings, import_ssh_key,
     save_git_identity,
 };
-use crate::frontend::Route;
+use crate::frontend::pages::SettingsCrumbs;
 use crate::frontend::pages::chat::shown_text::hidden_text_note;
 use crate::git::{GitIdentity, RepoTrustSummary, SshKeySummary};
 
@@ -57,7 +57,7 @@ pub fn GitSettingsPage() -> Element {
     rsx! {
         div { class: "sandbox-volumes-page git-page",
             div { class: "sandbox-volumes-header",
-                Link { to: Route::Home {}, class: "sandbox-volumes-back-link", "\u{2190} Back to conversations" }
+                SettingsCrumbs {}
                 h1 { "Git" }
                 p { class: "muted",
                     "Every sandbox gets these keys and this name and email, so the model can clone and push. Changes are sent to running sandboxes straight away."

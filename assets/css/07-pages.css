@@ -114,16 +114,66 @@
     margin-bottom: 24px;
 }
 
-.pods-back-link {
-    display: inline-block;
+/* Every settings page's breadcrumb (SME-512): Conversations › Settings,
+   with the page's own h1 as the last crumb. */
+.settings-crumbs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 6px;
     margin-bottom: 12px;
-    color: var(--text-2);
     font-size: 13px;
+}
+
+.settings-crumbs a {
+    color: var(--text-2);
     text-decoration: none;
 }
 
-.pods-back-link:hover {
+.settings-crumbs a:hover {
     color: var(--ink);
+}
+
+.settings-crumb-separator {
+    color: var(--muted);
+}
+
+/* The Settings index (SME-512): one row per settings page. */
+.settings-entries {
+    list-style: none;
+    margin: 0 0 32px;
+    padding: 0;
+    border-top: 1px solid var(--border);
+}
+
+.settings-entry {
+    padding: 12px 0;
+    border-bottom: 1px solid var(--border);
+}
+
+.settings-entry p {
+    margin: 4px 0 0;
+    font-size: 13px;
+}
+
+.settings-entry-link {
+    color: var(--ink);
+    font-weight: 600;
+    text-decoration: none;
+}
+
+.settings-entry-link:hover {
+    color: var(--accent);
+}
+
+.settings-browser h2 {
+    font-size: 16px;
+    margin: 0 0 4px;
+}
+
+.settings-browser p {
+    margin: 0 0 12px;
+    font-size: 13px;
 }
 
 .pods-table {

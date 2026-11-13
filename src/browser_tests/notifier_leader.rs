@@ -144,7 +144,7 @@ async fn spell_notifies(page: &chromiumoxide::Page, id: i64) -> bool {
 async fn to_providers(page: &chromiumoxide::Page) {
     click_when_present(page, ".providers-link", Duration::from_secs(10)).await;
     assert!(wait_pathname(page, "/providers", Duration::from_secs(10)).await, "the sidebar link didn't open /providers");
-    wait_for_element(page, ".mcp-back-link", Duration::from_secs(10)).await;
+    wait_for_element(page, ".settings-home-link", Duration::from_secs(10)).await;
     // Whatever the route change was going to do to the notifier, done.
     tokio::time::sleep(Duration::from_secs(1)).await;
 }
@@ -158,7 +158,7 @@ async fn browser_back(page: &chromiumoxide::Page, path: &str) {
 
 /// The settings page's own link back to Home, and it settled.
 async fn back_link_home(page: &chromiumoxide::Page) {
-    click_when_present(page, ".mcp-back-link", Duration::from_secs(10)).await;
+    click_when_present(page, ".settings-home-link", Duration::from_secs(10)).await;
     assert!(wait_pathname(page, "/", Duration::from_secs(10)).await, "the back link didn't open Home");
     tokio::time::sleep(Duration::from_secs(1)).await;
 }
