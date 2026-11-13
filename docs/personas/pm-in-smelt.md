@@ -13,11 +13,15 @@ Part of the [development process](../development-process.md). The [Project Manag
 - **Up to four ClaudeCode/Opus ticket slots and one strata slot,** one ticket each.
 - **Each ticket gets a fresh top-level Ticket Driver conversation,** never a child of the PM. A child would put every ticket line in one tree, so stopping or deleting the PM would take every line with it. Also, `start_agent` can't choose a provider, and `claude-opus-5-5` exists on both the paid API and ClaudeCode.
 - **Ticket slots aren't stack slots.** The [stack-slot rule](project-manager.md) (two full-stack seats at a time, granted on the ticket) stays as it is.
-- **A retrospective takes a ClaudeCode slot at once.** When one is due, the PM doesn't wait for a slot to free: it holds the ClaudeCode tree that's cheapest to pause, runs the retro in its slot, and resumes that tree after ([Retrospectives](#retrospectives-and-bug-bashes)).
+- **A retrospective takes a ClaudeCode slot at once.** When one is due, the PM doesn't wait for a slot to free: it holds the ClaudeCode tree that's cheapest to pause, runs the retro in its slot, and resumes that tree after ([Retrospectives](#retrospectives-and-bug-bashes)). The hold is a message to that tree's Driver (`smelt-api send`): start no seat and send no new work until told. A seat already mid-turn finishes its turn; it isn't stopped.
 
 ### ClaudeCode usage limit
 
-If any seat fails on a ClaudeCode "usage limit", the PM holds every ClaudeCode tree until the window resets, and tells the user with `notify_user`. It holds a tree by telling its Driver (`smelt-api send`) to start no seat and send no message until told, and starts no new ClaudeCode Driver meanwhile. Once the window has reset, it tells each held Driver to go on. The same hold, on one tree, is how a [retrospective](#retrospectives-and-bug-bashes) frees its slot.
+If any seat fails on a ClaudeCode "usage limit", the PM holds every ClaudeCode tree until the window resets:
+
+- **The hold:** the PM sends no new work to any ClaudeCode tree and starts no ClaudeCode seat until the reset time the error names, or, when it names none, until its first pass after the 5-hour window. A seat already mid-turn is left to finish or fail; it isn't stopped.
+- **It tells the user through `ask_user`** when its own turn can still run.
+- **If the PM's own turns fail on the limit,** the hold is implicit, since nothing gets sent. After the reset it rebuilds its state from the trail ([rules.md](rules.md)) before it resumes the trees.
 
 ## Starting a Driver
 
