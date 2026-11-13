@@ -86,18 +86,37 @@ fn pod_gone_report(name: &str, elapsed: Duration, seen: &[String], last_pod: Opt
     )
 }
 
-/// Waits up to `window` for `name` to be gone, polling every 200 ms: `Ok`
-/// once it is, `Err` with `pod_gone_report`'s account of the wait when
-/// `window` runs out, written at that moment.
-pub(super) async fn wait_for_pod_gone(pods: &Api<Pod>, name: &str, window: Duration) -> Result<(), String> {
+/// What a timed-out wait's polls saw: when it gave up, each change at its
+/// offset from the wait's start, and the last pod it read.
+#[derive(Debug)]
+struct GoneTrace {
+    elapsed: Duration,
+    seen: Vec<String>,
+    last_pod: Option<Pod>,
+}
+
+/// Polls `read` every 200 ms until it says the pod is gone (`Ok`) or
+/// `window` runs out (`Err` with what the polls saw, timed when the
+/// window closed). Each read is bounded by the time left in the window,
+/// so a read that only answers "gone" after the window fails the wait,
+/// and a hung one can't stretch it.
+async fn poll_until_gone<F, Fut>(mut read: F, window: Duration) -> Result<(), GoneTrace>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Pod>, String>>,
+{
     let start = std::time::Instant::now();
     let mut seen: Vec<String> = Vec::new();
     let mut last_state = String::new();
     let mut last_pod = None;
-    while start.elapsed() < window {
-        match pods.get_opt(name).await {
-            Ok(None) => return Ok(()),
-            Ok(Some(pod)) => {
+    loop {
+        let left = window.saturating_sub(start.elapsed());
+        if left.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(left, read()).await {
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Ok(Some(pod))) => {
                 let state = pod_gone_state(&pod);
                 if state != last_state {
                     seen.push(format!("+{:.1} s {state}", start.elapsed().as_secs_f64()));
@@ -105,18 +124,71 @@ pub(super) async fn wait_for_pod_gone(pods: &Api<Pod>, name: &str, window: Durat
                 }
                 last_pod = Some(pod);
             }
-            Err(e) => seen.push(format!("+{:.1} s read failed: {e}", start.elapsed().as_secs_f64())),
+            Ok(Err(e)) => seen.push(format!("+{:.1} s read failed: {e}", start.elapsed().as_secs_f64())),
+            Err(_) => seen.push(format!("+{:.1} s read still unanswered when the window closed", start.elapsed().as_secs_f64())),
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(200).min(window.saturating_sub(start.elapsed()))).await;
     }
-    let events = match &last_pod {
+    Err(GoneTrace { elapsed: start.elapsed(), seen, last_pod })
+}
+
+/// Waits up to `window` for `name` to be gone: `Ok` once it is, `Err`
+/// with `pod_gone_report`'s account of the wait when `window` runs out,
+/// its elapsed time taken at that moment (the events read after it).
+pub(super) async fn wait_for_pod_gone(pods: &Api<Pod>, name: &str, window: Duration) -> Result<(), String> {
+    let trace = match poll_until_gone(|| async { pods.get_opt(name).await.map_err(|e| e.to_string()) }, window).await {
+        Ok(()) => return Ok(()),
+        Err(trace) => trace,
+    };
+    let events = match &trace.last_pod {
         Some(pod) => match pod_events(pods, pod).await {
             Ok(events) => describe_gone_events(&events),
             Err(e) => format!("unavailable: {e}"),
         },
         None => "none read".to_string(),
     };
-    Err(pod_gone_report(name, start.elapsed(), &seen, last_pod.as_ref(), &events))
+    Err(pod_gone_report(name, trace.elapsed, &trace.seen, trace.last_pod.as_ref(), &events))
+}
+
+/// A pod the stub read reports once, as `pod_gone_state` sees a pending one.
+fn a_listed_pod() -> Pod {
+    serde_json::from_value(serde_json::json!({"metadata": {"name": "sandbox-z"}, "status": {"phase": "Pending"}})).expect("pod")
+}
+
+/// A read that hangs after the first answer ends at the window, not on
+/// kube-rs's own read timeout, and the report says the read never answered.
+#[tokio::test]
+async fn test_a_pod_gone_wait_bounds_a_read_that_hangs() {
+    let mut reads = 0;
+    let read = || {
+        reads += 1;
+        let first = reads == 1;
+        async move {
+            if first {
+                Ok(Some(a_listed_pod()))
+            } else {
+                std::future::pending::<Result<Option<Pod>, String>>().await
+            }
+        }
+    };
+    let waited = tokio::time::timeout(Duration::from_secs(3), poll_until_gone(read, Duration::from_millis(500))).await;
+    let trace = waited.expect("the wait should end at its window, not wait on a hung read").expect_err("the pod never went");
+    assert!(trace.elapsed >= Duration::from_millis(500) && trace.elapsed < Duration::from_secs(1), "{:?}", trace.elapsed);
+    assert!(trace.last_pod.is_some(), "the first read's pod is kept");
+    assert!(trace.seen.last().is_some_and(|s| s.contains("read still unanswered")), "{:?}", trace.seen);
+}
+
+/// A read started inside the window that only answers "gone" after it
+/// closed fails the wait, as the old `tokio::time::timeout` did.
+#[tokio::test]
+async fn test_a_pod_gone_wait_fails_a_gone_that_comes_after_the_window() {
+    let read = || async {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        Ok(None)
+    };
+    let gone = poll_until_gone(read, Duration::from_millis(300)).await;
+    let trace = gone.expect_err("gone only after the window closed is a timeout");
+    assert!(trace.elapsed < Duration::from_millis(700), "the wait gave up at its window: {:?}", trace.elapsed);
 }
 
 /// The real wait on a pod that never goes: it gives up at its window and
