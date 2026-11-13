@@ -72,6 +72,10 @@ smelt starts the CLI with a cleared environment and passes only these: `PATH`, `
 
 The CLI has no model listing, so the provider lists a fixed set: `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` and `claude-fable-5-1`, each with a 1,000,000-token window and a 128,000-token reply cap. Add another by id on the provider's page. Calls are priced on the `anthropic` price catalog entry, which the form picks: what the API would have charged, though the subscription pays.
 
+## Usage windows
+
+Each call records the subscription's usage windows from the CLI's `rate_limit_event` (SME-486): the percent of the five-hour and seven-day limits used, and when each resets. The provider's page shows them under **Subscription usage**, its row on the providers list ends `5h 45% · 7d 32%`, and a conversation on the provider shows the same at the right of its context bar, amber at 70% and red at 90%. Nothing shows until the first call after the deploy. The Project Manager reads them with `scripts/pm/smelt-api usage` to hold new work before the cap ([project-manager.md](../personas/project-manager.md#usage-hold-sme-486)).
+
 ## Recording the fixtures
 
 The transport's tests run a fake CLI (the test binary itself) that replays lines recorded from the real one, in `src/claude_cli/fixtures/`. `scripts/claude-cli-capture <out dir> <scenario>...` records them: each scenario but `sanitize` is one real `claude -p` call on the host's own Claude Code sign-in, built only with the `claude-cli-capture` feature, so nothing in the gate runs it. `sanitize` writes the fixtures from the raw output with every id, date, address, signature and email replaced. Keep the out dir outside the repo and delete its `config/` after.

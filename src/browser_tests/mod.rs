@@ -284,6 +284,9 @@ fn scenarios() -> Vec<Entry> {
         // Alone (SME-480): it reads the phone's folded count, which other
         // lanes' waiting conversations would add to.
         entry("archived_conversations", 90, Runs::Alone, |t| Box::pin(scenario_archived_conversations(t))),
+        // Alone (SME-486): its Claude Code provider shows in every lane's
+        // providers list and model picker.
+        entry("usage_windows", 90, Runs::Alone, |t| Box::pin(scenario_usage_windows(t))),
     ]
 }
 
@@ -472,6 +475,7 @@ mod report_owed;
 mod top_level_persona;
 mod archive;
 mod compact_now;
+mod usage_windows;
 
 use harness::*;
 use clicks::*;
@@ -500,3 +504,4 @@ use report_owed::*;
 use top_level_persona::*;
 use archive::*;
 use compact_now::*;
+use usage_windows::*;

@@ -11,7 +11,9 @@ directory on sys.path themselves (they run as `python3 -I`).
 """
 
 import json
+import math
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -25,7 +27,8 @@ DEFAULT_HOST = "smelt.constantlee.us"
 
 TIMEOUT_SECS = 30
 
-# name -> (method, path template). `{id}` is a conversation id, an integer.
+# name -> (method, path template). `{id}` is a conversation or (for
+# `usage`) a provider id, an integer either way.
 ROUTES = {
     "create": ("POST", "/api/conversations"),
     "attach": ("POST", "/api/conversations/{id}/repos"),
@@ -42,6 +45,8 @@ ROUTES = {
     "pods": ("GET", "/api/pods"),
     "pod-commands": ("GET", "/api/pods/commands"),
     "providers": ("GET", "/api/providers"),
+    # SME-486: `{id}` is a provider's id here.
+    "usage": ("GET", "/api/providers/{id}/usage"),
     "build-id": ("GET", "/api/build-id"),
     # SME-480: a view mark on a top-level conversation and its agents.
     "archive": ("POST", "/api/conversations/{id}/archive"),
@@ -178,6 +183,99 @@ def subtree(nodes, root):
         for child in reversed(children):
             stack.append((depth + 1, child))
     return out
+
+
+# The usage hold (SME-486, docs/personas/project-manager.md): a live
+# window at or over these holds new Drivers. Whole percents: the verdict
+# compares the percent it prints (round 1 B-L3).
+HOLD_FIVE_HOUR = 70
+HOLD_SEVEN_DAY = 90
+HOLD_PACE = 100
+HOLD_STATUSES = ("allowed_warning", "rejected")
+
+# The shape a window's name or status must have to print as itself: the
+# answer's other fields, and any text that isn't a plain word, never print.
+WINDOW_WORD = re.compile(r"[a-z0-9_]{1,40}")
+TIME = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d(:\d\d(\.\d+)?)?(Z|\+00:00)")
+
+
+def _number(value):
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _time(value):
+    """An RFC 3339 UTC time cut to the minute (`2026-11-13T14:20Z`), or None
+    for anything that isn't one."""
+    return value[:16] + "Z" if isinstance(value, str) and TIME.fullmatch(value) else None
+
+
+def _word(value, otherwise):
+    return value if isinstance(value, str) and WINDOW_WORD.fullmatch(value) else otherwise
+
+
+NO_USAGE_ROUTE = "unknown: no usage route"
+
+
+def is_usage_answer(answer):
+    """Whether `answer` is a ProviderUsage: a dict with a windows list. A
+    server before SME-486 answers the route 200 with its NotFound page."""
+    return isinstance(answer, dict) and isinstance(answer.get("windows"), list)
+
+
+def usage_windows(answer):
+    """The whitelisted fields of each window in a ProviderUsage answer
+    (SME-486): numbers, booleans, minute times, and a name or status
+    that is a plain word (else `(unnamed)` / `(unknown)`). Nothing else
+    of the answer is kept. Only seven_day keeps its pace (`projected`):
+    it's the only pace the verdict and the UI use."""
+    windows = answer.get("windows") if isinstance(answer, dict) else None
+    out = []
+    for w in windows if isinstance(windows, list) else []:
+        if not isinstance(w, dict):
+            continue
+        name = _word(w.get("name"), "(unnamed)")
+        out.append({
+            "name": name,
+            "utilization": _number(w.get("utilization")) or 0.0,
+            "status": _word(w.get("status"), "(unknown)"),
+            "resets_at": _time(w.get("resets_at")),
+            "seen_at": _time(w.get("seen_at")),
+            "reset_passed": w.get("reset_passed") is True,
+            "projected": _number(w.get("projected")) if name == "seven_day" else None,
+        })
+    return out
+
+
+def whole_percent(fraction):
+    """`fraction` as a whole percent, a half rounding up: Rust's f64::round
+    on the provider page and the context bar, not Python's round, which
+    rounds a half to even. The verdict compares this, the number printed."""
+    value = fraction * 100
+    whole = math.floor(value)
+    return whole + 1 if value - whole >= 0.5 else whole
+
+
+def percent(fraction):
+    return f"{whole_percent(fraction)}%"
+
+
+def usage_verdict(windows):
+    """`ok`, `hold: <reasons>` or `unknown: no reading`, for windows from
+    usage_windows. A window whose reset has passed never holds."""
+    live = [w for w in windows if not w["reset_passed"]]
+    if not live:
+        return "unknown: no reading"
+    reasons = []
+    for w in live:
+        name, used, pace = w["name"], w["utilization"], w["projected"]
+        shown = whole_percent(used)
+        if (name == "five_hour" and shown >= HOLD_FIVE_HOUR) or (name == "seven_day" and shown >= HOLD_SEVEN_DAY):
+            reasons.append(f"{name} at {percent(used)}")
+        elif name == "seven_day" and pace is not None and whole_percent(pace) >= HOLD_PACE:
+            reasons.append(f"{name} on pace for {percent(pace)} by reset")
+        if w["status"] in HOLD_STATUSES:
+            reasons.append(f"{name} {w['status']}")
+    return "hold: " + "; ".join(reasons) if reasons else "ok"
 
 
 def message_blocks(message):

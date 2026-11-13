@@ -11,3 +11,4 @@ mod errors;
 pub(crate) mod fake;
 mod render;
 mod status;
+pub(crate) mod usage;

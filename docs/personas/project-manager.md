@@ -47,6 +47,23 @@ It comments on the ticket, `Project Manager: moved to Up Next because …`, nami
 
 When the Project Manager runs as a smelt conversation rather than a Claude Code session, [pm-in-smelt.md](pm-in-smelt.md) applies too (SME-460). It covers its slots (four ClaudeCode/Opus ticket slots and one strata slot), starting each Ticket Driver as a top-level conversation through `scripts/pm/smelt-api`, the four parts of a Driver's brief, watching each Driver with `scripts/pm/smelt-wait`, quiet deploys, the ClaudeCode usage-limit hold, how it runs retrospectives and bug bashes (SME-514), the PM's standing rules, and the security model they rest on. The two scripts are its only way to write to smelt. Its Drivers aren't agents it started, so `list_agents` and `message_agent` don't reach them: there, a report owed is asked for with `smelt-api send ID -` ([pm-in-smelt.md](pm-in-smelt.md#watching)).
 
+## Usage hold (SME-486)
+
+The Claude subscription's usage windows (five hours and seven days) are shared by every seat on it, so the Project Manager slows down before the cap rather than hitting it mid-seat. smelt records the windows from each Claude Code call; `scripts/pm/smelt-api usage <id>` prints them and a verdict ([pm-in-smelt.md](pm-in-smelt.md#the-scripts)).
+
+- **When to check.** Before starting any Driver, on each pass while Drivers run, and at each watcher wake before it acts ([pm-in-smelt.md](pm-in-smelt.md#watching)), it runs `smelt-api usage <id>` for the Claude Code provider its Drivers use (`smelt-api providers` lists it).
+- **The verdict.** `hold: <reasons>` when a live window holds: five-hour at 70% or more; seven-day at 90% or more, or on pace for 100% or more by its reset (from the second day of the week); or any window `allowed_warning` or `rejected`. A window whose reset has passed never holds. `unknown: no reading` when there is none (no Claude Code call yet, or every window's reset has passed). Else `ok`. The thresholds are named constants in `scripts/pm/smelt_api.py`.
+- **On `hold`:**
+  - it starts no new Driver;
+  - it sends each running Driver one message (`smelt-api send ID -`): "Usage hold (SME-486): finish your current seat, start no next one, report, and wait for my resume";
+  - it comments `Usage hold: <verdict line>` on each affected ticket, with the time;
+  - it calls `notify_user` once;
+  - a held Driver that has reported is quiet by design: its `STALL` wake is answered without messaging it ([pm-in-smelt.md](pm-in-smelt.md#watching)).
+- **Resume.** On a later pass whose verdict is `ok` (typically after the window's reset), it messages each held Driver "Usage hold lifted", comments `Usage hold lifted` on the same tickets, and starts Drivers again.
+- **On `unknown`:** it proceeds, and says so in its pass note. A server without the route (one before SME-486 answers it 200 with its NotFound page) gives `unknown: no usage route` and exit 1; any other failure of `smelt-api usage` (an HTTP error, exit 1; smelt unreachable, exit 2) counts as `unknown` too.
+- **Not a gate on the user.** The user can lift a hold by saying so.
+- **At the cap itself** a second rule applies: a seat that fails on a ClaudeCode "usage limit" sets off the [usage-limit hold](pm-in-smelt.md#claudecode-usage-limit) (SME-514), which holds every ClaudeCode tree until the reset the error names. This rule slows down before the cap; that one stops at it. Both can stand at once, and the trees resume only once neither does.
+
 ## Compaction (SME-482)
 
 A long-running Project Manager keeps its context small by compacting (`compact_context`, SME-482) at these points, and only after recording the board first (open slots, the Drivers running and their conversations, pins, retro counts) on the "Next retrospective" ticket or in its todo list, so the summary is never the only copy: after a ticket reaches Done and its retro count is taken; after a retrospective closes; and before starting a new Driver when its context is past about 60,000 tokens, half its ceiling. Never mid-dispatch (a Driver started, its "started" comment not yet written). After a compaction, rebuild state from Linear, git and GitHub before acting ([rules.md](rules.md)). To compact a Driver it supervises while that Driver is idle, it uses `scripts/pm/smelt-api compact ID` ([pm-in-smelt.md](pm-in-smelt.md#the-scripts)), its only way to write to smelt; a busy Driver it asks to call `compact_context` itself instead.

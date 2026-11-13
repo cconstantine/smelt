@@ -144,6 +144,7 @@ In [api/events.md](api/events.md#the-browsing-panels-own-live-channel).
 | `refresh_model_details` | `POST /api/providers/{id}/models/refresh` | asks about one model, when it's chosen |
 | `set_model_settings` | `POST /api/providers/{id}/models/settings` | a model's settings (`ModelSettings`): thinking, context window, effort and max reply tokens (SME-111) |
 | `clear_learned_model_window` | `POST /api/providers/{id}/models/learned/clear` | the provider page's Forget button (SME-439 PR 2): the four learned Context-window columns go, the user's own value and the provider's report do not |
+| `get_provider_usage` / `get_conversation_usage_windows` | `GET /api/providers/{id}/usage`, `GET /api/conversations/{id}/usage-windows` | the Claude subscription's usage windows (SME-486), see [api/model.md](api/model.md) |
 | `get_default_model` / `set_default_model` | `GET`, `POST /api/default-model` | the default provider and model |
 | `get_pods` | `GET /api/pods` | every live pod with status, node (SME-304), activity, limits and usage, see above |
 | `stop_pod` | `POST /api/pods/{pod_id}/stop` | the user stopping a pod, see above |

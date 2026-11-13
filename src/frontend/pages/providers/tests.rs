@@ -229,3 +229,107 @@ fn test_an_empty_model_field_chooses_the_first_listed_model() {
     assert_eq!(model_to_choose(" typed ", Some("first")), Some("typed".to_string()));
     assert_eq!(model_to_choose("", None), None);
 }
+
+/// A window as served, `hours` from its reset at `now`.
+fn usage_window(name: &str, utilization: f64, status: &str, hours: i64, now: chrono::DateTime<chrono::Utc>) -> crate::claude_cli::usage::UsageWindow {
+    crate::claude_cli::usage::UsageWindow {
+        name: name.to_string(),
+        utilization,
+        status: status.to_string(),
+        resets_at: Some(now + chrono::Duration::hours(hours)),
+        seen_at: now - chrono::Duration::minutes(3),
+        reset_passed: hours < 0,
+        elapsed_fraction: None,
+        projected: None,
+    }
+}
+
+fn usage_of(windows: Vec<crate::claude_cli::usage::UsageWindow>, now: chrono::DateTime<chrono::Utc>) -> crate::claude_cli::usage::ProviderUsage {
+    crate::claude_cli::usage::ProviderUsage { provider_id: 1, windows, observed_at: now }
+}
+
+fn usage_now() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339("2026-11-13T12:00:00Z").expect("a time").to_utc()
+}
+
+/// SME-486: the short text puts 5-hour before 7-day whatever the order
+/// served, and an ended window reads as a dash.
+#[test]
+fn test_the_usage_short_text_orders_and_dashes() {
+    use super::usage::usage_short_text;
+    let now = usage_now();
+    let usage = usage_of(vec![usage_window("seven_day", 0.32, "allowed", 84, now), usage_window("five_hour", 0.454, "allowed", 2, now)], now);
+    assert_eq!(usage_short_text(&usage), "5h 45% \u{b7} 7d 32%");
+    let ended = usage_of(vec![usage_window("five_hour", 0.9, "allowed", -1, now), usage_window("seven_day", 1.0, "rejected", 84, now)], now);
+    assert_eq!(usage_short_text(&ended), "5h \u{2014} \u{b7} 7d 100%");
+    assert_eq!(usage_short_text(&usage_of(vec![], now)), "");
+}
+
+/// SME-486: the indicator's colour, at the plan's thresholds; an ended
+/// window counts for nothing.
+#[test]
+fn test_the_usage_level_follows_the_thresholds() {
+    use super::usage::usage_level;
+    let now = usage_now();
+    let one = |w| usage_of(vec![w], now);
+    assert_eq!(usage_level(&one(usage_window("five_hour", 0.69, "allowed", 2, now))), None);
+    assert_eq!(usage_level(&one(usage_window("five_hour", 0.70, "allowed", 2, now))), Some("warn"));
+    assert_eq!(usage_level(&one(usage_window("five_hour", 0.10, "allowed_warning", 2, now))), Some("warn"));
+    assert_eq!(usage_level(&one(usage_window("seven_day", 0.90, "allowed", 84, now))), Some("high"));
+    assert_eq!(usage_level(&one(usage_window("seven_day", 0.10, "rejected", 84, now))), Some("high"));
+    assert_eq!(usage_level(&one(usage_window("five_hour", 0.95, "rejected", -1, now))), None, "the reset has passed");
+    let mut paced = usage_window("seven_day", 0.40, "allowed", 84, now);
+    paced.projected = Some(1.0);
+    assert_eq!(usage_level(&one(paced.clone())), Some("warn"), "on pace for the cap");
+    paced.projected = Some(0.99);
+    assert_eq!(usage_level(&one(paced)), None);
+}
+
+/// Round 1 B-L3: the level compares the whole percent shown, so a window
+/// shown at a threshold is coloured for it; a half rounds up, as
+/// `smelt-api usage` rounds it too.
+#[test]
+fn test_the_usage_level_compares_the_percent_shown() {
+    use super::usage::{usage_level, usage_percent};
+    let now = usage_now();
+    let one = |w| usage_of(vec![w], now);
+    assert_eq!(usage_percent(0.6951), 70);
+    assert_eq!(usage_level(&one(usage_window("five_hour", 0.6951, "allowed", 2, now))), Some("warn"));
+    assert_eq!(usage_level(&one(usage_window("five_hour", 0.6949, "allowed", 2, now))), None);
+    assert_eq!(usage_level(&one(usage_window("seven_day", 0.8951, "allowed", 84, now))), Some("high"));
+    let mut paced = usage_window("seven_day", 0.40, "allowed", 84, now);
+    paced.projected = Some(0.9951);
+    assert_eq!(usage_level(&one(paced)), Some("warn"), "shown on pace for 100%");
+    assert_eq!((usage_percent(0.125), usage_percent(0.625)), (13, 63), "a half rounds up");
+}
+
+/// SME-486: a reset within a day says its time, a later one its weekday
+/// too; "seen" counts minutes, hours, then days.
+#[test]
+fn test_reset_and_seen_texts() {
+    use super::usage::{reset_text, seen_text, usage_title};
+    let now = usage_now();
+    assert_eq!(reset_text(&usage_window("five_hour", 0.4, "allowed", 2, now), now), "resets 14:00 UTC");
+    assert_eq!(reset_text(&usage_window("seven_day", 0.4, "allowed", 84, now), now), "resets Tue 00:00 UTC");
+    assert_eq!(reset_text(&usage_window("five_hour", 0.4, "allowed", -1, now), now), "reset since");
+    assert_eq!(seen_text(now, now), "seen just now");
+    assert_eq!(seen_text(now - chrono::Duration::minutes(3), now), "seen 3 min ago");
+    assert_eq!(seen_text(now - chrono::Duration::minutes(130), now), "seen 2 h ago");
+    assert_eq!(seen_text(now - chrono::Duration::days(4), now), "seen 4 d ago");
+    let usage = usage_of(vec![usage_window("seven_day", 0.32, "allowed", 84, now), usage_window("five_hour", 0.45, "allowed", 2, now)], now);
+    assert_eq!(usage_title(&usage), "Claude subscription: 5-hour 45%, resets 14:00 UTC; 7-day 32%, resets Tue 00:00 UTC");
+}
+
+/// Round 1 B-L5: a window whose reset has passed shows no percent, on the
+/// provider page (no bar either) or in the indicator's hover text: its
+/// utilization is an ended window's.
+#[test]
+fn test_an_ended_window_shows_no_stale_percent() {
+    use super::usage::{shown_percent, usage_title};
+    let now = usage_now();
+    let ended = usage_window("five_hour", 0.95, "rejected", -1, now);
+    assert_eq!(shown_percent(&ended), None);
+    assert_eq!(shown_percent(&usage_window("five_hour", 0.454, "allowed", 2, now)), Some(45));
+    let usage = usage_of(vec![usage_window("seven_day", 0.32, "allowed", 84, now), ended], now);
+    assert_eq!(usage_title(&usage), "Claude subscription: 5-hour \u{2014}, reset since; 7-day 32%, resets Tue 00:00 UTC");
+}

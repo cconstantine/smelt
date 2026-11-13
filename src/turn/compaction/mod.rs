@@ -418,7 +418,7 @@ async fn summarize(
     let recorder =
         CallRecorder::new(pool, conversation_id, turn_model, db::ModelCallKind::Compaction, &summarization_request);
     let turn = super::call::stream_for_kind(
-        conversation_id, turn_model,
+        pool, conversation_id, turn_model,
         &summarization_request,
         &mut discard_deltas,
         recorder.meter(),
@@ -534,7 +534,7 @@ async fn continue_summary(
     let recorder =
         CallRecorder::new(pool, conversation_id, turn_model, db::ModelCallKind::Compaction, &continuation_request);
     let turn = super::call::stream_for_kind(
-        conversation_id, turn_model,
+        pool, conversation_id, turn_model,
         &continuation_request,
         &mut discard_deltas,
         recorder.meter(),

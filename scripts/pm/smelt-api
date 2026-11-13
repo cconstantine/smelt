@@ -26,6 +26,9 @@ touches providers, settings, secrets or trust decisions.
                                            provider), or can_set and the options' labels
   pods                                     live pods and their running commands
   providers                                provider id, kind and name
+  usage PROVIDER_ID [--json]               a Claude Code provider's subscription usage windows and
+                                           the usage-hold verdict: ok, hold: <reasons> or
+                                           unknown: no reading (SME-486)
   where                                    the address, the Host sent and the build id
   archive|unarchive CONV                   archive a top-level conversation and its agents, or clear
                                            it (SME-480), then read the tree back (exit 1 unless it
@@ -290,6 +293,48 @@ def cmd_providers(args):
         print(f"{p['id']} {p['kind']} {p['name']}")
 
 
+def provider_arg(value):
+    text = str(value)
+    if not text.isdigit():
+        raise argparse.ArgumentTypeError(f"not a provider id: {text!r}")
+    return int(text)
+
+
+def usage_line(w):
+    """One window, from smelt_api.usage_windows's whitelisted fields only.
+    A window whose reset has passed shows a dash, not its ended
+    utilization (round 1 B-L5)."""
+    shown = "\u2014" if w["reset_passed"] else smelt_api.percent(w["utilization"])
+    parts = [f"{w['name']:<10}", f"{shown:>4}", f"{w['status']:<16}"]
+    if w["reset_passed"]:
+        parts.append("reset since " + (w["resets_at"] or "-"))
+    else:
+        parts.append("resets " + (w["resets_at"] or "-"))
+    parts.append("seen " + (w["seen_at"] or "-"))
+    if w["projected"] is not None and not w["reset_passed"]:
+        parts.append("pace " + smelt_api.percent(w["projected"]))
+    return "  ".join(parts)
+
+
+def cmd_usage(args):
+    """usage PROVIDER_ID (SME-486): the Claude subscription's usage windows
+    and the PM's usage-hold verdict (docs/personas/project-manager.md)."""
+    answer = request("usage", args.provider_id)
+    # Not a usage answer (a server before SME-486 answers 200 with its
+    # NotFound page): no usage route, exit 1, as a 404 would.
+    usage_route = smelt_api.is_usage_answer(answer)
+    windows = smelt_api.usage_windows(answer) if usage_route else []
+    verdict = smelt_api.usage_verdict(windows) if usage_route else smelt_api.NO_USAGE_ROUTE
+    if args.json:
+        show({"provider_id": args.provider_id, "windows": windows, "verdict": verdict})
+    else:
+        for w in windows:
+            print(usage_line(w))
+        print(f"{'verdict':<10}  {verdict}")
+    if not usage_route:
+        sys.exit(1)
+
+
 def cmd_where(args):
     base, host = smelt_api.address()
     print(f"url      {base}")
@@ -385,6 +430,10 @@ def parser():
     add("persona", cmd_persona, "conv")
     add("pods", cmd_pods)
     add("providers", cmd_providers)
+    s = sub.add_parser("usage")
+    s.add_argument("provider_id", type=provider_arg)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_usage)
     add("where", cmd_where)
     add("archive", cmd_archive, "conv")
     add("unarchive", cmd_archive, "conv")

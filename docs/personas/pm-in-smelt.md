@@ -22,11 +22,13 @@ If any seat fails on a ClaudeCode "usage limit", the PM holds every ClaudeCode t
 - **The hold:** the PM sends no new work to any ClaudeCode tree and starts no ClaudeCode seat until the reset time the error names, or, when it names none, until its first pass after the 5-hour window. A seat already mid-turn is left to finish or fail; it isn't stopped.
 - **It tells the user through `ask_user`** when its own turn can still run.
 - **If the PM's own turns fail on the limit,** the hold is implicit, since nothing gets sent. After the reset it rebuilds its state from the trail ([rules.md](rules.md)) before it resumes the trees.
+- **Before the cap,** the [usage hold](project-manager.md#usage-hold-sme-486) (SME-486) holds new Drivers when `smelt-api usage` says `hold`; this hold is for the cap itself. Both can stand at once, and the trees resume only once neither does.
 
 ## Starting a Driver
 
 In this order, one step at a time. After a failure, re-read the tree and the board before going on.
 
+0. `smelt-api usage <id>` for the Claude Code provider. On `hold`, start no Driver ([Usage hold](project-manager.md#usage-hold-sme-486), SME-486).
 1. Re-read the tree (`smelt-api tree` for each live Driver) and the board. Start a Driver only for a freed slot ([runaway guard](#security-model)).
 2. `smelt-api create`. The first line of its output is the new conversation's id.
 3. `smelt-api attach ID git@github.com:cconstantine/smelt.git`.
@@ -92,6 +94,7 @@ The trigger is [close-out.md's](../process/close-out.md#retrospective). The retr
 ## Watching
 
 - **One `smelt-wait` per live Driver.** After each wake, the PM reads `smelt-api messages ID` (a wake doesn't repeat what it saw) and acts, then restarts the watcher with `--since` set to the last wake's time, so a merge between two runs isn't missed. A wake line is `KIND TIME rest`, and `TIME` (UTC, `2026-11-12T03:04:05Z`) is that value: the watcher's last GitHub check less a second, a `MERGED` PR's `merged_at`, or, with `--no-github`, the wake itself. While GitHub doesn't answer, it stays at the run's own `--since`.
+- **Each wake checks the usage first** ([usage hold](project-manager.md#usage-hold-sme-486), SME-486): before it acts on a wake, the PM runs `smelt-api usage <id>` for the Claude Code provider. A `hold` it hasn't announced yet holds the Drivers as that rule says, and its action on the wake then sends no new work and starts no seat; an `ok` while a hold stands lifts it.
 - **What each wake means:**
 
   | Wake | What the PM does |
@@ -102,7 +105,7 @@ The trigger is [close-out.md's](../process/close-out.md#retrospective). The retr
   | `REPORT_OWED id since` | A seat ended its turn owing a report, with nothing running, longer ago than the grace (a stamp already that old when the watcher starts wakes at once): asks for it with `smelt-api send DRIVER -` (the Driver's report if `id` is the Driver, else a request that it chase its seat `id`), then restarts with `--known-owed id`, which quiets that stamp but not a later one. |
   | `MERGED pr#N` | Checks the ticket's close-out and frees the slot once it's Done, then archives the Driver's tree once nothing in it is busy, waiting, owed or running a command ([above](#starting-a-driver)). |
   | `MAIN_RED run#id` | Reads the run. Matches it to a flake ticket in Test reliability, or files one ([never re-run a red](#never-re-run-a-red)). |
-  | `STALL` | Nothing moved for `STALL_MIN` minutes: reads the tree and the Driver's messages, and asks. |
+  | `STALL` | Nothing moved for `STALL_MIN` minutes: reads the tree and the Driver's messages, and asks. While a usage hold stands and the Driver has reported where its ticket stands, its quiet is the hold's: the PM answers the wake without messaging it, noting the hold in its pass, and restarts the watcher. |
   | `UNREACHABLE n`, `UNREACHABLE github n` | smelt failed `n` polls in a row (a deploy restart, an outage): `smelt-api where`, then restart. With `github`, `smelt-mcp` failed `n` GitHub calls in a row, counted apart, so `MERGED` and `MAIN_RED` were off: restart, and if it repeats, run with `--no-github` and say so. |
   | `CAP` | Restarts the watcher. |
 
@@ -177,6 +180,7 @@ When the PM compacts itself and its Drivers is SME-482's, in [project-manager.md
 | `question CONV`, `model CONV` | The pending question (or `none`) and the model, as JSON. |
 | `pods` | Live pods: conversation, status and running commands. |
 | `providers` | `id kind name` only, never the URL or the key's hint. |
+| `usage PROVIDER_ID [--json]` | A Claude Code provider's subscription usage windows (percent, status, reset, last seen, seven-day pace) and the verdict `ok`, `hold: <reasons>`, `unknown: no reading`, or `unknown: no usage route` (exit 1) from a server before SME-486 ([Usage hold](project-manager.md#usage-hold-sme-486), SME-486). Whitelisted fields only, never the CLI's session id. |
 | `where` | The address, the `Host` sent, and the build id. |
 | `compact CONV [--note N]` | Compacts the conversation now, between turns (SME-482); refused, exit 1, while a turn runs or a question waits. |
 | `archive CONV`, `unarchive CONV` | Sets or clears a top-level conversation's archive mark (SME-480), which its agents follow, then reads `tree` back and exits 1 unless it reads archived (or not). `archive` first reads `tree` and the pods' running commands, and refuses, exit 1 with nothing sent, while any node in the tree is busy, waiting or owes a report, or a pod in it runs a command. An agent's id is refused (409, naming its root), exit 1. A view mark only: messages, pods and storage are untouched. |

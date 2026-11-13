@@ -93,6 +93,7 @@ mod server;
 pub mod session;
 #[cfg(feature = "server")]
 pub mod summary;
+pub mod usage;
 
 #[cfg(feature = "server")]
 pub use server::*;

@@ -97,6 +97,10 @@ pub(super) fn run_turn_bounded<'a>(
             provider_id = Empty,
             turn.steps = Empty,
             turn.stopped = Empty,
+            // A Claude Code turn's calls' tokens, summed (SME-486 T11).
+            gen_ai.usage.input_tokens = Empty,
+            gen_ai.usage.cache_read.input_tokens = Empty,
+            gen_ai.usage.cache_creation.input_tokens = Empty,
             smelt.slot_wait_ms = Empty,
             otel.status_code = Empty,
             otel.status_description = Empty,

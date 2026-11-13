@@ -56,6 +56,19 @@ def choice(provider_id, model, provider_name="prov"):
     }
 
 
+def window(name, utilization, status="allowed", resets_at="2026-11-13T14:20:00Z",
+           seen_at="2026-11-13T12:02:31.123456Z", reset_passed=False, elapsed_fraction=None, projected=None):
+    """One UsageWindow, as src/claude_cli/usage.rs serializes it."""
+    return {"name": name, "utilization": utilization, "status": status, "resets_at": resets_at,
+            "seen_at": seen_at, "reset_passed": reset_passed, "elapsed_fraction": elapsed_fraction,
+            "projected": projected}
+
+
+def usage(provider_id, windows, observed_at="2026-11-13T12:03:00Z"):
+    """A ProviderUsage, GET /api/providers/{id}/usage's answer."""
+    return {"provider_id": provider_id, "windows": windows, "observed_at": observed_at}
+
+
 class State:
     def __init__(self):
         self.lock = threading.Lock()
@@ -96,6 +109,10 @@ class State:
         self.persona_unapplied = False
         # archive/unarchive (SME-480): answer 200 but change nothing.
         self.ignore_archive = False
+        # GET /api/providers/{id}/usage (SME-486): provider id -> the
+        # ProviderUsage it answers; a provider not listed answers as a
+        # missing one does (a ServerFnError, a 500).
+        self.usage = {1: usage(1, [])}
 
     def default_model(self):
         return {"state": "Default", "choice": choice(1, "claude-opus-5-5", "ClaudeCode")}
@@ -170,6 +187,12 @@ def route(st, method, path, body):
         return 200, st.pod_commands
     if method == "GET" and path == "/api/providers":
         return 200, st.providers
+    provider_usage = re.fullmatch(r"/api/providers/(\d+)/usage", path)
+    if method == "GET" and provider_usage:
+        found = st.usage.get(int(provider_usage.group(1)))
+        if found is None:
+            return 500, {"message": "That provider no longer exists."}
+        return 200, found
     if not conv:
         return 404, {"message": f"no route {method} {path}"}
     cid, rest = int(conv.group(1)), conv.group(2)
