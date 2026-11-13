@@ -107,7 +107,7 @@ The trigger is [close-out.md's](../process/close-out.md#retrospective). The retr
   | `CAP` | Restarts the watcher. |
 
 - **A report owed is asked for with `smelt-api send`.** project-manager.md's SME-339 rule reads `list_agents` and asks with `message_agent`, which reach only agents the PM started, never its top-level Drivers. For those, a `REPORT_OWED`, a `STALL` or a gate the PM hasn't heard about is asked about with `smelt-api send DRIVER -`, the message on stdin. That replaces the `list_agents`/`message_agent` rule for them.
-- **The retrospective trigger** is about ten Done, per [close-out.md](../process/close-out.md#retrospective).
+- **The retrospective trigger** is [close-out.md's](../process/close-out.md#retrospective): any one of its conditions.
 - **A stall is an owed answer with nothing running:** `REPORT_OWED` names it exactly (SME-455), and `STALL` catches the rest.
 
 ## Standing rules
