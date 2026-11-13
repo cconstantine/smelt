@@ -297,7 +297,7 @@ The steps below build all of that yourself and take the import route. [Deploying
    - `SMELT_PREVIEW_URL` and `SMELT_PREVIEW_ADDR`: where sandbox previews live.
    - `BROWSER_CHECK_CACHE`: from step 4.
 7. **Put it behind TLS.** Use a reverse proxy that speaks HTTP/2: each tab holds an open event stream, and HTTP/1.1 allows only six connections per host. Route the preview host names (for example `{port}-{conversation}-smelt.example.com`) to `SMELT_PREVIEW_ADDR`'s port. They need wildcard DNS and a wildcard TLS certificate. The proxy must pass the browser's `Host` header through unchanged (in nginx, `proxy_set_header Host $host;`), since the preview listener reads the conversation and port from it, and must pass WebSocket upgrades through for a dev server's live reload. See [Sandbox previews](setup/sandbox.md#sandbox-previews).
-8. **Add a model provider.** Open smelt, go to **Model providers** in the sidebar, and add one with its key. Nothing about the model is read from the environment, except a Claude Code provider's sign-in, `CLAUDE_CODE_OAUTH_TOKEN`: see [docs/setup/claude-code.md](setup/claude-code.md).
+8. **Add a model provider.** Open smelt, go to Settings › **Model providers**, and add one with its key. Nothing about the model is read from the environment, except a Claude Code provider's sign-in, `CLAUDE_CODE_OAUTH_TOKEN`: see [docs/setup/claude-code.md](setup/claude-code.md).
 
 ### Deploying from published images
 
@@ -338,7 +338,7 @@ The model is a risk too, not only outsiders. It runs whatever it decides to in i
 
 ## Model providers
 
-smelt doesn't read a model or an API key from the environment (SME-72). Set them up in the app: **Model providers** in the sidebar (`/providers`). Until there's one, a conversation says "No model provider is set up" above its message box, with a link there, and Send waits.
+smelt doesn't read a model or an API key from the environment (SME-72). Set them up in the app: Settings › **Model providers** (`/providers`). Until there's one, a conversation says "No model provider is set up" above its message box, with a link there, and Send waits.
 
 - **A provider** is a name, a kind, a base URL and a key. Every turn goes to the base URL's `/v1/messages`, whatever the kind. The key is sent as `x-api-key` (API key) or `Authorization: Bearer` (bearer token), and pages only ever show its last four characters. Changing a provider's base URL needs the key entered again, so a stored key only goes where it was entered for. It's stored in plain text for now, like the SSH key ([SME-48](https://linear.app/smelt-agent/issue/SME-48)).
 - **The kind** decides how smelt lists the provider's models and what it learns about each (`src/anthropic/models.rs`):
@@ -402,4 +402,4 @@ Accepting the browser's warning once also works, but the warning comes back when
 
 **MCP OAuth** redirects are built from `SMELT_BASE_URL` (`http://localhost:8180/` in the compose file). When using the HTTPS address for an OAuth flow, set it to `https://localhost:8443` (no trailing slash, per the table above).
 
-**Desktop notifications** (SME-71) need a secure context too: the `Notification` constructor doesn't exist over plain HTTP, and the sidebar button then just says so. `https://localhost:8443` works as shipped, and production (`*.constantlee.us`) is HTTPS already. From another machine over LAN HTTP, Chrome's `chrome://flags/#unsafely-treat-insecure-origin-as-secure` with `http://ryzen.lan:8180` is the quick fix; either way the `(N) smelt` tab title works everywhere.
+**Desktop notifications** (SME-71) need a secure context too: the `Notification` constructor doesn't exist over plain HTTP, and the Settings button then says so. `https://localhost:8443` works as shipped, and production (`*.constantlee.us`) is HTTPS already. From another machine over LAN HTTP, Chrome's `chrome://flags/#unsafely-treat-insecure-origin-as-secure` with `http://ryzen.lan:8180` is the quick fix; either way the `(N) smelt` tab title works everywhere.
