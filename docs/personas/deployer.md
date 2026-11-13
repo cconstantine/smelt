@@ -8,7 +8,7 @@ The Deployer runs exactly one deploy of one named SHA of `main`, per homelab's [
 
 ## Quiet deploys
 
-The apply restarts smelt under every seat, so a Deployer is started only when no seat in any tree is busy in `/api/conversations/tree`, a seat idle while its own background command (a gate) runs counting as busy ([pm-in-smelt.md](pm-in-smelt.md#quiet-deploys); the SME-477 retrospective, proposal 4, agreed by the user 2026-11-12). Merges close together share one deploy, at `main`'s tip. The seat can't message other trees, so its report to its Driver names the trees that were busy at the restart, read just before the apply (or says none were), and the Driver passes the list on to the Project Manager.
+The seat is started only once the Project Manager has found every other tree quiet ([pm-in-smelt.md](pm-in-smelt.md#quiet-deploys)); it checks no tree itself. Its report to its Driver gives the time of the apply, so the Project Manager can tell the trees it restarted under.
 
 ## The procedure
 
