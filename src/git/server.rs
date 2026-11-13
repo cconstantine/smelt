@@ -25,6 +25,9 @@ mod instructions_tests;
 #[cfg(test)]
 mod held_directory;
 
+#[cfg(test)]
+pub(crate) mod remote_read_tests;
+
 /// The race tests' holds and fixtures, for the trust server functions'
 /// tests in `api::git` (SME-225), and, for the browser tier's late "Work
 /// on a repo" failure (SME-263), its held directory and the count of that
@@ -43,6 +46,7 @@ mod repos;
 mod child_ref;
 mod clone;
 mod personas;
+mod remote_read;
 mod trust;
 
 pub use keys::*;
@@ -51,5 +55,6 @@ pub use repos::*;
 pub use child_ref::*;
 pub use clone::*;
 pub use personas::*;
+pub use remote_read::*;
 pub use trust::*;
 pub use super::plain_text::*;

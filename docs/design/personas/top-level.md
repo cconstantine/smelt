@@ -8,10 +8,10 @@ Until SME-481 a persona was only ever a child's: `start_agent` read the persona 
 
 **What still holds:**
 - **The trust gate at the read.** The persona is read from the conversation's own checkout, and only from a remote the user trusts. Its options are listed only for a trusted remote, and the set reads the trust again under the remote's trust lock (`db::lock_remote_trust`) in its transaction. Nothing from an untrusted file (a description, a setting or a parse error) reaches the listing or a refusal.
-- **The snapshot is frozen.** A later edit of the file changes nothing, so a persona can't widen itself.
+- **The snapshot is frozen.** A later edit of the file changes nothing until a [refresh](#refresh), which reads only what reached the remote's default branch, so a persona can't widen itself.
 - **Credentials only from what the persona lists.** Rule G (`git-ssh`) is granted only if the persona lists it, and Rule S's named secrets come from its own snapshot alone ([tool-rules.md](tool-rules.md#credentials)). A top-level persona gets exactly what a child of the user's persona-less root with the same persona gets, and nothing more.
 - **`own` binds only its own conversation.** Its agents get its chain through `for_child`, which strips `own`.
-- **Never set or swapped once started.** There is no unset and no swap.
+- **Never set or swapped once started, only refreshed.** There is no unset and no swap: a set on an applied persona is a [refresh](#refresh) of the same persona.
 - **Its model resolves only on its own provider** (below). That is narrower than a child's resolution, never wider.
 
 ## How it's set
@@ -31,18 +31,44 @@ A conversation has **started** once it has any `messages` row, a turn holds or i
 
 One row per conversation set to a persona: the snapshot (`persona_name`, `persona_path`, `persona_commit`, `persona_body`, `persona_settings`, as a child's `agents` columns), `rule_chain` (the persona's one `smelt.tools` entry, `own` included, or NULL), `credentials` (Rule G's bit: `{git-ssh}` or `{}`), `created_at` and `applied_at`. It is a table of its own rather than an `agents` row at depth 0 because about 47 queries read `agents` as "this conversation is a child". A root row there would need every one audited, and one missed would be a parent notice to nobody or a `finish` offered to the user.
 
-**State:** none → unapplied (inserted) → applied (`applied_at` set), then gone with the conversation's cascade delete. **Writers:** the set (insert, replace-unapplied, mark applied, and the compensating delete of a failed apply), the startup sweep (delete unapplied) and the cascade. **Readers**, beside `agents`:
+**State:** none → unapplied (inserted) → applied (`applied_at` set) → applied (refreshed: the snapshot columns rewritten), then gone with the conversation's cascade delete. **Writers:** the set (insert, replace-unapplied, mark applied, and the compensating delete of a failed apply), the refresh (only `WHERE applied_at IS NOT NULL`; the set's insert only where it's NULL), the startup sweep (delete unapplied) and the cascade. **Readers**, beside `agents`:
 
 | Reader | What it reads |
 | -- | -- |
 | `db::agent_rule_chain` (the offer, the native and MCP calls, the question tools, script MCP calls) | the chain |
 | `db::agent_credentials` (Rule G) and `db::persona_credential_names` (Rule S) | the bit and the snapshot's names |
-| `db::agent_persona` (the `# Persona` section, "read when this conversation was set to it") | the snapshot |
+| `db::agent_persona` (the `# Persona` section, "read when this conversation was set to it or last refreshed") | the snapshot |
 | `db::conversation_tree` (the sidebar's persona line, with no status) | the name and path |
 | `db::create_child` (a top-level caller's children) | the chain through `for_child`, and the bit as the child's seed |
 | `db::admission_state` (the gate) | whether it's still unapplied |
 
 SME-484's `smelt.resources` rides the same snapshot: the set makes the conversation's `pod_resources` the persona's and restarts its pod with them (`persona::match_pod_resources`, a child's own step) before the credentials are reconciled. A later snapshot field reaches a top-level persona through the same `persona_settings` a child's does.
+
+## Refresh
+
+SME-516. A set on a conversation whose persona is applied is a **refresh**: `POST …/persona` with `{"persona": "<dir>:<name>", "commit": "<sha>"?}` (`agents::top_level_refresh`). It re-reads **the same persona** (another persona's name is refused: a swap is a new conversation) and replaces the snapshot: the body, `persona_settings` (`compact_at`, `tools`, `credentials`, `resources`, `ignored`), `rule_chain`, Rule G's bit and `persona_commit`. `prior_*`, `created_at` and `applied_at` stay. Each setting takes effect from the conversation's next turn: a turn reads its ceiling, chain and prompt at its start. The model isn't re-pinned (the conversation keeps its own), and children already started keep their chain; children started later get the new one through `for_child`. A `commit` on a first set is refused: a first set reads the checkout as it is.
+
+**Its input is only the remote's default branch.** A live seat can edit, commit and push its own persona file, and a top-level chain has no ancestor to intersect with. So a refresh reads the file only at a commit on the default branch of the **recorded** remote, and smelt does the read itself, never the seat's pod: the pod's `origin`, its refs and even its `git` are the seat's to forge (review 1 H1). `git::persona_at_remote` runs on the server, in a private temporary directory with an empty git config and environment:
+- It checks `conversation_repos.url` against the `remote_key` the trust was read on, and takes only an `ssh` or `https` URL.
+- `git ls-remote --symref <url> HEAD` names the default branch; that branch alone is fetched, into a bare repo of its own.
+- The commit (only a hex id, 4 to 64 digits; with no `commit`, the branch's tip) must be an ancestor of that tip. The file at it must be a regular blob under the instructions' size cap (a symlink, a submodule or an oversized file is refused), and is read with `git cat-file`.
+- ssh uses the user's stored SSH keys and checks host keys strictly against `/etc/smelt/known_hosts`, the image's copy of the sandbox image's pinned keys (docker/known_hosts). Each git command has a time limit, and the read as a whole has one too.
+
+It never reads the working tree, another branch or the seat's checkout, and it doesn't touch the seat's checkout either: no fetch moves its `origin/*`.
+
+**"Reached the default branch" is only as strong as that branch's protection.** The Driver, PM, Developer, Planner and Integrator personas hold `git-ssh`, the user's key. On a remote whose `main` takes direct pushes, any of them could push a widened persona file to `main` and then ask for a refresh. smelt doesn't check the forge's settings: the guarantee that what reaches `main` has been through review rests on branch protection for `main` (require a reviewed pull request, no direct pushes), set on the forge by the user (review 1 L2).
+
+The trust gate holds as the set's does: it's read before the read, and again under `lock_remote_trust` at the apply.
+
+**It applies under the turn lock.** The read runs outside it. Then `turn::between_turns_or_queue`: with the lock free, it applies at once (`applied`). Otherwise the apply takes its place in the lock's FIFO queue **after the read** and runs in a task of its own once the turn ends, before any turn queued after the read, and the answer is `pending`. A turn admitted while the read runs comes first, on the old snapshot. A seat refreshing itself is always `pending`.
+
+One refresh runs at a time per conversation. An in-memory map holds each conversation's last refresh (`pending`, `applied` or `refused` with why), which the `GET` returns as `refresh` beside the snapshot's `settings`. A second request while one is pending is refused. Only the claim inserts the entry; a later read or apply only updates it, so one forgotten with a deleted conversation stays gone. A claim dropped while still `pending` records `refused` ("the refresh ended without applying"), for example when the read times out or the apply's task is cancelled. A restart drops a pending refresh with nothing written.
+
+**The apply** (review 1 M1):
+1. Before the pod is touched, `db::begin_top_level_refresh` takes the remote's trust lock and checks that the conversation isn't `deleting_at`, the remote is still trusted, and the row is still applied at the same path.
+2. If the snapshot's `resources` differ from the conversation's `pod_resources` on a live pod, it's refused while any command runs there, since a restart would end them. Otherwise `pod_resources` is written and the pod restarted.
+3. `credentials::refresh_grant`, under the install lock, runs the same checks again, holding the trust lock through the pod's file write. Only then does it write the row, in that same transaction.
+4. A failed transaction puts the pod back to the row's grant (`reconcile_pod`). It tries 3 times, and if the pod still can't be put back, it's **stopped**, so it never keeps a grant the row doesn't hold. The refusal says so.
 
 ## Model
 

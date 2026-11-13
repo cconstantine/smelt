@@ -139,3 +139,36 @@ where
     release_idle_turn_state(conversation_id);
     result
 }
+
+/// `between_turns` for a step that must run whether or not the lock is free
+/// (SME-516, a persona refresh): `Some` with `f`'s result when it was free;
+/// otherwise `f` takes its place in the lock's queue before this returns
+/// `None`, and runs in a task of its own once it has the lock. tokio's lock
+/// is FIFO, so `f` runs before any turn queued after this call.
+pub(crate) async fn between_turns_or_queue<T, F, Fut>(conversation_id: i64, f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + Send,
+{
+    let mut acquire = Box::pin(conversation_lock(conversation_id).lock_owned());
+    // One poll takes the free lock, or a place in its queue.
+    let polled = std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(acquire.as_mut(), cx))).await;
+    match polled {
+        std::task::Poll::Ready(guard) => {
+            let result = f().await;
+            drop(guard);
+            release_idle_turn_state(conversation_id);
+            Some(result)
+        }
+        std::task::Poll::Pending => {
+            tokio::spawn(tracing::Instrument::in_current_span(async move {
+                let guard = acquire.await;
+                f().await;
+                drop(guard);
+                release_idle_turn_state(conversation_id);
+            }));
+            None
+        }
+    }
+}

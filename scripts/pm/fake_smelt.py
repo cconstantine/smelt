@@ -107,6 +107,12 @@ class State:
         self.persona_models = {}
         self.persona_refusals = {}
         self.persona_unapplied = False
+        # A refresh (SME-516), a set on an applied persona: the state it
+        # answers (applied or pending), the commit it reads back at (None:
+        # the one asked for, else the tip), and the settings it takes.
+        self.refresh_state = "applied"
+        self.refresh_reads_back = None
+        self.refresh_settings = {"compact_at": 120000}
         # archive/unarchive (SME-480): answer 200 but change nothing.
         self.ignore_archive = False
         # GET /api/providers/{id}/usage (SME-486): provider id -> the
@@ -236,7 +242,7 @@ def route(st, method, path, body):
             "set": None, "can_set": None, "notes": [],
             "options": [{"label": o, "description": None, "error": None} for o in st.persona_options]}
     if method == "POST" and rest == "persona":
-        return set_persona(st, cid, body.get("persona"))
+        return set_persona(st, cid, body.get("persona"), body.get("commit"))
     if method == "POST" and rest == "repos":
         if not str(body.get("url", "")).startswith(("https://", "git@")):
             return 500, {"message": f"can't clone {body.get('url')!r}"}
@@ -272,14 +278,20 @@ def set_archived(st, cid, archived):
                  "parent_id": None, "archived_at": target["archived_at"]}
 
 
-def set_persona(st, cid, label):
+TIP = "f00dfeedf00dfeedf00dfeedf00dfeedf00dfeed"
+
+
+def set_persona(st, cid, label, commit=None):
     """POST …/persona: refused as the real set_top_level_persona refuses
-    (a ServerFnError is a 500), else the SetPersona it answers."""
+    (a ServerFnError is a 500), else the SetPersona it answers. On an
+    applied persona it's a refresh (SME-516)."""
     if cid in st.persona_refusals:
         return 500, {"message": st.persona_refusals[cid]}
     current = st.personas.get(cid)
     if current and current["set"] and current["set"]["applied"]:
-        return 500, {"message": "this conversation's persona is already set"}
+        return refresh_persona(st, current["set"], label, commit)
+    if commit is not None:
+        return 500, {"message": "a first set reads the checkout as it is; commit is for a refresh"}
     if label not in st.persona_options:
         return 500, {"message": f"no persona {label!r} in this conversation's checkouts"}
     if label in st.persona_models:
@@ -289,9 +301,23 @@ def set_persona(st, cid, label):
     model = (st.models.get(cid) or st.default_model()).get("choice") or {}
     repo, name = label.split(":")
     out = {"label": label, "path": f"/workspace/{repo}/.agents/personas/{name}.md", "commit": "d687835b",
-           "applied": not st.persona_unapplied, "model": model.get("model"), "provider": model.get("provider_name")}
+           "applied": not st.persona_unapplied, "model": model.get("model"), "provider": model.get("provider_name"),
+           "settings": {"model": None, "compact_at": None}, "refresh": None}
     st.personas[cid] = {"set": out, "can_set": "this conversation's persona is set", "options": [], "notes": []}
     return 200, out
+
+
+def refresh_persona(st, current, label, commit):
+    """A refresh: the same persona only; `applied` takes the commit and
+    settings at once, `pending` changes nothing yet."""
+    if label != current["label"]:
+        return 500, {"message": f"a refresh keeps its persona: this conversation is `{current['label']}`"}
+    sha = commit or TIP
+    current["refresh"] = {"state": st.refresh_state, "commit": sha, "why": None, "at": STAMP}
+    if st.refresh_state == "applied":
+        current["commit"] = st.refresh_reads_back or sha
+        current["settings"] = st.refresh_settings
+    return 200, current
 
 
 class FakeSmelt:

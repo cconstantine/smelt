@@ -27,7 +27,7 @@ pub(super) async fn conversation_with(pool: &PgPool, trust: Option<bool>, person
 }
 
 pub(super) async fn set(pool: &PgPool, id: i64, persona: &str) -> Result<SetPersona, String> {
-    crate::agents::top_level::set_persona(pool, id, persona).await
+    crate::agents::top_level::set_persona(pool, id, persona, None).await
 }
 
 /// The conversation's top-level persona row: its name and whether applied.
@@ -55,12 +55,13 @@ async fn test_a_second_set_is_refused_before_and_after_a_message(pool: PgPool) {
     let id = conversation_with(&pool, Some(true), &personas).await;
     let set_to = set(&pool, id, "app:driver").await.expect("the first set");
     assert_eq!((set_to.label.as_str(), set_to.applied), ("app:driver", true));
+    // A set on an applied persona is a refresh, which keeps it (SME-516).
     let refused = set(&pool, id, "app:deployer").await.expect_err("a swap is refused");
-    assert!(refused.contains("has started"), "{refused}");
+    assert!(refused.contains("a refresh keeps its persona"), "{refused}");
     assert_eq!(row(&pool, id).await, Some(("driver".to_string(), true)));
     db::create_message(&pool, id, "user", &[ContentBlock::Text { text: "hi".to_string() }]).await.expect("a message");
     let refused = set(&pool, id, "app:deployer").await.expect_err("refused after a message too");
-    assert!(refused.contains("has started"), "{refused}");
+    assert!(refused.contains("a refresh keeps its persona"), "{refused}");
     assert_eq!(row(&pool, id).await, Some(("driver".to_string(), true)));
 }
 

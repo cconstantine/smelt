@@ -306,6 +306,10 @@ where
 /// across its reads and this write, so no install interleaves between
 /// a decision and its files.
 async fn write_pod_files(pool: &PgPool, pod_id: i64, files: &[PodFile]) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(capture) = test_writes::lookup(pod_id) {
+        return capture(files.to_vec()).await;
+    }
     let shell = sandbox::PodShell::for_pod(pool, pod_id).await.map_err(|e| e.to_string())?;
     let keys_dir = format!("{POD_GIT_DIR}/keys");
     // `install_pod_files` holds itself to `INSTALL_TIMEOUT`, and returns
@@ -365,6 +369,63 @@ where
         then().await
     })
     .await
+}
+
+/// A persona refresh's grant (SME-516): `before` (the row's transaction
+/// begun, the trust read under its lock: review 1 M1), then the pod's files
+/// written for the refreshed snapshot (Rule G from `git_ssh` and the stored
+/// key, Rule S from its names), then `then` with what `before` gave (the
+/// row written and committed), all under the same install lock, so no
+/// install reads the old row in between and writes the old grant back over
+/// the new. A refused `before` writes nothing; a failed write never runs
+/// `then`.
+pub async fn refresh_grant<B, BFut, T, F, Fut>(
+    pool: &PgPool,
+    conversation: i64,
+    snapshot: &db::PersonaSnapshot,
+    git_ssh: bool,
+    before: B,
+    then: F,
+) -> Result<(), String>
+where
+    B: FnOnce() -> BFut,
+    BFut: std::future::Future<Output = Result<T, String>>,
+    F: FnOnce(T) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    with_install_lock(conversation, async {
+        let begun = before().await?;
+        let pod = db::list_sandbox_pods(pool, conversation).await.map_err(|e| e.to_string())?.into_iter().next_back();
+        if let Some(pod) = pod {
+            let secrets = resolve_stored(pool, snapshot_credential_names(snapshot)).await.map_err(|e| e.to_string())?;
+            let files = files_for_granted(pool, &PodCredentials { git_ssh, secrets }).await.map_err(|e| e.to_string())?;
+            write_pod_files(pool, pod.id, &files).await?;
+        }
+        then(begun).await
+    })
+    .await
+}
+
+/// Tests' stand-ins for a pod's credential write, per pod id (SME-516):
+/// what a write would put in a pod with no container behind its row.
+#[cfg(test)]
+pub(crate) mod test_writes {
+    use super::PodFile;
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    type Boxed = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+    pub(crate) type Capture = Arc<dyn Fn(Vec<PodFile>) -> Boxed + Send + Sync>;
+    static CAPTURES: LazyLock<Mutex<HashMap<i64, Capture>>> = LazyLock::new(Default::default);
+
+    /// Every credential write into `pod_id` calls `capture` from now on.
+    pub(crate) fn register(pod_id: i64, capture: Capture) {
+        CAPTURES.lock().unwrap_or_else(|e| e.into_inner()).insert(pod_id, capture);
+    }
+
+    pub(super) fn lookup(pod_id: i64) -> Option<Capture> {
+        CAPTURES.lock().unwrap_or_else(|e| e.into_inner()).get(&pod_id).cloned()
+    }
 }
 
 /// How long an install's tries at writing the credential files into one pod

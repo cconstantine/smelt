@@ -21,6 +21,7 @@ mod queue;
 mod start;
 mod sweep;
 pub(crate) mod top_level;
+pub(crate) mod top_level_refresh;
 mod volumes;
 
 pub(crate) use checkout::*;
@@ -247,4 +248,4 @@ pub(crate) async fn admits_notices(pool: &PgPool, conversation_id: i64) -> bool 
 #[cfg(test)]
 pub(crate) mod test_hooks;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -31,6 +31,8 @@ pub(super) struct FakeCheckout {
     pub parent_files: Mutex<std::collections::HashMap<String, String>>,
     /// Each child whose pod `restart_pod` restarted, in order.
     pub restarts: Mutex<Vec<i64>>,
+    /// Each conversation whose pod `stop_pod` stopped, in order.
+    pub stops: Mutex<Vec<i64>>,
     /// Each child `reprovision` dropped and cloned again, in order.
     pub reprovisions: Mutex<Vec<i64>>,
     /// The child's `pod_resources` as each clone began (SME-484): what its
@@ -120,6 +122,17 @@ impl ChildCheckout for FakeCheckout {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
             self.restarts.lock().expect("restarts").push(child);
+            Ok(())
+        })
+    }
+
+    fn stop_pod<'a>(
+        &'a self,
+        _pool: &'a PgPool,
+        id: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.stops.lock().expect("stops").push(id);
             Ok(())
         })
     }

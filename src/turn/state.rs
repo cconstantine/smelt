@@ -183,12 +183,13 @@ pub(crate) fn conversation_lock(conversation_id: i64) -> Arc<tokio::sync::Mutex<
     })
 }
 
-/// Drops `conversation_id`'s lock, stop counter, pause and kept error, for
-/// when the conversation is deleted. A turn still holding the lock keeps
-/// its own handle; any later turn gets a fresh lock and then fails, since
-/// the conversation no longer exists. A turn still in flight keeps its
-/// place in the count, and its reply, until it ends.
+/// Drops `conversation_id`'s lock, stop counter, pause, kept error and
+/// refresh entry when it's deleted. A turn holding the lock keeps its
+/// handle; a later one gets a fresh lock and fails, the conversation being
+/// gone. A turn in flight keeps its place in the count, and its reply,
+/// until it ends.
 pub(crate) fn forget_conversation_lock(conversation_id: i64) {
+    crate::agents::top_level_refresh::forget(conversation_id);
     update_existing(conversation_id, |runtime| {
         runtime.lock = None;
         runtime.stops = None;

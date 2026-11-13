@@ -37,7 +37,10 @@ pub fn default_checkout_dir(url: &str) -> Option<String> {
 /// what trust decisions are remembered by, and two remotes differing
 /// only in characters a reader can't see would read as one — a refusal,
 /// not an escape, because showing an escape doesn't stop two rows being
-/// granted as each other.
+/// granted as each other. A backslash and a `.` or `..` path segment are
+/// refused too (SME-516 review 2 M1): the `url` crate reads `\` as `/` and
+/// resolves dot segments, where git may not, so the key and the remote git
+/// reaches could differ.
 pub(super) fn parse_remote(url: &str) -> Option<(String, String)> {
     let url = url.trim();
     if url.is_empty()
@@ -45,6 +48,8 @@ pub(super) fn parse_remote(url: &str) -> Option<(String, String)> {
         || url.contains("::")
         || url.contains(char::is_whitespace)
         || url.contains(not_plain)
+        || url.contains('\\')
+        || url.split(['/', ':']).any(is_dot_segment)
     {
         return None;
     }
@@ -73,6 +78,13 @@ pub(super) fn parse_remote(url: &str) -> Option<(String, String)> {
         return None;
     }
     Some((host, path.to_string()))
+}
+
+/// A `.` or `..` segment, percent-encoded or not, as the `url` crate
+/// resolves one.
+fn is_dot_segment(segment: &str) -> bool {
+    let s = segment.to_ascii_lowercase().replace("%2e", ".");
+    s == "." || s == ".."
 }
 
 fn repo_summary(

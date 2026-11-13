@@ -392,7 +392,7 @@ pub(crate) fn system_prompt(env: &PromptEnvironment) -> String {
     if let Some(persona) = env.agent.as_ref().and_then(|agent| agent.persona.as_ref()) {
         prompt.push_str(&persona_section(persona, "read when you started"));
     } else if let Some(persona) = &env.top_level_persona {
-        prompt.push_str(&persona_section(persona, "read when this conversation was set to it"));
+        prompt.push_str(&persona_section(persona, "read when this conversation was set to it or last refreshed"));
     }
     prompt.push_str(&crate::git::render_project_instructions(&env.instructions));
     prompt

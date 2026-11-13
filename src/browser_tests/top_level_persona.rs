@@ -62,6 +62,9 @@ impl crate::agents::ChildCheckout for FakePersonas {
     ) -> Boxed<'a, Result<Option<db::InstructionsFile>, String>> {
         Box::pin(async move { Ok(self.file(rel)) })
     }
+    fn stop_pod<'a>(&'a self, _: &'a sqlx::PgPool, _: i64) -> Boxed<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 impl FakePersonas {

@@ -49,7 +49,7 @@ pub fn validate_commit_id(sha: &str) -> Result<(), String> {
 }
 
 /// Whether `r` reads as a commit id, whole or abbreviated.
-fn is_hex_id(r: &str) -> bool {
+pub(super) fn is_hex_id(r: &str) -> bool {
     (4..=64).contains(&r.len()) && r.chars().all(|c| c.is_ascii_hexdigit())
 }
 

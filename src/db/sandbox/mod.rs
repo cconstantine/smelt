@@ -339,6 +339,21 @@ pub async fn running_command_conversation_counts(
     .await
 }
 
+/// `running_command_conversation_counts` for one conversation (SME-516):
+/// what a persona refresh that would restart the pod checks first.
+pub async fn running_command_count(pool: &PgPool, conversation_id: i64) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::BIGINT
+           FROM sandbox_pods p
+           JOIN sandbox_terminals t ON t.pod_id = p.id
+           JOIN terminal_commands tc ON tc.terminal_id = t.id
+          WHERE p.conversation_id = $1 AND p.terminated_at IS NULL AND tc.status = 'running'",
+    )
+    .bind(conversation_id)
+    .fetch_one(pool)
+    .await
+}
+
 /// Live pods only (`terminated_at IS NULL`) — a terminated pod's row
 /// sticks around (see SME-9's "How") but shouldn't be listed as if it
 /// still existed.

@@ -48,6 +48,11 @@ pub(crate) trait ChildCheckout: Send + Sync {
     /// and Docker data are its claims', and outlive the pod.
     fn restart_pod<'a>(&'a self, pool: &'a PgPool, child: i64) -> Boxed<'a, Result<(), String>>;
 
+    /// Stops the conversation's pod, with whatever files it held (SME-516
+    /// review 1 M1: a refused refresh whose grant couldn't be put back).
+    /// The next pod installs the row's grant from scratch.
+    fn stop_pod<'a>(&'a self, pool: &'a PgPool, id: i64) -> Boxed<'a, Result<(), String>>;
+
     /// Drops the starting child's pod and claims and clones `repo` at
     /// `target` again (SME-484, M1): its next pod reads `pod_resources`
     /// and is placed afresh, rather than pinned to the node its first pod
@@ -124,6 +129,10 @@ impl ChildCheckout for PodCheckout {
                 .map(|_| ())
                 .map_err(|e| format!("couldn't restart the agent's pod with its persona's resources: {e}"))
         })
+    }
+
+    fn stop_pod<'a>(&'a self, pool: &'a PgPool, id: i64) -> Boxed<'a, Result<(), String>> {
+        Box::pin(async move { crate::sandbox::terminate_pod(pool, id).await.map_err(|e| format!("couldn't stop the pod: {e}")) })
     }
 
     fn reprovision<'a>(
