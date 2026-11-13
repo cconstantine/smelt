@@ -14,6 +14,8 @@ It is the rung between the Project Manager and the work: the seats' parent, the 
 
 **One active seat at a time** (the user, 2026-11-02 retrospective): the driver starts a seat only once the one before it has finished, reviewers one after another. Seats in parallel make a one-slot local model switch conversations between calls, and each switch re-reads the whole prompt: 37 such re-prefills, about 30% of its working time, on SME-341's tree (SME-343).
 
+**A flaky-test ticket takes the lighter lane** ([testing.md](../testing.md#the-flaky-test-lane-sme-517); the SME-491 retrospective, proposal 2): the driver starts no Planner and writes the plan in the ticket itself, from the signature and the CI log; its Developer has a repro budget and ships diagnostics only if the red won't reproduce; and there is one review round, with a second only if that round finds a High.
+
 **A report owed is asked for** (SME-339). Before it starts new work or ends its own turn, the driver reads `list_agents` for its seats. A seat that is idle or finished with a gate the driver hasn't heard about — its trail on the ticket, or the PR, has moved past the last message it sent — owes a report now: the driver asks it with `message_agent` rather than waiting. A long gate is legitimate; the silence about one isn't. There is no timeout that stops a seat.
 
 **A watcher wakes only on structured events:** a `Message from agent` or `Report from agent` from a seat, a status change, or a Linear comment written by the seat, never on free text the driver's own side wrote. A grep over `list_comments` for `started:`/`finished:` matches the driver's own trail and wakes it falsely (SME-462's Driver; the PM's watcher twice, the SME-453 retrospective).
