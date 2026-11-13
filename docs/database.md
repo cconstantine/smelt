@@ -41,7 +41,7 @@ pub async fn delete_conversation(pool: &PgPool, id: i64) -> Result<(), sqlx::Err
 }
 ```
 
-Deleting an id that doesn't exist is not an error — it just affects zero rows. Deleting a conversation cascades through everything hanging off it (see [Deleting a conversation](#deleting-a-conversation)).
+Deleting an id that doesn't exist is not an error — it just affects zero rows. Deleting a conversation cascades through everything hanging off it (see [Deleting a conversation](database/schema.md#deleting-a-conversation)).
 
 Other patterns in `db.rs`:
 
