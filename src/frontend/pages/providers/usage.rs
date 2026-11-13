@@ -95,13 +95,15 @@ pub fn usage_title(usage: &ProviderUsage) -> String {
 /// The indicator's colour (`subscription-usage-<level>`): `high` at 90%
 /// or `rejected`, `warn` at 70%, `allowed_warning` or a 7-day pace at
 /// 100%, else none. A window whose reset has passed counts for nothing.
+/// It compares the whole percent shown (`usage_percent`, a half rounding
+/// up), as `smelt-api usage`'s verdict does (round 1 B-L3).
 pub fn usage_level(usage: &ProviderUsage) -> Option<&'static str> {
     let live: Vec<&UsageWindow> = usage.windows.iter().filter(|w| !w.reset_passed).collect();
-    if live.iter().any(|w| w.utilization >= 0.9 || w.status == "rejected") {
+    if live.iter().any(|w| usage_percent(w.utilization) >= 90 || w.status == "rejected") {
         return Some("high");
     }
-    let pace = |w: &&UsageWindow| w.name == "seven_day" && w.projected.is_some_and(|p| p >= 1.0);
-    if live.iter().any(|w| w.utilization >= 0.7 || w.status == "allowed_warning" || pace(w)) {
+    let pace = |w: &&UsageWindow| w.name == "seven_day" && w.projected.is_some_and(|p| usage_percent(p) >= 100);
+    if live.iter().any(|w| usage_percent(w.utilization) >= 70 || w.status == "allowed_warning" || pace(w)) {
         return Some("warn");
     }
     None

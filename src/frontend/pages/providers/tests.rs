@@ -285,6 +285,24 @@ fn test_the_usage_level_follows_the_thresholds() {
     assert_eq!(usage_level(&one(paced)), None);
 }
 
+/// Round 1 B-L3: the level compares the whole percent shown, so a window
+/// shown at a threshold is coloured for it; a half rounds up, as
+/// `smelt-api usage` rounds it too.
+#[test]
+fn test_the_usage_level_compares_the_percent_shown() {
+    use super::usage::{usage_level, usage_percent};
+    let now = usage_now();
+    let one = |w| usage_of(vec![w], now);
+    assert_eq!(usage_percent(0.6951), 70);
+    assert_eq!(usage_level(&one(usage_window("five_hour", 0.6951, "allowed", 2, now))), Some("warn"));
+    assert_eq!(usage_level(&one(usage_window("five_hour", 0.6949, "allowed", 2, now))), None);
+    assert_eq!(usage_level(&one(usage_window("seven_day", 0.8951, "allowed", 84, now))), Some("high"));
+    let mut paced = usage_window("seven_day", 0.40, "allowed", 84, now);
+    paced.projected = Some(0.9951);
+    assert_eq!(usage_level(&one(paced)), Some("warn"), "shown on pace for 100%");
+    assert_eq!((usage_percent(0.125), usage_percent(0.625)), (13, 63), "a half rounds up");
+}
+
 /// SME-486: a reset within a day says its time, a later one its weekday
 /// too; "seen" counts minutes, hours, then days.
 #[test]

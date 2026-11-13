@@ -11,6 +11,7 @@ directory on sys.path themselves (they run as `python3 -I`).
 """
 
 import json
+import math
 import os
 import re
 import urllib.error
@@ -185,10 +186,11 @@ def subtree(nodes, root):
 
 
 # The usage hold (SME-486, docs/personas/project-manager.md): a live
-# window at or over these holds new Drivers.
-HOLD_FIVE_HOUR = 0.70
-HOLD_SEVEN_DAY = 0.90
-HOLD_PACE = 1.0
+# window at or over these holds new Drivers. Whole percents: the verdict
+# compares the percent it prints (round 1 B-L3).
+HOLD_FIVE_HOUR = 70
+HOLD_SEVEN_DAY = 90
+HOLD_PACE = 100
 HOLD_STATUSES = ("allowed_warning", "rejected")
 
 # The shape a window's name or status must have to print as itself: the
@@ -244,8 +246,17 @@ def usage_windows(answer):
     return out
 
 
+def whole_percent(fraction):
+    """`fraction` as a whole percent, a half rounding up: Rust's f64::round
+    on the provider page and the context bar, not Python's round, which
+    rounds a half to even. The verdict compares this, the number printed."""
+    value = fraction * 100
+    whole = math.floor(value)
+    return whole + 1 if value - whole >= 0.5 else whole
+
+
 def percent(fraction):
-    return f"{round(fraction * 100)}%"
+    return f"{whole_percent(fraction)}%"
 
 
 def usage_verdict(windows):
@@ -257,9 +268,10 @@ def usage_verdict(windows):
     reasons = []
     for w in live:
         name, used, pace = w["name"], w["utilization"], w["projected"]
-        if (name == "five_hour" and used >= HOLD_FIVE_HOUR) or (name == "seven_day" and used >= HOLD_SEVEN_DAY):
+        shown = whole_percent(used)
+        if (name == "five_hour" and shown >= HOLD_FIVE_HOUR) or (name == "seven_day" and shown >= HOLD_SEVEN_DAY):
             reasons.append(f"{name} at {percent(used)}")
-        elif name == "seven_day" and pace is not None and pace >= HOLD_PACE:
+        elif name == "seven_day" and pace is not None and whole_percent(pace) >= HOLD_PACE:
             reasons.append(f"{name} on pace for {percent(pace)} by reset")
         if w["status"] in HOLD_STATUSES:
             reasons.append(f"{name} {w['status']}")

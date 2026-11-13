@@ -89,6 +89,25 @@ class Usage(FakeCase):
             with self.subTest(name):
                 self.assertEqual(self.verdict(*windows), expected)
 
+    # Round 1 B-L3: the verdict compares the whole percent it prints, so a
+    # window printed at a threshold holds; a half rounds up, as Rust's
+    # f64::round does on the provider page and the context bar.
+    def test_the_verdict_compares_the_percent_it_prints(self):
+        cases = [
+            ("five_hour 69.51%", [window("five_hour", 0.6951)], "hold: five_hour at 70%"),
+            ("five_hour 69.49%", [window("five_hour", 0.6949)], "ok"),
+            ("seven_day 89.51%", [window("seven_day", 0.8951)], "hold: seven_day at 90%"),
+            ("seven_day pace 99.51%", [window("seven_day", 0.60, elapsed_fraction=0.6, projected=0.9951)],
+             "hold: seven_day on pace for 100% by reset"),
+        ]
+        for name, windows, expected in cases:
+            with self.subTest(name):
+                self.assertEqual(self.verdict(*windows), expected)
+        self.st.usage[7] = usage(7, [window("five_hour", 0.125), window("seven_day", 0.625)])
+        lines = self.api("usage", "7").stdout.splitlines()
+        self.assertEqual(lines[0].split()[1], "13%", "a half rounds up")
+        self.assertEqual(lines[1].split()[1], "63%", "a half rounds up")
+
     # Round 1 B-L4: only the seven-day pace counts (the verdict, the UI), so
     # only it prints.
     def test_only_the_seven_day_pace_prints(self):
