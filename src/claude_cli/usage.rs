@@ -132,8 +132,28 @@ mod server {
     /// past a Stop still carries its own time.
     pub fn seen(conversation_id: i64, event: &Value) {
         if let Some(reading) = Reading::from_event(event, Utc::now()) {
-            pending().insert(conversation_id, reading);
+            hold(conversation_id, reading);
         }
+    }
+
+    /// How long a reading may stay held: one no call took (a Stop, a run
+    /// settled in the background) goes when the next is held after this.
+    pub const HELD_AT_MOST: Duration = Duration::hours(1);
+
+    /// Holds `reading` for `conversation_id`, sweeping out every reading
+    /// held longer than `HELD_AT_MOST`, so the map keeps none for good.
+    pub fn hold(conversation_id: i64, reading: Reading) {
+        let oldest = Utc::now() - HELD_AT_MOST;
+        let mut held = pending();
+        held.retain(|_, r| r.seen_at >= oldest);
+        held.insert(conversation_id, reading);
+    }
+
+    /// Drops `conversation_id`'s held reading: a Claude Code call does so
+    /// as it starts, so a leftover from an earlier call is never recorded
+    /// as this call's provider's (round 1 A-L1).
+    pub fn discard(conversation_id: i64) {
+        pending().remove(&conversation_id);
     }
 
     /// `conversation_id`'s held reading, taken.

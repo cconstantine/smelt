@@ -224,7 +224,9 @@ pub(super) async fn stream_for_kind(
     slot: anthropic::stream::SlotPolicy<'_>,
 ) -> Result<anthropic::stream::StreamedTurn, anthropic::stream::ModelError> {
     if turn_model.kind == crate::providers::ProviderKind::ClaudeCli {
-        // The summary's subscription reading (SME-486), Ok or Err.
+        // The summary's subscription reading (SME-486), Ok or Err; a
+        // leftover from an earlier call is dropped first.
+        crate::claude_cli::usage::discard(conversation_id);
         let done = crate::claude_cli::once::once(conversation_id, turn_model, request, on_delta, meter).await;
         crate::claude_cli::usage::record(pool, conversation_id, turn_model.provider_id).await;
         return done;
@@ -249,6 +251,8 @@ async fn call_claude_cli(
 ) -> Result<(anthropic::stream::StreamedTurn, CallRecorder), CallError> {
     clear_reply_in_progress(conversation_id);
     crate::events::publish(conversation_id, crate::events::ConversationEvent::ReplyReset {});
+    // Only this call's subscription reading is recorded (SME-486 A-L1).
+    crate::claude_cli::usage::discard(conversation_id);
     let recorder = CallRecorder::new(pool, conversation_id, turn_model, db::ModelCallKind::Turn, request);
     let extra = CallRecorder::new(pool, conversation_id, turn_model, db::ModelCallKind::Turn, request);
     let called = crate::claude_cli::run::call(pool, conversation_id, turn_model, request, relay, recorder.meter(), extra.meter(), cli).await;

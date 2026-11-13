@@ -37,6 +37,24 @@ async fn test_a_turn_records_its_providers_windows(pool: PgPool) {
     );
 }
 
+/// Round 1 A-L1: a reading left held by an earlier call (a Stop, a run
+/// settled in the background) is dropped when the next Claude Code call
+/// starts, not stored as that call's provider's.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_stale_held_reading_is_not_stored_by_the_next_call(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let fake = FakeCli::new("usage-stale", vec![vec![json!({"read": true}), text_reply("hi")]]);
+    let provider = fake.pick_for(&pool, conversation.id).await;
+    crate::claude_cli::usage::seen(conversation.id, &captured_event());
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the turn runs");
+
+    assert!(windows(&pool, provider).await.is_empty(), "the call streamed no event of its own");
+    assert_eq!(crate::claude_cli::usage::take(conversation.id), None, "and nothing is left held");
+}
+
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_capped_turn_still_records(pool: PgPool) {
     crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");

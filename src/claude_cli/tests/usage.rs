@@ -60,6 +60,23 @@ fn test_a_fixture_streams_windows_parse_to_numbers() {
     assert_eq!(take(conversation_id), None, "an invalid event leaves the slot as it was");
 }
 
+/// Round 1 A-L1: the held map can't keep an entry for good. A reading held
+/// longer than `HELD_AT_MOST` goes when any other is held, and `discard`
+/// drops one.
+#[test]
+fn test_a_held_reading_is_swept_once_old() {
+    let event = &events(include_str!("../fixtures/capped.jsonl"))[0];
+    let (old, kept, fresh) = (-486_002, -486_003, -486_004);
+    let reading = |seen_at| Reading::from_event(event, seen_at).expect("a reading");
+    hold(old, reading(Utc::now() - HELD_AT_MOST - Duration::minutes(1)));
+    hold(kept, reading(Utc::now() - HELD_AT_MOST + Duration::minutes(5)));
+    hold(fresh, reading(Utc::now()));
+    assert_eq!(take(old), None, "swept");
+    assert!(take(kept).is_some(), "younger than the limit stays");
+    discard(fresh);
+    assert_eq!(take(fresh), None, "discarded");
+}
+
 /// Every string an event can carry, planted with one marker.
 pub(crate) const MARKER: &str = "SK_ANT_MARKER_486";
 
