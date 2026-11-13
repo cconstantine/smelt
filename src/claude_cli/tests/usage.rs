@@ -126,7 +126,8 @@ fn test_a_reading_holds_no_string_from_the_event() {
 fn test_pace_and_reset_from_now() {
     // Synthesized windows: the fixtures' resetsAt is one fixed value.
     let now = at(1_767_225_600);
-    let seen_at = now - Duration::minutes(3);
+    // Read just now: the pace is as of the reading (round 1 A-L3).
+    let seen_at = now;
     let window = |name: &str, utilization: f64, left: Option<Duration>| {
         UsageWindow::from_stored(name.into(), utilization, "allowed".into(), left.map(|left| now + left), seen_at, now)
     };
@@ -149,4 +150,22 @@ fn test_pace_and_reset_from_now() {
     let no_reset = window("seven_day", 0.5, None);
     assert_eq!((no_reset.elapsed_fraction, no_reset.projected, no_reset.reset_passed), (None, None, false));
     assert_eq!(half.seen_at, seen_at);
+}
+
+/// Round 1 A-L3: the pace is the reading's, as of when it was seen, not
+/// the answer's time: a week half gone when 32% was read is on pace for
+/// 64%, however long ago that was. Whether the reset has passed is still
+/// as of now.
+#[test]
+fn test_the_pace_is_as_of_the_reading() {
+    let seen_at = at(1_767_225_600);
+    let resets_at = seen_at + Duration::hours(84);
+    let window = |now| UsageWindow::from_stored("seven_day".into(), 0.32, "allowed".into(), Some(resets_at), seen_at, now);
+    let later = window(seen_at + Duration::hours(48));
+    assert!(close(later.elapsed_fraction.expect("elapsed"), 0.5), "{later:?}");
+    assert!(close(later.projected.expect("projected"), 0.64), "{later:?}");
+    assert!(!later.reset_passed);
+    let after = window(resets_at + Duration::minutes(1));
+    assert!(after.reset_passed);
+    assert_eq!(after.projected, None, "an ended window has no pace");
 }

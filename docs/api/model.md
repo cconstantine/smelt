@@ -35,7 +35,7 @@ One layer down, `anthropic::stream::stream_anthropic_message_metered` retries a 
 
 | Function | Route | Answers |
 |---|---|---|
-| `get_provider_usage` | `GET /api/providers/{id}/usage` | `ProviderUsage { provider_id, windows, observed_at }`, empty `windows` with no reading; "That provider no longer exists." for a missing id. Each `UsageWindow` carries `reset_passed`, and for `five_hour`/`seven_day` the `elapsed_fraction` and the `projected` utilization by reset (none in a window's first seventh, or once it has reset). |
+| `get_provider_usage` | `GET /api/providers/{id}/usage` | `ProviderUsage { provider_id, windows, observed_at }`, empty `windows` with no reading; "That provider no longer exists." for a missing id. Each `UsageWindow` carries `reset_passed`, and for `five_hour`/`seven_day` the `elapsed_fraction` and the `projected` utilization by reset, both as of the reading's `seen_at` (none in a window's first seventh, or once it has reset as of `observed_at`). |
 | `get_conversation_usage_windows` | `GET /api/conversations/{id}/usage-windows` | The same for the conversation's provider, or `None` unless that provider is Claude Code: the chat's context-bar indicator. |
 
 The provider page, the providers list and the context bar show them ([setup/claude-code.md](../setup/claude-code.md)); `scripts/pm/smelt-api usage` reads the first for the Project Manager's [usage hold](../personas/project-manager.md#usage-hold-sme-486).

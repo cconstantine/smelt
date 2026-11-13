@@ -193,7 +193,9 @@ mod server {
     }
 
     impl UsageWindow {
-        /// A stored window, with its reset and pace as of `now`.
+        /// A stored window: whether its reset has passed as of `now`, and
+        /// its pace as of `seen_at`, when its utilization was read (round 1
+        /// A-L3), so the UI and `smelt-api usage` share one pace.
         pub fn from_stored(
             name: String,
             utilization: f64,
@@ -204,7 +206,7 @@ mod server {
         ) -> Self {
             let reset_passed = resets_at.is_some_and(|at| at < now);
             let elapsed_fraction = resets_at.zip(length(&name)).map(|(at, length)| {
-                let left = (at - now).num_milliseconds() as f64 / length.num_milliseconds() as f64;
+                let left = (at - seen_at).num_milliseconds() as f64 / length.num_milliseconds() as f64;
                 (1.0 - left).clamp(0.0, 1.0)
             });
             let projected = elapsed_fraction
