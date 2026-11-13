@@ -13,7 +13,11 @@ touches providers, settings, secrets or trust decisions.
   persona-set CONV DIR:NAME                set its persona (SME-481; scoped names only), then read
                                            it back (exit 1 unless that persona, applied); prints
                                            the model and provider it ended on: the persona's
-                                           smelt.model may have moved it, so check `model` again
+                                           smelt.model may have moved it, so check `model` again.
+    [--commit SHA]                         On an applied persona it's a refresh (SME-516): the same
+                                           persona at SHA (default: the default branch's tip);
+                                           `pending` exits 0 until the turn ends, `applied` is read
+                                           back at that commit (exit 1 unless so)
   send CONV FILE|- [--expect-model P:M]    send a message; with --expect-model, only on that model
   answer CONV TOOL_USE_ID ANSWER...        answer the pending ask_user, one ANSWER per question:
                                            a label, label1|label2 (multi-select), or other:<text>
@@ -23,7 +27,9 @@ touches providers, settings, secrets or trust decisions.
   question CONV                            the pending question's JSON, or `none`
   model CONV                               the conversation's model
   persona CONV                             what its persona is set to (label, commit, applied, model,
-                                           provider), or can_set and the options' labels
+                                           provider, then the snapshot's settings: compact_at,
+                                           resources, credentials as names, tools, ignored; and the
+                                           last refresh), or can_set and the options' labels
   pods                                     live pods and their running commands
   providers                                provider id, kind and name
   usage PROVIDER_ID [--json]               a Claude Code provider's subscription usage windows and
@@ -126,11 +132,20 @@ def persona_arg(value):
     return value
 
 
+def commit_arg(value):
+    """A commit sha, 4 to 40 hex digits; anything else is usage, exit 2."""
+    if not re.fullmatch(r"[0-9a-f]{4,40}", value):
+        raise argparse.ArgumentTypeError(f"expected a commit sha (hex), got {value!r}")
+    return value
+
+
 def print_persona(persona):
     chosen = persona.get("set") if isinstance(persona, dict) else None
     if chosen:
         for key in ("label", "commit", "applied", "model", "provider"):
             print(f"{key:<9}{chosen.get(key)}")
+        for line in smelt_api.persona_settings_lines(chosen):
+            print(line)
         return
     if not isinstance(persona, dict):
         print(f"unexpected answer: {json.dumps(persona)[:BODY_CUT]}")
@@ -148,7 +163,13 @@ def cmd_persona(args):
 
 
 def cmd_persona_set(args):
-    request("persona-set", args.conv, {"persona": args.persona})
+    body = {"persona": args.persona}
+    if args.commit:
+        body["commit"] = args.commit
+    answer = request("persona-set", args.conv, body)
+    refresh = answer.get("refresh") if isinstance(answer, dict) else None
+    if isinstance(refresh, dict):
+        return refreshed(args, refresh)
     persona = request("persona", args.conv)
     print_persona(persona)
     chosen = persona.get("set") if isinstance(persona, dict) else None
@@ -156,6 +177,23 @@ def cmd_persona_set(args):
         die(f"conversation {args.conv}'s persona reads back as above, not {args.persona} applied", 1)
     print(f"conversation {args.conv} is {args.persona} on model {chosen.get('model')}, "
           f"provider {chosen.get('provider')}")
+
+
+def refreshed(args, refresh):
+    """A set on an applied persona is a refresh (SME-516): `pending` until
+    the conversation's turn ends; `applied` read back at its commit."""
+    if refresh.get("state") == "pending":
+        print(f"pending: applies when conversation {args.conv}'s current turn ends; "
+              f"read it back then with `smelt-api persona {args.conv}`")
+        return
+    persona = request("persona", args.conv)
+    print_persona(persona)
+    chosen = persona.get("set") if isinstance(persona, dict) else None
+    wanted = args.commit or refresh.get("commit")
+    commit = (chosen or {}).get("commit") or ""
+    if not chosen or chosen.get("label") != args.persona or not wanted or not commit.startswith(wanted):
+        die(f"conversation {args.conv}'s persona reads back as above, not {args.persona} at {wanted}", 1)
+    print(f"conversation {args.conv} is {args.persona}, refreshed at {commit}")
 
 
 def read_brief(path):
@@ -426,7 +464,9 @@ def parser():
     s.add_argument("--json", action="store_true")
     add("question", cmd_question, "conv")
     add("model", cmd_model, "conv")
-    add("persona-set", cmd_persona_set, "conv").add_argument("persona", type=persona_arg)
+    persona_set = add("persona-set", cmd_persona_set, "conv")
+    persona_set.add_argument("persona", type=persona_arg)
+    persona_set.add_argument("--commit", type=commit_arg, help="a refresh at this commit on the default branch")
     add("persona", cmd_persona, "conv")
     add("pods", cmd_pods)
     add("providers", cmd_providers)

@@ -33,7 +33,7 @@ In this order, one step at a time. After a failure, re-read the tree and the boa
 2. `smelt-api create`. The first line of its output is the new conversation's id.
 3. `smelt-api attach ID git@github.com:cconstantine/smelt.git`.
 4. **Wait until the clone is ready:** run `smelt-api persona ID` until it lists `option   smelt:ticket-driver` with no `(error: …)` after it: an option whose file failed to load is listed with its error, and a set of it is refused. `can_set  yes` alone isn't enough: it shows while the clone is still cloning (SME-499). The set reads the persona from the attach's checkout, so it's refused until then.
-5. `smelt-api persona-set ID smelt:ticket-driver` (SME-481's top-level persona, [top-level.md](../design/personas/top-level.md)). It takes only a scoped `<dir>:<name>`, reads the persona back, and exits 1 unless it reads that persona, applied. **The persona's `smelt.model` must be listed on the conversation's provider, or the set is refused**, naming the providers that do list it ([top-level.md, "Model"](../design/personas/top-level.md#model)): there is no fallback to another provider. **After a failed `persona-set`, read `smelt-api persona ID` before retrying** (SME-499): a set that applied but whose read-back failed refuses every re-run as already set.
+5. `smelt-api persona-set ID smelt:ticket-driver` (SME-481's top-level persona, [top-level.md](../design/personas/top-level.md)). It takes only a scoped `<dir>:<name>`, reads the persona back, and exits 1 unless it reads that persona, applied. **The persona's `smelt.model` must be listed on the conversation's provider, or the set is refused**, naming the providers that do list it ([top-level.md, "Model"](../design/personas/top-level.md#model)): there is no fallback to another provider. **After a failed `persona-set`, read `smelt-api persona ID` before retrying** (SME-499): once a set has applied, a re-run is a refresh ([Refreshing a persona](#refreshing-a-persona)), not a set.
 6. `smelt-api model-set ID PROVIDER_ID MODEL`: ClaudeCode `claude-opus-5-5`, or strata's provider and model. `smelt-api providers` lists the provider ids. It reads the model back and exits 1 unless it reads `Chosen`. **The model is set after the persona, never before:** in the trial, `persona-set ID smelt:ticket-driver` moved a ClaudeCode conversation to strata (SME-502, cause not yet known). So the model is set after the persona and read back before the brief (step 8).
 7. The `Ticket Driver started: conversation ID` comment on the ticket, before the brief starts it ([rules.md](rules.md): comment first), so a PM that dies after `send` leaves no live Driver that no comment names.
 8. `smelt-api model ID`, then at once `smelt-api send ID brief.md --expect-model PROVIDER_ID:MODEL`, with `PROVIDER_ID:MODEL` copied from that read: its `choice`'s `provider_id` and `model`. `persona-set` prints only the provider's name, not its id, so its output isn't the source. The flag is required for a Driver's first brief: it sends nothing unless the model is `Chosen` with exactly that provider and model, so the brief never runs on another model.
@@ -59,6 +59,16 @@ Then the ticket facts: the ticket, the persona file, the user's answers.
 ## Order of work
 
 Urgent flakes (project Test reliability) first, then High, then the Backlog, within the user's direction to a project.
+
+## Refreshing a persona
+
+A live conversation's persona is a snapshot, taken when it was set. A persona change that merges doesn't reach it until it's refreshed (SME-516): `smelt-api persona-set ID DIR:NAME [--commit SHA]` on a conversation whose persona is applied re-reads **the same persona** at SHA, a commit on its remote's default branch (`main`'s tip after a fetch when there's no `--commit`), and replaces its body, settings, tool rules and credentials grant. Each takes effect from the conversation's next turn; its model is left as it is. Another persona's name is refused: a different persona is a new conversation. Only what reached the default branch can be read, never a branch or the working tree, so a seat can't widen its own rules ([top-level.md, "Refresh"](../design/personas/top-level.md#refresh)).
+
+After a persona change merges to `main`, or a deploy that adds a persona key:
+
+1. **Each live Driver:** `smelt-api persona-set ID smelt:ticket-driver`. A Driver mid-turn answers `pending`: it applies when its current turn ends. On the PM's next pass, read it back with `smelt-api persona ID` and check `commit`, `compact_at` and `refresh applied`.
+2. **Itself:** `smelt-api persona-set <own id> smelt:project-manager`. That is always `pending`, since its own turn holds the lock. At the start of its next turn, read back `smelt-api persona <own id>` and check `compact_at 120000` and the commit.
+3. **`refresh refused`** says why. For resources, commands are running: a persona whose `smelt.resources` changed restarts the pod, which would end them. Stop the PM's own wait loops at a quiet point, then refresh again. A refresh still `pending` when smelt restarts is dropped, with nothing written, and is run again.
 
 ## Deploys
 

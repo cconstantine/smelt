@@ -25,7 +25,7 @@ fn test_a_top_level_persona_is_in_the_prompt_and_absent_without_one() {
     assert!(
         prompt.contains(
             "# Persona\n\nYour persona, `smelt:ticket-driver` from /workspace/smelt/.agents/personas/ticket-driver.md \
-             at b774476, read when this conversation was set to it;"
+             at b774476, read when this conversation was set to it or last refreshed;"
         ),
         "{prompt}"
     );

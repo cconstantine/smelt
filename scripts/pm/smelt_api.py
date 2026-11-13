@@ -292,3 +292,36 @@ def message_blocks(message):
     if isinstance(content, dict):
         return [content]
     return content or []
+
+
+def _tools_summary(tools):
+    if not isinstance(tools, dict):
+        return "-"
+    parts = [f"{key} {len(tools[key])}" for key in ("allow", "deny") if isinstance(tools.get(key), list)]
+    if tools.get("own") is not None:
+        parts.append(f"own {json.dumps(tools['own'])}")
+    return ", ".join(parts) or "-"
+
+
+def persona_settings_lines(chosen):
+    """A set persona's snapshot settings (SME-516), one `key value` line
+    each, `-` for unset. Credentials are names only: the settings never
+    hold a value."""
+    settings = chosen.get("settings") if isinstance(chosen.get("settings"), dict) else {}
+    compact_at = settings.get("compact_at")
+    resources = settings.get("resources")
+    names = settings.get("credentials") or []
+    ignored = settings.get("ignored") or []
+    lines = [
+        f"compact_at {compact_at if compact_at is not None else '-'}",
+        f"resources {json.dumps(resources) if resources else '-'}",
+        f"credentials {', '.join(map(str, names)) or '-'}",
+        f"tools {_tools_summary(settings.get('tools'))}",
+        f"ignored {', '.join(map(str, ignored)) or '-'}",
+    ]
+    refresh = chosen.get("refresh")
+    if isinstance(refresh, dict):
+        commit = refresh.get("commit") or ""
+        line = f"refresh {refresh.get('state')}" + (f" at {commit[:7]}" if commit else "")
+        lines.append(line + (f": {refresh['why']}" if refresh.get("why") else ""))
+    return lines
