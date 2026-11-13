@@ -178,6 +178,10 @@ pub fn fails(what: &'static str, id: i64) -> bool {
 /// the pod's files are written for the new grant.
 pub const TOP_LEVEL_REFRESH_TX: &str = "top_level_refresh_tx";
 
+/// `fail_next`'s step: a persona refresh's task panics after its read
+/// (SME-516 review 1, seam B L3), dropping its claim while `pending`.
+pub const TOP_LEVEL_REFRESH_PANIC: &str = "top_level_refresh_panic";
+
 /// `fail_next`'s step: a top-level set's apply, after the pod is sized and
 /// its credentials reconciled, before the row is marked applied.
 pub const TOP_LEVEL_APPLY: &str = "top_level_apply";

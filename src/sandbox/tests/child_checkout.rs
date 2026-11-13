@@ -83,61 +83,6 @@ async fn test_checkout_ref_takes_a_branch_a_tag_and_commits() {
     checks.expect("checks finished within the timeout");
 }
 
-/// SME-516, R11: a refresh's read. A commit on `main` (abbreviated, or the
-/// tip when none is named) reads the file as committed, never the working
-/// tree's edit; a side branch's commit, a symlink, a missing file and an
-/// unknown commit are refused, each saying which.
-#[tokio::test]
-async fn test_persona_at_default_branch_reads_only_the_default_branch() {
-    let client = test_client().await;
-    let manager = SandboxManager::new(client.clone());
-    let sandbox = manager.create(&unique_session_id("persona-at"), "256Mi", &[]).await.expect("create pod");
-    let shell = sandbox.shell();
-
-    let checks = tokio::time::timeout(Duration::from_secs(120), async {
-        let script = r#"set -e
-            c() { git -c user.name=t -c user.email=t@t commit -q -m "$1"; git rev-parse HEAD; }
-            git init -q -b main /tmp/psrc && cd /tmp/psrc && mkdir -p .agents/personas
-            echo one > .agents/personas/dev.md; git add -A; c1=$(c one)
-            echo two > .agents/personas/dev.md; git add -A; c2=$(c two)
-            git checkout -q -b side; echo wide > .agents/personas/dev.md; git add -A; s=$(c side); git checkout -q main
-            ln -s dev.md .agents/personas/link.md; git add -A; c3=$(c link)
-            git clone -q --bare /tmp/psrc /tmp/porigin.git
-            echo "$c1"; echo "$c2"; echo "$s"; echo "$c3""#;
-        let made = sandbox.exec(&["sh", "-c", script]).await.expect("exec make origin");
-        assert_eq!(made.exit_code, 0, "make origin: {}{}", made.stdout, made.stderr);
-        let shas: Vec<String> = made.stdout.lines().map(str::to_string).collect();
-        let (c1, side, tip) = (&shas[0], &shas[2], &shas[3]);
-        crate::git::clone_into_pod(&shell, "file:///tmp/porigin.git", None, "p").await.expect("clone");
-        let edit = sandbox
-            .exec(&["sh", "-c", "echo edited > /workspace/p/.agents/personas/dev.md; git -C /workspace/p fetch -q origin side"])
-            .await
-            .expect("exec edit");
-        assert_eq!(edit.exit_code, 0, "{}", edit.stderr);
-        let read = |rel: &'static str, commit: Option<String>| {
-            let shell = &shell;
-            async move { crate::git::persona_at_default_branch(shell, "p", rel, commit.as_deref()).await }
-        };
-        let dev = ".agents/personas/dev.md";
-
-        assert_eq!(read(dev, None).await, Ok((tip.clone(), "two\n".to_string())), "the tip, not the working tree");
-        assert_eq!(read(dev, Some(c1[..10].to_string())).await, Ok((c1.clone(), "one\n".to_string())));
-
-        let refused = read(dev, Some(side.clone())).await.expect_err("a side branch");
-        assert_eq!(refused, format!("{side} isn't on origin/main: a refresh reads only commits on the remote's default branch"));
-        let refused = read(".agents/personas/link.md", None).await.expect_err("a symlink");
-        assert!(refused.contains("isn't a regular file (a symlink is refused)"), "{refused}");
-        let refused = read(".agents/personas/none.md", None).await.expect_err("missing");
-        assert!(refused.starts_with("no file .agents/personas/none.md in /workspace/p at "), "{refused}");
-        let refused = read(dev, Some("0123456789abcdef0123456789abcdef01234567".to_string())).await.expect_err("unknown");
-        assert!(refused.starts_with("no commit `0123456789"), "{refused}");
-    })
-    .await;
-
-    manager.delete(sandbox).await.expect("delete pod");
-    checks.expect("checks finished within the timeout");
-}
-
 /// A parent's checkout of /tmp/origin.git at /workspace/<dir>, on `main`
 /// tracking origin's, after `script` runs in it.
 async fn parent_checkout(sandbox: &Sandbox, shell: &crate::sandbox::PodShell, dir: &'static str, script: &str) {

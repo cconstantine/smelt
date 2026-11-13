@@ -48,6 +48,11 @@ pub(crate) trait ChildCheckout: Send + Sync {
     /// and Docker data are its claims', and outlive the pod.
     fn restart_pod<'a>(&'a self, pool: &'a PgPool, child: i64) -> Boxed<'a, Result<(), String>>;
 
+    /// Stops the conversation's pod, with whatever files it held (SME-516
+    /// review 1 M1: a refused refresh whose grant couldn't be put back).
+    /// The next pod installs the row's grant from scratch.
+    fn stop_pod<'a>(&'a self, pool: &'a PgPool, id: i64) -> Boxed<'a, Result<(), String>>;
+
     /// Drops the starting child's pod and claims and clones `repo` at
     /// `target` again (SME-484, M1): its next pod reads `pod_resources`
     /// and is placed afresh, rather than pinned to the node its first pod
@@ -69,19 +74,6 @@ pub(crate) trait ChildCheckout: Send + Sync {
         dir: &'a str,
         rel: &'a str,
     ) -> Boxed<'a, Result<Option<db::InstructionsFile>, String>>;
-
-    /// Reads `rel` in the conversation's checkout `dir` at `commit` (the
-    /// default branch's tip when `None`), which must be on the remote's
-    /// default branch after a fetch (SME-516: a refresh's input), with that
-    /// commit's full id.
-    fn persona_at<'a>(
-        &'a self,
-        pool: &'a PgPool,
-        conversation: i64,
-        dir: &'a str,
-        rel: &'a str,
-        commit: Option<&'a str>,
-    ) -> Boxed<'a, Result<(String, String), String>>;
 }
 
 /// The real checkout: the child's own pod.
@@ -139,6 +131,10 @@ impl ChildCheckout for PodCheckout {
         })
     }
 
+    fn stop_pod<'a>(&'a self, pool: &'a PgPool, id: i64) -> Boxed<'a, Result<(), String>> {
+        Box::pin(async move { crate::sandbox::terminate_pod(pool, id).await.map_err(|e| format!("couldn't stop the pod: {e}")) })
+    }
+
     fn reprovision<'a>(
         &'a self,
         pool: &'a PgPool,
@@ -173,22 +169,6 @@ impl ChildCheckout for PodCheckout {
                 .map_err(|e| format!("couldn't reach the agent's sandbox: {e}"))?;
             let checkout = format!("{}/{dir}", crate::sandbox::WORKSPACE_DIR);
             crate::git::read_instructions_file(&shell, &checkout, &format!("{checkout}/{rel}")).await
-        })
-    }
-
-    fn persona_at<'a>(
-        &'a self,
-        pool: &'a PgPool,
-        conversation: i64,
-        dir: &'a str,
-        rel: &'a str,
-        commit: Option<&'a str>,
-    ) -> Boxed<'a, Result<(String, String), String>> {
-        Box::pin(async move {
-            let shell = crate::sandbox::PodShell::for_conversation(pool, conversation)
-                .await
-                .map_err(|e| format!("couldn't reach the conversation's sandbox to read its persona: {e}"))?;
-            crate::git::persona_at_default_branch(&shell, dir, rel, commit).await
         })
     }
 }

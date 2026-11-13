@@ -313,11 +313,17 @@ RUN bash /build/smelt/scripts/browser-check/setup.sh \
 # The server image. `ca-certificates` because every model provider, MCP server
 # and price-catalog fetch is HTTPS; `fonts-liberation` (with fontconfig, as a
 # dependency) because a browsing session shows the user the page it rendered,
-# and a slim base with no fonts renders text as blanks.
+# and a slim base with no fonts renders text as blanks. `git` and
+# `openssh-client` because a top-level persona refresh reads the repo's
+# default branch from its remote, server-side, never from the seat's own pod
+# (SME-516); `/etc/smelt/known_hosts` pins the forges' host keys for that
+# read, the same ones the sandbox image pins.
 FROM debian:trixie-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates fonts-liberation \
+       git openssh-client \
     && rm -rf /var/lib/apt/lists/*
+COPY docker/known_hosts /etc/smelt/known_hosts
 # smelt writes nothing but Chrome's per-launch profile under /tmp; uid pinned
 # to 1000 so a mounted volume's ownership is predictable, same as everywhere
 # else in this repo's images.

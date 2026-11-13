@@ -371,30 +371,37 @@ where
     .await
 }
 
-/// A persona refresh's grant (SME-516): the pod's files written for the
-/// refreshed snapshot (Rule G from `git_ssh` and the stored key, Rule S
-/// from its names), then `then`, the row's transaction, under the same
-/// install lock, so no install reads the old row in between and writes the
-/// old grant back over the new. A failed write never runs `then`.
-pub async fn refresh_grant<F, Fut>(
+/// A persona refresh's grant (SME-516): `before` (the row's transaction
+/// begun, the trust read under its lock: review 1 M1), then the pod's files
+/// written for the refreshed snapshot (Rule G from `git_ssh` and the stored
+/// key, Rule S from its names), then `then` with what `before` gave (the
+/// row written and committed), all under the same install lock, so no
+/// install reads the old row in between and writes the old grant back over
+/// the new. A refused `before` writes nothing; a failed write never runs
+/// `then`.
+pub async fn refresh_grant<B, BFut, T, F, Fut>(
     pool: &PgPool,
     conversation: i64,
     snapshot: &db::PersonaSnapshot,
     git_ssh: bool,
+    before: B,
     then: F,
 ) -> Result<(), String>
 where
-    F: FnOnce() -> Fut,
+    B: FnOnce() -> BFut,
+    BFut: std::future::Future<Output = Result<T, String>>,
+    F: FnOnce(T) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
 {
     with_install_lock(conversation, async {
+        let begun = before().await?;
         let pod = db::list_sandbox_pods(pool, conversation).await.map_err(|e| e.to_string())?.into_iter().next_back();
         if let Some(pod) = pod {
             let secrets = resolve_stored(pool, snapshot_credential_names(snapshot)).await.map_err(|e| e.to_string())?;
             let files = files_for_granted(pool, &PodCredentials { git_ssh, secrets }).await.map_err(|e| e.to_string())?;
             write_pod_files(pool, pod.id, &files).await?;
         }
-        then().await
+        then(begun).await
     })
     .await
 }

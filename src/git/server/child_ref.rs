@@ -49,7 +49,7 @@ pub fn validate_commit_id(sha: &str) -> Result<(), String> {
 }
 
 /// Whether `r` reads as a commit id, whole or abbreviated.
-fn is_hex_id(r: &str) -> bool {
+pub(super) fn is_hex_id(r: &str) -> bool {
     (4..=64).contains(&r.len()) && r.chars().all(|c| c.is_ascii_hexdigit())
 }
 
@@ -101,63 +101,6 @@ pub async fn parent_commit(shell: &sandbox::PodShell, dir: &str) -> Result<(Stri
             "{path}'s branch {branch} tracks {upstream}, not a branch on origin: push it (git push -u origin {branch}), {or_ref}"
         )),
         code => Err(format!("couldn't read {path}'s commit (exit code {code}): {}", ran.stderr.trim())),
-    }
-}
-
-/// The file `rel` of the checkout `/workspace/<dir>` at `commit` (or at the
-/// remote's default branch's tip when `None`), after a fetch, and that
-/// commit's full id (SME-516: a persona refresh's input). The commit must
-/// be an ancestor of `origin/HEAD`, so only what reached the default branch
-/// is read, never the working tree or a pushed side branch: a live seat
-/// can't widen itself by editing its own file. A symlink, a file over the
-/// instructions ceiling and a missing file are refused, each saying so.
-pub async fn persona_at_default_branch(
-    shell: &sandbox::PodShell,
-    dir: &str,
-    rel: &str,
-    commit: Option<&str>,
-) -> Result<(String, String), String> {
-    if let Some(c) = commit {
-        validate_ref(c)?;
-    }
-    let path = format!("{}/{dir}", crate::sandbox::WORKSPACE_DIR);
-    let script = r#"cd "$1" || exit 1
-        GIT_TERMINAL_PROMPT=0 timeout 60 git -c core.sshCommand='ssh -o BatchMode=yes' fetch --quiet origin || exit 10
-        h=$(git symbolic-ref -q refs/remotes/origin/HEAD) || {
-            GIT_TERMINAL_PROMPT=0 timeout 60 git -c core.sshCommand='ssh -o BatchMode=yes' remote set-head origin -a >/dev/null 2>&1
-            h=$(git symbolic-ref -q refs/remotes/origin/HEAD); } || exit 11
-        echo "${h#refs/remotes/origin/}"
-        s=$(git rev-parse -q --verify "${3:-$h}^{commit}") || exit 12
-        echo "$s"
-        git merge-base --is-ancestor "$s" "$h" || exit 13
-        m=$(git ls-tree "$s" -- "$2" | cut -d' ' -f1)
-        [ -n "$m" ] || exit 14
-        [ "$m" = 100644 ] || [ "$m" = 100755 ] || exit 15
-        n=$(git cat-file -s "$s:$2") || exit 14
-        echo "$n"
-        [ "$n" -le "$4" ] || exit 16
-        git show "$s:$2""#;
-    let max = crate::git::INSTRUCTIONS_MAX_BYTES.to_string();
-    let ran = shell
-        .run(&["sh", "-c", script, "sh", &path, rel, commit.unwrap_or(""), &max], None)
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut parts = ran.stdout.splitn(4, '\n');
-    let mut line = || parts.next().unwrap_or("").trim().to_string();
-    let (default, sha, bytes) = (line(), line(), line());
-    let content = ran.stdout.splitn(4, '\n').nth(3).unwrap_or("").to_string();
-    let asked = commit.unwrap_or("the default branch's tip");
-    let on = format!("origin/{default}");
-    match ran.exit_code {
-        0 => Ok((sha, content)),
-        10 => Err(format!("couldn't fetch {path}'s remote to read the persona: {}", ran.stderr.trim())),
-        11 => Err(format!("{path}'s remote has no default branch (origin/HEAD) to read the persona at")),
-        12 => Err(format!("no commit `{asked}` on {path}'s remote")),
-        13 => Err(format!("{sha} isn't on {on}: a refresh reads only commits on the remote's default branch")),
-        14 => Err(format!("no file {rel} in {path} at {sha}")),
-        15 => Err(format!("{path}/{rel} at {sha} isn't a regular file (a symlink is refused)")),
-        16 => Err(format!("{path}/{rel} at {sha} is {bytes} bytes: a persona file may be at most {max}.")),
-        code => Err(format!("couldn't read {rel} in {path} (exit code {code}): {}", ran.stderr.trim())),
     }
 }
 

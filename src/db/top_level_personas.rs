@@ -130,47 +130,62 @@ pub async fn insert_top_level_persona(pool: &PgPool, new: &NewTopLevelPersona<'_
     Ok(InsertTopLevel::Inserted)
 }
 
-/// A refresh's transaction (SME-516): the remote's trust lock, the trust
-/// read again under it, and the row, still applied and at `snapshot`'s
-/// path, rewritten with the new snapshot, chain and Rule G bit. `prior_*`,
-/// `created_at` and `applied_at` stay. `Some(why)` is a refusal, which
-/// writes nothing.
-pub async fn refresh_top_level_persona(
+/// An open refresh transaction, holding the remote's trust lock and the
+/// conversation's and persona's rows (`begin_top_level_refresh`).
+pub type RefreshTx = sqlx::Transaction<'static, sqlx::Postgres>;
+
+/// A refresh's transaction begun (SME-516): the remote's trust lock, then
+/// the conversation (not being deleted), the trust read under the lock,
+/// and the row, still applied and at `path`, locked. Taken before any pod
+/// write or restart (review 1 M1), so a decline or a delete waits for the
+/// refresh or refuses it. `Err(why)` is a refusal, which wrote nothing.
+pub async fn begin_top_level_refresh(
     pool: &PgPool,
     id: i64,
     remote_key: &str,
-    snapshot: &PersonaSnapshot,
-    git_ssh: bool,
-) -> Result<Option<String>, sqlx::Error> {
+    path: &str,
+) -> Result<Result<RefreshTx, String>, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    lock_remote_trust(&mut *tx, remote_key).await?;
+    Ok(refresh_checks(&mut tx, id, remote_key, path).await?.map(|()| tx))
+}
+
+async fn refresh_checks(tx: &mut RefreshTx, id: i64, remote_key: &str, path: &str) -> Result<Result<(), String>, sqlx::Error> {
+    lock_remote_trust(&mut **tx, remote_key).await?;
     let deleting = sqlx::query_scalar::<_, Option<NaiveDateTime>>(
         "SELECT deleting_at FROM conversations WHERE id = $1 FOR NO KEY UPDATE",
     )
     .bind(id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     match deleting {
-        None => return Ok(Some("this conversation no longer exists".to_string())),
-        Some(Some(_)) => return Ok(Some("this conversation is being deleted".to_string())),
+        None => return Ok(Err("this conversation no longer exists".to_string())),
+        Some(Some(_)) => return Ok(Err("this conversation is being deleted".to_string())),
         Some(None) => {}
     }
-    if get_repo_trust(&mut *tx, remote_key).await? != Some(true) {
-        return Ok(Some("the user doesn't trust this repo's remote, so its personas can't be used".to_string()));
+    if get_repo_trust(&mut **tx, remote_key).await? != Some(true) {
+        return Ok(Err("the user doesn't trust this repo's remote, so its personas can't be used".to_string()));
     }
-    let path = sqlx::query_scalar::<_, String>(
+    let applied = sqlx::query_scalar::<_, String>(
         "SELECT persona_path FROM top_level_personas WHERE conversation_id = $1 AND applied_at IS NOT NULL FOR UPDATE",
     )
     .bind(id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
-    match path {
-        None => return Ok(Some("this conversation's persona is no longer applied".to_string())),
-        Some(path) if path != snapshot.path => {
-            return Ok(Some(format!("this conversation's persona is now {path}, not {}", snapshot.path)))
-        }
-        Some(_) => {}
-    }
+    Ok(match applied {
+        None => Err("this conversation's persona is no longer applied".to_string()),
+        Some(now) if now != path => Err(format!("this conversation's persona is now {now}, not {path}")),
+        Some(_) => Ok(()),
+    })
+}
+
+/// A begun refresh's row rewritten with the new snapshot, chain and Rule G
+/// bit, and committed. `prior_*`, `created_at` and `applied_at` stay.
+pub async fn finish_top_level_refresh(
+    mut tx: RefreshTx,
+    id: i64,
+    snapshot: &PersonaSnapshot,
+    git_ssh: bool,
+) -> Result<(), sqlx::Error> {
     let chain = snapshot
         .settings
         .get("tools")
@@ -190,8 +205,7 @@ pub async fn refresh_top_level_persona(
     .bind(&credentials)
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
-    Ok(None)
+    tx.commit().await
 }
 
 /// The set's last step: the row applied, so turns are admitted. Says

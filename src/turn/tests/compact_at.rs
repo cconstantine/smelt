@@ -415,11 +415,11 @@ async fn test_a_seat_refreshed_to_a_ceiling_compacts_at_it_from_its_next_turn(po
     let bodies = vec![todoread_at("toolu_1", 100_000), text_at("one", 130_000), text_reply_body("SUMMARY-R"), text_at("two", 9_000)];
     let requests = start_recording_mock_upstream(&pool, bodies).await;
     set_window(&pool).await;
-    let (id, newer) = crate::agents::tests::top_level_refresh::applied_without_a_ceiling(&pool).await;
+    let (id, remote) = crate::agents::tests::top_level_refresh::applied_without_a_ceiling(&pool).await;
     run_turn(&pool, id, hello()).await.expect("turn 1");
     assert!(dividers(&pool, id).await.is_empty(), "no ceiling yet: 130,000 compacts nothing");
 
-    let refreshed = crate::agents::top_level::set_persona(&pool, id, "app:driver", Some(newer)).await.expect("the refresh");
+    let refreshed = crate::agents::top_level::set_persona(&pool, id, "app:driver", Some(&remote.new)).await.expect("the refresh");
     assert_eq!(refreshed.refresh.map(|r| r.state), Some("applied".to_string()));
     run_turn(&pool, id, hello()).await.expect("turn 2");
 

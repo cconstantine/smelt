@@ -142,6 +142,24 @@ mod tests {
         assert!(broken.is_empty(), "links that don't resolve:\n{}", broken.join("\n"));
     }
 
+    /// The server image's known_hosts (docker/known_hosts, read by a
+    /// top-level persona refresh's server-side fetch, SME-516) pins the same
+    /// host keys as the sandbox image: a key rotated in one and not the other
+    /// would leave the refresh refusing a host the seat's own pushes reach.
+    #[test]
+    fn test_server_known_hosts_match_the_sandbox_images() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |p: &str| std::fs::read_to_string(root.join(p)).unwrap();
+        let sandbox = read("docker/sandbox/Dockerfile");
+        let pinned: Vec<&str> = sandbox
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix('"')?.strip_suffix("\" \\"))
+            .collect();
+        let server: Vec<String> = read("docker/known_hosts").lines().map(str::to_string).collect();
+        assert!(!pinned.is_empty(), "the sandbox Dockerfile's host keys were found");
+        assert_eq!(server, pinned, "docker/known_hosts differs from docker/sandbox/Dockerfile's");
+    }
+
     /// The Dockerfile's dx-tools stage installs the wasm-bindgen CLI that
     /// Cargo.lock's `wasm-bindgen` needs (SME-413): with NO_DOWNLOADS dx
     /// refuses any other version, and this says so before an image is built.
