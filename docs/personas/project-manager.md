@@ -39,13 +39,13 @@ On each pass over the project's tickets in Linear, it first rebuilds who owns wh
 
 It comments on the ticket, `Project Manager: moved to Up Next because …`, naming the runners-up. It tells the user in its next report, so they can swap the pick before the plan is approved. The user's own moves always take precedence: a ticket they put in Up Next means the Backlog isn't read.
 
-**Retrospectives.** On each pass it checks the "Next retrospective" ticket against the trigger in [Retrospective](../process/close-out.md#retrospective), whichever project it's working. When one holds, it moves the ticket to Up Next and starts a [Facilitator](facilitator.md) as a fresh smelt seat (`persona: "smelt:facilitator"`) with only the brief that persona names (the date range, the smelt address, and the Claude Code sessions in that window — those transcripts sit on the orchestrating machine, where no sandbox seat can reach them, so they arrive to the seat as the `scripts/retro-scan` output made there and handed over, per the persona page), and passes its report to the user unedited.
+**Retrospectives.** On each pass it checks the "Next retrospective" ticket against the trigger in [Retrospective](../process/close-out.md#retrospective), whichever project it's working. When one holds, it moves the ticket to Up Next and starts a [Facilitator](facilitator.md) with only the brief that persona names. It passes the report to the user unedited, then asks about the proposals with `ask_user`, as [pm-in-smelt.md](pm-in-smelt.md#retrospectives-and-bug-bashes) says.
 
 **When a bug bash or design review is due** (see [Bug bash](../process/sweeps.md#bug-bash-every-few-projects) and [Design review](../process/sweeps.md#design-review-every-few-projects-alternating-with-bug-bashes)), it says so in its report. It doesn't start one: a sweep is a project of its own, and the user directs the Project Manager to it.
 
 ## Running in smelt
 
-When the Project Manager runs as a smelt conversation rather than a Claude Code session, [pm-in-smelt.md](pm-in-smelt.md) applies too (SME-460). It covers its slots (four ClaudeCode/Opus ticket slots and one strata slot), starting each Ticket Driver as a top-level conversation through `scripts/pm/smelt-api`, the four parts of a Driver's brief, watching each Driver with `scripts/pm/smelt-wait`, the PM's standing rules, and the security model they rest on. The two scripts are its only way to write to smelt. Its Drivers aren't agents it started, so `list_agents` and `message_agent` don't reach them: there, a report owed is asked for with `smelt-api send ID -` ([pm-in-smelt.md](pm-in-smelt.md#watching)).
+When the Project Manager runs as a smelt conversation rather than a Claude Code session, [pm-in-smelt.md](pm-in-smelt.md) applies too (SME-460). It covers its slots (four ClaudeCode/Opus ticket slots and one strata slot), starting each Ticket Driver as a top-level conversation through `scripts/pm/smelt-api`, the four parts of a Driver's brief, watching each Driver with `scripts/pm/smelt-wait`, quiet deploys, the ClaudeCode usage-limit hold, how it runs retrospectives and bug bashes (SME-514), the PM's standing rules, and the security model they rest on. The two scripts are its only way to write to smelt. Its Drivers aren't agents it started, so `list_agents` and `message_agent` don't reach them: there, a report owed is asked for with `smelt-api send ID -` ([pm-in-smelt.md](pm-in-smelt.md#watching)).
 
 ## Usage hold (SME-486)
 
@@ -61,6 +61,7 @@ The Claude subscription's usage windows (five hours and seven days) are shared b
 - **Resume.** On a later pass whose verdict is `ok` (typically after the window's reset), it messages each held Driver "Usage hold lifted", comments `Usage hold lifted` on the same tickets, and starts Drivers again.
 - **On `unknown`:** it proceeds, and says so in its pass note. A server without the route (one before SME-486 answers it 200 with its NotFound page) gives `unknown: no usage route` and exit 1; any other failure of `smelt-api usage` (an HTTP error, exit 1; smelt unreachable, exit 2) counts as `unknown` too.
 - **Not a gate on the user.** The user can lift a hold by saying so.
+- **At the cap itself** a second rule applies: a seat that fails on a ClaudeCode "usage limit" sets off the [usage-limit hold](pm-in-smelt.md#claudecode-usage-limit) (SME-514), which holds every ClaudeCode tree until the reset the error names. This rule slows down before the cap; that one stops at it. Both can stand at once, and the trees resume only once neither does.
 
 ## Compaction (SME-482)
 
