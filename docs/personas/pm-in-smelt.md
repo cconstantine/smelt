@@ -6,12 +6,18 @@ Part of the [development process](../development-process.md). The [Project Manag
 - **A top-level smelt conversation** on ClaudeCode `claude-opus-5-5`, started with `smelt:project-manager`, with a clone of the repo at `main` for `scripts/pm/`. It's started as a Driver is ([below](#starting-a-driver), steps 2–6 and 8), with `persona-set ID smelt:project-manager`. It doesn't run on strata, where its own turns would share the strata line's one slot.
 - **Its only way to write to smelt is `scripts/pm/smelt-api`.** Its only waits are `scripts/pm/smelt-wait` (a Driver's tree) and `scripts/pm-wait-for-board` (the project's board). It makes no other request to smelt's API: see [Security model](#security-model).
 - **Reach smelt first:** `scripts/pm/smelt-api where` prints the address, the `Host` it sends and the server's build id. Run it before anything else in a new seat. See [The scripts](#the-scripts) for the address settings.
+- **The smelt PM owns the whole role, retrospectives and bug bashes included** (the user, 2026-11-13: "I want to fully move the PM role over to smelt, including bugbash and retros"; SME-514). The Claude Code PM session runs nothing by default. It's the fallback: the user opens it by hand only if smelt itself is down or a deploy broke it.
 
 ## Slots
 
 - **Up to four ClaudeCode/Opus ticket slots and one strata slot,** one ticket each.
 - **Each ticket gets a fresh top-level Ticket Driver conversation,** never a child of the PM. A child would put every ticket line in one tree, so stopping or deleting the PM would take every line with it. Also, `start_agent` can't choose a provider, and `claude-opus-5-5` exists on both the paid API and ClaudeCode.
 - **Ticket slots aren't stack slots.** The [stack-slot rule](project-manager.md) (two full-stack seats at a time, granted on the ticket) stays as it is.
+- **A retrospective takes a ClaudeCode slot at once.** When one is due, the PM doesn't wait for a slot to free: it holds the ClaudeCode tree that's cheapest to pause, runs the retro in its slot, and resumes that tree after ([Retrospectives](#retrospectives-and-bug-bashes)).
+
+### ClaudeCode usage limit
+
+If any seat fails on a ClaudeCode "usage limit", the PM holds every ClaudeCode tree until the window resets, and tells the user with `notify_user`. It holds a tree by telling its Driver (`smelt-api send`) to start no seat and send no message until told, and starts no new ClaudeCode Driver meanwhile. Once the window has reset, it tells each held Driver to go on. The same hold, on one tree, is how a [retrospective](#retrospectives-and-bug-bashes) frees its slot.
 
 ## Starting a Driver
 
@@ -51,6 +57,25 @@ Urgent flakes (project Test reliability) first, then High, then the Backlog, wit
 ## Deploys
 
 Deploys ride with a Driver, one at a time, at the current DEPLOY.md pin, and only from a `smelt:deployer` seat ([standing rule](#deploys-only-from-a-deployer-seat)).
+
+### Quiet deploys
+
+A deploy restarts smelt under every seat, so it runs only when the trees are quiet (the SME-477 retrospective, proposal 4; the user agreed 2026-11-12):
+
+- **A Deployer starts only when no seat in any tree is busy** in `/api/conversations/tree` (`smelt-api tree`). A seat that's idle while a background command of its own runs, such as a gate, counts as busy.
+- **A Deployer can't message other trees.** It reports which trees were busy at the restart to its Driver ([deployer.md](deployer.md#quiet-deploys)). The Driver passes that list to the PM, and the PM relays a note to each of those Drivers to check their seats.
+- **Merges that land close together share a deploy:** one deploy at `main`'s tip covers them.
+
+## Retrospectives and bug bashes
+
+The trigger is close-out.md's ([Watching](#watching)). The retro runs from smelt, with no Claude Code session involved:
+
+1. **It takes a ClaudeCode slot at once** ([Slots](#slots)): the PM holds the ClaudeCode tree that's cheapest to pause and resumes it once the retro is done.
+2. **The PM starts a top-level `smelt:facilitator`** on the open "Next retrospective" ticket, as it starts a Driver ([Starting a Driver](#starting-a-driver), with `persona-set ID smelt:facilitator`), and briefs it as it would a Driver ([Briefing a Driver](#briefing-a-driver)), adding what [facilitator.md](facilitator.md) names. It watches it with `smelt-wait` like a Driver.
+3. **The PM puts the proposals to the user with `ask_user`.** They're a real product decision, so `ask_user` is right here, not an answer of the PM's.
+4. **It files a ticket for each agreed proposal that needs code**, and owns the close-out PR: it starts the [Integrator](integrator.md) that makes it ([close-out.md](../process/close-out.md#retrospective)), top-level on the retro ticket and briefed like a Driver. The PM itself writes nothing to GitHub ([Hosted checks](#hosted-checks-are-a-small-spend)).
+
+**A bug bash** runs per [project-manager.md](project-manager.md) and [architect.md](architect.md), its seats started and watched the same way.
 
 ## Answering for the user
 
