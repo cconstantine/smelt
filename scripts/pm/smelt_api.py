@@ -12,6 +12,7 @@ directory on sys.path themselves (they run as `python3 -I`).
 
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -42,6 +43,8 @@ ROUTES = {
     "pods": ("GET", "/api/pods"),
     "pod-commands": ("GET", "/api/pods/commands"),
     "providers": ("GET", "/api/providers"),
+    # SME-486: `{id}` is a provider's id here.
+    "usage": ("GET", "/api/providers/{id}/usage"),
     "build-id": ("GET", "/api/build-id"),
     # SME-480: a view mark on a top-level conversation and its agents.
     "archive": ("POST", "/api/conversations/{id}/archive"),
@@ -178,6 +181,77 @@ def subtree(nodes, root):
         for child in reversed(children):
             stack.append((depth + 1, child))
     return out
+
+
+# The usage hold (SME-486, docs/personas/project-manager.md): a live
+# window at or over these holds new Drivers.
+HOLD_FIVE_HOUR = 0.70
+HOLD_SEVEN_DAY = 0.90
+HOLD_PACE = 1.0
+HOLD_STATUSES = ("allowed_warning", "rejected")
+
+# The shape a window's name or status must have to print as itself: the
+# answer's other fields, and any text that isn't a plain word, never print.
+WINDOW_WORD = re.compile(r"[a-z0-9_]{1,40}")
+TIME = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d(:\d\d(\.\d+)?)?(Z|\+00:00)")
+
+
+def _number(value):
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _time(value):
+    """An RFC 3339 UTC time cut to the minute (`2026-11-13T14:20Z`), or None
+    for anything that isn't one."""
+    return value[:16] + "Z" if isinstance(value, str) and TIME.fullmatch(value) else None
+
+
+def _word(value, otherwise):
+    return value if isinstance(value, str) and WINDOW_WORD.fullmatch(value) else otherwise
+
+
+def usage_windows(answer):
+    """The whitelisted fields of each window in a ProviderUsage answer
+    (SME-486): numbers, booleans, minute times, and a name or status
+    that is a plain word (else `(unnamed)` / `(unknown)`). Nothing else
+    of the answer is kept."""
+    windows = answer.get("windows") if isinstance(answer, dict) else None
+    out = []
+    for w in windows if isinstance(windows, list) else []:
+        if not isinstance(w, dict):
+            continue
+        out.append({
+            "name": _word(w.get("name"), "(unnamed)"),
+            "utilization": _number(w.get("utilization")) or 0.0,
+            "status": _word(w.get("status"), "(unknown)"),
+            "resets_at": _time(w.get("resets_at")),
+            "seen_at": _time(w.get("seen_at")),
+            "reset_passed": w.get("reset_passed") is True,
+            "projected": _number(w.get("projected")),
+        })
+    return out
+
+
+def percent(fraction):
+    return f"{round(fraction * 100)}%"
+
+
+def usage_verdict(windows):
+    """`ok`, `hold: <reasons>` or `unknown: no reading`, for windows from
+    usage_windows. A window whose reset has passed never holds."""
+    live = [w for w in windows if not w["reset_passed"]]
+    if not live:
+        return "unknown: no reading"
+    reasons = []
+    for w in live:
+        name, used, pace = w["name"], w["utilization"], w["projected"]
+        if (name == "five_hour" and used >= HOLD_FIVE_HOUR) or (name == "seven_day" and used >= HOLD_SEVEN_DAY):
+            reasons.append(f"{name} at {percent(used)}")
+        elif name == "seven_day" and pace is not None and pace >= HOLD_PACE:
+            reasons.append(f"{name} on pace for {percent(pace)} by reset")
+        if w["status"] in HOLD_STATUSES:
+            reasons.append(f"{name} {w['status']}")
+    return "hold: " + "; ".join(reasons) if reasons else "ok"
 
 
 def message_blocks(message):
