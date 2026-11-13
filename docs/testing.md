@@ -225,6 +225,16 @@ SME-341 spent two days getting a branch that changes nothing back to a first-att
 - **A test waits on the state it needs, never a fixed timer or an earlier step's side effect.** The flakes SME-341 fixed were each a wait on the wrong thing: a reply's chunks counted before it opened, a message typed into a disabled box, a claim "held" by a pod that could never be scheduled (before SME-335, a container with no resources got the namespace LimitRange's 64Gi max as its request), a lock shared by two tests' conversation 1. A test that builds its own pod spec gives it a small request; a test that needs ids no other test uses takes them from `id_alloc::FIXTURE_IDS`.
 - **Slow is usually waiting, not work.** Before parallelising, find what's being waited on: SME-341's pod tests were throttled by the test cluster's own volume provisioner (`scripts/k3s-bootstrap.sh`), not by CPU. `scripts/k3s-admin-kubeconfig` shows what the `park` account can't.
 
+### The flaky-test lane (SME-517)
+
+A flaky-test ticket runs a lighter lane, and stays **Urgent** (the SME-491 retrospective, proposal 2, agreed by the user 2026-11-13). Four flakes, SME-500, 501, 505 and 511, took about 24% of a window's ClaudeCode reads, and two of them ended as diagnostics only: SME-505's Developer ran the test 72 times, all green.
+
+- **No Planner seat.** The [Ticket Driver](personas/ticket-driver.md) writes the plan in the ticket from the signature and the CI log.
+- **A repro budget.** The [Developer](personas/developer.md) gets about 20 runs or 45 minutes to reproduce the red.
+- **If it doesn't reproduce, it ships diagnostics only:** something that makes the next red say what happened, such as SME-500's step-attributed report that survives the timeout. A follow-up ticket in Test reliability names what a recurrence must show.
+- **One review round,** with a second only if that round finds a High.
+- **SME-329's green-only rule still holds:** no re-runs, no `#[ignore]`, no widened timeout.
+
 ## Browser verification
 
 In [testing/browser.md](testing/browser.md).

@@ -6,12 +6,22 @@ Part of the [development process](../development-process.md). The [Project Manag
 - **A top-level smelt conversation** on ClaudeCode `claude-opus-5-5`, started with `smelt:project-manager`, with a clone of the repo at `main` for `scripts/pm/`. It's started as a Driver is ([below](#starting-a-driver), steps 2–6 and 8), with `persona-set ID smelt:project-manager`. It doesn't run on strata, where its own turns would share the strata line's one slot.
 - **Its only way to write to smelt is `scripts/pm/smelt-api`.** Its only waits are `scripts/pm/smelt-wait` (a Driver's tree) and `scripts/pm-wait-for-board` (the project's board). It makes no other request to smelt's API: see [Security model](#security-model).
 - **Reach smelt first:** `scripts/pm/smelt-api where` prints the address, the `Host` it sends and the server's build id. Run it before anything else in a new seat. See [The scripts](#the-scripts) for the address settings.
+- **The smelt PM owns the whole role, retrospectives and bug bashes included** (the user, 2026-11-13: "I want to fully move the PM role over to smelt, including bugbash and retros"; SME-514). The Claude Code PM session runs nothing by default. It's the fallback: the user opens it by hand only if smelt itself is down or a deploy broke it.
 
 ## Slots
 
 - **Up to four ClaudeCode/Opus ticket slots and one strata slot,** one ticket each.
 - **Each ticket gets a fresh top-level Ticket Driver conversation,** never a child of the PM. A child would put every ticket line in one tree, so stopping or deleting the PM would take every line with it. Also, `start_agent` can't choose a provider, and `claude-opus-5-5` exists on both the paid API and ClaudeCode.
 - **Ticket slots aren't stack slots.** The [stack-slot rule](project-manager.md) (two full-stack seats at a time, granted on the ticket) stays as it is.
+- **A retrospective takes a ClaudeCode slot at once,** unless a [usage-limit hold](#claudecode-usage-limit) is on; then the retro waits for the reset. When one is due, the PM doesn't wait for a slot to free: it holds the ClaudeCode tree that's cheapest to pause, runs the retro in its slot, and resumes that tree after ([Retrospectives](#retrospectives-and-bug-bashes)). The hold is a message to that tree's Driver (`smelt-api send`): start no seat and send no new work until told. A seat already mid-turn finishes its turn; it isn't stopped.
+
+### ClaudeCode usage limit
+
+If any seat fails on a ClaudeCode "usage limit", the PM holds every ClaudeCode tree until the window resets:
+
+- **The hold:** the PM sends no new work to any ClaudeCode tree and starts no ClaudeCode seat until the reset time the error names, or, when it names none, until its first pass after the 5-hour window. A seat already mid-turn is left to finish or fail; it isn't stopped.
+- **It tells the user through `ask_user`** when its own turn can still run.
+- **If the PM's own turns fail on the limit,** the hold is implicit, since nothing gets sent. After the reset it rebuilds its state from the trail ([rules.md](rules.md)) before it resumes the trees.
 
 ## Starting a Driver
 
@@ -52,6 +62,26 @@ Urgent flakes (project Test reliability) first, then High, then the Backlog, wit
 
 Deploys ride with a Driver, one at a time, at the current DEPLOY.md pin, and only from a `smelt:deployer` seat ([standing rule](#deploys-only-from-a-deployer-seat)).
 
+### Quiet deploys
+
+A deploy restarts smelt under every seat, so it runs only when the trees are quiet (the SME-477 retrospective, proposal 4; the user agreed 2026-11-12). The check is the PM's, since only it has `smelt-api`:
+
+- **The Driver asks for a go.** When a deploy is due, it writes `Driver gate: deploy due <sha>` and starts its Deployer only once the PM sends the go.
+- **The PM gives the go only when every other tree is quiet.** A seat is busy if `smelt-api tree` shows it `busy` (a turn in flight) or `smelt-api pods` shows a running command for it (the count after its status). A seat idle on its own gate shows only in `pods`, so both are read. The PM's own tree (its turn and its `smelt-wait` commands) and the asking Driver's are left out: both are busy by design.
+- **After the restart, the PM tells each tree it saw busy or running a command** to check its seats (`smelt-api send`). The Deployer reports its apply time to its Driver ([deployer.md](deployer.md#quiet-deploys)), and the Driver passes it on.
+- **Merges that land close together share a deploy:** one deploy at `main`'s tip covers them.
+
+## Retrospectives and bug bashes
+
+The trigger is [close-out.md's](../process/close-out.md#retrospective). The retro runs from smelt, with no Claude Code session involved:
+
+1. **It takes a ClaudeCode slot at once** ([Slots](#slots)): the PM holds the ClaudeCode tree that's cheapest to pause and resumes it once the retro is done.
+2. **The PM starts a top-level `smelt:facilitator`** on the open "Next retrospective" ticket, as it starts a Driver ([Starting a Driver](#starting-a-driver), with `persona-set ID smelt:facilitator`), and briefs it as it would a Driver ([Briefing a Driver](#briefing-a-driver)), adding what [facilitator.md](facilitator.md) names. It watches it with `smelt-wait` like a Driver.
+3. **The PM passes the Facilitator's report to the user unedited, then puts the proposals to the user with `ask_user`.** They're a real product decision, so `ask_user` is right here, not an answer of the PM's.
+4. **It files a ticket for each agreed proposal that needs code**, and owns the close-out PR: it starts the [Integrator](integrator.md) that makes it ([close-out.md](../process/close-out.md#retrospective)), top-level on the retro ticket and briefed like a Driver. The PM itself writes nothing to GitHub ([Hosted checks](#hosted-checks-are-a-small-spend)).
+
+**A bug bash** runs per [project-manager.md](project-manager.md) and [architect.md](architect.md), its seats started and watched the same way.
+
 ## Answering for the user
 
 - **A Driver's `ask_user` that is the PM's to decide** is answered with `smelt-api answer ID TOOL_USE_ID ANSWER…`, one `ANSWER` per question: an option's label, `label1|label2` for a multi-select, or `other:<text>`. `smelt-api question ID` shows the question first. The client checks the answer against the pending question and sends nothing if it doesn't fit.
@@ -77,7 +107,7 @@ Deploys ride with a Driver, one at a time, at the current DEPLOY.md pin, and onl
   | `CAP` | Restarts the watcher. |
 
 - **A report owed is asked for with `smelt-api send`.** project-manager.md's SME-339 rule reads `list_agents` and asks with `message_agent`, which reach only agents the PM started, never its top-level Drivers. For those, a `REPORT_OWED`, a `STALL` or a gate the PM hasn't heard about is asked about with `smelt-api send DRIVER -`, the message on stdin. That replaces the `list_agents`/`message_agent` rule for them.
-- **The retrospective trigger** is about ten Done, per [close-out.md](../process/close-out.md#retrospective).
+- **The retrospective trigger** is [close-out.md's](../process/close-out.md#retrospective): any one of its conditions.
 - **A stall is an owed answer with nothing running:** `REPORT_OWED` names it exactly (SME-455), and `STALL` catches the rest.
 
 ## Standing rules
