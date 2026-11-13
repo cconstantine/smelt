@@ -89,7 +89,11 @@ pub fn ProvidersIndex() -> Element {
                                 class: "mcp-server-row mcp-server-row-link",
                                 div { class: "mcp-server-summary",
                                     span { class: "mcp-server-name", "{provider.name}" }
-                                    span { class: "mcp-server-url", "{provider.kind.label()} \u{b7} {provider.base_url}" }
+                                    span { class: "mcp-server-url", "{provider.kind.label()} \u{b7} {provider.base_url}"
+                                        if provider.kind == ProviderKind::ClaudeCli {
+                                            super::usage::ProviderUsageSuffix { id: provider.id }
+                                        }
+                                    }
                                     if let Some(model) = current_default.as_ref().filter(|c| c.provider_id == provider.id).map(|c| c.model.clone()) {
                                         span { class: "provider-default-model", "Default model: {model}" }
                                     }

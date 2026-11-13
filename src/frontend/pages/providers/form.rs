@@ -405,6 +405,9 @@ pub fn ProviderEdit(id: i64) -> Element {
                     if saved() {
                         p { class: "muted provider-saved", "Saved." }
                     }
+                    if p.kind == ProviderKind::ClaudeCli {
+                        super::usage::SubscriptionUsage { id, refresh: models_refresh }
+                    }
                     ProviderModelsSection { id, refresh: models_refresh }
                     super::super::TwoStepButton {
                         armed: armed(),

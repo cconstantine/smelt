@@ -2,6 +2,8 @@
 
 use super::*;
 use super::shown_text::{hidden_text_notice, shown_pre};
+use super::super::providers::{usage_level, usage_short_text, usage_title};
+use crate::api::usage_windows::get_conversation_usage_windows;
 
 /// Where a loaded `AGENTS.md` came from, for the context detail view.
 pub(super) fn instructions_source(doc: &crate::git::ProjectInstructions) -> String {
@@ -393,6 +395,7 @@ pub(super) fn ContextUsage(
                 } else {
                     span { class: "context-usage-label", "No usage yet" }
                 }
+                SubscriptionUsageIndicator { selected, state }
             }
         } else {
             // The bar's space, kept until the usage arrives: it
@@ -454,6 +457,52 @@ pub(super) fn ContextUsage(
                         });
                     },
                 }
+            }
+        }
+    }
+}
+
+/// The Claude subscription's usage, right-aligned in the context bar
+/// (SME-486): `5h 45% · 7d 32%`, for a conversation on a Claude Code
+/// provider only. Fetched on select, after each context-usage update and
+/// when a turn ends (a capped turn sends no update); only the latest
+/// fetch for the conversation still selected lands, as the detail's does.
+#[component]
+fn SubscriptionUsageIndicator(selected: Memo<Option<i64>>, state: Store<ConversationState>) -> Element {
+    let context_usage = state.context_usage();
+    let turn_running = state.turn_running();
+    let mut usage: Signal<Option<(i64, crate::claude_cli::usage::ProviderUsage)>> = use_signal(|| None);
+    let mut request = use_signal(|| 0u64);
+    use_effect(move || {
+        let Some(id) = selected() else { return };
+        // Read to rerun on them: a new usage, and a turn starting or ending.
+        let _ = context_usage();
+        let _ = turn_running();
+        let asked = *request.peek() + 1;
+        request.set(asked);
+        spawn(async move {
+            let answer = get_conversation_usage_windows(id).await;
+            if selected() != Some(id) || *request.peek() != asked {
+                return;
+            }
+            match answer {
+                Ok(Some(found)) => usage.set(Some((id, found))),
+                Ok(None) => usage.set(None),
+                // A failed read keeps the last reading: it's a hint, not a gate.
+                Err(_) => {}
+            }
+        });
+    });
+    let shown = usage().filter(|(id, u)| selected() == Some(*id) && !u.windows.is_empty()).map(|(_, u)| u);
+    rsx! {
+        if let Some(u) = shown {
+            span {
+                class: match usage_level(&u) {
+                    Some(level) => format!("subscription-usage subscription-usage-{level}"),
+                    None => "subscription-usage".to_string(),
+                },
+                title: "{usage_title(&u)}",
+                "{usage_short_text(&u)}"
             }
         }
     }

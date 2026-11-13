@@ -45,10 +45,12 @@ pub struct UsageWindow {
 
 /// A provider's latest readings, one per window.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(not(feature = "server"), expect(dead_code, reason = "the UI reads it from SME-486's next commit"))]
 pub struct ProviderUsage {
     pub provider_id: i64,
     pub windows: Vec<UsageWindow>,
+    /// The server's clock when it answered: what the UI's "resets at"
+    /// and "seen ago" count from.
+    pub observed_at: DateTime<Utc>,
 }
 
 #[cfg(feature = "server")]
@@ -199,7 +201,7 @@ mod server {
                 .into_iter()
                 .map(|r| UsageWindow::from_stored(r.window_name, r.utilization, r.status, r.resets_at, r.seen_at, now))
                 .collect();
-            Self { provider_id, windows }
+            Self { provider_id, windows, observed_at: now }
         }
     }
 }

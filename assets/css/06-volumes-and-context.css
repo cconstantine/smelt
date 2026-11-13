@@ -206,6 +206,57 @@
     white-space: nowrap;
 }
 
+/* The Claude subscription's usage, at the context bar's right end
+   (SME-486): it never wraps or shrinks, and the context label gives way
+   with an ellipsis instead, so the bar keeps its one-line height
+   (SME-75). */
+.subscription-usage {
+    margin-left: auto;
+    flex-shrink: 0;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+}
+
+.subscription-usage-warn {
+    color: var(--warn);
+}
+
+.subscription-usage-high {
+    color: var(--danger);
+    font-weight: 600;
+}
+
+.context-usage-bar .context-usage-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* The provider page's usage block (SME-486): one row per window, its
+   name, a meter like the context bar's, the percent and when it resets. */
+.subscription-window {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin: 6px 0;
+    font-size: 13px;
+}
+
+.subscription-window-name {
+    min-width: 7em;
+}
+
+.subscription-window-percent {
+    min-width: 3em;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+.subscription-window-when {
+    font-size: 12px;
+}
+
 .context-detail-overlay {
     position: fixed;
     inset: 0;
