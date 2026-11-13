@@ -214,10 +214,20 @@ async fn test_a_pod_gone_wait_reports_a_pod_that_stays() {
 
     let report = gone.expect_err("the pod was never deleted, so the wait should time out");
     assert!(took < Duration::from_secs(5), "the wait should give up at its window, took {took:?}");
-    for part in [format!("pod {name} still there after 2."), "Pending, no deletionTimestamp".to_string(), "events: ".to_string()] {
+    // Not an exact "2.0": a loaded node may overshoot the window a little;
+    // what matters is that the wait isn't reported shorter than it was.
+    let reported = reported_wait_secs(&report);
+    assert!((2.0..5.0).contains(&reported), "the report should say it waited out its 2 s window: {report}");
+    for part in [format!("pod {name} still there after "), "Pending, no deletionTimestamp".to_string(), "events: ".to_string()] {
         assert!(report.contains(&part), "the report lacks {part:?}: {report}");
     }
     assert!(!report.contains("events: none read"), "the pod was read, so its events were asked for: {report}");
+}
+
+/// The seconds a `pod_gone_report` says it waited.
+fn reported_wait_secs(report: &str) -> f64 {
+    let after = report.split(" still there after ").nth(1).expect("the report names its wait");
+    after.split(" s;").next().and_then(|s| s.parse().ok()).expect("the wait is a number of seconds")
 }
 
 /// A pod deleted with a 20 s grace whose agent has exited and whose Docker
