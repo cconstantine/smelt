@@ -169,3 +169,25 @@ fn test_the_pace_is_as_of_the_reading() {
     assert!(after.reset_passed);
     assert_eq!(after.projected, None, "an ended window has no pace");
 }
+
+/// Round 1 B-L6: the docs give the utilization range and the statuses
+/// the parser keeps.
+#[test]
+fn test_the_docs_give_the_parsers_range_and_statuses() {
+    let docs = [
+        ("docs/api/model.md", include_str!("../../../docs/api/model.md")),
+        ("docs/database/schema.md", include_str!("../../../docs/database/schema.md")),
+    ];
+    for (doc, text) in docs {
+        let line = text.lines().find(|l| l.contains("SME-486") && l.contains("utilization")).expect(doc);
+        assert!(line.contains("(0–10"), "{doc}: the parser keeps 0 to 10");
+        for status in ["allowed", "allowed_warning", "rejected", "unknown"] {
+            assert!(line.contains(&format!("`{status}`")), "{doc}: {status}");
+        }
+    }
+    let over = json!({"rate_limit_info": {"unifiedWindows": {"five_hour": {"utilization": 10.0, "status": "odd"}}}});
+    let reading = Reading::from_event(&over, at(0)).expect("10 is kept");
+    assert_eq!(reading.windows[0].status, "unknown");
+    let past = json!({"rate_limit_info": {"unifiedWindows": {"five_hour": {"utilization": 10.01}}}});
+    assert_eq!(Reading::from_event(&past, at(0)), None, "past 10 is dropped");
+}

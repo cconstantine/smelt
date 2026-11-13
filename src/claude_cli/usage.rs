@@ -27,7 +27,8 @@ use serde::{Deserialize, Serialize};
 pub struct UsageWindow {
     /// `five_hour`, `seven_day`, or another window the CLI named.
     pub name: String,
-    /// The share used: 0.45 is 45%. Above 1.0 with overage.
+    /// The share used: 0.45 is 45%. Above 1.0 with overage; the parser
+    /// keeps 0 to 10.
     pub utilization: f64,
     /// `allowed`, `allowed_warning`, `rejected` or `unknown`.
     pub status: String,
