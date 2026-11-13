@@ -5,8 +5,10 @@
 use super::*;
 use k8s_openapi::api::core::v1::Event;
 
-/// One poll's view of the pod: whether its deletion is recorded, and each
-/// container's state, as `pod_gone_state` writes it.
+/// One poll's view of the pod, as "<phase>, <deletion>; <container>
+/// <state>, ...": the deletion is "deleting since <time> (grace <n> s)"
+/// or "no deletionTimestamp", and each container's state is "running",
+/// "terminated (<reason>, exit <code> at <time>)" or "waiting (<reason>)".
 fn pod_gone_state(pod: &Pod) -> String {
     let status = pod.status.as_ref();
     let statuses = [
