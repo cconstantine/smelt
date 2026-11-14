@@ -167,6 +167,26 @@ impl SessionMark {
     }
 }
 
+/// The longest a re-seed's call may take (PR #353 review 2 L12): it holds
+/// the conversation's turn lock, so a send waits behind it, and a cache
+/// read with a one-word reply takes seconds. `once`'s own limits are per
+/// line (`SILENCE`), not per call.
+pub const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+#[cfg(test)]
+pub static TIMEOUT_FOR_TESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn timeout() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        let ms = TIMEOUT_FOR_TESTS.load(Ordering::SeqCst);
+        if ms > 0 {
+            return std::time::Duration::from_millis(ms);
+        }
+    }
+    TIMEOUT
+}
+
 /// One re-seed of `conversation_id`'s session `session_id` with `request`
 /// (`reseed_request`'s), its usage to `meter`. Checks the session's file
 /// is as it found it (`SessionMark::check`).
@@ -190,7 +210,12 @@ pub async fn launch(
     // re-seed holds keeps a new run from starting meanwhile.
     super::run::ended(conversation_id).await;
     let mark = SessionMark::take(conversation_id, session_id);
-    let replied = once(conversation_id, turn_model, request, launch, &mut |_| {}, meter).await;
+    // Past `timeout()` the call is dropped, and its process with it
+    // (`kill_on_drop`); the session is checked after either way.
+    let replied = match tokio::time::timeout(timeout(), once(conversation_id, turn_model, request, launch, &mut |_| {}, meter)).await {
+        Ok(replied) => replied,
+        Err(_) => Err(ModelError::Other(format!("The cache re-seed took over {} seconds, so smelt stopped it.", timeout().as_secs()))),
+    };
     drop(run_bridge);
     if let Some(mark) = mark {
         mark.check(conversation_id);

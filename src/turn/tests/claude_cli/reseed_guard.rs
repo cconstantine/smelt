@@ -158,6 +158,39 @@ async fn test_a_re_seed_waits_for_the_last_process_to_end(pool: PgPool) {
     assert!(!candidates::off(), "the closing process's write isn't taken for the re-seed's");
 }
 
+/// Review 2 L12: a re-seed has an overall time limit, so it can't hold
+/// the turn lock for long. One whose CLI writes its session and then
+/// hangs is killed at the limit (here 1 s; `SILENCE` alone would allow
+/// 180 s), and its session is still checked: put back, re-seeding off.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_re_seed_past_its_time_limit_is_killed_and_its_session_still_checked(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let _clean = Clean::new();
+    let run = vec![json!({"read": true}), json!({"write_session": "append"}), json!({"hang": true})];
+    let (conversation, _, fake) = ready(&pool, "reseed-hangs", vec![run]).await;
+    let file = super::review3::session_file(conversation, SESSION);
+    std::fs::create_dir_all(file.parent().expect("its dir")).expect("the sessions dir");
+    let before = "{\"before\":true}\n";
+    std::fs::write(&file, before).expect("the session file");
+
+    crate::claude_cli::reseed::TIMEOUT_FOR_TESTS.store(1_000, std::sync::atomic::Ordering::SeqCst);
+    let started = run_tick(&pool, Utc::now()).await;
+    let ended = async {
+        for handle in started {
+            handle.await.expect("join");
+        }
+    };
+    let in_time = tokio::time::timeout(std::time::Duration::from_secs(10), ended).await;
+    crate::claude_cli::reseed::TIMEOUT_FOR_TESTS.store(0, std::sync::atomic::Ordering::SeqCst);
+    in_time.expect("the re-seed ended at its time limit");
+
+    assert_eq!(fake.started(), 1);
+    assert_eq!(std::fs::read_to_string(&file).expect("the session file"), before, "put back as it was");
+    assert!(candidates::off(), "re-seeding is off");
+    assert_eq!(candidates::get(conversation), None, "a failed re-seed drops its candidate");
+}
+
 /// Review 1 L8: a re-seed that fails after a real call replaced its
 /// candidate leaves that call's candidate; one with no call since drops
 /// its own.
