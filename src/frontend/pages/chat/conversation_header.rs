@@ -149,7 +149,8 @@ fn archive_conversation(id: i64, archived: bool, nodes: Signal<Vec<ConversationN
         };
         match result {
             Ok(conversation) => {
-                error.set(None);
+                let kept = error_after_success(error.peek().clone(), id);
+                error.set(kept);
                 if let Some(node) = nodes.write().iter_mut().find(|n| n.id == id) {
                     node.archived_at = conversation.archived_at;
                 }
@@ -197,7 +198,8 @@ pub(super) fn use_menu_delete(selected: Memo<Option<i64>>, nodes: Signal<Vec<Con
             end_delete(&mut deleting.write(), id);
             match result {
                 Ok(()) => {
-                    error.set(None);
+                    let kept = error_after_success(error.peek().clone(), id);
+                    error.set(kept);
                     let gone = subtree_ids(&nodes.peek(), id);
                     nodes.write().retain(|n| !gone.contains(&n.id));
                     if *selected.peek() == Some(id) {
@@ -232,6 +234,13 @@ fn after_delete(nodes: &[ConversationNode], id: i64) -> Route {
         .and_then(|n| n.parent_id)
         .filter(|p| nodes.iter().any(|n| n.id == *p))
         .map_or(Route::Home {}, |id| Route::ConversationRoute { id })
+}
+
+/// The header's error once a menu action on `id` has succeeded: `id`'s
+/// own goes, another conversation's stays for its header (review 1,
+/// A-L3).
+fn error_after_success(error: Option<(i64, String)>, id: i64) -> Option<(i64, String)> {
+    error.filter(|(failed, _)| *failed != id)
 }
 
 /// The error to show under `selected`'s header: only one from that
@@ -348,6 +357,17 @@ mod tests {
         assert_eq!(archive(1), Some(true));
         assert_eq!(archive(3), Some(false));
         assert_eq!(archive(2), None);
+    }
+
+    /// Review 1, A-L3: an Archive or Delete succeeding on one conversation
+    /// clears that conversation's error, not another's still waiting under
+    /// its own header.
+    #[test]
+    fn test_a_success_clears_only_its_own_conversations_error() {
+        let error = Some((1, "conversation not found".to_string()));
+        assert_eq!(error_after_success(error.clone(), 2), error, "another conversation's success");
+        assert_eq!(error_after_success(error, 1), None, "its own success");
+        assert_eq!(error_after_success(None, 1), None);
     }
 
     /// Review 1, A-L1: one conversation's DELETE in flight doesn't turn
