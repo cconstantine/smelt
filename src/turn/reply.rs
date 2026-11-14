@@ -305,11 +305,21 @@ pub(super) async fn run_tools(
     // Its call's id, once it's recorded (PR #295 review 1 M1).
     let mut asked_id: Option<String> = None;
     let mut finished = false;
-    every_call_unknown &= !turn.content.iter().any(|b| matches!(b, anthropic::ContentBlock::ToolUse { name, .. } if is_question(name)));
+    // A call whose input didn't parse (SME-520) never runs: its result is
+    // an error, and it counts as unresolved, as an unknown name does.
+    let unparsed = |id: &str| turn.unparsed_calls.iter().find(|call| call.id == id);
+    every_call_unknown &= !turn.content.iter().any(
+        |b| matches!(b, anthropic::ContentBlock::ToolUse { id, name, .. } if is_question(name) && unparsed(id).is_none()),
+    );
     for block in &turn.content {
         if let anthropic::ContentBlock::ToolUse { id, name, input } = block
             && is_question(name)
         {
+            if let Some(call) = unparsed(id) {
+                unknown.get_or_insert(name.as_str());
+                result_blocks.push(unparsed_result(id, &call.error));
+                continue;
+            }
             // The chain speaks first, as for every other tool (SME-354
             // B9): a question it denies is refused even when the model
             // calls it unoffered.
@@ -357,6 +367,11 @@ pub(super) async fn run_tools(
         if let anthropic::ContentBlock::ToolUse { id, name, input } = block
             && !is_question(name)
         {
+            if let Some(call) = unparsed(id) {
+                unknown.get_or_insert(name.as_str());
+                result_blocks.push(unparsed_result(id, &call.error));
+                continue;
+            }
             // A summary covering the question's call would leave its
             // answer's result orphaned, which the API refuses (SME-482).
             let result = if name == anthropic::tools::COMPACT_CONTEXT && asked.is_some() {
@@ -394,6 +409,16 @@ pub(super) async fn run_tools(
         unknown: unknown.filter(|_| every_call_unknown).map(str::to_string),
         asked: asked_id,
     })
+}
+
+/// The error result of a call whose input didn't parse (SME-520).
+#[cfg(feature = "server")]
+fn unparsed_result(id: &str, error: &str) -> anthropic::ContentBlock {
+    anthropic::ContentBlock::ToolResult {
+        tool_use_id: id.to_string(),
+        content: anthropic::stream::unparsed::call_result(error),
+        is_error: Some(true),
+    }
 }
 
 /// `compact_context`'s result in a reply that asked a question (SME-482).

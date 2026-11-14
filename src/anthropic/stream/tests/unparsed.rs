@@ -2,7 +2,7 @@
 //! with input `{}` and is listed, instead of failing the reply; its
 //! input's shape and bounded edges are logged.
 
-use super::super::unparsed::{Shape, edges};
+use super::super::unparsed::{Shape, call_result, edges};
 use super::*;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -125,6 +125,14 @@ async fn test_a_long_input_is_logged_only_by_its_edges() {
     assert!(log.contains("len=10240"), "{log}");
     assert!(!log.contains(marker), "the middle stays out of the log");
     assert!(log.len() < 1_000, "{} bytes logged", log.len());
+}
+
+/// The result words serde's message and never the input.
+#[test]
+fn test_the_call_result_quotes_only_serdes_message() {
+    let text = call_result("trailing characters at line 1 column 8");
+    assert!(text.contains("(trailing characters at line 1 column 8)"), "{text}");
+    assert!(text.contains("did not run"), "{text}");
 }
 
 #[test]

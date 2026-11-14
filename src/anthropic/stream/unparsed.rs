@@ -20,6 +20,15 @@ pub struct UnparsedCall {
 /// shows; an input of at most twice this is shown whole.
 pub const EDGE: usize = 160;
 
+/// The result an unparsed call gets in place of running: serde's message
+/// (a position and a kind) and nothing of the input.
+pub fn call_result(error: &str) -> String {
+    format!(
+        "smelt couldn't read this call's input: it isn't a single JSON object ({error}). The call did not run. \
+         Make the call again with its whole input as one JSON object."
+    )
+}
+
 /// What a broken input is made of: how many whole JSON values it starts
 /// with, where the first ends, and whether the first two are the same
 /// (a replayed call's input appended to itself).
