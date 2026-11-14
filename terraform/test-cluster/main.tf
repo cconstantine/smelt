@@ -90,6 +90,10 @@ module "smelt" {
   # real-cluster tests.
   test_namespace = true
 
+  # This root applies as the k3d cluster's admin, so it can make the
+  # cluster-wide read grant a namespace-scoped deployer can't (SME-521).
+  storage_reader_enabled = true
+
   # k3s's default provisioner, named explicitly so the plan says which storage
   # the Postgres claim lands on.
   storage_class_name = "local-path"

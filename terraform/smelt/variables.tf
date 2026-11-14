@@ -110,6 +110,12 @@ variable "sandbox_pod_memory_max" {
   default     = "64Gi"
 }
 
+variable "storage_reader_enabled" {
+  description = "Whether to make the read-only, cluster-wide `smelt-storage-reader` ClusterRole and its binding to `park` (SME-521), so smelt can report its claims' storage class and Released volumes. Off by default: the applier needs `create` on clusterroles/clusterrolebindings and `escalate`/`bind` on that role, which a namespace-scoped deployer lacks. smelt works without it."
+  type        = bool
+  default     = false
+}
+
 # --- Database ------------------------------------------------------------------
 
 variable "database_url" {

@@ -81,36 +81,6 @@ roleRef:
   name: park
   apiGroup: rbac.authorization.k8s.io
 ---
-# Read-only and cluster-wide, because PersistentVolumes and StorageClasses
-# have no namespace (SME-521). smelt reads which class its claims get and
-# its reclaim policy, and counts this namespace's Released/Failed volumes:
-# with a `Retain` class, removing a claim frees no disk. Without this grant
-# both reads come back 403 and smelt carries on without them.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: smelt-storage-reader
-rules:
-  - apiGroups: [""]
-    resources: ["persistentvolumes"]
-    verbs: ["get", "list"]
-  - apiGroups: ["storage.k8s.io"]
-    resources: ["storageclasses"]
-    verbs: ["get", "list"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: smelt-storage-reader
-subjects:
-  - kind: ServiceAccount
-    name: park
-    namespace: smelt-park
-roleRef:
-  kind: ClusterRole
-  name: smelt-storage-reader
-  apiGroup: rbac.authorization.k8s.io
----
 # Ceiling on `create_pod`'s per-pod memory_limit override (see
 # SME-12's "Per-pod limit overrides") — the
 # API server rejects any pod creation over this automatically, model

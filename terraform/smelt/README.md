@@ -17,11 +17,12 @@ In `namespace` (default `smelt-park`):
 - the namespace itself, a `park` ServiceAccount, a Role/RoleBinding mirroring
   `k8s/smelt-park-rbac.yaml`, and a LimitRange capping sandbox pod memory and
   declaring `default`/`defaultRequest` explicitly (SME-335);
-- cluster-wide, the read-only `smelt-storage-reader` ClusterRole (`get`/`list`
-  on PersistentVolumes and StorageClasses) bound to `park`, so smelt can tell
+- only with `storage_reader_enabled = true` (off by default), cluster-wide,
+  the read-only `smelt-storage-reader` ClusterRole (`get`/`list` on
+  PersistentVolumes and StorageClasses) bound to `park`, so smelt can tell
   whether removed sandbox storage frees disk (SME-521). It's named
-  `<namespace>-storage-reader` for a namespace other than `smelt-park`, so two
-  deployments in one cluster don't share one;
+  `smelt-storage-reader-<namespace>` for a namespace other than `smelt-park`,
+  so two deployments in one cluster never share one (see below);
 - one `smelt` server Deployment (Recreate, not RollingUpdate — a new server
   applies its migrations at startup, and two writers on one schema is how
   that goes wrong), Service, and Ingress;
@@ -91,6 +92,19 @@ where smelt's own real-cluster test suite runs.
   `reclaimPolicy: Delete`; with `Retain` the volume stays `Released`, data and
   all. If the default isn't such a class, set this variable to one (k3s's
   `local-path` is). See `docs/setup/sandbox.md#storage-class`.
+- **`storage_reader_enabled` is an admin's switch, off by default.** It
+  makes the module's only cluster-scoped objects, and a deployer bound to its
+  own namespaces can't: applying them takes `create` on `clusterroles` and
+  `clusterrolebindings` (`create` can't be narrowed by name),
+  `get`/`update`/`patch`/`delete` on the name, and `escalate` and `bind` on
+  that ClusterRole, since the deployer doesn't hold the reads it grants.
+  Without those the plan succeeds and the apply fails with a 403, part-way.
+  So turn it on only after the cluster's admin has given the deployer those
+  rights (for homelab, a change to its `smelt-deployer`), or leave it off and
+  have an admin run `kubectl apply -f k8s/smelt-storage-reader.yaml` once
+  (that file is for the default `smelt-park` namespace). smelt works without
+  the grant: it logs once that it can't read the storage class or the
+  Released volumes, and the Sandboxes page leaves those two lines out.
 - The pod gets its cluster access from its own ServiceAccount token — no
   kubeconfig is mounted, and none should be.
 

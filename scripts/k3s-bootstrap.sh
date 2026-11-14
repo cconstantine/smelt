@@ -1,7 +1,7 @@
 #!/bin/sh
 # Run once per `docker compose up` by the `k3s-bootstrap` service (see
-# docker-compose.yml). Applies k8s/smelt-park-rbac.yaml to the compose-
-# provided k3s cluster, mints a long-lived token for the `park` service
+# docker-compose.yml). Applies k8s/smelt-park-rbac.yaml and
+# k8s/smelt-storage-reader.yaml to the compose-provided k3s cluster, mints a long-lived token for the `park` service
 # account, and writes a ready-to-use kubeconfig for it — `smelt`'s own
 # KUBECONFIG points directly at the file this script produces, no
 # runtime rewriting needed.
@@ -25,6 +25,9 @@ until kctl get --raw=/healthz >/dev/null 2>&1; do
 done
 
 kctl apply -f /k8s/smelt-park-rbac.yaml
+# The optional cluster-wide read grant (SME-521): an admin step elsewhere,
+# applied here so the dev and test clusters exercise smelt with it.
+kctl apply -f /k8s/smelt-storage-reader.yaml
 
 kctl apply -f - <<'EOF'
 apiVersion: v1

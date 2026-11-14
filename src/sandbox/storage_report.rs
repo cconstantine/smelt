@@ -4,7 +4,8 @@
 //! stay, `Released`, until someone deletes it by hand. smelt can't see
 //! that from its namespace, since PersistentVolumes and StorageClasses
 //! are cluster-wide; the read-only `smelt-storage-reader` ClusterRole
-//! (`k8s/smelt-park-rbac.yaml`, `terraform/smelt/rbac.tf`) lets it read
+//! (`k8s/smelt-storage-reader.yaml`, an admin's step, or
+//! `terraform/smelt/rbac.tf`'s `storage_reader_enabled`) lets it read
 //! both. Without the grant each read is a 403, which reads as
 //! "unavailable" and is logged once: smelt never needs these to work.
 //!

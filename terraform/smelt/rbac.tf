@@ -1,8 +1,8 @@
 # What a sandbox needs from the cluster, and what smelt needs to be able to
 # ask for it. This is k8s/smelt-park-rbac.yaml expressed in Terraform: the same
-# `park` ServiceAccount, the same two Role/RoleBinding pairs, the same read-only
-# storage ClusterRole and its binding, the same LimitRange
-# ceiling on a sandbox pod's memory. Keeping it here means a deployment gets the
+# `park` ServiceAccount, the same two Role/RoleBinding pairs, the same LimitRange
+# ceiling on a sandbox pod's memory, and — only with `storage_reader_enabled` —
+# k8s/smelt-storage-reader.yaml's read-only storage ClusterRole and binding. Keeping it here means a deployment gets the
 # RBAC with the app rather than by applying a second file by hand — and if the
 # yaml ever changes, this must change with it.
 
@@ -143,14 +143,25 @@ resource "kubernetes_role_binding_v1" "park" {
 # Read-only and cluster-wide, because PersistentVolumes and StorageClasses have
 # no namespace (SME-521): smelt reads which class its claims get, with its
 # reclaim policy, and counts this namespace's Released/Failed volumes. Without
-# it both reads come back 403 and smelt carries on without them. Named for the
-# namespace unless it's the default, so two deployments in one cluster don't
-# share one binding, and the default matches k8s/smelt-park-rbac.yaml's.
+# it both reads come back 403 and smelt carries on without them.
+#
+# Off unless `storage_reader_enabled`: these are the module's only
+# cluster-scoped objects, and a deployer bound to its own namespaces can't
+# create them (it needs `create` on clusterroles/clusterrolebindings, and
+# `escalate`/`bind` on this role, since it doesn't hold these reads itself).
+# Turn it on only once the deployer can, or have an admin apply
+# k8s/smelt-storage-reader.yaml instead.
+#
+# Named `smelt-storage-reader` for the default namespace, matching that yaml,
+# and `smelt-storage-reader-<namespace>` otherwise: the suffix can't make the
+# default's name, so two deployments in one cluster never share one binding.
 locals {
-  storage_reader_name = var.namespace == "smelt-park" ? "smelt-storage-reader" : "${var.namespace}-storage-reader"
+  storage_reader_name = var.namespace == "smelt-park" ? "smelt-storage-reader" : "smelt-storage-reader-${var.namespace}"
 }
 
 resource "kubernetes_cluster_role_v1" "storage_reader" {
+  count = var.storage_reader_enabled ? 1 : 0
+
   metadata {
     name = local.storage_reader_name
   }
@@ -169,6 +180,8 @@ resource "kubernetes_cluster_role_v1" "storage_reader" {
 }
 
 resource "kubernetes_cluster_role_binding_v1" "storage_reader" {
+  count = var.storage_reader_enabled ? 1 : 0
+
   metadata {
     name = local.storage_reader_name
   }
@@ -182,7 +195,7 @@ resource "kubernetes_cluster_role_binding_v1" "storage_reader" {
   role_ref {
     api_group = "rbac.authorization.k8s.io"
     kind      = "ClusterRole"
-    name      = kubernetes_cluster_role_v1.storage_reader.metadata[0].name
+    name      = kubernetes_cluster_role_v1.storage_reader[0].metadata[0].name
   }
 }
 

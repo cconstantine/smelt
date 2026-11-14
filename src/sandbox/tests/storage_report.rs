@@ -111,7 +111,7 @@ fn test_a_volume_released_over_a_day_ago_is_overdue() {
 }
 
 /// The test cluster's `park` account has the `smelt-storage-reader`
-/// grant (`k8s/smelt-park-rbac.yaml`), and k3s's default class is
+/// grant (`k8s/smelt-storage-reader.yaml`, which `k3s-bootstrap` applies), and k3s's default class is
 /// `local-path` with `Delete`.
 #[tokio::test]
 async fn test_the_test_cluster_reports_its_default_class_and_released_volumes() {
