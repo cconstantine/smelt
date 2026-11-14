@@ -24,54 +24,70 @@ pub async fn mark_pod_quietly_stopped(pool: &PgPool, pod_id: i64) -> Result<(), 
     Ok(())
 }
 
-/// Conversations whose **latest** pod row was quietly stopped `days` days
-/// ago or more, as `(conversation_id, pod_id)`, oldest stop first: the
-/// pass's candidate list. Nothing at `days` of 0 (off, the
-/// `POD_IDLE_PAST` guard's shape). A row stops qualifying as soon as a
-/// newer row exists — a pod started within the grace, or one the pass
-/// itself will stamp — so a pickup restarts the clock by itself; the
-/// `EXISTS` covers a conversation deleted under a still-marked row (its
-/// rows cascade away, this just closes the race with the list read).
-/// No new index: hourly, small table.
-pub async fn storage_removal_candidates(
-    pool: &PgPool,
-    days: u32,
-) -> Result<Vec<(i64, i64)>, sqlx::Error> {
-    sqlx::query_as(
-        "SELECT p.conversation_id, p.id
-           FROM sandbox_pods p
-          WHERE p.quietly_stopped_at IS NOT NULL
-            AND $1 > 0
-            AND p.quietly_stopped_at <= now() - make_interval(days => $1)
-            AND NOT EXISTS (SELECT 1 FROM sandbox_pods q
-                             WHERE q.conversation_id = p.conversation_id AND q.id > p.id)
-            AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = p.conversation_id)
-          ORDER BY p.quietly_stopped_at ASC, p.id ASC",
-    )
-    .bind(days_param(days))
-    .fetch_all(pool)
-    .await
+/// What the storage-grace rule reads about one conversation (SME-521): its
+/// latest pod row, if any, and whether it is a sub-agent that's done.
+#[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
+pub struct StorageGraceRow {
+    pub conversation_id: i64,
+    /// The latest `sandbox_pods` row's id; `None` when it never had one.
+    pub pod_id: Option<i64>,
+    pub terminated_at: Option<NaiveDateTime>,
+    pub stopped_by_user: Option<bool>,
+    /// The latest row carries a quiet stop's mark.
+    pub quiet: bool,
+    /// `agents.state` is `finished`, `stopped` or `failed`.
+    pub agent_done: bool,
 }
 
-/// The one-statement re-check the pass makes under the conversation's
-/// turn and start locks: `pod_id`'s row is still the conversation's
-/// latest, still marked, and still `days` or more past the mark. A pod
-/// started since the candidate read makes it false.
-pub async fn storage_removal_still_due(pool: &PgPool, pod_id: i64, days: u32) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM sandbox_pods p
-          WHERE p.id = $2
-            AND p.quietly_stopped_at IS NOT NULL
-            AND $1 > 0
-            AND p.quietly_stopped_at <= now() - make_interval(days => $1)
-            AND NOT EXISTS (SELECT 1 FROM sandbox_pods q
-                             WHERE q.conversation_id = p.conversation_id AND q.id > p.id)
-            AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = p.conversation_id))",
+/// The rule's inputs for a set of conversations, with the database's
+/// clock (SME-354 B14). A conversation that no longer exists has no row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StorageGraceInputs {
+    pub rows: std::collections::HashMap<i64, StorageGraceRow>,
+    /// `now()` in the session the timestamps were read in.
+    pub observed_at: NaiveDateTime,
+    /// That session's clock less UTC's, so a claim's UTC creation time can
+    /// be put on the same clock.
+    pub utc_offset: chrono::Duration,
+}
+
+impl StorageGraceInputs {
+    /// A UTC time (a claim's `creationTimestamp`) on this read's clock.
+    pub fn from_utc(&self, at: NaiveDateTime) -> NaiveDateTime {
+        at + self.utc_offset
+    }
+}
+
+/// The storage-grace inputs of `conversation_ids` (SME-521): each one's
+/// latest pod row (`DISTINCT ON`'s shape, by the highest id) and its
+/// agent state, read in one statement on one connection with the clock.
+/// No new index: hourly, and keyed by conversation.
+pub async fn storage_grace_inputs(pool: &PgPool, conversation_ids: &[i64]) -> Result<StorageGraceInputs, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    let rows: Vec<StorageGraceRow> = sqlx::query_as(
+        "SELECT c.id AS conversation_id, p.id AS pod_id, p.terminated_at, p.stopped_by_user,
+                COALESCE(p.quietly_stopped_at IS NOT NULL, false) AS quiet,
+                COALESCE(a.state IN ('finished', 'stopped', 'failed'), false) AS agent_done
+           FROM conversations c
+           LEFT JOIN LATERAL (SELECT q.id, q.terminated_at, q.stopped_by_user, q.quietly_stopped_at
+                                FROM sandbox_pods q WHERE q.conversation_id = c.id
+                               ORDER BY q.id DESC LIMIT 1) p ON true
+           LEFT JOIN agents a ON a.conversation_id = c.id
+          WHERE c.id = ANY($1)",
     )
-    .bind(days_param(days))
-    .bind(pod_id)
-    .fetch_one(pool)
-    .await
+    .bind(conversation_ids)
+    .fetch_all(&mut *conn)
+    .await?;
+    let (observed_at, utc_offset_secs): (NaiveDateTime, f64) = sqlx::query_as(
+        "SELECT now()::timestamp, EXTRACT(EPOCH FROM (now()::timestamp - (now() AT TIME ZONE 'UTC')))::float8",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(StorageGraceInputs {
+        rows: rows.into_iter().map(|row| (row.conversation_id, row)).collect(),
+        observed_at,
+        utc_offset: chrono::Duration::seconds(utc_offset_secs.round() as i64),
+    })
 }
 
 /// Records that the pass is about to try removing `pod_id`'s mark's
@@ -158,12 +174,6 @@ pub(crate) mod fake_clear {
             .remove(&pod_id)
             .then(|| Err(sqlx::Error::PoolClosed))
     }
-}
-
-/// `days` as the `INT` `make_interval(days => …)` takes; the setting's
-/// year ceiling keeps it far inside the range.
-fn days_param(days: u32) -> i32 {
-    i32::try_from(days).unwrap_or(i32::MAX)
 }
 
 /// When each conversation's sandbox last stopped, and the quiet stop's

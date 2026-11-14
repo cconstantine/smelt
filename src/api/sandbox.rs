@@ -12,6 +12,20 @@ use sqlx::PgPool;
 #[cfg(feature = "server")]
 use std::collections::HashMap;
 
+/// The three storage graces as the server read them (SME-521), in whole
+/// days, `0` meaning kept until removed by hand; a `default_days` of 0
+/// turns automatic removal off altogether.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GraceSettings {
+    /// `SANDBOX_STORAGE_REMOVAL_DAYS`: every stop but the two below.
+    pub default_days: u32,
+    /// `SANDBOX_AGENT_STORAGE_REMOVAL_DAYS`: a finished sub-agent.
+    pub agent_days: u32,
+    /// `SANDBOX_USER_STOPPED_STORAGE_DAYS`: the user's Stop.
+    pub user_days: u32,
+}
+
 /// One line of a command's output, in the order it actually happened —
 /// `stdout`/`stderr` fetched and capped independently (see
 /// `fetch_command_summary`) but merged back into one true chronological

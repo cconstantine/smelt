@@ -127,6 +127,43 @@ pub struct PodStop {
     pub quiet: bool,
 }
 
+/// What becomes of a conversation's stored claims (SME-521), by the one
+/// rule the storage-grace pass also follows (`sandbox::fate`).
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub enum StorageFate {
+    /// Its latest pod is live: in use.
+    Live,
+    /// Kept until removed by hand: its grace's days are 0, or automatic
+    /// removal is off.
+    Kept,
+    /// Removed by the hourly pass once `at` (the database's clock) has
+    /// passed, `days` after its clock started, under `class`'s grace.
+    RemovesAt { at: NaiveDateTime, days: u32, class: GraceClass },
+    /// Not known: an older server, or the read failed.
+    #[default]
+    Unknown,
+}
+
+/// Which grace a conversation's storage gets (SME-521), in the rule's
+/// order of precedence.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GraceClass {
+    /// A sub-agent that finished, was stopped or failed.
+    Agent,
+    /// The user's Stop.
+    UserStop,
+    /// Stopped before SME-521, when a Stop and a `terminate_pod` looked
+    /// the same.
+    Unknown,
+    /// Any other end: an idle or finish stop, `terminate_pod`, a lost pod,
+    /// a failed create.
+    Default,
+    /// No pod ever ran: claims left by a create that never made a row.
+    NoPod,
+}
+
 /// One of a conversation's two conversation claims.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct StoredVolume {

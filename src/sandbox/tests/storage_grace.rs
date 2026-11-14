@@ -10,23 +10,115 @@ use super::*;
 
 /// The settle tests don't care about the per-candidate bound (F1); they
 /// give the removal an hour.
-const UNBOUNDED: Duration = Duration::from_secs(3600);
+pub(super) const UNBOUNDED: Duration = Duration::from_secs(3600);
 
-/// A conversation whose pod row was quiet-stopped and aged `days` back.
-async fn quiet_stopped_days_ago(pool: &PgPool, days: i32) -> (i64, i64) {
+/// A conversation whose pod row was quiet-stopped `days` back: the end and
+/// its mark both aged, as a quiet stop writes them.
+pub(super) async fn quiet_stopped_days_ago(pool: &PgPool, days: i32) -> (i64, i64) {
     db::test_support::start_ids_clear_of_other_runs(pool).await.expect("ids clear of other runs");
     let conversation = db::create_conversation(pool).await.expect("conversation");
     let pod = db::create_sandbox_pod(pool, conversation.id).await.expect("pod");
-    sqlx::query("UPDATE sandbox_pods SET terminated_at = now(), quietly_stopped_at = now() - make_interval(days => $2) WHERE id = $1")
-        .bind(pod.id)
-        .bind(days)
-        .execute(pool)
-        .await
-        .expect("quiet-stop the row");
+    db::terminate_sandbox_pod_as(pool, pod.id, db::PodEnd::Quiet).await.expect("quiet-stop the row");
+    age_pod_end(pool, pod.id, days).await;
     (conversation.id, pod.id)
 }
 
-async fn mark_set(pool: &PgPool, pod_id: i64) -> bool {
+/// Moves `pod_id`'s end, and its quiet mark if it has one, `days` back.
+pub(super) async fn age_pod_end(pool: &PgPool, pod_id: i64, days: i32) {
+    sqlx::query(
+        "UPDATE sandbox_pods SET terminated_at = now() - make_interval(days => $2), \
+         quietly_stopped_at = CASE WHEN quietly_stopped_at IS NULL THEN NULL ELSE now() - make_interval(days => $2) END \
+         WHERE id = $1",
+    )
+    .bind(pod_id)
+    .bind(days)
+    .execute(pool)
+    .await
+    .expect("age the row's end");
+}
+
+/// The cluster's claims as the fake list shows them: conversations whose
+/// removal came back with no claim left are gone from every later list,
+/// as they are from the real one. Keyed by each test's own database, so
+/// tests whose ids coincide never see each other's removals.
+static REMOVED: std::sync::Mutex<std::collections::BTreeSet<(String, i64)>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+async fn database_name(pool: &PgPool) -> String {
+    sqlx::query_scalar("SELECT current_database()::text").fetch_one(pool).await.expect("the test database's name")
+}
+
+/// One claim set per listed conversation (id, claim age in days) that the
+/// fake cluster still holds.
+async fn snapshot(pool: &PgPool, database: &str, listed: &[(i64, i64)]) -> StoredClaims {
+    let now: chrono::NaiveDateTime =
+        sqlx::query_scalar("SELECT now() AT TIME ZONE 'UTC'").fetch_one(pool).await.expect("the database's clock");
+    let removed = REMOVED.lock().expect("the removed set").clone();
+    StoredClaims {
+        by_conversation: listed
+            .iter()
+            .filter(|(id, _)| !removed.contains(&(database.to_string(), *id)))
+            .map(|&(id, claim_age_days)| {
+                let set = ClaimSet {
+                    names: vec![format!("conv-{id}-workspace"), format!("conv-{id}-docker")],
+                    oldest: Some(now - chrono::Duration::days(claim_age_days)),
+                    all_deleting: false,
+                };
+                (id, set)
+            })
+            .collect(),
+    }
+}
+
+/// One pass with `default_days`, the agent and Stop graces at their
+/// defaults (1 and 30), over `listed` (with claims a day old), the
+/// removal injected.
+pub(super) async fn pass<R, Fut>(pool: &PgPool, default_days: u32, timeout: Duration, listed: &[i64], remove: R) -> Vec<i64>
+where
+    R: Fn(i64) -> Fut,
+    Fut: std::future::Future<Output = Result<StorageRemoval, SandboxError>>,
+{
+    let settings = GraceSettings { default_days, agent_days: 1, user_days: 30 };
+    let listed: Vec<(i64, i64)> = listed.iter().map(|&id| (id, 1)).collect();
+    pass_with(pool, &settings, timeout, &listed, remove).await
+}
+
+/// One pass with `settings` over `listed` (conversation, claim age in
+/// days).
+pub(super) async fn pass_with<R, Fut>(
+    pool: &PgPool,
+    settings: &GraceSettings,
+    timeout: Duration,
+    listed: &[(i64, i64)],
+    remove: R,
+) -> Vec<i64>
+where
+    R: Fn(i64) -> Fut,
+    Fut: std::future::Future<Output = Result<StorageRemoval, SandboxError>>,
+{
+    let database = database_name(pool).await;
+    let claims = snapshot(pool, &database, listed).await;
+    let (remove, database) = (&remove, &database);
+    remove_expired_storage_once_with(
+        pool,
+        settings,
+        timeout,
+        || {
+            let claims = claims.clone();
+            async move { Ok(claims) }
+        },
+        |conversation_id| async move {
+            let removal = remove(conversation_id).await;
+            if matches!(&removal, Ok(removal) if removal.claims_failed == 0) {
+                REMOVED.lock().expect("the removed set").insert((database.clone(), conversation_id));
+            }
+            removal
+        },
+    )
+    .await
+}
+
+pub(super) async fn mark_set(pool: &PgPool, pod_id: i64) -> bool {
     sqlx::query_scalar::<_, Option<chrono::NaiveDateTime>>("SELECT quietly_stopped_at FROM sandbox_pods WHERE id = $1")
         .bind(pod_id)
         .fetch_one(pool)
@@ -36,7 +128,7 @@ async fn mark_set(pool: &PgPool, pod_id: i64) -> bool {
 }
 
 /// The storage-removal notices in `conversation_id`'s transcript.
-async fn removal_notices(pool: &PgPool, conversation_id: i64) -> Vec<String> {
+pub(super) async fn removal_notices(pool: &PgPool, conversation_id: i64) -> Vec<String> {
     db::list_messages(pool, conversation_id)
         .await
         .expect("list messages")
@@ -54,7 +146,7 @@ fn claims_already_gone() -> StorageRemoval {
 }
 
 /// Both claims deleted, the pass's usual outcome.
-fn claims_gone() -> StorageRemoval {
+pub(super) fn claims_gone() -> StorageRemoval {
     StorageRemoval { claims_deleted: 2, workspace_gone: true, ..Default::default() }
 }
 
@@ -87,7 +179,7 @@ async fn test_a_due_quiet_stop_is_removed_once_noticed_and_settled(pool: PgPool)
             async { Ok(claims_gone()) }
         }
     };
-    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, remove.clone()).await;
+    let settled = pass(&pool, 7, UNBOUNDED, &[conversation], remove.clone()).await;
 
     assert_eq!(settled, vec![conversation], "the due conversation settled");
     assert_eq!(calls.load(Ordering::SeqCst), 1, "one removal");
@@ -100,7 +192,7 @@ async fn test_a_due_quiet_stop_is_removed_once_noticed_and_settled(pool: PgPool)
     assert!(notices[0].contains("removed after 7 days stopped"), "{}", notices[0]);
     assert!(notices[0].contains("starts fresh with empty volumes"), "{}", notices[0]);
 
-    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, remove).await;
+    let settled = pass(&pool, 7, UNBOUNDED, &[conversation], remove).await;
     assert_eq!(settled, Vec::<i64>::new(), "the second pass has nothing to do");
     assert_eq!(calls.load(Ordering::SeqCst), 1, "and never removes again");
     assert_eq!(removal_notices(&pool, conversation).await.len(), 1, "and says it once");
@@ -112,7 +204,7 @@ async fn test_a_stop_within_the_grace_is_never_touched(pool: PgPool) {
     let calls = Arc::new(AtomicUsize::new(0));
     let counted = calls.clone();
 
-    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, move |_conversation| {
+    let settled = pass(&pool, 7, UNBOUNDED, &[conversation], move |_conversation| {
         counted.fetch_add(1, Ordering::SeqCst);
         async { Ok(claims_gone()) }
     })
@@ -132,7 +224,7 @@ async fn test_a_failing_removal_keeps_the_mark_and_retries_next_pass(pool: PgPoo
     let calls = Arc::new(AtomicUsize::new(0));
     let counted = calls.clone();
 
-    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, move |_conversation: i64| {
+    let settled = pass(&pool, 7, UNBOUNDED, &[conversation], move |_conversation: i64| {
         counted.fetch_add(1, Ordering::SeqCst);
         async { Err(SandboxError::StartFailed("the API server is down".into())) }
     })
@@ -142,7 +234,7 @@ async fn test_a_failing_removal_keeps_the_mark_and_retries_next_pass(pool: PgPoo
     assert!(mark_set(&pool, pod).await, "the mark is kept for the retry");
     assert!(removal_notices(&pool, conversation).await.is_empty(), "nothing was removed, nothing is claimed");
 
-    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, {
+    let settled = pass(&pool, 7, UNBOUNDED, &[conversation], {
         let calls = calls.clone();
         move |_conversation: i64| {
             calls.fetch_add(1, Ordering::SeqCst);
@@ -161,7 +253,7 @@ async fn test_a_failing_removal_keeps_the_mark_and_retries_next_pass(pool: PgPoo
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_claim_left_behind_retries_and_holds_its_notice(pool: PgPool) {
     let (conversation, pod) = quiet_stopped_days_ago(&pool, 8).await;
-    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async {
+    let settled = pass(&pool, 7, UNBOUNDED, &[conversation], |_conversation| async {
         Ok(StorageRemoval { claims_deleted: 1, claims_failed: 1, ..Default::default() })
     })
     .await;
@@ -180,7 +272,7 @@ async fn test_claims_already_gone_settle_quietly_and_once(pool: PgPool) {
     let calls = Arc::new(AtomicUsize::new(0));
     let counted = calls.clone();
 
-    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, move |_conversation: i64| {
+    let settled = pass(&pool, 7, UNBOUNDED, &[conversation], move |_conversation: i64| {
         counted.fetch_add(1, Ordering::SeqCst);
         async { Ok(claims_already_gone()) }
     })
@@ -190,7 +282,7 @@ async fn test_claims_already_gone_settle_quietly_and_once(pool: PgPool) {
     assert!(!mark_set(&pool, pod).await, "the mark clears — retrying could never help");
     assert!(removal_notices(&pool, conversation).await.is_empty(), "and no notice for a removal that didn't happen");
 
-    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, {
+    let settled = pass(&pool, 7, UNBOUNDED, &[conversation], {
         let calls = calls.clone();
         move |_conversation| {
             calls.fetch_add(1, Ordering::SeqCst);
@@ -212,7 +304,7 @@ async fn test_claims_already_gone_settle_quietly_and_once(pool: PgPool) {
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_removal_that_stopped_a_pod_saved_its_own_notice(pool: PgPool) {
     let (conversation, pod) = quiet_stopped_days_ago(&pool, 8).await;
-    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async {
+    let settled = pass(&pool, 7, UNBOUNDED, &[conversation], |_conversation| async {
         Ok(StorageRemoval { pod_stopped: true, claims_deleted: 2, workspace_gone: true, ..Default::default() })
     })
     .await;
@@ -228,7 +320,7 @@ async fn test_zero_days_touches_nothing(pool: PgPool) {
     let calls = Arc::new(AtomicUsize::new(0));
     let counted = calls.clone();
 
-    let settled = remove_expired_storage_once_with(&pool, 0, UNBOUNDED, move |_conversation| {
+    let settled = pass(&pool, 0, UNBOUNDED, &[conversation], move |_conversation| {
         counted.fetch_add(1, Ordering::SeqCst);
         async { Ok(claims_gone()) }
     })
@@ -246,12 +338,12 @@ async fn test_zero_days_touches_nothing(pool: PgPool) {
 /// and the pass goes on to the next candidate rather than freezing on it.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_removal_given_up_on_keeps_its_mark_and_the_pass_goes_on(pool: PgPool) {
-    // The stalled one first: older marks sort first, so it is the pass's
+    // The stalled one first: older ends sort first, so it is the pass's
     // first candidate and the hour it sleeps for is the stall.
     let (stalled, stalled_pod) = quiet_stopped_days_ago(&pool, 9).await;
     let (on_time, on_time_pod) = quiet_stopped_days_ago(&pool, 8).await;
 
-    let settled = remove_expired_storage_once_with(&pool, 7, Duration::from_millis(50), move |conversation| async move {
+    let settled = pass(&pool, 7, Duration::from_millis(50), &[on_time, stalled], move |conversation| async move {
         if conversation == stalled {
             // Ten times the pass's patience here (production's is the
             // 90 s constant): a bound removal is cancelled in its sleep.
@@ -278,7 +370,7 @@ async fn test_a_removal_given_up_on_keeps_its_mark_and_the_pass_goes_on(pool: Pg
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_foreign_workspace_stands_and_settles_quietly(pool: PgPool) {
     let (conversation, pod) = quiet_stopped_days_ago(&pool, 8).await;
-    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async {
+    let settled = pass(&pool, 7, UNBOUNDED, &[conversation], |_conversation| async {
         Ok(StorageRemoval { claims_deleted: 1, workspace_gone: false, ..Default::default() })
     })
     .await;
@@ -289,24 +381,29 @@ async fn test_a_foreign_workspace_stands_and_settles_quietly(pool: PgPool) {
 }
 
 /// F4 (SME-345 review 1): pins the comment's claim on the failed clear —
-/// the notice is already saved when the clear fails, the mark is kept,
-/// and the next pass settles the stop over the no-op removal without
-/// announcing it a second time. One notice per stop, across the failure.
+/// the notice is already saved when the clear fails and the mark is kept.
+/// Since SME-521 the mark is bookkeeping only: the claims are gone, so
+/// the next pass doesn't list the conversation and never removes or
+/// announces again. One notice per stop, across the failure.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_failed_clear_still_leaves_exactly_one_notice(pool: PgPool) {
     let (conversation, pod) = quiet_stopped_days_ago(&pool, 8).await;
     db::fake_clear::fail_next(pod);
 
-    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async { Ok(claims_gone()) }).await;
+    let settled = pass(&pool, 7, UNBOUNDED, &[conversation], |_conversation| async { Ok(claims_gone()) }).await;
     assert_eq!(settled, Vec::<i64>::new(), "a failed clear settles nothing");
-    assert!(mark_set(&pool, pod).await, "the mark is kept for the retry");
+    assert!(mark_set(&pool, pod).await, "the mark is kept");
     assert_eq!(removal_notices(&pool, conversation).await.len(), 1, "the removal happened, and it was announced once");
 
-    // The next pass: still due, and the removal now finds nothing left —
-    // the no-op that settles quietly.
-    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async { Ok(claims_already_gone()) }).await;
-    assert_eq!(settled, vec![conversation], "the retry settles the stop");
-    assert!(!mark_set(&pool, pod).await, "and the mark finally clears");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let settled = pass(&pool, 7, UNBOUNDED, &[conversation], move |_conversation: i64| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        async { Ok(claims_already_gone()) }
+    })
+    .await;
+    assert_eq!(settled, Vec::<i64>::new(), "its claims are gone, so the next pass doesn't list it");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(removal_notices(&pool, conversation).await.len(), 1, "and exactly one notice was ever saved");
 }
 
@@ -319,7 +416,7 @@ async fn test_a_removal_that_timed_out_after_deleting_the_claims_is_noticed_on_i
     let (conversation, pod) = quiet_stopped_days_ago(&pool, 8).await;
 
     // The claims go, then the cluster stalls past the bound.
-    let settled = remove_expired_storage_once_with(&pool, 7, Duration::from_millis(200), |_conversation| async {
+    let settled = pass(&pool, 7, Duration::from_millis(200), &[conversation], |_conversation| async {
         tokio::time::sleep(Duration::from_secs(5)).await;
         Ok(claims_gone())
     })
@@ -328,7 +425,7 @@ async fn test_a_removal_that_timed_out_after_deleting_the_claims_is_noticed_on_i
     assert!(mark_set(&pool, pod).await, "the mark stays for the retry");
     assert!(removal_notices(&pool, conversation).await.is_empty(), "nothing said yet");
 
-    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async { Ok(claims_already_gone()) }).await;
+    let settled = pass(&pool, 7, UNBOUNDED, &[conversation], |_conversation| async { Ok(claims_already_gone()) }).await;
     assert_eq!(settled, vec![conversation]);
     assert!(!mark_set(&pool, pod).await);
     assert_eq!(removal_notices(&pool, conversation).await.len(), 1, "the stop's storage went, and the model is told once");
@@ -341,14 +438,14 @@ async fn test_a_removal_that_timed_out_after_deleting_the_claims_is_noticed_on_i
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_failed_attempt_then_claims_gone_settles_without_a_notice(pool: PgPool) {
     let (conversation, pod) = quiet_stopped_days_ago(&pool, 8).await;
-    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async {
+    let settled = pass(&pool, 7, UNBOUNDED, &[conversation], |_conversation| async {
         Err(SandboxError::StartFailed("the API server is down".into()))
     })
     .await;
     assert_eq!(settled, Vec::<i64>::new());
     assert!(mark_set(&pool, pod).await, "the mark is kept for the retry");
 
-    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async { Ok(claims_already_gone()) }).await;
+    let settled = pass(&pool, 7, UNBOUNDED, &[conversation], |_conversation| async { Ok(claims_already_gone()) }).await;
     assert_eq!(settled, vec![conversation], "the retry settles the stop");
     assert!(!mark_set(&pool, pod).await);
     assert!(removal_notices(&pool, conversation).await.is_empty(), "the pass removed nothing, and says nothing");
@@ -360,7 +457,7 @@ async fn test_a_failed_attempt_then_claims_gone_settles_without_a_notice(pool: P
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_users_removal_settles_a_stop_the_pass_gave_up_on(pool: PgPool) {
     let (conversation, pod) = quiet_stopped_days_ago(&pool, 8).await;
-    let settled = remove_expired_storage_once_with(&pool, 7, Duration::from_millis(200), |_conversation| async {
+    let settled = pass(&pool, 7, Duration::from_millis(200), &[conversation], |_conversation| async {
         tokio::time::sleep(Duration::from_secs(5)).await;
         Ok(claims_gone())
     })
@@ -371,9 +468,10 @@ async fn test_the_users_removal_settles_a_stop_the_pass_gave_up_on(pool: PgPool)
     db::clear_conversation_quiet_stop_marks(&pool, conversation).await.expect("settle the quiet stops");
     assert!(!mark_set(&pool, pod).await, "the user's removal settles the stop");
 
+    // The user's removal took the claims: the cluster lists none.
     let calls = Arc::new(AtomicUsize::new(0));
     let counted = calls.clone();
-    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, move |_conversation: i64| {
+    let settled = pass(&pool, 7, UNBOUNDED, &[], move |_conversation: i64| {
         counted.fetch_add(1, Ordering::SeqCst);
         async { Ok(claims_already_gone()) }
     })
@@ -390,37 +488,37 @@ async fn test_the_users_removal_settles_a_stop_the_pass_gave_up_on(pool: PgPool)
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_error_after_a_timed_out_removal_keeps_its_notice(pool: PgPool) {
     let (conversation, _pod) = quiet_stopped_days_ago(&pool, 8).await;
-    let settled = remove_expired_storage_once_with(&pool, 7, Duration::from_millis(200), |_conversation| async {
+    let settled = pass(&pool, 7, Duration::from_millis(200), &[conversation], |_conversation| async {
         tokio::time::sleep(Duration::from_secs(5)).await;
         Ok(claims_gone())
     })
     .await;
     assert_eq!(settled, Vec::<i64>::new(), "given up on: nothing settles");
 
-    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async {
+    let settled = pass(&pool, 7, UNBOUNDED, &[conversation], |_conversation| async {
         Err(SandboxError::StartFailed("the API server is down".into()))
     })
     .await;
     assert_eq!(settled, Vec::<i64>::new());
 
-    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async { Ok(claims_already_gone()) }).await;
+    let settled = pass(&pool, 7, UNBOUNDED, &[conversation], |_conversation| async { Ok(claims_already_gone()) }).await;
     assert_eq!(settled, vec![conversation]);
     assert_eq!(removal_notices(&pool, conversation).await.len(), 1, "the first attempt's removal is still told, once");
 }
 
 /// SME-354 review 2, L1: a first attempt that finds the claims already
-/// gone (someone else removed them), whose clear fails: the retry claims
-/// no removal either.
+/// gone (someone else removed them), whose clear fails: no notice then,
+/// and none later — with no claims left it isn't listed again (SME-521).
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_failed_clear_over_claims_already_gone_sends_no_notice(pool: PgPool) {
     let (conversation, pod) = quiet_stopped_days_ago(&pool, 8).await;
     db::fake_clear::fail_next(pod);
 
-    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async { Ok(claims_already_gone()) }).await;
+    let settled = pass(&pool, 7, UNBOUNDED, &[conversation], |_conversation| async { Ok(claims_already_gone()) }).await;
     assert_eq!(settled, Vec::<i64>::new(), "a failed clear settles nothing");
     assert!(mark_set(&pool, pod).await);
 
-    let settled = remove_expired_storage_once_with(&pool, 7, UNBOUNDED, |_conversation| async { Ok(claims_already_gone()) }).await;
-    assert_eq!(settled, vec![conversation], "the retry settles the stop");
+    let settled = pass(&pool, 7, UNBOUNDED, &[conversation], |_conversation| async { Ok(claims_already_gone()) }).await;
+    assert_eq!(settled, Vec::<i64>::new(), "not listed again: nothing left to remove");
     assert!(removal_notices(&pool, conversation).await.is_empty(), "the pass removed nothing, and never says it did");
 }
