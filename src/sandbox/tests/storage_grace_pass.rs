@@ -218,3 +218,66 @@ async fn test_a_failed_removal_uses_its_slot(pool: PgPool) {
     assert!(settled.is_empty());
     assert_eq!(calls.load(Ordering::SeqCst), STORAGE_REMOVALS_PER_PASS, "22 due, 20 tried");
 }
+
+/// Review 1, A-L3: the pass removes nothing while the conversation's turn
+/// runs, its turn lock is held, or its start lock is; once free, it does.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_pass_skips_while_a_turn_runs_or_a_lock_is_held(pool: PgPool) {
+    let (conversation, _) = ended_days_ago(&pool, db::PodEnd::Plain, 8).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let turn = crate::turn::count_a_test_turn(conversation);
+    assert!(pass(&pool, 7, UNBOUNDED, &[conversation], counting(&calls)).await.is_empty(), "a turn running");
+    drop(turn);
+
+    let lock = crate::turn::conversation_lock(conversation);
+    let held = lock.lock().await;
+    assert!(pass(&pool, 7, UNBOUNDED, &[conversation], counting(&calls)).await.is_empty(), "the turn lock held");
+    drop(held);
+    drop(lock);
+
+    let start = pod_start_lock(conversation);
+    let starting = start.lock().await;
+    assert!(pass(&pool, 7, UNBOUNDED, &[conversation], counting(&calls)).await.is_empty(), "the start lock held");
+    drop(starting);
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing removed while busy");
+
+    assert_eq!(pass(&pool, 7, UNBOUNDED, &[conversation], counting(&calls)).await, vec![conversation], "removed once free");
+}
+
+/// Review 1, A-L3: an agent woken (`finished` → `active`) between the
+/// list and the re-check isn't due any more: 2 days after its end is past
+/// the agent's day but within the default week.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_an_agent_woken_after_the_list_skips_the_removal(pool: PgPool) {
+    let (conversation, pod) = ended_days_ago(&pool, db::PodEnd::Plain, 2).await;
+    make_agent(&pool, conversation, "finished").await;
+    let at: chrono::NaiveDateTime =
+        sqlx::query_scalar("SELECT terminated_at + interval '1 day' FROM sandbox_pods WHERE id = $1")
+            .bind(pod)
+            .fetch_one(&pool)
+            .await
+            .expect("the agent's due time");
+    let due = Due { conversation_id: conversation, pod_id: Some(pod), oldest_claim_utc: None, at, days: 1, class: GraceClass::Agent };
+    assert!(still_due(&pool, &SETTINGS, &due).await, "due as listed");
+    sqlx::query("UPDATE agents SET state = 'active' WHERE conversation_id = $1")
+        .bind(conversation)
+        .execute(&pool)
+        .await
+        .expect("the parent's message wakes it");
+    assert!(!still_due(&pool, &SETTINGS, &due).await, "woken: skipped");
+}
+
+/// Review 1, A-L3: a conversation whose latest row is live is never
+/// removed through the pass, however old its claims or done its agent.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_live_row_is_never_removed_through_the_pass(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let (conversation, _) = ended_days_ago(&pool, db::PodEnd::Plain, 40).await;
+    db::create_sandbox_pod(&pool, conversation).await.expect("a live pod after the old one");
+    make_agent(&pool, conversation, "finished").await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let settled = pass_with(&pool, &SETTINGS, UNBOUNDED, &[(conversation, 400)], counting(&calls)).await;
+    assert!(settled.is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "never tried");
+}
