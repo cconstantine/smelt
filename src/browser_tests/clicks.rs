@@ -221,9 +221,15 @@ pub(super) async fn js_bool(page: &chromiumoxide::Page, expression: &str) -> boo
 
 /// Presses Escape on `selector`'s element, as a user would with it focused.
 pub(super) async fn press_escape(page: &chromiumoxide::Page, selector: &str) {
+    press_key(page, selector, "Escape").await;
+}
+
+/// Focuses `selector`'s element and presses `key` (a DOM key name, e.g.
+/// "ArrowDown") on it.
+pub(super) async fn press_key(page: &chromiumoxide::Page, selector: &str, key: &str) {
     let el = wait_for_element(page, selector, Duration::from_secs(5)).await;
-    el.focus().await.expect("focus for Escape");
-    el.press_key("Escape").await.expect("press Escape");
+    el.focus().await.unwrap_or_else(|e| panic!("focus for {key}: {e}"));
+    el.press_key(key).await.unwrap_or_else(|e| panic!("press {key}: {e}"));
 }
 
 /// A click step whose click goes through and then reports an error, as a

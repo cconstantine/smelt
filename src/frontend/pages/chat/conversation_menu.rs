@@ -236,14 +236,22 @@ pub(super) fn ConversationMenu(
                 title: "Conversation actions",
                 onmounted: move |e| button_el.set(Some(e)),
                 onclick: move |_| if open() { apply(open, armed, MenuEvent::Outside) } else { open_at(0) },
-                onkeydown: move |e: KeyboardEvent| match e.key() {
-                    Key::ArrowDown => {
+                // Already open (a click opened it and focus came back to
+                // ☰), the arrows move into the menu and Escape closes it.
+                onkeydown: move |e: KeyboardEvent| match (e.key(), open()) {
+                    (Key::ArrowDown, was_open) => {
                         e.prevent_default();
-                        open_at(0);
+                        if was_open { move_to(0) } else { open_at(0) }
                     }
-                    Key::ArrowUp => {
+                    (Key::ArrowUp, was_open) => {
                         e.prevent_default();
-                        open_at(count.saturating_sub(1));
+                        let last = count.saturating_sub(1);
+                        if was_open { move_to(last) } else { open_at(last) }
+                    }
+                    (Key::Escape, true) => {
+                        e.prevent_default();
+                        e.stop_propagation();
+                        apply(open, armed, MenuEvent::Escape);
                     }
                     _ => {}
                 },
@@ -317,6 +325,9 @@ pub(super) fn ConversationMenu(
                                         // Delete's first click arms it in place, the
                                         // menu open and focus kept (Q2); its second
                                         // confirms. Any other item closes the menu.
+                                        // Focus goes back to ☰ as the menu closes,
+                                        // not to the page's body; Compact's popover
+                                        // takes it instead (review 1, A-L4).
                                         // Read first: a guard in the match's
                                         // scrutinee lives through its arms, and
                                         // `apply` writes the same signal.
@@ -325,10 +336,14 @@ pub(super) fn ConversationMenu(
                                             (MenuItem::Delete, false) => apply(open, armed, MenuEvent::Arm),
                                             (MenuItem::Delete, true) => {
                                                 apply(open, armed, MenuEvent::Confirm);
+                                                focus(button_el.peek().clone());
                                                 on_action.call(item);
                                             }
                                             _ => {
                                                 apply(open, armed, MenuEvent::OtherItem);
+                                                if item != MenuItem::Compact {
+                                                    focus(button_el.peek().clone());
+                                                }
                                                 on_action.call(item);
                                             }
                                         }

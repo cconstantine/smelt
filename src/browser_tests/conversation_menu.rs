@@ -81,6 +81,21 @@ async fn open_and_close(page: &chromiumoxide::Page, id: i64, (width, _, mobile):
     press_escape(page, ".conversation-menu-thinking").await;
     assert!(wait_for_count(page, ".conversation-menu", 0, Duration::from_secs(5)).await, "{width}px: Escape closes it");
     assert!(focused(page, ".conversation-menu-button").await, "{width}px: Escape puts focus back on ☰");
+    // Review 1, A-L4: with the menu already open, the arrows on ☰ move
+    // into it, and Escape on ☰ closes it.
+    open_conversation_menu(page, id).await;
+    press_key(page, ".conversation-menu-button", "ArrowUp").await;
+    assert!(
+        wait_until(|| focused(page, ".conversation-menu-delete"), Duration::from_secs(5)).await,
+        "{width}px: ArrowUp on an open ☰ focuses the last item"
+    );
+    press_key(page, ".conversation-menu-button", "ArrowDown").await;
+    assert!(
+        wait_until(|| focused(page, ".conversation-menu-thinking"), Duration::from_secs(5)).await,
+        "{width}px: ArrowDown on an open ☰ focuses the first item"
+    );
+    press_key(page, ".conversation-menu-button", "Escape").await;
+    assert!(wait_for_count(page, ".conversation-menu", 0, Duration::from_secs(5)).await, "{width}px: Escape on an open ☰ closes it");
     open_conversation_menu(page, id).await;
     click_when_present(page, ".conversation-menu-backdrop", Duration::from_secs(5)).await;
     assert!(wait_for_count(page, ".conversation-menu", 0, Duration::from_secs(5)).await, "{width}px: a click outside closes it");
@@ -94,6 +109,10 @@ async fn show_thinking(page: &chromiumoxide::Page, id: i64) {
     open_conversation_menu(page, id).await;
     click_when_present(page, ".conversation-menu-thinking", Duration::from_secs(5)).await;
     assert!(wait_for_count(page, ".conversation-menu", 0, Duration::from_secs(5)).await, "Show thinking closes the menu");
+    assert!(
+        wait_until(|| focused(page, ".conversation-menu-button"), Duration::from_secs(5)).await,
+        "Show thinking puts focus back on ☰ (review 1, A-L4)"
+    );
     assert!(wait_for_count(page, ".thinking-block", 1, Duration::from_secs(5)).await, "the thinking shows");
     open_conversation_menu(page, id).await;
     assert_eq!(menu_items(page).await[0], "Hide thinking|menuitemcheckbox|true|");
@@ -130,6 +149,10 @@ async fn archive(page: &chromiumoxide::Page, id: i64) {
         assert_eq!(menu_items(page).await[2], format!("{from}|menuitem||"));
         click_when_present(page, ".conversation-menu-archive", Duration::from_secs(5)).await;
         assert!(wait_for_count(page, ".conversation-menu", 0, Duration::from_secs(5)).await, "{from} closes the menu");
+        assert!(
+            wait_until(|| focused(page, ".conversation-menu-button"), Duration::from_secs(5)).await,
+            "{from} puts focus back on ☰ (review 1, A-L4)"
+        );
         open_conversation_menu(page, id).await;
         let flipped = wait_until(
             || async { menu_items(page).await.get(2).is_some_and(|s| s.starts_with(&format!("{to}|"))) },
@@ -185,6 +208,14 @@ async fn delete(page: &chromiumoxide::Page, id: i64, lands: &str) {
         wait_until(|| js_bool(page, &at_lands), Duration::from_secs(10)).await,
         "deleting lands on {lands}"
     );
+    // Landing on its parent, the header stays, and focus is back on ☰
+    // (review 1, A-L4); Home has no header to hold it.
+    if lands != "/" {
+        assert!(
+            wait_until(|| focused(page, ".conversation-menu-button"), Duration::from_secs(5)).await,
+            "Delete's confirm puts focus back on ☰"
+        );
+    }
 }
 
 /// Holds the page's next DELETE reply back 3 s after the server has
