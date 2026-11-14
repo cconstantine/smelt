@@ -169,6 +169,44 @@ async fn test_each_conversations_last_stop_is_its_latest_ended_pod(pool: PgPool)
     assert!(!stops.contains_key(&live.id), "a live pod hasn't stopped: {stops:?}");
 }
 
+/// `pod_id`'s `stopped_by_user`, read back (SME-521).
+async fn stopped_by_user(pool: &PgPool, pod_id: i64) -> Option<bool> {
+    sqlx::query_scalar("SELECT stopped_by_user FROM sandbox_pods WHERE id = $1")
+        .bind(pod_id)
+        .fetch_one(pool)
+        .await
+        .expect("read stopped_by_user")
+}
+
+/// SME-521: every way a row is closed says whether the user's Stop closed
+/// it, so the storage-grace rule can give a Stop its own grace. A live row
+/// says neither, and a `Plain` close after a Stop (a failed create's
+/// cleanup inside SME-122's B1 window) must not turn the Stop into
+/// something else.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_each_pod_end_records_whether_the_user_stopped_it(pool: PgPool) {
+    let conversation = create_conversation(&pool).await.expect("conversation");
+    let plain = create_sandbox_pod(&pool, conversation.id).await.expect("pod");
+    assert_eq!(stopped_by_user(&pool, plain.id).await, None, "a live row says neither");
+    terminate_sandbox_pod_as(&pool, plain.id, PodEnd::Plain).await.expect("plain end");
+    assert_eq!(stopped_by_user(&pool, plain.id).await, Some(false), "terminate_pod, a lost pod, a failed create");
+
+    let quiet = create_sandbox_pod(&pool, conversation.id).await.expect("pod");
+    terminate_sandbox_pod_as(&pool, quiet.id, PodEnd::Quiet).await.expect("quiet end");
+    assert_eq!(stopped_by_user(&pool, quiet.id).await, Some(false), "an idle or finish stop");
+
+    let by_user = create_sandbox_pod(&pool, conversation.id).await.expect("pod");
+    terminate_sandbox_pod_as(&pool, by_user.id, PodEnd::ByUser).await.expect("the user's Stop");
+    assert_eq!(stopped_by_user(&pool, by_user.id).await, Some(true), "the user's Stop");
+    terminate_sandbox_pod_as(&pool, by_user.id, PodEnd::Plain).await.expect("a plain close after it");
+    assert_eq!(stopped_by_user(&pool, by_user.id).await, Some(true), "a later plain close keeps the Stop");
+
+    let quiet_then_user = create_sandbox_pod(&pool, conversation.id).await.expect("pod");
+    terminate_sandbox_pod_as(&pool, quiet_then_user.id, PodEnd::Quiet).await.expect("quiet end");
+    terminate_sandbox_pod_as(&pool, quiet_then_user.id, PodEnd::ByUser).await.expect("then the user's Stop");
+    assert_eq!(stopped_by_user(&pool, quiet_then_user.id).await, Some(true), "a Stop landing after a quiet stop wins (B3)");
+}
+
 /// SME-354 B14: a stop's age is measured on the database's clock, the one
 /// its `terminated_at` was written on. The connection's time zone puts
 /// that clock 14 hours from the server's UTC, so a mixed reading is off
