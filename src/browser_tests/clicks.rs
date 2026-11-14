@@ -232,6 +232,48 @@ pub(super) async fn press_key(page: &chromiumoxide::Page, selector: &str, key: &
     el.press_key(key).await.unwrap_or_else(|e| panic!("press {key}: {e}"));
 }
 
+/// The page's tab stops, in order, from `from`'s element to `to`'s, each
+/// marked `data-tab-hop="i"`: what Tab should visit. Fails (`Err`) when
+/// either isn't a tab stop or `to` doesn't come after `from`.
+const MARK_TAB_HOPS: &str = "(([from, to]) => { \
+     document.querySelectorAll('[data-tab-hop]').forEach(e => e.removeAttribute('data-tab-hop')); \
+     const stops = [...document.querySelectorAll('a[href], button, input, textarea, select, summary, [tabindex]')] \
+       .filter(e => e.tabIndex >= 0 && !e.disabled && !e.closest('[inert]') && e.getClientRects().length > 0 \
+         && getComputedStyle(e).visibility !== 'hidden'); \
+     const a = stops.indexOf(document.querySelector(from)), b = stops.indexOf(document.querySelector(to)); \
+     if (a < 0 || b <= a) return `not in the tab order after it: from ${a}, to ${b} of ${stops.length}`; \
+     stops.slice(a, b + 1).forEach((e, i) => e.setAttribute('data-tab-hop', String(i))); \
+     return b - a; })";
+
+/// Tabs from `from`'s element to `to`'s, one stop at a time, asserting
+/// each hop lands on the page's next tab stop (`MARK_TAB_HOPS`): however
+/// many rows a full run's earlier scenarios leave in the sidebar, it
+/// arrives, and a stop that's skipped or out of order says which.
+pub(super) async fn tab_to(page: &chromiumoxide::Page, from: &str, to: &str) {
+    let hops = page
+        .evaluate(format!("{MARK_TAB_HOPS}([{from:?}, {to:?}])"))
+        .await
+        .expect("mark the tab stops")
+        .into_value::<serde_json::Value>()
+        .expect("a value");
+    let hops = hops.as_u64().unwrap_or_else(|| panic!("Tab from {from} to {to}: {hops}"));
+    let start = wait_for_element(page, from, Duration::from_secs(5)).await;
+    start.focus().await.expect("focus where Tab starts");
+    let on_now = "(() => { const e = document.activeElement; \
+         return `${e?.tagName} .${e?.className} hop=${e?.getAttribute('data-tab-hop')}`; })()";
+    for hop in 1..=hops {
+        // chromiumoxide 0.7's `Element::press_key` is the page's own
+        // (`Input.dispatchKeyEvent`): it goes to whatever has focus and
+        // doesn't focus `start` again.
+        start.press_key("Tab").await.expect("press Tab");
+        let landed = js_bool(page, &format!("document.activeElement?.getAttribute('data-tab-hop') === '{hop}'")).await;
+        if !landed {
+            let on: String = page.evaluate(on_now).await.ok().and_then(|v| v.into_value().ok()).unwrap_or_default();
+            panic!("Tab {hop} of {hops} from {from} to {to} landed on {on}");
+        }
+    }
+}
+
 /// A click step whose click goes through and then reports an error, as a
 /// CDP call failing after the mouse was pressed and released would.
 fn click_then_fail(element: &chromiumoxide::Element) -> BoxFuture<'_, Result<(), String>> {

@@ -257,6 +257,13 @@ pub(super) async fn scenario_streaming_into_a_long_transcript(t: &Scenario<'_>) 
 /// arms Delete without leaving the page or closing the menu, and Escape
 /// closes it back onto ☰.
 pub(super) async fn scenario_conversation_rows_by_keyboard(t: &Scenario<'_>) {
+    // Older rows under the two this scenario opens, as a full run's earlier
+    // scenarios leave them: the list is newest first, so they sit between
+    // the opened row and the header in the page's tab order (CI's red on
+    // PR #355, run 43588642743, came from a long list).
+    for _ in 0..45 {
+        t.conversation().await;
+    }
     let first = t.conversation().await;
     seed_user_message(t.pool, first.id, "the first row").await;
     let second = t.conversation().await;
@@ -320,17 +327,7 @@ pub(super) async fn scenario_conversation_rows_by_keyboard(t: &Scenario<'_>) {
     };
     // ☰ is reached with Tab from the row just opened, not focused by the
     // test (review 1, B-L5): it's a tab stop in the page's own order.
-    let first_row = wait_for_element(&page, &title(first.id), Duration::from_secs(10)).await;
-    first_row.focus().await.expect("focus the first row");
-    let mut reached = false;
-    for _ in 0..40 {
-        first_row.press_key("Tab").await.expect("press Tab");
-        if focused(button.clone()).await {
-            reached = true;
-            break;
-        }
-    }
-    assert!(reached, "Tab from the sidebar should reach ☰");
+    tab_to(&page, &title(first.id), &button).await;
     menu_button.press_key("Enter").await.expect("press Enter on ☰");
     wait_for_element(&page, ".conversation-menu[role=menu]", Duration::from_secs(5)).await;
     assert!(
