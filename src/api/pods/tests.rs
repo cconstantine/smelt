@@ -272,6 +272,7 @@ fn test_storage_rows_groups_a_conversations_two_claims() {
             ],
             stopped: None,
             observed_at: chrono::NaiveDateTime::default(),
+            fate: StorageFate::Unknown,
         }],
         "workspace first however they listed, docker's size from the request, its deleting flagged"
     );
@@ -342,4 +343,98 @@ fn test_storage_rows_name_the_node_a_claim_was_bound_on() {
     let rows = storage_rows(&[bound, unused], &titles);
     let nodes: Vec<Option<&str>> = rows[0].volumes.iter().map(|volume| volume.node.as_deref()).collect();
     assert_eq!(nodes, vec![Some("ryzen"), None]);
+}
+
+const GRACES: crate::api::sandbox::GraceSettings =
+    crate::api::sandbox::GraceSettings { default_days: 7, agent_days: 1, user_days: 30 };
+
+/// A page row for conversation `id` with one claim per `(size, deleting)`.
+fn stored_row(id: i64, volumes: &[(&str, bool)], fate: StorageFate) -> StoredStorage {
+    StoredStorage {
+        conversation_id: id,
+        conversation_title: format!("c{id}"),
+        volumes: volumes
+            .iter()
+            .map(|(size, deleting)| StoredVolume {
+                kind: StorageKind::Workspace,
+                size: Some((*size).to_string()),
+                deleting: *deleting,
+                node: None,
+            })
+            .collect(),
+        stopped: None,
+        observed_at: at(12),
+        fate,
+    }
+}
+
+/// The listed claims of `ids`, each with an oldest claim at hour 1.
+fn claims_of(ids: &[i64]) -> crate::sandbox::StoredClaims {
+    crate::sandbox::StoredClaims {
+        by_conversation: ids
+            .iter()
+            .map(|id| (*id, crate::sandbox::ClaimSet { names: vec![format!("w-{id}")], oldest: Some(at(1)), all_deleting: false }))
+            .collect(),
+    }
+}
+
+/// SME-521: the page's fate is the pass's rule's, row by row — live in
+/// use, the user's Stop 30 days, a done agent 1 day even after a Stop —
+/// with the stop shown, and a conversation the read lacks unknown.
+#[test]
+fn test_each_rows_fate_comes_from_the_passes_rule() {
+    let row = |conversation_id, terminated_at, stopped_by_user, agent_done| db::StorageGraceRow {
+        conversation_id,
+        pod_id: Some(conversation_id * 10),
+        terminated_at,
+        stopped_by_user,
+        quiet: false,
+        agent_done,
+        activity_at: None,
+    };
+    let inputs = db::StorageGraceInputs {
+        rows: std::collections::HashMap::from([
+            (1, row(1, None, None, false)),
+            (2, row(2, Some(at(3)), Some(true), false)),
+            (3, row(3, Some(at(4)), Some(true), true)),
+        ]),
+        observed_at: at(12),
+        utc_offset: chrono::Duration::zero(),
+    };
+    let mut rows: Vec<StoredStorage> =
+        [1, 2, 3, 4].into_iter().map(|id| stored_row(id, &[("1Gi", false)], StorageFate::Unknown)).collect();
+    apply_fates(&mut rows, &inputs, &claims_of(&[1, 2, 3, 4]), &GRACES);
+    let days = |hour, days| at(hour) + chrono::Duration::days(days);
+    assert_eq!(
+        rows.iter().map(|row| row.fate.clone()).collect::<Vec<_>>(),
+        vec![
+            StorageFate::Live,
+            StorageFate::RemovesAt { at: days(3, 30), days: 30, class: GraceClass::UserStop },
+            StorageFate::RemovesAt { at: days(4, 1), days: 1, class: GraceClass::Agent },
+            StorageFate::Unknown,
+        ]
+    );
+    assert_eq!(rows[1].stopped, Some(PodStop { at: at(3), quiet: false }), "the stop is still shown");
+    assert_eq!(rows[0].stopped, None, "a live pod hasn't stopped");
+    assert!(rows.iter().all(|row| row.observed_at == at(12)), "measured on the read's clock");
+}
+
+/// SME-521: the summary line's counts on a fixed snapshot. A row past its
+/// grace whose claims are all being removed isn't counted past grace
+/// (the pass has nothing left to do); claims of no row are orphaned.
+#[test]
+fn test_the_summary_counts_claims_bytes_past_grace_and_orphans() {
+    let due = StorageFate::RemovesAt { at: at(11), days: 7, class: GraceClass::Default };
+    let waiting = StorageFate::RemovesAt { at: at(13), days: 7, class: GraceClass::Default };
+    let rows = vec![
+        stored_row(1, &[("20Gi", false), ("20Gi", false)], due.clone()),
+        stored_row(2, &[("10Gi", true)], due),
+        stored_row(3, &[("1Gi", false), ("1Gi", false)], waiting),
+        stored_row(4, &[("1Gi", false)], StorageFate::Kept),
+    ];
+    let gi = 1024 * 1024 * 1024;
+    assert_eq!(
+        stored_summary(&rows, &claims_of(&[1, 2, 3, 4, 9])),
+        StoredSummary { conversations: 4, claims: 6, requested_bytes: 53 * gi, past_grace: 1, orphaned: 1 }
+    );
 }

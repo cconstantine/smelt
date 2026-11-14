@@ -361,3 +361,20 @@ fn test_the_metrics_request_names_the_namespaces_pods() {
         format!("/apis/metrics.k8s.io/v1beta1/namespaces/{NAMESPACE}/pods")
     );
 }
+
+/// SME-521: `SANDBOX_STORAGE_CLASS` names the class both conversation
+/// claims get; unset or empty leaves it to the cluster's default, the
+/// spec exactly as before.
+#[test]
+fn test_the_conversation_claims_get_the_configured_storage_class() {
+    assert_eq!(storage_class_from(None), None);
+    assert_eq!(storage_class_from(Some(String::new())), None, "an empty setting is no setting");
+    assert_eq!(storage_class_from(Some("local-path".to_string())).as_deref(), Some("local-path"));
+    let class_of = |claim: &PersistentVolumeClaim| claim.spec.as_ref().and_then(|spec| spec.storage_class_name.clone());
+    for (_, claim) in conversation_pvc_specs_with(42, TEST_INSTANCE, Some("x".to_string())) {
+        assert_eq!(class_of(&claim).as_deref(), Some("x"), "{:?}", claim.metadata.name);
+    }
+    for (_, claim) in conversation_pvc_specs_with(42, TEST_INSTANCE, None) {
+        assert_eq!(class_of(&claim), None, "the cluster default: {:?}", claim.metadata.name);
+    }
+}

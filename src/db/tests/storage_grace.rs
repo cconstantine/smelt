@@ -38,93 +38,104 @@ async fn test_marking_a_pod_quietly_stopped_stamps_now(pool: PgPool) {
     );
 }
 
-/// A conversation with one terminated, unmarked pod row: a quiet stop's
-/// mark, aged `days` back, turns it into a candidate.
-async fn stopped_pod(pool: &PgPool) -> (i64, i64) {
-    let conversation = create_conversation(pool).await.expect("conversation");
-    let pod = create_sandbox_pod(pool, conversation.id).await.expect("pod");
-    sqlx::query("UPDATE sandbox_pods SET terminated_at = now() WHERE id = $1")
-        .bind(pod.id)
-        .execute(pool)
-        .await
-        .expect("close the row");
-    (conversation.id, pod.id)
-}
-
-/// Closes and marks `pod_id`'s row `days` ago, as a quiet stop that has
-/// aged would have left it.
-async fn quiet_stopped_ago(pool: &PgPool, pod_id: i64, days: i32) {
-    sqlx::query("UPDATE sandbox_pods SET terminated_at = now(), quietly_stopped_at = now() - make_interval(days => $2) WHERE id = $1")
-        .bind(pod_id)
-        .bind(days)
-        .execute(pool)
-        .await
-        .expect("quiet-stop the row");
-}
-
-async fn candidates(pool: &PgPool, days: u32) -> Vec<(i64, i64)> {
-    storage_removal_candidates(pool, days).await.expect("candidates")
-}
-
-/// The rule's edge: only marked rows qualify; the grace is `days` long,
-/// not `days` plus a hair; and `0` is off, not due-for-all.
+/// SME-521: the grace inputs are each listed conversation's latest pod row
+/// — whatever ended it, marked or not — and whether it's a sub-agent
+/// that's done. A conversation with no row reads `None`; one that no
+/// longer exists isn't in the answer at all.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_candidates_are_marked_rows_past_their_days(pool: PgPool) {
-    let (conversation, pod) = stopped_pod(&pool).await;
-    assert!(candidates(&pool, 7).await.is_empty(), "an unmarked row is never a candidate");
+async fn test_grace_inputs_are_each_conversations_latest_row_and_agent_state(pool: PgPool) {
+    let stopped = create_conversation(&pool).await.expect("conversation");
+    let old = create_sandbox_pod(&pool, stopped.id).await.expect("pod");
+    terminate_sandbox_pod_as(&pool, old.id, PodEnd::ByUser).await.expect("an older Stop");
+    let latest = create_sandbox_pod(&pool, stopped.id).await.expect("pod");
+    terminate_sandbox_pod_as(&pool, latest.id, PodEnd::Quiet).await.expect("a quiet stop");
 
-    quiet_stopped_ago(&pool, pod, 0).await;
-    assert!(candidates(&pool, 7).await.is_empty(), "a fresh mark is the grace beginning, not a due date");
-    quiet_stopped_ago(&pool, pod, 6).await;
-    assert!(candidates(&pool, 7).await.is_empty(), "6 days old at 7 is still grace");
-    quiet_stopped_ago(&pool, pod, 8).await;
-    assert_eq!(candidates(&pool, 7).await, vec![(conversation, pod)]);
-    assert!(candidates(&pool, 0).await.is_empty(), "0 turns removal off, it is not due-for-all");
-}
-
-/// Only the conversation's latest row can qualify: any newer row — the
-/// live pod of a pickup, or a user-stopped pod whose NULL mark says keep
-/// — takes the row out of the list. A deleted conversation leaves nothing
-/// to sweep (its rows cascade).
-#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_a_newer_row_takes_the_conversation_out_of_the_list(pool: PgPool) {
-    let (conversation, pod) = stopped_pod(&pool).await;
-    quiet_stopped_ago(&pool, pod, 8).await;
-    assert_eq!(candidates(&pool, 7).await, vec![(conversation, pod)]);
-
-    let newer = create_sandbox_pod(&pool, conversation).await.expect("a newer live row");
-    assert!(candidates(&pool, 7).await.is_empty(), "a live pod means the conversation picked up again");
-    sqlx::query("UPDATE sandbox_pods SET terminated_at = now() WHERE id = $1")
-        .bind(newer.id)
+    let live = create_conversation(&pool).await.expect("conversation");
+    let live_pod = create_sandbox_pod(&pool, live.id).await.expect("a live pod");
+    let never = create_conversation(&pool).await.expect("conversation");
+    let agent = create_conversation(&pool).await.expect("conversation");
+    sqlx::query("INSERT INTO agents (conversation_id, root_id, depth, brief, state) VALUES ($1, $2, 1, 'b', 'finished')")
+        .bind(agent.id)
+        .bind(stopped.id)
         .execute(&pool)
         .await
-        .expect("close the newer row");
-    assert!(
-        candidates(&pool, 7).await.is_empty(),
-        "a user Stop's NULL mark means keep: only the pass's quiet stop qualifies"
-    );
+        .expect("a finished agent");
+    let gone = create_conversation(&pool).await.expect("conversation");
+    sqlx::query("DELETE FROM conversations WHERE id = $1").bind(gone.id).execute(&pool).await.expect("delete it");
 
-    sqlx::query("DELETE FROM conversations WHERE id = $1")
-        .bind(conversation)
-        .execute(&pool)
-        .await
-        .expect("delete the conversation");
-    assert!(candidates(&pool, 7).await.is_empty(), "a deleted conversation leaves nothing to remove");
+    let inputs = storage_grace_inputs(&pool, &[stopped.id, live.id, never.id, agent.id, gone.id]).await.expect("read");
+    let row = &inputs.rows[&stopped.id];
+    assert_eq!(row.pod_id, Some(latest.id), "the latest row, not the older Stop");
+    assert!(row.terminated_at.is_some() && row.quiet && row.stopped_by_user == Some(false), "{row:?}");
+    assert!(!row.agent_done);
+    let row = &inputs.rows[&live.id];
+    assert_eq!((row.pod_id, row.terminated_at), (Some(live_pod.id), None), "a live row has no end");
+    let row = &inputs.rows[&never.id];
+    assert_eq!((row.pod_id, row.quiet, row.agent_done), (None, false, false), "no row at all");
+    assert!(inputs.rows[&agent.id].agent_done, "a finished sub-agent");
+    assert!(!inputs.rows.contains_key(&gone.id), "a deleted conversation is gone from the answer");
 }
 
-/// The re-check answers until the clear retires the row; `0` never asks
-/// the database to sweep anything.
+/// SME-521 review 1, M1: a done agent's activity is the later of its
+/// latest message and a question still waiting on the user; an answered
+/// question or one asked of its parent doesn't count. Read only for a
+/// done agent: nothing else's clock uses it.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_still_due_holds_until_the_mark_is_cleared(pool: PgPool) {
-    let (_conversation, pod) = stopped_pod(&pool).await;
-    quiet_stopped_ago(&pool, pod, 8).await;
-    assert!(storage_removal_still_due(&pool, pod, 7).await.expect("due"));
-    assert!(!storage_removal_still_due(&pool, pod, 9).await.expect("not yet due"), "9 days wanted, 8 marked");
-    assert!(!storage_removal_still_due(&pool, pod, 0).await.expect("off"), "0 is off, never due");
+async fn test_a_done_agents_activity_is_its_latest_message_or_waiting_question(pool: PgPool) {
+    let root = create_conversation(&pool).await.expect("conversation");
+    let mut agents = Vec::new();
+    for _ in 0..3 {
+        let agent = create_conversation(&pool).await.expect("conversation");
+        sqlx::query("INSERT INTO agents (conversation_id, root_id, depth, brief, state) VALUES ($1, $2, 1, 'b', 'finished')")
+            .bind(agent.id)
+            .bind(root.id)
+            .execute(&pool)
+            .await
+            .expect("a finished agent");
+        agents.push(agent.id);
+    }
+    let message = |conversation_id: i64, hours: i32| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query("INSERT INTO messages (conversation_id, role, content, created_at) VALUES ($1, 'user', '[]', now()::timestamp + make_interval(hours => $2))")
+                .bind(conversation_id)
+                .bind(hours)
+                .execute(&pool)
+                .await
+                .expect("a message");
+        }
+    };
+    let question = |conversation_id: i64, hours: i32, answered: bool, asked_of: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO pending_questions (conversation_id, tool_use_id, questions, answer, asked_of, created_at)
+                 VALUES ($1, 't', '[]', CASE WHEN $3 THEN '[]'::jsonb END, $4, now()::timestamp + make_interval(hours => $2))",
+            )
+            .bind(conversation_id)
+            .bind(hours)
+            .bind(answered)
+            .bind(asked_of)
+            .execute(&pool)
+            .await
+            .expect("a question");
+        }
+    };
+    let [waiting, answered, of_parent] = agents[..] else { unreachable!() };
+    message(waiting, 1).await;
+    question(waiting, 5, false, "user").await;
+    message(answered, 2).await;
+    question(answered, 9, true, "user").await;
+    message(of_parent, 3).await;
+    question(of_parent, 9, false, "parent").await;
+    message(root.id, 4).await;
 
-    clear_pod_quiet_stop_mark(&pool, pod).await.expect("clear the mark");
-    assert!(!storage_removal_still_due(&pool, pod, 7).await.expect("cleared"), "a cleared row never qualifies again");
-    assert!(mark(&pool, pod).await.is_none(), "the clear is a NULL, not a time");
+    let inputs = storage_grace_inputs(&pool, &[root.id, waiting, answered, of_parent]).await.expect("read");
+    let hours_on = |id: i64| inputs.rows[&id].activity_at.map(|at| ((at - inputs.observed_at).num_seconds() as f64 / 3600.0).round() as i64);
+    assert_eq!(hours_on(waiting), Some(5), "the waiting question, later than the message");
+    assert_eq!(hours_on(answered), Some(2), "an answered question doesn't count");
+    assert_eq!(hours_on(of_parent), Some(3), "nor does one asked of the parent");
+    assert_eq!(inputs.rows[&root.id].activity_at, None, "a top-level conversation's isn't read");
 }
 
 /// The upgrade shape: `quietly_stopped_at` is added nullable with no
@@ -143,30 +154,42 @@ async fn test_quietly_stopped_at_is_added_nullable_with_no_default(pool: PgPool)
     assert_eq!(default, None, "no default that could stamp a row retroactively");
 }
 
-/// SME-123 DR9: the Sandboxes page's stored volumes say when each
-/// conversation's sandbox stopped and whether that was a quiet stop: its
-/// latest pod row, once that row has ended. A live pod, and a
-/// conversation that never had one, give nothing.
+/// `pod_id`'s `stopped_by_user`, read back (SME-521).
+async fn stopped_by_user(pool: &PgPool, pod_id: i64) -> Option<bool> {
+    sqlx::query_scalar("SELECT stopped_by_user FROM sandbox_pods WHERE id = $1")
+        .bind(pod_id)
+        .fetch_one(pool)
+        .await
+        .expect("read stopped_by_user")
+}
+
+/// SME-521: every way a row is closed says whether the user's Stop closed
+/// it, so the storage-grace rule can give a Stop its own grace. A live row
+/// says neither, and a `Plain` close after a Stop (a failed create's
+/// cleanup inside SME-122's B1 window) must not turn the Stop into
+/// something else.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_each_conversations_last_stop_is_its_latest_ended_pod(pool: PgPool) {
-    let quiet = create_conversation(&pool).await.expect("conversation");
-    let old = create_sandbox_pod(&pool, quiet.id).await.expect("pod");
-    terminate_sandbox_pod(&pool, old.id).await.expect("end it");
-    let latest = create_sandbox_pod(&pool, quiet.id).await.expect("pod");
-    mark_pod_quietly_stopped(&pool, latest.id).await.expect("mark it");
-    terminate_sandbox_pod(&pool, latest.id).await.expect("end it");
+async fn test_each_pod_end_records_whether_the_user_stopped_it(pool: PgPool) {
+    let conversation = create_conversation(&pool).await.expect("conversation");
+    let plain = create_sandbox_pod(&pool, conversation.id).await.expect("pod");
+    assert_eq!(stopped_by_user(&pool, plain.id).await, None, "a live row says neither");
+    terminate_sandbox_pod_as(&pool, plain.id, PodEnd::Plain).await.expect("plain end");
+    assert_eq!(stopped_by_user(&pool, plain.id).await, Some(false), "terminate_pod, a lost pod, a failed create");
 
-    let stopped_by_user = create_conversation(&pool).await.expect("conversation");
-    let pod = create_sandbox_pod(&pool, stopped_by_user.id).await.expect("pod");
-    terminate_sandbox_pod(&pool, pod.id).await.expect("end it");
+    let quiet = create_sandbox_pod(&pool, conversation.id).await.expect("pod");
+    terminate_sandbox_pod_as(&pool, quiet.id, PodEnd::Quiet).await.expect("quiet end");
+    assert_eq!(stopped_by_user(&pool, quiet.id).await, Some(false), "an idle or finish stop");
 
-    let live = create_conversation(&pool).await.expect("conversation");
-    create_sandbox_pod(&pool, live.id).await.expect("a live pod");
+    let by_user = create_sandbox_pod(&pool, conversation.id).await.expect("pod");
+    terminate_sandbox_pod_as(&pool, by_user.id, PodEnd::ByUser).await.expect("the user's Stop");
+    assert_eq!(stopped_by_user(&pool, by_user.id).await, Some(true), "the user's Stop");
+    terminate_sandbox_pod_as(&pool, by_user.id, PodEnd::Plain).await.expect("a plain close after it");
+    assert_eq!(stopped_by_user(&pool, by_user.id).await, Some(true), "a later plain close keeps the Stop");
 
-    let (stops, _) = last_pod_stops(&pool).await.expect("read");
-    assert!(stops.get(&quiet.id).is_some_and(|(_, quiet_stop)| quiet_stop.is_some()), "{stops:?}");
-    assert!(stops.get(&stopped_by_user.id).is_some_and(|(_, quiet_stop)| quiet_stop.is_none()), "{stops:?}");
-    assert!(!stops.contains_key(&live.id), "a live pod hasn't stopped: {stops:?}");
+    let quiet_then_user = create_sandbox_pod(&pool, conversation.id).await.expect("pod");
+    terminate_sandbox_pod_as(&pool, quiet_then_user.id, PodEnd::Quiet).await.expect("quiet end");
+    terminate_sandbox_pod_as(&pool, quiet_then_user.id, PodEnd::ByUser).await.expect("then the user's Stop");
+    assert_eq!(stopped_by_user(&pool, quiet_then_user.id).await, Some(true), "a Stop landing after a quiet stop wins (B3)");
 }
 
 /// SME-354 B14: a stop's age is measured on the database's clock, the one
@@ -194,9 +217,14 @@ async fn test_the_stops_come_with_the_databases_own_clock(pool: PgPool) {
     let pod = create_sandbox_pod(&shifted, conversation.id).await.expect("pod");
     terminate_sandbox_pod(&shifted, pod.id).await.expect("end it");
 
-    let (stops, observed_at) = last_pod_stops(&shifted).await.expect("read");
-    let (stopped, _) = stops.get(&conversation.id).copied().expect("its stop");
-    let age = observed_at - stopped;
-    assert!(age >= chrono::Duration::zero() && age < chrono::Duration::minutes(1), "stopped {stopped}, observed {observed_at}: {age}");
+    // SME-521: the grace inputs, which the page and the pass both read,
+    // and a claim's UTC creation time put on that same clock.
+    let inputs = storage_grace_inputs(&shifted, &[conversation.id]).await.expect("read");
+    let stopped = inputs.rows[&conversation.id].terminated_at.expect("its end");
+    let age = inputs.observed_at - stopped;
+    assert!(age >= chrono::Duration::zero() && age < chrono::Duration::minutes(1), "stopped {stopped}, observed {}: {age}", inputs.observed_at);
+    let claim_made_now = inputs.from_utc(chrono::Utc::now().naive_utc());
+    let skew = (inputs.observed_at - claim_made_now).num_seconds().abs();
+    assert!(skew < 60, "a claim made now reads as now on the database's clock: {claim_made_now} vs {}", inputs.observed_at);
     shifted.close().await;
 }

@@ -220,4 +220,7 @@ mod image;
 mod idle_notice;
 mod quiet_stop;
 mod storage_grace;
+mod storage_grace_pass;
+mod storage_grace_rule;
+mod storage_report;
 mod resources;

@@ -12,6 +12,62 @@ use sqlx::PgPool;
 #[cfg(feature = "server")]
 use std::collections::HashMap;
 
+/// The three storage graces as the server read them (SME-521), in whole
+/// days, `0` meaning kept until removed by hand; a `default_days` of 0
+/// turns automatic removal off altogether.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GraceSettings {
+    /// `SANDBOX_STORAGE_REMOVAL_DAYS`: every stop but the two below.
+    pub default_days: u32,
+    /// `SANDBOX_AGENT_STORAGE_REMOVAL_DAYS`: a finished sub-agent.
+    pub agent_days: u32,
+    /// `SANDBOX_USER_STOPPED_STORAGE_DAYS`: the user's Stop.
+    pub user_days: u32,
+}
+
+/// The provisioner of a class of static volumes: nothing reclaims a
+/// released one, whatever the class's `reclaimPolicy` (review 1, B-L1).
+pub const NO_PROVISIONER: &str = "kubernetes.io/no-provisioner";
+
+/// The storage class the conversation claims get (SME-521), as the
+/// cluster says; reading it needs the `smelt-storage-reader` grant.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ClaimClass {
+    /// The grant is missing, or the read failed.
+    Unavailable,
+    /// No `SANDBOX_STORAGE_CLASS` and no default class: claims stay
+    /// Pending.
+    NoDefault,
+    /// `SANDBOX_STORAGE_CLASS` names a class the cluster doesn't have.
+    Missing { name: String },
+    Found {
+        name: String,
+        provisioner: String,
+        /// `Delete` or `Retain`; the API's default is `Delete`.
+        reclaim_policy: String,
+        /// Named by `SANDBOX_STORAGE_CLASS`, not the cluster's default.
+        configured: bool,
+    },
+}
+
+/// This namespace's volumes whose claims are gone but whose disk isn't
+/// yet (phase `Released` or `Failed`), SME-521.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReleasedVolumes {
+    pub count: u32,
+    pub capacity_bytes: u64,
+    /// The longest-standing one's move to that phase (UTC).
+    pub oldest: Option<chrono::NaiveDateTime>,
+}
+
+/// What the cluster says about where sandbox storage goes, for the pods
+/// page (SME-521). `released` is `None` when it can't be read.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageReport {
+    pub class: ClaimClass,
+    pub released: Option<ReleasedVolumes>,
+}
+
 /// One line of a command's output, in the order it actually happened —
 /// `stdout`/`stderr` fetched and capped independently (see
 /// `fetch_command_summary`) but merged back into one true chronological
@@ -233,4 +289,19 @@ pub async fn get_idle_stop_minutes() -> ServerFnResult<u32> {
 #[get("/api/sandbox/storage-removal-days")]
 pub async fn get_storage_removal_days() -> ServerFnResult<u32> {
     Ok(sandbox::storage_removal_days())
+}
+
+/// The three storage graces as the server read them, for the pods page's
+/// note (SME-521). `get_storage_removal_days` stays for older tabs.
+#[get("/api/sandbox/storage-grace")]
+pub async fn get_storage_grace() -> ServerFnResult<GraceSettings> {
+    Ok(sandbox::grace_settings())
+}
+
+/// The claims' storage class and the namespace's Released volumes, for
+/// the pods page (SME-521). Either reads as unavailable without the
+/// `smelt-storage-reader` grant.
+#[get("/api/sandbox/storage-report")]
+pub async fn get_storage_report() -> ServerFnResult<StorageReport> {
+    Ok(sandbox::storage_report().await)
 }

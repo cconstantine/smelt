@@ -1,0 +1,40 @@
+# The optional, cluster-wide half of smelt's RBAC (SME-521), kept out of
+# smelt-park-rbac.yaml because it needs a cluster admin: creating a
+# ClusterRole and its binding takes rights a namespace's deployer doesn't
+# have, and granting `get`/`list` on PersistentVolumes takes `escalate`/`bind`
+# on this role or holding those reads already. Apply it as an admin
+# (`kubectl apply -f k8s/smelt-storage-reader.yaml`); the compose stack's
+# k3s-bootstrap does, so the dev and test clusters have it.
+#
+# Read-only, and cluster-wide because PersistentVolumes and StorageClasses
+# have no namespace. smelt reads which class its claims get and its reclaim
+# policy, and counts its namespace's Released/Failed volumes: with a `Retain`
+# class, removing a claim frees no disk. Without this grant both reads come
+# back 403, smelt logs that once, and nothing else changes.
+#
+# terraform/smelt/rbac.tf makes the same two objects when
+# `storage_reader_enabled` is true (false by default).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: smelt-storage-reader
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: smelt-storage-reader
+subjects:
+  - kind: ServiceAccount
+    name: park
+    namespace: smelt-park
+roleRef:
+  kind: ClusterRole
+  name: smelt-storage-reader
+  apiGroup: rbac.authorization.k8s.io

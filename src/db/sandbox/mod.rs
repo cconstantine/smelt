@@ -67,20 +67,28 @@ pub enum PodEnd {
     ByUser,
 }
 
-/// `terminate_sandbox_pod`, closing the row the way `end` says.
+/// `terminate_sandbox_pod`, closing the row the way `end` says. Each end
+/// also records whether the user's Stop made it (`stopped_by_user`,
+/// SME-521), for the storage-grace rule: `Plain` never turns an earlier
+/// Stop into something else (a failed create's cleanup can close a row
+/// the Stop already closed, SME-122's B1 window).
 pub async fn terminate_sandbox_pod_as(
     pool: &PgPool,
     pod_id: i64,
     end: PodEnd,
 ) -> Result<Option<SandboxPod>, sqlx::Error> {
     let sql = match end {
-        PodEnd::Plain => "UPDATE sandbox_pods SET terminated_at = now() WHERE id = $1 RETURNING *",
+        PodEnd::Plain => {
+            "UPDATE sandbox_pods SET terminated_at = now(), stopped_by_user = COALESCE(stopped_by_user, false)
+              WHERE id = $1 RETURNING *"
+        }
         PodEnd::Quiet => {
-            "UPDATE sandbox_pods SET terminated_at = now(), quietly_stopped_at = now()
+            "UPDATE sandbox_pods SET terminated_at = now(), quietly_stopped_at = now(), stopped_by_user = false
               WHERE id = $1 AND terminated_at IS NULL RETURNING *"
         }
         PodEnd::ByUser => {
-            "UPDATE sandbox_pods SET terminated_at = COALESCE(terminated_at, now()), quietly_stopped_at = NULL
+            "UPDATE sandbox_pods SET terminated_at = COALESCE(terminated_at, now()), quietly_stopped_at = NULL,
+                    stopped_by_user = true
               WHERE id = $1 RETURNING *"
         }
     };

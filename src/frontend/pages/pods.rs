@@ -2,9 +2,10 @@ use chrono::NaiveDateTime;
 use dioxus::prelude::*;
 
 use crate::api::pods::{
-    AgentStatus, PodActivity, PodUsage, ServerPodOverview, StorageKind, StoredStorage,
-    get_pods, get_stored_storage, remove_stored_storage, stop_pod,
+    AgentStatus, PodActivity, PodUsage, ServerPodOverview, StorageFate, StorageKind, StoredStorage, StoredSummary,
+    get_pods, get_stored_storage, get_stored_summary, remove_stored_storage, stop_pod,
 };
+use crate::api::sandbox::{ClaimClass, GraceSettings, NO_PROVISIONER, StorageReport, get_storage_report};
 use crate::frontend::Route;
 use crate::frontend::pages::SettingsCrumbs;
 use crate::frontend::pages::STORAGE_REMOVE_WARNING;
@@ -160,12 +161,24 @@ fn StoredVolumes(pods_changed: Signal<u64>, tick: Signal<u64>) -> Element {
         let _ = (pods_changed(), tick());
         get_stored_storage()
     });
-    // Unknown until it loads, and then no fate is shown: assuming 0 read a
-    // quiet stop as "kept" (review 1 L4).
-    let grace_days = use_resource(crate::api::sandbox::get_storage_removal_days);
-    let grace_days = match grace_days() {
-        Some(Ok(days)) => Some(days),
+    // Its own read, so `get_stored_storage` keeps its type for older tabs;
+    // nothing shown until it loads, or if it fails.
+    let summary = use_resource(move || {
+        let _ = (pods_changed(), tick());
+        get_stored_summary()
+    });
+    let summary = match summary() {
+        Some(Ok(summary)) if summary.conversations > 0 || summary.orphaned > 0 => Some(summary_text(&summary)),
         _ => None,
+    };
+    // Where removed storage goes (SME-521): read on the same signals.
+    let report = use_resource(move || {
+        let _ = (pods_changed(), tick());
+        get_storage_report()
+    });
+    let report_lines = match report() {
+        Some(Ok(report)) => storage_report_lines(&report),
+        _ => Vec::new(),
     };
     let mut pending_remove: Signal<Option<i64>> = use_signal(|| None);
     let mut remove_error: Signal<Option<String>> = use_signal(|| None);
@@ -182,6 +195,12 @@ fn StoredVolumes(pods_changed: Signal<u64>, tick: Signal<u64>) -> Element {
             h2 { "Stored volumes" }
             p { class: "muted",
                 "Each conversation's sandbox keeps its /workspace and its Docker images in two volumes that outlive its pods; they hold node disk until removed here or when the conversation is deleted."
+            }
+            if let Some(summary) = summary {
+                p { class: "muted storage-summary", "{summary}" }
+            }
+            for line in report_lines {
+                p { class: "muted storage-report", "{line}" }
             }
             super::ErrorText { message: remove_error() }
             match fetched() {
@@ -205,7 +224,7 @@ fn StoredVolumes(pods_changed: Signal<u64>, tick: Signal<u64>) -> Element {
                                     td { class: "storage-conversation",
                                         Link { to: Route::ConversationRoute { id: row.conversation_id }, "{row.conversation_title}" }
                                     }
-                                    td { class: "storage-stopped", "data-label": "Stopped", "{stopped_text(row.stopped.as_ref(), grace_days, row.observed_at)}" }
+                                    td { class: "storage-stopped", "data-label": "Stopped", "{stopped_text(row.stopped.as_ref(), &row.fate, row.observed_at)}" }
                                     td { "data-label": "/workspace", "{volume_cell_text(&row, StorageKind::Workspace)}" }
                                     td { "data-label": "Docker", "{volume_cell_text(&row, StorageKind::Docker)}" }
                                     td {
@@ -229,29 +248,75 @@ fn StoredVolumes(pods_changed: Signal<u64>, tick: Signal<u64>) -> Element {
     }
 }
 
-/// When a row's sandbox stopped and what becomes of its storage
-/// (SME-123 DR9): a quiet stop's goes `grace_days` after it (SME-345), a
-/// Stop's, or any with removal off, stays until removed here. Empty with
-/// no stop on record.
-fn stopped_text(stop: Option<&crate::api::pods::PodStop>, grace_days: Option<u32>, now: NaiveDateTime) -> String {
-    let Some(stop) = stop else {
-        return String::new();
-    };
-    let elapsed = age_seconds(stop.at, now);
-    let Some(grace_days) = grace_days else {
-        return format!("stopped {} ago", format_age(elapsed));
-    };
-    let fate = if stop.quiet && grace_days > 0 {
-        let left_days = (i64::from(grace_days) * 86_400 - elapsed + 86_399) / 86_400;
-        match left_days {
-            ..=0 => "removed within the hour".to_string(),
+/// When a row's sandbox stopped (SME-123 DR9) and what becomes of its
+/// storage, as the server's rule says (SME-521): removed in so many days,
+/// kept until removed here, or nothing while in use or not known. Claims
+/// no pod ever used have no stop, only their fate.
+fn stopped_text(stop: Option<&crate::api::pods::PodStop>, fate: &StorageFate, now: NaiveDateTime) -> String {
+    let stopped = stop.map(|stop| format!("stopped {} ago", format_age(age_seconds(stop.at, now))));
+    let fate = match fate {
+        StorageFate::Kept => Some("kept until you remove it".to_string()),
+        StorageFate::RemovesAt { at, .. } => Some(match ((*at - now).num_seconds() + 86_399) / 86_400 {
+            // Review 1, B-L5: not "within the hour" — a pass tries at
+            // most 20 and skips a busy conversation.
+            ..=0 => "due for removal".to_string(),
             1 => "removed in 1 day".to_string(),
             n => format!("removed in {n} days"),
-        }
-    } else {
-        "kept until you remove it".to_string()
+        }),
+        StorageFate::Live | StorageFate::Unknown => None,
     };
-    format!("stopped {} ago \u{b7} {fate}", format_age(elapsed))
+    [stopped, fate].into_iter().flatten().collect::<Vec<_>>().join(" \u{b7} ")
+}
+
+/// `n` and its noun, singular or plural.
+fn count_of(n: u32, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// The stored-storage section's summary line (SME-521).
+fn summary_text(summary: &StoredSummary) -> String {
+    let holds = if summary.conversations == 1 { "holds" } else { "hold" };
+    format!(
+        "{} {holds} {} ({} requested) \u{b7} {} past their grace, removed over the next passes \u{b7} {} orphaned",
+        count_of(summary.conversations, "conversation", "conversations"),
+        count_of(summary.claims, "claim", "claims"),
+        format_bytes(summary.requested_bytes),
+        summary.past_grace,
+        summary.orphaned,
+    )
+}
+
+/// The stored-volumes section's lines on where removed storage goes
+/// (SME-521): the claims' class, and the volumes left Released. Nothing
+/// for a read the server couldn't make.
+fn storage_report_lines(report: &StorageReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    match &report.class {
+        ClaimClass::Unavailable => {}
+        ClaimClass::NoDefault => lines.push(
+            "Sandbox claims have no storage class: the cluster has no default and SANDBOX_STORAGE_CLASS isn't set."
+                .to_string(),
+        ),
+        ClaimClass::Missing { name } => {
+            lines.push(format!("Sandbox claims name storage class {name}, which the cluster doesn't have."))
+        }
+        ClaimClass::Found { name, provisioner, reclaim_policy, .. } => {
+            // Review 1, B-L1: static volumes have no one to reclaim them.
+            let static_volumes = provisioner == NO_PROVISIONER;
+            let kind = if static_volumes { ", no provisioner" } else { "" };
+            let frees =
+                if reclaim_policy == "Delete" && !static_volumes { "" } else { "; removing storage frees no disk" };
+            lines.push(format!("Sandbox claims use {name} (reclaim: {reclaim_policy}{kind}){frees}."));
+        }
+    }
+    if let Some(released) = &report.released {
+        lines.push(format!(
+            "Released volumes not yet reclaimed: {} ({}).",
+            released.count,
+            format_bytes(released.capacity_bytes)
+        ));
+    }
+    lines
 }
 
 /// A stored-volumes cell: the claim's size (`"20Gi"` — its capacity,
@@ -358,16 +423,23 @@ fn idle_stop_note(minutes: u32) -> String {
     }
 }
 
-/// The footnote's sentence on automatic storage removal (SME-345), for a
-/// grace of `days` (`0`: removal off). It says whose storage goes and
-/// whose doesn't — a quiet stop's does, a Stop's never does.
-fn storage_removal_note(days: u32) -> String {
-    match days {
-        0 => "Storage is never removed automatically.".to_string(),
-        days => format!(
-            "Storage a quietly stopped sandbox keeps is removed {days} days after the stop; a sandbox you stopped keeps it until you remove it."
-        ),
+/// The footnote's sentence on automatic storage removal, naming the three
+/// graces (SME-521); a default of `0` turns removal off, and any other
+/// grace of `0` keeps that storage until it's removed by hand.
+fn storage_grace_note(graces: &GraceSettings) -> String {
+    if graces.default_days == 0 {
+        return "Storage is never removed automatically.".to_string();
     }
+    let after = |days: u32| match days {
+        0 => "is kept until you remove it".to_string(),
+        days => format!("is removed {} later", count_of(days, "day", "days")),
+    };
+    format!(
+        "A stopped sandbox's storage {}; a finished agent's {}; one you stopped {}.",
+        after(graces.default_days),
+        after(graces.agent_days),
+        after(graces.user_days),
+    )
 }
 
 /// The footnote on automatic stops and what becomes of the storage they
@@ -375,10 +447,10 @@ fn storage_removal_note(days: u32) -> String {
 #[component]
 fn IdleStopNote() -> Element {
     let minutes = use_resource(crate::api::sandbox::get_idle_stop_minutes);
-    let days = use_resource(crate::api::sandbox::get_storage_removal_days);
-    match (minutes(), days()) {
-        (Some(Ok(minutes)), Some(Ok(days))) => rsx! {
-            p { class: "muted pods-footnote", "{idle_stop_note(minutes)} {storage_removal_note(days)}" }
+    let graces = use_resource(crate::api::sandbox::get_storage_grace);
+    match (minutes(), graces()) {
+        (Some(Ok(minutes)), Some(Ok(graces))) => rsx! {
+            p { class: "muted pods-footnote", "{idle_stop_note(minutes)} {storage_grace_note(&graces)}" }
         },
         _ => rsx! {},
     }
@@ -467,13 +539,79 @@ mod tests {
         );
     }
 
+    /// SME-521: the note names the three graces, a 0 one as kept, and a
+    /// default of 0 as no automatic removal at all.
     #[test]
-    fn test_the_storage_removal_note_says_whose_storage_goes() {
+    fn test_the_storage_note_names_the_three_graces() {
+        let graces = GraceSettings { default_days: 7, agent_days: 1, user_days: 30 };
         assert_eq!(
-            storage_removal_note(7),
-            "Storage a quietly stopped sandbox keeps is removed 7 days after the stop; a sandbox you stopped keeps it until you remove it."
+            storage_grace_note(&graces),
+            "A stopped sandbox's storage is removed 7 days later; a finished agent's is removed 1 day later; one you stopped is removed 30 days later."
         );
-        assert_eq!(storage_removal_note(0), "Storage is never removed automatically.");
+        assert_eq!(
+            storage_grace_note(&GraceSettings { user_days: 0, ..graces }),
+            "A stopped sandbox's storage is removed 7 days later; a finished agent's is removed 1 day later; one you stopped is kept until you remove it."
+        );
+        assert_eq!(
+            storage_grace_note(&GraceSettings { default_days: 0, ..graces }),
+            "Storage is never removed automatically."
+        );
+    }
+
+    #[test]
+    fn test_the_storage_report_says_the_class_and_the_released_volumes() {
+        use crate::api::sandbox::ReleasedVolumes;
+        let class = |policy: &str| ClaimClass::Found {
+            name: "local-path".to_string(),
+            provisioner: "rancher.io/local-path".to_string(),
+            reclaim_policy: policy.to_string(),
+            configured: false,
+        };
+        let released = Some(ReleasedVolumes { count: 3, capacity_bytes: 60 << 30, oldest: None });
+        assert_eq!(
+            storage_report_lines(&StorageReport { class: class("Delete"), released: released.clone() }),
+            ["Sandbox claims use local-path (reclaim: Delete).", "Released volumes not yet reclaimed: 3 (60 GiB)."]
+        );
+        assert_eq!(
+            storage_report_lines(&StorageReport { class: class("Retain"), released: None }),
+            ["Sandbox claims use local-path (reclaim: Retain); removing storage frees no disk."]
+        );
+        // Review 1, B-L1: no provisioner, no one to reclaim it.
+        let static_class = ClaimClass::Found {
+            name: "static".to_string(),
+            provisioner: "kubernetes.io/no-provisioner".to_string(),
+            reclaim_policy: "Delete".to_string(),
+            configured: true,
+        };
+        assert_eq!(
+            storage_report_lines(&StorageReport { class: static_class, released: None }),
+            ["Sandbox claims use static (reclaim: Delete, no provisioner); removing storage frees no disk."]
+        );
+        assert_eq!(
+            storage_report_lines(&StorageReport { class: ClaimClass::Missing { name: "fast".to_string() }, released: None }),
+            ["Sandbox claims name storage class fast, which the cluster doesn't have."]
+        );
+        assert!(storage_report_lines(&StorageReport { class: ClaimClass::Unavailable, released: None }).is_empty());
+    }
+
+    #[test]
+    fn test_the_summary_line_counts_what_the_claims_hold() {
+        let summary = StoredSummary {
+            conversations: 34,
+            claims: 68,
+            requested_bytes: 1_429_365_116_108,
+            past_grace: 12,
+            orphaned: 0,
+        };
+        assert_eq!(
+            summary_text(&summary),
+            "34 conversations hold 68 claims (1.3 TiB requested) \u{b7} 12 past their grace, removed over the next passes \u{b7} 0 orphaned"
+        );
+        let one = StoredSummary { conversations: 1, claims: 1, requested_bytes: 20 << 30, past_grace: 0, orphaned: 2 };
+        assert_eq!(
+            summary_text(&one),
+            "1 conversation holds 1 claim (20 GiB requested) \u{b7} 0 past their grace, removed over the next passes \u{b7} 2 orphaned"
+        );
     }
 
     #[test]
@@ -515,6 +653,7 @@ mod tests {
             volumes,
             stopped: None,
             observed_at: chrono::NaiveDateTime::default(),
+            fate: StorageFate::Unknown,
         };
         let both = row(vec![
             volume(StorageKind::Workspace, Some("20Gi"), false),
@@ -534,18 +673,33 @@ mod tests {
         assert_eq!(volume_cell_text(&row(vec![on_node]), StorageKind::Workspace), "20Gi on ryzen");
     }
 
+    /// SME-521: the row says what the server's rule says, whatever the
+    /// stop was — the page does no grace math of its own.
     #[test]
-    fn test_a_rows_stop_says_when_and_what_becomes_of_its_storage() {
-        use crate::api::pods::PodStop;
+    fn test_a_rows_stop_says_when_and_what_its_fate_is() {
+        use crate::api::pods::{GraceClass, PodStop};
         let now = chrono::NaiveDate::from_ymd_opt(2026, 11, 10).expect("date").and_hms_opt(12, 0, 0).expect("time");
         let days_ago = |d: i64| now - chrono::Duration::days(d);
-        let quiet = PodStop { at: days_ago(3), quiet: true };
-        assert_eq!(stopped_text(Some(&quiet), Some(7), now), "stopped 3d 0h ago \u{b7} removed in 4 days");
-        assert_eq!(stopped_text(Some(&PodStop { at: days_ago(6), quiet: true }), Some(7), now), "stopped 6d 0h ago \u{b7} removed in 1 day");
-        assert_eq!(stopped_text(Some(&PodStop { at: days_ago(8), quiet: true }), Some(7), now), "stopped 8d 0h ago \u{b7} removed within the hour");
-        assert_eq!(stopped_text(Some(&quiet), Some(0), now), "stopped 3d 0h ago \u{b7} kept until you remove it");
-        assert_eq!(stopped_text(Some(&PodStop { at: days_ago(3), quiet: false }), Some(7), now), "stopped 3d 0h ago \u{b7} kept until you remove it");
-        assert_eq!(stopped_text(None, Some(7), now), "");
-        assert_eq!(stopped_text(Some(&quiet), None, now), "stopped 3d 0h ago", "no fate until the grace is known");
+        let removes = |in_days: i64, class| StorageFate::RemovesAt { at: now + chrono::Duration::days(in_days), days: 7, class };
+        let stop = PodStop { at: days_ago(3), quiet: false };
+        assert_eq!(
+            stopped_text(Some(&stop), &removes(27, GraceClass::UserStop), now),
+            "stopped 3d 0h ago \u{b7} removed in 27 days",
+            "the user's Stop is removed too now"
+        );
+        let in_a_day = StorageFate::RemovesAt { at: now + chrono::Duration::hours(20), days: 1, class: GraceClass::Agent };
+        assert_eq!(stopped_text(Some(&stop), &in_a_day, now), "stopped 3d 0h ago \u{b7} removed in 1 day");
+        assert_eq!(
+            stopped_text(Some(&stop), &removes(-1, GraceClass::Default), now),
+            "stopped 3d 0h ago \u{b7} due for removal"
+        );
+        assert_eq!(stopped_text(Some(&stop), &StorageFate::Kept, now), "stopped 3d 0h ago \u{b7} kept until you remove it");
+        assert_eq!(stopped_text(Some(&stop), &StorageFate::Unknown, now), "stopped 3d 0h ago", "no fate from an older server");
+        assert_eq!(stopped_text(None, &StorageFate::Live, now), "", "in use");
+        assert_eq!(
+            stopped_text(None, &removes(5, GraceClass::NoPod), now),
+            "removed in 5 days",
+            "claims no pod used have a fate but no stop"
+        );
     }
 }
