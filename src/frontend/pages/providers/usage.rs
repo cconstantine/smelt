@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use super::*;
 use crate::api::usage_windows::get_provider_usage;
 use crate::claude_cli::usage::{ProviderUsage, UsageWindow};
+use crate::frontend::timezone::{LocalZone, use_local_zone};
 
 /// The share a window is at, as a whole percent.
 pub fn usage_percent(utilization: f64) -> u32 {
@@ -65,14 +66,17 @@ pub fn usage_short_text(usage: &ProviderUsage) -> String {
         .join(" \u{b7} ")
 }
 
-/// `resets 14:20 UTC` within a day of `now`, else `resets Mon 09:00 UTC`;
-/// `reset since` once it's past.
-pub fn reset_text(window: &UsageWindow, now: DateTime<Utc>) -> String {
+/// `resets 14:20 PST` within a day of `now`, else `resets Mon 09:00 PST`,
+/// on the viewer's wall clock with its local weekday (SME-523); `reset
+/// since` once it's past.
+pub fn reset_text(window: &UsageWindow, now: DateTime<Utc>, zone: &LocalZone) -> String {
     match window.resets_at {
         None => "reset time unknown".to_string(),
         Some(_) if window.reset_passed => "reset since".to_string(),
-        Some(at) if at - now < chrono::Duration::hours(24) => format!("resets {}", at.format("%H:%M UTC")),
-        Some(at) => format!("resets {}", at.format("%a %H:%M UTC")),
+        Some(at) if at - now < chrono::Duration::hours(24) => {
+            format!("resets {} {}", zone.local(at).format("%H:%M"), zone.label)
+        }
+        Some(at) => format!("resets {} {}", zone.local(at).format("%a %H:%M"), zone.label),
     }
 }
 
@@ -90,10 +94,10 @@ pub fn seen_text(seen_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
 /// The context bar indicator's hover text: `Claude subscription: 5-hour
 /// 45%, resets 14:20 UTC; 7-day 32%, resets Mon 09:00 UTC`; an ended
 /// window reads `5-hour —, reset since`.
-pub fn usage_title(usage: &ProviderUsage) -> String {
+pub fn usage_title(usage: &ProviderUsage, zone: &LocalZone) -> String {
     let parts: Vec<String> = ordered(usage)
         .iter()
-        .map(|w| format!("{} {}, {}", long_name(&w.name), shown_text(w), reset_text(w, usage.observed_at)))
+        .map(|w| format!("{} {}, {}", long_name(&w.name), shown_text(w), reset_text(w, usage.observed_at, zone)))
         .collect();
     format!("Claude subscription: {}", parts.join("; "))
 }
@@ -119,6 +123,7 @@ pub fn usage_level(usage: &ProviderUsage) -> Option<&'static str> {
 /// read it and, for the 7-day window, its pace.
 #[component]
 pub(super) fn SubscriptionUsage(id: i64, refresh: Signal<u64>) -> Element {
+    let zone = use_local_zone();
     let usage = use_resource(move || async move {
         refresh();
         get_provider_usage(id).await
@@ -140,7 +145,7 @@ pub(super) fn SubscriptionUsage(id: i64, refresh: Signal<u64>) -> Element {
                     }
                     span { class: "subscription-window-percent", "{shown_text(w)}" }
                     span { class: "muted subscription-window-when",
-                        "{reset_text(w, usage.observed_at)} \u{b7} {seen_text(w.seen_at, usage.observed_at)}"
+                        "{reset_text(w, usage.observed_at, &zone.read())} \u{b7} {seen_text(w.seen_at, usage.observed_at)}"
                         if let Some(projected) = w.projected.filter(|_| w.name == "seven_day") {
                             " \u{b7} on pace for {usage_percent(projected)}% by reset"
                         }

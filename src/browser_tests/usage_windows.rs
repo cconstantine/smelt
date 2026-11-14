@@ -1,6 +1,7 @@
 //! Scenario `usage_windows` (SME-486 B1): the Claude subscription's usage
 //! windows on a Claude Code provider's page, its providers-list row and
-//! its conversation's context bar, and not on an HTTP provider's.
+//! its conversation's context bar, and not on an HTTP provider's; with
+//! SME-523's T3, the resets and a usage hold on the browser's clock.
 
 use super::*;
 
@@ -55,6 +56,53 @@ fn assert_bar_fits(at: &str, m: &serde_json::Value) {
     assert_eq!(m["inside"], true, "{at}: the indicator runs past the bar: {m}");
 }
 
+/// The zone T3 (SME-523) runs its tabs in: no daylight saving, a
+/// half-hour offset, and no short name in en-US, so the label is the
+/// browser's `GMT+5:30`.
+const ZONE: &str = "Asia/Kolkata";
+const ZONE_OFFSET_MINUTES: i64 = 330;
+
+/// `at` on `ZONE`'s wall clock, `HH:MM`.
+fn zone_clock(at: chrono::DateTime<chrono::Utc>) -> String {
+    (at + chrono::Duration::minutes(ZONE_OFFSET_MINUTES)).format("%H:%M").to_string()
+}
+
+/// Opens `url` in a new tab whose browser runs in `ZONE` from its first
+/// script on: the zone is read once per page load.
+async fn zoned_tab(t: &Scenario<'_>, url: String) -> chromiumoxide::Page {
+    let page = t.tab("about:blank").await;
+    page.execute(chromiumoxide::cdp::browser_protocol::emulation::SetTimezoneOverrideParams::new(ZONE))
+        .await
+        .expect("set the tab's time zone");
+    page.goto(url.as_str()).await.unwrap_or_else(|e| panic!("open {url}: {e}"));
+    page
+}
+
+/// T3 (SME-523): a held turn's working line, in `ZONE`, on one line at
+/// 360 px; and the line goes back to "Working…" when the hold clears.
+async fn assert_hold_line(chat: &chromiumoxide::Page, conversation: i64) {
+    use crate::events::{ConversationEvent, publish};
+    chat.execute(chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::new(360, 800, 1.0, false))
+        .await
+        .expect("resize the page");
+    let until = chrono::Utc::now() + chrono::Duration::minutes(90);
+    publish(conversation, ConversationEvent::TurnState { running: true, elapsed: 0 });
+    publish(conversation, ConversationEvent::UsageHold { until: Some(until.timestamp()) });
+    let held = format!("Waiting for the Claude 5-hour usage window \u{b7} resumes about {} (in 1 h", zone_clock(until));
+    assert!(wait_for_text(chat, &held, Duration::from_secs(10)).await, "the working line doesn't say {held:?}");
+    let fits: bool = chat
+        .evaluate("(() => { const line = document.querySelector('.turn-working'); return line.scrollWidth <= line.clientWidth + 0.5; })()")
+        .await
+        .expect("measure the working line")
+        .into_value()
+        .expect("a bool");
+    assert!(fits, "the held working line runs past its box at 360 px");
+    publish(conversation, ConversationEvent::UsageHold { until: None });
+    assert!(wait_for_text(chat, "Working\u{2026}", Duration::from_secs(10)).await, "the cleared hold's line");
+    publish(conversation, ConversationEvent::TurnState { running: false, elapsed: 0 });
+    assert!(wait_for_count(chat, ".turn-working", 0, Duration::from_secs(10)).await, "the turn ended");
+}
+
 pub(super) async fn scenario_usage_windows(t: &Scenario<'_>) {
     // A binary that doesn't exist: the page's CLI status and model list
     // fail fast, and the usage block doesn't wait on them.
@@ -69,9 +117,10 @@ pub(super) async fn scenario_usage_windows(t: &Scenario<'_>) {
     ];
     db::record_usage_windows(t.pool, provider, &rows).await.expect("seed the windows");
 
-    // 1. The provider's page.
-    let page = t.tab(t.url(&format!("providers/{provider}"))).await;
-    for text in ["Subscription usage", "45%", "32%", "resets "] {
+    // 1. The provider's page, its resets on the browser's clock (T3).
+    let page = zoned_tab(t, t.url(&format!("providers/{provider}"))).await;
+    let reset = format!("resets {} GMT+5:30", zone_clock(rows[0].resets_at.expect("a reset")));
+    for text in ["Subscription usage", "45%", "32%", reset.as_str()] {
         assert!(wait_for_text(&page, text, Duration::from_secs(15)).await, "the provider page doesn't show {text:?}");
     }
 
@@ -90,7 +139,7 @@ pub(super) async fn scenario_usage_windows(t: &Scenario<'_>) {
     .await
     .expect("seed a todo list");
     assert!(db::set_conversation_model(t.pool, conversation.id, provider, "claude-sonnet-4-5").await.expect("set the model"), "the conversation exists");
-    let chat = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    let chat = zoned_tab(t, t.url(&format!("conversation/{}", conversation.id))).await;
     wait_for_live_client(&chat, conversation.id).await;
     let indicator = ".context-usage-bar .subscription-usage";
     wait_for_element(&chat, indicator, Duration::from_secs(15)).await;
@@ -116,7 +165,10 @@ pub(super) async fn scenario_usage_windows(t: &Scenario<'_>) {
         assert_bar_fits(&format!("{width} px"), &measure_bar(&chat).await);
     }
 
-    // 6. A conversation on the mock HTTP provider has no indicator.
+    // 6. A held turn's working line (SME-523 T3).
+    assert_hold_line(&chat, conversation.id).await;
+
+    // 7. A conversation on the mock HTTP provider has no indicator.
     let other = t.conversation().await;
     seed_usage(t.pool, other.id, 40_000, 10_000).await;
     let plain = t.tab(t.url(&format!("conversation/{}", other.id))).await;

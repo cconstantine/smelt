@@ -31,16 +31,15 @@ pub(super) fn use_turn_timer(state: Store<ConversationState>) {
 /// from. A hook, not an effect: it reads nothing reactive, so an effect
 /// never reran anyway (SME-58). Web-only: there's no browser `Date`
 /// during SSR, and 0 (UTC) is a fine fallback for the pre-hydration
-/// render either way.
+/// render either way. The zone comes from the one shared reader
+/// (`frontend::timezone`, SME-523).
 #[cfg(feature = "web")]
 pub(super) fn use_timezone_offset(tz_offset_minutes: Signal<i32>) {
     let mut tz_offset_minutes = tz_offset_minutes;
     use_hook(move || {
         spawn(async move {
-            if let Ok(value) = document::eval("return -new Date().getTimezoneOffset();").await
-                && let Some(offset) = value.as_i64()
-            {
-                tz_offset_minutes.set(offset as i32);
+            if let Some(zone) = crate::frontend::timezone::read_local_zone().await {
+                tz_offset_minutes.set(zone.offset_minutes);
             }
         });
     });

@@ -1,4 +1,5 @@
 use super::*;
+use crate::frontend::timezone::LocalZone;
 
 fn choice(tools: Option<bool>, known: bool) -> ModelChoice {
     ModelChoice {
@@ -309,15 +310,16 @@ fn test_the_usage_level_compares_the_percent_shown() {
 fn test_reset_and_seen_texts() {
     use super::usage::{reset_text, seen_text, usage_title};
     let now = usage_now();
-    assert_eq!(reset_text(&usage_window("five_hour", 0.4, "allowed", 2, now), now), "resets 14:00 UTC");
-    assert_eq!(reset_text(&usage_window("seven_day", 0.4, "allowed", 84, now), now), "resets Tue 00:00 UTC");
-    assert_eq!(reset_text(&usage_window("five_hour", 0.4, "allowed", -1, now), now), "reset since");
+    let utc = LocalZone::utc();
+    assert_eq!(reset_text(&usage_window("five_hour", 0.4, "allowed", 2, now), now, &utc), "resets 14:00 UTC");
+    assert_eq!(reset_text(&usage_window("seven_day", 0.4, "allowed", 84, now), now, &utc), "resets Tue 00:00 UTC");
+    assert_eq!(reset_text(&usage_window("five_hour", 0.4, "allowed", -1, now), now, &utc), "reset since");
     assert_eq!(seen_text(now, now), "seen just now");
     assert_eq!(seen_text(now - chrono::Duration::minutes(3), now), "seen 3 min ago");
     assert_eq!(seen_text(now - chrono::Duration::minutes(130), now), "seen 2 h ago");
     assert_eq!(seen_text(now - chrono::Duration::days(4), now), "seen 4 d ago");
     let usage = usage_of(vec![usage_window("seven_day", 0.32, "allowed", 84, now), usage_window("five_hour", 0.45, "allowed", 2, now)], now);
-    assert_eq!(usage_title(&usage), "Claude subscription: 5-hour 45%, resets 14:00 UTC; 7-day 32%, resets Tue 00:00 UTC");
+    assert_eq!(usage_title(&usage, &LocalZone::utc()), "Claude subscription: 5-hour 45%, resets 14:00 UTC; 7-day 32%, resets Tue 00:00 UTC");
 }
 
 /// Round 1 B-L5: a window whose reset has passed shows no percent, on the
@@ -331,5 +333,27 @@ fn test_an_ended_window_shows_no_stale_percent() {
     assert_eq!(shown_percent(&ended), None);
     assert_eq!(shown_percent(&usage_window("five_hour", 0.454, "allowed", 2, now)), Some(45));
     let usage = usage_of(vec![usage_window("seven_day", 0.32, "allowed", 84, now), ended], now);
-    assert_eq!(usage_title(&usage), "Claude subscription: 5-hour \u{2014}, reset since; 7-day 32%, resets Tue 00:00 UTC");
+    assert_eq!(usage_title(&usage, &LocalZone::utc()), "Claude subscription: 5-hour \u{2014}, reset since; 7-day 32%, resets Tue 00:00 UTC");
+}
+
+/// T1 (SME-523): resets in the viewer's zone, named as the browser names
+/// it, with the weekday of the local date: Tuesday 00:00 UTC is still
+/// Monday in California and already 05:30 on Tuesday in India.
+#[test]
+fn test_resets_show_in_the_viewers_zone_with_its_local_day() {
+    use super::usage::{reset_text, usage_title};
+    let now = usage_now();
+    let zone = |offset_minutes, label: &str| LocalZone { offset_minutes, label: label.to_string() };
+    let (pst, ist) = (zone(-480, "PST"), zone(330, "IST"));
+    let soon = usage_window("five_hour", 0.4, "allowed", 2, now);
+    let later = usage_window("seven_day", 0.4, "allowed", 84, now);
+    assert_eq!(reset_text(&soon, now, &pst), "resets 06:00 PST");
+    assert_eq!(reset_text(&soon, now, &ist), "resets 19:30 IST");
+    assert_eq!(reset_text(&later, now, &pst), "resets Mon 16:00 PST");
+    assert_eq!(reset_text(&later, now, &ist), "resets Tue 05:30 IST");
+    assert_eq!(reset_text(&usage_window("five_hour", 0.4, "allowed", -1, now), now, &pst), "reset since");
+    let usage = usage_of(vec![later, soon], now);
+    assert_eq!(usage_title(&usage, &pst), "Claude subscription: 5-hour 40%, resets 06:00 PST; 7-day 40%, resets Mon 16:00 PST");
+    use crate::frontend::timezone::offset_label;
+    assert_eq!((offset_label(0), offset_label(-480), offset_label(330)), ("UTC".into(), "UTC-8".into(), "UTC+5:30".into()));
 }
