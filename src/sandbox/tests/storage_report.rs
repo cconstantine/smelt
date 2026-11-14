@@ -3,9 +3,10 @@
 //! Released. Pure reads of API objects, and one live read.
 
 use super::*;
-use crate::api::sandbox::{ClaimClass, ReleasedVolumes};
+use crate::api::sandbox::{ClaimClass, ReleasedVolumes, StorageReport};
 use crate::sandbox::storage_report::{
-    claim_class, class_problem, released_overdue, released_volumes, storage_report_with,
+    StorageReportLog, claim_class, class_problem, released_overdue, released_volumes, report_from,
+    storage_report_with,
 };
 use k8s_openapi::api::core::v1::PersistentVolume;
 use k8s_openapi::api::storage::v1::StorageClass;
@@ -122,6 +123,33 @@ fn test_a_volume_released_over_a_day_ago_is_overdue() {
     assert!(!released_overdue(&released, at(10, 23).expect("a time")));
     assert!(released_overdue(&released, at(11, 1).expect("a time")));
     assert!(!released_overdue(&ReleasedVolumes::default(), at(30, 0).expect("a time")));
+}
+
+fn api_error(code: u16, reason: &str) -> kube::Error {
+    kube::Error::Api(Box::new(kube::core::Status::failure("no", reason).with_code(code)))
+}
+
+/// Review 1, B-L4: a read refused for the missing grant (a 403) reads as
+/// unavailable, the class as `Unavailable` and the volumes as `None`.
+#[test]
+fn test_a_forbidden_read_reads_as_unavailable() {
+    let report = report_from(Err(api_error(403, "Forbidden")), Err(api_error(403, "Forbidden")));
+    assert_eq!(report, StorageReport { class: ClaimClass::Unavailable, released: None });
+    let released = ReleasedVolumes { count: 1, capacity_bytes: 1, oldest: None };
+    let report = report_from(Err(api_error(403, "Forbidden")), Ok(released.clone()));
+    assert_eq!(report, StorageReport { class: ClaimClass::Unavailable, released: Some(released) });
+}
+
+/// Review 1, B-L4: the missing grant is logged once however many passes
+/// meet it; any other failure each time.
+#[test]
+fn test_a_missing_grant_is_logged_once() {
+    let mut log = StorageReportLog::default();
+    assert!(log.failed("storage classes", &api_error(403, "Forbidden")), "the first 403 is said");
+    assert!(!log.failed("persistent volumes", &api_error(403, "Forbidden")), "a second is not");
+    assert!(!log.failed("persistent volumes", &api_error(403, "Forbidden")));
+    assert!(log.failed("persistent volumes", &api_error(500, "InternalError")), "other failures each time");
+    assert!(log.failed("persistent volumes", &api_error(500, "InternalError")));
 }
 
 /// The test cluster's `park` account has the `smelt-storage-reader`

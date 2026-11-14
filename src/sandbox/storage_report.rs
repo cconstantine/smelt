@@ -132,6 +132,15 @@ async fn read_released(client: &kube::Client) -> Result<ReleasedVolumes, kube::E
 /// Both reads with `client`, a failure of either reading as unavailable.
 pub(in crate::sandbox) async fn storage_report_with(client: &kube::Client) -> StorageReport {
     let (class, released) = tokio::join!(read_claim_class(client), read_released(client));
+    report_from(class, released)
+}
+
+/// The two reads' results as a report, a failed one (a 403 for a missing
+/// grant, or any other) reading as unavailable.
+pub(in crate::sandbox) fn report_from(
+    class: Result<ClaimClass, kube::Error>,
+    released: Result<ReleasedVolumes, kube::Error>,
+) -> StorageReport {
     StorageReport { class: class.unwrap_or(ClaimClass::Unavailable), released: released.ok() }
 }
 
@@ -152,16 +161,19 @@ pub(crate) struct StorageReportLog {
 
 impl StorageReportLog {
     /// Logs a failed read: a 403 once, as the missing grant; anything
-    /// else each time.
-    fn failed(&mut self, what: &str, error: &kube::Error) {
+    /// else each time. Whether it logged anything.
+    pub(in crate::sandbox) fn failed(&mut self, what: &str, error: &kube::Error) -> bool {
         if matches!(error, kube::Error::Api(e) if e.code == 403) {
-            if !std::mem::replace(&mut self.said_forbidden, true) {
+            let say = !std::mem::replace(&mut self.said_forbidden, true);
+            if say {
                 tracing::info!(
                     "smelt can't read {what} (no smelt-storage-reader grant), so it can't tell whether removed storage frees disk"
                 );
             }
+            say
         } else {
             tracing::warn!(error = %error, "couldn't read {what}");
+            true
         }
     }
 
@@ -174,7 +186,9 @@ impl StorageReportLog {
                 Some(problem) => tracing::warn!("{problem}"),
                 None => tracing::info!(?class, "sandbox claims' storage class"),
             },
-            Err(e) => self.failed("storage classes", &e),
+            Err(e) => {
+                self.failed("storage classes", &e);
+            }
         }
     }
 
@@ -190,7 +204,9 @@ impl StorageReportLog {
                 "released sandbox volumes are still holding disk a day on: their storage class doesn't reclaim them"
             ),
             Ok(released) => tracing::info!(count = released.count, bytes = released.capacity_bytes, "released sandbox volumes"),
-            Err(e) => self.failed("persistent volumes", &e),
+            Err(e) => {
+                self.failed("persistent volumes", &e);
+            }
         }
     }
 }
