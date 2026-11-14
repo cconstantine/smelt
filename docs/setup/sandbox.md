@@ -66,3 +66,20 @@ The Sandboxes page (`/pods`) shows each sandbox pod's live memory and CPU use fr
 - **Another cluster** needs the manifest applied there.
 
 Until then, usage shows as "unavailable" and everything else on the page works.
+
+## Storage class
+
+SME-521. Each conversation's two claims (`/workspace` and Docker's data) take `SANDBOX_STORAGE_CLASS` if it's set, else the cluster's default class. smelt removes them after a grace (see [environment.md](environment.md), `SANDBOX_STORAGE_REMOVAL_DAYS` and the two after it), but deleting a claim frees disk only when its class has a dynamic provisioner with **`reclaimPolicy: Delete`**. With `Retain`, the volume stays `Released`, data and all, until someone deletes it by hand. k3s's stock `local-path` class (`rancher.io/local-path`) is `Delete`: a helper pod removes the directory, then the volume goes.
+
+- **What smelt reports.** With the read-only `smelt-storage-reader` ClusterRole (`get`/`list` on `persistentvolumes` and `storageclasses`; `k8s/smelt-park-rbac.yaml` and `terraform/smelt/rbac.tf` both grant it), smelt logs the class its claims get once at startup, as a warning when it isn't `Delete`, names a class the cluster lacks, or there's no default. Each hourly pass logs how many of its namespace's volumes are `Released` or `Failed`, as a warning once one has sat there over a day. The Sandboxes page's stored-volumes section shows both lines. Without the grant both reads are a 403, logged once, and the page shows neither.
+- **The local k3s** gets the grant like the metrics one above: `docker compose run --rm k3s-bootstrap`.
+- **Checking a cluster by hand** (admin access):
+
+  ```bash
+  kubectl get sc
+  kubectl get pv -o jsonpath='{range .items[*]}{.status.phase}{" "}{.spec.storageClassName}{" "}{.spec.persistentVolumeReclaimPolicy}{"\n"}{end}' | sort | uniq -c
+  kubectl -n smelt-park get pvc -o jsonpath='{range .items[*]}{.spec.storageClassName}{"\n"}{end}' | sort | uniq -c
+  ```
+
+- **If the claims' class is `Delete`** (the default `local-path`): nothing to do. Released volumes are transient; the pass removes at most 20 conversations (40 claims) an hour, so the provisioner's helper pods stay few.
+- **If it's `Retain`, or there's no default class:** set `SANDBOX_STORAGE_CLASS` (Terraform: `sandbox_storage_class_name`) to a class with `Delete`, such as `local-path`. Claims made after that use it; existing claims keep their class until their grace removes them. The volumes already `Released`, and their data, need deleting by hand (`kubectl delete pv <name>` for each of the namespace's `Released` ones, after checking nothing in them is wanted): smelt never deletes PersistentVolumes.
