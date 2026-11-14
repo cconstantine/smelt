@@ -146,8 +146,9 @@ resource "kubernetes_role_binding_v1" "park" {
 # it both reads come back 403 and smelt carries on without them.
 #
 # Off unless `storage_reader_enabled`: these are the module's only
-# cluster-scoped objects, and a deployer bound to its own namespaces can't
-# create them (it needs `create` on clusterroles/clusterrolebindings, and
+# cluster-wide RBAC objects (its namespaces are cluster-scoped as well, but
+# any deployer of this module already makes those), and a deployer bound to
+# its own namespaces can't create them (it needs `create` on clusterroles/clusterrolebindings, and
 # `escalate`/`bind` on this role, since it doesn't hold these reads itself).
 # Turn it on only once the deployer can, or have an admin apply
 # k8s/smelt-storage-reader.yaml instead.

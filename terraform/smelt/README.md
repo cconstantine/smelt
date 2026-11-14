@@ -93,8 +93,10 @@ where smelt's own real-cluster test suite runs.
   all. If the default isn't such a class, set this variable to one (k3s's
   `local-path` is). See `docs/setup/sandbox.md#storage-class`.
 - **`storage_reader_enabled` is an admin's switch, off by default.** It
-  makes the module's only cluster-scoped objects, and a deployer bound to its
-  own namespaces can't: applying them takes `create` on `clusterroles` and
+  makes the module's only cluster-wide RBAC objects (a ClusterRole and its
+  binding; the namespaces are cluster-scoped as well, but any deployer of this
+  module already makes those), and a deployer bound to its own namespaces
+  can't: applying them takes `create` on `clusterroles` and
   `clusterrolebindings` (`create` can't be narrowed by name),
   `get`/`update`/`patch`/`delete` on the name, and `escalate` and `bind` on
   that ClusterRole, since the deployer doesn't hold the reads it grants.
