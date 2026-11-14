@@ -81,12 +81,8 @@ pub(super) fn ConversationHeader(
             }
             // Its second click: the menu has closed (SME-513 Q2).
             MenuItem::Delete => {
-                // Read first: a guard in an `if let` lives through its
-                // block, and `run_delete` writes `deleting`.
-                let idle = deleting.peek().is_none();
-                if let Some(id) = selected()
-                    && idle
-                {
+                // `run_delete` sends nothing while this one's in flight.
+                if let Some(id) = selected() {
                     run_delete.call((id, after_delete(&nodes.peek(), id)));
                 }
             }
@@ -112,7 +108,7 @@ pub(super) fn ConversationHeader(
                     turn_running: state.turn_running()(),
                     compacting,
                     delete_confirm: selected().map(|id| delete_confirm_label(&nodes.read(), id)).unwrap_or_default(),
-                    deleting: deleting().is_some() && deleting() == selected(),
+                    deleting: selected().is_some_and(|id| deleting.read().contains(&id)),
                     on_action,
                 }
                 // Last in the row: its popover is right-aligned under ☰ and
@@ -170,9 +166,8 @@ fn archive_conversation(id: i64, archived: bool, nodes: Signal<Vec<ConversationN
 /// reply could land the page anywhere.
 #[derive(Clone, Copy, PartialEq)]
 pub(super) struct MenuDelete {
-    /// The conversation whose DELETE is in flight, so a third click sends
-    /// no second one.
-    pub deleting: Signal<Option<i64>>,
+    /// The conversations whose DELETE is in flight (`begin_delete`).
+    pub deleting: Signal<std::collections::BTreeSet<i64>>,
     /// The last menu action's failure, with the conversation it's about:
     /// the header isn't remounted on a switch (review 1, L1), so another's
     /// error mustn't show there.
@@ -190,14 +185,16 @@ pub(super) struct MenuDelete {
 /// the conversation stays. Call it in a component that outlives the
 /// header: its task is that component's.
 pub(super) fn use_menu_delete(selected: Memo<Option<i64>>, nodes: Signal<Vec<ConversationNode>>) -> MenuDelete {
-    let mut deleting: Signal<Option<i64>> = use_signal(|| None);
+    let mut deleting: Signal<std::collections::BTreeSet<i64>> = use_signal(Default::default);
     let mut error: Signal<Option<(i64, String)>> = use_signal(|| None);
     let mut nodes = nodes;
     let run = use_callback(move |(id, to): (i64, Route)| {
-        deleting.set(Some(id));
+        if !begin_delete(&mut deleting.write(), id) {
+            return;
+        }
         spawn(async move {
             let result = delete_conversation(id).await;
-            deleting.set(None);
+            end_delete(&mut deleting.write(), id);
             match result {
                 Ok(()) => {
                     error.set(None);
@@ -212,6 +209,18 @@ pub(super) fn use_menu_delete(selected: Memo<Option<i64>>, nodes: Signal<Vec<Con
         });
     });
     MenuDelete { deleting, error, run }
+}
+
+/// Marks `id`'s DELETE in flight; false when one already is, so a third
+/// click sends no second one. Another conversation's DELETE in flight
+/// doesn't count (review 1, A-L1).
+fn begin_delete(in_flight: &mut std::collections::BTreeSet<i64>, id: i64) -> bool {
+    in_flight.insert(id)
+}
+
+/// `id`'s reply is in.
+fn end_delete(in_flight: &mut std::collections::BTreeSet<i64>, id: i64) {
+    in_flight.remove(&id);
 }
 
 /// Where deleting `id` from its own page lands: its parent, if listed,
@@ -339,6 +348,18 @@ mod tests {
         assert_eq!(archive(1), Some(true));
         assert_eq!(archive(3), Some(false));
         assert_eq!(archive(2), None);
+    }
+
+    /// Review 1, A-L1: one conversation's DELETE in flight doesn't turn
+    /// away another's; only a second one for the same conversation is.
+    #[test]
+    fn test_a_delete_in_flight_holds_back_only_its_own_conversation() {
+        let mut in_flight = std::collections::BTreeSet::new();
+        assert!(begin_delete(&mut in_flight, 1), "the first delete goes");
+        assert!(!begin_delete(&mut in_flight, 1), "a third click on the same one sends nothing");
+        assert!(begin_delete(&mut in_flight, 2), "another conversation's delete still goes");
+        end_delete(&mut in_flight, 1);
+        assert!(begin_delete(&mut in_flight, 1), "once its reply is in, it can go again");
     }
 
     /// SME-513: deleting an agent from its own page lands on its parent;
