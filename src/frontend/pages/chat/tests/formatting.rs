@@ -183,3 +183,35 @@ fn test_format_timestamp_offset_crosses_a_day_boundary() {
         .unwrap();
     assert_eq!(format_timestamp(dt, 2 * 60), "1:32 AM");
 }
+
+/// T2 (SME-523): the working line while a call waits at the usage gate,
+/// in the viewer's local time, with how long is left.
+#[test]
+fn test_the_held_working_line_says_when_it_resumes_in_local_time() {
+    use crate::frontend::timezone::LocalZone;
+    use chrono::{Duration, TimeZone, Utc};
+    let now = Utc.with_ymd_and_hms(2026, 11, 14, 13, 57, 0).unwrap();
+    let at = |minutes: i64| now + Duration::minutes(minutes);
+    let (utc, pst, ist) = (LocalZone::utc(), LocalZone::fixed(-480, "PST"), LocalZone::fixed(330, "IST"));
+    assert_eq!(held_text(at(23), now, &utc), "Waiting for the Claude 5-hour usage window · resumes about 14:20 (in 23 min)");
+    assert_eq!(held_text(at(23), now, &pst), "Waiting for the Claude 5-hour usage window · resumes about 06:20 (in 23 min)");
+    assert_eq!(held_text(at(4 * 60 + 59), now, &ist), "Waiting for the Claude 5-hour usage window · resumes about 00:26 (in 4 h 59 min)");
+    assert_eq!(held_text(at(60), now, &utc), "Waiting for the Claude 5-hour usage window · resumes about 14:57 (in 1 h)");
+    // Part of a minute left counts as a minute; none left says so.
+    assert_eq!(held_text(now + Duration::seconds(30), now, &utc), "Waiting for the Claude 5-hour usage window · resumes about 13:57 (in 1 min)");
+    assert_eq!(held_text(now - Duration::seconds(5), now, &utc), "Waiting for the Claude 5-hour usage window · resumes any moment");
+}
+
+/// Review 2 L7: a hold ending past a daylight-saving change shows that
+/// side's wall clock. In California on 2027-03-14 the clocks go from 02:00
+/// PST to 03:00 PDT at 10:00 UTC; a hold until 11:00 UTC ends at 04:00.
+#[test]
+fn test_a_hold_ending_past_a_daylight_saving_change_shows_that_sides_time() {
+    use crate::frontend::timezone::LocalZone;
+    use chrono::{TimeZone, Utc};
+    let now = Utc.with_ymd_and_hms(2027, 3, 14, 8, 0, 0).unwrap();
+    let mut california = LocalZone::fixed(-480, "PST");
+    california.changes.push((Utc.with_ymd_and_hms(2027, 3, 14, 10, 0, 0).unwrap(), -420, "PDT".to_string()));
+    let until = Utc.with_ymd_and_hms(2027, 3, 14, 11, 0, 0).unwrap();
+    assert_eq!(held_text(until, now, &california), "Waiting for the Claude 5-hour usage window · resumes about 04:00 (in 3 h)");
+}

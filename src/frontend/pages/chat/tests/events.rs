@@ -378,3 +378,18 @@ fn test_apply_event_counters_and_the_stale_bundle_are_left_to_the_page() {
         assert_eq!(apply_event(state, ConversationEvent::Unknown), EventEffect::StaleBundle);
     });
 }
+
+/// SME-523: a usage hold sets the working line's hold, its clear and the
+/// turn's end take it away.
+#[test]
+fn test_a_usage_hold_event_sets_and_clears_the_hold() {
+    with_state(|state| {
+        apply_event(state, ConversationEvent::UsageHold { until: Some(1_700_000_000) });
+        assert_eq!(*state.usage_hold().peek(), chrono::DateTime::from_timestamp(1_700_000_000, 0));
+        apply_event(state, ConversationEvent::UsageHold { until: None });
+        assert_eq!(*state.usage_hold().peek(), None);
+        apply_event(state, ConversationEvent::UsageHold { until: Some(1_700_000_000) });
+        apply_event(state, ConversationEvent::TurnState { running: false, elapsed: 0 });
+        assert_eq!(*state.usage_hold().peek(), None, "a turn that ended waits on nothing");
+    });
+}

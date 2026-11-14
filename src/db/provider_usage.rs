@@ -41,6 +41,19 @@ pub async fn record_usage_windows(pool: &PgPool, provider_id: i64, rows: &[Provi
     tx.commit().await
 }
 
+/// The newest `five_hour` window recorded for any Claude Code provider:
+/// the usage gate's reading at startup (SME-523).
+pub async fn newest_claude_code_five_hour(pool: &PgPool) -> Result<Option<ProviderUsageWindowRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT w.window_name, w.utilization, w.status, w.resets_at, w.seen_at
+         FROM provider_usage_windows w JOIN inference_providers p ON p.id = w.provider_id
+         WHERE p.kind = 'claude_cli' AND w.window_name = 'five_hour'
+         ORDER BY w.seen_at DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+}
+
 /// `provider_id`'s windows, by name.
 pub async fn provider_usage_windows(pool: &PgPool, provider_id: i64) -> Result<Vec<ProviderUsageWindowRow>, sqlx::Error> {
     sqlx::query_as(

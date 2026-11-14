@@ -80,11 +80,15 @@ pub mod errors;
 #[cfg(feature = "server")]
 pub mod files;
 #[cfg(feature = "server")]
+pub mod gate;
+#[cfg(feature = "server")]
 pub mod once;
 #[cfg(feature = "server")]
 pub mod process;
 #[cfg(feature = "server")]
 pub mod render;
+#[cfg(feature = "server")]
+pub mod reseed;
 #[cfg(feature = "server")]
 pub mod run;
 #[cfg(feature = "server")]

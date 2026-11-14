@@ -140,7 +140,7 @@ async fn test_a_cut_off_one_shot_is_stopped_at_once(pool: PgPool) {
     let mut relay = |_: &str| {};
 
     let started = std::time::Instant::now();
-    let turn = crate::claude_cli::once::once(conversation.id, &model, &request, &mut relay, &meter).await.expect("the cut-off reply");
+    let turn = crate::claude_cli::once::once(conversation.id, &model, &request, crate::claude_cli::once::OnceLaunch::summary(), &mut relay, &meter).await.expect("the cut-off reply");
     let took = started.elapsed();
 
     assert_eq!(turn.stop_reason, "max_tokens");

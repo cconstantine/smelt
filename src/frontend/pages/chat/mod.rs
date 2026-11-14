@@ -267,6 +267,8 @@ fn ChatPanel(
         },
     );
     let tz_offset_minutes: Signal<i32> = use_signal(|| 0);
+    // The zone with its changes ahead, for the usage hold's time (SME-523).
+    let zone = use_signal(crate::frontend::timezone::LocalZone::utc);
     // The context bar, so closing its detail view can give it focus back.
     let context_bar_el: Signal<Option<MountedEvent>> = use_signal(|| None);
 
@@ -284,7 +286,7 @@ fn ChatPanel(
     let media_loaded: Signal<u64> = use_signal(|| 0);
 
     #[cfg(feature = "web")]
-    use_timezone_offset(tz_offset_minutes);
+    use_timezone_offset(tz_offset_minutes, zone);
     use_initial_messages(initial_messages, selected, state, transcript_scroll);
     #[cfg(feature = "web")]
     use_conversation_events(
@@ -354,6 +356,7 @@ fn ChatPanel(
                             state,
                             initial_messages,
                             tz_offset_minutes,
+                            zone,
                             input,
                             on_attach: move |_| attach_repo_now(),
                             stream_errors,

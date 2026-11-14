@@ -1,0 +1,267 @@
+//! The five-hour usage gate (SME-523): its verdict over a table (G1), the
+//! release order (G5) and the newest reading winning (G6), on gates of
+//! their own; the turn path's tests are in `turn::tests::claude_cli::gate`.
+
+use std::sync::Arc;
+use std::time::Duration as StdDuration;
+
+use chrono::{DateTime, Duration, Utc};
+
+use crate::claude_cli::gate::{FiveHour, Gate, LINE, Verdict, WINDOW, verdict};
+use crate::claude_cli::usage::{Reading, Window};
+
+/// A reading of `utilization` at `elapsed` of the window gone by, as of `now`.
+fn at(utilization: f64, elapsed: f64, now: DateTime<Utc>) -> FiveHour {
+    let left = Duration::milliseconds(((1.0 - elapsed) * WINDOW.num_milliseconds() as f64) as i64);
+    FiveHour { utilization, status: "allowed".into(), resets_at: Some(now + left), seen_at: now }
+}
+
+fn until(v: Verdict) -> DateTime<Utc> {
+    match v {
+        Verdict::Held { until } => until,
+        Verdict::Open => panic!("held, not open"),
+    }
+}
+
+/// G1: the line is `u ≥ 0.95 × e`, with `e` floored at 1/7.
+#[test]
+fn test_the_verdict_holds_on_pace_to_pass_the_line() {
+    let now = Utc::now();
+    assert_eq!(verdict(Some(&at(0.28, 0.30, now)), now), Verdict::Open, "0.93 of the line");
+    let held = at(0.29, 0.30, now);
+    let release = until(verdict(Some(&held), now));
+    let start = held.resets_at.expect("a reset") - WINDOW;
+    let expected = start + Duration::milliseconds((WINDOW.num_milliseconds() as f64 * 0.29 / LINE) as i64);
+    assert!((release - expected).num_milliseconds().abs() <= 1, "release at start + 5h × u / 0.95: {release} vs {expected}");
+    assert!(release > now, "{release}");
+    assert_eq!(verdict(Some(&held), release), Verdict::Open, "open once the release comes");
+    assert!(matches!(verdict(Some(&held), release - Duration::seconds(1)), Verdict::Held { .. }), "held just before");
+}
+
+#[test]
+fn test_the_verdict_floors_the_elapsed_share_at_a_seventh() {
+    let now = Utc::now();
+    assert!(matches!(verdict(Some(&at(0.14, 0.05, now)), now), Verdict::Held { .. }), "0.14 ÷ 1/7 = 0.98");
+    assert_eq!(verdict(Some(&at(0.13, 0.05, now)), now), Verdict::Open, "0.13 ÷ 1/7 = 0.91, not 0.13 ÷ 0.05");
+}
+
+#[test]
+fn test_a_rejected_or_full_window_is_held_until_its_reset() {
+    let now = Utc::now();
+    let mut rejected = at(0.50, 0.30, now);
+    rejected.status = "rejected".into();
+    assert_eq!(verdict(Some(&rejected), now), Verdict::Held { until: rejected.resets_at.expect("a reset") });
+    let full = at(0.97, 0.90, now);
+    assert_eq!(verdict(Some(&full), now), Verdict::Held { until: full.resets_at.expect("a reset") }, "never past the reset");
+}
+
+#[test]
+fn test_the_verdict_fails_open() {
+    let now = Utc::now();
+    assert_eq!(verdict(None, now), Verdict::Open, "no reading");
+    let mut passed = at(1.0, 0.5, now - WINDOW);
+    passed.status = "rejected".into();
+    assert_eq!(verdict(Some(&passed), now), Verdict::Open, "a reset passed");
+    let mut no_reset = at(1.0, 0.5, now);
+    no_reset.resets_at = None;
+    assert_eq!(verdict(Some(&no_reset), now), Verdict::Open, "no reset time");
+}
+
+#[test]
+fn test_the_gate_reads_a_readings_five_hour_window() {
+    let now = Utc::now();
+    let resets = Some(now + Duration::hours(1));
+    let window = |name: &str, utilization| Window { name: name.into(), utilization, status: "allowed".into(), resets_at: resets };
+    let reading = Reading { windows: vec![window("seven_day", 0.40), window("five_hour", 0.20)], seen_at: now };
+    assert_eq!(
+        FiveHour::from_reading(&reading),
+        Some(FiveHour { utilization: 0.20, status: "allowed".into(), resets_at: resets, seen_at: now })
+    );
+    let seven_only = Reading { windows: vec![window("seven_day", 0.40)], seen_at: now };
+    assert_eq!(FiveHour::from_reading(&seven_only), None);
+}
+
+/// G6: a late, older reading doesn't reopen a hold.
+#[test]
+fn test_the_newest_reading_wins() {
+    let gate = Gate::new(StdDuration::ZERO);
+    let now = Utc::now();
+    gate.observe(at(0.99, 0.5, now));
+    assert!(matches!(gate.verdict(), Verdict::Held { .. }));
+    gate.observe(at(0.01, 0.5, now - Duration::seconds(5)));
+    assert!(matches!(gate.verdict(), Verdict::Held { .. }), "the older reading is ignored");
+    gate.observe(at(0.01, 0.5, now + Duration::milliseconds(1)));
+    assert_eq!(gate.verdict(), Verdict::Open, "a newer one is taken");
+}
+
+async fn until_waiting(gate: &Gate, n: usize) {
+    for _ in 0..500 {
+        if gate.waiting().len() == n {
+            return;
+        }
+        tokio::time::sleep(StdDuration::from_millis(5)).await;
+    }
+    panic!("{n} waiters never queued: {:?}", gate.waiting());
+}
+
+/// G5: warm waiters first, oldest first among each, a spacing apart. With
+/// FIFO alone the cold, older waiter would go first.
+#[tokio::test]
+async fn test_waiters_pass_warm_first_then_oldest_a_spacing_apart() {
+    let spacing = StdDuration::from_millis(50);
+    let gate = Arc::new(Gate::new(spacing));
+    let (warm_old, cold_older, warm_new) = (1, 2, 3);
+    // Open and no one queued: each passes at once, and is warm after.
+    for id in [warm_old, warm_new] {
+        tokio::time::timeout(StdDuration::from_secs(1), gate.wait(id, |_| {})).await.expect("passes at once");
+    }
+    let now = Utc::now();
+    gate.observe(at(0.99, 0.5, now));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    for (n, id) in [cold_older, warm_old, warm_new].into_iter().enumerate() {
+        let (shared, tx) = (gate.clone(), tx.clone());
+        tokio::spawn(async move {
+            shared.wait(id, |_| {}).await;
+            let _ = tx.send((id, tokio::time::Instant::now()));
+        });
+        until_waiting(&gate, n + 1).await;
+    }
+    gate.observe(at(0.01, 0.5, now + Duration::milliseconds(1)));
+    let mut passed = Vec::new();
+    for _ in 0..3 {
+        passed.push(tokio::time::timeout(StdDuration::from_secs(5), rx.recv()).await.expect("each passes").expect("sent"));
+    }
+    let order: Vec<i64> = passed.iter().map(|(id, _)| *id).collect();
+    assert_eq!(order, vec![warm_old, warm_new, cold_older]);
+    for pair in passed.windows(2) {
+        let gap = pair[1].1 - pair[0].1;
+        assert!(gap >= spacing - StdDuration::from_millis(10), "a spacing apart: {gap:?}");
+    }
+    assert!(gate.waiting().is_empty());
+}
+
+/// Queues `ids` on `gate` (held), in order, each sending its id once it
+/// passes.
+async fn queue(gate: &Arc<Gate>, ids: &[i64], tx: &tokio::sync::mpsc::UnboundedSender<i64>) {
+    for id in ids {
+        let (shared, tx, id) = (gate.clone(), tx.clone(), *id);
+        let before = gate.waiting().len();
+        tokio::spawn(async move {
+            shared.wait(id, |_| {}).await;
+            let _ = tx.send(id);
+        });
+        until_waiting(gate, before + 1).await;
+    }
+}
+
+async fn passed_in_order(rx: &mut tokio::sync::mpsc::UnboundedReceiver<i64>, n: usize) -> Vec<i64> {
+    let mut order = Vec::new();
+    for _ in 0..n {
+        order.push(tokio::time::timeout(StdDuration::from_secs(5), rx.recv()).await.expect("each passes").expect("sent"));
+    }
+    order
+}
+
+/// Review 1 M1: warmth is decided as the queue is released, not when the
+/// call queued. A conversation that passed just before queueing, but whose
+/// cache has since gone past `WARM_FOR`, no longer jumps an older waiter.
+#[tokio::test]
+async fn test_a_waiter_whose_cache_went_cold_while_waiting_loses_its_priority() {
+    let warm_for = StdDuration::from_millis(200);
+    let gate = Arc::new(Gate::with_timing(StdDuration::ZERO, warm_for, StdDuration::from_secs(3600)));
+    let (was_warm, cold) = (1, 2);
+    tokio::time::timeout(StdDuration::from_secs(1), gate.wait(was_warm, |_| {})).await.expect("passes at once");
+    let now = Utc::now();
+    gate.observe(at(0.99, 0.5, now));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    queue(&gate, &[cold, was_warm], &tx).await;
+    tokio::time::sleep(warm_for + StdDuration::from_millis(100)).await;
+    gate.observe(at(0.01, 0.5, now + Duration::milliseconds(1)));
+    assert_eq!(passed_in_order(&mut rx, 2).await, vec![cold, was_warm], "both cold now: oldest first");
+}
+
+/// Review 1 M1: a cold waiter that has waited `COLD_LIMIT` ranks with the
+/// warm ones, so it goes ahead of a warm one that queued after it.
+#[tokio::test]
+async fn test_a_cold_waiter_past_the_cold_limit_goes_ahead_of_a_newer_warm_one() {
+    let cold_limit = StdDuration::from_millis(200);
+    let gate = Arc::new(Gate::with_timing(StdDuration::ZERO, StdDuration::from_secs(3600), cold_limit));
+    let (warm, cold) = (1, 2);
+    tokio::time::timeout(StdDuration::from_secs(1), gate.wait(warm, |_| {})).await.expect("passes at once");
+    let now = Utc::now();
+    gate.observe(at(0.99, 0.5, now));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    queue(&gate, &[cold], &tx).await;
+    tokio::time::sleep(cold_limit + StdDuration::from_millis(100)).await;
+    queue(&gate, &[warm], &tx).await;
+    gate.observe(at(0.01, 0.5, now + Duration::milliseconds(1)));
+    assert_eq!(passed_in_order(&mut rx, 2).await, vec![cold, warm], "the aged cold waiter first");
+}
+
+/// Review 1 L5's nit: a pass older than `WARM_FOR` is forgotten.
+#[tokio::test]
+async fn test_passes_too_old_to_be_warm_are_pruned() {
+    let warm_for = StdDuration::from_millis(100);
+    let gate = Gate::with_timing(StdDuration::ZERO, warm_for, StdDuration::from_secs(3600));
+    gate.wait(1, |_| {}).await;
+    gate.wait(2, |_| {}).await;
+    assert_eq!(gate.remembered(), 2);
+    tokio::time::sleep(warm_for + StdDuration::from_millis(50)).await;
+    gate.wait(3, |_| {}).await;
+    assert_eq!(gate.remembered(), 1, "only the fresh pass is kept");
+}
+
+/// Review 2 L10: a waiter behind another looks again within the spacing
+/// even with no wake. The interleaving forced: the one ahead leaves the
+/// line with no notify (as when the order flips between two waiters'
+/// looks and each finds the other first), and the waiter behind it still
+/// passes.
+#[tokio::test]
+async fn test_a_waiter_behind_another_looks_again_without_a_wake() {
+    let spacing = StdDuration::from_millis(200);
+    let gate = Arc::new(Gate::new(spacing));
+    let ahead = gate.queue_for_tests(1);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    queue(&gate, &[2], &tx).await;
+    // Its first look found 1 ahead of it, and it sleeps.
+    tokio::time::sleep(StdDuration::from_millis(50)).await;
+    gate.leave_quietly_for_tests(ahead);
+    let passed = tokio::time::timeout(StdDuration::from_secs(2), rx.recv()).await.expect("it looked again with no wake").expect("sent");
+    assert_eq!(passed, 2);
+}
+
+/// A dropped waiter leaves the queue at once, and the next can go.
+#[tokio::test]
+async fn test_a_dropped_waiter_leaves_the_queue() {
+    let gate = Arc::new(Gate::new(StdDuration::ZERO));
+    let now = Utc::now();
+    gate.observe(at(0.99, 0.5, now));
+    let waiting = tokio::spawn({
+        let gate = gate.clone();
+        async move { gate.wait(7, |_| {}).await }
+    });
+    until_waiting(&gate, 1).await;
+    waiting.abort();
+    let _ = waiting.await;
+    assert!(gate.waiting().is_empty(), "{:?}", gate.waiting());
+}
+
+/// Review 1 L2: a call still queued behind others once the gate opens
+/// still shows its hold to a tab that (re)connects, as its open tabs do
+/// until it passes.
+#[tokio::test]
+async fn test_a_call_queued_behind_others_after_a_hold_still_shows_it() {
+    let gate = Arc::new(Gate::new(StdDuration::from_secs(60)));
+    let now = Utc::now();
+    let held = at(0.99, 0.5, now);
+    let until = until(verdict(Some(&held), now));
+    gate.observe(held);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    queue(&gate, &[1, 2], &tx).await;
+    assert_eq!(gate.held_until(2), Some(until), "held");
+    gate.observe(at(0.01, 0.5, now + Duration::milliseconds(1)));
+    assert_eq!(passed_in_order(&mut rx, 1).await, vec![1]);
+    assert_eq!(gate.waiting(), vec![2], "2 waits out the spacing");
+    assert_eq!(gate.held_until(2), Some(until), "the hold it was told of, until it passes");
+    assert_eq!(gate.held_until(3), None, "not waiting");
+}

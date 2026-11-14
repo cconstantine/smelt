@@ -304,6 +304,15 @@ fn test_an_attach_error_line_shows_under_a_message_but_not_on_a_switchs_load() {
     assert!(!shows_attach_error_line(true, true, true), "a deleted conversation with an error line");
 }
 
+/// PR #353 review 1 L6: the usage gate's hold line shows with no turn
+/// running too, as a compaction's call waits there outside a turn.
+#[test]
+fn test_the_working_line_shows_for_a_hold_with_no_turn_running() {
+    assert!(shows_working_line(false, true), "a compaction's hold");
+    assert!(shows_working_line(true, false), "a turn");
+    assert!(!shows_working_line(false, false), "idle");
+}
+
 /// T13 (SME-377): the model's `notify_user` call reads as what it told
 /// the user, with anything that could reorder or hide text escaped: a
 /// refused call's input is saved as the model sent it.

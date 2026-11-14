@@ -12,7 +12,8 @@
 //! "to": b}` (its lines `a..b`), `{"call": [{"id", "name", "input"}, …]}`
 //! (each through the bridge, one at a time, then its `tool_result` line),
 //! `{"await_interrupt": true}`, `{"stderr": text}`, `{"hang": true}`, `{"exit": code}`,
-//! `{"write_session": true}` (its session's file, where the CLI keeps it). An
+//! `{"write_session": true}` (its session's file, where the CLI keeps it;
+//! `"append"` adds a line to it instead). An
 //! interrupt during `read` or `call` ends the call with the CLI's
 //! stopped result and an `error_during_execution` `result`, and skips to
 //! the next `read`. After the last step, stdin is read to EOF.
@@ -114,6 +115,12 @@ impl FakeCli {
     /// What each of process `n`'s tool calls got from the bridge.
     pub(crate) fn results(&self, n: usize) -> Vec<Value> {
         self.json_lines(&format!("results.{n}.jsonl"))
+    }
+
+    /// The tools process `n` found on its `--mcp-config` server, by name
+    /// (a `list_tools` step).
+    pub(crate) fn tools(&self, n: usize) -> Vec<String> {
+        self.json_lines(&format!("tools.{n}.jsonl")).iter().filter_map(|t| t["name"].as_str().map(str::to_string)).collect()
     }
 
     /// What process `n`'s model would read in its session (SME-444).
@@ -439,6 +446,12 @@ async fn play(dir: &Path, n: usize) -> i32 {
         } else if let Some(name) = step["stamp"].as_str() {
             std::fs::write(fake.dir.join(format!("{name}.stamp")), "").expect("a stamp");
             false
+        } else if step.get("list_tools").is_some() {
+            let peer = fake.peer().await;
+            for tool in peer.list_all_tools().await.expect("the bridge lists its tools") {
+                fake.log("tools", &json!({"name": tool.name}));
+            }
+            false
         } else if step.get("write_session").is_some() {
             // Its session's file, as the CLI writes it as it goes (SME-431
             // L22), where smelt's `files` looks for it.
@@ -450,7 +463,15 @@ async fn play(dir: &Path, n: usize) -> i32 {
             let conversation_id: i64 = cwd.file_name().and_then(|n| n.to_str()).and_then(|n| n.parse().ok()).expect("a conversation's work dir");
             let sessions = crate::claude_cli::files::sessions_dir(&config, &crate::claude_cli::files::work_dir(&config, conversation_id));
             std::fs::create_dir_all(&sessions).expect("the sessions dir");
-            std::fs::write(sessions.join(format!("{id}.jsonl")), "{}\n").expect("the session file");
+            let file = sessions.join(format!("{id}.jsonl"));
+            if step["write_session"] == "append" {
+                // As the CLI adds to a resumed session's file.
+                use std::io::Write as _;
+                let mut appended = std::fs::OpenOptions::new().append(true).create(true).open(&file).expect("the session file");
+                appended.write_all(b"{\"appended\":true}\n").expect("an appended line");
+            } else {
+                std::fs::write(file, "{}\n").expect("the session file");
+            }
             false
         } else if let Some(ms) = step["sleep_ms"].as_u64() {
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;

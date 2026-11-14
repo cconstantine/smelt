@@ -133,6 +133,8 @@ mod server {
     /// past a Stop still carries its own time.
     pub fn seen(conversation_id: i64, event: &Value) {
         if let Some(reading) = Reading::from_event(event, Utc::now()) {
+            // The usage gate (SME-523) sees it as it streams.
+            crate::claude_cli::gate::observe(&reading);
             hold(conversation_id, reading);
         }
     }

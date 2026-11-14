@@ -15,6 +15,10 @@ pub enum SessionArg<'a> {
     New(&'a str),
     /// The session with this id, resumed (`--resume`).
     Resume(&'a str),
+    /// The session with this id, read but not written back (`--resume
+    /// --no-session-persistence`): a cache re-seed (SME-523), which must
+    /// leave the session its wake resumes as it was.
+    ResumeUnsaved(&'a str),
 }
 
 /// One launch's settings.
@@ -73,6 +77,7 @@ pub fn cli_args(launch: &Launch<'_>) -> Vec<OsString> {
         SessionArg::Ephemeral => args.push("--no-session-persistence".into()),
         SessionArg::New(id) => args.extend(["--session-id".into(), id.into()]),
         SessionArg::Resume(id) => args.extend(["--resume".into(), id.into()]),
+        SessionArg::ResumeUnsaved(id) => args.extend(["--resume".into(), id.into(), "--no-session-persistence".into()]),
     }
     args
 }
@@ -92,10 +97,13 @@ pub const MCP_TOOL_TIMEOUT_MS: u32 = 86_400_000;
 /// (`DISABLE_COMPACT`): smelt's history is the record, and smelt compacts
 /// (SME-431). The reply's budget is `max_output_tokens`. Thinking has no
 /// switch here: neither `MAX_THINKING_TOKENS=0` nor the
-/// `alwaysThinkingEnabled` setting turns it off (S6), so it stays on.
+/// `alwaysThinkingEnabled` setting turns it off (S6), so it stays on. The
+/// prompt cache's TTL is pinned at an hour (SME-523 Q6): the lifetime
+/// `turn::reseed` times its re-seeds by, whatever the CLI's default.
 pub fn turn_env(mut base: Vec<(String, OsString)>, max_output_tokens: u32) -> Vec<(String, OsString)> {
     let mut set = |name: &str, value: String| base.push((name.to_string(), value.into()));
     set("DISABLE_COMPACT", "1".to_string());
+    set("CLAUDE_CODE_PROMPT_CACHE_TTL", "1h".to_string());
     set("CLAUDE_CODE_MAX_OUTPUT_TOKENS", max_output_tokens.to_string());
     set("MAX_MCP_OUTPUT_TOKENS", MAX_MCP_OUTPUT_TOKENS.to_string());
     set("MCP_TOOL_TIMEOUT", MCP_TOOL_TIMEOUT_MS.to_string());

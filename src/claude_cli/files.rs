@@ -52,13 +52,23 @@ pub async fn forget_conversation(conversation_id: i64) {
     }
 }
 
+/// Whether `session_id` is an id as the CLI makes them: never a path.
+fn is_session_id(session_id: &str) -> bool {
+    !session_id.is_empty() && session_id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// The file the CLI keeps session `session_id` of `conversation_id` in.
+pub fn session_file(conversation_id: i64, session_id: &str) -> Option<PathBuf> {
+    let config_dir = config_dir()?;
+    is_session_id(session_id).then(|| sessions_dir(&config_dir, &work_dir(&config_dir, conversation_id)).join(format!("{session_id}.jsonl")))
+}
+
 /// Removes session `session_id` of `conversation_id`, once replaced.
 pub fn forget_session(conversation_id: i64, session_id: &str) {
     let Some(config_dir) = config_dir() else {
         return;
     };
-    // Only an id as the CLI makes them: never a path.
-    if session_id.is_empty() || !session_id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+    if !is_session_id(session_id) {
         return;
     }
     let sessions = sessions_dir(&config_dir, &work_dir(&config_dir, conversation_id));

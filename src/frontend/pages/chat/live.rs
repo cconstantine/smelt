@@ -31,16 +31,16 @@ pub(super) fn use_turn_timer(state: Store<ConversationState>) {
 /// from. A hook, not an effect: it reads nothing reactive, so an effect
 /// never reran anyway (SME-58). Web-only: there's no browser `Date`
 /// during SSR, and 0 (UTC) is a fine fallback for the pre-hydration
-/// render either way.
+/// render either way. The zone comes from the one shared reader
+/// (`frontend::timezone`, SME-523).
 #[cfg(feature = "web")]
-pub(super) fn use_timezone_offset(tz_offset_minutes: Signal<i32>) {
-    let mut tz_offset_minutes = tz_offset_minutes;
+pub(super) fn use_timezone_offset(tz_offset_minutes: Signal<i32>, zone: Signal<crate::frontend::timezone::LocalZone>) {
+    let (mut tz_offset_minutes, mut zone) = (tz_offset_minutes, zone);
     use_hook(move || {
         spawn(async move {
-            if let Ok(value) = document::eval("return -new Date().getTimezoneOffset();").await
-                && let Some(offset) = value.as_i64()
-            {
-                tz_offset_minutes.set(offset as i32);
+            if let Some(read) = crate::frontend::timezone::read_local_zone().await {
+                tz_offset_minutes.set(read.offset_minutes);
+                zone.set(read);
             }
         });
     });
@@ -114,6 +114,7 @@ pub(super) fn use_conversation_events(
     let mut turn_running = state.turn_running();
     let mut turn_state_known = state.turn_state_known();
     let mut turn_elapsed = state.turn_elapsed();
+    let mut usage_hold = state.usage_hold();
     let mut todos = state.todos();
     let mut pending_question = state.pending_question();
     let mut repos = state.repos();
@@ -201,6 +202,10 @@ pub(super) fn use_conversation_events(
                     }
                     if let Ok(reply) = get_reply_in_progress(id).await {
                         streaming_reply.set(reply);
+                    }
+                    // A call waiting at the usage gate (SME-523).
+                    if let Ok(until) = crate::api::usage_windows::get_usage_hold(id).await {
+                        usage_hold.set(until.and_then(|at| chrono::DateTime::from_timestamp(at, 0)));
                     }
                     // A turn that failed before this tab connected
                     // (SME-51 B11), or none since a later one started

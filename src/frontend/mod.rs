@@ -1,6 +1,7 @@
 pub(crate) mod clipboard;
 mod notifications;
 mod pages;
+pub(crate) mod timezone;
 
 use dioxus::prelude::*;
 use notifications::Shell;

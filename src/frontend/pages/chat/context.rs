@@ -472,6 +472,7 @@ fn SubscriptionUsageIndicator(selected: Memo<Option<i64>>, state: Store<Conversa
     let context_usage = state.context_usage();
     let turn_running = state.turn_running();
     let mut usage: Signal<Option<(i64, crate::claude_cli::usage::ProviderUsage)>> = use_signal(|| None);
+    let zone = crate::frontend::timezone::use_local_zone();
     let mut request = use_signal(|| 0u64);
     use_effect(move || {
         let Some(id) = selected() else { return };
@@ -501,7 +502,7 @@ fn SubscriptionUsageIndicator(selected: Memo<Option<i64>>, state: Store<Conversa
                     Some(level) => format!("subscription-usage subscription-usage-{level}"),
                     None => "subscription-usage".to_string(),
                 },
-                title: "{usage_title(&u)}",
+                title: "{usage_title(&u, &zone.read())}",
                 "{usage_short_text(&u)}"
             }
         }

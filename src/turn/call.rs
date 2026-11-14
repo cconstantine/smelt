@@ -224,10 +224,13 @@ pub(super) async fn stream_for_kind(
     slot: anthropic::stream::SlotPolicy<'_>,
 ) -> Result<anthropic::stream::StreamedTurn, anthropic::stream::ModelError> {
     if turn_model.kind == crate::providers::ProviderKind::ClaudeCli {
+        // The five-hour usage gate (SME-523), between calls.
+        crate::claude_cli::gate::wait(conversation_id).await;
         // The summary's subscription reading (SME-486), Ok or Err; a
         // leftover from an earlier call is dropped first.
         crate::claude_cli::usage::discard(conversation_id);
-        let done = crate::claude_cli::once::once(conversation_id, turn_model, request, on_delta, meter).await;
+        let summary = crate::claude_cli::once::OnceLaunch::summary();
+        let done = crate::claude_cli::once::once(conversation_id, turn_model, request, summary, on_delta, meter).await;
         crate::claude_cli::usage::record(pool, conversation_id, turn_model.provider_id).await;
         return done;
     }
@@ -249,6 +252,12 @@ async fn call_claude_cli(
     relay: &mut (dyn FnMut(&str) + Send),
     cli: &mut crate::claude_cli::run::TurnCli,
 ) -> Result<(anthropic::stream::StreamedTurn, CallRecorder), CallError> {
+    // The five-hour usage gate (SME-523): waits, between calls, while the
+    // window is on pace to pass its line. A Stop drops the wait.
+    crate::claude_cli::gate::wait(conversation_id).await;
+    // Its cache is fresh from this call: a candidate for re-seeding
+    // while it idles (SME-523, `turn::reseed`).
+    crate::claude_cli::reseed::note_call(conversation_id, turn_model.provider_id, chrono::Utc::now());
     clear_reply_in_progress(conversation_id);
     crate::events::publish(conversation_id, crate::events::ConversationEvent::ReplyReset {});
     // Only this call's subscription reading is recorded (SME-486 A-L1).

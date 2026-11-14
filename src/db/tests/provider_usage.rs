@@ -39,6 +39,24 @@ async fn claude_provider_named(pool: &PgPool, name: &str) -> i64 {
     create_inference_provider(pool, name, "claude_cli", "claude", "api_key", "", false, None, true, None).await.expect("provider").id
 }
 
+/// G7 (SME-523): the gate's startup reading is the newest `five_hour` of
+/// any Claude Code provider, never another kind's nor another window.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_the_gates_reading_is_the_newest_claude_code_five_hour(pool: PgPool) {
+    let one = claude_provider(&pool).await;
+    let two = claude_provider_named(&pool, "Claude 2").await;
+    let http = create_inference_provider(&pool, "llama", "llama_cpp", "http://one", "bearer", "k", false, None, true, None).await.expect("provider").id;
+    assert_eq!(newest_claude_code_five_hour(&pool).await.expect("read"), None, "nothing recorded");
+    let older = row(0.30, now() - Duration::minutes(2));
+    let newest = row(0.40, now() - Duration::minutes(1));
+    record_usage_windows(&pool, one, std::slice::from_ref(&older)).await.expect("record");
+    record_usage_windows(&pool, two, std::slice::from_ref(&newest)).await.expect("record");
+    record_usage_windows(&pool, http, &[row(0.90, now())]).await.expect("record");
+    let seven_day = ProviderUsageWindowRow { window_name: "seven_day".into(), ..row(0.80, now()) };
+    record_usage_windows(&pool, one, &[seven_day]).await.expect("record");
+    assert_eq!(newest_claude_code_five_hour(&pool).await.expect("read"), Some(newest));
+}
+
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_rows_go_with_their_provider(pool: PgPool) {
     let provider = claude_provider(&pool).await;

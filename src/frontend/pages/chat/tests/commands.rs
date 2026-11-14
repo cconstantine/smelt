@@ -174,6 +174,7 @@ fn test_conversation_state_starts_empty() {
         turn_running,
         turn_state_known,
         turn_elapsed,
+        usage_hold,
         notification_delivery_error,
         todos,
         pending_question,
@@ -206,6 +207,7 @@ fn test_conversation_state_starts_empty() {
     assert!(!turn_running, "turn_running");
     assert!(!turn_state_known, "turn_state_known");
     assert_eq!(turn_elapsed, 0, "turn_elapsed");
+    assert!(usage_hold.is_none(), "usage_hold");
     assert!(notification_delivery_error.is_none(), "notification_delivery_error");
     assert!(todos.is_empty(), "todos");
     assert!(pending_question.is_none(), "pending_question");

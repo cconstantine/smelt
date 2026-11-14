@@ -229,6 +229,12 @@ pub enum ConversationEvent {
     /// "streaming" is done with (it's saved, or it was a false start the
     /// retry replaces). Each model call gets its own streaming bubble.
     ReplyReset {},
+    /// A Claude Code call of this conversation's waits at the five-hour
+    /// usage gate (SME-523) until `until`, in Unix seconds; `None` once
+    /// it no longer does. Regenerable from `api::usage_windows::get_usage_hold`.
+    UsageHold {
+        until: Option<i64>,
+    },
     /// More reply text as the model streams it. Published for every
     /// turn, whoever started it, so every tab watching sees the reply
     /// arrive live. Regenerable mid-turn from
