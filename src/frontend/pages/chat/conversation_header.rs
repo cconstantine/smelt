@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::api::agents::ConversationNode;
-use super::conversation_menu::{ConversationMenu, MenuItem, menu_items};
+use super::conversation_menu::{ConversationMenu, MenuEvent, MenuItem, apply, delete_confirm_label, menu_items, subtree_ids};
 
 /// What the header shows for one conversation.
 #[derive(Clone, Debug, PartialEq)]
@@ -54,17 +54,21 @@ pub(super) fn ConversationHeader(
     // Kept with the conversation it's about: the header isn't remounted
     // on a switch (review 1, L1), so another's error mustn't show here.
     let header_error: Signal<Option<(i64, String)>> = use_signal(|| None);
-    let mut menu_open = use_signal(|| false);
+    let menu_open = use_signal(|| false);
+    let delete_armed = use_signal(|| false);
+    // The conversation whose DELETE is in flight, so a third click sends
+    // no second one.
+    let deleting: Signal<Option<i64>> = use_signal(|| None);
     let mut compact_open = use_signal(|| false);
     let compact_busy = use_signal(|| None::<i64>);
-    // Another conversation opened: its menu starts closed.
+    // Another conversation opened: its menu starts closed and disarmed.
     use_effect(move || {
         selected();
-        menu_open.set(false);
+        apply(menu_open, delete_armed, MenuEvent::Switch);
     });
     let compacting = super::compact_control::compacting_here(compact_busy(), selected());
+    // The menu has already moved itself (`menu_after`): this is the action.
     let on_action = move |item: MenuItem| {
-        menu_open.set(false);
         match item {
             // Thinking beside tool calls and replies is hidden unless
             // asked for (SME-123 DR6).
@@ -77,6 +81,17 @@ pub(super) fn ConversationHeader(
             MenuItem::Archive => {
                 if let (Some(archived), Some(id)) = (archive, selected()) {
                     archive_conversation(id, archived, nodes, header_error);
+                }
+            }
+            // Its second click: the menu has closed (SME-513 Q2).
+            MenuItem::Delete => {
+                // Read first: a guard in an `if let` lives through its
+                // block, and `delete_from_header` writes `deleting`.
+                let idle = deleting.peek().is_none();
+                if let Some(id) = selected()
+                    && idle
+                {
+                    delete_from_header(id, selected, nodes, deleting, header_error);
                 }
             }
         }
@@ -95,10 +110,13 @@ pub(super) fn ConversationHeader(
                 }
                 ConversationMenu {
                     open: menu_open,
+                    armed: delete_armed,
                     items: menu_items(archive, listed),
                     archived: archive.unwrap_or(false),
                     turn_running: state.turn_running()(),
                     compacting,
+                    delete_confirm: selected().map(|id| delete_confirm_label(&nodes.read(), id)).unwrap_or_default(),
+                    deleting: deleting().is_some() && deleting() == selected(),
                     on_action,
                 }
                 // Last in the row: its popover is right-aligned under ☰ and
@@ -147,6 +165,48 @@ fn archive_conversation(id: i64, archived: bool, nodes: Signal<Vec<ConversationN
             Err(e) => error.set(Some((id, server_error_message(&e)))),
         }
     });
+}
+
+/// Delete from the menu (SME-513, from the sidebar's SME-236 button):
+/// the conversation and its whole subtree leave the list at once, and if
+/// it's still the one open, the page goes to its parent, or Home. A
+/// failure shows under the header and the conversation stays.
+fn delete_from_header(
+    id: i64,
+    selected: Memo<Option<i64>>,
+    nodes: Signal<Vec<ConversationNode>>,
+    deleting: Signal<Option<i64>>,
+    error: Signal<Option<(i64, String)>>,
+) {
+    let (mut nodes, mut deleting, mut error) = (nodes, deleting, error);
+    deleting.set(Some(id));
+    spawn(async move {
+        let result = delete_conversation(id).await;
+        deleting.set(None);
+        match result {
+            Ok(()) => {
+                error.set(None);
+                let to = after_delete(&nodes.peek(), id);
+                let gone = subtree_ids(&nodes.peek(), id);
+                nodes.write().retain(|n| !gone.contains(&n.id));
+                if *selected.peek() == Some(id) {
+                    navigator().push(to);
+                }
+            }
+            Err(e) => error.set(Some((id, server_error_message(&e)))),
+        }
+    });
+}
+
+/// Where deleting `id` from its own page lands: its parent, if listed,
+/// else Home.
+fn after_delete(nodes: &[ConversationNode], id: i64) -> Route {
+    nodes
+        .iter()
+        .find(|n| n.id == id)
+        .and_then(|n| n.parent_id)
+        .filter(|p| nodes.iter().any(|n| n.id == *p))
+        .map_or(Route::Home {}, |id| Route::ConversationRoute { id })
 }
 
 /// The error to show under `selected`'s header: only one from that
@@ -262,5 +322,17 @@ mod tests {
         assert_eq!(archive(1), Some(true));
         assert_eq!(archive(3), Some(false));
         assert_eq!(archive(2), None);
+    }
+
+    /// SME-513: deleting an agent from its own page lands on its parent;
+    /// a top-level conversation, or an agent whose parent isn't listed,
+    /// lands Home.
+    #[test]
+    fn test_a_delete_lands_on_the_parent_or_home() {
+        let nodes = [node(1, None, "root", None, None), node(2, Some(1), "seat", Some("idle"), None), node(3, Some(9), "orphan", Some("idle"), None)];
+        assert_eq!(after_delete(&nodes, 2), Route::ConversationRoute { id: 1 });
+        assert_eq!(after_delete(&nodes, 1), Route::Home {});
+        assert_eq!(after_delete(&nodes, 3), Route::Home {}, "its parent isn't listed");
+        assert_eq!(after_delete(&nodes, 4), Route::Home {}, "not listed at all");
     }
 }

@@ -120,14 +120,20 @@ const RECORDER: &str = "(() => { if (window.__smeltLog) return true; const log =
      return true; })()";
 
 /// What the page held when a click or wait gave up, as JSON: where the tab
-/// was, which rows had an armed two-step button, the sidebar's error, and
-/// `RECORDER`'s log. Each names a different cause of a missing button: a
-/// navigation, a confirm that already happened (no row armed, perhaps an
-/// error), a click that never reached the page (no click logged).
+/// was, which conversations had an armed two-step button (the header
+/// carries `data-conversation-id` too since SME-513, so its menu's Delete
+/// resolves to its conversation), the sidebar's and the header's errors,
+/// whether the header's ☰ menu is open, and `RECORDER`'s log. Each names a
+/// different cause of a missing button: a navigation, a confirm that
+/// already happened (nothing armed, perhaps an error), a menu that closed,
+/// a click that never reached the page (no click logged). The log's "row N
+/// added/removed" lines can mean the header as well as a sidebar row.
 pub(super) async fn page_state(page: &chromiumoxide::Page) -> String {
     let read = "JSON.stringify({ url: location.href, \
          armed: [...document.querySelectorAll('.confirm')].map(b => { const r = b.closest('[data-conversation-id]'); return r ? r.dataset.conversationId : b.className; }), \
          sidebar_error: (document.querySelector('.sidebar-scroll > .error') || {}).innerText ?? null, \
+         header_error: (document.querySelector('.conversation-header > .error') || {}).innerText ?? null, \
+         menu_open: (document.querySelector('.conversation-menu-button') || { getAttribute: () => null }).getAttribute('aria-expanded'), \
          log: window.__smeltLog || 'nothing recorded: no click_when_present on this page' })";
     // Bounded: a hung renderer may be why the click or wait failed, and an
     // unbounded read would hold its failure up to chromiumoxide's 30 s, past
@@ -193,6 +199,21 @@ pub(super) async fn open_conversation_menu(page: &chromiumoxide::Page, id: i64) 
     wait_for_element(page, ".conversation-menu[role=menu]", Duration::from_secs(5)).await;
 }
 
+/// Conversation `id`'s header menu Delete, idle or armed: the selector
+/// matches both, so `click_when_present`'s no-repeat guard is what keeps
+/// a retried arm from confirming (SME-505's fix, point 1 of the plan).
+pub(super) fn menu_delete(id: i64) -> String {
+    format!(".conversation-header[data-conversation-id='{id}'] .conversation-menu-delete")
+}
+
+/// Deletes the open conversation `id` through its ☰ menu: open, arm,
+/// confirm (SME-513).
+pub(super) async fn delete_through_menu(page: &chromiumoxide::Page, id: i64) {
+    open_conversation_menu(page, id).await;
+    click_when_present(page, &menu_delete(id), Duration::from_secs(5)).await;
+    click_when_present(page, &format!("{}.confirm", menu_delete(id)), Duration::from_secs(5)).await;
+}
+
 /// Evaluates a JS expression to a bool: false when it can't be read.
 pub(super) async fn js_bool(page: &chromiumoxide::Page, expression: &str) -> bool {
     page.evaluate(expression).await.ok().and_then(|v| v.into_value::<bool>().ok()) == Some(true)
@@ -231,26 +252,37 @@ fn miss_once_then_click(element: &chromiumoxide::Element) -> BoxFuture<'_, Resul
 
 /// SME-505: a click that reached its target isn't clicked again, even when
 /// its click step reports an error; one seen to land elsewhere still is,
-/// whatever its target did meanwhile (review 1, M1). A sidebar
-/// Delete arms on its first click and deletes on its second, and the same
-/// selector matches it armed or not; so a click whose report is lost (here
-/// an error after the press and release) and is retried confirms the
-/// delete, and the scenario's own confirm then finds no armed button:
-/// "….confirm never settled to be clicked: missing", main's CI run
-/// 43219768271. That such a retry happened there is not shown: the run's
-/// log has only that line. This shows the path exists, and closes it.
+/// whatever its target did meanwhile (review 1, M1). The ☰ menu's Delete
+/// (a sidebar row's before SME-513) arms on its first click and deletes on
+/// its second, and the same selector matches it armed or not; so a click
+/// whose report is lost (here an error after the press and release) and is
+/// retried confirms the delete, and the scenario's own confirm then finds
+/// no armed button: "….confirm never settled to be clicked: missing",
+/// main's CI run 43219768271. That such a retry happened there is not
+/// shown: the run's log has only that line. This shows the path exists,
+/// and closes it.
 pub(super) async fn scenario_click_not_repeated(t: &Scenario<'_>) {
     let missed = t.conversation().await;
     let target = t.conversation().await;
-    let open = t.conversation().await;
-    let page = t.tab(t.url(&format!("conversation/{}", open.id))).await;
-    wait_for_live_client(&page, open.id).await;
+    let page = t.tab(t.url(&format!("conversation/{}", missed.id))).await;
+    wait_for_live_client(&page, missed.id).await;
     // A click seen to land elsewhere is retried, even when its target's
     // class changes meanwhile for another reason (SME-505 review 1, M1).
-    let missed_delete = format!(".conversation-item[data-conversation-id='{}'] .delete-conversation", missed.id);
+    open_conversation_menu(&page, missed.id).await;
+    let missed_delete = format!(".conversation-header[data-conversation-id='{}'] .conversation-menu-delete", missed.id);
     click_when_present_with(&page, &missed_delete, Duration::from_secs(5), miss_once_then_click).await;
     wait_for_element(&page, &format!("{missed_delete}.confirm"), Duration::from_secs(5)).await;
-    let delete = format!(".conversation-item[data-conversation-id='{}'] .delete-conversation", target.id);
+    // Escape closes the menu and disarms it.
+    press_escape(&page, &missed_delete).await;
+    assert!(wait_for_count(&page, ".conversation-menu", 0, Duration::from_secs(5)).await, "Escape closes the menu");
+    open_conversation_menu(&page, missed.id).await;
+    assert!(wait_for_count(&page, &format!("{missed_delete}.confirm"), 0, Duration::from_secs(2)).await, "and disarms it");
+    press_escape(&page, &missed_delete).await;
+
+    page.goto(t.url(&format!("conversation/{}", target.id))).await.expect("open the target");
+    wait_for_live_client(&page, target.id).await;
+    open_conversation_menu(&page, target.id).await;
+    let delete = format!(".conversation-header[data-conversation-id='{}'] .conversation-menu-delete", target.id);
     click_when_present_with(&page, &delete, Duration::from_secs(5), click_then_fail).await;
     // Armed, and still armed: the arm wasn't repeated into a confirm.
     let armed = format!("{delete}.confirm");
@@ -274,17 +306,19 @@ pub(super) async fn scenario_click_not_repeated(t: &Scenario<'_>) {
         .await
         .expect("raise the probes");
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let gone = format!(".conversation-item[data-conversation-id='{}'] .no-such-button", target.id);
+    let gone = format!(".conversation-header[data-conversation-id='{}'] .no-such-button", target.id);
     let why = settle_failure(&page, &gone, "missing").await;
     for told in [
         "error probe error (SME-505)".to_string(),
         "unhandledrejection probe rejection (SME-505)".to_string(),
         format!("{gone} never settled to be clicked: missing; the page: "),
-        format!("\"url\":\"{}\"", t.url(&format!("conversation/{}", open.id))),
+        format!("\"url\":\"{}\"", t.url(&format!("conversation/{}", target.id))),
         format!("\"armed\":[\"{}\"]", target.id),
         "\"sidebar_error\":null".to_string(),
+        "\"header_error\":null".to_string(),
+        "\"menu_open\":\"true\"".to_string(),
         format!("click on two-step-text in {}", target.id),
-        format!("class delete-conversation confirm in {}", target.id),
+        format!("class conversation-menu-item conversation-menu-delete confirm in {}", target.id),
     ] {
         assert!(why.contains(&told), "the failure should say {told}: {why}");
     }

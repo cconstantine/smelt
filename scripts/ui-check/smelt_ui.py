@@ -83,11 +83,15 @@ class Tab:
         return int(match.group(1)) if match else None
 
     def delete_conversation(self, conversation_id):
-        """The sidebar's two-click Delete. Deleting also removes its pod."""
-        row = self.page.locator(f'[data-conversation-id="{conversation_id}"]')
-        if not row.count():
+        """The conversation's ☰ menu's two-click Delete (SME-513): it
+        opens the conversation first. Deleting also removes its pod."""
+        self.goto(f"/conversation/{conversation_id}")
+        header = self.page.locator(f'.conversation-header[data-conversation-id="{conversation_id}"]')
+        if not header.count():
             return False
-        button = row.locator(".delete-conversation")
+        header.locator(".conversation-menu-button").click()
+        button = header.locator(".conversation-menu-delete")
+        button.wait_for(timeout=10000)
         button.click()
         self.page.wait_for_timeout(300)
         button.click()

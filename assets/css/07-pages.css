@@ -295,11 +295,6 @@
     font-variant-numeric: tabular-nums;
 }
 
-.conversation-item:hover .conversation-age,
-.conversation-item:focus-within .conversation-age {
-    visibility: hidden;
-}
-
 /* An archived tree's root row, when it's listed anyway (SME-480). */
 .conversation-archived {
     flex-shrink: 0;

@@ -226,8 +226,9 @@ fn scenarios() -> Vec<Entry> {
         // review).
         entry("error_text", 60, Runs::Alone, |t| Box::pin(scenario_error_text(t))),
         entry("settings_two_step", 60, Runs::Alone, |t| Box::pin(scenario_settings_two_step(t))),
-        // Alone (SME-505): it clicks a sidebar row's Delete, which other
-        // lanes' conversations arriving would move.
+        // Alone (SME-505): it reads the click recorder's log of class and
+        // row changes, which other lanes' conversations arriving add to.
+        // Its Delete is the header menu's now (SME-513).
         entry("click_not_repeated", 30, Runs::Alone, |t| Box::pin(scenario_click_not_repeated(t))),
         entry("pointer_keeps_text_still", 120, Runs::Beside, |t| Box::pin(scenario_pointer_keeps_text_still(t))),
         entry("ask_user_card", 60, Runs::Beside, |t| Box::pin(scenario_ask_user_card(t))),

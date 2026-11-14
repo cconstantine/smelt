@@ -247,66 +247,6 @@ body {
     color: var(--danger);
 }
 
-/* On a two-line row, Delete covers the first line's end, where the age is,
-   not the persona and status. */
-.conversation-agent .delete-conversation {
-    top: 7px;
-    transform: none;
-}
-
-/* Laid over the end of the row rather than taking room from the title
-   (SME-41 D8); it covers the age while shown. */
-.delete-conversation {
-    position: absolute;
-    right: 8px;
-    top: 50%;
-    transform: translateY(-50%);
-    flex-shrink: 0;
-    padding: 4px 9px;
-    border: 1px solid var(--border-strong);
-    border-radius: 6px;
-    background: var(--surface);
-    color: var(--text-2);
-    font-size: 12px;
-    line-height: 1.4;
-    cursor: pointer;
-    opacity: 0;
-    transition: opacity 100ms ease, background-color 100ms ease, color 100ms ease, border-color 100ms ease;
-}
-
-/* Kept clickable/focusable at all times; just visually quiet until the row
-   is engaged, so the affordance doesn't read as a wall of buttons. */
-.conversation-item:hover .delete-conversation,
-.conversation-item:focus-within .delete-conversation,
-.delete-conversation:focus-visible {
-    opacity: 1;
-}
-
-.delete-conversation:hover {
-    background: var(--canvas);
-    border-color: var(--border-strong);
-    color: var(--text);
-}
-
-.delete-conversation.confirm {
-    opacity: 1;
-    background: var(--danger);
-    border-color: var(--danger);
-    color: var(--surface);
-}
-
-/* Bold in both states (hidden while idle), so the width the button
-   reserves for it is the width it has when armed (SME-40 F9). */
-.delete-conversation .two-step-confirm {
-    font-weight: 600;
-}
-
-.delete-conversation.confirm:hover {
-    background: var(--danger);
-    border-color: var(--danger);
-    color: var(--surface);
-}
-
 /* Below WIDE_LAYOUT_BREAKPOINT (see the media query further down): the
    side-panels row (todos, the live browser, sandbox terminals) and chat (messages
    + composer) stack vertically, each taking the full width left over from
@@ -630,6 +570,26 @@ body {
 .conversation-menu-note {
     font-size: 11px;
     color: var(--muted);
+}
+
+/* Destructive, last (SME-513): red text; armed, filled red, reading its
+   count in the same spot (TwoStepLabel), so the confirming click lands
+   where the first did. */
+.conversation-menu-delete {
+    color: var(--danger);
+}
+
+.conversation-menu-delete.confirm,
+.conversation-menu-delete.confirm:hover,
+.conversation-menu-delete.confirm:focus-visible {
+    background: var(--danger);
+    color: var(--surface);
+}
+
+/* Bold in both states (hidden while idle), so the width reserved for it
+   is the width it has when armed (SME-40 F9). */
+.conversation-menu-delete .two-step-confirm {
+    font-weight: 600;
 }
 
 @media (max-width: 720px) {

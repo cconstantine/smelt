@@ -54,10 +54,12 @@ async fn open_and_close(page: &chromiumoxide::Page, id: i64, (width, _, mobile):
     );
     open_conversation_menu(page, id).await;
     assert!(js_bool(page, &format!("document.querySelector({button:?}).getAttribute('aria-expanded') === 'true'")).await);
-    assert_eq!(
-        menu_items(page).await,
-        ["Show thinking|menuitemcheckbox|false|", "Compact|menuitem||", "Archive|menuitem||"],
-        "{width}px: a top-level conversation's items, in order"
+    // Archive and Delete wait for the tree to have the row (S1 to S2).
+    let s2 = ["Show thinking|menuitemcheckbox|false|", "Compact|menuitem||", "Archive|menuitem||", "Delete|menuitem||"];
+    assert!(
+        wait_until(|| async { menu_items(page).await == s2 }, Duration::from_secs(10)).await,
+        "{width}px: a top-level conversation's items, in order: {:?}",
+        menu_items(page).await
     );
     assert!(focused(page, ".conversation-menu-thinking").await, "{width}px: the click focuses the first item");
     if mobile {
@@ -139,12 +141,50 @@ async fn archive(page: &chromiumoxide::Page, id: i64) {
     }
 }
 
-/// An agent's header (S3): Show thinking and Compact, no Archive.
+/// An agent's header (S3): Show thinking, Compact and Delete, no Archive.
 async fn agent_shape(page: &chromiumoxide::Page, agent: i64) {
     open_conversation_menu(page, agent).await;
-    let labels: Vec<String> = menu_items(page).await.iter().map(|s| s.split('|').next().unwrap_or("").to_string()).collect();
-    assert_eq!(labels, ["Show thinking", "Compact"], "an agent has no Archive");
+    let labels = || async {
+        menu_items(page).await.iter().map(|s| s.split('|').next().unwrap_or("").to_string()).collect::<Vec<_>>()
+    };
+    assert!(
+        wait_until(|| async { labels().await == ["Show thinking", "Compact", "Delete"] }, Duration::from_secs(10)).await,
+        "an agent has no Archive: {:?}",
+        labels().await
+    );
     press_escape(page, ".conversation-menu-thinking").await;
+}
+
+/// Delete: the first click arms it in place, the menu staying open (Q2),
+/// and a list refetch leaves it armed (SME-505's signature was an armed
+/// Delete vanishing under one); the confirm drops the row and lands on
+/// `lands` (the parent for an agent, Home for a root).
+async fn delete(page: &chromiumoxide::Page, id: i64, lands: &str) {
+    open_conversation_menu(page, id).await;
+    let delete = menu_delete(id);
+    click_when_present(page, &delete, Duration::from_secs(10)).await;
+    let armed = format!("{delete}.confirm");
+    wait_for_element(page, &armed, Duration::from_secs(5)).await;
+    assert!(js_bool(page, "!!document.querySelector('.conversation-menu[role=menu]')").await, "arming leaves the menu open");
+    let before = list_requests(page).await;
+    crate::events::publish_app(crate::events::AppEvent::ConversationsChanged);
+    assert!(
+        wait_until(|| async { list_requests(page).await > before }, Duration::from_secs(10)).await,
+        "ConversationsChanged refetches the list"
+    );
+    // The refetch's result is applied by an effect after the request ends.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(js_bool(page, &format!("!!document.querySelector({armed:?})")).await, "a refetch leaves Delete armed");
+    click_when_present(page, &armed, Duration::from_secs(5)).await;
+    assert!(
+        wait_for_count(page, &format!(".conversation-item[data-conversation-id='{id}']"), 0, Duration::from_secs(10)).await,
+        "the confirm drops the row"
+    );
+    let at_lands = format!("location.pathname === {lands:?}");
+    assert!(
+        wait_until(|| js_bool(page, &at_lands), Duration::from_secs(10)).await,
+        "deleting lands on {lands}"
+    );
 }
 
 /// SME-513: the ☰ menu at 1400×900 and at 390×844 (a phone).
@@ -172,8 +212,13 @@ pub(super) async fn scenario_conversation_menu(t: &Scenario<'_>) {
         compact(&page, root.id).await;
         page.close().await.expect("close the tab");
 
+        // Then Delete, the agent first: it lands on its root, which is
+        // then deleted in turn and lands Home.
         let page = open_at(t, agent, size).await;
         agent_shape(&page, agent).await;
+        delete(&page, agent, &format!("/conversation/{}", root.id)).await;
+        wait_for_live_client(&page, root.id).await;
+        delete(&page, root.id, "/").await;
         page.close().await.expect("close the tab");
     }
 }

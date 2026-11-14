@@ -1,7 +1,8 @@
 use super::*;
 
 /// SME-236: a conversation's armed Delete names the agents that go with it,
-/// and the longer label fits its row, on a phone and on a laptop.
+/// and the longer label fits its ☰ menu (SME-513; a sidebar row's before),
+/// on a phone and on a laptop.
 pub(super) async fn scenario_delete_names_its_agents(t: &Scenario<'_>) {
     let root = t.conversation().await;
     seed_user_message(t.pool, root.id, "a parent with agents").await;
@@ -16,8 +17,7 @@ pub(super) async fn scenario_delete_names_its_agents(t: &Scenario<'_>) {
             .expect("a child row");
         seed_user_message(t.pool, child, brief).await;
     }
-    let row = format!(".conversation-item[data-conversation-id='{}']", root.id);
-    let delete = format!("{row} .delete-conversation");
+    let delete = menu_delete(root.id);
     for (width, height, mobile) in [(390, 844, true), (1400, 900, false)] {
         let page = t.tab("about:blank").await;
         page.execute(
@@ -25,27 +25,28 @@ pub(super) async fn scenario_delete_names_its_agents(t: &Scenario<'_>) {
         )
         .await
         .expect("set the window's size");
-        page.goto(t.url("")).await.expect("open the home page");
-        wait_for_element(&page, "[data-app-live]", Duration::from_secs(15)).await;
-        if mobile {
-            click_when_present(&page, ".sidebar-toggle", Duration::from_secs(5)).await;
-        }
+        page.goto(t.url(&format!("conversation/{}", root.id))).await.expect("open the root");
+        wait_for_live_client(&page, root.id).await;
+        open_conversation_menu(&page, root.id).await;
+        // Delete waits for the tree: its label counts the subtree.
         wait_for_element(&page, &delete, Duration::from_secs(10)).await;
         click_when_present(&page, &delete, Duration::from_secs(5)).await;
         wait_for_element(&page, &format!("{delete}.confirm"), Duration::from_secs(5)).await;
         let measured: Vec<String> = page
             .evaluate(format!(
-                "(() => {{ const row = document.querySelector(\"{row}\"); \
-                 const label = row.querySelector('.two-step-confirm'); \
-                 return [label.innerText, String(row.scrollWidth - row.clientWidth), \
+                "(() => {{ const item = document.querySelector(\"{delete}\"); \
+                 const menu = document.querySelector('.conversation-menu').getBoundingClientRect(); \
+                 const label = item.querySelector('.two-step-confirm'); \
+                 const out = Math.max(0, -menu.left, menu.right - window.innerWidth, item.scrollWidth - item.clientWidth); \
+                 return [label.innerText, String(out), \
                  String(document.documentElement.scrollWidth - document.documentElement.clientWidth)]; }})()"
             ))
             .await
-            .expect("measure the row")
+            .expect("measure the menu")
             .into_value()
             .expect("strings");
         assert_eq!(measured[0], "Delete + 2 agents?", "{width}px: {measured:?}");
-        assert!(measured[1].parse::<f64>().unwrap_or(1.0) <= 0.0, "{width}px: the row overflows: {measured:?}");
+        assert!(measured[1].parse::<f64>().unwrap_or(1.0) <= 0.0, "{width}px: the menu overflows: {measured:?}");
         assert!(measured[2].parse::<f64>().unwrap_or(1.0) <= 0.0, "{width}px: the page scrolls sideways: {measured:?}");
         page.close().await.expect("close the tab");
     }
