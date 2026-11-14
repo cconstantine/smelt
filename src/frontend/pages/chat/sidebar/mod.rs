@@ -113,13 +113,11 @@ pub(super) fn ConversationSidebar(
     });
     let mut conversations = conversations;
     let mut loaded = use_signal(|| false);
-    // Why the list couldn't load, and why the last New conversation or
-    // Delete failed. Each is cleared by its own next success: the list
-    // reloads on every new message, which says nothing about a failed
-    // Delete (SME-81).
+    // Why the list couldn't load, and why the last New conversation
+    // failed. Each is cleared by its own next success: the list reloads on
+    // every new message, which says nothing about a failed action (SME-81).
     let mut list_error: Signal<Option<String>> = use_signal(|| None);
     let mut action_error: Signal<Option<String>> = use_signal(|| None);
-    let mut pending_delete: Signal<Option<i64>> = use_signal(|| None);
     // The conversations whose agents are folded away, in this tab only: a
     // reload shows every agent again (SME-246).
     let mut collapsed: Signal<HashSet<i64>> = FOLDED.signal();
@@ -192,32 +190,8 @@ pub(super) fn ConversationSidebar(
 
     // Opening a row, by a click or from the keyboard.
     let mut open_conversation = move |id: i64| {
-        pending_delete.set(None);
         open_on_phone.set(false);
         navigator.push(Route::ConversationRoute { id });
-    };
-
-    // First click on a row's delete button arms it; a second click on the
-    // same (still-armed) row confirms. Only one row is ever armed at a
-    // time, so arming a different row implicitly cancels the last one.
-    let mut request_delete = move |id: i64| {
-        if pending_delete() == Some(id) {
-            pending_delete.set(None);
-            spawn(async move {
-                match delete_conversation(id).await {
-                    Ok(()) => {
-                        action_error.set(None);
-                        conversations.write().retain(|c| c.id != id);
-                        if selected() == Some(id) {
-                            navigator.push(Route::Home {});
-                        }
-                    }
-                    Err(e) => action_error.set(Some(server_error_message(&e))),
-                }
-            });
-        } else {
-            pending_delete.set(Some(id));
-        }
     };
 
     // Whether the sidebar's live connection is up, for `data-app-live`: the
@@ -285,10 +259,7 @@ pub(super) fn ConversationSidebar(
                             running_commands: running_commands_for(row.node.id),
                             age: now_utc().map(|now| short_age((now - row.node.updated_at).num_seconds())),
                             report_owed: report_marker(row.node.report_owed_at, row.node.busy, now_utc()),
-                            armed: pending_delete() == Some(row.node.id),
-                            confirm: delete_confirm_label(&conversations(), row.node.id),
                             on_open: move |id| open_conversation(id),
-                            on_delete: move |id| request_delete(id),
                             on_toggle: move |id| {
                                 FOLD_DECIDED.write().insert(id);
                                 let mut folded = collapsed.write();
@@ -353,10 +324,7 @@ fn ConversationRow(
     running_commands: i64,
     age: Option<String>,
     report_owed: Option<String>,
-    armed: bool,
-    confirm: String,
     on_open: EventHandler<i64>,
-    on_delete: EventHandler<i64>,
     on_toggle: EventHandler<i64>,
 ) -> Element {
     let id = row.node.id;
@@ -393,9 +361,10 @@ fn ConversationRow(
                 span { class: "tree-caret-spacer" }
             }
             // The title is the row's link and tab stop, which Enter or
-            // Space opens (SME-58). Not the whole row: its Delete would be
+            // Space opens (SME-58). Not the whole row: its caret would be
             // inside the link, read as part of its name and, by some screen
-            // readers, not reachable at all.
+            // readers, not reachable at all. (Its Delete went into the
+            // conversation's ☰ menu, SME-513.)
             span {
                 class: "conversation-title",
                 tabindex: "0",
@@ -450,14 +419,6 @@ fn ConversationRow(
             }
             if let Some(age) = age {
                 span { class: "conversation-age", "{age}" }
-            }
-            super::TwoStepButton {
-                armed,
-                class: "delete-conversation",
-                idle: "Delete",
-                confirm,
-                on_arm: move |_| on_delete.call(id),
-                on_confirm: move |_| on_delete.call(id),
             }
             {agent_meta(&row.node)}
             {tree_summary(&row)}
@@ -560,24 +521,6 @@ pub(super) fn report_marker(owed_at: Option<chrono::NaiveDateTime>, busy: bool, 
             })
         }
         _ => None,
-    }
-}
-
-/// The armed Delete's label: how many agents go with the conversation, its
-/// whole subtree, counted from the list the sidebar already has (SME-236).
-fn delete_confirm_label(conversations: &[ConversationNode], id: i64) -> String {
-    let mut under = 0;
-    let mut frontier = vec![id];
-    while let Some(parent) = frontier.pop() {
-        for child in conversations.iter().filter(|c| c.parent_id == Some(parent)) {
-            under += 1;
-            frontier.push(child.id);
-        }
-    }
-    match under {
-        0 => "Confirm?".to_string(),
-        1 => "Delete + 1 agent?".to_string(),
-        n => format!("Delete + {n} agents?"),
     }
 }
 

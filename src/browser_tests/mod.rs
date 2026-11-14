@@ -178,6 +178,7 @@ fn scenarios() -> Vec<Entry> {
         entry("context_usage", 60, Runs::Beside, |t| Box::pin(scenario_context_usage(t))),
         entry("compaction_divider", 60, Runs::Beside, |t| Box::pin(scenario_compaction_divider(t))),
         entry("compact_now", 150, Runs::Beside, |t| Box::pin(scenario_compact_now(t))),
+        entry("conversation_menu", 150, Runs::Beside, |t| Box::pin(scenario_conversation_menu(t))),
         entry("overflow_compacts", 60, Runs::Beside, |t| Box::pin(scenario_overflow_compacts(t))),
         entry("todo_panel", 60, Runs::Beside, |t| Box::pin(scenario_todo_panel(t))),
         entry("reply_stays_in_its_conversation", 60, Runs::Beside, |t| Box::pin(scenario_reply_stays_in_its_conversation(t))),
@@ -225,8 +226,9 @@ fn scenarios() -> Vec<Entry> {
         // review).
         entry("error_text", 60, Runs::Alone, |t| Box::pin(scenario_error_text(t))),
         entry("settings_two_step", 60, Runs::Alone, |t| Box::pin(scenario_settings_two_step(t))),
-        // Alone (SME-505): it clicks a sidebar row's Delete, which other
-        // lanes' conversations arriving would move.
+        // Alone (SME-505): it reads the click recorder's log of class and
+        // row changes, which other lanes' conversations arriving add to.
+        // Its Delete is the header menu's now (SME-513).
         entry("click_not_repeated", 30, Runs::Alone, |t| Box::pin(scenario_click_not_repeated(t))),
         entry("pointer_keeps_text_still", 120, Runs::Beside, |t| Box::pin(scenario_pointer_keeps_text_still(t))),
         entry("ask_user_card", 60, Runs::Beside, |t| Box::pin(scenario_ask_user_card(t))),
@@ -476,6 +478,7 @@ mod report_owed;
 mod top_level_persona;
 mod archive;
 mod compact_now;
+mod conversation_menu;
 mod usage_windows;
 mod settings_page;
 
@@ -506,5 +509,6 @@ use report_owed::*;
 use top_level_persona::*;
 use archive::*;
 use compact_now::*;
+use conversation_menu::*;
 use usage_windows::*;
 use settings_page::*;

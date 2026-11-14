@@ -282,8 +282,9 @@ where
 }
 
 /// Scenario 30 (SME-81): an error says what went wrong, not dioxus's
-/// "error running server function: … (details: None)" wrapper, and the
-/// sidebar's error goes once a later sidebar action succeeds.
+/// "error running server function: … (details: None)" wrapper, and a
+/// failed menu action's error goes once a later one on the same
+/// conversation succeeds.
 pub(super) async fn scenario_error_text(t: &Scenario<'_>) {
     // Through the list, whose own fetch shows the page is hydrated: typed
     // into the server-rendered form before that, the text never reaches
@@ -313,67 +314,82 @@ pub(super) async fn scenario_error_text(t: &Scenario<'_>) {
         "the error should be the server's message alone: {shown:?}"
     );
 
-    // Two conversations to delete from the sidebar: the first delete fails,
-    // the second succeeds. A success that navigates (New conversation)
-    // remounts the sidebar and hides the bug; deleting a row that isn't
-    // open stays on the page.
+    // A conversation deleted from its ☰ menu (SME-513): the first delete
+    // fails, and its error stays through a list reload; a later one
+    // succeeds and clears it (SME-81). Arm and confirm go through
+    // `click_when_present` on `menu_delete`, which matches both states,
+    // so a retried arm can't confirm (SME-505).
     let refused = t.conversation().await;
-    let deleted = t.conversation().await;
     let watched = t.conversation().await;
-    let sidebar = t.tab(t.url(&format!("conversation/{}", watched.id))).await;
-    wait_for_live_client(&sidebar, watched.id).await;
-    let delete_button = |id: i64| format!(".conversation-item[data-conversation-id='{id}'] .delete-conversation");
-    wait_for_stable(&sidebar, &delete_button(refused.id), tokio::time::Instant::now() + Duration::from_secs(10)).await;
+    let chat = t.tab(t.url(&format!("conversation/{}", refused.id))).await;
+    wait_for_live_client(&chat, refused.id).await;
+    let header_error = ".conversation-header > .error";
+    open_conversation_menu(&chat, refused.id).await;
     // The next DELETE (the first conversation delete) fails as a server
     // error would; everything else goes through.
-    sidebar.evaluate(FAIL_NEXT_DELETE).await.expect("make the next DELETE fail");
-    click_when_present(&sidebar, &delete_button(refused.id), Duration::from_secs(5)).await;
-    click_when_present(&sidebar, &format!("{}.confirm", delete_button(refused.id)), Duration::from_secs(5)).await;
-    wait_for_element(&sidebar, ".sidebar-scroll > .error", Duration::from_secs(10)).await;
+    chat.evaluate(FAIL_NEXT_DELETE).await.expect("make the next DELETE fail");
+    click_when_present(&chat, &menu_delete(refused.id), Duration::from_secs(5)).await;
+    click_when_present(&chat, &format!("{}.confirm", menu_delete(refused.id)), Duration::from_secs(5)).await;
+    wait_for_element(&chat, header_error, Duration::from_secs(10)).await;
     // A message arriving in the open conversation reloads the list (as a
     // running turn's every reply does); that reload succeeding isn't the
     // failed Delete succeeding, so the error stays (SME-81 review).
-    let lists_before = list_requests(&sidebar).await;
+    let lists_before = list_requests(&chat).await;
     let arrived = db::create_message(
         t.pool,
-        watched.id,
+        refused.id,
         "assistant",
         &[anthropic::ContentBlock::Text { text: "scenario 30 reload".to_string() }],
     )
     .await
     .expect("save a message");
-    crate::events::publish(watched.id, crate::events::ConversationEvent::MessagesAppended { messages: vec![arrived] });
+    crate::events::publish(refused.id, crate::events::ConversationEvent::MessagesAppended { messages: vec![arrived] });
     assert!(
-        wait_for_text(&sidebar, "scenario 30 reload", Duration::from_secs(10)).await,
+        wait_for_text(&chat, "scenario 30 reload", Duration::from_secs(10)).await,
         "the open conversation should show the new message"
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while list_requests(&sidebar).await <= lists_before {
+    while list_requests(&chat).await <= lists_before {
         assert!(tokio::time::Instant::now() < deadline, "the new message should reload the conversation list");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     // The reload's result is applied by an effect after the request ends.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let kept: bool = sidebar
-        .evaluate("!!document.querySelector('.sidebar-scroll > .error')")
-        .await
-        .expect("look for the sidebar error")
-        .into_value()
-        .expect("bool");
-    assert!(kept, "a list reload shouldn't clear a failed Delete's error");
-    click_when_present(&sidebar, &delete_button(deleted.id), Duration::from_secs(5)).await;
-    click_when_present(&sidebar, &format!("{}.confirm", delete_button(deleted.id)), Duration::from_secs(5)).await;
     assert!(
-        wait_for_count(&sidebar, &format!(".conversation-item[data-conversation-id='{}']", deleted.id), 0, Duration::from_secs(10)).await,
+        js_bool(&chat, &format!("!!document.querySelector('{header_error}')")).await,
+        "a list reload shouldn't clear a failed Delete's error"
+    );
+    // The error is the refused conversation's own: not under another's
+    // header, and back on returning (review 1, L1).
+    click_conversation(&chat, watched.id).await;
+    wait_for_element(&chat, &format!(".conversation-header[data-conversation-id='{}']", watched.id), Duration::from_secs(5)).await;
+    assert!(wait_for_count(&chat, header_error, 0, Duration::from_secs(5)).await, "another conversation's header shows no error");
+    click_conversation(&chat, refused.id).await;
+    wait_for_element(&chat, header_error, Duration::from_secs(5)).await;
+    // A later success on the same conversation clears it, with the page
+    // still on it: an Archive, which navigates nowhere (review 1, A-L5).
+    open_conversation_menu(&chat, refused.id).await;
+    click_when_present(&chat, ".conversation-menu-archive", Duration::from_secs(5)).await;
+    assert!(
+        wait_for_count(&chat, header_error, 0, Duration::from_secs(10)).await,
+        "a successful Archive of the refused conversation clears its error"
+    );
+    delete_through_menu(&chat, refused.id).await;
+    assert!(
+        wait_for_count(&chat, &format!(".conversation-item[data-conversation-id='{}']", refused.id), 0, Duration::from_secs(10)).await,
         "the second delete should go through"
+    );
+    assert!(
+        wait_until(|| js_bool(&chat, "location.pathname === '/'"), Duration::from_secs(10)).await,
+        "deleting the open top-level conversation lands Home"
     );
     // The row can go first: the delete announces itself to every tab, and
     // that list reload can land before the delete's own reply, which is
     // what clears the error. So wait for the error to go rather than read it
     // once (SME-341: CI run 41394052871).
     assert!(
-        wait_for_count(&sidebar, ".sidebar-scroll > .error", 0, Duration::from_secs(10)).await,
-        "a later success should clear the sidebar's error"
+        wait_for_count(&chat, ".error", 0, Duration::from_secs(10)).await,
+        "a later success leaves no error on the page"
     );
 
     // The same on a settings page: a failed volume delete's error goes once

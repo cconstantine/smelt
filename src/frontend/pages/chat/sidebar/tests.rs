@@ -83,17 +83,3 @@ fn test_the_waiting_total_counts_every_conversation_waiting() {
     list[2].waiting_for_user = true;
     assert_eq!(waiting_total(&list), 2);
 }
-
-#[test]
-fn test_the_delete_label_counts_the_whole_subtree() {
-    let list = vec![
-        conversation(1, None),
-        conversation(2, Some(1)),
-        conversation(3, Some(1)),
-        conversation(4, Some(2)),
-        conversation(5, None),
-    ];
-    assert_eq!(delete_confirm_label(&list, 1), "Delete + 3 agents?");
-    assert_eq!(delete_confirm_label(&list, 2), "Delete + 1 agent?");
-    assert_eq!(delete_confirm_label(&list, 5), "Confirm?");
-}

@@ -86,16 +86,26 @@ pub(super) async fn scenario_archived_conversations(t: &Scenario<'_>) {
     // and is gone from Home; opened by URL, Unarchive lists it again.
     let open_b = t.tab(t.url(&format!("conversation/{}", b.id))).await;
     wait_for_live_client(&open_b, b.id).await;
-    click_when_present(&open_b, ".conversation-archive", Duration::from_secs(10)).await;
+    // Through the ☰ menu (SME-513): the item closes it, and reopened its
+    // label has flipped.
+    open_conversation_menu(&open_b, b.id).await;
+    click_when_present(&open_b, ".conversation-menu-archive", Duration::from_secs(10)).await;
     assert!(wait_for_count(&open_b, &tag(b.id), 1, Duration::from_secs(10)).await, "the open row stays, tagged");
-    assert!(wait_for_text(&open_b, ".conversation-archive", "Unarchive", Duration::from_secs(10)).await);
+    assert!(wait_for_count(&open_b, ".conversation-menu", 0, Duration::from_secs(5)).await, "Archive closes the menu");
+    open_conversation_menu(&open_b, b.id).await;
+    assert!(wait_for_text(&open_b, ".conversation-menu-archive", "Unarchive", Duration::from_secs(10)).await);
+    press_escape(&open_b, ".conversation-menu-archive").await;
     home.reload().await.expect("reload");
     wait_for_element(&home, "[data-app-live]", Duration::from_secs(15)).await;
     assert!(wait_for_count(&home, &b_row, 0, Duration::from_secs(10)).await, "B is gone from Home");
     open_b.reload().await.expect("reload B");
     wait_for_live_client(&open_b, b.id).await;
-    click_when_present(&open_b, ".conversation-archive", Duration::from_secs(10)).await;
-    assert!(wait_for_text(&open_b, ".conversation-archive", "Archive", Duration::from_secs(10)).await);
+    open_conversation_menu(&open_b, b.id).await;
+    assert!(wait_for_text(&open_b, ".conversation-menu-archive", "Unarchive", Duration::from_secs(10)).await);
+    click_when_present(&open_b, ".conversation-menu-archive", Duration::from_secs(10)).await;
+    open_conversation_menu(&open_b, b.id).await;
+    assert!(wait_for_text(&open_b, ".conversation-menu-archive", "Archive", Duration::from_secs(10)).await);
+    press_escape(&open_b, ".conversation-menu-archive").await;
     home.reload().await.expect("reload");
     wait_for_element(&home, "[data-app-live]", Duration::from_secs(15)).await;
     assert!(wait_for_count(&home, &b_row, 1, Duration::from_secs(10)).await, "B is listed again");

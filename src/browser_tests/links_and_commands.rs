@@ -415,7 +415,6 @@ pub(super) async fn scenario_deleted_in_another_tab(t: &Scenario<'_>) {
     )
     .await
     .expect("set todos");
-    let other = t.conversation().await;
     let row = format!(".conversation-item[data-conversation-id='{}']", deleted.id);
 
     let open = t.tab(t.url(&format!("conversation/{}", deleted.id))).await;
@@ -423,12 +422,10 @@ pub(super) async fn scenario_deleted_in_another_tab(t: &Scenario<'_>) {
     assert!(wait_for_text(&open, "B44-TRANSCRIPT-MARKER", Duration::from_secs(10)).await, "the transcript never showed");
     assert!(wait_for_count(&open, &row, 1, Duration::from_secs(10)).await, "the sidebar should list it");
 
-    let deleter = t.tab(t.url(&format!("conversation/{}", other.id))).await;
-    wait_for_live_client(&deleter, other.id).await;
-    let delete_button = format!("{row} .delete-conversation");
-    wait_for_stable(&deleter, &delete_button, tokio::time::Instant::now() + Duration::from_secs(10)).await;
-    click_when_present(&deleter, &delete_button, Duration::from_secs(5)).await;
-    click_when_present(&deleter, &format!("{delete_button}.confirm"), Duration::from_secs(5)).await;
+    // Deleting takes the conversation open, from its ☰ menu (SME-513).
+    let deleter = t.tab(t.url(&format!("conversation/{}", deleted.id))).await;
+    wait_for_live_client(&deleter, deleted.id).await;
+    delete_through_menu(&deleter, deleted.id).await;
     assert!(wait_for_count(&deleter, &row, 0, Duration::from_secs(10)).await, "the deleting tab's sidebar drops it");
 
     assert!(

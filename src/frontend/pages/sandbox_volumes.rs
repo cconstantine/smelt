@@ -10,8 +10,8 @@ use crate::frontend::pages::SettingsCrumbs;
 /// every one of these mounted, unconditionally (see
 /// SME-17's Phase 4). No edit
 /// page: nothing to change once a volume exists besides deleting it, same
-/// inline arm/confirm pattern `ConversationSidebar`'s delete already uses
-/// — only one row armed at a time.
+/// inline arm/confirm pattern the conversation header's ☰ menu Delete
+/// uses (SME-513) — only one row armed at a time.
 #[component]
 pub fn SandboxVolumesIndex() -> Element {
     let initial_volumes = use_resource(list_sandbox_volumes);
