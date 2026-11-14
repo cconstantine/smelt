@@ -282,8 +282,9 @@ where
 }
 
 /// Scenario 30 (SME-81): an error says what went wrong, not dioxus's
-/// "error running server function: … (details: None)" wrapper, and the
-/// sidebar's error goes once a later sidebar action succeeds.
+/// "error running server function: … (details: None)" wrapper, and a
+/// failed menu action's error goes once a later one on the same
+/// conversation succeeds.
 pub(super) async fn scenario_error_text(t: &Scenario<'_>) {
     // Through the list, whose own fetch shows the page is hydrated: typed
     // into the server-rendered form before that, the text never reaches
@@ -320,20 +321,20 @@ pub(super) async fn scenario_error_text(t: &Scenario<'_>) {
     // so a retried arm can't confirm (SME-505).
     let refused = t.conversation().await;
     let watched = t.conversation().await;
-    let sidebar = t.tab(t.url(&format!("conversation/{}", refused.id))).await;
-    wait_for_live_client(&sidebar, refused.id).await;
+    let chat = t.tab(t.url(&format!("conversation/{}", refused.id))).await;
+    wait_for_live_client(&chat, refused.id).await;
     let header_error = ".conversation-header > .error";
-    open_conversation_menu(&sidebar, refused.id).await;
+    open_conversation_menu(&chat, refused.id).await;
     // The next DELETE (the first conversation delete) fails as a server
     // error would; everything else goes through.
-    sidebar.evaluate(FAIL_NEXT_DELETE).await.expect("make the next DELETE fail");
-    click_when_present(&sidebar, &menu_delete(refused.id), Duration::from_secs(5)).await;
-    click_when_present(&sidebar, &format!("{}.confirm", menu_delete(refused.id)), Duration::from_secs(5)).await;
-    wait_for_element(&sidebar, header_error, Duration::from_secs(10)).await;
+    chat.evaluate(FAIL_NEXT_DELETE).await.expect("make the next DELETE fail");
+    click_when_present(&chat, &menu_delete(refused.id), Duration::from_secs(5)).await;
+    click_when_present(&chat, &format!("{}.confirm", menu_delete(refused.id)), Duration::from_secs(5)).await;
+    wait_for_element(&chat, header_error, Duration::from_secs(10)).await;
     // A message arriving in the open conversation reloads the list (as a
     // running turn's every reply does); that reload succeeding isn't the
     // failed Delete succeeding, so the error stays (SME-81 review).
-    let lists_before = list_requests(&sidebar).await;
+    let lists_before = list_requests(&chat).await;
     let arrived = db::create_message(
         t.pool,
         refused.id,
@@ -344,34 +345,42 @@ pub(super) async fn scenario_error_text(t: &Scenario<'_>) {
     .expect("save a message");
     crate::events::publish(refused.id, crate::events::ConversationEvent::MessagesAppended { messages: vec![arrived] });
     assert!(
-        wait_for_text(&sidebar, "scenario 30 reload", Duration::from_secs(10)).await,
+        wait_for_text(&chat, "scenario 30 reload", Duration::from_secs(10)).await,
         "the open conversation should show the new message"
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while list_requests(&sidebar).await <= lists_before {
+    while list_requests(&chat).await <= lists_before {
         assert!(tokio::time::Instant::now() < deadline, "the new message should reload the conversation list");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     // The reload's result is applied by an effect after the request ends.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
-        js_bool(&sidebar, &format!("!!document.querySelector('{header_error}')")).await,
+        js_bool(&chat, &format!("!!document.querySelector('{header_error}')")).await,
         "a list reload shouldn't clear a failed Delete's error"
     );
     // The error is the refused conversation's own: not under another's
     // header, and back on returning (review 1, L1).
-    click_conversation(&sidebar, watched.id).await;
-    wait_for_element(&sidebar, &format!(".conversation-header[data-conversation-id='{}']", watched.id), Duration::from_secs(5)).await;
-    assert!(wait_for_count(&sidebar, header_error, 0, Duration::from_secs(5)).await, "another conversation's header shows no error");
-    click_conversation(&sidebar, refused.id).await;
-    wait_for_element(&sidebar, header_error, Duration::from_secs(5)).await;
-    delete_through_menu(&sidebar, refused.id).await;
+    click_conversation(&chat, watched.id).await;
+    wait_for_element(&chat, &format!(".conversation-header[data-conversation-id='{}']", watched.id), Duration::from_secs(5)).await;
+    assert!(wait_for_count(&chat, header_error, 0, Duration::from_secs(5)).await, "another conversation's header shows no error");
+    click_conversation(&chat, refused.id).await;
+    wait_for_element(&chat, header_error, Duration::from_secs(5)).await;
+    // A later success on the same conversation clears it, with the page
+    // still on it: an Archive, which navigates nowhere (review 1, A-L5).
+    open_conversation_menu(&chat, refused.id).await;
+    click_when_present(&chat, ".conversation-menu-archive", Duration::from_secs(5)).await;
     assert!(
-        wait_for_count(&sidebar, &format!(".conversation-item[data-conversation-id='{}']", refused.id), 0, Duration::from_secs(10)).await,
+        wait_for_count(&chat, header_error, 0, Duration::from_secs(10)).await,
+        "a successful Archive of the refused conversation clears its error"
+    );
+    delete_through_menu(&chat, refused.id).await;
+    assert!(
+        wait_for_count(&chat, &format!(".conversation-item[data-conversation-id='{}']", refused.id), 0, Duration::from_secs(10)).await,
         "the second delete should go through"
     );
     assert!(
-        wait_until(|| js_bool(&sidebar, "location.pathname === '/'"), Duration::from_secs(10)).await,
+        wait_until(|| js_bool(&chat, "location.pathname === '/'"), Duration::from_secs(10)).await,
         "deleting the open top-level conversation lands Home"
     );
     // The row can go first: the delete announces itself to every tab, and
@@ -379,7 +388,7 @@ pub(super) async fn scenario_error_text(t: &Scenario<'_>) {
     // what clears the error. So wait for the error to go rather than read it
     // once (SME-341: CI run 41394052871).
     assert!(
-        wait_for_count(&sidebar, ".error", 0, Duration::from_secs(10)).await,
+        wait_for_count(&chat, ".error", 0, Duration::from_secs(10)).await,
         "a later success leaves no error on the page"
     );
 
