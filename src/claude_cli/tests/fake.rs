@@ -12,7 +12,8 @@
 //! "to": b}` (its lines `a..b`), `{"call": [{"id", "name", "input"}, …]}`
 //! (each through the bridge, one at a time, then its `tool_result` line),
 //! `{"await_interrupt": true}`, `{"stderr": text}`, `{"hang": true}`, `{"exit": code}`,
-//! `{"write_session": true}` (its session's file, where the CLI keeps it). An
+//! `{"write_session": true}` (its session's file, where the CLI keeps it;
+//! `"append"` adds a line to it instead). An
 //! interrupt during `read` or `call` ends the call with the CLI's
 //! stopped result and an `error_during_execution` `result`, and skips to
 //! the next `read`. After the last step, stdin is read to EOF.
@@ -450,7 +451,15 @@ async fn play(dir: &Path, n: usize) -> i32 {
             let conversation_id: i64 = cwd.file_name().and_then(|n| n.to_str()).and_then(|n| n.parse().ok()).expect("a conversation's work dir");
             let sessions = crate::claude_cli::files::sessions_dir(&config, &crate::claude_cli::files::work_dir(&config, conversation_id));
             std::fs::create_dir_all(&sessions).expect("the sessions dir");
-            std::fs::write(sessions.join(format!("{id}.jsonl")), "{}\n").expect("the session file");
+            let file = sessions.join(format!("{id}.jsonl"));
+            if step["write_session"] == "append" {
+                // As the CLI adds to a resumed session's file.
+                use std::io::Write as _;
+                let mut appended = std::fs::OpenOptions::new().append(true).create(true).open(&file).expect("the session file");
+                appended.write_all(b"{\"appended\":true}\n").expect("an appended line");
+            } else {
+                std::fs::write(file, "{}\n").expect("the session file");
+            }
             false
         } else if let Some(ms) = step["sleep_ms"].as_u64() {
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;

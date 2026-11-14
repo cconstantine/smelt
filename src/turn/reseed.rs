@@ -42,11 +42,15 @@ pub(crate) enum Decision {
     Launch(Ready),
 }
 
-/// What a re-seed is sent with, and the slot it holds.
+/// What a re-seed is sent with, and the slot and lock it holds.
 pub(crate) struct Ready {
     turn_model: crate::providers::TurnModel,
     session_id: String,
     _slot: Option<crate::providers::limiter::Slot>,
+    /// The conversation's turn lock, held for the re-seed (review 1 M2):
+    /// a turn started meanwhile waits for it, so the two never run on
+    /// the session at once.
+    _turn_lock: tokio::sync::OwnedMutexGuard<()>,
 }
 
 /// Re-seeds candidates due, every `TICK`, for good.
@@ -87,6 +91,9 @@ pub(crate) async fn run_tick(pool: &PgPool, now: DateTime<Utc>) -> Vec<tokio::ta
 
 /// Whether `conversation_id`, a candidate due at `now`, is re-seeded now.
 pub(crate) async fn consider(pool: &PgPool, conversation_id: i64, candidate: candidates::Candidate, now: DateTime<Utc>) -> Decision {
+    if candidates::off() {
+        return Decision::Drop("re-seeding is off: one wrote to its session");
+    }
     if turn_running(conversation_id) {
         return Decision::Wait("a turn is running");
     }
@@ -121,6 +128,11 @@ pub(crate) async fn consider(pool: &PgPool, conversation_id: i64, candidate: can
             return Decision::Wait("its session couldn't be read");
         }
     };
+    // Taken last but the slot and the gate, so it's held for no await
+    // here, and before them, so a busy lock takes neither.
+    let Ok(turn_lock) = conversation_lock(conversation_id).try_lock_owned() else {
+        return Decision::Wait("a turn holds the conversation");
+    };
     let slot = match crate::providers::limiter::current(turn_model.provider_id) {
         Some(limit) => match limit.try_acquire() {
             Some(slot) => Some(slot),
@@ -131,7 +143,7 @@ pub(crate) async fn consider(pool: &PgPool, conversation_id: i64, candidate: can
     if !crate::claude_cli::gate::try_pass(conversation_id) {
         return Decision::Wait("the usage gate is held or has others waiting");
     }
-    Decision::Launch(Ready { turn_model, session_id: session.session_id, _slot: slot })
+    Decision::Launch(Ready { turn_model, session_id: session.session_id, _slot: slot, _turn_lock: turn_lock })
 }
 
 /// One re-seed: the request a wake would send now, as `claude_cli::reseed`
