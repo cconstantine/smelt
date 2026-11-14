@@ -227,3 +227,22 @@ async fn test_a_dropped_waiter_leaves_the_queue() {
     assert!(gate.waiting().is_empty(), "{:?}", gate.waiting());
 }
 
+/// Review 1 L2: a call still queued behind others once the gate opens
+/// still shows its hold to a tab that (re)connects, as its open tabs do
+/// until it passes.
+#[tokio::test]
+async fn test_a_call_queued_behind_others_after_a_hold_still_shows_it() {
+    let gate = Arc::new(Gate::new(StdDuration::from_secs(60)));
+    let now = Utc::now();
+    let held = at(0.99, 0.5, now);
+    let until = until(verdict(Some(&held), now));
+    gate.observe(held);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    queue(&gate, &[1, 2], &tx).await;
+    assert_eq!(gate.held_until(2), Some(until), "held");
+    gate.observe(at(0.01, 0.5, now + Duration::milliseconds(1)));
+    assert_eq!(passed_in_order(&mut rx, 1).await, vec![1]);
+    assert_eq!(gate.waiting(), vec![2], "2 waits out the spacing");
+    assert_eq!(gate.held_until(2), Some(until), "the hold it was told of, until it passes");
+    assert_eq!(gate.held_until(3), None, "not waiting");
+}

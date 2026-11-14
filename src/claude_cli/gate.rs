@@ -112,6 +112,9 @@ struct Entry {
     id: u64,
     conversation_id: i64,
     since: Instant,
+    /// The hold's end it was last told of, kept until it passes: its tabs
+    /// show the hold until then (PR #353 review 1 L2).
+    held: Option<DateTime<Utc>>,
 }
 
 #[derive(Default)]
@@ -190,16 +193,16 @@ impl Gate {
         self.state().waiters.iter().map(|e| e.conversation_id).collect()
     }
 
-    /// When `conversation_id`'s waiting call is due to go, if it waits on
-    /// a hold (not only on its turn in the release order).
+    /// The hold `conversation_id`'s waiting call shows: the gate's while
+    /// it's held, and once it opens, the last one the call was told of,
+    /// until it passes (as `wait` clears it only then). `None` for a call
+    /// that queued behind others with the gate open, or none waiting.
     pub fn held_until(&self, conversation_id: i64) -> Option<DateTime<Utc>> {
         let state = self.state();
-        if !state.waiters.iter().any(|e| e.conversation_id == conversation_id) {
-            return None;
-        }
+        let told = state.waiters.iter().filter(|e| e.conversation_id == conversation_id).map(|e| e.held).max()?;
         match verdict(state.reading.as_ref(), Utc::now()) {
             Verdict::Held { until } => Some(until),
-            Verdict::Open => None,
+            Verdict::Open => told,
         }
     }
 
@@ -280,7 +283,7 @@ impl Gate {
         }
         let id = state.next_id;
         state.next_id += 1;
-        state.waiters.push(Entry { id, conversation_id, since: now });
+        state.waiters.push(Entry { id, conversation_id, since: now, held: None });
         Some(id)
     }
 
@@ -292,6 +295,9 @@ impl Gate {
     fn step(&self, id: u64) -> Step {
         let mut state = self.state();
         if let Verdict::Held { until } = verdict(state.reading.as_ref(), Utc::now()) {
+            if let Some(entry) = state.waiters.iter_mut().find(|e| e.id == id) {
+                entry.held = Some(until);
+            }
             return Step::Held(until);
         }
         let now = Instant::now();
