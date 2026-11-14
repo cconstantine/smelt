@@ -21,7 +21,8 @@ pub(super) struct HeaderInfo {
 }
 
 /// The header for conversation `id`, from the conversation list; None
-/// while the list doesn't have it (the header is then its toggle alone).
+/// while the list doesn't have it (the header is then its ☰ menu alone,
+/// with Show thinking and Compact).
 pub(super) fn header_info(nodes: &[ConversationNode], id: i64) -> Option<HeaderInfo> {
     let node = nodes.iter().find(|n| n.id == id)?;
     let meta = node.status.as_deref().map(|status| match node.persona.as_deref() {
