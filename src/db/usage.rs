@@ -56,6 +56,8 @@ pub async fn model_spend_since(
 pub enum ModelCallKind {
     Turn,
     Compaction,
+    /// A Claude Code conversation's prompt-cache re-seed (SME-523).
+    Reseed,
 }
 
 impl ModelCallKind {
@@ -63,6 +65,7 @@ impl ModelCallKind {
         match self {
             Self::Turn => "turn",
             Self::Compaction => "compaction",
+            Self::Reseed => "reseed",
         }
     }
 }

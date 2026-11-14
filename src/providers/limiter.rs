@@ -76,8 +76,8 @@ impl Pool {
         Some(Slot { permit: Some(permit), pool: self.clone() })
     }
 
-    /// A slot if one is free now.
-    #[cfg(test)]
+    /// A slot if one is free now: a cache re-seed's (SME-523), which
+    /// never waits for one.
     pub fn try_acquire(self: &Arc<Self>) -> Option<Slot> {
         let permit = self.slots.clone().try_acquire_owned().ok()?;
         Some(Slot { permit: Some(permit), pool: self.clone() })

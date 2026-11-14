@@ -467,3 +467,22 @@ pub async fn list_terminal_commands(
     .fetch_all(pool)
     .await
 }
+
+/// Whether something is expected to wake `conversation_id` by itself
+/// (SME-523, the cache re-seed's condition 3): a command of its still
+/// running, a child agent of its still starting or at work, or its own
+/// question to its parent unanswered. A question to the user doesn't
+/// count: the user may be gone for hours.
+pub async fn expects_wake(pool: &PgPool, conversation_id: i64) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM terminal_commands WHERE conversation_id = $1 AND status = 'running')
+             OR EXISTS (SELECT 1 FROM conversations c JOIN agents a ON a.conversation_id = c.id
+                        WHERE c.parent_id = $1 AND a.state IN ('starting', 'active'))
+             OR EXISTS (SELECT 1 FROM pending_questions
+                        WHERE conversation_id = $1 AND answer IS NULL AND asked_of = $2)",
+    )
+    .bind(conversation_id)
+    .bind(crate::db::ASKED_OF_PARENT)
+    .fetch_one(pool)
+    .await
+}

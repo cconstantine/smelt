@@ -88,6 +88,8 @@ pub mod process;
 #[cfg(feature = "server")]
 pub mod render;
 #[cfg(feature = "server")]
+pub mod reseed;
+#[cfg(feature = "server")]
 pub mod run;
 #[cfg(feature = "server")]
 mod server;

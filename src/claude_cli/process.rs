@@ -15,6 +15,10 @@ pub enum SessionArg<'a> {
     New(&'a str),
     /// The session with this id, resumed (`--resume`).
     Resume(&'a str),
+    /// The session with this id, read but not written back (`--resume
+    /// --no-session-persistence`): a cache re-seed (SME-523), which must
+    /// leave the session its wake resumes as it was.
+    ResumeUnsaved(&'a str),
 }
 
 /// One launch's settings.
@@ -73,6 +77,7 @@ pub fn cli_args(launch: &Launch<'_>) -> Vec<OsString> {
         SessionArg::Ephemeral => args.push("--no-session-persistence".into()),
         SessionArg::New(id) => args.extend(["--session-id".into(), id.into()]),
         SessionArg::Resume(id) => args.extend(["--resume".into(), id.into()]),
+        SessionArg::ResumeUnsaved(id) => args.extend(["--resume".into(), id.into(), "--no-session-persistence".into()]),
     }
     args
 }

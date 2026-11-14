@@ -25,6 +25,7 @@ mod overflow;
 mod outside_turn;
 mod questions;
 mod reply;
+pub(crate) mod reseed;
 mod room;
 mod run;
 mod state;

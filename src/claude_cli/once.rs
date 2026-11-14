@@ -1,8 +1,9 @@
-//! A one-shot CLI call (SME-431): `claude -p` with no session, no tools
-//! and no bridge, one user message in and one reply out. smelt's
-//! compaction summary goes through it on a Claude Code provider
-//! (`turn::call::stream_for_kind`), recorded by the caller's meter like
-//! any other model call.
+//! A one-shot CLI call (SME-431): `claude -p` with one user message in
+//! and one reply out. smelt's compaction summary goes through it on a
+//! Claude Code provider (`turn::call::stream_for_kind`), with no session
+//! and no tools; a cache re-seed (SME-523, `claude_cli::reseed`) with the
+//! turn's tools and its session resumed unsaved. Either is recorded by the
+//! caller's meter like any other model call.
 //!
 //! The process: started under the start lock and the same environment
 //! allowlist as a turn's run, given the request's system prompt as its
@@ -54,11 +55,30 @@ pub fn result_failure(result: &Value, rate: Option<&super::errors::RateLimit>) -
     }
 }
 
-/// One call of `request` (tools-less, one user message) through the CLI.
+/// How a one-shot call's process is launched: the summary's
+/// (`OnceLaunch::summary`), or a cache re-seed's (`claude_cli::reseed`).
+pub struct OnceLaunch<'a> {
+    pub effort: Option<crate::anthropic::Effort>,
+    /// The `--mcp-config` JSON (`bridge::RunBridge::mcp_config`) when the
+    /// call carries the turn's tools; written to a private file.
+    pub mcp_config: Option<Value>,
+    pub session: SessionArg<'a>,
+}
+
+impl OnceLaunch<'_> {
+    /// The compaction summary's: thinking at its least (M1), since a
+    /// summary needs little; no tools, no session.
+    pub fn summary() -> Self {
+        Self { effort: Some(crate::anthropic::Effort::Low), mcp_config: None, session: SessionArg::Ephemeral }
+    }
+}
+
+/// One call of `request` (one user message) through the CLI.
 pub async fn once(
     conversation_id: i64,
     turn_model: &crate::providers::TurnModel,
     request: &CreateMessageRequest,
+    launch: OnceLaunch<'_>,
     on_delta: &mut (dyn FnMut(&str) + Send),
     meter: &UsageMeter,
 ) -> Result<StreamedTurn, ModelError> {
@@ -74,14 +94,24 @@ pub async fn once(
         super::private_dir(dir).map_err(|e| fail(format!("Couldn't make Claude Code's directory {} private: {e}", dir.display())))?;
     }
     let binary = super::resolve_binary(&turn_model.endpoint.base_url, value("PATH").as_deref()).map_err(fail)?;
-    let prompt_file = prompts.join(format!("{conversation_id}-{}-once.md", super::bridge::random_hex(8)));
-    let _files = RunFiles(vec![prompt_file.clone()]);
+    let stem = format!("{conversation_id}-{}-once", super::bridge::random_hex(8));
+    let prompt_file = prompts.join(format!("{stem}.md"));
+    let config_file = launch.mcp_config.as_ref().map(|_| prompts.join(format!("{stem}-mcp.json")));
+    let _files = RunFiles([Some(prompt_file.clone()), config_file.clone()].into_iter().flatten().collect());
     super::process::write_private(&prompt_file, request.system.as_deref().unwrap_or_default().as_bytes())
         .map_err(|e| fail(format!("Couldn't write the system prompt for Claude Code: {e}")))?;
-    // Thinking at its least (M1): a summary needs little.
-    let effort = Some(crate::anthropic::Effort::Low);
-    let launch = Launch { model: &turn_model.model, effort, system_prompt_file: &prompt_file, mcp_config_file: None, session: SessionArg::Ephemeral };
-    let mut args = cli_args(&launch);
+    if let (Some(file), Some(config)) = (&config_file, &launch.mcp_config) {
+        super::process::write_private(file, config.to_string().as_bytes())
+            .map_err(|e| fail(format!("Couldn't write Claude Code's MCP config: {e}")))?;
+    }
+    let cli_launch = Launch {
+        model: &turn_model.model,
+        effort: launch.effort,
+        system_prompt_file: &prompt_file,
+        mcp_config_file: config_file.as_deref(),
+        session: launch.session,
+    };
+    let mut args = cli_args(&cli_launch);
     args.extend(["--max-turns".into(), "1".into()]);
     let launching = Launching::take().await;
     let mut child = tokio::process::Command::new(&binary)

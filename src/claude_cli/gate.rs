@@ -215,6 +215,18 @@ impl Gate {
         }
     }
 
+    /// Passes `conversation_id` if the gate is open and no one waits, as
+    /// `wait` would at once; otherwise false, and nothing is queued. A
+    /// cache re-seed's (SME-523): it never waits its turn.
+    pub fn try_pass(&self, conversation_id: i64) -> bool {
+        let mut state = self.state();
+        if !state.waiters.is_empty() || verdict(state.reading.as_ref(), Utc::now()) != Verdict::Open {
+            return false;
+        }
+        state.last_pass.insert(conversation_id, Instant::now());
+        true
+    }
+
     /// Passes `conversation_id` at once if the gate is open and no one
     /// waits (`None`); otherwise queues it and returns its entry's id.
     fn enqueue(&self, conversation_id: i64) -> Option<u64> {
@@ -303,6 +315,11 @@ pub async fn load(pool: &sqlx::PgPool) {
         Ok(None) => {}
         Err(e) => tracing::warn!("couldn't load the Claude subscription's five-hour window for the usage gate: {e}"),
     }
+}
+
+/// `Gate::try_pass` on the process's gate.
+pub fn try_pass(conversation_id: i64) -> bool {
+    gate().try_pass(conversation_id)
 }
 
 /// Waits at the process's gate for `conversation_id`'s Claude Code call,

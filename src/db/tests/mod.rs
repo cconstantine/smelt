@@ -77,3 +77,4 @@ mod secrets;
 mod storage_grace;
 mod claude_cli;
 mod provider_usage;
+mod expects_wake;

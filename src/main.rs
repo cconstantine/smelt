@@ -195,6 +195,9 @@ async fn start_up(dotenv_problem: Option<String>) -> tokio::net::TcpListener {
     // The Claude subscription's last five-hour reading, so a restart
     // mid-hold keeps holding (SME-523): before anything can wake a turn.
     claude_cli::gate::load(pool).await;
+    // Keeps the prompt cache of idle Claude Code conversations expected
+    // to wake warm (SME-523). See `turn::reseed`.
+    tokio::spawn(turn::reseed::watch(pool.clone()));
     // Every live pod's agent, so scripts' MCP calls work again at once
     // (SME-359). After the pauses: a delivered exit can wake a turn.
     sandbox::reconnect_live_pods(pool).await;
