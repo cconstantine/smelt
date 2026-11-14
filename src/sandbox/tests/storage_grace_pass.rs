@@ -180,3 +180,41 @@ async fn test_a_pass_removes_at_most_twenty_oldest_first(pool: PgPool) {
     let settled = pass(&pool, 7, UNBOUNDED, &by_age, counting(&calls)).await;
     assert_eq!(settled.len(), 5, "the next pass takes the rest");
 }
+
+/// Review 1, A-L2: the cap counts removals tried. The oldest due
+/// conversation busy (its turn running) uses no slot, so a pass over 21
+/// due still removes 20, the busy one among none of them.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_busy_conversation_uses_no_slot_of_the_cap(pool: PgPool) {
+    let mut by_age = Vec::new();
+    for days in 8..29 {
+        by_age.push(ended_days_ago(&pool, db::PodEnd::Plain, days).await.0);
+    }
+    let oldest = *by_age.last().expect("21 due");
+    let turn = crate::turn::count_a_test_turn(oldest);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let settled = pass(&pool, 7, UNBOUNDED, &by_age, counting(&calls)).await;
+    drop(turn);
+    assert_eq!(settled.len(), STORAGE_REMOVALS_PER_PASS, "twenty removed past the busy one: {settled:?}");
+    assert!(!settled.contains(&oldest), "the busy one stands");
+    assert_eq!(calls.load(Ordering::SeqCst), 20);
+}
+
+/// Review 1, A-L2: a removal tried and left unsettled (a claim left
+/// behind) does use its slot, so a stuck one is bounded too.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_failed_removal_uses_its_slot(pool: PgPool) {
+    let mut by_age = Vec::new();
+    for days in 8..30 {
+        by_age.push(ended_days_ago(&pool, db::PodEnd::Plain, days).await.0);
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let settled = pass(&pool, 7, UNBOUNDED, &by_age, move |_conversation| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        std::future::ready(Ok(StorageRemoval { claims_failed: 1, ..claims_gone() }))
+    })
+    .await;
+    assert!(settled.is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), STORAGE_REMOVALS_PER_PASS, "22 due, 20 tried");
+}

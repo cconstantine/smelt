@@ -34,7 +34,8 @@ pub(crate) use self::settings::*;
 /// noise.
 const STORAGE_REMOVAL_PASS_SECS: u64 = 3600;
 
-/// The most conversations one pass removes (SME-521): bounds the first
+/// The most removals one pass tries (SME-521; a busy conversation, or one
+/// no longer due, uses no slot: review 1, A-L2). Bounds the first
 /// pass after a deploy, when every stop that was never marked comes due
 /// at once, and the local-path helper pods each claim's delete starts.
 /// The oldest go first; the rest wait for the next hour.
@@ -86,6 +87,13 @@ pub(in crate::sandbox) struct Due {
     pub class: GraceClass,
 }
 
+/// What one due conversation came to under the locks: skipped (busy, or
+/// no longer due), or a removal tried, settled or not.
+enum Attempt {
+    Skipped,
+    Tried { settled: bool },
+}
+
 /// The rule's input from a database row.
 fn grace_input(row: &db::StorageGraceRow) -> GraceInput {
     GraceInput {
@@ -115,8 +123,8 @@ pub(crate) fn fate_of(
 }
 
 /// One pass: list the claims, decide each conversation's fate, log the
-/// counts, and remove the due ones, oldest first, at most
-/// `STORAGE_REMOVALS_PER_PASS`. Each removal is skipped while its turn
+/// counts, and remove the due ones, oldest first, trying at most
+/// `STORAGE_REMOVALS_PER_PASS` (a skipped one tries nothing). Each removal is skipped while its turn
 /// runs or is queued, or while a start holds its lock, re-checked under
 /// both locks, and given up on past `removal_timeout` (F1's bound; a
 /// test's is shorter than production's). The conversations it settled,
@@ -191,31 +199,45 @@ where
     );
     let remove = &remove;
     let mut settled = Vec::new();
-    for due in due.into_iter().take(STORAGE_REMOVALS_PER_PASS) {
+    // Review 1, A-L2: the cap counts removals tried, not conversations
+    // looked at — a busy one, or one no longer due, uses no slot, so a few
+    // that never settle can't hold the rest back for good.
+    let mut attempted = 0;
+    for due in due {
+        if attempted >= STORAGE_REMOVALS_PER_PASS {
+            break;
+        }
         let conversation_id = due.conversation_id;
         if crate::turn::turn_running(conversation_id) {
             continue;
         }
-        let done = crate::turn::between_turns(conversation_id, false, || async move {
+        let outcome = crate::turn::between_turns(conversation_id, false, || async move {
             let start_lock = pod_start_lock(conversation_id);
             let Ok(_starting) = start_lock.try_lock() else {
-                return false;
+                return Attempt::Skipped;
             };
             // A turn admitted while the lock was being taken: busy all
             // the same, as in the quiet stop's candidate.
             if crate::turn::turn_running(conversation_id) {
-                return false;
+                return Attempt::Skipped;
             }
             if !still_due(pool, settings, &due).await {
-                return false;
+                return Attempt::Skipped;
             }
-            match due.pod_id {
+            let done = match due.pod_id {
                 Some(pod_id) => settle_pod_removal(pool, removal_timeout, remove, &due, pod_id).await,
                 None => settle_podless_removal(removal_timeout, remove, conversation_id).await,
-            }
+            };
+            Attempt::Tried { settled: done }
         });
-        if done.await.unwrap_or(false) {
-            settled.push(conversation_id);
+        match outcome.await {
+            Some(Attempt::Tried { settled: done }) => {
+                attempted += 1;
+                if done {
+                    settled.push(conversation_id);
+                }
+            }
+            Some(Attempt::Skipped) | None => {}
         }
     }
     settled
