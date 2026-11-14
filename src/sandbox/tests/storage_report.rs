@@ -68,6 +68,20 @@ fn test_a_configured_retain_class_is_a_problem() {
     assert!(problem.contains("nfs-keep") && problem.contains("Retain"), "{problem}");
 }
 
+/// Review 1, B-L1: a class with no provisioner (static volumes) has no
+/// one to reclaim a released volume, whatever its reclaimPolicy says.
+#[test]
+fn test_a_class_with_no_provisioner_is_a_problem() {
+    let mut classes = classes();
+    classes.push(class(serde_json::json!({
+        "metadata": {"name": "static"},
+        "provisioner": "kubernetes.io/no-provisioner", "reclaimPolicy": "Delete",
+    })));
+    let found = claim_class(Some("static"), &classes);
+    let problem = class_problem(&found).expect("a class with no provisioner is a problem");
+    assert!(problem.contains("static") && problem.contains("no-provisioner"), "{problem}");
+}
+
 #[test]
 fn test_a_missing_class_or_no_default_is_a_problem() {
     let missing = claim_class(Some("gone"), &classes());

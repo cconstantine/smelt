@@ -25,6 +25,10 @@ pub struct GraceSettings {
     pub user_days: u32,
 }
 
+/// The provisioner of a class of static volumes: nothing reclaims a
+/// released one, whatever the class's `reclaimPolicy` (review 1, B-L1).
+pub const NO_PROVISIONER: &str = "kubernetes.io/no-provisioner";
+
 /// The storage class the conversation claims get (SME-521), as the
 /// cluster says; reading it needs the `smelt-storage-reader` grant.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

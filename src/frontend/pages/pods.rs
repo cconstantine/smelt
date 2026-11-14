@@ -5,7 +5,7 @@ use crate::api::pods::{
     AgentStatus, PodActivity, PodUsage, ServerPodOverview, StorageFate, StorageKind, StoredStorage, StoredSummary,
     get_pods, get_stored_storage, get_stored_summary, remove_stored_storage, stop_pod,
 };
-use crate::api::sandbox::{ClaimClass, GraceSettings, StorageReport, get_storage_report};
+use crate::api::sandbox::{ClaimClass, GraceSettings, NO_PROVISIONER, StorageReport, get_storage_report};
 use crate::frontend::Route;
 use crate::frontend::pages::SettingsCrumbs;
 use crate::frontend::pages::STORAGE_REMOVE_WARNING;
@@ -298,9 +298,13 @@ fn storage_report_lines(report: &StorageReport) -> Vec<String> {
         ClaimClass::Missing { name } => {
             lines.push(format!("Sandbox claims name storage class {name}, which the cluster doesn't have."))
         }
-        ClaimClass::Found { name, reclaim_policy, .. } => {
-            let frees = if reclaim_policy == "Delete" { "" } else { "; removing storage frees no disk" };
-            lines.push(format!("Sandbox claims use {name} (reclaim: {reclaim_policy}){frees}."));
+        ClaimClass::Found { name, provisioner, reclaim_policy, .. } => {
+            // Review 1, B-L1: static volumes have no one to reclaim them.
+            let static_volumes = provisioner == NO_PROVISIONER;
+            let kind = if static_volumes { ", no provisioner" } else { "" };
+            let frees =
+                if reclaim_policy == "Delete" && !static_volumes { "" } else { "; removing storage frees no disk" };
+            lines.push(format!("Sandbox claims use {name} (reclaim: {reclaim_policy}{kind}){frees}."));
         }
     }
     if let Some(released) = &report.released {
@@ -569,6 +573,17 @@ mod tests {
         assert_eq!(
             storage_report_lines(&StorageReport { class: class("Retain"), released: None }),
             ["Sandbox claims use local-path (reclaim: Retain); removing storage frees no disk."]
+        );
+        // Review 1, B-L1: no provisioner, no one to reclaim it.
+        let static_class = ClaimClass::Found {
+            name: "static".to_string(),
+            provisioner: "kubernetes.io/no-provisioner".to_string(),
+            reclaim_policy: "Delete".to_string(),
+            configured: true,
+        };
+        assert_eq!(
+            storage_report_lines(&StorageReport { class: static_class, released: None }),
+            ["Sandbox claims use static (reclaim: Delete, no provisioner); removing storage frees no disk."]
         );
         assert_eq!(
             storage_report_lines(&StorageReport { class: ClaimClass::Missing { name: "fast".to_string() }, released: None }),

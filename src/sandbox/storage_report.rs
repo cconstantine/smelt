@@ -20,7 +20,7 @@ use k8s_openapi::api::core::v1::PersistentVolume;
 use k8s_openapi::api::storage::v1::StorageClass;
 
 use super::*;
-use crate::api::sandbox::{ClaimClass, ReleasedVolumes, StorageReport};
+use crate::api::sandbox::{ClaimClass, NO_PROVISIONER, ReleasedVolumes, StorageReport};
 
 /// The annotation that marks the cluster's default storage class.
 const DEFAULT_CLASS_ANNOTATION: &str = "storageclass.kubernetes.io/is-default-class";
@@ -101,6 +101,13 @@ pub(in crate::sandbox) fn class_problem(class: &ClaimClass) -> Option<String> {
         ClaimClass::Found { name, reclaim_policy, .. } if reclaim_policy != "Delete" => Some(format!(
             "sandbox claims use storage class {name}, whose reclaimPolicy is {reclaim_policy}: removing a claim frees no disk; \
              set SANDBOX_STORAGE_CLASS to a class with reclaimPolicy Delete"
+        )),
+        // Review 1, B-L1: static volumes have no provisioner to reclaim a
+        // released one, whatever the class's reclaimPolicy says.
+        ClaimClass::Found { name, provisioner, .. } if provisioner == NO_PROVISIONER => Some(format!(
+            "sandbox claims use storage class {name}, whose provisioner is {NO_PROVISIONER}: nothing reclaims a \
+             released volume, so removing a claim frees no disk; set SANDBOX_STORAGE_CLASS to a provisioned class \
+             with reclaimPolicy Delete"
         )),
         ClaimClass::Found { .. } => None,
     }
