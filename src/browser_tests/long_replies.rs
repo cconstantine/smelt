@@ -251,20 +251,30 @@ pub(super) async fn scenario_streaming_into_a_long_transcript(t: &Scenario<'_>) 
 
 /// SME-57 (d), from SME-58: a conversation in the sidebar opens from the
 /// keyboard. Each row's title is a link and a tab stop that Enter or Space
-/// opens; the row itself isn't one, so its Delete isn't nested inside the
-/// link (a screen reader would read "Delete" as part of the link's name,
-/// and some can't reach a button inside a link). Delete stays a tab stop
-/// of its own: Enter on it arms it, without opening the conversation. The
-/// rows took mouse clicks only.
+/// opens; the row itself isn't one, so its caret isn't nested inside the
+/// link. The rows took mouse clicks only. Delete is the header's ☰ menu's
+/// now (SME-513): Enter on ☰ opens it on its first item, End then Enter
+/// arms Delete without leaving the page or closing the menu, and Escape
+/// closes it back onto ☰.
 pub(super) async fn scenario_conversation_rows_by_keyboard(t: &Scenario<'_>) {
+    // Older rows under the two this scenario opens, as a full run's earlier
+    // scenarios leave them: the list is newest first, so they sit between
+    // the opened row and the header in the page's tab order (CI's red on
+    // PR #355, run 43588642743, came from a long list).
+    for _ in 0..45 {
+        t.conversation().await;
+    }
     let first = t.conversation().await;
     seed_user_message(t.pool, first.id, "the first row").await;
     let second = t.conversation().await;
     seed_user_message(t.pool, second.id, "the second row").await;
     let page = t.tab(t.url(&format!("conversation/{}", first.id))).await;
     wait_for_live_client(&page, first.id).await;
-    let row = |id: i64| format!("[data-conversation-id=\"{id}\"]");
+    // The row, not the header, which names its conversation too.
+    let row = |id: i64| format!(".conversation-item[data-conversation-id=\"{id}\"]");
     let title = |id: i64| format!("{} .conversation-title", row(id));
+    // The list arrives after the live client: wait for the row it reads.
+    wait_for_element(&page, &title(second.id), Duration::from_secs(10)).await;
     let roles: serde_json::Value = page
         .evaluate(format!(
             "(() => {{ const r = document.querySelector('{}'), t = r.querySelector('.conversation-title'); \
@@ -276,7 +286,7 @@ pub(super) async fn scenario_conversation_rows_by_keyboard(t: &Scenario<'_>) {
         .into_value()
         .expect("facts");
     assert_eq!(roles["title"], "link", "a row's title should be its link: {roles}");
-    assert_eq!(roles["row"], "none", "the row around the link and its Delete shouldn't be a link too: {roles}");
+    assert_eq!(roles["row"], "none", "the row around the link and its caret shouldn't be a link too: {roles}");
     assert!(roles["tab"].as_i64().is_some_and(|t| t >= 0), "the title should be a tab stop: {roles}");
     let at = |id: i64| format!("/conversation/{id}");
     let url_now = |page: &chromiumoxide::Page| {
@@ -304,13 +314,40 @@ pub(super) async fn scenario_conversation_rows_by_keyboard(t: &Scenario<'_>) {
     first_row.focus().await.expect("focus the first row");
     first_row.press_key(" ").await.expect("press Space");
     assert!(wait_for_url(&page, at(first.id)).await, "Space on a row should open it: at {}", url_now(&page).await);
-    let delete = wait_for_element(&page, &format!("{} .delete-conversation", row(second.id)), Duration::from_secs(10)).await;
-    delete.focus().await.expect("focus the second row's Delete");
-    delete.press_key("Enter").await.expect("press Enter on Delete");
-    wait_for_element(&page, &format!("{} .delete-conversation.confirm", row(second.id)), Duration::from_secs(5)).await;
+    assert_eq!(
+        page.find_elements(".conversation-item .delete-conversation").await.map(|v| v.len()).unwrap_or(0),
+        0,
+        "the rows have no Delete of their own (SME-513)"
+    );
+    let button = format!(".conversation-header[data-conversation-id='{}'] .conversation-menu-button", first.id);
+    let menu_button = wait_for_element(&page, &button, Duration::from_secs(10)).await;
+    let focused = |selector: String| {
+        let page = page.clone();
+        async move { js_bool(&page, &format!("!!document.activeElement && document.activeElement.matches({selector:?})")).await }
+    };
+    // ☰ is reached with Tab from the row just opened, not focused by the
+    // test (review 1, B-L5): it's a tab stop in the page's own order.
+    tab_to(&page, &title(first.id), &button).await;
+    menu_button.press_key("Enter").await.expect("press Enter on ☰");
+    wait_for_element(&page, ".conversation-menu[role=menu]", Duration::from_secs(5)).await;
+    assert!(
+        wait_until(|| focused(".conversation-menu-thinking".to_string()), Duration::from_secs(5)).await,
+        "Enter on ☰ should open the menu on its first item"
+    );
+    let first_item = wait_for_element(&page, ".conversation-menu-thinking", Duration::from_secs(5)).await;
+    first_item.press_key("End").await.expect("press End");
+    let delete = menu_delete(first.id);
+    assert!(wait_until(|| focused(delete.clone()), Duration::from_secs(5)).await, "End should reach Delete, the last item");
+    let delete_item = wait_for_element(&page, &delete, Duration::from_secs(5)).await;
+    delete_item.press_key("Enter").await.expect("press Enter on Delete");
+    wait_for_element(&page, &format!("{delete}.confirm"), Duration::from_secs(5)).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let url = url_now(&page).await;
-    assert!(url.ends_with(&at(first.id)), "Enter on Delete should arm it, not open its row: at {url}");
+    assert!(url.ends_with(&at(first.id)), "Enter on Delete should arm it, not leave the page: at {url}");
+    assert!(js_bool(&page, "!!document.querySelector('.conversation-menu[role=menu]')").await, "arming leaves the menu open");
+    press_escape(&page, &delete).await;
+    assert!(wait_for_count(&page, ".conversation-menu", 0, Duration::from_secs(5)).await, "Escape closes the menu");
+    assert!(wait_until(|| focused(button.clone()), Duration::from_secs(5)).await, "Escape puts focus back on ☰");
 }
 
 /// SME-57 (d), from SME-58: the message box has a label, not only a

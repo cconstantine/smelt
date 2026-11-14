@@ -317,30 +317,36 @@ pub(super) async fn scenario_sidebar(t: &Scenario<'_>) {
     // A row to measure, even when this scenario runs alone.
     let conversation = t.conversation().await;
     seed_user_message(t.pool, conversation.id, "a sidebar row").await;
-    let other = t.conversation().await;
-    seed_user_message(t.pool, other.id, "another sidebar row").await;
-    let page = t.tab(t.url("")).await;
-    // And the sidebar's two-step Delete keeps its size when armed: the
-    // armed label was bold, so it came out wider than the width the
-    // button had reserved for it (SME-40 F9). Arming is client-side
-    // only; closing this tab disarms it.
-    let delete = ".conversation-item .delete-conversation";
-    wait_for_stable(&page, delete, tokio::time::Instant::now() + Duration::from_secs(10)).await;
-    let before = element_box(&page, delete).await;
-    click_when_present(&page, delete, Duration::from_secs(5)).await;
-    wait_for_element(&page, ".conversation-item .delete-conversation.confirm", Duration::from_secs(5)).await;
-    let after = element_box(&page, ".conversation-item .delete-conversation.confirm").await;
-    assert_eq!(before.2, after.2, "arming the sidebar's Delete changed its width");
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_live_client(&page, conversation.id).await;
+    // The rows have no Delete of their own: it's in the header's ☰ menu
+    // (SME-513).
+    wait_for_element(&page, ".conversation-item", Duration::from_secs(10)).await;
+    assert!(wait_for_count(&page, ".delete-conversation", 0, Duration::from_secs(1)).await, "a sidebar row still has a Delete");
+    // And the menu's two-step Delete keeps its size when armed, and the
+    // menu its width: the armed label was bold, so it came out wider than
+    // the width the button had reserved for it (SME-40 F9). Arming is
+    // client-side only; closing this tab disarms it.
+    open_conversation_menu(&page, conversation.id).await;
+    let delete = menu_delete(conversation.id);
+    wait_for_stable(&page, &delete, tokio::time::Instant::now() + Duration::from_secs(10)).await;
+    let before = element_box(&page, &delete).await;
+    let menu_before = element_box(&page, ".conversation-menu").await;
+    click_when_present(&page, &delete, Duration::from_secs(5)).await;
+    let armed = format!("{delete}.confirm");
+    wait_for_element(&page, &armed, Duration::from_secs(5)).await;
+    let after = element_box(&page, &armed).await;
+    let menu_after = element_box(&page, ".conversation-menu").await;
+    assert_eq!(before.2, after.2, "arming the menu's Delete changed its width");
+    assert_eq!(menu_before.2, menu_after.2, "arming the menu's Delete changed the menu's width");
     // A title uses its row, and each row says how long ago the
     // conversation was active. Titles were cut at about 15 characters
-    // with most of the row empty (SME-41 D8). The row measured is one the
-    // pointer isn't on, since a hovered row trades its age for Delete:
-    // with this scenario's one conversation the only row was the one the
-    // Delete click above left the pointer on, so run first or alone the
-    // age read empty (SME-278). A second conversation gives it one.
+    // with most of the row empty (SME-41 D8). A hovered row no longer
+    // trades its age for a Delete (SME-513), so any row will do (the
+    // SME-278 workaround is gone).
     let row: Vec<String> = page
         .evaluate(
-            "(() => { const item = document.querySelector('.conversation-item:not(:hover)') || document.querySelector('.conversation-item'); \
+            "(() => { const item = document.querySelector('.conversation-item'); \
              const w = s => item.querySelector(s).getBoundingClientRect().width; \
              const age = item.querySelector('.conversation-age'); \
              return [String(w('.conversation-title') / item.getBoundingClientRect().width), age ? age.innerText : '']; })()",
@@ -553,12 +559,11 @@ pub(super) async fn scenario_conversations_appear_live(t: &Scenario<'_>) {
 
     // And the same the other way: delete it here, and the tab that made it —
     // which has it open, so it listens through that conversation's stream —
-    // loses the row without a reload either.
-    let delete = format!("{row} .delete-conversation");
-    click_when_present(&listening, &delete, Duration::from_secs(10)).await;
-    let confirm = format!("{row} .delete-conversation.confirm");
-    wait_for_element(&listening, &confirm, Duration::from_secs(5)).await;
-    click_when_present(&listening, &confirm, Duration::from_secs(5)).await;
+    // loses the row without a reload either. Deleting takes it open, from
+    // its ☰ menu (SME-513): the listening tab opens it from its sidebar.
+    click_conversation(&listening, id).await;
+    wait_for_live_client(&listening, id).await;
+    delete_through_menu(&listening, id).await;
     assert!(
         wait_for_count(&listening, &row, 0, Duration::from_secs(10)).await,
         "the tab that deleted the conversation should drop its row"

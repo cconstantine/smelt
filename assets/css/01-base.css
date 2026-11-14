@@ -156,7 +156,6 @@ body {
 }
 
 .conversation-item {
-    position: relative;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -245,66 +244,6 @@ body {
 
 .conversation-agent-meta .status-failed {
     color: var(--danger);
-}
-
-/* On a two-line row, Delete covers the first line's end, where the age is,
-   not the persona and status. */
-.conversation-agent .delete-conversation {
-    top: 7px;
-    transform: none;
-}
-
-/* Laid over the end of the row rather than taking room from the title
-   (SME-41 D8); it covers the age while shown. */
-.delete-conversation {
-    position: absolute;
-    right: 8px;
-    top: 50%;
-    transform: translateY(-50%);
-    flex-shrink: 0;
-    padding: 4px 9px;
-    border: 1px solid var(--border-strong);
-    border-radius: 6px;
-    background: var(--surface);
-    color: var(--text-2);
-    font-size: 12px;
-    line-height: 1.4;
-    cursor: pointer;
-    opacity: 0;
-    transition: opacity 100ms ease, background-color 100ms ease, color 100ms ease, border-color 100ms ease;
-}
-
-/* Kept clickable/focusable at all times; just visually quiet until the row
-   is engaged, so the affordance doesn't read as a wall of buttons. */
-.conversation-item:hover .delete-conversation,
-.conversation-item:focus-within .delete-conversation,
-.delete-conversation:focus-visible {
-    opacity: 1;
-}
-
-.delete-conversation:hover {
-    background: var(--canvas);
-    border-color: var(--border-strong);
-    color: var(--text);
-}
-
-.delete-conversation.confirm {
-    opacity: 1;
-    background: var(--danger);
-    border-color: var(--danger);
-    color: var(--surface);
-}
-
-/* Bold in both states (hidden while idle), so the width the button
-   reserves for it is the width it has when armed (SME-40 F9). */
-.delete-conversation .two-step-confirm {
-    font-weight: 600;
-}
-
-.delete-conversation.confirm:hover {
-    background: var(--danger);
-    border-color: var(--danger);
-    color: var(--surface);
 }
 
 /* Below WIDE_LAYOUT_BREAKPOINT (see the media query further down): the
@@ -546,30 +485,139 @@ body {
     min-width: 0;
 }
 
-.conversation-thinking-toggle,
-.conversation-archive {
+/* The conversation's ☰ menu (SME-513): its actions behind one button,
+   the menu right-aligned under it inside the chat column. */
+.conversation-compacting {
     flex-shrink: 0;
-    padding: 2px 8px;
+    font-size: 12px;
+    color: var(--muted);
+}
+
+/* ☰ and Compact's popover in one box (review 1, B-L2): both popups hang
+   right-aligned from its edge, which is ☰'s. */
+.conversation-actions {
+    position: relative;
+    flex-shrink: 0;
+    align-self: center;
+    display: flex;
+}
+
+.conversation-menu-wrap {
+    position: relative;
+}
+
+.conversation-menu-button {
+    width: 36px;
+    height: 36px;
+    padding: 0;
     border: 1px solid var(--border);
     border-radius: 6px;
     background: none;
     color: var(--text-2);
-    font-size: 12px;
+    font-size: 18px;
+    line-height: 1;
     cursor: pointer;
 }
 
-.conversation-thinking-toggle:disabled {
+.conversation-menu-button[aria-expanded='true'] {
+    background: var(--subtle);
+}
+
+.conversation-menu-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 20;
+}
+
+.conversation-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 21;
+    min-width: 200px;
+    max-width: calc(100vw - 16px);
+    box-sizing: border-box;
+    padding: 4px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.15);
+    display: flex;
+    flex-direction: column;
+}
+
+.conversation-menu-item {
+    min-height: 36px;
+    padding: 6px 10px;
+    border: none;
+    border-radius: 6px;
+    background: none;
+    color: var(--ink);
+    font: inherit;
+    font-size: 13px;
+    text-align: left;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+}
+
+.conversation-menu-item:hover,
+.conversation-menu-item:focus-visible {
+    background: var(--subtle);
+}
+
+/* Keyboard focus has a ring of its own, not just hover's background
+   (review 1, B-M1); inset, so the menu's padding doesn't clip it. */
+.conversation-menu-item:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+}
+
+.conversation-menu-item[aria-disabled='true'] {
+    color: var(--muted);
     cursor: default;
-    opacity: 0.6;
 }
 
-/* Compact on demand (SME-482): the button after "Show thinking", and its
-   popover anchored under it, right-aligned, inside the chat column. */
-.compact-control {
-    position: relative;
-    flex-shrink: 0;
+.conversation-menu-note {
+    font-size: 11px;
+    color: var(--muted);
 }
 
+/* Destructive, last (SME-513): red text; armed, filled red, reading its
+   count in the same spot (TwoStepLabel), so the confirming click lands
+   where the first did. */
+.conversation-menu-delete {
+    color: var(--danger);
+}
+
+.conversation-menu-delete.confirm,
+.conversation-menu-delete.confirm:hover,
+.conversation-menu-delete.confirm:focus-visible {
+    background: var(--danger);
+    color: var(--surface);
+}
+
+/* Bold in both states (hidden while idle), so the width reserved for it
+   is the width it has when armed (SME-40 F9). */
+.conversation-menu-delete .two-step-confirm {
+    font-weight: 600;
+}
+
+@media (max-width: 720px) {
+    .conversation-menu-button {
+        width: 44px;
+        height: 44px;
+    }
+
+    .conversation-menu-item {
+        min-height: 44px;
+    }
+}
+
+/* Compact on demand (SME-482): its popover, opened from the ☰ menu,
+   anchored under it (`.conversation-actions`), right-aligned, inside the
+   chat column. Its holder is empty and unpositioned. */
 .compact-backdrop {
     position: fixed;
     inset: 0;
