@@ -218,10 +218,10 @@ async fn read(
             _ => {}
         }
     }
-    let (content, cut_off_call) = blocks.finish(&stop_reason).map_err(ModelError::Other)?;
+    let (content, cut_off_call, unparsed_calls) = blocks.finish(&stop_reason);
     // Cut off: no `result` to wait for, since `once` kills it now (L1).
     if crate::anthropic::stream::is_cut_off(&stop_reason) {
-        return Ok(StreamedTurn { content, stop_reason, usage: meter.usage(), cut_off_call });
+        return Ok(StreamedTurn { content, stop_reason, usage: meter.usage(), cut_off_call, unparsed_calls });
     }
     // Its `result`, so the process is done; a reply already in hand stands.
     let _ = tokio::time::timeout(WIND_DOWN, async {
@@ -232,5 +232,5 @@ async fn read(
         }
     })
     .await;
-    Ok(StreamedTurn { content, stop_reason, usage: meter.usage(), cut_off_call })
+    Ok(StreamedTurn { content, stop_reason, usage: meter.usage(), cut_off_call, unparsed_calls })
 }

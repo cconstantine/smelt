@@ -286,25 +286,6 @@ async fn test_sequential_blocks_from_ollama_are_kept() {
     assert_eq!(turn.content, vec![text("Adding."), add_call("call_a", 1)]);
 }
 
-/// A tool call whose input never parses still fails the call, whether
-/// its stop came or the stream just ended.
-#[tokio::test]
-async fn test_an_unparseable_tool_input_still_fails_the_call() {
-    for with_stop in [true, false] {
-        let [start, input] = tool_at(0, "call_a", r#"{"a":"#);
-        let [delta, stop] = tool_use_end();
-        let mut events = vec![start, input];
-        if with_stop {
-            events.push(stop_at(0));
-        }
-        events.extend([delta, stop]);
-        let err = run_against_mock_upstream(sse(&events), |_| {})
-            .await
-            .expect_err("a broken tool input fails");
-        assert!(err.contains("failed to parse tool_use input JSON for add"), "{err}");
-    }
-}
-
 /// SME-169: a character whose bytes arrive in two network chunks is
 /// decoded whole, in a reply's text and in a tool's input alike.
 #[tokio::test]

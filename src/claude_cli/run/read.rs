@@ -238,15 +238,17 @@ impl Run {
 
     /// The reply at its `message_stop`.
     pub(super) async fn finish(&mut self, blocks: Blocks, stop_reason: String, meter: &UsageMeter, extra: &UsageMeter) -> Result<StreamedTurn, String> {
-        let (mut content, cut_off_call) = blocks.finish(&stop_reason)?;
-        for block in &mut content {
-            if let ContentBlock::ToolUse { name, .. } = block
-                && let Some(smelt) = self.bridge.smelt_name(name)
-            {
+        let (mut content, cut_off_call, mut unparsed_calls) = blocks.finish(&stop_reason);
+        let names = content.iter_mut().filter_map(|block| match block {
+            ContentBlock::ToolUse { name, .. } => Some(name),
+            _ => None,
+        });
+        for name in names.chain(unparsed_calls.iter_mut().map(|call| &mut call.name)) {
+            if let Some(smelt) = self.bridge.smelt_name(name) {
                 *name = smelt.to_string();
             }
         }
-        let turn = StreamedTurn { content, stop_reason, usage: meter.usage(), cut_off_call };
+        let turn = StreamedTurn { content, stop_reason, usage: meter.usage(), cut_off_call, unparsed_calls };
         if turn.stop_reason == "tool_use" {
             self.expected = turn
                 .content

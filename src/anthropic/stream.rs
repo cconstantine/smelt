@@ -11,8 +11,10 @@ mod endpoint;
 pub(crate) mod interpret;
 mod lines;
 mod meter;
+pub mod unparsed;
 
 use interpret::*;
+pub use unparsed::UnparsedCall;
 
 pub use endpoint::{Auth, Endpoint};
 pub use meter::UsageMeter;
@@ -73,6 +75,10 @@ pub struct StreamedTurn {
     /// The tool call a cut-off reply stopped in the middle of, by name
     /// (SME-126): dropped from `content`, never run.
     pub cut_off_call: Option<String>,
+    /// The reply's calls whose input isn't one JSON value (SME-520): each
+    /// kept in `content` with input `{}`, never run, answered with
+    /// `unparsed::call_result`.
+    pub unparsed_calls: Vec<UnparsedCall>,
 }
 
 /// Accumulates one in-progress content block across its
@@ -98,12 +104,12 @@ pub(crate) enum PartialBlock {
 /// A finished block. A tool call whose input doesn't parse is kept until
 /// the reply's `stop_reason` is known (SME-126): a reply cut off at its
 /// limit stops every block before saying so, and the call it was cut in
-/// is dropped rather than failing the reply. Any other is the error it
-/// always was.
+/// is dropped rather than failing the reply. Any other stays in the reply
+/// with input `{}` and is listed, never run (SME-520).
 #[derive(Debug)]
 enum Finished {
     Block(ContentBlock),
-    UnparsedCall { name: String, error: String },
+    UnparsedCall { id: String, name: String, raw: String, error: String },
 }
 
 impl Finished {
@@ -131,8 +137,10 @@ impl PartialBlock {
                 match serde_json::from_str(&partial_json) {
                     Ok(input) => Finished::Block(ContentBlock::ToolUse { id, name, input }),
                     Err(e) => Finished::UnparsedCall {
-                        error: format!("failed to parse tool_use input JSON for {name}: {e}"),
+                        id,
                         name,
+                        raw: partial_json,
+                        error: e.to_string(),
                     },
                 }
             }
@@ -263,8 +271,8 @@ impl Blocks {
     /// order. When the reply stopped early (`stopped_early`) and its last block
     /// is a tool call, that call is dropped, whether or not its input
     /// parsed, and its name returned (SME-126). A call left whose input
-    /// doesn't parse fails the reply.
-    pub(crate) fn finish(mut self, stop_reason: &str) -> Result<(Vec<ContentBlock>, Option<String>), String> {
+    /// doesn't parse is kept with input `{}`, logged and listed (SME-520).
+    pub(crate) fn finish(mut self, stop_reason: &str) -> (Vec<ContentBlock>, Option<String>, Vec<UnparsedCall>) {
         while let Some(&index) = self.open.keys().next() {
             self.stop(Some(index));
         }
@@ -280,15 +288,21 @@ impl Blocks {
             cut_off_call = Some(name.to_string()).filter(|name| is_plain_tool_name(name));
             last.remove();
         }
+        let mut unparsed_calls = Vec::new();
         let content = self
             .done
             .into_values()
             .map(|finished| match finished {
-                Finished::Block(block) => Ok(block),
-                Finished::UnparsedCall { error, .. } => Err(error),
+                Finished::Block(block) => block,
+                Finished::UnparsedCall { id, name, raw, error } => {
+                    unparsed::report(&name, &id, &raw, &error);
+                    let input = Value::Object(serde_json::Map::new());
+                    unparsed_calls.push(UnparsedCall { id: id.clone(), name: name.clone(), error });
+                    ContentBlock::ToolUse { id, name, input }
+                }
             })
-            .collect::<Result<_, _>>()?;
-        Ok((content, cut_off_call))
+            .collect();
+        (content, cut_off_call, unparsed_calls)
     }
 }
 
@@ -796,12 +810,13 @@ async fn stream_message(
         }
     }
 
-    let (content, cut_off_call) = blocks.finish(&stop_reason)?;
+    let (content, cut_off_call, unparsed_calls) = blocks.finish(&stop_reason);
     Ok(StreamedTurn {
         content,
         stop_reason,
         usage: meter.usage(),
         cut_off_call,
+        unparsed_calls,
     })
 }
 

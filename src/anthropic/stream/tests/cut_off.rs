@@ -103,16 +103,26 @@ async fn test_a_cut_call_names_only_a_plain_tool_name() {
 }
 
 /// Only the reply's last block can be the cut one: an unparseable
-/// call before it still fails, cut off or not; and a reply that
-/// wasn't cut off, or was cut off in text, drops nothing.
+/// call before it is kept with `{}` and listed (SME-520), not dropped
+/// as cut; and a reply that wasn't cut off, or was cut off in text,
+/// drops nothing.
 #[tokio::test]
 async fn test_only_a_cut_off_replys_last_call_is_forgiven() {
     let [start, input] = tool_at(0, "call_a", r#"{"a":"#);
     let [delta, stop] = cut_off_end("max_tokens");
-    let err = run_against_mock_upstream(sse(&[start, input, stop_at(0), text_at(1, "And"), delta, stop]), |_| {})
+    let turn = run_against_mock_upstream(sse(&[start, input, stop_at(0), text_at(1, "And"), delta, stop]), |_| {})
         .await
-        .expect_err("a broken call that isn't last fails");
-    assert!(err.contains("failed to parse tool_use input JSON for add"), "{err}");
+        .expect("a broken call that isn't last is listed, not failed");
+    let empty = ContentBlock::ToolUse { id: "call_a".to_string(), name: "add".to_string(), input: serde_json::json!({}) };
+    assert_eq!((turn.content, turn.cut_off_call), (vec![empty, text("And")], None));
+    let ids: Vec<_> = turn.unparsed_calls.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(ids, ["call_a"]);
+
+    // The cut last call is dropped as before, and not listed.
+    let [start, input] = tool_at(1, "call_a", r#"{"a":"#);
+    let [delta, stop] = cut_off_end("max_tokens");
+    let turn = run_against_mock_upstream(sse(&[text_at(0, "x"), start, input, delta, stop]), |_| {}).await.expect("cut");
+    assert!(turn.unparsed_calls.is_empty(), "{:?}", turn.unparsed_calls);
 
     let [delta, stop] = cut_off_end("max_tokens");
     let turn = run_against_mock_upstream(sse(&[text_at(0, "Half a tho"), delta, stop]), |_| {})
@@ -150,7 +160,7 @@ fn test_blocks_without_an_index_follow_one_another() {
     blocks.start(None, PartialBlock::ToolUse { id: "t".to_string(), name: "add".to_string(), partial_json: String::new() });
     blocks.tool_input(None, r#"{"a":1}"#);
     assert_eq!(
-        blocks.finish("end_turn").expect("finish").0,
+        blocks.finish("end_turn").0,
         vec![
             ContentBlock::Thinking { thinking: "Hm".to_string(), signature: "sig".to_string() },
             text("AB"),
@@ -170,7 +180,7 @@ fn test_a_delta_after_its_blocks_stop_is_kept_after_it() {
     blocks.text(Some(1), "second".to_string());
     blocks.stop(Some(1));
     blocks.text(Some(0), "late".to_string());
-    assert_eq!(blocks.finish("end_turn").expect("finish").0, vec![text("first"), text("late"), text("second")]);
+    assert_eq!(blocks.finish("end_turn").0, vec![text("first"), text("late"), text("second")]);
 }
 
 /// A provider's index at `usize::MAX`, then an event without one, must
@@ -181,7 +191,7 @@ fn test_a_block_at_the_largest_index_doesnt_overflow_the_next() {
     blocks.text(Some(usize::MAX), "last".to_string());
     blocks.thinking(None, "Hm".to_string());
     assert_eq!(
-        blocks.finish("end_turn").expect("finish").0,
+        blocks.finish("end_turn").0,
         vec![
             text("last"),
             ContentBlock::Thinking { thinking: "Hm".to_string(), signature: String::new() },
@@ -199,14 +209,14 @@ fn test_a_tool_call_started_twice_stays_one_call() {
     empty.start(Some(0), call());
     empty.start(Some(0), call());
     empty.tool_input(Some(0), r#"{"a":1}"#);
-    assert_eq!(empty.finish("end_turn").expect("finish").0, vec![add_call("t", 1)]);
+    assert_eq!(empty.finish("end_turn").0, vec![add_call("t", 1)]);
 
     let mut partial = Blocks::default();
     partial.start(Some(0), call());
     partial.tool_input(Some(0), "{");
     partial.start(Some(0), call());
     partial.tool_input(Some(0), r#""a":1}"#);
-    assert_eq!(partial.finish("end_turn").expect("finish").0, vec![add_call("t", 1)]);
+    assert_eq!(partial.finish("end_turn").0, vec![add_call("t", 1)]);
 }
 
 /// A signature or tool input with no block of its kind open is
@@ -219,5 +229,5 @@ fn test_a_signature_or_tool_input_without_its_block_is_dropped() {
     blocks.text(Some(1), "hi".to_string());
     blocks.signature(Some(1), "sig");
     blocks.tool_input(Some(1), "{}");
-    assert_eq!(blocks.finish("end_turn").expect("finish").0, vec![text("hi")]);
+    assert_eq!(blocks.finish("end_turn").0, vec![text("hi")]);
 }
