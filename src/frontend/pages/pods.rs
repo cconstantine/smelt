@@ -257,7 +257,9 @@ fn stopped_text(stop: Option<&crate::api::pods::PodStop>, fate: &StorageFate, no
     let fate = match fate {
         StorageFate::Kept => Some("kept until you remove it".to_string()),
         StorageFate::RemovesAt { at, .. } => Some(match ((*at - now).num_seconds() + 86_399) / 86_400 {
-            ..=0 => "removed within the hour".to_string(),
+            // Review 1, B-L5: not "within the hour" — a pass tries at
+            // most 20 and skips a busy conversation.
+            ..=0 => "due for removal".to_string(),
             1 => "removed in 1 day".to_string(),
             n => format!("removed in {n} days"),
         }),
@@ -689,7 +691,7 @@ mod tests {
         assert_eq!(stopped_text(Some(&stop), &in_a_day, now), "stopped 3d 0h ago \u{b7} removed in 1 day");
         assert_eq!(
             stopped_text(Some(&stop), &removes(-1, GraceClass::Default), now),
-            "stopped 3d 0h ago \u{b7} removed within the hour"
+            "stopped 3d 0h ago \u{b7} due for removal"
         );
         assert_eq!(stopped_text(Some(&stop), &StorageFate::Kept, now), "stopped 3d 0h ago \u{b7} kept until you remove it");
         assert_eq!(stopped_text(Some(&stop), &StorageFate::Unknown, now), "stopped 3d 0h ago", "no fate from an older server");
