@@ -157,7 +157,7 @@ variable "database_storage_size" {
 }
 
 variable "storage_class_name" {
-  description = "Storage class for every claim this module makes (Postgres, and nothing else — sandbox claims are made by smelt with the cluster default). Unset uses the cluster default."
+  description = "Storage class for every claim this module makes (Postgres, and nothing else — sandbox claims are made by smelt, with `sandbox_storage_class_name`). Unset uses the cluster default."
   type        = string
   default     = null
 }
@@ -178,6 +178,12 @@ variable "docker_storage_size" {
 
 variable "workspace_storage_size" {
   description = "`SANDBOX_WORKSPACE_STORAGE_SIZE`: each conversation's /workspace claim. Unset → smelt's default (20Gi)."
+  type        = string
+  default     = null
+}
+
+variable "sandbox_storage_class_name" {
+  description = "`SANDBOX_STORAGE_CLASS`: the storage class of each conversation's two claims (SME-521). It needs a dynamic provisioner with `reclaimPolicy: Delete`, or removing a claim frees no disk. Unset → the cluster's default class."
   type        = string
   default     = null
 }

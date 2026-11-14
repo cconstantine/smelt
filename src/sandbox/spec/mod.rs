@@ -65,7 +65,10 @@ pub(in crate::sandbox) use pods::build_pod_spec;
 pub(in crate::sandbox) use pods::{immediate_delete_params, START_DOCKERD_SCRIPT};
 pub(in crate::sandbox) use pvcs::{build_agent_volume_pvc_spec, build_volume_pvc_spec, conversation_pvc_specs};
 #[cfg(test)]
-pub(in crate::sandbox) use pvcs::{build_conversation_pvc_spec, default_docker_storage_size, default_volume_storage_size};
+pub(in crate::sandbox) use pvcs::{
+    build_conversation_pvc_spec, conversation_pvc_specs_with, default_docker_storage_size, default_volume_storage_size,
+    storage_class_from,
+};
 #[cfg(test)]
 pub(in crate::sandbox) use status::unschedulable_notice;
 pub(in crate::sandbox) use status::{pending_panel_update, pod_pending_detail, pod_startup_failure, unschedulable_reason};

@@ -29,6 +29,7 @@ locals {
     SANDBOX_MEMORY_LIMIT              = var.sandbox_memory_limit
     SANDBOX_DOCKER_STORAGE_SIZE       = var.docker_storage_size
     SANDBOX_WORKSPACE_STORAGE_SIZE    = var.workspace_storage_size
+    SANDBOX_STORAGE_CLASS             = var.sandbox_storage_class_name
     SANDBOX_RUNNING_WAIT_TIMEOUT_SECS = var.sandbox_wait_timeout_secs != null ? tostring(var.sandbox_wait_timeout_secs) : null
   }
 

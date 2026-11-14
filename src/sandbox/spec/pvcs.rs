@@ -53,16 +53,42 @@ pub(in crate::sandbox) fn default_workspace_storage_size() -> String {
         .unwrap_or_else(|| "20Gi".to_string())
 }
 
+/// `SANDBOX_STORAGE_CLASS` (SME-521): the storage class of the two
+/// conversation claims. Unset or empty leaves `storageClassName` out, so
+/// they get the cluster's default class, as before. Whichever class they
+/// get needs `reclaimPolicy: Delete`, or removing a claim frees no disk.
+pub(crate) fn sandbox_storage_class() -> Option<String> {
+    storage_class_from(std::env::var("SANDBOX_STORAGE_CLASS").ok())
+}
+
+/// The class for a `SANDBOX_STORAGE_CLASS` of `setting`, for the tests.
+pub(in crate::sandbox) fn storage_class_from(setting: Option<String>) -> Option<String> {
+    setting.filter(|class| !class.is_empty())
+}
+
 /// A conversation's claims: its Docker data and its /workspace (SME-32),
 /// both kept across its pods and deleted with it. Each comes with its
 /// name, so a caller needn't read it back out of the spec's `Option`.
 pub(in crate::sandbox) fn conversation_pvc_specs(conversation_id: i64, instance: &str) -> [(String, PersistentVolumeClaim); 2] {
+    conversation_pvc_specs_with(conversation_id, instance, sandbox_storage_class())
+}
+
+/// `conversation_pvc_specs` with the storage class given, `None` being
+/// the cluster's default.
+pub(in crate::sandbox) fn conversation_pvc_specs_with(
+    conversation_id: i64,
+    instance: &str,
+    storage_class: Option<String>,
+) -> [(String, PersistentVolumeClaim); 2] {
     [
         (docker_pvc_name(conversation_id), default_docker_storage_size()),
         (workspace_pvc_name(conversation_id), default_workspace_storage_size()),
     ]
     .map(|(name, size)| {
-        let spec = build_conversation_pvc_spec(name.clone(), conversation_id, size, instance);
+        let mut spec = build_conversation_pvc_spec(name.clone(), conversation_id, size, instance);
+        if let Some(claim_spec) = spec.spec.as_mut() {
+            claim_spec.storage_class_name = storage_class.clone();
+        }
         (name, spec)
     })
 }
