@@ -277,6 +277,7 @@ mod compaction;
 mod round1;
 mod questions;
 mod unknown_call;
+mod unparsed_input;
 mod on_request;
 mod compact_at;
 mod usage;

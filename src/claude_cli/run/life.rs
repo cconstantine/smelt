@@ -68,6 +68,7 @@ impl Run {
             bridge: run_bridge,
             state: State::Streaming,
             expected: Vec::new(),
+            unparsed: std::collections::HashSet::new(),
             arrived: HashMap::new(),
             anonymous: Vec::new(),
             answers: HashMap::new(),

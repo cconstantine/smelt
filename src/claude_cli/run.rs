@@ -260,6 +260,9 @@ struct Run {
     state: State,
     /// The calls of the reply last returned, while Parked.
     expected: Vec<Expected>,
+    /// Which of `expected`'s inputs didn't parse (SME-520): the CLI
+    /// refuses those locally, so its echo for one is a slip.
+    unparsed: std::collections::HashSet<String>,
     /// Calls that arrived before smelt had their result, by tool-use id.
     arrived: HashMap<String, ParkedCall>,
     /// Calls that arrived with no tool-use id.

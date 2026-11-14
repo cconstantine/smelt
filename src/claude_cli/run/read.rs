@@ -130,7 +130,7 @@ impl Run {
                             // call arriving mid-`stream` read as a stray
                             // (review 1 L1). The record carries the correction.
                             self.answers.remove(&id);
-                            tracing::warn!(conversation_id = self.conversation_id, tool_use_id = %id, tool = %name, "Claude Code refused a call to a name it was never given; smelt carries on and answers it from its own record");
+                            tracing::warn!(conversation_id = self.conversation_id, tool_use_id = %id, tool = %name, "Claude Code refused a call itself (a name it was never given, or an input that didn't parse); smelt carries on and answers it from its own record");
                         }
                     }
                 }
@@ -179,8 +179,10 @@ impl Run {
                 // never saw: divergence. Of a name it was never given, the
                 // echo can only be its local unknown-name refusal — with
                 // no `init` list to prove the run checkable, keep today's
-                // loud failure.
-                Some(if self.cli_tools.is_some() && !self.bridge.was_handed(&ours.name) {
+                // loud failure. A call whose input didn't parse (SME-520)
+                // the CLI refuses locally too, whatever its name: smelt's
+                // own error result is its record.
+                Some(if self.unparsed.contains(id) || (self.cli_tools.is_some() && !self.bridge.was_handed(&ours.name)) {
                     CliAnswered::Slip { id: id.to_string(), name: ours.name.clone() }
                 } else {
                     CliAnswered::Diverged { id: id.to_string() }
@@ -258,6 +260,7 @@ impl Run {
                     _ => None,
                 })
                 .collect();
+            self.unparsed = turn.unparsed_calls.iter().map(|call| call.id.clone()).collect();
             self.state = State::Parked;
             self.settle_held();
             return Ok(turn);
@@ -304,6 +307,7 @@ impl Run {
         }
         self.state = State::Idle;
         self.expected.clear();
+        self.unparsed.clear();
     }
 }
 
@@ -346,8 +350,9 @@ pub(in crate::claude_cli) fn apply(blocks: &mut Blocks, stop_reason: &mut String
 
 /// What an echoed `tool_result` for an expected call smelt never answered
 /// is (SME-447): `Slip`, the CLI's own local refusal of a name it was never
-/// given — the same mistake an HTTP kind gets smelt's unknown-call
-/// correction for, so the turn carries on and the shared bound counts it;
+/// given, or of a call whose input didn't parse (SME-520) — the same
+/// mistakes an HTTP kind gets smelt's own error result for, so the turn
+/// carries on and the shared bound counts it;
 /// or `Diverged`, an answer to a call the CLI was given, or an echo with no
 /// `init` tool list to check against, where the two contexts no longer
 /// agree (review 1 L2, unchanged).
