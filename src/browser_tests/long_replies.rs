@@ -314,13 +314,25 @@ pub(super) async fn scenario_conversation_rows_by_keyboard(t: &Scenario<'_>) {
     );
     let button = format!(".conversation-header[data-conversation-id='{}'] .conversation-menu-button", first.id);
     let menu_button = wait_for_element(&page, &button, Duration::from_secs(10)).await;
-    menu_button.focus().await.expect("focus ☰");
-    menu_button.press_key("Enter").await.expect("press Enter on ☰");
-    wait_for_element(&page, ".conversation-menu[role=menu]", Duration::from_secs(5)).await;
     let focused = |selector: String| {
         let page = page.clone();
         async move { js_bool(&page, &format!("!!document.activeElement && document.activeElement.matches({selector:?})")).await }
     };
+    // ☰ is reached with Tab from the row just opened, not focused by the
+    // test (review 1, B-L5): it's a tab stop in the page's own order.
+    let first_row = wait_for_element(&page, &title(first.id), Duration::from_secs(10)).await;
+    first_row.focus().await.expect("focus the first row");
+    let mut reached = false;
+    for _ in 0..40 {
+        first_row.press_key("Tab").await.expect("press Tab");
+        if focused(button.clone()).await {
+            reached = true;
+            break;
+        }
+    }
+    assert!(reached, "Tab from the sidebar should reach ☰");
+    menu_button.press_key("Enter").await.expect("press Enter on ☰");
+    wait_for_element(&page, ".conversation-menu[role=menu]", Duration::from_secs(5)).await;
     assert!(
         wait_until(|| focused(".conversation-menu-thinking".to_string()), Duration::from_secs(5)).await,
         "Enter on ☰ should open the menu on its first item"
