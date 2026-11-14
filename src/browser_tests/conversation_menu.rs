@@ -23,6 +23,21 @@ async fn focused(page: &chromiumoxide::Page, selector: &str) -> bool {
     js_bool(page, &format!("document.activeElement?.matches({selector:?}) ?? false")).await
 }
 
+/// Whether the focused element matches `selector` and shows a keyboard
+/// focus ring of its own: `:focus-visible` with a 2 px outline, not just
+/// hover's background (review 1, B-M1).
+async fn ringed(page: &chromiumoxide::Page, selector: &str) -> bool {
+    js_bool(
+        page,
+        &format!(
+            "(() => {{ const e = document.activeElement; if (!e?.matches({selector:?})) return false; \
+             const s = getComputedStyle(e); \
+             return e.matches(':focus-visible') && s.outlineStyle !== 'none' && parseFloat(s.outlineWidth) >= 2; }})()"
+        ),
+    )
+    .await
+}
+
 /// Opens `id` in a new tab at `width`×`height`, live.
 async fn open_at(t: &Scenario<'_>, id: i64, (width, height, mobile): (i64, i64, bool)) -> chromiumoxide::Page {
     let page = t.tab("about:blank").await;
@@ -94,6 +109,7 @@ async fn open_and_close(page: &chromiumoxide::Page, id: i64, (width, _, mobile):
         wait_until(|| focused(page, ".conversation-menu-thinking"), Duration::from_secs(5)).await,
         "{width}px: ArrowDown on an open ☰ focuses the first item"
     );
+    assert!(ringed(page, ".conversation-menu-thinking").await, "{width}px: a keyboard-focused item shows a focus ring");
     press_key(page, ".conversation-menu-button", "Escape").await;
     assert!(wait_for_count(page, ".conversation-menu", 0, Duration::from_secs(5)).await, "{width}px: Escape on an open ☰ closes it");
     open_conversation_menu(page, id).await;
@@ -198,6 +214,14 @@ async fn delete(page: &chromiumoxide::Page, id: i64, lands: &str) {
     // The refetch's result is applied by an effect after the request ends.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(js_bool(page, &format!("!!document.querySelector({armed:?})")).await, "a refetch leaves Delete armed");
+    // Reached by keyboard, the armed Delete's ring shows on its red fill
+    // (review 1, B-M1): round the menu, wrapping, back onto it.
+    press_key(page, &armed, "ArrowDown").await;
+    press_key(page, ".conversation-menu-thinking", "ArrowUp").await;
+    assert!(
+        wait_until(|| ringed(page, &armed), Duration::from_secs(5)).await,
+        "the armed Delete, keyboard-focused, shows a focus ring"
+    );
     click_when_present(page, &armed, Duration::from_secs(5)).await;
     assert!(
         wait_for_count(page, &format!(".conversation-item[data-conversation-id='{id}']"), 0, Duration::from_secs(10)).await,

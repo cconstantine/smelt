@@ -559,7 +559,13 @@ body {
 .conversation-menu-item:hover,
 .conversation-menu-item:focus-visible {
     background: var(--subtle);
-    outline: none;
+}
+
+/* Keyboard focus has a ring of its own, not just hover's background
+   (review 1, B-M1); inset, so the menu's padding doesn't clip it. */
+.conversation-menu-item:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
 }
 
 .conversation-menu-item[aria-disabled='true'] {
