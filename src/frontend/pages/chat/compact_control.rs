@@ -19,13 +19,21 @@ pub(super) fn compacting_here(busy: Option<i64>, selected: Option<i64>) -> bool 
     busy.is_some() && busy == selected
 }
 
+/// Compact's popover, opened from the header's ☰ menu (SME-513 Q1): the
+/// header owns `open` and `busy`, so the menu's item opens it and reads
+/// whether this conversation is compacting.
 #[component]
-pub(super) fn CompactControl(selected: Memo<Option<i64>>, state: Store<ConversationState>) -> Element {
+pub(super) fn CompactControl(
+    selected: Memo<Option<i64>>,
+    state: Store<ConversationState>,
+    open: Signal<bool>,
+    busy: Signal<Option<i64>>,
+) -> Element {
     let turn_running = state.turn_running();
     let mut context_usage = state.context_usage();
-    let mut open = use_signal(|| false);
+    let mut open = open;
     let mut note = use_signal(String::new);
-    let mut busy = use_signal(|| None::<i64>);
+    let mut busy = busy;
     let mut error = use_signal(|| None::<String>);
     // Another conversation opened: its own popover starts closed.
     use_effect(move || {
@@ -65,18 +73,8 @@ pub(super) fn CompactControl(selected: Memo<Option<i64>>, state: Store<Conversat
     };
     let running = turn_running();
     let busy_here = compacting_here(busy(), selected());
-    let label = if busy_here { "Compacting…" } else { "Compact" };
     rsx! {
         div { class: "compact-control",
-            button {
-                class: "conversation-thinking-toggle conversation-compact-toggle",
-                r#type: "button",
-                disabled: running || busy_here,
-                title: if running { "Compact once the turn ends" } else { "Summarise this conversation's history now, to save tokens" },
-                aria_expanded: "{open()}",
-                onclick: move |_| open.set(!open()),
-                "{label}"
-            }
             if open() {
                 div { class: "compact-backdrop", onclick: move |_| open.set(false) }
                 div {
@@ -92,6 +90,10 @@ pub(super) fn CompactControl(selected: Memo<Option<i64>>, state: Store<Conversat
                         placeholder: "What should the summary keep? (optional)",
                         value: "{note}",
                         oninput: move |e| note.set(e.value()),
+                        // Opened from the menu: focus moves into the popover.
+                        onmounted: move |e: MountedEvent| async move {
+                            let _ = e.set_focus(true).await;
+                        },
                     }
                     if let Some(message) = error() {
                         p { class: "compact-error", "{message}" }
@@ -134,28 +136,31 @@ mod tests {
         assert!(!compacting_here(Some(7), None));
     }
 
-    fn rendered(turn_running: bool) -> String {
-        fn app(turn_running: bool) -> Element {
+    fn rendered(open: bool, turn_running: bool) -> String {
+        fn app((is_open, turn_running): (bool, bool)) -> Element {
             let selected = use_memo(|| Some(7));
             let state = use_store(move || ConversationState { turn_running, ..ConversationState::default() });
-            rsx! { CompactControl { selected, state } }
+            let open = use_signal(|| is_open);
+            let busy = use_signal(|| None::<i64>);
+            rsx! { CompactControl { selected, state, open, busy } }
         }
-        let mut dom = VirtualDom::new_with_props(app, turn_running);
+        let mut dom = VirtualDom::new_with_props(app, (open, turn_running));
         dom.rebuild_in_place();
         dioxus::ssr::render(&dom)
     }
 
-    /// T18: the button shows, and is disabled with its reason while a turn
-    /// runs (the server refuses then anyway).
+    /// T18 (SME-513): the popover's Compact now is disabled while a turn
+    /// runs (the server refuses then anyway); closed, nothing shows.
     #[cfg(feature = "server")]
     #[test]
-    fn test_the_compact_button_waits_for_the_turn_to_end() {
-        let idle = rendered(false);
-        assert!(idle.contains(">Compact<"), "{idle}");
+    fn test_compact_now_waits_for_the_turn_to_end() {
+        let closed = rendered(false, false);
+        assert!(!closed.contains("compact-popover"), "{closed}");
+        let idle = rendered(true, false);
+        assert!(idle.contains(">Compact now<"), "{idle}");
         assert!(!idle.contains("disabled"), "{idle}");
-        let running = rendered(true);
-        assert!(running.contains(">Compact<"), "{running}");
+        let running = rendered(true, true);
+        assert!(running.contains(">Compact now<"), "{running}");
         assert!(running.contains("disabled"), "{running}");
-        assert!(running.contains("Compact once the turn ends"), "{running}");
     }
 }

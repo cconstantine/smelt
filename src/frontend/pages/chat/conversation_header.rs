@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::api::agents::ConversationNode;
+use super::conversation_menu::{ConversationMenu, MenuItem, menu_items};
 
 /// What the header shows for one conversation.
 #[derive(Clone, Debug, PartialEq)]
@@ -42,41 +43,70 @@ pub(super) fn ConversationHeader(
     state: Store<ConversationState>,
 ) -> Element {
     // Without the tree (not fetched yet, or a row it doesn't have yet) the
-    // header is the toggle alone: thinking can be shown from the start
-    // (SME-354 B18).
+    // header is the ☰ menu with Show thinking and Compact: thinking can be
+    // shown from the start (SME-354 B18).
     let info = selected().and_then(|id| header_info(&nodes.read(), id));
+    let listed = info.is_some();
     let (title, meta, parent, archive) = match info {
         Some(info) => (info.title, info.meta, info.parent, info.archive),
         None => (String::new(), None, None, None),
     };
     // Kept with the conversation it's about: the header isn't remounted
     // on a switch (review 1, L1), so another's error mustn't show here.
-    let archive_error: Signal<Option<(i64, String)>> = use_signal(|| None);
+    let header_error: Signal<Option<(i64, String)>> = use_signal(|| None);
+    let mut menu_open = use_signal(|| false);
+    let mut compact_open = use_signal(|| false);
+    let compact_busy = use_signal(|| None::<i64>);
+    // Another conversation opened: its menu starts closed.
+    use_effect(move || {
+        selected();
+        menu_open.set(false);
+    });
+    let compacting = super::compact_control::compacting_here(compact_busy(), selected());
+    let on_action = move |item: MenuItem| {
+        menu_open.set(false);
+        match item {
+            // Thinking beside tool calls and replies is hidden unless
+            // asked for (SME-123 DR6).
+            MenuItem::Thinking => {
+                let shown = *super::transcript::SHOW_THINKING.peek();
+                *super::transcript::SHOW_THINKING.write() = !shown;
+            }
+            // Today's popover, under ☰ (SME-513 Q1).
+            MenuItem::Compact => compact_open.set(true),
+            MenuItem::Archive => {
+                if let (Some(archived), Some(id)) = (archive, selected()) {
+                    archive_conversation(id, archived, nodes, header_error);
+                }
+            }
+        }
+    };
     rsx! {
         div { class: "conversation-header",
+            // Names the conversation for the browser tier's diagnostics
+            // (SME-505's `page_state`).
+            "data-conversation-id": selected().map(|id| id.to_string()),
             div { class: "conversation-header-top",
                 h1 { class: "conversation-header-title", title: "{title}", "{title}" }
-                // Thinking beside tool calls and replies is hidden unless
-                // asked for (SME-123 DR6).
-                button {
-                    class: "conversation-thinking-toggle",
-                    r#type: "button",
-                    aria_pressed: "{super::transcript::SHOW_THINKING()}",
-                    onclick: move |_| {
-                        let shown = *super::transcript::SHOW_THINKING.peek();
-                        *super::transcript::SHOW_THINKING.write() = !shown;
-                    },
-                    if super::transcript::SHOW_THINKING() { "Hide thinking" } else { "Show thinking" }
+                // The popover's button went into the menu: a compaction
+                // left running still says so (SME-513 Q4).
+                if compacting {
+                    span { class: "conversation-compacting", "Compacting…" }
                 }
-                if let (Some(archived), Some(id)) = (archive, selected()) {
-                    ArchiveButton { id, archived, nodes, error: archive_error }
+                ConversationMenu {
+                    open: menu_open,
+                    items: menu_items(archive, listed),
+                    archived: archive.unwrap_or(false),
+                    turn_running: state.turn_running()(),
+                    compacting,
+                    on_action,
                 }
-                // Last in the row: its popover is right-aligned under it and
+                // Last in the row: its popover is right-aligned under ☰ and
                 // 320 px wide, so anything after it pushes the popover off a
                 // phone's left edge (SME-482's compact_now at 375 px).
-                super::compact_control::CompactControl { selected, state }
+                super::compact_control::CompactControl { selected, state, open: compact_open, busy: compact_busy }
             }
-            super::ErrorText { message: archive_error_for(archive_error(), selected()) }
+            super::ErrorText { message: header_error_for(header_error(), selected()) }
             if meta.is_some() || parent.is_some() {
                 div { class: "conversation-header-meta",
                     if let Some(meta) = meta {
@@ -94,43 +124,34 @@ pub(super) fn ConversationHeader(
     }
 }
 
-/// Archive / Unarchive for a top-level conversation (SME-480 D6). The
-/// returned mark goes into the shared tree at once; the refetch on
-/// `ConversationsChanged` confirms it. A failure shows under the header.
-#[component]
-fn ArchiveButton(id: i64, archived: bool, nodes: Signal<Vec<ConversationNode>>, error: Signal<Option<(i64, String)>>) -> Element {
+/// Archive / Unarchive for a top-level conversation (SME-480 D6), from
+/// the menu. The returned mark goes into the shared tree at once; the
+/// refetch on `ConversationsChanged` confirms it. A failure shows under
+/// the header.
+fn archive_conversation(id: i64, archived: bool, nodes: Signal<Vec<ConversationNode>>, error: Signal<Option<(i64, String)>>) {
     let mut nodes = nodes;
     let mut error = error;
-    rsx! {
-        button {
-            class: "conversation-archive",
-            r#type: "button",
-            onclick: move |_| {
-                spawn(async move {
-                    let result = if archived {
-                        crate::api::archive::unarchive_conversation(id).await
-                    } else {
-                        crate::api::archive::archive_conversation(id).await
-                    };
-                    match result {
-                        Ok(conversation) => {
-                            error.set(None);
-                            if let Some(node) = nodes.write().iter_mut().find(|n| n.id == id) {
-                                node.archived_at = conversation.archived_at;
-                            }
-                        }
-                        Err(e) => error.set(Some((id, server_error_message(&e)))),
-                    }
-                });
-            },
-            if archived { "Unarchive" } else { "Archive" }
+    spawn(async move {
+        let result = if archived {
+            crate::api::archive::unarchive_conversation(id).await
+        } else {
+            crate::api::archive::archive_conversation(id).await
+        };
+        match result {
+            Ok(conversation) => {
+                error.set(None);
+                if let Some(node) = nodes.write().iter_mut().find(|n| n.id == id) {
+                    node.archived_at = conversation.archived_at;
+                }
+            }
+            Err(e) => error.set(Some((id, server_error_message(&e)))),
         }
-    }
+    });
 }
 
-/// The archive error to show under `selected`'s header: only one from
-/// that conversation's own Archive / Unarchive (review 1, L1).
-fn archive_error_for(error: Option<(i64, String)>, selected: Option<i64>) -> Option<String> {
+/// The error to show under `selected`'s header: only one from that
+/// conversation's own menu actions (review 1, L1).
+fn header_error_for(error: Option<(i64, String)>, selected: Option<i64>) -> Option<String> {
     error.filter(|(id, _)| selected == Some(*id)).map(|(_, message)| message)
 }
 
@@ -155,22 +176,44 @@ mod tests {
         }
     }
 
-    /// SME-354 B18: "Show thinking" lived only in a header that rendered
-    /// nothing until the conversation tree loaded. With the tree not in
-    /// yet (or without the open conversation), the toggle still shows.
-    #[cfg(feature = "server")]
-    #[test]
-    fn test_the_thinking_toggle_shows_before_the_tree_has_the_conversation() {
-        fn app() -> Element {
-            let selected = use_memo(|| Some(7));
-            let nodes = use_signal(Vec::new);
+    fn rendered_header(nodes: Vec<ConversationNode>, id: i64) -> String {
+        fn app(props: (Vec<ConversationNode>, i64)) -> Element {
+            let (list, id) = props;
+            let selected = use_memo(move || Some(id));
+            let nodes = use_signal(move || list.clone());
             let state = use_store(ConversationState::default);
             rsx! { ConversationHeader { selected, nodes, state } }
         }
-        let mut dom = VirtualDom::new(app);
+        let mut dom = VirtualDom::new_with_props(app, (nodes, id));
         dom.rebuild_in_place();
-        let html = dioxus::ssr::render(&dom);
-        assert!(html.contains("Show thinking"), "{html}");
+        dioxus::ssr::render(&dom)
+    }
+
+    /// SME-354 B18: "Show thinking" lived only in a header that rendered
+    /// nothing until the conversation tree loaded. With the tree not in
+    /// yet (or without the open conversation), the ☰ menu that holds it
+    /// still shows (SME-513 S1).
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_the_menu_shows_before_the_tree_has_the_conversation() {
+        let html = rendered_header(Vec::new(), 7);
+        assert!(html.contains("conversation-menu-button"), "{html}");
+        assert!(html.contains(r#"data-conversation-id="7""#), "{html}");
+    }
+
+    /// SME-513 S2 and S3: a listed conversation's header holds the menu
+    /// too, and none of the old row of buttons.
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_a_listed_conversations_header_holds_the_menu_alone() {
+        let nodes = vec![node(1, None, "root", None, None), node(2, Some(1), "seat", Some("idle"), None)];
+        for id in [1, 2] {
+            let html = rendered_header(nodes.clone(), id);
+            assert!(html.contains("conversation-menu-button"), "{id}: {html}");
+            for gone in ["conversation-thinking-toggle", "conversation-archive", "conversation-compact-toggle"] {
+                assert!(!html.contains(gone), "{id}: {gone} in {html}");
+            }
+        }
     }
 
     #[test]
@@ -199,11 +242,11 @@ mod tests {
     /// Review 1, L1: a failed Archive on one conversation isn't shown
     /// under the next one's header, and shows again on going back.
     #[test]
-    fn test_an_archive_error_shows_only_under_its_own_conversation() {
+    fn test_a_header_error_shows_only_under_its_own_conversation() {
         let error = Some((1, "conversation not found".to_string()));
-        assert_eq!(archive_error_for(error.clone(), Some(1)).as_deref(), Some("conversation not found"));
-        assert_eq!(archive_error_for(error.clone(), Some(2)), None, "another conversation's header");
-        assert_eq!(archive_error_for(error, None), None, "no conversation open");
+        assert_eq!(header_error_for(error.clone(), Some(1)).as_deref(), Some("conversation not found"));
+        assert_eq!(header_error_for(error.clone(), Some(2)), None, "another conversation's header");
+        assert_eq!(header_error_for(error, None), None, "no conversation open");
     }
 
     /// SME-480 D6: a top-level conversation offers Archive or Unarchive by

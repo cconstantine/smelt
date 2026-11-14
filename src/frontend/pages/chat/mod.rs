@@ -60,6 +60,7 @@ mod agents_waiting;
 mod composer;
 mod compact_control;
 mod conversation_header;
+mod conversation_menu;
 mod empty_home;
 mod context;
 mod follow;

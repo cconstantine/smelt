@@ -181,6 +181,30 @@ pub(super) async fn wait_for_stable(page: &chromiumoxide::Page, selector: &str, 
     }
 }
 
+/// Opens the header's ☰ menu (SME-513) and waits for it. Clicks only a
+/// closed menu's button (`aria-expanded='false'`): the button toggles, so
+/// a retried click on it would close the menu again, and once it's open
+/// the selector no longer matches (the plan's SME-505 point 2). `id` is
+/// the open conversation's: the header names it, so a stale header isn't
+/// the one clicked.
+pub(super) async fn open_conversation_menu(page: &chromiumoxide::Page, id: i64) {
+    let button = format!(".conversation-header[data-conversation-id='{id}'] .conversation-menu-button[aria-expanded='false']");
+    click_when_present(page, &button, Duration::from_secs(10)).await;
+    wait_for_element(page, ".conversation-menu[role=menu]", Duration::from_secs(5)).await;
+}
+
+/// Evaluates a JS expression to a bool: false when it can't be read.
+pub(super) async fn js_bool(page: &chromiumoxide::Page, expression: &str) -> bool {
+    page.evaluate(expression).await.ok().and_then(|v| v.into_value::<bool>().ok()) == Some(true)
+}
+
+/// Presses Escape on `selector`'s element, as a user would with it focused.
+pub(super) async fn press_escape(page: &chromiumoxide::Page, selector: &str) {
+    let el = wait_for_element(page, selector, Duration::from_secs(5)).await;
+    el.focus().await.expect("focus for Escape");
+    el.press_key("Escape").await.expect("press Escape");
+}
+
 /// A click step whose click goes through and then reports an error, as a
 /// CDP call failing after the mouse was pressed and released would.
 fn click_then_fail(element: &chromiumoxide::Element) -> BoxFuture<'_, Result<(), String>> {

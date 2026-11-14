@@ -178,6 +178,7 @@ fn scenarios() -> Vec<Entry> {
         entry("context_usage", 60, Runs::Beside, |t| Box::pin(scenario_context_usage(t))),
         entry("compaction_divider", 60, Runs::Beside, |t| Box::pin(scenario_compaction_divider(t))),
         entry("compact_now", 150, Runs::Beside, |t| Box::pin(scenario_compact_now(t))),
+        entry("conversation_menu", 150, Runs::Beside, |t| Box::pin(scenario_conversation_menu(t))),
         entry("overflow_compacts", 60, Runs::Beside, |t| Box::pin(scenario_overflow_compacts(t))),
         entry("todo_panel", 60, Runs::Beside, |t| Box::pin(scenario_todo_panel(t))),
         entry("reply_stays_in_its_conversation", 60, Runs::Beside, |t| Box::pin(scenario_reply_stays_in_its_conversation(t))),
@@ -476,6 +477,7 @@ mod report_owed;
 mod top_level_persona;
 mod archive;
 mod compact_now;
+mod conversation_menu;
 mod usage_windows;
 mod settings_page;
 
@@ -506,5 +508,6 @@ use report_owed::*;
 use top_level_persona::*;
 use archive::*;
 use compact_now::*;
+use conversation_menu::*;
 use usage_windows::*;
 use settings_page::*;
