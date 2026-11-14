@@ -5,7 +5,8 @@
 //! still at work, or its own question to its parent.
 //!
 //! A candidate is re-seeded only if every one of these holds (`consider`):
-//! no turn runs in it; its cache is still alive (`CACHE_TTL` less
+//! no turn runs in it; no Stop has paused it (PR #353 review 1 M3); its
+//! cache is still alive (`CACHE_TTL` less
 //! `MARGIN` from its start); something is expected to wake it
 //! (`db::expects_wake`); it has had fewer than `RESEED_CAP` re-seeds this
 //! idle spell; its model still resolves to the same Claude Code provider,
@@ -88,6 +89,9 @@ pub(crate) async fn run_tick(pool: &PgPool, now: DateTime<Utc>) -> Vec<tokio::ta
 pub(crate) async fn consider(pool: &PgPool, conversation_id: i64, candidate: candidates::Candidate, now: DateTime<Utc>) -> Decision {
     if turn_running(conversation_id) {
         return Decision::Wait("a turn is running");
+    }
+    if is_paused(conversation_id) {
+        return Decision::Drop("a Stop paused it: nothing wakes it until the user writes");
     }
     if candidate.start + CACHE_TTL <= now + MARGIN {
         return Decision::Drop("its cache is gone");
