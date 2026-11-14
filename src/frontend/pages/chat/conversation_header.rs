@@ -100,21 +100,25 @@ pub(super) fn ConversationHeader(
                 if compacting {
                     span { class: "conversation-compacting", "Compacting…" }
                 }
-                ConversationMenu {
-                    open: menu_open,
-                    armed: delete_armed,
-                    items: menu_items(archive, listed),
-                    archived: archive.unwrap_or(false),
-                    turn_running: state.turn_running()(),
-                    compacting,
-                    delete_confirm: selected().map(|id| delete_confirm_label(&nodes.read(), id)).unwrap_or_default(),
-                    deleting: selected().is_some_and(|id| deleting.read().contains(&id)),
-                    on_action,
+                // ☰ and Compact's popover share one box, last in the row:
+                // the popover hangs right-aligned under ☰ as the menu does,
+                // and the popover's empty holder adds no gap after ☰
+                // (review 1, B-L2). Anything after it would push the 320 px
+                // popover off a phone's left edge (SME-482's compact_now).
+                div { class: "conversation-actions",
+                    ConversationMenu {
+                        open: menu_open,
+                        armed: delete_armed,
+                        items: menu_items(archive, listed),
+                        archived: archive.unwrap_or(false),
+                        turn_running: state.turn_running()(),
+                        compacting,
+                        delete_confirm: selected().map(|id| delete_confirm_label(&nodes.read(), id)).unwrap_or_default(),
+                        deleting: selected().is_some_and(|id| deleting.read().contains(&id)),
+                        on_action,
+                    }
+                    super::compact_control::CompactControl { selected, state, open: compact_open, busy: compact_busy }
                 }
-                // Last in the row: its popover is right-aligned under ☰ and
-                // 320 px wide, so anything after it pushes the popover off a
-                // phone's left edge (SME-482's compact_now at 375 px).
-                super::compact_control::CompactControl { selected, state, open: compact_open, busy: compact_busy }
             }
             super::ErrorText { message: header_error_for(header_error(), selected()) }
             if meta.is_some() || parent.is_some() {

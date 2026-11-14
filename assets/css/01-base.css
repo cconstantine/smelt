@@ -156,7 +156,6 @@ body {
 }
 
 .conversation-item {
-    position: relative;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -494,10 +493,17 @@ body {
     color: var(--muted);
 }
 
-.conversation-menu-wrap {
+/* ☰ and Compact's popover in one box (review 1, B-L2): both popups hang
+   right-aligned from its edge, which is ☰'s. */
+.conversation-actions {
     position: relative;
     flex-shrink: 0;
     align-self: center;
+    display: flex;
+}
+
+.conversation-menu-wrap {
+    position: relative;
 }
 
 .conversation-menu-button {
@@ -610,12 +616,8 @@ body {
 }
 
 /* Compact on demand (SME-482): its popover, opened from the ☰ menu,
-   anchored under it, right-aligned, inside the chat column. */
-.compact-control {
-    position: relative;
-    flex-shrink: 0;
-}
-
+   anchored under it (`.conversation-actions`), right-aligned, inside the
+   chat column. Its holder is empty and unpositioned. */
 .compact-backdrop {
     position: fixed;
     inset: 0;

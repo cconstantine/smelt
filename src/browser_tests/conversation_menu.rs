@@ -77,6 +77,16 @@ async fn open_and_close(page: &chromiumoxide::Page, id: i64, (width, _, mobile):
         menu_items(page).await
     );
     assert!(focused(page, ".conversation-menu-thinking").await, "{width}px: the click focuses the first item");
+    assert!(
+        js_bool(
+            page,
+            "(() => { const b = document.querySelector('.conversation-menu-button').getBoundingClientRect(); \
+             const m = document.querySelector('.conversation-menu').getBoundingClientRect(); \
+             return Math.abs(m.right - b.right) < 1 && m.top >= b.bottom; })()"
+        )
+        .await,
+        "{width}px: the menu hangs under ☰, its right edge on ☰'s (review 1, B-L2)"
+    );
     if mobile {
         let measured: Vec<f64> = page
             .evaluate(
@@ -143,6 +153,15 @@ async fn compact(page: &chromiumoxide::Page, id: i64) {
     click_when_present(page, ".conversation-menu-compact", Duration::from_secs(5)).await;
     wait_for_element(page, ".compact-popover", Duration::from_secs(5)).await;
     assert!(focused(page, ".compact-note").await, "the popover opens with its note focused");
+    let anchored = js_bool(
+        page,
+        "(() => { const b = document.querySelector('.conversation-menu-button').getBoundingClientRect(); \
+         const p = document.querySelector('.compact-popover').getBoundingClientRect(); \
+         const row = document.querySelector('.conversation-header-top').getBoundingClientRect(); \
+         return Math.abs(p.right - b.right) < 1 && p.top >= b.bottom && Math.abs(row.right - b.right) < 1; })()",
+    )
+    .await;
+    assert!(anchored, "the popover hangs under ☰, its right edge on ☰'s, and nothing follows ☰ in the row (review 1, B-L2)");
     press_escape(page, ".compact-note").await;
     assert!(wait_for_count(page, ".compact-popover", 0, Duration::from_secs(5)).await);
 
