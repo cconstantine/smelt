@@ -439,10 +439,17 @@ mod tests {
         compacting: bool,
         armed: bool,
         deleting: bool,
+        /// The global Show thinking, set before the first render.
+        thinking: bool,
     }
 
     fn rendered(shown: Shown) -> String {
         fn app(shown: Shown) -> Element {
+            use_hook(|| {
+                if shown.thinking {
+                    *super::super::transcript::SHOW_THINKING.write() = true;
+                }
+            });
             let open = use_signal(|| true);
             let armed = use_signal(|| shown.armed);
             rsx! {
@@ -465,7 +472,7 @@ mod tests {
     }
 
     fn all(archived: bool, turn_running: bool, compacting: bool) -> Shown {
-        Shown { items: menu_items(Some(archived), true), archived, turn_running, compacting, armed: false, deleting: false }
+        Shown { items: menu_items(Some(archived), true), archived, turn_running, compacting, armed: false, deleting: false, thinking: false }
     }
 
     /// The button says what it opens, and the open menu lists its items in
@@ -482,6 +489,16 @@ mod tests {
         assert!(html.contains(r#"role="menuitemcheckbox""#) && html.contains(r#"aria-checked="false""#), "{html}");
         let archived = rendered(all(true, false, false));
         assert!(archived.contains(">Unarchive<"), "{archived}");
+    }
+
+    /// Review 1, B-L4: with thinking shown, the checkbox item reads Hide
+    /// thinking and is checked.
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_shown_thinking_reads_hide_thinking_checked() {
+        let html = rendered(Shown { thinking: true, ..all(false, false, false) });
+        assert!(html.contains(">Hide thinking<") && !html.contains(">Show thinking<"), "{html}");
+        assert!(html.contains(r#"role="menuitemcheckbox""#) && html.contains(r#"aria-checked="true""#), "{html}");
     }
 
     /// T18, moved from the popover's trigger: Compact waits for the turn
