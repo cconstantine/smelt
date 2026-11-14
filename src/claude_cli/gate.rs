@@ -52,6 +52,9 @@ pub const RELEASE_SPACING: StdDuration = StdDuration::from_secs(15);
 pub const WARM_FOR: StdDuration = StdDuration::from_secs(55 * 60);
 /// How long a cold waiter waits before it ranks with the warm ones.
 pub const COLD_LIMIT: StdDuration = StdDuration::from_secs(30 * 60);
+/// The least a waiter behind others sleeps before it looks again unwoken,
+/// so a gate with no spacing (a test's) doesn't spin.
+const BEHIND_FLOOR: StdDuration = StdDuration::from_millis(100);
 
 /// The `five_hour` window of a reading, as the gate keeps it.
 #[derive(Clone, Debug, PartialEq)]
@@ -157,6 +160,24 @@ impl Gate {
         Self { state: Mutex::default(), changed: Notify::new(), spacing, warm_for, cold_limit }
     }
 
+    /// Queues an entry for `conversation_id` with no task behind it, for
+    /// a test to hold a place in line; its id.
+    #[cfg(test)]
+    pub fn queue_for_tests(&self, conversation_id: i64) -> u64 {
+        let mut state = self.state();
+        let id = state.next_id;
+        state.next_id += 1;
+        state.waiters.push(Entry { id, conversation_id, since: Instant::now(), held: None });
+        id
+    }
+
+    /// Takes entry `id` out of the line without waking anyone: a missed
+    /// wake, for a test.
+    #[cfg(test)]
+    pub fn leave_quietly_for_tests(&self, id: u64) {
+        self.state().waiters.retain(|e| e.id != id);
+    }
+
     /// How many conversations' last passes it remembers.
     #[cfg(test)]
     pub fn remembered(&self) -> usize {
@@ -235,10 +256,14 @@ impl Gate {
                         told = Some(until);
                         on_hold(Some(until));
                     }
-                    Some(Instant::now() + (until - Utc::now()).to_std().unwrap_or_default())
+                    Instant::now() + (until - Utc::now()).to_std().unwrap_or_default()
                 }
-                Step::Behind => None,
-                Step::Spacing(at) => Some(at),
+                // Not on a wake alone: the order changes with time too, so
+                // two waiters can each find the other first with no wake
+                // to come (PR #353 review 2 L10). Within a spacing it looks
+                // again; a release is never sooner than that anyway.
+                Step::Behind => Instant::now() + self.spacing.max(BEHIND_FLOOR),
+                Step::Spacing(at) => at,
                 Step::Passed => {
                     if told.is_some() {
                         on_hold(None);
@@ -246,14 +271,9 @@ impl Gate {
                     return;
                 }
             };
-            match deadline {
-                Some(at) => {
-                    tokio::select! {
-                        () = &mut notified => {}
-                        () = tokio::time::sleep_until(at) => {}
-                    }
-                }
-                None => notified.await,
+            tokio::select! {
+                () = &mut notified => {}
+                () = tokio::time::sleep_until(deadline) => {}
             }
         }
     }

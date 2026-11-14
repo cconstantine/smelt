@@ -211,6 +211,25 @@ async fn test_passes_too_old_to_be_warm_are_pruned() {
     assert_eq!(gate.remembered(), 1, "only the fresh pass is kept");
 }
 
+/// Review 2 L10: a waiter behind another looks again within the spacing
+/// even with no wake. The interleaving forced: the one ahead leaves the
+/// line with no notify (as when the order flips between two waiters'
+/// looks and each finds the other first), and the waiter behind it still
+/// passes.
+#[tokio::test]
+async fn test_a_waiter_behind_another_looks_again_without_a_wake() {
+    let spacing = StdDuration::from_millis(200);
+    let gate = Arc::new(Gate::new(spacing));
+    let ahead = gate.queue_for_tests(1);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    queue(&gate, &[2], &tx).await;
+    // Its first look found 1 ahead of it, and it sleeps.
+    tokio::time::sleep(StdDuration::from_millis(50)).await;
+    gate.leave_quietly_for_tests(ahead);
+    let passed = tokio::time::timeout(StdDuration::from_secs(2), rx.recv()).await.expect("it looked again with no wake").expect("sent");
+    assert_eq!(passed, 2);
+}
+
 /// A dropped waiter leaves the queue at once, and the next can go.
 #[tokio::test]
 async fn test_a_dropped_waiter_leaves_the_queue() {
