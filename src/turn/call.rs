@@ -224,6 +224,8 @@ pub(super) async fn stream_for_kind(
     slot: anthropic::stream::SlotPolicy<'_>,
 ) -> Result<anthropic::stream::StreamedTurn, anthropic::stream::ModelError> {
     if turn_model.kind == crate::providers::ProviderKind::ClaudeCli {
+        // The five-hour usage gate (SME-523), between calls.
+        crate::claude_cli::gate::wait(conversation_id).await;
         // The summary's subscription reading (SME-486), Ok or Err; a
         // leftover from an earlier call is dropped first.
         crate::claude_cli::usage::discard(conversation_id);
@@ -249,6 +251,9 @@ async fn call_claude_cli(
     relay: &mut (dyn FnMut(&str) + Send),
     cli: &mut crate::claude_cli::run::TurnCli,
 ) -> Result<(anthropic::stream::StreamedTurn, CallRecorder), CallError> {
+    // The five-hour usage gate (SME-523): waits, between calls, while the
+    // window is on pace to pass its line. A Stop drops the wait.
+    crate::claude_cli::gate::wait(conversation_id).await;
     clear_reply_in_progress(conversation_id);
     crate::events::publish(conversation_id, crate::events::ConversationEvent::ReplyReset {});
     // Only this call's subscription reading is recorded (SME-486 A-L1).

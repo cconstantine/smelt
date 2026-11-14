@@ -9,6 +9,7 @@ mod close;
 mod compaction;
 mod errors;
 pub(crate) mod fake;
+mod gate;
 mod render;
 mod status;
 pub(crate) mod usage;

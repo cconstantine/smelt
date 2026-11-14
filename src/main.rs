@@ -192,6 +192,9 @@ async fn start_up(dotenv_problem: Option<String>) -> tokio::net::TcpListener {
     // Conversations the user stopped stay paused across a restart
     // (SME-238): restored before anything below can wake one.
     turn::restore_pauses(pool).await;
+    // The Claude subscription's last five-hour reading, so a restart
+    // mid-hold keeps holding (SME-523): before anything can wake a turn.
+    claude_cli::gate::load(pool).await;
     // Every live pod's agent, so scripts' MCP calls work again at once
     // (SME-359). After the pauses: a delivered exit can wake a turn.
     sandbox::reconnect_live_pods(pool).await;
