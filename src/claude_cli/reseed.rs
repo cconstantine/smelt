@@ -183,6 +183,12 @@ pub async fn launch(
     let run_bridge = super::bridge::bridge().await.map_err(ModelError::Other)?.register(&request.tools);
     let mcp_config = (!request.tools.is_empty()).then(|| run_bridge.mcp_config());
     let launch = OnceLaunch { effort: turn_model.effort, mcp_config, session: SessionArg::ResumeUnsaved(session_id) };
+    // Never two processes in one session, as a turn's resume (SME-444):
+    // the last turn's may still be ending, writing what it delivered, and
+    // the mark is taken after that (PR #353 review 2 L11). Bounded by
+    // `run::ENDED_WAIT`, which kills one still going; the turn lock this
+    // re-seed holds keeps a new run from starting meanwhile.
+    super::run::ended(conversation_id).await;
     let mark = SessionMark::take(conversation_id, session_id);
     let replied = once(conversation_id, turn_model, request, launch, &mut |_| {}, meter).await;
     drop(run_bridge);

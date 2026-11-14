@@ -133,6 +133,31 @@ async fn test_a_re_seed_and_a_turn_never_run_at_once(pool: PgPool) {
     assert_eq!(fake.started(), 1);
 }
 
+/// Review 2 L11: a re-seed waits for the conversation's last CLI process
+/// to end, as a turn's resume does: never two processes in one session.
+/// The turn's process takes 1.5 s to end after its turn, writing its
+/// session as it goes; the re-seed's starts after it, and its guard
+/// doesn't mistake that write for its own.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_re_seed_waits_for_the_last_process_to_end(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let _clean = Clean::new();
+    let turn = vec![json!({"read": true}), text_reply("one"), json!({"sleep_ms": 1_500}), json!({"write_session": "append"})];
+    let reseed = vec![json!({"read": true}), json!({"emit": reply()})];
+    let (conversation, _, fake) = ready(&pool, "reseed-closing", vec![turn, reseed]).await;
+    let model = crate::providers::resolve_turn_model(&pool, conversation).await.expect("the model");
+    let mut cli = crate::claude_cli::run::TurnCli::default();
+    super::review1::one_call(&pool, conversation, &model, &mut cli, vec![super::review1::said("user", "hi")], 1_000).await.expect("the turn's call");
+    // The turn ends: its process goes on ending in the background.
+    drop(cli);
+
+    assert_eq!(tick_and_wait(&pool).await, 1, "one re-seed");
+    assert_eq!(fake.started(), 2);
+    assert_eq!(fake.alive_at_start(1), Vec::<String>::new(), "the turn's process had ended as the re-seed started");
+    assert!(!candidates::off(), "the closing process's write isn't taken for the re-seed's");
+}
+
 /// Review 1 L8: a re-seed that fails after a real call replaced its
 /// candidate leaves that call's candidate; one with no call since drops
 /// its own.
