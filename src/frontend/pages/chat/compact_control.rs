@@ -1,4 +1,5 @@
-//! The chat header's Compact button (SME-482): compacts the conversation
+//! Compact's popover (SME-482), opened from the header's ☰ menu (SME-513):
+//! compacts the conversation
 //! now, between turns, with an optional note of what the summary must keep
 //! (`POST /api/conversations/{id}/compact`). The divider arrives through
 //! `MessagesAppended` as for every compaction; this tab refetches the
