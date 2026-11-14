@@ -27,6 +27,20 @@ pub(crate) async fn provider_usage(pool: &PgPool, id: i64) -> ServerFnResult<Pro
     Ok(ProviderUsage::from_rows(id, rows, chrono::Utc::now()))
 }
 
+/// When conversation `id`'s Claude Code call waiting at the five-hour
+/// usage gate resumes, in Unix seconds (SME-523): `None` when none waits
+/// on a hold. Regenerates `ConversationEvent::UsageHold` on (re)connect.
+#[get("/api/conversations/{id}/usage-hold")]
+pub async fn get_usage_hold(id: i64) -> ServerFnResult<Option<i64>> {
+    Ok(usage_hold(id))
+}
+
+/// `get_usage_hold`'s body.
+#[cfg(feature = "server")]
+pub(crate) fn usage_hold(id: i64) -> Option<i64> {
+    crate::claude_cli::gate::gate().held_until(id).map(|at| at.timestamp())
+}
+
 /// The windows of the provider `id`'s next turn runs on, for the chat's
 /// indicator: `None` unless that provider is a Claude Code one.
 #[get("/api/conversations/{id}/usage-windows")]

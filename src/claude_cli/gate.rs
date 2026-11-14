@@ -159,6 +159,19 @@ impl Gate {
         self.state().waiters.iter().map(|e| e.conversation_id).collect()
     }
 
+    /// When `conversation_id`'s waiting call is due to go, if it waits on
+    /// a hold (not only on its turn in the release order).
+    pub fn held_until(&self, conversation_id: i64) -> Option<DateTime<Utc>> {
+        let state = self.state();
+        if !state.waiters.iter().any(|e| e.conversation_id == conversation_id) {
+            return None;
+        }
+        match verdict(state.reading.as_ref(), Utc::now()) {
+            Verdict::Held { until } => Some(until),
+            Verdict::Open => None,
+        }
+    }
+
     /// Waits until `conversation_id`'s call may go. `on_hold` is told the
     /// hold's end as it starts or changes, and `None` once it's over.
     pub async fn wait(&self, conversation_id: i64, mut on_hold: impl FnMut(Option<DateTime<Utc>>) + Send) {
@@ -292,9 +305,34 @@ pub async fn load(pool: &sqlx::PgPool) {
     }
 }
 
-/// Waits at the process's gate for `conversation_id`'s Claude Code call.
+/// Waits at the process's gate for `conversation_id`'s Claude Code call,
+/// telling the conversation's tabs about a hold (`UsageHold`) as it
+/// starts or moves, and clearing it however the wait ends.
 pub async fn wait(conversation_id: i64) {
-    gate().wait(conversation_id, |_until| {}).await;
+    let mut shown = Shown { conversation_id, held: false };
+    gate().wait(conversation_id, |until| shown.show(until)).await;
+}
+
+/// The hold a conversation's tabs were told of: cleared on drop, so a
+/// Stop during a hold doesn't leave its line up.
+struct Shown {
+    conversation_id: i64,
+    held: bool,
+}
+
+impl Shown {
+    fn show(&mut self, until: Option<DateTime<Utc>>) {
+        self.held = until.is_some();
+        crate::events::publish(self.conversation_id, crate::events::ConversationEvent::UsageHold { until: until.map(|at| at.timestamp()) });
+    }
+}
+
+impl Drop for Shown {
+    fn drop(&mut self) {
+        if self.held {
+            self.show(None);
+        }
+    }
 }
 
 /// Clears the process's gate, for a test that set a reading on it.

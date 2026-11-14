@@ -183,3 +183,19 @@ fn test_format_timestamp_offset_crosses_a_day_boundary() {
         .unwrap();
     assert_eq!(format_timestamp(dt, 2 * 60), "1:32 AM");
 }
+
+/// T2 (SME-523): the working line while a call waits at the usage gate,
+/// in the viewer's local time, with how long is left.
+#[test]
+fn test_the_held_working_line_says_when_it_resumes_in_local_time() {
+    use chrono::{Duration, TimeZone, Utc};
+    let now = Utc.with_ymd_and_hms(2026, 11, 14, 13, 57, 0).unwrap();
+    let at = |minutes: i64| now + Duration::minutes(minutes);
+    assert_eq!(held_text(at(23), now, 0), "Waiting for the Claude 5-hour usage window · resumes about 14:20 (in 23 min)");
+    assert_eq!(held_text(at(23), now, -480), "Waiting for the Claude 5-hour usage window · resumes about 06:20 (in 23 min)");
+    assert_eq!(held_text(at(4 * 60 + 59), now, 330), "Waiting for the Claude 5-hour usage window · resumes about 00:26 (in 4 h 59 min)");
+    assert_eq!(held_text(at(60), now, 0), "Waiting for the Claude 5-hour usage window · resumes about 14:57 (in 1 h)");
+    // Part of a minute left counts as a minute; none left says so.
+    assert_eq!(held_text(now + Duration::seconds(30), now, 0), "Waiting for the Claude 5-hour usage window · resumes about 13:57 (in 1 min)");
+    assert_eq!(held_text(now - Duration::seconds(5), now, 0), "Waiting for the Claude 5-hour usage window · resumes any moment");
+}

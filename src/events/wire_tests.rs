@@ -69,6 +69,21 @@ fn test_a_commands_change_event_round_trips_through_json() {
     );
 }
 
+/// E1 (SME-523): a usage hold's exact shape, and a tab on a bundle from
+/// before it skips it (its `until` field and all) rather than failing.
+#[test]
+fn test_a_usage_hold_is_its_until_in_unix_seconds_and_old_bundles_skip_it() {
+    let json = serde_json::to_string(&ConversationEvent::UsageHold { until: Some(1_700_000_000) }).expect("serialize");
+    assert_eq!(json, r#"{"type":"UsageHold","until":1700000000}"#);
+    let cleared = serde_json::to_string(&ConversationEvent::UsageHold { until: None }).expect("serialize");
+    assert_eq!(cleared, r#"{"type":"UsageHold","until":null}"#);
+    // An older bundle's enum has no `UsageHold`: the same shape under a
+    // name this one doesn't know stands in for it.
+    for unknown in [json.replace("UsageHold", "UsageHoldLater"), cleared.replace("UsageHold", "UsageHoldLater")] {
+        assert_eq!(serde_json::from_str::<ConversationEvent>(&unknown).expect("decodes"), ConversationEvent::Unknown, "{unknown}");
+    }
+}
+
 /// A tab still running an older bundle gets event types added since.
 /// It skips them rather than taking the stream for broken (SME-43).
 #[test]
@@ -140,6 +155,8 @@ fn one_of_each() -> Vec<ConversationEvent> {
         ConversationEvent::ReplyReset {},
         ConversationEvent::ReplyDelta { text: "Hi".to_string(), offset: 0 },
         ConversationEvent::TurnState { running: true, elapsed: 0 },
+        ConversationEvent::UsageHold { until: Some(1_700_000_000) },
+        ConversationEvent::UsageHold { until: None },
         ConversationEvent::PodsChanged {},
         ConversationEvent::TurnsChanged {},
         ConversationEvent::QuestionsChanged {},

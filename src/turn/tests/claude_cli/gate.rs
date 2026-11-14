@@ -71,6 +71,49 @@ async fn test_a_held_turns_call_waits_for_the_release(pool: PgPool) {
     assert!(gate::gate().waiting().is_empty());
 }
 
+/// The events a subscription has had so far.
+fn drain(events: &mut crate::events::Subscription) -> Vec<crate::events::ConversationEvent> {
+    std::iter::from_fn(|| events.try_recv().ok()).collect()
+}
+
+fn holds(events: &[crate::events::ConversationEvent]) -> Vec<Option<i64>> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            crate::events::ConversationEvent::UsageHold { until } => Some(*until),
+            _ => None,
+        })
+        .collect()
+}
+
+/// SME-523's hold UI: a held call publishes its release, `usage_hold`
+/// regenerates it, and the pass clears it.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_hold_is_published_regenerable_and_cleared(pool: PgPool) {
+    crate::db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let _guard = lock_turn_tests();
+    let _gate = GateReset::new();
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let fake = FakeCli::new("gate-shown", vec![vec![json!({"read": true}), text_reply("hi")]]);
+    fake.pick_for(&pool, conversation.id).await;
+    let reading = hold_for(500);
+    let gate::Verdict::Held { until } = gate::verdict(Some(&reading), Utc::now()) else { panic!("held") };
+    gate::gate().observe(reading);
+    let mut events = crate::events::subscribe(conversation.id);
+    assert_eq!(crate::api::usage_windows::usage_hold(conversation.id), None, "nothing waits yet");
+
+    let turn = tokio::spawn({
+        let pool = pool.clone();
+        async move { run_turn(&pool, conversation.id, hello()).await }
+    });
+    until_held(conversation.id).await;
+    assert_eq!(crate::api::usage_windows::usage_hold(conversation.id), Some(until.timestamp()));
+    tokio::time::timeout(std::time::Duration::from_secs(10), turn).await.expect("the turn ends").expect("join").expect("the turn runs");
+
+    assert_eq!(holds(&drain(&mut events)), vec![Some(until.timestamp()), None]);
+    assert_eq!(crate::api::usage_windows::usage_hold(conversation.id), None);
+}
+
 /// G3: a compaction's summary, a Claude Code call of its own, waits too.
 /// With only the turn's call gated, the summary's process would start.
 #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
@@ -116,6 +159,7 @@ async fn test_a_stop_during_a_hold_drops_the_waiter(pool: PgPool) {
     let fake = FakeCli::new("gate-stop", vec![vec![json!({"read": true}), text_reply("hi")]]);
     fake.pick_for(&pool, conversation.id).await;
     gate::gate().observe(hold_for(60_000));
+    let mut events = crate::events::subscribe(conversation.id);
 
     let turn = tokio::spawn({
         let pool = pool.clone();
@@ -126,6 +170,7 @@ async fn test_a_stop_during_a_hold_drops_the_waiter(pool: PgPool) {
     let ended = tokio::time::timeout(std::time::Duration::from_secs(5), turn).await.expect("the turn ends").expect("join");
 
     assert!(ended.expect_err("stopped").to_string().contains(TURN_STOPPED));
+    assert_eq!(holds(&drain(&mut events)).last(), Some(&None), "the dropped wait clears the hold");
     assert!(gate::gate().waiting().is_empty(), "{:?}", gate::gate().waiting());
     assert_eq!(fake.started(), 0);
 }

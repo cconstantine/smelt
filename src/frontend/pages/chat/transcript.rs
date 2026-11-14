@@ -528,7 +528,7 @@ pub(super) fn Transcript(
             }
             StreamingReply { state, on_media_load }
             if turn_running() {
-                WorkingLine { state }
+                WorkingLine { state, tz_offset_minutes }
             }
             ModelNotes { selected, state, stream_errors }
             // A "Work on a repo" error once its form is gone: the first

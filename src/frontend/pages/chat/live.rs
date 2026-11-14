@@ -114,6 +114,7 @@ pub(super) fn use_conversation_events(
     let mut turn_running = state.turn_running();
     let mut turn_state_known = state.turn_state_known();
     let mut turn_elapsed = state.turn_elapsed();
+    let mut usage_hold = state.usage_hold();
     let mut todos = state.todos();
     let mut pending_question = state.pending_question();
     let mut repos = state.repos();
@@ -201,6 +202,10 @@ pub(super) fn use_conversation_events(
                     }
                     if let Ok(reply) = get_reply_in_progress(id).await {
                         streaming_reply.set(reply);
+                    }
+                    // A call waiting at the usage gate (SME-523).
+                    if let Ok(until) = crate::api::usage_windows::get_usage_hold(id).await {
+                        usage_hold.set(until.and_then(|at| chrono::DateTime::from_timestamp(at, 0)));
                     }
                     // A turn that failed before this tab connected
                     // (SME-51 B11), or none since a later one started

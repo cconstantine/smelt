@@ -45,6 +45,10 @@ pub(super) struct ConversationState {
     /// `ConversationEvent::TurnState` and the reconnect pull, and ticked
     /// once a second in between (SME-41 D1; SME-160).
     pub(super) turn_elapsed: u64,
+    /// When the turn's Claude Code call waiting at the five-hour usage
+    /// gate resumes (SME-523, `ConversationEvent::UsageHold`); the
+    /// working line says so while it's set.
+    pub(super) usage_hold: Option<chrono::DateTime<chrono::Utc>>,
     /// A background wake-up that failed to reach the model
     /// (`ConversationEvent::NotificationDeliveryFailed`). Kept apart from
     /// the turn errors, which a send clears: this can arrive at any time.
@@ -269,9 +273,13 @@ pub(super) fn apply_event(state: Store<ConversationState>, event: ConversationEv
             state.turn_elapsed().set(elapsed);
             if !running {
                 state.streaming_reply().set(None);
+                state.usage_hold().set(None);
             } else {
                 return EventEffect::TurnStarted;
             }
+        }
+        ConversationEvent::UsageHold { until } => {
+            state.usage_hold().set(until.and_then(|at| chrono::DateTime::from_timestamp(at, 0)));
         }
         ConversationEvent::ReplyReset {} => state.streaming_reply().set(Some(String::new())),
         ConversationEvent::ReplyDelta { text, offset } => {
