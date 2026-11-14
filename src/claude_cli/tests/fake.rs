@@ -117,6 +117,12 @@ impl FakeCli {
         self.json_lines(&format!("results.{n}.jsonl"))
     }
 
+    /// The tools process `n` found on its `--mcp-config` server, by name
+    /// (a `list_tools` step).
+    pub(crate) fn tools(&self, n: usize) -> Vec<String> {
+        self.json_lines(&format!("tools.{n}.jsonl")).iter().filter_map(|t| t["name"].as_str().map(str::to_string)).collect()
+    }
+
     /// What process `n`'s model would read in its session (SME-444).
     pub(crate) fn transcript(&self, n: usize) -> Vec<Value> {
         self.json_lines(&format!("transcript.{n}.jsonl"))
@@ -439,6 +445,12 @@ async fn play(dir: &Path, n: usize) -> i32 {
             false
         } else if let Some(name) = step["stamp"].as_str() {
             std::fs::write(fake.dir.join(format!("{name}.stamp")), "").expect("a stamp");
+            false
+        } else if step.get("list_tools").is_some() {
+            let peer = fake.peer().await;
+            for tool in peer.list_all_tools().await.expect("the bridge lists its tools") {
+                fake.log("tools", &json!({"name": tool.name}));
+            }
             false
         } else if step.get("write_session").is_some() {
             // Its session's file, as the CLI writes it as it goes (SME-431

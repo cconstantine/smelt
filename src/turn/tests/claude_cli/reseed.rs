@@ -170,7 +170,7 @@ async fn test_a_re_seed_resumes_the_session_unsaved_and_is_recorded(pool: PgPool
     let mut lines = vec![rate];
     lines.extend(reply);
     lines.push(crate::claude_cli::tests::fake::result_ok());
-    let r = ready(&pool, "reseed-run", vec![vec![json!({"read": true}), json!({"emit": lines})]]).await;
+    let r = ready(&pool, "reseed-run", vec![vec![json!({"read": true}), json!({"list_tools": true}), json!({"emit": lines})]]).await;
 
     let started = run_tick(&pool, Utc::now()).await;
     assert_eq!(started.len(), 1, "one re-seed");
@@ -187,6 +187,17 @@ async fn test_a_re_seed_resumes_the_session_unsaved_and_is_recorded(pool: PgPool
     assert!(args.iter().any(|a| a == "--no-session-persistence"), "{args:?}");
     let config = args.iter().position(|a| a == "--mcp-config").and_then(|i| args.get(i + 1)).expect("the turn's tools");
     assert!(config.ends_with(".json"), "{config}");
+    // Review 1 L4: the config's server serves the turn's own tools.
+    let turn_model = crate::providers::resolve_turn_model(&pool, r.conversation).await.expect("its model");
+    let (turn_request, _) = crate::turn::reply::build_request(&pool, r.conversation, &turn_model, None, &[], false, 0).await.expect("a turn's request");
+    let prefix = format!("mcp__{}__", crate::claude_cli::bridge::SERVER_NAME);
+    let mut expected: Vec<String> =
+        turn_request.tools.iter().map(|t| crate::claude_cli::bridge::cli_tool_name(&t.name).trim_start_matches(&prefix).to_string()).collect();
+    let mut served = r.fake.tools(0);
+    expected.sort();
+    served.sort();
+    assert!(!expected.is_empty(), "a turn has tools");
+    assert_eq!(served, expected, "the re-seed's tools are the turn's");
     assert_eq!(user_texts(&r.fake, 0), vec![candidates::MESSAGE.to_string()]);
     assert!(saved(&pool, r.conversation).await.is_empty(), "the reply isn't saved");
     let kinds: Vec<(String, i64)> = sqlx::query_as("SELECT kind, cache_read_input_tokens FROM model_call_usage WHERE conversation_id = $1")
