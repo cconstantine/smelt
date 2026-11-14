@@ -84,6 +84,16 @@ pub fn forget(conversation_id: i64) {
     candidates().remove(&conversation_id);
 }
 
+/// Drops `conversation_id` after its re-seed from `start` failed, unless a
+/// real call has since replaced the candidate it began from (PR #353
+/// review 1 L8): that call's cache is fresh, so its candidate stands.
+pub fn forget_if_from(conversation_id: i64, start: DateTime<Utc>) {
+    let mut candidates = candidates();
+    if candidates.get(&conversation_id).is_some_and(|c| c.start == start && c.in_flight) {
+        candidates.remove(&conversation_id);
+    }
+}
+
 /// `conversation_id`'s candidate, if any, for a test.
 #[cfg(test)]
 pub fn get(conversation_id: i64) -> Option<Candidate> {

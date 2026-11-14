@@ -46,6 +46,8 @@ pub(crate) enum Decision {
 pub(crate) struct Ready {
     turn_model: crate::providers::TurnModel,
     session_id: String,
+    /// The candidate's start it began from (review 1 L8).
+    from: DateTime<Utc>,
     _slot: Option<crate::providers::limiter::Slot>,
     /// The conversation's turn lock, held for the re-seed (review 1 M2):
     /// a turn started meanwhile waits for it, so the two never run on
@@ -143,7 +145,7 @@ pub(crate) async fn consider(pool: &PgPool, conversation_id: i64, candidate: can
     if !crate::claude_cli::gate::try_pass(conversation_id) {
         return Decision::Wait("the usage gate is held or has others waiting");
     }
-    Decision::Launch(Ready { turn_model, session_id: session.session_id, _slot: slot, _turn_lock: turn_lock })
+    Decision::Launch(Ready { turn_model, session_id: session.session_id, from: candidate.start, _slot: slot, _turn_lock: turn_lock })
 }
 
 /// One re-seed: the request a wake would send now, as `claude_cli::reseed`
@@ -156,7 +158,7 @@ async fn reseed(pool: &PgPool, conversation_id: i64, ready: Ready) {
         Ok((request, _)) => candidates::reseed_request(&request),
         Err(e) => {
             tracing::warn!(conversation_id, "couldn't build a cache re-seed's request: {e}");
-            candidates::forget(conversation_id);
+            candidates::forget_if_from(conversation_id, ready.from);
             return;
         }
     };
@@ -179,7 +181,7 @@ async fn reseed(pool: &PgPool, conversation_id: i64, ready: Ready) {
         }
         Err(e) => {
             tracing::warn!(conversation_id, "a cache re-seed failed, so its next wake starts cold: {e}");
-            candidates::forget(conversation_id);
+            candidates::forget_if_from(conversation_id, ready.from);
         }
     }
 }

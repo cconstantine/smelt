@@ -1,12 +1,13 @@
 //! Re-seeding's guards from PR #353's review 1: none for a conversation
 //! paused by a Stop (M3); a re-seed that writes its session undone, and
 //! re-seeding off after (M2); a re-seed and a turn never at once on a
-//! conversation (M2).
+//! conversation (M2); a failed re-seed leaves a newer call's candidate
+//! (L8).
 
 use super::*;
 use crate::claude_cli::reseed as candidates;
 use crate::turn::reseed::{Decision, RESEED_AFTER, consider, run_tick};
-use chrono::Utc;
+use chrono::{Duration, Utc};
 
 /// A re-seed's reply: one API call answering `ok`, and its result.
 fn reply() -> Vec<Value> {
@@ -130,4 +131,25 @@ async fn test_a_re_seed_and_a_turn_never_run_at_once(pool: PgPool) {
     }
     assert!(lock.try_lock().is_ok(), "and lets it go");
     assert_eq!(fake.started(), 1);
+}
+
+/// Review 1 L8: a re-seed that fails after a real call replaced its
+/// candidate leaves that call's candidate; one with no call since drops
+/// its own.
+#[test]
+fn test_a_failed_re_seed_forgets_only_the_candidate_it_began_from() {
+    let _guard = lock_turn_tests();
+    let _clean = Clean::new();
+    let t0 = Utc::now() - Duration::minutes(60);
+    let call = t0 + Duration::minutes(55);
+    candidates::note_call(-523_006, 7, t0);
+    assert!(candidates::begin(-523_006));
+    candidates::note_call(-523_006, 7, call);
+    candidates::forget_if_from(-523_006, t0);
+    assert_eq!(candidates::get(-523_006).map(|c| c.start), Some(call), "the call's candidate stands");
+
+    candidates::note_call(-523_007, 7, t0);
+    assert!(candidates::begin(-523_007));
+    candidates::forget_if_from(-523_007, t0);
+    assert_eq!(candidates::get(-523_007), None);
 }
