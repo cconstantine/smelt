@@ -41,6 +41,7 @@ pub(super) fn ConversationHeader(
     selected: Memo<Option<i64>>,
     nodes: Signal<Vec<ConversationNode>>,
     state: Store<ConversationState>,
+    delete: MenuDelete,
 ) -> Element {
     // Without the tree (not fetched yet, or a row it doesn't have yet) the
     // header is the ☰ menu with Show thinking and Compact: thinking can be
@@ -51,14 +52,9 @@ pub(super) fn ConversationHeader(
         Some(info) => (info.title, info.meta, info.parent, info.archive),
         None => (String::new(), None, None, None),
     };
-    // Kept with the conversation it's about: the header isn't remounted
-    // on a switch (review 1, L1), so another's error mustn't show here.
-    let header_error: Signal<Option<(i64, String)>> = use_signal(|| None);
+    let MenuDelete { deleting, error: header_error, run: run_delete } = delete;
     let menu_open = use_signal(|| false);
     let delete_armed = use_signal(|| false);
-    // The conversation whose DELETE is in flight, so a third click sends
-    // no second one.
-    let deleting: Signal<Option<i64>> = use_signal(|| None);
     let mut compact_open = use_signal(|| false);
     let compact_busy = use_signal(|| None::<i64>);
     // Another conversation opened: its menu starts closed and disarmed.
@@ -86,12 +82,12 @@ pub(super) fn ConversationHeader(
             // Its second click: the menu has closed (SME-513 Q2).
             MenuItem::Delete => {
                 // Read first: a guard in an `if let` lives through its
-                // block, and `delete_from_header` writes `deleting`.
+                // block, and `run_delete` writes `deleting`.
                 let idle = deleting.peek().is_none();
                 if let Some(id) = selected()
                     && idle
                 {
-                    delete_from_header(id, selected, nodes, deleting, header_error);
+                    run_delete.call((id, after_delete(&nodes.peek(), id)));
                 }
             }
         }
@@ -167,35 +163,55 @@ fn archive_conversation(id: i64, archived: bool, nodes: Signal<Vec<ConversationN
     });
 }
 
+/// The menu's Delete and the header's error line, owned by the chat
+/// panel rather than the header (review 1, A-M1): a deleted conversation's
+/// stream ends and its resubscribe comes back "not found", which unmounts
+/// the header, and a task the header spawned would go with it, before the
+/// reply could land the page anywhere.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct MenuDelete {
+    /// The conversation whose DELETE is in flight, so a third click sends
+    /// no second one.
+    pub deleting: Signal<Option<i64>>,
+    /// The last menu action's failure, with the conversation it's about:
+    /// the header isn't remounted on a switch (review 1, L1), so another's
+    /// error mustn't show there.
+    pub error: Signal<Option<(i64, String)>>,
+    /// Deletes a conversation, landing on the route given if it's still
+    /// the one open when the reply comes.
+    pub run: Callback<(i64, Route)>,
+}
+
 /// Delete from the menu (SME-513, from the sidebar's SME-236 button):
 /// the conversation and its whole subtree leave the list at once, and if
-/// it's still the one open, the page goes to its parent, or Home. A
-/// failure shows under the header and the conversation stays.
-fn delete_from_header(
-    id: i64,
-    selected: Memo<Option<i64>>,
-    nodes: Signal<Vec<ConversationNode>>,
-    deleting: Signal<Option<i64>>,
-    error: Signal<Option<(i64, String)>>,
-) {
-    let (mut nodes, mut deleting, mut error) = (nodes, deleting, error);
-    deleting.set(Some(id));
-    spawn(async move {
-        let result = delete_conversation(id).await;
-        deleting.set(None);
-        match result {
-            Ok(()) => {
-                error.set(None);
-                let to = after_delete(&nodes.peek(), id);
-                let gone = subtree_ids(&nodes.peek(), id);
-                nodes.write().retain(|n| !gone.contains(&n.id));
-                if *selected.peek() == Some(id) {
-                    navigator().push(to);
+/// it's still the one open, the page goes where the confirm click said
+/// (`after_delete`, read then: the reply can come after the list has
+/// dropped the row, review 1 A-L2). A failure shows under the header and
+/// the conversation stays. Call it in a component that outlives the
+/// header: its task is that component's.
+pub(super) fn use_menu_delete(selected: Memo<Option<i64>>, nodes: Signal<Vec<ConversationNode>>) -> MenuDelete {
+    let mut deleting: Signal<Option<i64>> = use_signal(|| None);
+    let mut error: Signal<Option<(i64, String)>> = use_signal(|| None);
+    let mut nodes = nodes;
+    let run = use_callback(move |(id, to): (i64, Route)| {
+        deleting.set(Some(id));
+        spawn(async move {
+            let result = delete_conversation(id).await;
+            deleting.set(None);
+            match result {
+                Ok(()) => {
+                    error.set(None);
+                    let gone = subtree_ids(&nodes.peek(), id);
+                    nodes.write().retain(|n| !gone.contains(&n.id));
+                    if *selected.peek() == Some(id) {
+                        navigator().push(to);
+                    }
                 }
+                Err(e) => error.set(Some((id, server_error_message(&e)))),
             }
-            Err(e) => error.set(Some((id, server_error_message(&e)))),
-        }
+        });
     });
+    MenuDelete { deleting, error, run }
 }
 
 /// Where deleting `id` from its own page lands: its parent, if listed,
@@ -242,7 +258,8 @@ mod tests {
             let selected = use_memo(move || Some(id));
             let nodes = use_signal(move || list.clone());
             let state = use_store(ConversationState::default);
-            rsx! { ConversationHeader { selected, nodes, state } }
+            let delete = use_menu_delete(selected, nodes);
+            rsx! { ConversationHeader { selected, nodes, state, delete } }
         }
         let mut dom = VirtualDom::new_with_props(app, (nodes, id));
         dom.rebuild_in_place();

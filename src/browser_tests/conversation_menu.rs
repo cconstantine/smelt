@@ -187,6 +187,35 @@ async fn delete(page: &chromiumoxide::Page, id: i64, lands: &str) {
     );
 }
 
+/// Holds the page's next DELETE reply back 3 s after the server has
+/// answered: by then the deleted conversation's stream has ended and its
+/// resubscribe come back "not found", which unmounts the header.
+const DELAY_NEXT_DELETE_REPLY: &str = "(() => { const real = window.fetch; let armed = true; \
+     window.fetch = function (input, init) { \
+       const method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase(); \
+       const reply = real.apply(this, arguments); \
+       if (!armed || method !== 'DELETE') return reply; \
+       armed = false; \
+       return reply.then(r => new Promise(done => setTimeout(() => done(r), 3000))); }; })()";
+
+/// Review 1, A-M1: a Delete whose reply lands after the header has gone
+/// (the conversation's own stream said "not found" first) still lands
+/// Home: the delete isn't the header's to cancel.
+async fn delete_with_a_late_reply(t: &Scenario<'_>) {
+    let root = t.conversation().await;
+    let page = open_at(t, root.id, (1400, 900, false)).await;
+    open_conversation_menu(&page, root.id).await;
+    page.evaluate(DELAY_NEXT_DELETE_REPLY).await.expect("hold the next DELETE's reply");
+    let delete = menu_delete(root.id);
+    click_when_present(&page, &delete, Duration::from_secs(10)).await;
+    click_when_present(&page, &format!("{delete}.confirm"), Duration::from_secs(5)).await;
+    assert!(
+        wait_until(|| js_bool(&page, "location.pathname === '/'"), Duration::from_secs(15)).await,
+        "a Delete whose reply comes after the header unmounted still lands Home"
+    );
+    page.close().await.expect("close the tab");
+}
+
 /// SME-513: the ☰ menu at 1400×900 and at 390×844 (a phone).
 pub(super) async fn scenario_conversation_menu(t: &Scenario<'_>) {
     for size in [(1400, 900, false), (390, 844, true)] {
@@ -221,4 +250,5 @@ pub(super) async fn scenario_conversation_menu(t: &Scenario<'_>) {
         delete(&page, root.id, "/").await;
         page.close().await.expect("close the tab");
     }
+    delete_with_a_late_reply(t).await;
 }

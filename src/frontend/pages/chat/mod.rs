@@ -305,6 +305,9 @@ fn ChatPanel(
     use_browser_frames(selected, state);
     let mut send = send_action(selected, state, input, next_temp_id, model_ready, stream_errors, conversations_changed, attaches);
     use_transcript_follow(state, transcript_scroll, pointer_over_transcript, media_loaded);
+    // The header's Delete is this panel's: the header unmounts when its
+    // deleted conversation goes "not found" (review 1, A-M1).
+    let menu_delete = conversation_header::use_menu_delete(selected, conversation_nodes);
 
     rsx! {
         section {
@@ -344,7 +347,7 @@ fn ChatPanel(
                         // header nor its side panels (SME-354 B24: its sandbox
                         // panel's Remove volumes stayed up).
                         if !conversation_missing() {
-                            conversation_header::ConversationHeader { selected, nodes: conversation_nodes, state }
+                            conversation_header::ConversationHeader { selected, nodes: conversation_nodes, state, delete: menu_delete }
                         }
                         AgentsWaitingBanner { selected, conversations_changed, questions_changed }
                         ContextUsage {
