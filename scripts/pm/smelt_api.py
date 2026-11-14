@@ -187,8 +187,9 @@ def subtree(nodes, root):
 
 # The usage hold (SME-486, docs/personas/project-manager.md): a live
 # window at or over these holds new Drivers. Whole percents: the verdict
-# compares the percent it prints (round 1 B-L3).
-HOLD_FIVE_HOUR = 70
+# compares the percent it prints (round 1 B-L3). The five-hour window's
+# percent isn't one of them: smelt's own gate holds every Claude Code
+# call at 95% of it (SME-523 Q7); its status still holds.
 HOLD_SEVEN_DAY = 90
 HOLD_PACE = 100
 HOLD_STATUSES = ("allowed_warning", "rejected")
@@ -268,8 +269,7 @@ def usage_verdict(windows):
     reasons = []
     for w in live:
         name, used, pace = w["name"], w["utilization"], w["projected"]
-        shown = whole_percent(used)
-        if (name == "five_hour" and shown >= HOLD_FIVE_HOUR) or (name == "seven_day" and shown >= HOLD_SEVEN_DAY):
+        if name == "seven_day" and whole_percent(used) >= HOLD_SEVEN_DAY:
             reasons.append(f"{name} at {percent(used)}")
         elif name == "seven_day" and pace is not None and whole_percent(pace) >= HOLD_PACE:
             reasons.append(f"{name} on pace for {percent(pace)} by reset")

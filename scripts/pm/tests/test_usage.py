@@ -39,14 +39,14 @@ class Usage(FakeCase):
         self.assertEqual(lines[2].split(), ["verdict", "ok"])
 
     def test_json_prints_the_same_fields_and_the_verdict(self):
-        self.st.usage[7] = usage(7, [window("five_hour", 0.75)])
+        self.st.usage[7] = usage(7, [window("five_hour", 0.75), window("seven_day", 0.95)])
         r = self.api("usage", "7", "--json")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         out = json.loads(r.stdout)
         self.assertEqual(out["provider_id"], 7)
         self.assertEqual(out["windows"][0]["name"], "five_hour")
         self.assertEqual(out["windows"][0]["utilization"], 0.75)
-        self.assertTrue(out["verdict"].startswith("hold: "), out)
+        self.assertEqual(out["verdict"], "hold: seven_day at 95%", out)
 
     def test_a_server_refusal_exits_1(self):
         r = self.api("usage", "99")
@@ -69,8 +69,10 @@ class Usage(FakeCase):
     # P2
     def test_the_verdicts(self):
         cases = [
-            ("five_hour at 70%", [window("five_hour", 0.70)], "hold: five_hour at 70%"),
-            ("five_hour at 69%", [window("five_hour", 0.69)], "ok"),
+            # SME-523 Q7: smelt's own gate holds the five-hour window at
+            # 95%, so the PM's verdict no longer weighs its percent.
+            ("five_hour at 99%", [window("five_hour", 0.99)], "ok"),
+            ("five_hour at 70%", [window("five_hour", 0.70)], "ok"),
             ("seven_day at 90%", [window("seven_day", 0.90)], "hold: seven_day at 90%"),
             ("seven_day at 89%", [window("seven_day", 0.89)], "ok"),
             ("seven_day pace 105%", [window("seven_day", 0.60, elapsed_fraction=0.57, projected=1.05)],
@@ -83,8 +85,10 @@ class Usage(FakeCase):
              [window("five_hour", 0.10), window("seven_day", 0.95, reset_passed=True, status="rejected")], "ok"),
             ("no windows", [], "unknown: no reading"),
             ("every window reset-passed", [window("five_hour", 0.95, reset_passed=True)], "unknown: no reading"),
-            ("two reasons", [window("five_hour", 0.80), window("seven_day", 0.95)],
-             "hold: five_hour at 80%; seven_day at 95%"),
+            ("two reasons", [window("seven_day", 0.95, status="allowed_warning")],
+             "hold: seven_day at 95%; seven_day allowed_warning"),
+            ("five_hour's percent is no reason", [window("five_hour", 0.80), window("seven_day", 0.95)],
+             "hold: seven_day at 95%"),
         ]
         for name, windows, expected in cases:
             with self.subTest(name):
@@ -95,8 +99,6 @@ class Usage(FakeCase):
     # f64::round does on the provider page and the context bar.
     def test_the_verdict_compares_the_percent_it_prints(self):
         cases = [
-            ("five_hour 69.51%", [window("five_hour", 0.6951)], "hold: five_hour at 70%"),
-            ("five_hour 69.49%", [window("five_hour", 0.6949)], "ok"),
             ("seven_day 89.51%", [window("seven_day", 0.8951)], "hold: seven_day at 90%"),
             ("seven_day pace 99.51%", [window("seven_day", 0.60, elapsed_fraction=0.6, projected=0.9951)],
              "hold: seven_day on pace for 100% by reset"),
