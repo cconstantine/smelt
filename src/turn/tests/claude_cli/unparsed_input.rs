@@ -13,11 +13,21 @@ fn cli_init() -> Value {
            "mcp_servers": [{"name": "smelt", "status": "connected"}]})
 }
 
-/// A `user` event echoing the CLI's own refusal of `id`.
-fn refusal(id: &str) -> Value {
+/// A `user` event echoing the CLI's own refusal of `id`, whose input was
+/// `raw`: the shape and words CLI 2.1.318 printed for `{"a":1}{"a":1}`
+/// from a fake Messages endpoint (the SME-520 hand check), quoting the
+/// input as it does.
+fn refusal(id: &str, raw: &str) -> Value {
+    let len = raw.len();
+    let content = format!(
+        "<tool_use_error>InputValidationError: mcp__smelt__todoread was called with input that could not be parsed as JSON.\n\
+         You sent (first {len} of {len} bytes): {raw}\n\
+         Common causes: unescaped backslashes in file paths (use / or \\\\), unescaped control characters, or truncated output. \
+         Retry with valid JSON.</tool_use_error>"
+    );
     json!({"type": "user", "message": {"role": "user", "content": [
-        {"type": "tool_result", "tool_use_id": id, "is_error": true, "content": "refused locally"}
-    ]}})
+        {"type": "tool_result", "content": content, "is_error": true, "tool_use_id": id}
+    ]}, "tool_use_result": format!("InputValidationError: JSON parse failed ({len} bytes)")})
 }
 
 /// A `todoread` call's events whose input deltas are `raw`, unparsed.
@@ -57,7 +67,7 @@ async fn test_the_clis_refusal_of_an_unparsed_call_carries_the_turn_on(pool: PgP
         json!({"read": true}),
         json!({"emit": [cli_init()]}),
         json!({"emit": api_call(10, vec![raw_todoread("toolu_broken", &broken_input())], "tool_use", 5)}),
-        json!({"emit": [refusal("toolu_broken")]}),
+        json!({"emit": [refusal("toolu_broken", &broken_input())]}),
         text_reply("Recovered."),
     ]]);
     fake.pick_for(&pool, conversation.id).await;
@@ -74,7 +84,7 @@ async fn test_the_clis_refusal_of_an_unparsed_call_carries_the_turn_on(pool: PgP
     assert!(saved.iter().any(|(role, blocks)| role == "assistant"
         && matches!(&blocks[..], [anthropic::ContentBlock::Text { text }] if text == "Recovered.")), "{saved:?}");
     let json = saved_json(&saved);
-    assert!(!json.contains("refused locally") && !json.contains(MARKER), "{saved:?}");
+    assert!(!json.contains("InputValidationError") && !json.contains(MARKER), "{saved:?}");
 }
 
 /// Test 10: if the CLI makes the bridge call after all, it gets smelt's
@@ -114,7 +124,7 @@ async fn test_an_echo_for_a_parsed_call_still_diverges(pool: PgPool) {
         json!({"read": true}),
         json!({"emit": [cli_init()]}),
         json!({"emit": api_call(10, blocks, "tool_use", 5)}),
-        json!({"emit": [refusal("toolu_broken"), refusal("toolu_here")]}),
+        json!({"emit": [refusal("toolu_broken", &broken_input()), refusal("toolu_here", "{}")]}),
         text_reply("Unrelated."),
     ]]);
     fake.pick_for(&pool, conversation.id).await;
