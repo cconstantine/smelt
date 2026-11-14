@@ -16,7 +16,13 @@ fn ended(ended: u32, stopped_by_user: Option<bool>, quiet: bool, agent_done: boo
     GraceInput {
         latest: Some(LatestPod { pod_id: 1, terminated_at: Some(at(ended)), stopped_by_user, quiet }),
         agent_done,
+        activity_at: None,
     }
+}
+
+/// A conversation that never had a pod row.
+fn podless(agent_done: bool) -> GraceInput {
+    GraceInput { latest: None, agent_done, activity_at: None }
 }
 
 fn removes(at: NaiveDateTime, days: u32, class: GraceClass) -> StorageFate {
@@ -47,8 +53,34 @@ fn test_a_live_latest_row_is_in_use_whatever_else_is_true() {
     let live = GraceInput {
         latest: Some(LatestPod { pod_id: 1, terminated_at: None, stopped_by_user: None, quiet: false }),
         agent_done: true,
+        activity_at: Some(at(1)),
     };
     assert_eq!(fate(&live, at(1), &SETTINGS), StorageFate::Live);
+}
+
+/// SME-521 review 1, M1: a done agent the user is still working with —
+/// a message, or a question still waiting on the user, after its pod
+/// ended — counts its one day from that, not from the pod's end. An
+/// older message changes nothing, and only the agent class reads it.
+#[test]
+fn test_a_done_agents_clock_is_the_later_of_its_end_and_its_activity() {
+    let with_activity = |input: GraceInput, day| GraceInput { activity_at: Some(at(day)), ..input };
+    assert_eq!(
+        fate(&with_activity(ended(10, Some(false), true, true), 12), at(1), &SETTINGS),
+        removes(at(13), 1, GraceClass::Agent),
+        "a message two days after the pod's end"
+    );
+    assert_eq!(
+        fate(&with_activity(ended(10, Some(true), false, true), 9), at(1), &SETTINGS),
+        removes(at(11), 1, GraceClass::Agent),
+        "an older message keeps the end's clock"
+    );
+    assert_eq!(fate(&with_activity(podless(true), 5), at(2), &SETTINGS), removes(at(6), 1, GraceClass::Agent), "no pod row");
+    assert_eq!(
+        fate(&with_activity(ended(3, Some(false), false, false), 20), at(1), &SETTINGS),
+        removes(at(10), 7, GraceClass::Default),
+        "a top-level conversation's clock is its pod's end"
+    );
 }
 
 /// Q2: a done sub-agent gets the agent grace, even over the user's Stop.
@@ -92,10 +124,8 @@ fn test_an_end_from_before_the_column_gets_the_stops_grace() {
 /// grace for a done agent, else the default.
 #[test]
 fn test_claims_with_no_row_run_from_their_creation() {
-    let none = GraceInput { latest: None, agent_done: false };
-    assert_eq!(fate(&none, at(2), &SETTINGS), removes(at(9), 7, GraceClass::NoPod));
-    let agent = GraceInput { latest: None, agent_done: true };
-    assert_eq!(fate(&agent, at(2), &SETTINGS), removes(at(3), 1, GraceClass::Agent));
+    assert_eq!(fate(&podless(false), at(2), &SETTINGS), removes(at(9), 7, GraceClass::NoPod));
+    assert_eq!(fate(&podless(true), at(2), &SETTINGS), removes(at(3), 1, GraceClass::Agent));
 }
 
 /// A class whose days are 0 is kept; a default of 0 is the off switch
@@ -107,7 +137,7 @@ fn test_zero_days_keep_and_a_zero_default_turns_it_all_off() {
     let keep_agents = GraceSettings { agent_days: 0, ..SETTINGS };
     assert_eq!(fate(&ended(1, None, false, true), at(1), &keep_agents), StorageFate::Kept);
     let off = GraceSettings { default_days: 0, ..SETTINGS };
-    for input in [ended(1, Some(true), false, false), ended(1, None, false, true), GraceInput { latest: None, agent_done: false }] {
+    for input in [ended(1, Some(true), false, false), ended(1, None, false, true), podless(false)] {
         assert_eq!(fate(&input, at(1), &off), StorageFate::Kept, "{input:?}");
     }
 }

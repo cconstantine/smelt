@@ -18,6 +18,9 @@ pub(crate) struct GraceInput {
     /// A sub-agent whose `agents.state` is `finished`, `stopped` or
     /// `failed`.
     pub agent_done: bool,
+    /// For a done agent, its latest message or question still waiting on
+    /// the user (SME-521 review 1, M1): its clock starts no earlier.
+    pub activity_at: Option<NaiveDateTime>,
 }
 
 /// The fields of a conversation's latest `sandbox_pods` row the rule reads.
@@ -37,7 +40,8 @@ pub(crate) struct LatestPod {
 /// creation time of its oldest claim (on the database's clock), the clock
 /// of a conversation that never had a pod. In order: a live latest row is
 /// in use; a finished sub-agent gets the agent grace, whatever ended its
-/// pod; then the user's Stop, a pre-SME-521 end that can't be told (the
+/// pod, from the later of that clock and its `activity_at`; then the
+/// user's Stop, a pre-SME-521 end that can't be told (the
 /// Stop's grace, or the default when the Stop's is 0), and any other end
 /// the default. A class whose days are 0 is kept; a default of 0 turns
 /// automatic removal off for every class.
@@ -59,6 +63,12 @@ pub(crate) fn fate(input: &GraceInput, oldest_claim: NaiveDateTime, settings: &G
         }
         None if input.agent_done => (oldest_claim, GraceClass::Agent),
         None => (oldest_claim, GraceClass::NoPod),
+    };
+    // A done agent the user is still working with: its day runs from the
+    // last word either way, not from the pod's end (review 1, M1).
+    let clock = match (class, input.activity_at) {
+        (GraceClass::Agent, Some(activity)) => clock.max(activity),
+        _ => clock,
     };
     if settings.default_days == 0 {
         return StorageFate::Kept;

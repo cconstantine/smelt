@@ -131,7 +131,9 @@ fn test_an_agents_environment_says_finish_stops_its_pod() {
 const STORAGE_LINE: &str = "- A stopped sandbox loses its storage 7 days later unless it starts again \
     (30 days later if the user stopped it); the next sandbox then starts fresh.\n";
 const AGENT_STORAGE_LINE: &str =
-    "- When you finish, your sandbox's storage is removed 1 day later unless you're given more work.\n";
+    "- When you finish, your sandbox's storage is removed 1 day after both your sandbox has stopped \
+    and this conversation's last message or question to the user; a message from the user or your \
+    parent restarts that clock.\n";
 
 /// SME-521: every stop's storage goes, the user's Stop's after its own
 /// grace; an agent is told its finish's grace too; nothing when off.

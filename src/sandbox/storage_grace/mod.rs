@@ -96,6 +96,7 @@ fn grace_input(row: &db::StorageGraceRow) -> GraceInput {
             quiet: row.quiet,
         }),
         agent_done: row.agent_done,
+        activity_at: row.activity_at,
     }
 }
 

@@ -76,6 +76,68 @@ async fn test_grace_inputs_are_each_conversations_latest_row_and_agent_state(poo
     assert!(!inputs.rows.contains_key(&gone.id), "a deleted conversation is gone from the answer");
 }
 
+/// SME-521 review 1, M1: a done agent's activity is the later of its
+/// latest message and a question still waiting on the user; an answered
+/// question or one asked of its parent doesn't count. Read only for a
+/// done agent: nothing else's clock uses it.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_done_agents_activity_is_its_latest_message_or_waiting_question(pool: PgPool) {
+    let root = create_conversation(&pool).await.expect("conversation");
+    let mut agents = Vec::new();
+    for _ in 0..3 {
+        let agent = create_conversation(&pool).await.expect("conversation");
+        sqlx::query("INSERT INTO agents (conversation_id, root_id, depth, brief, state) VALUES ($1, $2, 1, 'b', 'finished')")
+            .bind(agent.id)
+            .bind(root.id)
+            .execute(&pool)
+            .await
+            .expect("a finished agent");
+        agents.push(agent.id);
+    }
+    let message = |conversation_id: i64, hours: i32| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query("INSERT INTO messages (conversation_id, role, content, created_at) VALUES ($1, 'user', '[]', now()::timestamp + make_interval(hours => $2))")
+                .bind(conversation_id)
+                .bind(hours)
+                .execute(&pool)
+                .await
+                .expect("a message");
+        }
+    };
+    let question = |conversation_id: i64, hours: i32, answered: bool, asked_of: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO pending_questions (conversation_id, tool_use_id, questions, answer, asked_of, created_at)
+                 VALUES ($1, 't', '[]', CASE WHEN $3 THEN '[]'::jsonb END, $4, now()::timestamp + make_interval(hours => $2))",
+            )
+            .bind(conversation_id)
+            .bind(hours)
+            .bind(answered)
+            .bind(asked_of)
+            .execute(&pool)
+            .await
+            .expect("a question");
+        }
+    };
+    let [waiting, answered, of_parent] = agents[..] else { unreachable!() };
+    message(waiting, 1).await;
+    question(waiting, 5, false, "user").await;
+    message(answered, 2).await;
+    question(answered, 9, true, "user").await;
+    message(of_parent, 3).await;
+    question(of_parent, 9, false, "parent").await;
+    message(root.id, 4).await;
+
+    let inputs = storage_grace_inputs(&pool, &[root.id, waiting, answered, of_parent]).await.expect("read");
+    let hours_on = |id: i64| inputs.rows[&id].activity_at.map(|at| ((at - inputs.observed_at).num_seconds() as f64 / 3600.0).round() as i64);
+    assert_eq!(hours_on(waiting), Some(5), "the waiting question, later than the message");
+    assert_eq!(hours_on(answered), Some(2), "an answered question doesn't count");
+    assert_eq!(hours_on(of_parent), Some(3), "nor does one asked of the parent");
+    assert_eq!(inputs.rows[&root.id].activity_at, None, "a top-level conversation's isn't read");
+}
+
 /// The upgrade shape: `quietly_stopped_at` is added nullable with no
 /// default, so a row written before the migration — and every stopped
 /// row the upgrade finds already there — keeps NULL and is never swept.

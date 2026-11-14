@@ -37,6 +37,9 @@ pub struct StorageGraceRow {
     pub quiet: bool,
     /// `agents.state` is `finished`, `stopped` or `failed`.
     pub agent_done: bool,
+    /// For a done agent only, the later of its latest message and a
+    /// question still waiting on the user (SME-521 review 1, M1).
+    pub activity_at: Option<NaiveDateTime>,
 }
 
 /// The rule's inputs for a set of conversations, with the database's
@@ -59,15 +62,20 @@ impl StorageGraceInputs {
 }
 
 /// The storage-grace inputs of `conversation_ids` (SME-521): each one's
-/// latest pod row (`DISTINCT ON`'s shape, by the highest id) and its
-/// agent state, read in one statement on one connection with the clock.
+/// latest pod row (`DISTINCT ON`'s shape, by the highest id), its agent
+/// state and, for a done agent, its last activity, read in one statement on one connection with the clock.
 /// No new index: hourly, and keyed by conversation.
 pub async fn storage_grace_inputs(pool: &PgPool, conversation_ids: &[i64]) -> Result<StorageGraceInputs, sqlx::Error> {
     let mut conn = pool.acquire().await?;
     let rows: Vec<StorageGraceRow> = sqlx::query_as(
         "SELECT c.id AS conversation_id, p.id AS pod_id, p.terminated_at, p.stopped_by_user,
                 COALESCE(p.quietly_stopped_at IS NOT NULL, false) AS quiet,
-                COALESCE(a.state IN ('finished', 'stopped', 'failed'), false) AS agent_done
+                COALESCE(a.state IN ('finished', 'stopped', 'failed'), false) AS agent_done,
+                CASE WHEN a.state IN ('finished', 'stopped', 'failed') THEN GREATEST(
+                  (SELECT max(m.created_at) FROM messages m WHERE m.conversation_id = c.id),
+                  (SELECT q.created_at FROM pending_questions q
+                    WHERE q.conversation_id = c.id AND q.answer IS NULL AND q.asked_of = 'user'))
+                END AS activity_at
            FROM conversations c
            LEFT JOIN LATERAL (SELECT q.id, q.terminated_at, q.stopped_by_user, q.quietly_stopped_at
                                 FROM sandbox_pods q WHERE q.conversation_id = c.id

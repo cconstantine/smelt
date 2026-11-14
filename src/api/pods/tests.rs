@@ -390,6 +390,7 @@ fn test_each_rows_fate_comes_from_the_passes_rule() {
         stopped_by_user,
         quiet: false,
         agent_done,
+        activity_at: None,
     };
     let inputs = db::StorageGraceInputs {
         rows: std::collections::HashMap::from([

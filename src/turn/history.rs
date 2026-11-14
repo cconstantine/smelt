@@ -283,9 +283,14 @@ fn storage_grace_lines(graces: &crate::api::sandbox::GraceSettings, agent: bool)
         days_later(graces.default_days)
     );
     if agent && graces.agent_days > 0 {
+        // The pass's clock for a done agent (SME-521 review 1, M1): the
+        // later of the pod's end and the last message or waiting question.
+        let days = graces.agent_days;
+        let span = if days == 1 { "1 day".to_string() } else { format!("{days} days") };
         lines.push_str(&format!(
-            "- When you finish, your sandbox's storage is removed {} unless you're given more work.\n",
-            days_later(graces.agent_days)
+            "- When you finish, your sandbox's storage is removed {span} after both your sandbox has stopped \
+             and this conversation's last message or question to the user; a message from the user or your \
+             parent restarts that clock.\n"
         ));
     }
     lines
