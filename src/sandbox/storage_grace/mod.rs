@@ -186,15 +186,14 @@ where
         }
     }
     due.sort_by_key(|due| (due.at, due.conversation_id));
-    let removing = due.len().min(STORAGE_REMOVALS_PER_PASS);
+    let due_count = due.len();
     tracing::info!(
         stored = claims.by_conversation.len(),
         live,
         kept,
         waiting,
-        due = due.len(),
+        due = due_count,
         orphaned,
-        removing,
         "storage grace pass"
     );
     let remove = &remove;
@@ -239,6 +238,11 @@ where
             }
             Some(Attempt::Skipped) | None => {}
         }
+    }
+    // Review 2, L3: what the pass did, counted after the skips, rather
+    // than `due.min(20)` before them.
+    if due_count > 0 {
+        tracing::info!(due = due_count, tried = attempted, settled = settled.len(), "storage grace pass removals");
     }
     settled
 }
