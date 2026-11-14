@@ -140,6 +140,77 @@ async fn test_waiters_pass_warm_first_then_oldest_a_spacing_apart() {
     assert!(gate.waiting().is_empty());
 }
 
+/// Queues `ids` on `gate` (held), in order, each sending its id once it
+/// passes.
+async fn queue(gate: &Arc<Gate>, ids: &[i64], tx: &tokio::sync::mpsc::UnboundedSender<i64>) {
+    for id in ids {
+        let (shared, tx, id) = (gate.clone(), tx.clone(), *id);
+        let before = gate.waiting().len();
+        tokio::spawn(async move {
+            shared.wait(id, |_| {}).await;
+            let _ = tx.send(id);
+        });
+        until_waiting(gate, before + 1).await;
+    }
+}
+
+async fn passed_in_order(rx: &mut tokio::sync::mpsc::UnboundedReceiver<i64>, n: usize) -> Vec<i64> {
+    let mut order = Vec::new();
+    for _ in 0..n {
+        order.push(tokio::time::timeout(StdDuration::from_secs(5), rx.recv()).await.expect("each passes").expect("sent"));
+    }
+    order
+}
+
+/// Review 1 M1: warmth is decided as the queue is released, not when the
+/// call queued. A conversation that passed just before queueing, but whose
+/// cache has since gone past `WARM_FOR`, no longer jumps an older waiter.
+#[tokio::test]
+async fn test_a_waiter_whose_cache_went_cold_while_waiting_loses_its_priority() {
+    let warm_for = StdDuration::from_millis(200);
+    let gate = Arc::new(Gate::with_timing(StdDuration::ZERO, warm_for, StdDuration::from_secs(3600)));
+    let (was_warm, cold) = (1, 2);
+    tokio::time::timeout(StdDuration::from_secs(1), gate.wait(was_warm, |_| {})).await.expect("passes at once");
+    let now = Utc::now();
+    gate.observe(at(0.99, 0.5, now));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    queue(&gate, &[cold, was_warm], &tx).await;
+    tokio::time::sleep(warm_for + StdDuration::from_millis(100)).await;
+    gate.observe(at(0.01, 0.5, now + Duration::milliseconds(1)));
+    assert_eq!(passed_in_order(&mut rx, 2).await, vec![cold, was_warm], "both cold now: oldest first");
+}
+
+/// Review 1 M1: a cold waiter that has waited `COLD_LIMIT` ranks with the
+/// warm ones, so it goes ahead of a warm one that queued after it.
+#[tokio::test]
+async fn test_a_cold_waiter_past_the_cold_limit_goes_ahead_of_a_newer_warm_one() {
+    let cold_limit = StdDuration::from_millis(200);
+    let gate = Arc::new(Gate::with_timing(StdDuration::ZERO, StdDuration::from_secs(3600), cold_limit));
+    let (warm, cold) = (1, 2);
+    tokio::time::timeout(StdDuration::from_secs(1), gate.wait(warm, |_| {})).await.expect("passes at once");
+    let now = Utc::now();
+    gate.observe(at(0.99, 0.5, now));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    queue(&gate, &[cold], &tx).await;
+    tokio::time::sleep(cold_limit + StdDuration::from_millis(100)).await;
+    queue(&gate, &[warm], &tx).await;
+    gate.observe(at(0.01, 0.5, now + Duration::milliseconds(1)));
+    assert_eq!(passed_in_order(&mut rx, 2).await, vec![cold, warm], "the aged cold waiter first");
+}
+
+/// Review 1 L5's nit: a pass older than `WARM_FOR` is forgotten.
+#[tokio::test]
+async fn test_passes_too_old_to_be_warm_are_pruned() {
+    let warm_for = StdDuration::from_millis(100);
+    let gate = Gate::with_timing(StdDuration::ZERO, warm_for, StdDuration::from_secs(3600));
+    gate.wait(1, |_| {}).await;
+    gate.wait(2, |_| {}).await;
+    assert_eq!(gate.remembered(), 2);
+    tokio::time::sleep(warm_for + StdDuration::from_millis(50)).await;
+    gate.wait(3, |_| {}).await;
+    assert_eq!(gate.remembered(), 1, "only the fresh pass is kept");
+}
+
 /// A dropped waiter leaves the queue at once, and the next can go.
 #[tokio::test]
 async fn test_a_dropped_waiter_leaves_the_queue() {
@@ -155,3 +226,4 @@ async fn test_a_dropped_waiter_leaves_the_queue() {
     let _ = waiting.await;
     assert!(gate.waiting().is_empty(), "{:?}", gate.waiting());
 }
+

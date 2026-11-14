@@ -21,8 +21,13 @@
 //! once. Coming out of a hold they pass one per `RELEASE_SPACING`, warm
 //! caches first (a pass under `WARM_FOR` ago: a cache read costs less of
 //! the window than a full prefill, SME-346's idea), then oldest first,
-//! each re-checking the latest reading as it goes. A waiter dropped (a
-//! Stop, a dropped turn) leaves the queue at once.
+//! each re-checking the latest reading as it goes. Warmth is decided at
+//! each release, from the conversation's last pass then, not when its call
+//! queued: a cache can go cold while its call waits (PR #353 review 1 M1).
+//! And a waiter that has waited `COLD_LIMIT` ranks with the warm ones, so
+//! a cold call isn't starved for the rest of the window by warm ones that
+//! keep coming back. A waiter dropped (a Stop, a dropped turn) leaves the
+//! queue at once.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -45,6 +50,8 @@ pub const FLOOR: f64 = 1.0 / 7.0;
 pub const RELEASE_SPACING: StdDuration = StdDuration::from_secs(15);
 /// How long after a conversation's last pass its cache counts as warm.
 pub const WARM_FOR: StdDuration = StdDuration::from_secs(55 * 60);
+/// How long a cold waiter waits before it ranks with the warm ones.
+pub const COLD_LIMIT: StdDuration = StdDuration::from_secs(30 * 60);
 
 /// The `five_hour` window of a reading, as the gate keeps it.
 #[derive(Clone, Debug, PartialEq)]
@@ -105,7 +112,6 @@ struct Entry {
     id: u64,
     conversation_id: i64,
     since: Instant,
-    warm: bool,
 }
 
 #[derive(Default)]
@@ -114,7 +120,18 @@ struct State {
     waiters: Vec<Entry>,
     next_id: u64,
     last_release: Option<Instant>,
+    /// Each conversation's last pass, while it's under `warm_for` old:
+    /// older ones are pruned as passes are noted.
     last_pass: HashMap<i64, Instant>,
+}
+
+impl State {
+    /// Notes `conversation_id`'s pass at `now`, pruning passes too old to
+    /// count as warm.
+    fn note_pass(&mut self, conversation_id: i64, now: Instant, warm_for: StdDuration) {
+        self.last_pass.retain(|_, at| now.duration_since(*at) < warm_for);
+        self.last_pass.insert(conversation_id, now);
+    }
 }
 
 /// A gate: the process has one (`gate()`); tests make their own.
@@ -122,11 +139,25 @@ pub struct Gate {
     state: Mutex<State>,
     changed: Notify,
     spacing: StdDuration,
+    warm_for: StdDuration,
+    cold_limit: StdDuration,
 }
 
 impl Gate {
     pub fn new(spacing: StdDuration) -> Self {
-        Self { state: Mutex::default(), changed: Notify::new(), spacing }
+        Self { state: Mutex::default(), changed: Notify::new(), spacing, warm_for: WARM_FOR, cold_limit: COLD_LIMIT }
+    }
+
+    /// A gate with its own `WARM_FOR` and `COLD_LIMIT`, for a test.
+    #[cfg(test)]
+    pub fn with_timing(spacing: StdDuration, warm_for: StdDuration, cold_limit: StdDuration) -> Self {
+        Self { state: Mutex::default(), changed: Notify::new(), spacing, warm_for, cold_limit }
+    }
+
+    /// How many conversations' last passes it remembers.
+    #[cfg(test)]
+    pub fn remembered(&self) -> usize {
+        self.state().last_pass.len()
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -180,11 +211,20 @@ impl Gate {
         };
         let _queued = Queued { gate: self, id };
         let mut told: Option<DateTime<Utc>> = None;
+        let mut was_next = false;
         loop {
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             let step = self.step(id);
+            // The order is decided at each look, so the waiter that was
+            // next can find, its spacing up, that another has moved ahead
+            // of it (a cache gone cold, a cold waiter aged): that one waits
+            // on a change, so it's told of this one.
+            if matches!(step, Step::Behind) && was_next {
+                self.changed.notify_waiters();
+            }
+            was_next = matches!(step, Step::Spacing(_));
             let deadline = match step {
                 Step::Held(until) => {
                     if told != Some(until) {
@@ -223,7 +263,7 @@ impl Gate {
         if !state.waiters.is_empty() || verdict(state.reading.as_ref(), Utc::now()) != Verdict::Open {
             return false;
         }
-        state.last_pass.insert(conversation_id, Instant::now());
+        state.note_pass(conversation_id, Instant::now(), self.warm_for);
         true
     }
 
@@ -235,34 +275,40 @@ impl Gate {
         if state.waiters.is_empty() && verdict(state.reading.as_ref(), Utc::now()) == Verdict::Open {
             // Not a release: the spacing only separates passes from the
             // queue, so the first out of a hold goes at once.
-            state.last_pass.insert(conversation_id, now);
+            state.note_pass(conversation_id, now, self.warm_for);
             return None;
         }
-        let warm = state.last_pass.get(&conversation_id).is_some_and(|at| now.duration_since(*at) < WARM_FOR);
         let id = state.next_id;
         state.next_id += 1;
-        state.waiters.push(Entry { id, conversation_id, since: now, warm });
+        state.waiters.push(Entry { id, conversation_id, since: now });
         Some(id)
     }
 
     /// One look at the queue for entry `id`: passes it (removing it) when
-    /// the gate is open, it's first in line and the spacing is up.
+    /// the gate is open, it's first in line and the spacing is up. First
+    /// in line is decided now: warm (its conversation passed under
+    /// `warm_for` ago) or waiting `cold_limit` and more ranks ahead, then
+    /// the oldest.
     fn step(&self, id: u64) -> Step {
         let mut state = self.state();
         if let Verdict::Held { until } = verdict(state.reading.as_ref(), Utc::now()) {
             return Step::Held(until);
         }
-        let first = state.waiters.iter().min_by_key(|e| (!e.warm, e.since, e.id)).map(|e| (e.id, e.conversation_id));
+        let now = Instant::now();
+        let ahead = |e: &Entry| {
+            let warm = state.last_pass.get(&e.conversation_id).is_some_and(|at| now.duration_since(*at) < self.warm_for);
+            warm || now.duration_since(e.since) >= self.cold_limit
+        };
+        let first = state.waiters.iter().min_by_key(|e| (!ahead(e), e.since, e.id)).map(|e| (e.id, e.conversation_id));
         let Some((first_id, conversation_id)) = first.filter(|(first_id, _)| *first_id == id) else {
             return Step::Behind;
         };
-        let now = Instant::now();
         if let Some(at) = state.last_release.map(|last| last + self.spacing).filter(|at| *at > now) {
             return Step::Spacing(at);
         }
         state.waiters.retain(|e| e.id != first_id);
         state.last_release = Some(now);
-        state.last_pass.insert(conversation_id, now);
+        state.note_pass(conversation_id, now, self.warm_for);
         Step::Passed
     }
 }
