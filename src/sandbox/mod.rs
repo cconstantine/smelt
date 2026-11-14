@@ -43,6 +43,7 @@ mod quiet_stop;
 mod script_mcp;
 mod spec;
 mod storage_grace;
+mod storage_report;
 mod watch;
 
 pub use self::adopt::*;
@@ -58,6 +59,7 @@ pub(crate) use self::script_mcp::ScriptMcpLimits;
 pub(crate) use self::script_mcp::command_summary as script_mcp_summary;
 pub use self::spec::*;
 pub(crate) use self::storage_grace::*;
+pub(crate) use self::storage_report::{storage_report, StorageReportLog};
 pub use self::watch::*;
 
 // `cfg(test)` rather than an env var deliberately: the whole point is that

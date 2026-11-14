@@ -5,7 +5,7 @@ use crate::api::pods::{
     AgentStatus, PodActivity, PodUsage, ServerPodOverview, StorageFate, StorageKind, StoredStorage, StoredSummary,
     get_pods, get_stored_storage, get_stored_summary, remove_stored_storage, stop_pod,
 };
-use crate::api::sandbox::GraceSettings;
+use crate::api::sandbox::{ClaimClass, GraceSettings, StorageReport, get_storage_report};
 use crate::frontend::Route;
 use crate::frontend::pages::SettingsCrumbs;
 use crate::frontend::pages::STORAGE_REMOVE_WARNING;
@@ -171,6 +171,15 @@ fn StoredVolumes(pods_changed: Signal<u64>, tick: Signal<u64>) -> Element {
         Some(Ok(summary)) if summary.conversations > 0 || summary.orphaned > 0 => Some(summary_text(&summary)),
         _ => None,
     };
+    // Where removed storage goes (SME-521): read on the same signals.
+    let report = use_resource(move || {
+        let _ = (pods_changed(), tick());
+        get_storage_report()
+    });
+    let report_lines = match report() {
+        Some(Ok(report)) => storage_report_lines(&report),
+        _ => Vec::new(),
+    };
     let mut pending_remove: Signal<Option<i64>> = use_signal(|| None);
     let mut remove_error: Signal<Option<String>> = use_signal(|| None);
     let mut confirm_remove = move |conversation_id: i64| {
@@ -189,6 +198,9 @@ fn StoredVolumes(pods_changed: Signal<u64>, tick: Signal<u64>) -> Element {
             }
             if let Some(summary) = summary {
                 p { class: "muted storage-summary", "{summary}" }
+            }
+            for line in report_lines {
+                p { class: "muted storage-report", "{line}" }
             }
             super::ErrorText { message: remove_error() }
             match fetched() {
@@ -270,6 +282,35 @@ fn summary_text(summary: &StoredSummary) -> String {
         summary.past_grace,
         summary.orphaned,
     )
+}
+
+/// The stored-volumes section's lines on where removed storage goes
+/// (SME-521): the claims' class, and the volumes left Released. Nothing
+/// for a read the server couldn't make.
+fn storage_report_lines(report: &StorageReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    match &report.class {
+        ClaimClass::Unavailable => {}
+        ClaimClass::NoDefault => lines.push(
+            "Sandbox claims have no storage class: the cluster has no default and SANDBOX_STORAGE_CLASS isn't set."
+                .to_string(),
+        ),
+        ClaimClass::Missing { name } => {
+            lines.push(format!("Sandbox claims name storage class {name}, which the cluster doesn't have."))
+        }
+        ClaimClass::Found { name, reclaim_policy, .. } => {
+            let frees = if reclaim_policy == "Delete" { "" } else { "; removing storage frees no disk" };
+            lines.push(format!("Sandbox claims use {name} (reclaim: {reclaim_policy}){frees}."));
+        }
+    }
+    if let Some(released) = &report.released {
+        lines.push(format!(
+            "Released volumes not yet reclaimed: {} ({}).",
+            released.count,
+            format_bytes(released.capacity_bytes)
+        ));
+    }
+    lines
 }
 
 /// A stored-volumes cell: the claim's size (`"20Gi"` — its capacity,
@@ -509,6 +550,31 @@ mod tests {
             storage_grace_note(&GraceSettings { default_days: 0, ..graces }),
             "Storage is never removed automatically."
         );
+    }
+
+    #[test]
+    fn test_the_storage_report_says_the_class_and_the_released_volumes() {
+        use crate::api::sandbox::ReleasedVolumes;
+        let class = |policy: &str| ClaimClass::Found {
+            name: "local-path".to_string(),
+            provisioner: "rancher.io/local-path".to_string(),
+            reclaim_policy: policy.to_string(),
+            configured: false,
+        };
+        let released = Some(ReleasedVolumes { count: 3, capacity_bytes: 60 << 30, oldest: None });
+        assert_eq!(
+            storage_report_lines(&StorageReport { class: class("Delete"), released: released.clone() }),
+            ["Sandbox claims use local-path (reclaim: Delete).", "Released volumes not yet reclaimed: 3 (60 GiB)."]
+        );
+        assert_eq!(
+            storage_report_lines(&StorageReport { class: class("Retain"), released: None }),
+            ["Sandbox claims use local-path (reclaim: Retain); removing storage frees no disk."]
+        );
+        assert_eq!(
+            storage_report_lines(&StorageReport { class: ClaimClass::Missing { name: "fast".to_string() }, released: None }),
+            ["Sandbox claims name storage class fast, which the cluster doesn't have."]
+        );
+        assert!(storage_report_lines(&StorageReport { class: ClaimClass::Unavailable, released: None }).is_empty());
     }
 
     #[test]

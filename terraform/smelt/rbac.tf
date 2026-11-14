@@ -1,6 +1,7 @@
 # What a sandbox needs from the cluster, and what smelt needs to be able to
 # ask for it. This is k8s/smelt-park-rbac.yaml expressed in Terraform: the same
-# `park` ServiceAccount, the same two Role/RoleBinding pairs, the same LimitRange
+# `park` ServiceAccount, the same two Role/RoleBinding pairs, the same read-only
+# storage ClusterRole and its binding, the same LimitRange
 # ceiling on a sandbox pod's memory. Keeping it here means a deployment gets the
 # RBAC with the app rather than by applying a second file by hand — and if the
 # yaml ever changes, this must change with it.
@@ -136,6 +137,52 @@ resource "kubernetes_role_binding_v1" "park" {
     api_group = "rbac.authorization.k8s.io"
     kind      = "Role"
     name      = "park"
+  }
+}
+
+# Read-only and cluster-wide, because PersistentVolumes and StorageClasses have
+# no namespace (SME-521): smelt reads which class its claims get, with its
+# reclaim policy, and counts this namespace's Released/Failed volumes. Without
+# it both reads come back 403 and smelt carries on without them. Named for the
+# namespace unless it's the default, so two deployments in one cluster don't
+# share one binding, and the default matches k8s/smelt-park-rbac.yaml's.
+locals {
+  storage_reader_name = var.namespace == "smelt-park" ? "smelt-storage-reader" : "${var.namespace}-storage-reader"
+}
+
+resource "kubernetes_cluster_role_v1" "storage_reader" {
+  metadata {
+    name = local.storage_reader_name
+  }
+
+  rule {
+    api_groups = [""]
+    resources  = ["persistentvolumes"]
+    verbs      = ["get", "list"]
+  }
+
+  rule {
+    api_groups = ["storage.k8s.io"]
+    resources  = ["storageclasses"]
+    verbs      = ["get", "list"]
+  }
+}
+
+resource "kubernetes_cluster_role_binding_v1" "storage_reader" {
+  metadata {
+    name = local.storage_reader_name
+  }
+
+  subject {
+    kind      = "ServiceAccount"
+    name      = kubernetes_service_account_v1.park.metadata[0].name
+    namespace = kubernetes_namespace_v1.park.metadata[0].name
+  }
+
+  role_ref {
+    api_group = "rbac.authorization.k8s.io"
+    kind      = "ClusterRole"
+    name      = kubernetes_cluster_role_v1.storage_reader.metadata[0].name
   }
 }
 

@@ -63,7 +63,9 @@ pub(in crate::sandbox) use pods::{build_sized_pod_spec, sandbox_delete_params};
 pub(in crate::sandbox) use pods::build_pod_spec;
 #[cfg(test)]
 pub(in crate::sandbox) use pods::{immediate_delete_params, START_DOCKERD_SCRIPT};
-pub(in crate::sandbox) use pvcs::{build_agent_volume_pvc_spec, build_volume_pvc_spec, conversation_pvc_specs};
+pub(in crate::sandbox) use pvcs::{
+    build_agent_volume_pvc_spec, build_volume_pvc_spec, conversation_pvc_specs, sandbox_storage_class,
+};
 #[cfg(test)]
 pub(in crate::sandbox) use pvcs::{
     build_conversation_pvc_spec, conversation_pvc_specs_with, default_docker_storage_size, default_volume_storage_size,

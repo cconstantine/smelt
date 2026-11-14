@@ -55,8 +55,13 @@ pub(crate) const STORAGE_REMOVAL_TIMEOUT: Duration = Duration::from_secs(90);
 /// the browser-test harness. The settings are read once, here.
 pub async fn remove_expired_storage(pool: PgPool) {
     let settings = grace_settings();
+    // Whether a removal frees disk at all (SME-521): the class once, the
+    // volumes left Released each pass.
+    let mut report_log = StorageReportLog::default();
+    report_log.log_class().await;
     loop {
         tokio::time::sleep(Duration::from_secs(STORAGE_REMOVAL_PASS_SECS)).await;
+        report_log.log_released().await;
         remove_expired_storage_once_with(
             &pool,
             &settings,
