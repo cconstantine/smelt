@@ -358,6 +358,13 @@ pub(super) fn shows_start_screen(
         && matches!(loaded, Some((id, Ok(list))) if Some(*id) == selected && list.is_empty())
 }
 
+/// Whether the working line shows: while a turn runs, and whenever a call
+/// waits at the usage gate, a compaction's included, which runs outside a
+/// turn (PR #353 review 1 L6).
+pub(super) fn shows_working_line(turn_running: bool, held: bool) -> bool {
+    turn_running || held
+}
+
 /// Whether the transcript shows a "Work on a repo" error under itself, once
 /// the start screen's form, which shows it otherwise, is down (SME-263):
 /// under a message, or under the conversation's error line when a failed
@@ -391,6 +398,7 @@ pub(super) fn Transcript(
     let messages = state.messages();
     let load_error = state.load_error();
     let turn_running = state.turn_running();
+    let usage_hold = state.usage_hold();
     let pending_question = state.pending_question();
     let mut layout_snap_pending = state.layout_snap_pending();
     // An image in a reply loaded: a layout change for the sticky scroll.
@@ -527,7 +535,7 @@ pub(super) fn Transcript(
                 }
             }
             StreamingReply { state, on_media_load }
-            if turn_running() {
+            if shows_working_line(turn_running(), usage_hold().is_some()) {
                 WorkingLine { state, tz_offset_minutes }
             }
             ModelNotes { selected, state, stream_errors }
