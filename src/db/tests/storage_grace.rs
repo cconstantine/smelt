@@ -92,32 +92,6 @@ async fn test_quietly_stopped_at_is_added_nullable_with_no_default(pool: PgPool)
     assert_eq!(default, None, "no default that could stamp a row retroactively");
 }
 
-/// SME-123 DR9: the Sandboxes page's stored volumes say when each
-/// conversation's sandbox stopped and whether that was a quiet stop: its
-/// latest pod row, once that row has ended. A live pod, and a
-/// conversation that never had one, give nothing.
-#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
-async fn test_each_conversations_last_stop_is_its_latest_ended_pod(pool: PgPool) {
-    let quiet = create_conversation(&pool).await.expect("conversation");
-    let old = create_sandbox_pod(&pool, quiet.id).await.expect("pod");
-    terminate_sandbox_pod(&pool, old.id).await.expect("end it");
-    let latest = create_sandbox_pod(&pool, quiet.id).await.expect("pod");
-    mark_pod_quietly_stopped(&pool, latest.id).await.expect("mark it");
-    terminate_sandbox_pod(&pool, latest.id).await.expect("end it");
-
-    let stopped_by_user = create_conversation(&pool).await.expect("conversation");
-    let pod = create_sandbox_pod(&pool, stopped_by_user.id).await.expect("pod");
-    terminate_sandbox_pod(&pool, pod.id).await.expect("end it");
-
-    let live = create_conversation(&pool).await.expect("conversation");
-    create_sandbox_pod(&pool, live.id).await.expect("a live pod");
-
-    let (stops, _) = last_pod_stops(&pool).await.expect("read");
-    assert!(stops.get(&quiet.id).is_some_and(|(_, quiet_stop)| quiet_stop.is_some()), "{stops:?}");
-    assert!(stops.get(&stopped_by_user.id).is_some_and(|(_, quiet_stop)| quiet_stop.is_none()), "{stops:?}");
-    assert!(!stops.contains_key(&live.id), "a live pod hasn't stopped: {stops:?}");
-}
-
 /// `pod_id`'s `stopped_by_user`, read back (SME-521).
 async fn stopped_by_user(pool: &PgPool, pod_id: i64) -> Option<bool> {
     sqlx::query_scalar("SELECT stopped_by_user FROM sandbox_pods WHERE id = $1")
@@ -181,13 +155,8 @@ async fn test_the_stops_come_with_the_databases_own_clock(pool: PgPool) {
     let pod = create_sandbox_pod(&shifted, conversation.id).await.expect("pod");
     terminate_sandbox_pod(&shifted, pod.id).await.expect("end it");
 
-    let (stops, observed_at) = last_pod_stops(&shifted).await.expect("read");
-    let (stopped, _) = stops.get(&conversation.id).copied().expect("its stop");
-    let age = observed_at - stopped;
-    assert!(age >= chrono::Duration::zero() && age < chrono::Duration::minutes(1), "stopped {stopped}, observed {observed_at}: {age}");
-
-    // SME-521: the grace inputs too, and a claim's UTC creation time put
-    // on that same clock.
+    // SME-521: the grace inputs, which the page and the pass both read,
+    // and a claim's UTC creation time put on that same clock.
     let inputs = storage_grace_inputs(&shifted, &[conversation.id]).await.expect("read");
     let stopped = inputs.rows[&conversation.id].terminated_at.expect("its end");
     let age = inputs.observed_at - stopped;

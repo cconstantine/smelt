@@ -15,7 +15,6 @@ use std::collections::HashMap;
 /// The three storage graces as the server read them (SME-521), in whole
 /// days, `0` meaning kept until removed by hand; a `default_days` of 0
 /// turns automatic removal off altogether.
-#[cfg(feature = "server")]
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GraceSettings {
     /// `SANDBOX_STORAGE_REMOVAL_DAYS`: every stop but the two below.
@@ -247,4 +246,11 @@ pub async fn get_idle_stop_minutes() -> ServerFnResult<u32> {
 #[get("/api/sandbox/storage-removal-days")]
 pub async fn get_storage_removal_days() -> ServerFnResult<u32> {
     Ok(sandbox::storage_removal_days())
+}
+
+/// The three storage graces as the server read them, for the pods page's
+/// note (SME-521). `get_storage_removal_days` stays for older tabs.
+#[get("/api/sandbox/storage-grace")]
+pub async fn get_storage_grace() -> ServerFnResult<GraceSettings> {
+    Ok(sandbox::grace_settings())
 }

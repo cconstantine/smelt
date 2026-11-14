@@ -96,7 +96,8 @@ fn grace_input(row: &db::StorageGraceRow) -> GraceInput {
 
 /// `conversation_id`'s fate from `inputs`, its claims' oldest creation
 /// (UTC) put on the database's clock; `None` when the conversation is gone.
-fn fate_of(
+/// The Pods page asks it too, so the page and the pass can't disagree.
+pub(crate) fn fate_of(
     inputs: &db::StorageGraceInputs,
     conversation_id: i64,
     oldest_claim_utc: Option<NaiveDateTime>,

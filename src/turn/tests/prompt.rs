@@ -57,7 +57,7 @@ pub(super) fn prompt_env() -> PromptEnvironment {
         top_level_persona: None,
         credentials: None,
         idle_stop_minutes: Some(60),
-        storage_removal_days: Some(7),
+        storage_grace: Some(crate::api::sandbox::GraceSettings { default_days: 7, agent_days: 1, user_days: 30 }),
     }
 }
 

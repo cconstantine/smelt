@@ -128,19 +128,39 @@ fn test_an_agents_environment_says_finish_stops_its_pod() {
     assert!(system_prompt(&agent).contains(FINISH_LINE), "even with idle stops off");
 }
 
-const STORAGE_LINE: &str = "- A sandbox stopped by idle or finish loses its storage 7 days later unless it starts again; \
-    the next sandbox then starts fresh.\n";
+const STORAGE_LINE: &str = "- A stopped sandbox loses its storage 7 days later unless it starts again \
+    (30 days later if the user stopped it); the next sandbox then starts fresh.\n";
+const AGENT_STORAGE_LINE: &str =
+    "- When you finish, your sandbox's storage is removed 1 day later unless you're given more work.\n";
 
+/// SME-521: every stop's storage goes, the user's Stop's after its own
+/// grace; an agent is told its finish's grace too; nothing when off.
 #[test]
-fn test_the_environment_says_when_a_quiet_stop_loses_its_storage() {
+fn test_the_environment_says_when_a_stopped_sandbox_loses_its_storage() {
     let env = super::prompt::prompt_env();
-    assert!(system_prompt(&env).contains(STORAGE_LINE), "{}", system_prompt(&env));
+    let top = system_prompt(&env);
+    assert!(top.contains(STORAGE_LINE), "{top}");
+    assert!(!top.contains("When you finish, your sandbox's storage"), "a top-level conversation doesn't finish");
 
-    let off = PromptEnvironment { storage_removal_days: None, ..super::prompt::prompt_env() };
+    let agent = PromptEnvironment {
+        agent: Some(AgentPrompt { id: 7, parent_id: 42, persona: None }),
+        ..super::prompt::prompt_env()
+    };
+    let agent = system_prompt(&agent);
+    assert!(agent.contains(STORAGE_LINE) && agent.contains(AGENT_STORAGE_LINE), "{agent}");
+
+    let off = PromptEnvironment { storage_grace: None, ..super::prompt::prompt_env() };
     assert!(!system_prompt(&off).contains("loses its storage"), "no line while automatic removal is off");
 
-    let thirty = PromptEnvironment { storage_removal_days: Some(30), ..super::prompt::prompt_env() };
-    assert!(system_prompt(&thirty).contains("storage 30 days later"), "the days in force");
+    let graces = crate::api::sandbox::GraceSettings { default_days: 30, agent_days: 0, user_days: 0 };
+    let kept = PromptEnvironment {
+        storage_grace: Some(graces),
+        agent: Some(AgentPrompt { id: 7, parent_id: 42, persona: None }),
+        ..super::prompt::prompt_env()
+    };
+    let kept = system_prompt(&kept);
+    assert!(kept.contains("storage 30 days later unless it starts again (kept if the user stopped it)"), "{kept}");
+    assert!(!kept.contains("When you finish, your sandbox's storage"), "an agent grace of 0 keeps it: no line");
 }
 
 /// A mock model whose replies each wait for a permit on `gate`; `seen` is

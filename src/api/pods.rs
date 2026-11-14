@@ -116,6 +116,29 @@ pub struct StoredStorage {
     /// measured against, as a pod's `observed_at` is.
     #[serde(default)]
     pub observed_at: NaiveDateTime,
+    /// What becomes of its claims, by the storage pass's own rule
+    /// (SME-521); `Unknown` from an older server.
+    #[serde(default)]
+    pub fate: StorageFate,
+}
+
+/// The stored-storage section's summary line (SME-521): what this
+/// instance's conversation claims add up to, on one read.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoredSummary {
+    /// Conversations with claims, the page's rows.
+    pub conversations: u32,
+    /// Their claims, the ones being removed included.
+    pub claims: u32,
+    /// The claims' sizes added up (bound capacity, else the request):
+    /// what was asked for, never what's used.
+    pub requested_bytes: u64,
+    /// Conversations past their grace, which the hourly pass removes,
+    /// at most 20 a pass.
+    pub past_grace: u32,
+    /// Conversations whose row is gone but whose claims stand: the
+    /// startup sweep's to remove, not shown as rows.
+    pub orphaned: u32,
 }
 
 /// When a conversation's sandbox stopped, and whether smelt stopped it
@@ -129,7 +152,6 @@ pub struct PodStop {
 
 /// What becomes of a conversation's stored claims (SME-521), by the one
 /// rule the storage-grace pass also follows (`sandbox::fate`).
-#[cfg(feature = "server")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub enum StorageFate {
     /// Its latest pod is live: in use.
@@ -147,7 +169,6 @@ pub enum StorageFate {
 
 /// Which grace a conversation's storage gets (SME-521), in the rule's
 /// order of precedence.
-#[cfg(feature = "server")]
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum GraceClass {
     /// A sub-agent that finished, was stopped or failed.
@@ -381,17 +402,65 @@ fn storage_rows(
                 volumes,
                 stopped: None,
                 observed_at: NaiveDateTime::default(),
+                fate: StorageFate::Unknown,
             })
         })
         .collect()
 }
 
-/// The claims and titles behind `get_stored_storage`. The list carries
-/// the startup sweep's selector — instance-scoped (SME-115), so a check
-/// server's list can never show or act on production's claims, or vice
-/// versa.
+/// Each row's stop, clock and fate from `inputs` (SME-521): the fate by
+/// the pass's own rule, `claims` giving each conversation's oldest claim.
+/// A row `inputs` lacks (its conversation went between reads) stays
+/// `Unknown`.
+#[cfg(feature = "server")]
+fn apply_fates(
+    rows: &mut [StoredStorage],
+    inputs: &db::StorageGraceInputs,
+    claims: &crate::sandbox::StoredClaims,
+    settings: &crate::api::sandbox::GraceSettings,
+) {
+    for row in rows {
+        row.observed_at = inputs.observed_at;
+        let input = inputs.rows.get(&row.conversation_id);
+        row.stopped = input.and_then(|input| input.terminated_at.map(|at| PodStop { at, quiet: input.quiet }));
+        let oldest = claims.by_conversation.get(&row.conversation_id).and_then(|set| set.oldest);
+        row.fate = crate::sandbox::fate_of(inputs, row.conversation_id, oldest, settings).unwrap_or_default();
+    }
+}
+
+/// The summary line over `rows`, `claims` being every claim listed: a
+/// conversation with claims but no row is orphaned. Past grace counts a
+/// row due by its fate with a claim not already being removed.
+#[cfg(feature = "server")]
+fn stored_summary(rows: &[StoredStorage], claims: &crate::sandbox::StoredClaims) -> StoredSummary {
+    let shown: std::collections::HashSet<i64> = rows.iter().map(|row| row.conversation_id).collect();
+    let volumes = || rows.iter().flat_map(|row| row.volumes.iter());
+    let past_grace = rows.iter().filter(|row| {
+        let due = matches!(row.fate, StorageFate::RemovesAt { at, .. } if at <= row.observed_at);
+        due && row.volumes.iter().any(|volume| !volume.deleting)
+    });
+    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    StoredSummary {
+        conversations: count(rows.len()),
+        claims: count(volumes().count()),
+        requested_bytes: volumes().filter_map(|volume| volume.size.as_deref().and_then(parse_memory_bytes)).sum(),
+        past_grace: count(past_grace.count()),
+        orphaned: count(claims.by_conversation.keys().filter(|id| !shown.contains(id)).count()),
+    }
+}
+
+/// `stored_view`'s rows alone, for `get_stored_storage` and the tests.
 #[cfg(feature = "server")]
 pub(crate) async fn stored_storage(pool: &sqlx::PgPool) -> Result<Vec<StoredStorage>, String> {
+    Ok(stored_view(pool).await?.0)
+}
+
+/// The claims and titles behind `get_stored_storage`, and their summary.
+/// The list carries the startup sweep's selector — instance-scoped
+/// (SME-115), so a check server's list can never show or act on
+/// production's claims, or vice versa.
+#[cfg(feature = "server")]
+pub(crate) async fn stored_view(pool: &sqlx::PgPool) -> Result<(Vec<StoredStorage>, StoredSummary), String> {
     let instance = db::smelt_instance(pool).await.map_err(|e| e.to_string())?;
     let client = crate::sandbox::kube_client().map_err(|e| e.to_string())?;
     let selector = kube::api::ListParams::default()
@@ -407,16 +476,14 @@ pub(crate) async fn stored_storage(pool: &sqlx::PgPool) -> Result<Vec<StoredStor
         .into_iter()
         .map(|conversation| (conversation.id, conversation.title))
         .collect();
-    // The database's own clock: the stops are its timestamps (SME-354 B14).
-    let (stops, observed_at) = db::last_pod_stops(pool).await.map_err(|e| e.to_string())?;
     let mut rows = storage_rows(&claims, &titles);
-    for row in &mut rows {
-        row.observed_at = observed_at;
-        row.stopped = stops
-            .get(&row.conversation_id)
-            .map(|(at, quiet)| PodStop { at: quiet.unwrap_or(*at), quiet: quiet.is_some() });
-    }
-    Ok(rows)
+    let grouped = crate::sandbox::group_claims(&claims);
+    // The database's own clock: the stops are its timestamps (SME-354 B14).
+    let ids: Vec<i64> = rows.iter().map(|row| row.conversation_id).collect();
+    let inputs = db::storage_grace_inputs(pool, &ids).await.map_err(|e| e.to_string())?;
+    apply_fates(&mut rows, &inputs, &grouped, &crate::sandbox::grace_settings());
+    let summary = stored_summary(&rows, &grouped);
+    Ok((rows, summary))
 }
 
 /// Whether a pod is doing anything. Busy while a turn runs, a repo clones
@@ -592,6 +659,13 @@ pub async fn get_running_command_conversations() -> ServerFnResult<Vec<RunningCo
 #[get("/api/storage")]
 pub async fn get_stored_storage() -> ServerFnResult<Vec<StoredStorage>> {
     stored_storage(db::get()).await.map_err(ServerFnError::new)
+}
+
+/// The stored-storage section's summary line (SME-521), on its own so
+/// `get_stored_storage`'s type stays the same for older tabs.
+#[get("/api/storage/summary")]
+pub async fn get_stored_summary() -> ServerFnResult<StoredSummary> {
+    Ok(stored_view(db::get()).await.map_err(ServerFnError::new)?.1)
 }
 
 /// Removes a conversation's sandbox volumes, keeping the conversation:

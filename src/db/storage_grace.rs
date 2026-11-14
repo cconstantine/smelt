@@ -175,30 +175,3 @@ pub(crate) mod fake_clear {
             .then(|| Err(sqlx::Error::PoolClosed))
     }
 }
-
-/// When each conversation's sandbox last stopped, and the quiet stop's
-/// mark if that stop was one (SME-123 DR9: the stored volumes said
-/// neither): its latest pod row, if that row has ended. Keyed by
-/// conversation; a conversation whose latest pod is live has no entry.
-/// With the clock the stops are measured against (SME-354 B14).
-pub async fn last_pod_stops(pool: &PgPool) -> Result<(LastPodStops, chrono::NaiveDateTime), sqlx::Error> {
-    // One connection for both reads: the clock is `now()` in the session
-    // the timestamps are read in, never the server's own (B14).
-    let mut conn = pool.acquire().await?;
-    let rows: Vec<(i64, chrono::NaiveDateTime, Option<chrono::NaiveDateTime>)> = sqlx::query_as(
-        "SELECT DISTINCT ON (conversation_id) conversation_id, terminated_at, quietly_stopped_at
-           FROM sandbox_pods
-          ORDER BY conversation_id, id DESC",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .map(|rows: Vec<(i64, Option<chrono::NaiveDateTime>, Option<chrono::NaiveDateTime>)>| {
-        rows.into_iter().filter_map(|(id, ended, quiet)| ended.map(|ended| (id, ended, quiet))).collect()
-    })?;
-    let stops = rows.into_iter().map(|(id, ended, quiet)| (id, (ended, quiet))).collect();
-    let observed_at = sqlx::query_scalar("SELECT now()::timestamp").fetch_one(&mut *conn).await?;
-    Ok((stops, observed_at))
-}
-
-/// Each conversation's last stop and its quiet stop's mark, if any.
-pub type LastPodStops = std::collections::HashMap<i64, (chrono::NaiveDateTime, Option<chrono::NaiveDateTime>)>;

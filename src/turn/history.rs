@@ -257,10 +257,38 @@ pub(crate) struct PromptEnvironment {
     /// `SANDBOX_IDLE_STOP_MINUTES` while idle stops are on; `None` at `0`
     /// (SME-78).
     pub idle_stop_minutes: Option<u32>,
-    /// `SANDBOX_STORAGE_REMOVAL_DAYS` while automatic removal is on;
-    /// `None` at `0` (SME-345). What it describes is storage a quiet stop
-    /// kept, so the line speaks for both quiet kinds.
-    pub storage_removal_days: Option<u32>,
+    /// The three storage graces while automatic removal is on; `None`
+    /// when `SANDBOX_STORAGE_REMOVAL_DAYS` is `0` (SME-345, SME-521).
+    pub storage_grace: Option<crate::api::sandbox::GraceSettings>,
+}
+
+/// `days` as the prompt says it: `1 day later`, `7 days later`.
+#[cfg(feature = "server")]
+fn days_later(days: u32) -> String {
+    if days == 1 { "1 day later".to_string() } else { format!("{days} days later") }
+}
+
+/// The prompt's lines on when a stopped sandbox's storage goes (SME-521):
+/// every stop's, with the user's Stop's own grace, and for an agent, its
+/// finish's. A grace of 0 is storage kept, which the line says.
+#[cfg(feature = "server")]
+fn storage_grace_lines(graces: &crate::api::sandbox::GraceSettings, agent: bool) -> String {
+    let user = match graces.user_days {
+        0 => "kept if the user stopped it".to_string(),
+        days => format!("{} if the user stopped it", days_later(days)),
+    };
+    let mut lines = format!(
+        "- A stopped sandbox loses its storage {} unless it starts again ({user}); \
+         the next sandbox then starts fresh.\n",
+        days_later(graces.default_days)
+    );
+    if agent && graces.agent_days > 0 {
+        lines.push_str(&format!(
+            "- When you finish, your sandbox's storage is removed {} unless you're given more work.\n",
+            days_later(graces.agent_days)
+        ));
+    }
+    lines
 }
 
 /// One volume in the environment section (SME-239): a global volume from
@@ -321,11 +349,8 @@ pub(crate) fn system_prompt(env: &PromptEnvironment) -> String {
         );
     }
     // When smelt removes what those quiet stops kept (SME-345).
-    if let Some(days) = env.storage_removal_days {
-        prompt.push_str(&format!(
-            "- A sandbox stopped by idle or finish loses its storage {days} days later unless it starts again; \
-             the next sandbox then starts fresh.\n"
-        ));
+    if let Some(graces) = &env.storage_grace {
+        prompt.push_str(&storage_grace_lines(graces, env.agent.is_some()));
     }
     if !env.volumes.is_empty() {
         prompt.push_str("- Volumes (their contents survive the pod ending):\n");
@@ -577,7 +602,7 @@ pub(crate) async fn prompt_environment(
         top_level_persona,
         credentials,
         idle_stop_minutes: Some(crate::sandbox::idle_stop_minutes()).filter(|minutes| *minutes > 0),
-        storage_removal_days: Some(crate::sandbox::storage_removal_days()).filter(|days| *days > 0),
+        storage_grace: Some(crate::sandbox::grace_settings()).filter(|graces| graces.default_days > 0),
     }
 }
 
