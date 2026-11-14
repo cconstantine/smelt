@@ -386,6 +386,7 @@ pub(super) fn Transcript(
     state: Store<ConversationState>,
     initial_messages: Resource<Option<(i64, Result<Vec<Message>, ServerFnError>)>>,
     tz_offset_minutes: Signal<i32>,
+    zone: Signal<crate::frontend::timezone::LocalZone>,
     mut input: Signal<String>,
     on_attach: EventHandler<()>,
     stream_errors: Signal<super::state::ChatErrors>,
@@ -536,7 +537,7 @@ pub(super) fn Transcript(
             }
             StreamingReply { state, on_media_load }
             if shows_working_line(turn_running(), usage_hold().is_some()) {
-                WorkingLine { state, tz_offset_minutes }
+                WorkingLine { state, zone }
             }
             ModelNotes { selected, state, stream_errors }
             // A "Work on a repo" error once its form is gone: the first

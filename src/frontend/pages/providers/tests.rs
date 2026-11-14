@@ -343,8 +343,7 @@ fn test_an_ended_window_shows_no_stale_percent() {
 fn test_resets_show_in_the_viewers_zone_with_its_local_day() {
     use super::usage::{reset_text, usage_title};
     let now = usage_now();
-    let zone = |offset_minutes, label: &str| LocalZone { offset_minutes, label: label.to_string() };
-    let (pst, ist) = (zone(-480, "PST"), zone(330, "IST"));
+    let (pst, ist) = (LocalZone::fixed(-480, "PST"), LocalZone::fixed(330, "IST"));
     let soon = usage_window("five_hour", 0.4, "allowed", 2, now);
     let later = usage_window("seven_day", 0.4, "allowed", 84, now);
     assert_eq!(reset_text(&soon, now, &pst), "resets 06:00 PST");
@@ -356,4 +355,25 @@ fn test_resets_show_in_the_viewers_zone_with_its_local_day() {
     assert_eq!(usage_title(&usage, &pst), "Claude subscription: 5-hour 40%, resets 06:00 PST; 7-day 40%, resets Mon 16:00 PST");
     use crate::frontend::timezone::offset_label;
     assert_eq!((offset_label(0), offset_label(-480), offset_label(330)), ("UTC".into(), "UTC-8".into(), "UTC+5:30".into()));
+}
+
+/// Review 2 L7: each reset is shown at the zone's offset and name at that
+/// instant. Read on 2027-03-08 in California, a 7-day reset at
+/// 2027-03-15 16:00 UTC falls after the change to PDT (2027-03-14 10:00
+/// UTC), so it's 09:00 PDT, not 08:00 PST; a reset before it stays PST.
+#[test]
+fn test_a_reset_past_a_daylight_saving_change_shows_that_sides_time() {
+    use super::usage::reset_text;
+    let at = |s: &str| chrono::DateTime::parse_from_rfc3339(s).expect("a time").with_timezone(&chrono::Utc);
+    let now = at("2027-03-08T18:00:00Z");
+    let mut california = LocalZone::fixed(-480, "PST");
+    california.changes.push((at("2027-03-14T10:00:00Z"), -420, "PDT".to_string()));
+    let window = |resets_at| {
+        let mut w = usage_window("seven_day", 0.4, "allowed", 0, now);
+        w.resets_at = Some(resets_at);
+        w
+    };
+    assert_eq!(reset_text(&window(at("2027-03-15T16:00:00Z")), now, &california), "resets Mon 09:00 PDT");
+    assert_eq!(reset_text(&window(at("2027-03-13T16:00:00Z")), now, &california), "resets Sat 08:00 PST");
+    assert_eq!(reset_text(&window(at("2027-03-08T20:00:00Z")), now, &california), "resets 12:00 PST");
 }

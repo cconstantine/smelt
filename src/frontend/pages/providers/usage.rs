@@ -67,16 +67,17 @@ pub fn usage_short_text(usage: &ProviderUsage) -> String {
 }
 
 /// `resets 14:20 PST` within a day of `now`, else `resets Mon 09:00 PST`,
-/// on the viewer's wall clock with its local weekday (SME-523); `reset
-/// since` once it's past.
+/// on the viewer's wall clock with its local weekday (SME-523), at the
+/// zone's offset and name at the reset (review 2 L7); `reset since` once
+/// it's past.
 pub fn reset_text(window: &UsageWindow, now: DateTime<Utc>, zone: &LocalZone) -> String {
     match window.resets_at {
         None => "reset time unknown".to_string(),
         Some(_) if window.reset_passed => "reset since".to_string(),
         Some(at) if at - now < chrono::Duration::hours(24) => {
-            format!("resets {} {}", zone.local(at).format("%H:%M"), zone.label)
+            format!("resets {} {}", zone.local(at).format("%H:%M"), zone.label_at(at))
         }
-        Some(at) => format!("resets {} {}", zone.local(at).format("%a %H:%M"), zone.label),
+        Some(at) => format!("resets {} {}", zone.local(at).format("%a %H:%M"), zone.label_at(at)),
     }
 }
 

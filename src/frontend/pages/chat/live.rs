@@ -34,12 +34,13 @@ pub(super) fn use_turn_timer(state: Store<ConversationState>) {
 /// render either way. The zone comes from the one shared reader
 /// (`frontend::timezone`, SME-523).
 #[cfg(feature = "web")]
-pub(super) fn use_timezone_offset(tz_offset_minutes: Signal<i32>) {
-    let mut tz_offset_minutes = tz_offset_minutes;
+pub(super) fn use_timezone_offset(tz_offset_minutes: Signal<i32>, zone: Signal<crate::frontend::timezone::LocalZone>) {
+    let (mut tz_offset_minutes, mut zone) = (tz_offset_minutes, zone);
     use_hook(move || {
         spawn(async move {
-            if let Some(zone) = crate::frontend::timezone::read_local_zone().await {
-                tz_offset_minutes.set(zone.offset_minutes);
+            if let Some(read) = crate::frontend::timezone::read_local_zone().await {
+                tz_offset_minutes.set(read.offset_minutes);
+                zone.set(read);
             }
         });
     });

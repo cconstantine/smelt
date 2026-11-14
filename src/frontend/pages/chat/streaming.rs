@@ -14,15 +14,19 @@ pub(super) fn format_elapsed(seconds: u64) -> String {
 }
 
 /// The working line while a call waits at the five-hour usage gate
-/// (SME-523): when it resumes in the viewer's local time
-/// (`tz_offset_minutes` ahead of UTC), and how long that is from `now`.
-pub(super) fn held_text(until: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>, tz_offset_minutes: i32) -> String {
+/// (SME-523): when it resumes on the viewer's wall clock (`zone`'s, at
+/// its offset then: review 2 L7), and how long that is from `now`.
+pub(super) fn held_text(
+    until: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+    zone: &crate::frontend::timezone::LocalZone,
+) -> String {
     let lead = "Waiting for the Claude 5-hour usage window";
     let left = (until - now).num_seconds();
     if left <= 0 {
         return format!("{lead} · resumes any moment");
     }
-    let local = until + chrono::Duration::minutes(i64::from(tz_offset_minutes));
+    let local = zone.local(until);
     // Part of a minute counts as one, so it never says "in 0 min".
     let minutes = (left + 59) / 60;
     let span = match (minutes / 60, minutes % 60) {
@@ -55,12 +59,12 @@ pub(super) fn StreamingReply(state: Store<ConversationState>, on_media_load: Eve
 /// once-a-second tick re-renders this line and not the transcript
 /// (SME-57); the tick also counts the hold's minutes down.
 #[component]
-pub(super) fn WorkingLine(state: Store<ConversationState>, tz_offset_minutes: Signal<i32>) -> Element {
+pub(super) fn WorkingLine(state: Store<ConversationState>, zone: Signal<crate::frontend::timezone::LocalZone>) -> Element {
     let turn_elapsed = state.turn_elapsed();
     let usage_hold = state.usage_hold();
     let elapsed = turn_elapsed();
     let text = match usage_hold() {
-        Some(until) => held_text(until, chrono::Utc::now(), tz_offset_minutes()),
+        Some(until) => held_text(until, chrono::Utc::now(), &zone.read()),
         None => format!("Working… {}", format_elapsed(elapsed)),
     };
     rsx! {
