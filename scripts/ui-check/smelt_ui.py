@@ -41,6 +41,7 @@ import re
 import sys
 import time
 
+from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
 
 BASE = os.environ.get("SMELT_UI_BASE", "http://localhost:8081").rstrip("/")
@@ -84,10 +85,14 @@ class Tab:
 
     def delete_conversation(self, conversation_id):
         """The conversation's ☰ menu's two-click Delete (SME-513): it
-        opens the conversation first. Deleting also removes its pod."""
+        opens the conversation first, and waits for its header, which a
+        slow load renders late. Deleting also removes its pod. False when
+        the conversation has no header (it doesn't exist)."""
         self.goto(f"/conversation/{conversation_id}")
         header = self.page.locator(f'.conversation-header[data-conversation-id="{conversation_id}"]')
-        if not header.count():
+        try:
+            header.wait_for(timeout=10000)
+        except PlaywrightTimeout:
             return False
         header.locator(".conversation-menu-button").click()
         button = header.locator(".conversation-menu-delete")
@@ -205,7 +210,7 @@ def _delete_started(tab, started):
             if cleaner.delete_conversation(conversation_id):
                 log(f"cleanup: deleted conversation {conversation_id}")
             else:
-                log(f"cleanup: conversation {conversation_id} not in the sidebar; delete it by hand")
+                log(f"cleanup: conversation {conversation_id} shows no header to delete it from; delete it by hand")
         except Exception as e:  # noqa: BLE001
             log(f"cleanup: deleting conversation {conversation_id} failed: {e}")
 
